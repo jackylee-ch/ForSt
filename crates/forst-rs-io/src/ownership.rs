@@ -152,10 +152,10 @@ impl FileOwnershipTracker {
 
     /// Registers a file with the tracker.
     ///
-    /// If a file with the same [`FileNumber`] is already registered, it will
-    /// be replaced.
-    pub fn register(&mut self, file: OwnedFile) {
-        self.files.insert(file.file_number, file);
+    /// If a file with the same [`FileNumber`] is already registered, the old
+    /// entry is returned so the caller can detect (and log) silent replacements.
+    pub fn register(&mut self, file: OwnedFile) -> Option<OwnedFile> {
+        self.files.insert(file.file_number, file)
     }
 
     /// Transfers a file to a new ownership level.
@@ -415,7 +415,8 @@ mod tests {
     #[test]
     fn test_tracker_register_and_get() {
         let mut tracker = FileOwnershipTracker::new();
-        tracker.register(make_file(1, FileOwnership::PrivateOwnedByDb));
+        let prev = tracker.register(make_file(1, FileOwnership::PrivateOwnedByDb));
+        assert!(prev.is_none()); // first registration returns None
 
         let file = tracker.get(FileNumber(1)).unwrap();
         assert_eq!(file.file_number, FileNumber(1));
@@ -427,12 +428,16 @@ mod tests {
     fn test_tracker_register_replaces_existing() {
         let mut tracker = FileOwnershipTracker::new();
         tracker.register(make_file(1, FileOwnership::PrivateOwnedByDb));
-        tracker.register(OwnedFile {
+        let prev = tracker.register(OwnedFile {
             path: PathBuf::from("/new/path.sst"),
             ownership: FileOwnership::NotOwned,
             file_number: FileNumber(1),
             file_size: 9999,
         });
+
+        // Previous entry is returned.
+        assert!(prev.is_some());
+        assert_eq!(prev.unwrap().ownership, FileOwnership::PrivateOwnedByDb);
 
         let file = tracker.get(FileNumber(1)).unwrap();
         assert_eq!(file.ownership, FileOwnership::NotOwned);

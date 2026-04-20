@@ -74,11 +74,12 @@ impl SequentialFile for LocalSequentialFile {
 
 /// A random-access file backed by `std::fs::File`.
 ///
-/// Each `read_at` call seeks to the requested offset then reads. A `Mutex`
-/// protects the file handle so `read_at` can be called from multiple threads
-/// (the trait requires `Send + Sync`).
+/// On Unix, uses `pread(2)` via [`std::os::unix::fs::FileExt::read_at`] for
+/// lock-free positioned reads without modifying the file offset.
+/// `File` is `Send + Sync` in Rust, and `pread` is thread-safe, so no
+/// `Mutex` is needed.
 pub struct LocalRandomAccessFile {
-    file: std::sync::Mutex<File>,
+    file: File,
     size: u64,
 }
 
@@ -88,22 +89,34 @@ impl LocalRandomAccessFile {
             .metadata()
             .map_err(|e| map_io_error(e, "random access file metadata"))?
             .len();
-        Ok(Self {
-            file: std::sync::Mutex::new(file),
-            size,
-        })
+        Ok(Self { file, size })
     }
 }
 
 impl RandomAccessFile for LocalRandomAccessFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
-        let mut file = self.file.lock().map_err(|e| {
-            forst_rs_common::error::ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| map_io_error(e, "random access seek"))?;
-        file.read(buf)
-            .map_err(|e| map_io_error(e, "random access read"))
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file
+                .read_at(buf, offset)
+                .map_err(|e| map_io_error(e, "random access pread"))
+        }
+        #[cfg(not(unix))]
+        {
+            // Non-Unix fallback: this path is not truly concurrent-safe.
+            // Production deployments target Linux; this exists only for
+            // cross-compilation checks.
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let file = &self.file;
+            // File on Windows does not support concurrent positioned reads
+            // without platform-specific APIs. This is a best-effort fallback.
+            let _ = offset;
+            let _ = buf;
+            Err(ForstError::not_supported(
+                "random access reads require Unix (pread)".to_string(),
+            ))
+        }
     }
 
     fn file_size(&self) -> ForstResult<u64> {

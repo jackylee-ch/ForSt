@@ -179,6 +179,11 @@ impl FileSystem for FileSystemRouter {
     fn list_dir(&self, dir: &Path) -> ForstResult<Vec<FileMetadata>> {
         // Directory listing is always handled by the local filesystem,
         // because directories (WAL dir, db dir, etc.) live locally.
+        //
+        // NOTE: In tiered mode, SST files on the remote filesystem will NOT
+        // appear in this listing. The engine discovers remote SSTs via the
+        // MANIFEST / VersionSet, not via directory listing. Callers that need
+        // to enumerate remote SSTs should query the VersionSet directly.
         self.local_fs.list_dir(dir)
     }
 

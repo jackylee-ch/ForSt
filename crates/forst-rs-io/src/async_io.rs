@@ -110,7 +110,9 @@ pub trait AsyncWriter: Send + Sync {
     /// Closes the writer, releasing any held resources.
     ///
     /// Takes `Box<Self>` so the writer is consumed and cannot be used after
-    /// closing.
+    /// closing. The returned future has a `'static` lifetime because the
+    /// writer is moved into it; implementors must ensure all captured state
+    /// is `'static` (i.e., no borrowed references from the caller).
     fn close(self: Box<Self>) -> BoxFuture<'static, ForstResult<()>>;
 }
 
