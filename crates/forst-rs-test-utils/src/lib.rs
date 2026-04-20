@@ -16,5 +16,21 @@
 //!
 //! This crate provides test helpers, temporary directory management,
 //! and shared test fixtures for ForSt-RS integration and unit tests.
+//!
+//! # Key Components
+//!
+//! - [`TestDir`]: Managed temporary directory with convenience helpers.
+//! - [`generate_kv_pairs`]: Deterministic KV data generator for tests.
+//! - [`generate_sequential_keys`]: Sequential key generator with zero-padded
+//!   keys for sorted iteration testing.
+//! - [`assert_bytes_eq`], [`assert_kv_pairs_sorted`]: Common assertion helpers.
 
 #![forbid(unsafe_code)]
+
+pub mod assert_helpers;
+pub mod kv_gen;
+pub mod temp_dir;
+
+pub use assert_helpers::{assert_bytes_eq, assert_kv_pairs_sorted};
+pub use kv_gen::{generate_kv_pairs, generate_sequential_keys};
+pub use temp_dir::TestDir;
