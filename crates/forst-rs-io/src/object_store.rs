@@ -174,12 +174,8 @@ pub trait ObjectStore: Send + Sync {
     ///
     /// Returns [`ForstError::NotFound`] if the object does not exist.
     /// Returns [`ForstError::InvalidArgument`] if offset is beyond the object.
-    fn get_range(
-        &self,
-        path: &ObjectStorePath,
-        offset: u64,
-        length: usize,
-    ) -> ForstResult<Vec<u8>>;
+    fn get_range(&self, path: &ObjectStorePath, offset: u64, length: usize)
+        -> ForstResult<Vec<u8>>;
 
     /// Deletes an object.
     ///
@@ -228,11 +224,7 @@ pub trait ObjectStore: Send + Sync {
     ) -> ForstResult<()>;
 
     /// Aborts a multipart upload, discarding any uploaded parts.
-    fn abort_multipart_upload(
-        &self,
-        path: &ObjectStorePath,
-        upload_id: &str,
-    ) -> ForstResult<()>;
+    fn abort_multipart_upload(&self, path: &ObjectStorePath, upload_id: &str) -> ForstResult<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,17 +286,19 @@ impl ObjectStore for MockObjectStore {
     }
 
     fn put(&self, path: &ObjectStorePath, data: &[u8]) -> ForstResult<()> {
-        let mut storage = self.storage.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         storage.insert(path.canonical(), data.to_vec());
         Ok(())
     }
 
     fn get(&self, path: &ObjectStorePath) -> ForstResult<Vec<u8>> {
-        let storage = self.storage.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         storage
             .get(&path.canonical())
             .cloned()
@@ -317,9 +311,10 @@ impl ObjectStore for MockObjectStore {
         offset: u64,
         length: usize,
     ) -> ForstResult<Vec<u8>> {
-        let storage = self.storage.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         let data = storage
             .get(&path.canonical())
             .ok_or_else(|| ForstError::not_found(format!("object not found: {}", path)))?;
@@ -339,22 +334,21 @@ impl ObjectStore for MockObjectStore {
     }
 
     fn delete(&self, path: &ObjectStorePath) -> ForstResult<()> {
-        let mut storage = self.storage.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         if storage.remove(&path.canonical()).is_none() {
-            return Err(ForstError::not_found(format!(
-                "object not found: {}",
-                path
-            )));
+            return Err(ForstError::not_found(format!("object not found: {}", path)));
         }
         Ok(())
     }
 
     fn list(&self, bucket: &str, prefix: &str) -> ForstResult<Vec<ObjectStorePath>> {
-        let storage = self.storage.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
 
         let full_prefix = format!("{}/{}", bucket, prefix);
         let mut results: Vec<ObjectStorePath> = storage
@@ -374,16 +368,18 @@ impl ObjectStore for MockObjectStore {
     }
 
     fn exists(&self, path: &ObjectStorePath) -> ForstResult<bool> {
-        let storage = self.storage.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         Ok(storage.contains_key(&path.canonical()))
     }
 
     fn head(&self, path: &ObjectStorePath) -> ForstResult<u64> {
-        let storage = self.storage.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let storage = self
+            .storage
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         storage
             .get(&path.canonical())
             .map(|data| data.len() as u64)
@@ -391,15 +387,17 @@ impl ObjectStore for MockObjectStore {
     }
 
     fn create_multipart_upload(&self, path: &ObjectStorePath) -> ForstResult<String> {
-        let mut counter = self.upload_counter.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let mut counter = self
+            .upload_counter
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         *counter += 1;
         let upload_id = format!("upload-{}", *counter);
 
-        let mut uploads = self.uploads.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let mut uploads = self
+            .uploads
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         uploads.insert(upload_id.clone(), (path.canonical(), Vec::new()));
         Ok(upload_id)
     }
@@ -411,12 +409,13 @@ impl ObjectStore for MockObjectStore {
         part_number: u32,
         data: &[u8],
     ) -> ForstResult<CompletedPart> {
-        let mut uploads = self.uploads.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
-        let (_, parts) = uploads.get_mut(upload_id).ok_or_else(|| {
-            ForstError::not_found(format!("upload not found: {}", upload_id))
-        })?;
+        let mut uploads = self
+            .uploads
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
+        let (_, parts) = uploads
+            .get_mut(upload_id)
+            .ok_or_else(|| ForstError::not_found(format!("upload not found: {}", upload_id)))?;
         parts.push((part_number, data.to_vec()));
 
         Ok(CompletedPart {
@@ -431,20 +430,19 @@ impl ObjectStore for MockObjectStore {
         upload_id: &str,
         mut parts: Vec<CompletedPart>,
     ) -> ForstResult<()> {
-        let mut uploads = self.uploads.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
-        let (canonical_key, uploaded_parts) =
-            uploads.remove(upload_id).ok_or_else(|| {
-                ForstError::not_found(format!("upload not found: {}", upload_id))
-            })?;
+        let mut uploads = self
+            .uploads
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
+        let (canonical_key, uploaded_parts) = uploads
+            .remove(upload_id)
+            .ok_or_else(|| ForstError::not_found(format!("upload not found: {}", upload_id)))?;
 
         // Sort parts by part number to assemble in order.
         parts.sort_by_key(|p| p.part_number);
 
         // Build a map from part_number -> data for lookup.
-        let part_data: HashMap<u32, Vec<u8>> =
-            uploaded_parts.into_iter().collect();
+        let part_data: HashMap<u32, Vec<u8>> = uploaded_parts.into_iter().collect();
 
         // Assemble the final object from parts in order.
         let mut assembled = Vec::new();
@@ -458,21 +456,19 @@ impl ObjectStore for MockObjectStore {
             assembled.extend_from_slice(data);
         }
 
-        let mut storage = self.storage.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let mut storage = self
+            .storage
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         storage.insert(canonical_key, assembled);
         Ok(())
     }
 
-    fn abort_multipart_upload(
-        &self,
-        _path: &ObjectStorePath,
-        upload_id: &str,
-    ) -> ForstResult<()> {
-        let mut uploads = self.uploads.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+    fn abort_multipart_upload(&self, _path: &ObjectStorePath, upload_id: &str) -> ForstResult<()> {
+        let mut uploads = self
+            .uploads
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         if uploads.remove(upload_id).is_none() {
             return Err(ForstError::not_found(format!(
                 "upload not found: {}",
@@ -596,9 +592,10 @@ struct ObjectStoreCommittingWriter {
 
 impl WritableFile for ObjectStoreCommittingWriter {
     fn append(&mut self, data: &[u8]) -> ForstResult<()> {
-        let mut buf = self.buffer.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let mut buf = self
+            .buffer
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         buf.extend_from_slice(data);
         Ok(())
     }
@@ -612,9 +609,10 @@ impl WritableFile for ObjectStoreCommittingWriter {
     }
 
     fn file_size(&self) -> ForstResult<u64> {
-        let buf = self.buffer.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let buf = self
+            .buffer
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         Ok(buf.len() as u64)
     }
 }
@@ -794,22 +792,14 @@ mod tests {
 
     #[test]
     fn test_object_store_path_from_path() {
-        let path = ObjectStorePath::from_path(
-            Path::new("/data/sst/000001.sst"),
-            "bucket",
-            "/data",
-        );
+        let path = ObjectStorePath::from_path(Path::new("/data/sst/000001.sst"), "bucket", "/data");
         assert_eq!(path.bucket, "bucket");
         assert_eq!(path.key, "sst/000001.sst");
     }
 
     #[test]
     fn test_object_store_path_from_path_no_prefix_match() {
-        let path = ObjectStorePath::from_path(
-            Path::new("/other/file.sst"),
-            "bucket",
-            "/data",
-        );
+        let path = ObjectStorePath::from_path(Path::new("/other/file.sst"), "bucket", "/data");
         assert_eq!(path.bucket, "bucket");
         // Should keep the full path (minus leading slash).
         assert_eq!(path.key, "other/file.sst");
@@ -817,11 +807,7 @@ mod tests {
 
     #[test]
     fn test_object_store_path_from_path_empty_prefix() {
-        let path = ObjectStorePath::from_path(
-            Path::new("/sst/000001.sst"),
-            "bucket",
-            "",
-        );
+        let path = ObjectStorePath::from_path(Path::new("/sst/000001.sst"), "bucket", "");
         assert_eq!(path.key, "sst/000001.sst");
     }
 
@@ -1067,12 +1053,8 @@ mod tests {
         let store = MockObjectStore::new("test");
         assert_eq!(store.object_count(), 0);
 
-        store
-            .put(&ObjectStorePath::new("b", "k1"), b"1")
-            .unwrap();
-        store
-            .put(&ObjectStorePath::new("b", "k2"), b"2")
-            .unwrap();
+        store.put(&ObjectStorePath::new("b", "k1"), b"1").unwrap();
+        store.put(&ObjectStorePath::new("b", "k2"), b"2").unwrap();
         assert_eq!(store.object_count(), 2);
     }
 
@@ -1089,15 +1071,9 @@ mod tests {
         let upload_id = store.create_multipart_upload(&path).unwrap();
 
         // Upload parts (out of order).
-        let part2 = store
-            .upload_part(&path, &upload_id, 2, b" world")
-            .unwrap();
-        let part1 = store
-            .upload_part(&path, &upload_id, 1, b"hello")
-            .unwrap();
-        let part3 = store
-            .upload_part(&path, &upload_id, 3, b"!")
-            .unwrap();
+        let part2 = store.upload_part(&path, &upload_id, 2, b" world").unwrap();
+        let part1 = store.upload_part(&path, &upload_id, 1, b"hello").unwrap();
+        let part3 = store.upload_part(&path, &upload_id, 3, b"!").unwrap();
 
         assert_eq!(part1.part_number, 1);
         assert_eq!(part2.part_number, 2);
@@ -1119,9 +1095,7 @@ mod tests {
         let path = ObjectStorePath::new("bucket", "aborted.sst");
 
         let upload_id = store.create_multipart_upload(&path).unwrap();
-        store
-            .upload_part(&path, &upload_id, 1, b"data")
-            .unwrap();
+        store.upload_part(&path, &upload_id, 1, b"data").unwrap();
 
         // Abort.
         store.abort_multipart_upload(&path, &upload_id).unwrap();
@@ -1150,8 +1124,7 @@ mod tests {
         let store = MockObjectStore::new("test");
         let path = ObjectStorePath::new("bucket", "file");
 
-        let result =
-            store.complete_multipart_upload(&path, "nonexistent", vec![]);
+        let result = store.complete_multipart_upload(&path, "nonexistent", vec![]);
         assert!(result.is_err());
         assert!(result.unwrap_err().is_not_found());
     }
@@ -1355,10 +1328,7 @@ mod tests {
     #[test]
     fn test_osfs_rename_not_found() {
         let fs = create_osfs();
-        let result = fs.rename(
-            Path::new("/data/nonexistent"),
-            Path::new("/data/dst"),
-        );
+        let result = fs.rename(Path::new("/data/nonexistent"), Path::new("/data/dst"));
         assert!(result.is_err());
         assert!(result.unwrap_err().is_not_found());
     }
@@ -1367,22 +1337,13 @@ mod tests {
     fn test_osfs_list_dir() {
         let store = MockObjectStore::new("test");
         store
-            .put(
-                &ObjectStorePath::new("bucket", "sst/000001.sst"),
-                b"data1",
-            )
+            .put(&ObjectStorePath::new("bucket", "sst/000001.sst"), b"data1")
             .unwrap();
         store
-            .put(
-                &ObjectStorePath::new("bucket", "sst/000002.sst"),
-                b"data2",
-            )
+            .put(&ObjectStorePath::new("bucket", "sst/000002.sst"), b"data2")
             .unwrap();
         store
-            .put(
-                &ObjectStorePath::new("bucket", "wal/000001.log"),
-                b"wal",
-            )
+            .put(&ObjectStorePath::new("bucket", "wal/000001.log"), b"wal")
             .unwrap();
 
         let fs = ObjectStoreFileSystem::new(Box::new(store), "bucket", "");
@@ -1404,16 +1365,10 @@ mod tests {
     fn test_osfs_delete_dir() {
         let store = MockObjectStore::new("test");
         store
-            .put(
-                &ObjectStorePath::new("bucket", "dir/a.sst"),
-                b"a",
-            )
+            .put(&ObjectStorePath::new("bucket", "dir/a.sst"), b"a")
             .unwrap();
         store
-            .put(
-                &ObjectStorePath::new("bucket", "dir/b.sst"),
-                b"b",
-            )
+            .put(&ObjectStorePath::new("bucket", "dir/b.sst"), b"b")
             .unwrap();
         store
             .put(&ObjectStorePath::new("bucket", "other"), b"c")
@@ -1453,22 +1408,14 @@ mod tests {
     fn test_osfs_with_prefix() {
         let store = MockObjectStore::new("test");
         store
-            .put(
-                &ObjectStorePath::new("bucket", "sst/000001.sst"),
-                b"data",
-            )
+            .put(&ObjectStorePath::new("bucket", "sst/000001.sst"), b"data")
             .unwrap();
 
         // Prefix is "/data" so path "/data/sst/000001.sst" maps to key "sst/000001.sst".
-        let fs =
-            ObjectStoreFileSystem::new(Box::new(store), "bucket", "/data");
+        let fs = ObjectStoreFileSystem::new(Box::new(store), "bucket", "/data");
 
-        assert!(fs
-            .file_exists(Path::new("/data/sst/000001.sst"))
-            .unwrap());
-        assert!(!fs
-            .file_exists(Path::new("/other/sst/000001.sst"))
-            .unwrap());
+        assert!(fs.file_exists(Path::new("/data/sst/000001.sst")).unwrap());
+        assert!(!fs.file_exists(Path::new("/other/sst/000001.sst")).unwrap());
     }
 
     #[test]
@@ -1492,10 +1439,7 @@ mod tests {
 
         let fs = ObjectStoreFileSystem::new(Box::new(store), "bucket", "");
 
-        let result = fs.open_writable_file(
-            Path::new("/existing"),
-            WriteMode::CreateNew,
-        );
+        let result = fs.open_writable_file(Path::new("/existing"), WriteMode::CreateNew);
         match result {
             Err(e) => assert!(e.is_invalid_argument()),
             Ok(_) => panic!("expected InvalidArgument error"),

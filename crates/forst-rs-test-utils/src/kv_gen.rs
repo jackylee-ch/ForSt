@@ -38,7 +38,11 @@
 /// assert_eq!(&pairs[1].0, b"key_00000001");
 /// assert_eq!(pairs[0].1.len(), 16);
 /// ```
-pub fn generate_kv_pairs(count: usize, key_prefix: &str, value_size: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+pub fn generate_kv_pairs(
+    count: usize,
+    key_prefix: &str,
+    value_size: usize,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     (0..count)
         .map(|i| {
             let key = format!("{}{:08}", key_prefix, i).into_bytes();

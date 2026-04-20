@@ -172,9 +172,7 @@ pub trait FileSystem: Send + Sync {
 /// `ForstError::NotFound`, and all others into `ForstError::Io`.
 pub fn map_io_error(err: std::io::Error, context: &str) -> ForstError {
     match err.kind() {
-        std::io::ErrorKind::NotFound => {
-            ForstError::not_found(format!("{}: {}", context, err))
-        }
+        std::io::ErrorKind::NotFound => ForstError::not_found(format!("{}: {}", context, err)),
         std::io::ErrorKind::AlreadyExists => {
             ForstError::invalid_argument(format!("{}: {}", context, err))
         }

@@ -142,9 +142,7 @@ impl EngineOptions {
     /// - `block_size` must be greater than zero.
     pub fn validate(&self) -> ForstResult<()> {
         if self.db_path.is_empty() {
-            return Err(ForstError::invalid_argument(
-                "db_path must not be empty",
-            ));
+            return Err(ForstError::invalid_argument("db_path must not be empty"));
         }
         if self.num_levels == 0 || self.num_levels > MAX_LEVELS {
             return Err(ForstError::invalid_argument(format!(
@@ -518,7 +516,10 @@ mod tests {
         let from_builder = EngineOptions::builder().build();
         let from_default = EngineOptions::default();
 
-        assert_eq!(from_builder.write_buffer_size, from_default.write_buffer_size);
+        assert_eq!(
+            from_builder.write_buffer_size,
+            from_default.write_buffer_size
+        );
         assert_eq!(
             from_builder.max_write_buffer_number,
             from_default.max_write_buffer_number
@@ -542,9 +543,15 @@ mod tests {
         );
         assert_eq!(from_builder.block_cache_size, from_default.block_cache_size);
         assert_eq!(from_builder.block_size, from_default.block_size);
-        assert_eq!(from_builder.bloom_bits_per_key, from_default.bloom_bits_per_key);
+        assert_eq!(
+            from_builder.bloom_bits_per_key,
+            from_default.bloom_bits_per_key
+        );
         assert_eq!(from_builder.compression, from_default.compression);
-        assert_eq!(from_builder.enable_statistics, from_default.enable_statistics);
+        assert_eq!(
+            from_builder.enable_statistics,
+            from_default.enable_statistics
+        );
         assert_eq!(from_builder.db_path, from_default.db_path);
     }
 
@@ -640,7 +647,10 @@ mod tests {
         let engine = EngineOptions::default();
         let cf = CfOptions::default();
 
-        assert_eq!(cf.effective_write_buffer_size(&engine), engine.write_buffer_size);
+        assert_eq!(
+            cf.effective_write_buffer_size(&engine),
+            engine.write_buffer_size
+        );
         assert_eq!(
             cf.effective_max_write_buffer_number(&engine),
             engine.max_write_buffer_number
@@ -666,7 +676,10 @@ mod tests {
 
         assert_eq!(cf.effective_write_buffer_size(&engine), 32 * 1024 * 1024);
         assert_eq!(cf.effective_max_write_buffer_number(&engine), 6);
-        assert_eq!(cf.effective_target_file_size_base(&engine), 16 * 1024 * 1024);
+        assert_eq!(
+            cf.effective_target_file_size_base(&engine),
+            16 * 1024 * 1024
+        );
         assert_eq!(cf.effective_compression(&engine), CompressionType::Zstd);
         assert_eq!(cf.merge_operator.as_deref(), Some("my_merge"));
         assert_eq!(cf.ttl_seconds, Some(3600));

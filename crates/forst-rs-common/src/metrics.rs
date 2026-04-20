@@ -143,8 +143,8 @@ impl Default for Gauge {
 ///
 /// These match RocksDB's common latency percentile buckets.
 pub const DEFAULT_BUCKETS: &[f64] = &[
-    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
-    20000.0, 50000.0, 100000.0, 200000.0, 500000.0, 1000000.0,
+    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
+    50000.0, 100000.0, 200000.0, 500000.0, 1000000.0,
 ];
 
 /// A histogram that records observed values into fixed buckets.
@@ -247,7 +247,11 @@ impl Histogram {
     /// The returned vector has the same length as the bounds.
     /// An additional overflow count is returned separately.
     pub fn bucket_counts(&self) -> (Vec<u64>, u64) {
-        let counts: Vec<u64> = self.counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let counts: Vec<u64> = self
+            .counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
         let overflow = self.overflow.load(Ordering::Relaxed);
         (counts, overflow)
     }

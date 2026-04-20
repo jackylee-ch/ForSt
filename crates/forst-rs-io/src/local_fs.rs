@@ -94,10 +94,9 @@ impl LocalRandomAccessFile {
 
 impl RandomAccessFile for LocalRandomAccessFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|e| forst_rs_common::error::ForstError::corruption(format!("lock poisoned: {}", e)))?;
+        let mut file = self.file.lock().map_err(|e| {
+            forst_rs_common::error::ForstError::corruption(format!("lock poisoned: {}", e))
+        })?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|e| map_io_error(e, "random access seek"))?;
         file.read(buf)
@@ -199,19 +198,13 @@ impl FileSystem for LocalFileSystem {
         mode: WriteMode,
     ) -> ForstResult<Box<dyn WritableFile>> {
         let file = match mode {
-            WriteMode::CreateNew => OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path),
+            WriteMode::CreateNew => OpenOptions::new().write(true).create_new(true).open(path),
             WriteMode::CreateOrTruncate => OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(path),
-            WriteMode::Append => OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path),
+            WriteMode::Append => OpenOptions::new().create(true).append(true).open(path),
         }
         .map_err(|e| map_io_error(e, &format!("open writable file: {}", path.display())))?;
         Ok(Box::new(LocalWritableFile::new(file)?))
@@ -221,10 +214,7 @@ impl FileSystem for LocalFileSystem {
         match fs::metadata(path) {
             Ok(meta) => Ok(meta.is_file()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(map_io_error(
-                e,
-                &format!("file_exists: {}", path.display()),
-            )),
+            Err(e) => Err(map_io_error(e, &format!("file_exists: {}", path.display()))),
         }
     }
 
@@ -243,13 +233,10 @@ impl FileSystem for LocalFileSystem {
             .map_err(|e| map_io_error(e, &format!("list_dir: {}", dir.display())))?;
         let mut result = Vec::new();
         for entry in entries {
-            let entry =
-                entry.map_err(|e| map_io_error(e, &format!("list_dir entry: {}", dir.display())))?;
+            let entry = entry
+                .map_err(|e| map_io_error(e, &format!("list_dir entry: {}", dir.display())))?;
             let meta = entry.metadata().map_err(|e| {
-                map_io_error(
-                    e,
-                    &format!("list_dir metadata: {}", entry.path().display()),
-                )
+                map_io_error(e, &format!("list_dir metadata: {}", entry.path().display()))
             })?;
             result.push(FileMetadata {
                 path: entry.path(),

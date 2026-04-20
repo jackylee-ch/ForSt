@@ -527,11 +527,7 @@ mod tests {
 
     #[test]
     fn test_internal_key_accessors() {
-        let key = InternalKey::new(
-            b"hello".to_vec(),
-            SequenceNumber(100),
-            OpType::Put,
-        );
+        let key = InternalKey::new(b"hello".to_vec(), SequenceNumber(100), OpType::Put);
         assert_eq!(key.user_key(), b"hello");
         assert_eq!(key.sequence(), SequenceNumber(100));
         assert_eq!(key.op_type(), OpType::Put);
@@ -549,7 +545,10 @@ mod tests {
         // Same user_key — higher sequence number should sort first (smaller).
         let newer = InternalKey::new(b"key".to_vec(), SequenceNumber(100), OpType::Put);
         let older = InternalKey::new(b"key".to_vec(), SequenceNumber(1), OpType::Put);
-        assert!(newer < older, "newer (higher seq) should sort before older (lower seq)");
+        assert!(
+            newer < older,
+            "newer (higher seq) should sort before older (lower seq)"
+        );
     }
 
     #[test]
@@ -569,11 +568,7 @@ mod tests {
 
     #[test]
     fn test_internal_key_display() {
-        let key = InternalKey::new(
-            b"\x01\xab".to_vec(),
-            SequenceNumber(42),
-            OpType::Delete,
-        );
+        let key = InternalKey::new(b"\x01\xab".to_vec(), SequenceNumber(42), OpType::Delete);
         assert_eq!(format!("{}", key), "01ab @ 42 (Delete)");
     }
 
@@ -585,7 +580,7 @@ mod tests {
     fn test_key_range_contains() {
         let range = KeyRange::new(b"b".to_vec(), b"d".to_vec());
         assert!(!range.contains(b"a"));
-        assert!(range.contains(b"b"));  // inclusive start
+        assert!(range.contains(b"b")); // inclusive start
         assert!(range.contains(b"c"));
         assert!(!range.contains(b"d")); // exclusive end
         assert!(!range.contains(b"e"));

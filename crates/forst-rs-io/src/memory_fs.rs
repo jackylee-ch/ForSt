@@ -132,9 +132,10 @@ pub struct MemoryWritableFile {
 
 impl WritableFile for MemoryWritableFile {
     fn append(&mut self, data: &[u8]) -> ForstResult<()> {
-        let mut buf = self.data.lock().map_err(|e| {
-            ForstError::corruption(format!("lock poisoned: {}", e))
-        })?;
+        let mut buf = self
+            .data
+            .lock()
+            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?;
         buf.extend_from_slice(data);
         self.bytes_written += data.len() as u64;
         Ok(())
@@ -299,9 +300,7 @@ impl FileSystem for MemoryFileSystem {
                     Some(FileEntry::File(existing)) => {
                         let size = existing
                             .lock()
-                            .map_err(|e| {
-                                ForstError::corruption(format!("lock poisoned: {}", e))
-                            })?
+                            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?
                             .len() as u64;
                         (Arc::clone(existing), size)
                     }
@@ -387,9 +386,7 @@ impl FileSystem for MemoryFileSystem {
                     FileEntry::File(data) => {
                         let size = data
                             .lock()
-                            .map_err(|e| {
-                                ForstError::corruption(format!("lock poisoned: {}", e))
-                            })?
+                            .map_err(|e| ForstError::corruption(format!("lock poisoned: {}", e)))?
                             .len() as u64;
                         result.push(FileMetadata {
                             path: entry_path.clone(),
@@ -492,9 +489,10 @@ impl FileSystem for MemoryFileSystem {
             .collect();
 
         if !recursive && !children.is_empty() {
-            return Err(ForstError::Io(std::io::Error::other(
-                format!("delete_dir: {} is not empty", path.display()),
-            )));
+            return Err(ForstError::Io(std::io::Error::other(format!(
+                "delete_dir: {} is not empty",
+                path.display()
+            ))));
         }
 
         for child in children {
@@ -921,13 +919,7 @@ mod tests {
 
         let names: Vec<String> = entries
             .iter()
-            .map(|e| {
-                e.path
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(names.contains(&"a.txt".to_string()));
         assert!(names.contains(&"b.txt".to_string()));

@@ -31,9 +31,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use forst_rs_common::error::ForstResult;
+use forst_rs_common::error::{ForstError, ForstResult};
 
-use crate::filesystem::{FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile, WriteMode};
+use crate::filesystem::{
+    FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile, WriteMode,
+};
 
 // ---------------------------------------------------------------------------
 // FileSystemRouter
@@ -101,10 +103,7 @@ impl FileSystemRouter {
     ///
     /// SST files will be routed to `remote_fs`, and all other files to
     /// `local_fs`.
-    pub fn with_remote(
-        local_fs: Arc<dyn FileSystem>,
-        remote_fs: Arc<dyn FileSystem>,
-    ) -> Self {
+    pub fn with_remote(local_fs: Arc<dyn FileSystem>, remote_fs: Arc<dyn FileSystem>) -> Self {
         Self {
             local_fs,
             remote_fs: Some(remote_fs),
@@ -126,9 +125,7 @@ impl FileSystemRouter {
     /// filesystem regardless of file type.
     fn route(&self, path: &Path) -> &dyn FileSystem {
         if Self::is_remote_file(path) {
-            self.remote_fs
-                .as_deref()
-                .unwrap_or(self.local_fs.as_ref())
+            self.remote_fs.as_deref().unwrap_or(self.local_fs.as_ref())
         } else {
             self.local_fs.as_ref()
         }
@@ -201,8 +198,18 @@ impl FileSystem for FileSystemRouter {
     }
 
     fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
-        // Both src and dst should be on the same filesystem.
-        // Route based on the destination path (the file's final location).
+        // Both src and dst must be on the same filesystem.
+        let src_remote = Self::is_remote_file(src);
+        let dst_remote = Self::is_remote_file(dst);
+        if src_remote != dst_remote {
+            return Err(ForstError::invalid_argument(format!(
+                "cannot rename across filesystems: src={} ({}), dst={} ({})",
+                src.display(),
+                if src_remote { "remote" } else { "local" },
+                dst.display(),
+                if dst_remote { "remote" } else { "local" },
+            )));
+        }
         self.route(dst).rename(src, dst)
     }
 
@@ -224,11 +231,7 @@ impl std::fmt::Display for FileSystemRouter {
                 self.local_fs.name(),
                 remote.name()
             ),
-            None => write!(
-                f,
-                "FileSystemRouter(local={})",
-                self.local_fs.name()
-            ),
+            None => write!(f, "FileSystemRouter(local={})", self.local_fs.name()),
         }
     }
 }
@@ -298,16 +301,24 @@ mod tests {
 
     #[test]
     fn test_is_remote_file_sst() {
-        assert!(FileSystemRouter::is_remote_file(Path::new("/data/000042.sst")));
+        assert!(FileSystemRouter::is_remote_file(Path::new(
+            "/data/000042.sst"
+        )));
         assert!(FileSystemRouter::is_remote_file(Path::new("table.sst")));
     }
 
     #[test]
     fn test_is_remote_file_non_sst() {
-        assert!(!FileSystemRouter::is_remote_file(Path::new("/wal/000001.log")));
-        assert!(!FileSystemRouter::is_remote_file(Path::new("MANIFEST-000001")));
+        assert!(!FileSystemRouter::is_remote_file(Path::new(
+            "/wal/000001.log"
+        )));
+        assert!(!FileSystemRouter::is_remote_file(Path::new(
+            "MANIFEST-000001"
+        )));
         assert!(!FileSystemRouter::is_remote_file(Path::new("CURRENT")));
-        assert!(!FileSystemRouter::is_remote_file(Path::new("OPTIONS-000001")));
+        assert!(!FileSystemRouter::is_remote_file(Path::new(
+            "OPTIONS-000001"
+        )));
         assert!(!FileSystemRouter::is_remote_file(Path::new("LOCK")));
         assert!(!FileSystemRouter::is_remote_file(Path::new("/db/IDENTITY")));
     }
@@ -315,14 +326,19 @@ mod tests {
     #[test]
     fn test_is_remote_file_no_extension() {
         assert!(!FileSystemRouter::is_remote_file(Path::new("CURRENT")));
-        assert!(!FileSystemRouter::is_remote_file(Path::new("/path/to/MANIFEST")));
+        assert!(!FileSystemRouter::is_remote_file(Path::new(
+            "/path/to/MANIFEST"
+        )));
     }
 
     #[test]
     fn test_file_locality_function() {
         assert_eq!(file_locality(Path::new("000001.sst")), FileLocality::Remote);
         assert_eq!(file_locality(Path::new("000001.log")), FileLocality::Local);
-        assert_eq!(file_locality(Path::new("MANIFEST-000001")), FileLocality::Local);
+        assert_eq!(
+            file_locality(Path::new("MANIFEST-000001")),
+            FileLocality::Local
+        );
         assert_eq!(file_locality(Path::new("CURRENT")), FileLocality::Local);
     }
 
@@ -727,5 +743,28 @@ mod tests {
         let (_, _, router) = create_tiered_router();
         assert!(router.remote_fs().is_some());
         assert_eq!(router.remote_fs().unwrap().name(), "MemoryFileSystem");
+    }
+
+    #[test]
+    fn test_cross_filesystem_rename_rejected() {
+        let (local, _remote, router) = create_tiered_router();
+        local.create_dir_all(Path::new("/db")).unwrap();
+
+        // Create a local .log file
+        let mut w = local
+            .open_writable_file(Path::new("/db/000001.log"), WriteMode::CreateNew)
+            .unwrap();
+        w.append(b"wal-data").unwrap();
+        drop(w);
+
+        // Try to rename .log (local) → .sst (remote) — should fail
+        let result = router.rename(Path::new("/db/000001.log"), Path::new("/db/000001.sst"));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            format!("{}", err).contains("cannot rename across filesystems"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

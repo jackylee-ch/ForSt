@@ -174,9 +174,10 @@ impl FileOwnershipTracker {
         file_number: FileNumber,
         new_ownership: FileOwnership,
     ) -> ForstResult<()> {
-        let file = self.files.get_mut(&file_number).ok_or_else(|| {
-            ForstError::not_found(format!("file {} not registered", file_number))
-        })?;
+        let file = self
+            .files
+            .get_mut(&file_number)
+            .ok_or_else(|| ForstError::not_found(format!("file {} not registered", file_number)))?;
 
         validate_transition(file.ownership, new_ownership)?;
         file.ownership = new_ownership;
@@ -344,20 +345,17 @@ mod tests {
 
     #[test]
     fn test_valid_transition_private_to_not_owned() {
-        assert!(validate_transition(
-            FileOwnership::PrivateOwnedByDb,
-            FileOwnership::NotOwned,
-        )
-        .is_ok());
+        assert!(
+            validate_transition(FileOwnership::PrivateOwnedByDb, FileOwnership::NotOwned,).is_ok()
+        );
     }
 
     #[test]
     fn test_valid_transition_shareable_to_not_owned() {
-        assert!(validate_transition(
-            FileOwnership::ShareableOwnedByDb,
-            FileOwnership::NotOwned,
-        )
-        .is_ok());
+        assert!(
+            validate_transition(FileOwnership::ShareableOwnedByDb, FileOwnership::NotOwned,)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -377,19 +375,14 @@ mod tests {
 
     #[test]
     fn test_invalid_transition_not_owned_to_private() {
-        let result = validate_transition(
-            FileOwnership::NotOwned,
-            FileOwnership::PrivateOwnedByDb,
-        );
+        let result = validate_transition(FileOwnership::NotOwned, FileOwnership::PrivateOwnedByDb);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_invalid_transition_not_owned_to_shareable() {
-        let result = validate_transition(
-            FileOwnership::NotOwned,
-            FileOwnership::ShareableOwnedByDb,
-        );
+        let result =
+            validate_transition(FileOwnership::NotOwned, FileOwnership::ShareableOwnedByDb);
         assert!(result.is_err());
     }
 
@@ -497,8 +490,7 @@ mod tests {
     #[test]
     fn test_tracker_transfer_ownership_not_found() {
         let mut tracker = FileOwnershipTracker::new();
-        let result =
-            tracker.transfer_ownership(FileNumber(999), FileOwnership::NotOwned);
+        let result = tracker.transfer_ownership(FileNumber(999), FileOwnership::NotOwned);
         assert!(result.is_err());
         assert!(result.unwrap_err().is_not_found());
     }
@@ -508,8 +500,7 @@ mod tests {
         let mut tracker = FileOwnershipTracker::new();
         tracker.register(make_file(1, FileOwnership::NotOwned));
 
-        let result = tracker
-            .transfer_ownership(FileNumber(1), FileOwnership::PrivateOwnedByDb);
+        let result = tracker.transfer_ownership(FileNumber(1), FileOwnership::PrivateOwnedByDb);
         assert!(result.is_err());
         assert!(result.unwrap_err().is_invalid_argument());
     }
@@ -522,17 +513,14 @@ mod tests {
         tracker.register(make_file(3, FileOwnership::ShareableOwnedByDb));
         tracker.register(make_file(4, FileOwnership::NotOwned));
 
-        let private_files =
-            tracker.files_with_ownership(FileOwnership::PrivateOwnedByDb);
+        let private_files = tracker.files_with_ownership(FileOwnership::PrivateOwnedByDb);
         assert_eq!(private_files.len(), 2);
 
-        let shareable_files =
-            tracker.files_with_ownership(FileOwnership::ShareableOwnedByDb);
+        let shareable_files = tracker.files_with_ownership(FileOwnership::ShareableOwnedByDb);
         assert_eq!(shareable_files.len(), 1);
         assert_eq!(shareable_files[0].file_number, FileNumber(3));
 
-        let not_owned_files =
-            tracker.files_with_ownership(FileOwnership::NotOwned);
+        let not_owned_files = tracker.files_with_ownership(FileOwnership::NotOwned);
         assert_eq!(not_owned_files.len(), 1);
         assert_eq!(not_owned_files[0].file_number, FileNumber(4));
     }
