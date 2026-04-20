@@ -12,32 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! CRC32C checksum utilities for ForSt-RS.
+//! CRC32C (Castagnoli) checksum utilities for ForSt-RS.
 //!
-//! This module provides CRC32C (Castagnoli) checksum computation with
-//! the same masking scheme used by RocksDB/LevelDB, ensuring on-disk
-//! compatibility with existing SST files and WAL records.
+//! This module provides CRC32C checksum computation with the same masking
+//! scheme used by RocksDB/LevelDB, ensuring on-disk compatibility with
+//! existing SST files and WAL records.
+//!
+//! **Important:** RocksDB uses CRC32**C** (Castagnoli, polynomial 0x1EDC6F41),
+//! NOT the IEEE CRC32 (polynomial 0x04C11DB7). The `crc32c` crate provides
+//! the correct algorithm with hardware acceleration on x86_64 (SSE 4.2).
 //!
 //! # Masking
 //!
 //! RocksDB stores *masked* CRC values to avoid collisions between the
 //! CRC of a block and the CRC of a block that happens to be a valid
-//! CRC prefix. The mask is: `((crc >> 15) | (crc << 17)) + 0xa282ead8`.
+//! CRC prefix. The mask is: `rotate_right(crc, 15) + 0xa282ead8`.
 
-/// Computes the CRC32C checksum of `data`.
+/// Computes the CRC32C (Castagnoli) checksum of `data`.
 #[inline]
 pub fn crc32c(data: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
+    crc32c::crc32c(data)
 }
 
 /// Extends a running CRC32C with additional `data`.
 #[inline]
 pub fn crc32c_extend(crc: u32, data: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new_with_initial(crc);
-    hasher.update(data);
-    hasher.finalize()
+    crc32c::crc32c_append(crc, data)
 }
 
 /// The masking constant used by RocksDB/LevelDB.
@@ -69,17 +69,26 @@ mod tests {
 
     #[test]
     fn test_crc32c_empty() {
-        let crc = crc32c(&[]);
-        // CRC32 of empty input is 0
-        assert_eq!(crc, 0);
+        // CRC32C of empty input is 0
+        assert_eq!(crc32c(&[]), 0);
+    }
+
+    #[test]
+    fn test_crc32c_known_vector() {
+        // RFC 3720 test vector: CRC32C of "123456789" = 0xE3069283
+        let crc = crc32c(b"123456789");
+        assert_eq!(
+            crc, 0xE3069283,
+            "CRC32C of '123456789' should match RFC 3720 test vector"
+        );
     }
 
     #[test]
     fn test_crc32c_hello() {
         let crc = crc32c(b"hello");
-        // Verify deterministic — same input, same output
+        // Verify deterministic
         assert_eq!(crc, crc32c(b"hello"));
-        // Verify different input gives different result
+        // Different input gives different result
         assert_ne!(crc, crc32c(b"world"));
     }
 
@@ -105,16 +114,15 @@ mod tests {
     fn test_mask_changes_value() {
         let crc = crc32c(b"test data");
         let masked = mask_crc(crc);
-        // Masking should produce a different value
         assert_ne!(crc, masked, "mask should change the value");
     }
 
     #[test]
     fn test_crc32c_large_data() {
-        // 4 KB of zeros
         let data = vec![0u8; 4096];
         let crc = crc32c(&data);
         assert_eq!(crc, crc32c(&data)); // deterministic
+        assert_ne!(crc, 0); // 4K of zeros should NOT hash to 0 with CRC32C
     }
 
     #[test]
@@ -122,10 +130,17 @@ mod tests {
         let data = b"The quick brown fox jumps over the lazy dog";
         let full_crc = crc32c(data);
 
-        // Build up incrementally
         let crc1 = crc32c(&data[..10]);
         let crc2 = crc32c_extend(crc1, &data[10..20]);
         let crc3 = crc32c_extend(crc2, &data[20..]);
         assert_eq!(full_crc, crc3);
+    }
+
+    #[test]
+    fn test_crc32c_single_byte_values() {
+        // Verify each single byte produces a unique CRC
+        let crcs: Vec<u32> = (0u8..=255).map(|b| crc32c(&[b])).collect();
+        let unique: std::collections::HashSet<u32> = crcs.iter().cloned().collect();
+        assert_eq!(unique.len(), 256, "all single-byte CRCs should be unique");
     }
 }

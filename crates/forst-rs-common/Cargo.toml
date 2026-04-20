@@ -24,4 +24,4 @@ description = "Common types, error definitions, and configuration for ForSt-RS"
 [dependencies]
 thiserror = { workspace = true }
 bytes = { workspace = true }
-crc32fast = { workspace = true }
+crc32c = { workspace = true }
