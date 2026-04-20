@@ -23,6 +23,7 @@ pub mod async_io;
 pub mod filesystem;
 pub mod local_fs;
 pub mod memory_fs;
+pub mod object_store;
 pub mod ownership;
 pub mod router;
 
@@ -34,4 +35,7 @@ pub use filesystem::{
 pub use local_fs::LocalFileSystem;
 pub use memory_fs::MemoryFileSystem;
 pub use ownership::{FileOwnership, FileOwnershipTracker, OwnedFile};
+pub use object_store::{
+    CompletedPart, MockObjectStore, ObjectStore, ObjectStoreFileSystem, ObjectStorePath,
+};
 pub use router::{file_locality, FileLocality, FileSystemRouter};
