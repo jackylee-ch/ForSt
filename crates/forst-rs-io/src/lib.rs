@@ -21,9 +21,11 @@
 
 pub mod filesystem;
 pub mod local_fs;
+pub mod memory_fs;
 
 pub use filesystem::{
     map_io_error, FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile,
     WriteMode,
 };
 pub use local_fs::LocalFileSystem;
+pub use memory_fs::MemoryFileSystem;
