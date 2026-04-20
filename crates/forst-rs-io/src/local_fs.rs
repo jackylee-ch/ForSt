@@ -26,7 +26,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use forst_rs_common::error::ForstResult;
+use forst_rs_common::error::{ForstError, ForstResult};
 
 use crate::filesystem::{
     map_io_error, FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile,
@@ -58,8 +58,11 @@ impl SequentialFile for LocalSequentialFile {
     }
 
     fn skip(&mut self, n: u64) -> ForstResult<()> {
+        let offset = i64::try_from(n).map_err(|_| {
+            ForstError::invalid_argument(format!("skip offset {} exceeds i64::MAX", n))
+        })?;
         self.reader
-            .seek(SeekFrom::Current(n as i64))
+            .seek(SeekFrom::Current(offset))
             .map(|_| ())
             .map_err(|e| map_io_error(e, "sequential skip"))
     }
