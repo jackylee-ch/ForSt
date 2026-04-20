@@ -1,0 +1,62 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[workspace]
+members = [
+    "crates/forst-rs-common",
+    "crates/forst-rs-io",
+    "crates/forst-rs-test-utils",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+repository = "https://github.com/nicetoseeyou/ForSt"
+
+[workspace.dependencies]
+# Internal crates
+forst-rs-common = { path = "crates/forst-rs-common" }
+forst-rs-io = { path = "crates/forst-rs-io" }
+forst-rs-test-utils = { path = "crates/forst-rs-test-utils" }
+
+# Core dependencies
+thiserror = "2"
+bytes = "1"
+arrow = { version = "54", features = ["ffi"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "fs", "sync", "macros"] }
+tracing = "0.1"
+
+# Compression
+lz4_flex = "0.11"
+zstd = "0.13"
+
+# Checksums
+crc32fast = "1"
+
+# Dev / testing dependencies
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+proptest = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+[profile.bench]
+inherits = "release"
+debug = true
