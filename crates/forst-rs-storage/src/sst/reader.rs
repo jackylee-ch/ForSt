@@ -90,6 +90,7 @@ pub struct SstReaderImpl {
     file: Box<dyn RandomAccessFile>,
     footer: FooterV1,
     index_entries: Vec<SparseIndexEntry>,
+    #[allow(dead_code)] // Stored for future range-scan and compaction support.
     index_stats: Vec<BlockStats>,
     bloom_filter: Sbbf,
 }
