@@ -1,0 +1,185 @@
+// Copyright 2026 The ForSt-RS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! End-to-end integration test: SstWriter -> complete SST file -> read back all entries.
+
+use arrow::array::{Array, BinaryArray, UInt64Array};
+use forst_rs_common::{get_fixed32, CompressionType};
+use forst_rs_storage::sst::{
+    decode_data_block, decode_index, search_index, FileHeader, FooterV1, SstWriterImpl,
+    SstWriterOptions, FILE_HEADER_SIZE, SST_MAGIC,
+};
+
+/// Writes N sorted entries, then verifies every entry can be read back.
+fn write_and_verify(n: usize, compression: CompressionType, block_size: usize) {
+    let options = SstWriterOptions {
+        block_size,
+        compression,
+    };
+    let mut writer = SstWriterImpl::with_options(options);
+
+    // Generate sorted keys: "key_00000" .. "key_NNNNN"
+    for i in 0..n {
+        let key = format!("key_{:05}", i);
+        let val = format!("val_{:05}", i);
+        writer
+            .add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 0)
+            .unwrap();
+    }
+
+    let (data, info) = writer.finish().unwrap();
+
+    // --- Structural verification ---
+
+    // 1. FileHeader
+    assert_eq!(&data[..4], SST_MAGIC);
+    let header = FileHeader::decode(&data[..FILE_HEADER_SIZE]).unwrap();
+    assert_eq!(header.format_version, 1);
+
+    // 2. Footer (from tail)
+    let len = data.len();
+    assert_eq!(&data[len - 4..], SST_MAGIC);
+    let (footer_length, _) = get_fixed32(&data[len - 8..len - 4]).unwrap();
+    let footer_start = len - footer_length as usize;
+    let footer = FooterV1::decode(&data[footer_start..]).unwrap();
+    assert_eq!(footer.total_entries, n as u64);
+    assert_eq!(footer.data_block_count, info.data_block_count);
+    assert_eq!(footer.min_key, format!("key_{:05}", 0).as_bytes());
+    assert_eq!(footer.max_key, format!("key_{:05}", n - 1).as_bytes());
+
+    // 3. Index Section
+    let idx_start = footer.index_offset as usize;
+    let idx_end = idx_start + footer.index_size as usize;
+    let (entries, stats) = decode_index(&data[idx_start..idx_end]).unwrap();
+    assert_eq!(entries.len() as u32, footer.data_block_count);
+    assert_eq!(stats.len() as u32, footer.data_block_count);
+
+    // 4. Read back ALL entries via DataBlocks
+    let mut all_keys: Vec<Vec<u8>> = Vec::new();
+    let mut all_vals: Vec<Vec<u8>> = Vec::new();
+    let mut all_seqs: Vec<u64> = Vec::new();
+
+    for entry in &entries {
+        let start = entry.block_offset as usize;
+        let end = start + entry.block_size as usize;
+        let batch = decode_data_block(&data[start..end]).unwrap();
+
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let vals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let seqs = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+
+        for i in 0..batch.num_rows() {
+            all_keys.push(keys.value(i).to_vec());
+            all_vals.push(vals.value(i).to_vec());
+            all_seqs.push(seqs.value(i));
+        }
+    }
+
+    // Verify count
+    assert_eq!(all_keys.len(), n);
+
+    // Verify every key/value/sequence matches
+    for i in 0..n {
+        let expected_key = format!("key_{:05}", i);
+        let expected_val = format!("val_{:05}", i);
+        assert_eq!(all_keys[i], expected_key.as_bytes(), "key mismatch at {i}");
+        assert_eq!(all_vals[i], expected_val.as_bytes(), "val mismatch at {i}");
+        assert_eq!(all_seqs[i], i as u64 + 1, "seq mismatch at {i}");
+    }
+
+    // Verify keys are in sorted order
+    for i in 1..all_keys.len() {
+        assert!(
+            all_keys[i] >= all_keys[i - 1],
+            "keys not sorted at index {i}"
+        );
+    }
+}
+
+#[test]
+fn test_e2e_1000_entries_no_compression() {
+    write_and_verify(1000, CompressionType::None, 4096);
+}
+
+#[test]
+fn test_e2e_1000_entries_lz4() {
+    write_and_verify(1000, CompressionType::Lz4, 4096);
+}
+
+#[test]
+fn test_e2e_1000_entries_zstd() {
+    write_and_verify(1000, CompressionType::Zstd, 4096);
+}
+
+#[test]
+fn test_e2e_search_index_point_lookup() {
+    let options = SstWriterOptions {
+        block_size: 256,
+        compression: CompressionType::None,
+    };
+    let mut writer = SstWriterImpl::with_options(options);
+
+    for i in 0..500u64 {
+        let key = format!("k{:05}", i);
+        writer.add(key.as_bytes(), Some(b"v"), i + 1, 0).unwrap();
+    }
+
+    let (data, _info) = writer.finish().unwrap();
+
+    // Parse footer and index
+    let len = data.len();
+    let (footer_length, _) = get_fixed32(&data[len - 8..len - 4]).unwrap();
+    let footer_start = len - footer_length as usize;
+    let footer = FooterV1::decode(&data[footer_start..]).unwrap();
+    let idx_start = footer.index_offset as usize;
+    let idx_end = idx_start + footer.index_size as usize;
+    let (entries, _stats) = decode_index(&data[idx_start..idx_end]).unwrap();
+
+    // Search for a key in the middle
+    let target = format!("k{:05}", 250);
+    let block_idx = search_index(&entries, target.as_bytes());
+    assert!(block_idx.is_some(), "search should find a block");
+
+    // Decode that block and verify the key exists
+    let idx = block_idx.unwrap();
+    let entry = &entries[idx];
+    let start = entry.block_offset as usize;
+    let end = start + entry.block_size as usize;
+    let batch = decode_data_block(&data[start..end]).unwrap();
+
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .unwrap();
+
+    let found = (0..batch.num_rows()).any(|i| keys.value(i) == target.as_bytes());
+    assert!(
+        found,
+        "target key {:?} should be in the located block",
+        target
+    );
+}
