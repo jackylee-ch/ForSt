@@ -17,7 +17,7 @@
 use arrow::array::{Array, BinaryArray, UInt64Array};
 use forst_rs_common::{get_fixed32, CompressionType};
 use forst_rs_storage::sst::{
-    decode_data_block, decode_index, search_index, FileHeader, FooterV1, SstWriterImpl,
+    decode_data_block, decode_index, search_index, FileHeader, FooterV1, Sbbf, SstWriterImpl,
     SstWriterOptions, FILE_HEADER_SIZE, SST_MAGIC,
 };
 
@@ -182,4 +182,77 @@ fn test_e2e_search_index_point_lookup() {
         "target key {:?} should be in the located block",
         target
     );
+}
+
+#[test]
+fn test_e2e_bloom_filter_filters_keys() {
+    let n = 500;
+    let options = SstWriterOptions {
+        block_size: 512,
+        compression: CompressionType::None,
+    };
+    let mut writer = SstWriterImpl::with_options(options);
+
+    for i in 0..n {
+        let key = format!("bloom_{:05}", i);
+        let val = format!("val_{:05}", i);
+        writer
+            .add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 0)
+            .unwrap();
+    }
+
+    let (data, info) = writer.finish().unwrap();
+    assert_eq!(info.entry_count, n as u64);
+
+    // Parse footer.
+    let len = data.len();
+    let (footer_length, _) = get_fixed32(&data[len - 8..len - 4]).unwrap();
+    let footer_start = len - footer_length as usize;
+    let footer = FooterV1::decode(&data[footer_start..]).unwrap();
+
+    // Bloom filter section should be non-empty and correctly positioned.
+    assert!(footer.bloom_filter_offset > FILE_HEADER_SIZE as u64);
+    assert!(footer.bloom_filter_size > 0);
+    assert!(footer.bloom_filter_offset < footer.index_offset);
+
+    // Decode the bloom filter.
+    let bf_start = footer.bloom_filter_offset as usize;
+    let bf_end = bf_start + footer.bloom_filter_size as usize;
+    assert!(bf_end <= footer_start, "bloom filter should end before footer");
+    let sbbf = Sbbf::decode(&data[bf_start..bf_end]).unwrap();
+
+    // All inserted keys must be found (no false negatives).
+    for i in 0..n {
+        let key = format!("bloom_{:05}", i);
+        assert!(
+            sbbf.check(key.as_bytes()),
+            "bloom filter must find inserted key {} at index {}",
+            key,
+            i,
+        );
+    }
+
+    // Check that the bloom filter correctly rejects most absent keys.
+    let mut false_positives = 0;
+    let num_absent = 5000;
+    for i in 0..num_absent {
+        let key = format!("absent_{:08}", i);
+        if sbbf.check(key.as_bytes()) {
+            false_positives += 1;
+        }
+    }
+
+    let fpr = false_positives as f64 / num_absent as f64;
+    assert!(
+        fpr < 0.05,
+        "integration FPR {:.4} too high (expected < 5%)",
+        fpr,
+    );
+}
+
+/// Verify that the existing write_and_verify helper still passes with the
+/// new bloom filter section present (regression guard).
+#[test]
+fn test_e2e_500_entries_no_compression_with_bloom() {
+    write_and_verify(500, CompressionType::None, 2048);
 }

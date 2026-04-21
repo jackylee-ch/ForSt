@@ -35,7 +35,7 @@ const SALT: [u32; 8] = [
 /// The formula targets ~1.95% false-positive rate at full capacity:
 /// `ceil(num_keys * 21 / 512)`, with a minimum of 1.
 pub fn optimal_num_blocks(num_keys: usize) -> usize {
-    let blocks = (num_keys * 21 + 511) / 512;
+    let blocks = (num_keys * 21).div_ceil(512);
     if blocks < 1 {
         1
     } else {
@@ -178,9 +178,9 @@ impl Sbbf {
         for i in 0..num_blocks {
             let offset = i * 32;
             let mut block = [0u32; 8];
-            for j in 0..8 {
+            for (j, slot) in block.iter_mut().enumerate() {
                 let w = offset + j * 4;
-                block[j] = u32::from_le_bytes([data[w], data[w + 1], data[w + 2], data[w + 3]]);
+                *slot = u32::from_le_bytes([data[w], data[w + 1], data[w + 2], data[w + 3]]);
             }
             blocks.push(block);
         }
