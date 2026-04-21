@@ -23,6 +23,7 @@ repository.workspace = true
 
 [dependencies]
 forst-rs-common = { workspace = true }
+forst-rs-io = { workspace = true }
 arrow = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }

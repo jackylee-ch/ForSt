@@ -23,6 +23,7 @@ pub mod schema;
 pub mod bloom_filter;
 pub mod sparse_index;
 pub mod writer;
+pub mod reader;
 
 pub use block_header::BlockHeader;
 pub use compression::{compress, decompress};
@@ -35,3 +36,4 @@ pub use schema::{
 pub use bloom_filter::Sbbf;
 pub use sparse_index::{decode_index, encode_index, search_index, BlockStats, SparseIndexEntry};
 pub use writer::{SstFileInfo, SstWriterImpl, SstWriterOptions};
+pub use reader::{LookupResult, SstReaderImpl};
