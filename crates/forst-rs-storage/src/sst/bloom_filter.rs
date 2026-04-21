@@ -41,6 +41,34 @@ pub fn optimal_num_blocks(num_keys: usize) -> usize {
     }
 }
 
+/// Determines which block a hash maps to.
+///
+/// Uses the upper 32 bits of the hash to select a block index via
+/// fixed-point multiplication.
+fn block_index_from_hash(hash: u64, num_blocks: u32) -> u32 {
+    let upper = (hash >> 32) as u32;
+    ((upper as u64 * num_blocks as u64) >> 32) as u32
+}
+
+/// Sets 8 bit positions in a single 256-bit block using the SALT constants.
+fn block_insert(block: &mut [u32; 8], key_bits: u32) {
+    for i in 0..8 {
+        let bit_pos = key_bits.wrapping_mul(SALT[i]) >> 27;
+        block[i] |= 1u32 << bit_pos;
+    }
+}
+
+/// Checks whether all 8 bit positions in a block are set.
+fn block_check(block: &[u32; 8], key_bits: u32) -> bool {
+    for i in 0..8 {
+        let bit_pos = key_bits.wrapping_mul(SALT[i]) >> 27;
+        if block[i] & (1u32 << bit_pos) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// A Split Block Bloom Filter (SBBF).
 ///
 /// Each element of `data` is a 256-bit block represented as `[u32; 8]`.
@@ -72,6 +100,40 @@ impl Sbbf {
     /// Each block is 8 x 4 = 32 bytes.
     pub fn size_in_bytes(&self) -> usize {
         self.data.len() * 32
+    }
+
+    /// Computes the xxHash64 digest of `key` with seed 0.
+    pub fn hash_key(key: &[u8]) -> u64 {
+        xxhash_rust::xxh64::xxh64(key, 0)
+    }
+
+    /// Inserts a pre-computed hash into the filter.
+    pub fn insert_hash(&mut self, hash: u64) {
+        let num_blocks = self.data.len() as u32;
+        let block_index = block_index_from_hash(hash, num_blocks);
+        let key_bits = hash as u32;
+        block_insert(&mut self.data[block_index as usize], key_bits);
+    }
+
+    /// Checks whether a pre-computed hash *might* be present in the filter.
+    ///
+    /// Returns `true` if the hash may have been inserted (possible false positive),
+    /// or `false` if it was definitely never inserted.
+    pub fn check_hash(&self, hash: u64) -> bool {
+        let num_blocks = self.data.len() as u32;
+        let block_index = block_index_from_hash(hash, num_blocks);
+        let key_bits = hash as u32;
+        block_check(&self.data[block_index as usize], key_bits)
+    }
+
+    /// Inserts a key into the filter.
+    pub fn insert(&mut self, key: &[u8]) {
+        self.insert_hash(Self::hash_key(key));
+    }
+
+    /// Checks whether a key *might* be present in the filter.
+    pub fn check(&self, key: &[u8]) -> bool {
+        self.check_hash(Self::hash_key(key))
     }
 }
 
@@ -138,5 +200,66 @@ mod tests {
         for salt in &SALT {
             assert!(seen.insert(*salt), "duplicate salt: {:#x}", salt);
         }
+    }
+
+    // ---- Task 3: insert / check tests ----
+
+    #[test]
+    fn test_insert_then_check_finds_key() {
+        let mut sbbf = Sbbf::new(10);
+        sbbf.insert(b"hello");
+        assert!(sbbf.check(b"hello"));
+    }
+
+    #[test]
+    fn test_check_absent_key_returns_false() {
+        let sbbf = Sbbf::new(10);
+        assert!(!sbbf.check(b"missing"));
+    }
+
+    #[test]
+    fn test_insert_multiple_keys() {
+        let mut sbbf = Sbbf::new(50);
+        for i in 0..50u32 {
+            sbbf.insert(&i.to_le_bytes());
+        }
+        for i in 0..50u32 {
+            assert!(sbbf.check(&i.to_le_bytes()), "key {} not found", i);
+        }
+    }
+
+    #[test]
+    fn test_insert_from_hash() {
+        let mut sbbf = Sbbf::new(10);
+        let hash = Sbbf::hash_key(b"test-key");
+        sbbf.insert_hash(hash);
+        assert!(sbbf.check_hash(hash));
+    }
+
+    #[test]
+    fn test_false_positive_rate_below_5_percent() {
+        let num_inserted = 1000usize;
+        let mut sbbf = Sbbf::new(num_inserted);
+
+        // Insert keys 0..1000
+        for i in 0..num_inserted as u32 {
+            sbbf.insert(&i.to_le_bytes());
+        }
+
+        // Check 10 000 keys that were NOT inserted
+        let num_checks = 10_000u32;
+        let mut false_positives = 0u32;
+        for i in (num_inserted as u32)..(num_inserted as u32 + num_checks) {
+            if sbbf.check(&i.to_le_bytes()) {
+                false_positives += 1;
+            }
+        }
+
+        let fp_rate = false_positives as f64 / num_checks as f64;
+        assert!(
+            fp_rate < 0.05,
+            "false positive rate {:.4} exceeds 5%",
+            fp_rate
+        );
     }
 }
