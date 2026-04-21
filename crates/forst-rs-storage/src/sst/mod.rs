@@ -14,10 +14,14 @@
 
 //! SST file format definitions and utilities.
 
+pub mod block_header;
 pub mod compression;
+pub mod data_block;
 pub mod schema;
 
+pub use block_header::BlockHeader;
 pub use compression::{compress, decompress};
+pub use data_block::{decode_data_block, encode_data_block};
 pub use schema::{
     sst_schema, BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA, FILE_HEADER_SIZE, SST_FORMAT_VERSION,
     SST_MAGIC,
