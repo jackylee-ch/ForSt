@@ -21,6 +21,7 @@ pub mod file_header;
 pub mod footer;
 pub mod schema;
 pub mod sparse_index;
+pub mod writer;
 
 pub use block_header::BlockHeader;
 pub use compression::{compress, decompress};
@@ -28,7 +29,7 @@ pub use data_block::{decode_data_block, encode_data_block};
 pub use file_header::FileHeader;
 pub use footer::{ChecksumType, FooterV1, FOOTER_FIXED_FIELDS_SIZE, FOOTER_TAIL_SIZE};
 pub use schema::{
-    sst_schema, BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA, FILE_HEADER_SIZE, SST_FORMAT_VERSION,
-    SST_MAGIC,
+    sst_schema, BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA, FILE_HEADER_SIZE, SST_FORMAT_VERSION, SST_MAGIC,
 };
 pub use sparse_index::{decode_index, encode_index, search_index, BlockStats, SparseIndexEntry};
+pub use writer::{SstFileInfo, SstWriterImpl, SstWriterOptions};
