@@ -20,6 +20,7 @@ pub mod data_block;
 pub mod file_header;
 pub mod footer;
 pub mod schema;
+pub mod bloom_filter;
 pub mod sparse_index;
 pub mod writer;
 
@@ -31,5 +32,6 @@ pub use footer::{ChecksumType, FooterV1, FOOTER_FIXED_FIELDS_SIZE, FOOTER_TAIL_S
 pub use schema::{
     sst_schema, BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA, FILE_HEADER_SIZE, SST_FORMAT_VERSION, SST_MAGIC,
 };
+pub use bloom_filter::Sbbf;
 pub use sparse_index::{decode_index, encode_index, search_index, BlockStats, SparseIndexEntry};
 pub use writer::{SstFileInfo, SstWriterImpl, SstWriterOptions};
