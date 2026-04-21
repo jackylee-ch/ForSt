@@ -271,6 +271,86 @@ impl VectorizedMemTable {
         Ok(result)
     }
 
+    /// Batch-inserts multiple entries at once.
+    ///
+    /// All arrays must have the same length. `values[i]` is `None` for deletes.
+    /// Sequences are assigned monotonically starting from `self.next_sequence`.
+    ///
+    /// Returns the number of entries inserted.
+    pub fn batch_insert(
+        &mut self,
+        keys: &[&[u8]],
+        values: &[Option<&[u8]>],
+        op_types: &[u8],
+    ) -> ForstResult<usize> {
+        if self.frozen {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "cannot write to a frozen MemTable",
+            ));
+        }
+        if keys.len() != values.len() || keys.len() != op_types.len() {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "batch_insert: all arrays must have the same length",
+            ));
+        }
+
+        let count = keys.len();
+        let base_seq = self.next_sequence;
+        self.next_sequence += count as u64;
+        let base_offset = self.sequences.len() as u32;
+
+        for i in 0..count {
+            let key = keys[i];
+            let value = values[i];
+            let seq = base_seq + i as u64;
+            let row_offset = base_offset + i as u32;
+
+            // Append key.
+            self.key_data.extend_from_slice(key);
+            self.key_offsets.push(self.key_data.len() as u32);
+
+            // Append value.
+            match value {
+                Some(v) => {
+                    self.value_data.extend_from_slice(v);
+                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_nulls.push(false);
+                }
+                None => {
+                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_nulls.push(true);
+                }
+            }
+
+            self.sequences.push(seq);
+            self.op_types.push(op_types[i]);
+
+            let op_type = OpType::from_u8(op_types[i]).unwrap_or(OpType::Put);
+            let row_index = RowIndex {
+                offset: row_offset,
+                sequence: seq,
+                op_type,
+            };
+
+            self.unsorted_entries.push(row_offset);
+            self.unsorted_lookup
+                .entry(key.to_vec())
+                .or_default()
+                .push(row_index);
+
+            self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
+        }
+
+        // Check merge threshold.
+        let merge_threshold = ((self.sorted_count as f64) * self.config.unsorted_merge_ratio)
+            .max(1024.0) as usize;
+        if self.unsorted_entries.len() > merge_threshold {
+            self.merge_unsorted_to_sorted();
+        }
+
+        Ok(count)
+    }
+
     /// Among a list of RowIndex entries, find the one with the highest
     /// sequence that is <= `read_sequence` and build a GetResult.
     fn find_latest(&self, indices: &[RowIndex], read_sequence: u64) -> Option<GetResult> {
@@ -487,6 +567,88 @@ mod tests {
 
         let r = mt.get(b"b", u64::MAX).unwrap().unwrap();
         assert_eq!(r.value, Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn test_batch_insert_basic() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let keys: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let values: Vec<Option<&[u8]>> = vec![Some(b"1"), Some(b"2"), Some(b"3")];
+        let ops = vec![0u8, 0, 0];
+
+        let count = mt.batch_insert(&keys, &values, &ops).unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(mt.num_entries(), 3);
+
+        assert_eq!(mt.get(b"a", u64::MAX).unwrap().unwrap().value, Some(b"1".to_vec()));
+        assert_eq!(mt.get(b"b", u64::MAX).unwrap().unwrap().value, Some(b"2".to_vec()));
+        assert_eq!(mt.get(b"c", u64::MAX).unwrap().unwrap().value, Some(b"3".to_vec()));
+    }
+
+    #[test]
+    fn test_batch_insert_with_deletes() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let keys: Vec<&[u8]> = vec![b"x", b"y"];
+        let values: Vec<Option<&[u8]>> = vec![Some(b"val"), None];
+        let ops = vec![0u8, 1]; // Put, Delete
+
+        mt.batch_insert(&keys, &values, &ops).unwrap();
+
+        let r = mt.get(b"x", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.op_type, OpType::Put);
+
+        let r = mt.get(b"y", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.op_type, OpType::Delete);
+        assert_eq!(r.value, None);
+    }
+
+    #[test]
+    fn test_batch_insert_mismatched_lengths() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let keys: Vec<&[u8]> = vec![b"a", b"b"];
+        let values: Vec<Option<&[u8]>> = vec![Some(b"1")]; // wrong length
+        let ops = vec![0u8, 0];
+
+        let result = mt.batch_insert(&keys, &values, &ops);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_batch_insert_100k_then_get_all() {
+        let mut mt = VectorizedMemTable::new(MemTableConfig {
+            max_size: 256 * 1024 * 1024,
+            unsorted_merge_ratio: 0.25,
+        });
+
+        let n = 100_000;
+        let batch_size = 1000;
+
+        for batch_start in (0..n).step_by(batch_size) {
+            let batch_end = (batch_start + batch_size).min(n);
+            let keys: Vec<Vec<u8>> = (batch_start..batch_end)
+                .map(|i| format!("k_{:08}", i).into_bytes())
+                .collect();
+            let values: Vec<Vec<u8>> = (batch_start..batch_end)
+                .map(|i| format!("v_{:08}", i).into_bytes())
+                .collect();
+
+            let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+            let val_refs: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
+            let ops = vec![0u8; batch_end - batch_start];
+
+            mt.batch_insert(&key_refs, &val_refs, &ops).unwrap();
+        }
+
+        assert_eq!(mt.num_entries(), n);
+
+        // Verify all entries can be retrieved.
+        for i in 0..n {
+            let key = format!("k_{:08}", i);
+            let expected = format!("v_{:08}", i);
+            let r = mt.get(key.as_bytes(), u64::MAX).unwrap();
+            assert!(r.is_some(), "key {} not found", key);
+            assert_eq!(r.unwrap().value, Some(expected.into_bytes()), "mismatch at {}", i);
+        }
     }
 
     #[test]
