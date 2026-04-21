@@ -19,10 +19,8 @@
 //! ForSt-RS Arrow SST format:
 //!
 //! ```text
-//! FileHeader (16B) | DataBlock₀ | … | DataBlockₙ | IndexSection | Footer
+//! FileHeader (16B) | DataBlock₀ | … | DataBlockₙ | BloomFilter | IndexSection | Footer
 //! ```
-//!
-//! Bloom Filter is a placeholder (offset=0, size=0) until W7.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,6 +34,7 @@ use super::data_block::encode_data_block;
 use super::file_header::FileHeader;
 use super::footer::{ChecksumType, FooterV1};
 use super::schema::{sst_schema, SST_FORMAT_VERSION};
+use super::bloom_filter::Sbbf;
 use super::sparse_index::{encode_index, BlockStats, SparseIndexEntry};
 
 /// Information about a completed SST file.
@@ -95,6 +94,7 @@ pub struct SstWriterImpl {
     finished: bool,
     /// Last added key for debug-mode sorted-order invariant check.
     last_added_key: Option<Vec<u8>>,
+    key_hashes: Vec<u64>,
 }
 
 impl Default for SstWriterImpl {
@@ -133,6 +133,7 @@ impl SstWriterImpl {
             global_max_sequence: 0,
             finished: false,
             last_added_key: None,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -185,6 +186,7 @@ impl SstWriterImpl {
 
         self.total_entries += 1;
         self.last_added_key = Some(key.to_vec());
+        self.key_hashes.push(Sbbf::hash_key(key));
 
         if self.current_estimated_size >= self.options.block_size {
             self.flush_block()?;
@@ -219,13 +221,20 @@ impl SstWriterImpl {
             ));
         }
 
-        // Write Index Section (Bloom Filter placeholder: offset=0, size=0).
+        // --- Write Bloom Filter Section ---
+        let bloom_filter_offset = self.buf.len() as u64;
+        let sbbf = Sbbf::from_hashes(&self.key_hashes);
+        let bloom_bytes = sbbf.encode();
+        let bloom_filter_size = bloom_bytes.len() as u32;
+        self.buf.extend_from_slice(&bloom_bytes);
+
+        // --- Write Index Section ---
         let index_offset = self.buf.len() as u64;
         let index_bytes = encode_index(&self.index_entries, &self.block_stats);
         let index_size = index_bytes.len() as u32;
         self.buf.extend_from_slice(&index_bytes);
 
-        // Write Footer.
+        // --- Write Footer ---
         let creation_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -246,8 +255,8 @@ impl SstWriterImpl {
         let footer = FooterV1 {
             data_block_count,
             total_entries: self.total_entries,
-            bloom_filter_offset: 0,
-            bloom_filter_size: 0,
+            bloom_filter_offset,
+            bloom_filter_size,
             index_offset,
             index_size,
             min_key: info.min_key.to_vec(),
@@ -406,8 +415,14 @@ mod tests {
 
         assert!(footer.index_offset > FILE_HEADER_SIZE as u64);
         assert!(footer.index_size > 0);
-        assert_eq!(footer.bloom_filter_offset, 0);
-        assert_eq!(footer.bloom_filter_size, 0);
+        assert!(
+            footer.bloom_filter_offset > 0,
+            "bloom filter should have non-zero offset"
+        );
+        assert!(
+            footer.bloom_filter_size > 0,
+            "bloom filter should have non-zero size"
+        );
         assert_eq!(footer.data_block_count, 1);
         assert_eq!(footer.total_entries, 1);
     }
@@ -506,5 +521,73 @@ mod tests {
         let (data, info) = writer.finish().unwrap();
         assert_eq!(info.entry_count, 10);
         assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_writer_bloom_filter_present_in_footer() {
+        let mut writer = SstWriterImpl::new();
+        for i in 0..10u64 {
+            writer
+                .add(format!("k{i:03}").as_bytes(), Some(b"v"), i + 1, 0)
+                .unwrap();
+        }
+        let (data, _info) = writer.finish().unwrap();
+
+        let len = data.len();
+        let (footer_length, _) = get_fixed32(&data[len - 8..len - 4]).unwrap();
+        let footer_start = len - footer_length as usize;
+        let footer = FooterV1::decode(&data[footer_start..]).unwrap();
+
+        // Bloom filter should now have non-zero offset and size.
+        assert!(
+            footer.bloom_filter_offset > FILE_HEADER_SIZE as u64,
+            "bloom_filter_offset should be after FileHeader, got {}",
+            footer.bloom_filter_offset,
+        );
+        assert!(
+            footer.bloom_filter_size > 0,
+            "bloom_filter_size should be > 0"
+        );
+        // Bloom filter should come before the index section.
+        assert!(
+            footer.bloom_filter_offset < footer.index_offset,
+            "bloom filter should precede index section"
+        );
+        assert_eq!(
+            footer.bloom_filter_offset + footer.bloom_filter_size as u64,
+            footer.index_offset,
+            "bloom filter end should equal index start"
+        );
+    }
+
+    #[test]
+    fn test_writer_bloom_filter_data_is_valid_sbbf() {
+        let mut writer = SstWriterImpl::new();
+        let keys: Vec<String> = (0..50).map(|i| format!("key_{:04}", i)).collect();
+        for (i, key) in keys.iter().enumerate() {
+            writer
+                .add(key.as_bytes(), Some(b"val"), i as u64 + 1, 0)
+                .unwrap();
+        }
+        let (data, _info) = writer.finish().unwrap();
+
+        let len = data.len();
+        let (footer_length, _) = get_fixed32(&data[len - 8..len - 4]).unwrap();
+        let footer_start = len - footer_length as usize;
+        let footer = FooterV1::decode(&data[footer_start..]).unwrap();
+
+        // Extract and decode the bloom filter section.
+        let bf_start = footer.bloom_filter_offset as usize;
+        let bf_end = bf_start + footer.bloom_filter_size as usize;
+        let sbbf = crate::sst::bloom_filter::Sbbf::decode(&data[bf_start..bf_end]).unwrap();
+
+        // All inserted keys must be found (no false negatives).
+        for key in &keys {
+            assert!(
+                sbbf.check(key.as_bytes()),
+                "bloom filter should find inserted key {:?}",
+                key,
+            );
+        }
     }
 }
