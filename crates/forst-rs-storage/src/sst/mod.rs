@@ -17,11 +17,15 @@
 pub mod block_header;
 pub mod compression;
 pub mod data_block;
+pub mod file_header;
+pub mod footer;
 pub mod schema;
 
 pub use block_header::BlockHeader;
 pub use compression::{compress, decompress};
 pub use data_block::{decode_data_block, encode_data_block};
+pub use file_header::FileHeader;
+pub use footer::{ChecksumType, FooterV1, FOOTER_FIXED_FIELDS_SIZE, FOOTER_TAIL_SIZE};
 pub use schema::{
     sst_schema, BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA, FILE_HEADER_SIZE, SST_FORMAT_VERSION,
     SST_MAGIC,
