@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use forst_rs_common::{ForstResult, OpType};
 
-use super::MemTableConfig;
+use super::{GetResult, MemTableConfig};
 
 /// Index of a single row within the columnar storage arrays.
 #[derive(Debug, Clone, Copy)]
@@ -216,7 +216,6 @@ impl VectorizedMemTable {
 
     /// Retrieves the value bytes for a given row offset. Returns `None` for tombstones.
     /// Used by get() (Task 3) and to_flush_batches() (Task 5).
-    #[allow(dead_code)]
     fn value_at(&self, offset: u32) -> Option<&[u8]> {
         if self.value_nulls[offset as usize] {
             return None;
@@ -236,6 +235,59 @@ impl VectorizedMemTable {
         }
         self.sorted_count += self.unsorted_entries.len() as u32;
         self.unsorted_entries.clear();
+    }
+
+    /// Point lookup: returns the latest entry for `key` with sequence <= `read_sequence`.
+    ///
+    /// Checks the unsorted zone first (newer data), then the sorted index.
+    /// Returns the entry with the highest sequence number.
+    pub fn get(&self, key: &[u8], read_sequence: u64) -> ForstResult<Option<GetResult>> {
+        // Check unsorted zone first (potentially newer).
+        let unsorted_result = self
+            .unsorted_lookup
+            .get(key)
+            .and_then(|indices| self.find_latest(indices, read_sequence));
+
+        // Check sorted index.
+        let sorted_result = self
+            .sorted_index
+            .get(key)
+            .and_then(|indices| self.find_latest(indices, read_sequence));
+
+        // Return the one with the higher sequence.
+        let result = match (unsorted_result, sorted_result) {
+            (Some(u), Some(s)) => {
+                if u.sequence >= s.sequence {
+                    Some(u)
+                } else {
+                    Some(s)
+                }
+            }
+            (Some(u), None) => Some(u),
+            (None, Some(s)) => Some(s),
+            (None, None) => None,
+        };
+
+        Ok(result)
+    }
+
+    /// Among a list of RowIndex entries, find the one with the highest
+    /// sequence that is <= `read_sequence` and build a GetResult.
+    fn find_latest(&self, indices: &[RowIndex], read_sequence: u64) -> Option<GetResult> {
+        let mut best: Option<&RowIndex> = None;
+        for idx in indices {
+            if idx.sequence <= read_sequence {
+                match best {
+                    Some(b) if idx.sequence <= b.sequence => {}
+                    _ => best = Some(idx),
+                }
+            }
+        }
+        best.map(|idx| GetResult {
+            value: self.value_at(idx.offset).map(|v| v.to_vec()),
+            sequence: idx.sequence,
+            op_type: idx.op_type,
+        })
     }
 }
 
@@ -360,5 +412,97 @@ mod tests {
         assert_eq!(mt.memory_usage(), 0);
         mt.put(b"key", Some(b"value"), 0).unwrap();
         assert!(mt.memory_usage() > 0);
+    }
+
+    #[test]
+    fn test_get_existing_key() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"hello", Some(b"world"), 0).unwrap();
+        let result = mt.get(b"hello", u64::MAX).unwrap();
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.value, Some(b"world".to_vec()));
+        assert_eq!(r.sequence, 1);
+        assert_eq!(r.op_type, OpType::Put);
+    }
+
+    #[test]
+    fn test_get_missing_key() {
+        let mt = VectorizedMemTable::new(test_config());
+        let result = mt.get(b"missing", u64::MAX).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_returns_latest_version() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"key", Some(b"v1"), 0).unwrap();
+        mt.put(b"key", Some(b"v2"), 0).unwrap();
+        mt.put(b"key", Some(b"v3"), 0).unwrap();
+
+        let r = mt.get(b"key", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"v3".to_vec()));
+        assert_eq!(r.sequence, 3);
+    }
+
+    #[test]
+    fn test_get_respects_read_sequence() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"key", Some(b"v1"), 0).unwrap();
+        mt.put(b"key", Some(b"v2"), 0).unwrap();
+        mt.put(b"key", Some(b"v3"), 0).unwrap();
+
+        let r = mt.get(b"key", 2).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"v2".to_vec()));
+        assert_eq!(r.sequence, 2);
+
+        let r = mt.get(b"key", 1).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"v1".to_vec()));
+    }
+
+    #[test]
+    fn test_get_delete_tombstone() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"key", Some(b"val"), 0).unwrap();
+        mt.put(b"key", None, 1).unwrap();
+
+        let r = mt.get(b"key", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, None);
+        assert_eq!(r.op_type, OpType::Delete);
+        assert_eq!(r.sequence, 2);
+    }
+
+    #[test]
+    fn test_get_after_merge_to_sorted() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"a", Some(b"1"), 0).unwrap();
+        mt.put(b"b", Some(b"2"), 0).unwrap();
+        mt.merge_unsorted_to_sorted();
+
+        mt.put(b"a", Some(b"updated"), 0).unwrap();
+
+        let r = mt.get(b"a", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"updated".to_vec()));
+        assert_eq!(r.sequence, 3);
+
+        let r = mt.get(b"b", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn test_get_1000_entries() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        for i in 0..1000u32 {
+            let key = format!("k_{:06}", i);
+            let val = format!("v_{:06}", i);
+            mt.put(key.as_bytes(), Some(val.as_bytes()), 0).unwrap();
+        }
+
+        for i in 0..1000u32 {
+            let key = format!("k_{:06}", i);
+            let expected_val = format!("v_{:06}", i);
+            let r = mt.get(key.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(r.value, Some(expected_val.into_bytes()), "mismatch at {}", i);
+        }
     }
 }
