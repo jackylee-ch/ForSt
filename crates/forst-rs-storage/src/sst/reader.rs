@@ -25,10 +25,12 @@
 //! 5. Binary search within the RecordBatch for the target key
 //! 6. Return the latest version (highest sequence) with op_type awareness
 
+use arrow::array::{Array, BinaryArray, RecordBatch};
 use forst_rs_common::{get_fixed32, ForstError, ForstResult, OpType};
 use forst_rs_io::filesystem::RandomAccessFile;
 
 use super::bloom_filter::Sbbf;
+use super::data_block::decode_data_block;
 use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
 use super::schema::{FILE_HEADER_SIZE, SST_MAGIC};
 use super::sparse_index::{decode_index, BlockStats, SparseIndexEntry};
@@ -42,6 +44,42 @@ pub struct LookupResult {
     pub sequence: u64,
     /// The operation type.
     pub op_type: OpType,
+}
+
+/// Binary-searches a RecordBatch's key column for `target_key`.
+///
+/// Returns the index of the first row where key == target_key,
+/// or `None` if the key is not present. The RecordBatch keys must
+/// be sorted in ascending order.
+fn search_key_in_batch(batch: &RecordBatch, target_key: &[u8]) -> Option<usize> {
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("column 0 must be BinaryArray");
+
+    let num_rows = keys.len();
+    if num_rows == 0 {
+        return None;
+    }
+
+    // Binary search for the first row where key >= target_key.
+    let mut lo = 0usize;
+    let mut hi = num_rows;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if keys.value(mid) < target_key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if lo < num_rows && keys.value(lo) == target_key {
+        Some(lo)
+    } else {
+        None
+    }
 }
 
 /// An SST file reader that serves point lookups.
@@ -122,12 +160,21 @@ impl SstReaderImpl {
     pub fn total_entries(&self) -> u64 {
         self.footer.total_entries
     }
+
+    /// Reads and decodes a DataBlock at the given offset and size.
+    fn read_data_block(&self, block_offset: u64, block_size: u32) -> ForstResult<RecordBatch> {
+        let mut buf = vec![0u8; block_size as usize];
+        self.file.read_at(block_offset, &mut buf)?;
+        decode_data_block(&buf)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sst::schema::sst_schema;
     use crate::sst::writer::{SstWriterImpl, SstWriterOptions};
+    use arrow::array::{BinaryArray, UInt64Array, UInt8Array};
     use forst_rs_common::CompressionType;
     use std::sync::Arc;
 
@@ -223,5 +270,71 @@ mod tests {
         });
         let result = SstReaderImpl::open(file);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // search_key_in_batch tests
+    // -----------------------------------------------------------------------
+
+    fn make_batch(keys: &[&[u8]], vals: &[&[u8]], seqs: &[u64], ops: &[u8]) -> RecordBatch {
+        let schema = Arc::new(sst_schema());
+        let key_array = BinaryArray::from_iter_values(keys.iter().copied());
+        let val_array = BinaryArray::from_iter_values(vals.iter().copied());
+        let seq_array = UInt64Array::from(seqs.to_vec());
+        let op_array = UInt8Array::from(ops.to_vec());
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(key_array),
+                Arc::new(val_array),
+                Arc::new(seq_array),
+                Arc::new(op_array),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_search_key_in_batch_found() {
+        let batch = make_batch(
+            &[b"aaa", b"bbb", b"ccc", b"ddd"],
+            &[b"v1", b"v2", b"v3", b"v4"],
+            &[1, 2, 3, 4],
+            &[0, 0, 0, 0],
+        );
+        assert_eq!(search_key_in_batch(&batch, b"bbb"), Some(1));
+        assert_eq!(search_key_in_batch(&batch, b"aaa"), Some(0));
+        assert_eq!(search_key_in_batch(&batch, b"ddd"), Some(3));
+    }
+
+    #[test]
+    fn test_search_key_in_batch_not_found() {
+        let batch = make_batch(
+            &[b"aaa", b"ccc", b"eee"],
+            &[b"v1", b"v2", b"v3"],
+            &[1, 2, 3],
+            &[0, 0, 0],
+        );
+        assert_eq!(search_key_in_batch(&batch, b"bbb"), None);
+        assert_eq!(search_key_in_batch(&batch, b"zzz"), None);
+    }
+
+    #[test]
+    fn test_search_key_in_batch_empty() {
+        let schema = Arc::new(sst_schema());
+        let batch = RecordBatch::new_empty(schema);
+        assert_eq!(search_key_in_batch(&batch, b"any"), None);
+    }
+
+    #[test]
+    fn test_search_key_in_batch_duplicate_keys_finds_first() {
+        // Same key with different sequences — should find the first occurrence
+        let batch = make_batch(
+            &[b"key", b"key", b"key"],
+            &[b"v1", b"v2", b"v3"],
+            &[100, 50, 10],
+            &[0, 0, 0],
+        );
+        assert_eq!(search_key_in_batch(&batch, b"key"), Some(0));
     }
 }
