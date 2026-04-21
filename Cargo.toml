@@ -16,6 +16,7 @@
 members = [
     "crates/forst-rs-common",
     "crates/forst-rs-io",
+    "crates/forst-rs-storage",
     "crates/forst-rs-test-utils",
 ]
 resolver = "2"
@@ -30,6 +31,7 @@ repository = "https://github.com/nicetoseeyou/ForSt"
 # Internal crates
 forst-rs-common = { path = "crates/forst-rs-common" }
 forst-rs-io = { path = "crates/forst-rs-io" }
+forst-rs-storage = { path = "crates/forst-rs-storage" }
 forst-rs-test-utils = { path = "crates/forst-rs-test-utils" }
 
 # Core dependencies

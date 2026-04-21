@@ -1,0 +1,31 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "forst-rs-storage"
+version = "0.1.0"
+description = "SST file format: data blocks, index, bloom filter, header/footer"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+forst-rs-common = { workspace = true }
+arrow = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+forst-rs-test-utils = { workspace = true }
