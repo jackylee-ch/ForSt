@@ -19,4 +19,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod memtable;
 pub mod sst;
