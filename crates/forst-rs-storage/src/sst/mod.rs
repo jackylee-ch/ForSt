@@ -20,6 +20,7 @@ pub mod data_block;
 pub mod file_header;
 pub mod footer;
 pub mod schema;
+pub mod sparse_index;
 
 pub use block_header::BlockHeader;
 pub use compression::{compress, decompress};
@@ -30,3 +31,4 @@ pub use schema::{
     sst_schema, BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA, FILE_HEADER_SIZE, SST_FORMAT_VERSION,
     SST_MAGIC,
 };
+pub use sparse_index::{decode_index, encode_index, search_index, BlockStats, SparseIndexEntry};
