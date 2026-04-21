@@ -20,6 +20,8 @@
 //! block is a 256-bit (8 x u32) word array, and keys are mapped to blocks via
 //! the upper 32 bits of an xxHash64 digest.
 
+use forst_rs_common::{ForstError, ForstResult};
+
 /// Salt constants used for bit-setting within a 256-bit block.
 /// Each salt produces one bit position (via `key_bits.wrapping_mul(salt) >> 27`),
 /// giving 8 independent bit probes per block.
@@ -134,6 +136,55 @@ impl Sbbf {
     /// Checks whether a key *might* be present in the filter.
     pub fn check(&self, key: &[u8]) -> bool {
         self.check_hash(Self::hash_key(key))
+    }
+
+    /// Builds an SBBF from a slice of pre-computed hashes.
+    pub fn from_hashes(hashes: &[u64]) -> Self {
+        let mut sbbf = Self::new(hashes.len());
+        for &h in hashes {
+            sbbf.insert_hash(h);
+        }
+        sbbf
+    }
+
+    /// Serializes the filter to bytes (little-endian).
+    ///
+    /// Each `[u32; 8]` block is written as 32 consecutive little-endian bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.data.len() * 32);
+        for block in &self.data {
+            for word in block {
+                buf.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Deserializes a filter from bytes previously produced by [`encode`](Self::encode).
+    ///
+    /// Returns an error if `data` is empty or its length is not a multiple of 32.
+    pub fn decode(data: &[u8]) -> ForstResult<Self> {
+        if data.is_empty() {
+            return Err(ForstError::corruption("SBBF data is empty"));
+        }
+        if data.len() % 32 != 0 {
+            return Err(ForstError::corruption(format!(
+                "SBBF data size {} is not a multiple of 32",
+                data.len()
+            )));
+        }
+        let num_blocks = data.len() / 32;
+        let mut blocks = Vec::with_capacity(num_blocks);
+        for i in 0..num_blocks {
+            let offset = i * 32;
+            let mut block = [0u32; 8];
+            for j in 0..8 {
+                let w = offset + j * 4;
+                block[j] = u32::from_le_bytes([data[w], data[w + 1], data[w + 2], data[w + 3]]);
+            }
+            blocks.push(block);
+        }
+        Ok(Self { data: blocks })
     }
 }
 
@@ -261,5 +312,80 @@ mod tests {
             "false positive rate {:.4} exceeds 5%",
             fp_rate
         );
+    }
+
+    // ---- Task 4: encode / decode / from_hashes tests ----
+
+    #[test]
+    fn test_encode_size_matches() {
+        let sbbf = Sbbf::new(100);
+        assert_eq!(sbbf.encode().len(), sbbf.size_in_bytes());
+    }
+
+    #[test]
+    fn test_encode_empty_filter_is_all_zeros() {
+        let sbbf = Sbbf::new(10);
+        let encoded = sbbf.encode();
+        assert!(encoded.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_roundtrip_empty() {
+        let original = Sbbf::new(10);
+        let encoded = original.encode();
+        let decoded = Sbbf::decode(&encoded).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_roundtrip_with_data() {
+        let mut original = Sbbf::new(200);
+        for i in 0..200u32 {
+            original.insert(&i.to_le_bytes());
+        }
+        let encoded = original.encode();
+        let decoded = Sbbf::decode(&encoded).unwrap();
+        assert_eq!(original, decoded);
+
+        // Verify all inserted keys are still found
+        for i in 0..200u32 {
+            assert!(decoded.check(&i.to_le_bytes()), "key {} lost", i);
+        }
+    }
+
+    #[test]
+    fn test_decode_invalid_size() {
+        let bad = vec![0u8; 33]; // not a multiple of 32
+        let result = Sbbf::decode(&bad);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_empty_data() {
+        let result = Sbbf::decode(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encode_uses_little_endian() {
+        let mut sbbf = Sbbf::new(1); // 1 block
+        sbbf.data[0][0] = 0x01020304;
+        let encoded = sbbf.encode();
+        // Little-endian: least significant byte first
+        assert_eq!(encoded[0], 0x04);
+        assert_eq!(encoded[1], 0x03);
+        assert_eq!(encoded[2], 0x02);
+        assert_eq!(encoded[3], 0x01);
+    }
+
+    #[test]
+    fn test_from_hashes_builds_correct_filter() {
+        let keys = [b"alpha".as_slice(), b"beta", b"gamma"];
+        let hashes: Vec<u64> = keys.iter().map(|k| Sbbf::hash_key(k)).collect();
+        let sbbf = Sbbf::from_hashes(&hashes);
+
+        for key in &keys {
+            assert!(sbbf.check(key), "key {:?} not found", key);
+        }
     }
 }
