@@ -25,7 +25,7 @@
 //! 5. Binary search within the RecordBatch for the target key
 //! 6. Return the latest version (highest sequence) with op_type awareness
 
-use arrow::array::{Array, BinaryArray, RecordBatch};
+use arrow::array::{Array, BinaryArray, RecordBatch, UInt64Array, UInt8Array};
 use forst_rs_common::{get_fixed32, ForstError, ForstResult, OpType};
 use forst_rs_io::filesystem::RandomAccessFile;
 
@@ -33,7 +33,7 @@ use super::bloom_filter::Sbbf;
 use super::data_block::decode_data_block;
 use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
 use super::schema::{FILE_HEADER_SIZE, SST_MAGIC};
-use super::sparse_index::{decode_index, BlockStats, SparseIndexEntry};
+use super::sparse_index::{decode_index, search_index, BlockStats, SparseIndexEntry};
 
 /// Result of a point lookup: the value bytes and operation type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +166,105 @@ impl SstReaderImpl {
         let mut buf = vec![0u8; block_size as usize];
         self.file.read_at(block_offset, &mut buf)?;
         decode_data_block(&buf)
+    }
+
+    /// Performs a point lookup for `key`.
+    ///
+    /// Returns the [`LookupResult`] for the latest version of the key
+    /// (highest sequence number), or `None` if the key is not in this SST file.
+    ///
+    /// The lookup algorithm:
+    /// 1. Key-range check: if key < min_key or key > max_key, return None
+    /// 2. Bloom filter: if SBBF says "definitely not present", return None
+    /// 3. Sparse index: binary search to find candidate DataBlock
+    /// 4. Read and decode the DataBlock
+    /// 5. Binary search within the RecordBatch for the key
+    /// 6. Among matching rows, pick the one with the highest sequence number
+    /// 7. If op_type is Delete/SingleDelete, return LookupResult with value=None
+    pub fn get(&self, key: &[u8]) -> ForstResult<Option<LookupResult>> {
+        // 1. Key-range check.
+        if key < self.footer.min_key.as_slice() || key > self.footer.max_key.as_slice() {
+            return Ok(None);
+        }
+
+        // 2. Bloom filter check.
+        if !self.bloom_filter.check(key) {
+            return Ok(None);
+        }
+
+        // 3. Sparse index binary search.
+        let block_idx = match search_index(&self.index_entries, key) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        // 4. Read and decode the DataBlock.
+        let entry = &self.index_entries[block_idx];
+        let batch = self.read_data_block(entry.block_offset, entry.block_size)?;
+
+        // 5. Binary search within the RecordBatch.
+        let first_row = match search_key_in_batch(&batch, key) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+
+        // 6. Find the row with the highest sequence number among matching keys.
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("column 0 must be BinaryArray");
+        let sequences = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("column 2 must be UInt64Array");
+        let op_types = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .expect("column 3 must be UInt8Array");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("column 1 must be BinaryArray");
+
+        let mut best_row = first_row;
+        let mut best_seq = sequences.value(first_row);
+
+        let mut row = first_row + 1;
+        while row < batch.num_rows() && keys.value(row) == key {
+            let seq = sequences.value(row);
+            if seq > best_seq {
+                best_seq = seq;
+                best_row = row;
+            }
+            row += 1;
+        }
+
+        // 7. Build result based on op_type.
+        let op_byte = op_types.value(best_row);
+        let op = OpType::from_u8(op_byte).ok_or_else(|| {
+            ForstError::corruption(format!("invalid op_type byte: {}", op_byte))
+        })?;
+
+        let value = match op {
+            OpType::Delete | OpType::SingleDelete => None,
+            OpType::Put | OpType::Merge => {
+                if values.is_null(best_row) {
+                    None
+                } else {
+                    Some(values.value(best_row).to_vec())
+                }
+            }
+        };
+
+        Ok(Some(LookupResult {
+            value,
+            sequence: best_seq,
+            op_type: op,
+        }))
     }
 }
 
@@ -336,5 +435,101 @@ mod tests {
             &[0, 0, 0],
         );
         assert_eq!(search_key_in_batch(&batch, b"key"), Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // get() tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_existing_key() {
+        let sst_data = write_test_sst(100);
+        let file = Box::new(MemRandomAccessFile { data: sst_data });
+        let reader = SstReaderImpl::open(file).unwrap();
+
+        let result = reader.get(b"key_00050").unwrap();
+        assert!(result.is_some());
+        let lr = result.unwrap();
+        assert_eq!(lr.value, Some(b"val_00050".to_vec()));
+        assert_eq!(lr.sequence, 51);
+        assert_eq!(lr.op_type, OpType::Put);
+    }
+
+    #[test]
+    fn test_get_first_key() {
+        let sst_data = write_test_sst(100);
+        let file = Box::new(MemRandomAccessFile { data: sst_data });
+        let reader = SstReaderImpl::open(file).unwrap();
+        let result = reader.get(b"key_00000").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().value, Some(b"val_00000".to_vec()));
+    }
+
+    #[test]
+    fn test_get_last_key() {
+        let sst_data = write_test_sst(100);
+        let file = Box::new(MemRandomAccessFile { data: sst_data });
+        let reader = SstReaderImpl::open(file).unwrap();
+        let result = reader.get(b"key_00099").unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().value, Some(b"val_00099".to_vec()));
+    }
+
+    #[test]
+    fn test_get_missing_key_out_of_range() {
+        let sst_data = write_test_sst(100);
+        let file = Box::new(MemRandomAccessFile { data: sst_data });
+        let reader = SstReaderImpl::open(file).unwrap();
+        // Before min key
+        assert!(reader.get(b"aaa").unwrap().is_none());
+        // After max key
+        assert!(reader.get(b"zzz").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_missing_key_in_range() {
+        let sst_data = write_test_sst(100);
+        let file = Box::new(MemRandomAccessFile { data: sst_data });
+        let reader = SstReaderImpl::open(file).unwrap();
+        // Key in range but not present
+        assert!(reader.get(b"key_00100").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_delete_tombstone() {
+        let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+            block_size: 4096,
+            compression: CompressionType::None,
+        });
+        writer.add(b"aaa", Some(b"val"), 1, 0).unwrap();
+        writer.add(b"bbb", None, 2, 1).unwrap(); // Delete
+        writer.add(b"ccc", Some(b"val3"), 3, 0).unwrap();
+        let (data, _) = writer.finish().unwrap();
+
+        let file = Box::new(MemRandomAccessFile {
+            data: Arc::new(data),
+        });
+        let reader = SstReaderImpl::open(file).unwrap();
+
+        let result = reader.get(b"bbb").unwrap().unwrap();
+        assert_eq!(result.op_type, OpType::Delete);
+        assert_eq!(result.value, None);
+    }
+
+    #[test]
+    fn test_get_all_keys_100_percent_hit() {
+        let n = 500;
+        let sst_data = write_test_sst(n);
+        let file = Box::new(MemRandomAccessFile { data: sst_data });
+        let reader = SstReaderImpl::open(file).unwrap();
+
+        for i in 0..n {
+            let key = format!("key_{:05}", i);
+            let result = reader.get(key.as_bytes()).unwrap();
+            assert!(result.is_some(), "key {} should be found", key);
+            let lr = result.unwrap();
+            let expected_val = format!("val_{:05}", i);
+            assert_eq!(lr.value, Some(expected_val.into_bytes()));
+        }
     }
 }
