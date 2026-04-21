@@ -20,7 +20,10 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
+use arrow::array::{BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
+use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstResult, OpType};
 
 use super::{GetResult, MemTableConfig};
@@ -207,7 +210,6 @@ impl VectorizedMemTable {
 
     /// Retrieves the key bytes for a given row offset.
     /// Used by get() (Task 3) and to_flush_batches() (Task 5).
-    #[allow(dead_code)]
     fn key_at(&self, offset: u32) -> &[u8] {
         let start = self.key_offsets[offset as usize] as usize;
         let end = self.key_offsets[offset as usize + 1] as usize;
@@ -235,6 +237,91 @@ impl VectorizedMemTable {
         }
         self.sorted_count += self.unsorted_entries.len() as u32;
         self.unsorted_entries.clear();
+    }
+
+    /// Freezes this MemTable, making it immutable.
+    ///
+    /// Before freezing, all unsorted data is merged into the sorted index.
+    /// After freezing, `put()` and `batch_insert()` will return an error.
+    pub fn freeze(&mut self) {
+        if !self.frozen {
+            self.merge_unsorted_to_sorted();
+            self.frozen = true;
+        }
+    }
+
+    /// Exports the entire MemTable as sorted Arrow RecordBatches.
+    ///
+    /// Each batch contains up to `batch_size` rows. Rows are ordered by
+    /// (key ASC, sequence DESC). For each key, all versions are included.
+    ///
+    /// Schema: `key(Binary), value(Binary nullable), sequence(UInt64), op_type(UInt8)`.
+    ///
+    /// The MemTable must be frozen before calling this method.
+    pub fn to_flush_batches(&self, batch_size: usize) -> ForstResult<Vec<RecordBatch>> {
+        if !self.frozen {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "MemTable must be frozen before flushing",
+            ));
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
+            Field::new("sequence", DataType::UInt64, false),
+            Field::new("op_type", DataType::UInt8, false),
+        ]));
+
+        // Collect all rows in sorted order: key ASC, sequence DESC.
+        let mut sorted_rows: Vec<(u32, u64)> = Vec::new();
+        for indices in self.sorted_index.values() {
+            for idx in indices {
+                sorted_rows.push((idx.offset, idx.sequence));
+            }
+        }
+
+        // Build batches.
+        let mut batches = Vec::new();
+        let mut row_idx = 0;
+
+        while row_idx < sorted_rows.len() {
+            let chunk_end = (row_idx + batch_size).min(sorted_rows.len());
+            let mut key_builder = BinaryBuilder::new();
+            let mut value_builder = BinaryBuilder::new();
+            let mut seq_builder = UInt64Builder::new();
+            let mut op_builder = UInt8Builder::new();
+
+            for &(offset, _seq) in &sorted_rows[row_idx..chunk_end] {
+                let key = self.key_at(offset);
+                key_builder.append_value(key);
+
+                match self.value_at(offset) {
+                    Some(v) => value_builder.append_value(v),
+                    None => value_builder.append_null(),
+                }
+
+                seq_builder.append_value(self.sequences[offset as usize]);
+                op_builder.append_value(self.op_types[offset as usize]);
+            }
+
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(key_builder.finish()),
+                    Arc::new(value_builder.finish()),
+                    Arc::new(seq_builder.finish()),
+                    Arc::new(op_builder.finish()),
+                ],
+            )
+            .map_err(|e| {
+                forst_rs_common::ForstError::corruption(format!("Arrow error: {}", e))
+            })?;
+
+            batches.push(batch);
+            row_idx = chunk_end;
+        }
+
+        Ok(batches)
     }
 
     /// Point lookup: returns the latest entry for `key` with sequence <= `read_sequence`.
@@ -374,6 +461,8 @@ impl VectorizedMemTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use arrow::array::{Array, BinaryArray, UInt64Array, UInt8Array};
 
     fn test_config() -> MemTableConfig {
         MemTableConfig {
@@ -665,6 +754,136 @@ mod tests {
             let expected_val = format!("v_{:06}", i);
             let r = mt.get(key.as_bytes(), u64::MAX).unwrap().unwrap();
             assert_eq!(r.value, Some(expected_val.into_bytes()), "mismatch at {}", i);
+        }
+    }
+
+    #[test]
+    fn test_freeze_makes_immutable() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"k", Some(b"v"), 0).unwrap();
+        mt.freeze();
+        assert!(mt.is_frozen());
+        assert!(mt.put(b"k2", Some(b"v2"), 0).is_err());
+    }
+
+    #[test]
+    fn test_freeze_merges_unsorted() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"c", Some(b"3"), 0).unwrap();
+        mt.put(b"a", Some(b"1"), 0).unwrap();
+        assert!(!mt.unsorted_entries.is_empty());
+        mt.freeze();
+        assert!(mt.unsorted_entries.is_empty());
+        assert!(mt.sorted_index.contains_key(b"a".as_slice()));
+    }
+
+    #[test]
+    fn test_to_flush_batches_requires_frozen() {
+        let mt = VectorizedMemTable::new(test_config());
+        assert!(mt.to_flush_batches(1024).is_err());
+    }
+
+    #[test]
+    fn test_to_flush_batches_sorted_output() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"charlie", Some(b"3"), 0).unwrap();
+        mt.put(b"alpha", Some(b"1"), 0).unwrap();
+        mt.put(b"bravo", Some(b"2"), 0).unwrap();
+        mt.freeze();
+
+        let batches = mt.to_flush_batches(1024).unwrap();
+        assert_eq!(batches.len(), 1);
+
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let keys = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(keys.value(0), b"alpha");
+        assert_eq!(keys.value(1), b"bravo");
+        assert_eq!(keys.value(2), b"charlie");
+    }
+
+    #[test]
+    fn test_to_flush_batches_multi_version() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"key", Some(b"v1"), 0).unwrap();
+        mt.put(b"key", Some(b"v2"), 0).unwrap();
+        mt.freeze();
+
+        let batches = mt.to_flush_batches(1024).unwrap();
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+
+        let seqs = batch.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
+        assert_eq!(seqs.value(0), 2);
+        assert_eq!(seqs.value(1), 1);
+    }
+
+    #[test]
+    fn test_to_flush_batches_respects_batch_size() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        for i in 0..100u32 {
+            let key = format!("k_{:05}", i);
+            mt.put(key.as_bytes(), Some(b"v"), 0).unwrap();
+        }
+        mt.freeze();
+
+        let batches = mt.to_flush_batches(30).unwrap();
+        assert_eq!(batches.len(), 4);
+        assert_eq!(batches[0].num_rows(), 30);
+        assert_eq!(batches[3].num_rows(), 10);
+    }
+
+    #[test]
+    fn test_to_flush_batches_with_tombstones() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"alive", Some(b"val"), 0).unwrap();
+        mt.put(b"dead", None, 1).unwrap();
+        mt.freeze();
+
+        let batches = mt.to_flush_batches(1024).unwrap();
+        let batch = &batches[0];
+        let values = batch.column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
+        let ops = batch.column(3).as_any().downcast_ref::<UInt8Array>().unwrap();
+
+        assert!(!values.is_null(0));
+        assert_eq!(values.value(0), b"val");
+        assert_eq!(ops.value(0), 0);
+
+        assert!(values.is_null(1));
+        assert_eq!(ops.value(1), 1);
+    }
+
+    #[test]
+    fn test_freeze_to_flush_roundtrip_100k() {
+        let mut mt = VectorizedMemTable::new(MemTableConfig {
+            max_size: 256 * 1024 * 1024,
+            unsorted_merge_ratio: 0.25,
+        });
+
+        let n = 100_000usize;
+        for i in 0..n {
+            let key = format!("rk_{:08}", i);
+            let val = format!("rv_{:08}", i);
+            mt.put(key.as_bytes(), Some(val.as_bytes()), 0).unwrap();
+        }
+        mt.freeze();
+
+        let batches = mt.to_flush_batches(10_000).unwrap();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, n);
+
+        let mut prev_key: Option<Vec<u8>> = None;
+        for batch in &batches {
+            let keys = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            for i in 0..batch.num_rows() {
+                let key = keys.value(i).to_vec();
+                if let Some(ref pk) = prev_key {
+                    assert!(key >= *pk, "keys not sorted");
+                }
+                prev_key = Some(key);
+            }
         }
     }
 }
