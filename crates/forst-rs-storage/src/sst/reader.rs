@@ -532,4 +532,86 @@ mod tests {
             assert_eq!(lr.value, Some(expected_val.into_bytes()));
         }
     }
+
+    #[test]
+    fn test_get_multi_block_small_block_size() {
+        // Force many small blocks
+        let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+            block_size: 128,
+            compression: CompressionType::None,
+        });
+        for i in 0..200u64 {
+            let key = format!("mb_{:05}", i);
+            let val = format!("v_{:05}", i);
+            writer
+                .add(key.as_bytes(), Some(val.as_bytes()), i + 1, 0)
+                .unwrap();
+        }
+        let (data, info) = writer.finish().unwrap();
+        assert!(info.data_block_count > 1, "should have multiple blocks");
+
+        let file = Box::new(MemRandomAccessFile {
+            data: Arc::new(data),
+        });
+        let reader = SstReaderImpl::open(file).unwrap();
+
+        // Verify all keys found
+        for i in 0..200u64 {
+            let key = format!("mb_{:05}", i);
+            let expected_val = format!("v_{:05}", i);
+            let result = reader.get(key.as_bytes()).unwrap();
+            assert!(result.is_some(), "key {} not found", key);
+            assert_eq!(result.unwrap().value, Some(expected_val.into_bytes()));
+        }
+    }
+
+    #[test]
+    fn test_get_with_lz4_compression() {
+        let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+            block_size: 4096,
+            compression: CompressionType::Lz4,
+        });
+        for i in 0..100u64 {
+            let key = format!("lz4_{:05}", i);
+            writer
+                .add(key.as_bytes(), Some(b"value"), i + 1, 0)
+                .unwrap();
+        }
+        let (data, _) = writer.finish().unwrap();
+        let file = Box::new(MemRandomAccessFile {
+            data: Arc::new(data),
+        });
+        let reader = SstReaderImpl::open(file).unwrap();
+
+        for i in 0..100u64 {
+            let key = format!("lz4_{:05}", i);
+            let result = reader.get(key.as_bytes()).unwrap();
+            assert!(result.is_some(), "LZ4 key {} not found", key);
+        }
+    }
+
+    #[test]
+    fn test_get_with_zstd_compression() {
+        let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+            block_size: 4096,
+            compression: CompressionType::Zstd,
+        });
+        for i in 0..100u64 {
+            let key = format!("zstd_{:05}", i);
+            writer
+                .add(key.as_bytes(), Some(b"value"), i + 1, 0)
+                .unwrap();
+        }
+        let (data, _) = writer.finish().unwrap();
+        let file = Box::new(MemRandomAccessFile {
+            data: Arc::new(data),
+        });
+        let reader = SstReaderImpl::open(file).unwrap();
+
+        for i in 0..100u64 {
+            let key = format!("zstd_{:05}", i);
+            let result = reader.get(key.as_bytes()).unwrap();
+            assert!(result.is_some(), "Zstd key {} not found", key);
+        }
+    }
 }
