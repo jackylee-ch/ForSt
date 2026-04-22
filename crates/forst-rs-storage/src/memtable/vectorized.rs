@@ -188,6 +188,16 @@ impl VectorizedMemTable {
         Ok(seq)
     }
 
+    /// Inserts a merge operand for the given key.
+    ///
+    /// This is a convenience wrapper around `put()` that sets
+    /// `op_type = OpType::Merge (3)`.
+    ///
+    /// Returns the assigned sequence number.
+    pub fn merge(&mut self, key: &[u8], operand: &[u8]) -> ForstResult<u64> {
+        self.put(key, Some(operand), OpType::Merge as u8)
+    }
+
     /// Returns the total number of entries (rows) in the MemTable.
     pub fn num_entries(&self) -> usize {
         self.sequences.len()
@@ -852,6 +862,76 @@ mod tests {
 
         assert!(values.is_null(1));
         assert_eq!(ops.value(1), 1);
+    }
+
+    // --- merge() convenience method tests ---
+
+    #[test]
+    fn test_merge_stores_entry() {
+        let mut mt = VectorizedMemTable::with_defaults();
+        let seq = mt.merge(b"key1", b"operand1").unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(mt.num_entries(), 1);
+
+        let result = mt.get(b"key1", u64::MAX).unwrap().unwrap();
+        assert_eq!(result.op_type, OpType::Merge);
+        assert_eq!(result.value, Some(b"operand1".to_vec()));
+        assert_eq!(result.sequence, 1);
+    }
+
+    #[test]
+    fn test_merge_multiple_operands_same_key() {
+        let mut mt = VectorizedMemTable::with_defaults();
+        mt.merge(b"key1", b"op1").unwrap();
+        mt.merge(b"key1", b"op2").unwrap();
+        mt.merge(b"key1", b"op3").unwrap();
+        assert_eq!(mt.num_entries(), 3);
+
+        // get() returns the latest entry (highest sequence)
+        let result = mt.get(b"key1", u64::MAX).unwrap().unwrap();
+        assert_eq!(result.op_type, OpType::Merge);
+        assert_eq!(result.value, Some(b"op3".to_vec()));
+        assert_eq!(result.sequence, 3);
+    }
+
+    #[test]
+    fn test_merge_after_put() {
+        let mut mt = VectorizedMemTable::with_defaults();
+        mt.put(b"key1", Some(b"base"), 0).unwrap(); // Put
+        mt.merge(b"key1", b"append1").unwrap(); // Merge
+        mt.merge(b"key1", b"append2").unwrap(); // Merge
+
+        // get() returns latest entry (which is a Merge operand)
+        // Note: actual merge resolution happens in the Engine read path, not in MemTable
+        let result = mt.get(b"key1", u64::MAX).unwrap().unwrap();
+        assert_eq!(result.op_type, OpType::Merge);
+        assert_eq!(result.value, Some(b"append2".to_vec()));
+    }
+
+    #[test]
+    fn test_merge_read_sequence_filtering() {
+        let mut mt = VectorizedMemTable::with_defaults();
+        mt.put(b"key1", Some(b"base"), 0).unwrap(); // seq=1
+        mt.merge(b"key1", b"op1").unwrap(); // seq=2
+        mt.merge(b"key1", b"op2").unwrap(); // seq=3
+
+        // Read at seq=1: should see the Put
+        let result = mt.get(b"key1", 1).unwrap().unwrap();
+        assert_eq!(result.op_type, OpType::Put);
+        assert_eq!(result.value, Some(b"base".to_vec()));
+
+        // Read at seq=2: should see first merge
+        let result = mt.get(b"key1", 2).unwrap().unwrap();
+        assert_eq!(result.op_type, OpType::Merge);
+        assert_eq!(result.value, Some(b"op1".to_vec()));
+    }
+
+    #[test]
+    fn test_merge_frozen_memtable_rejects() {
+        let mut mt = VectorizedMemTable::with_defaults();
+        mt.freeze();
+        let err = mt.merge(b"key1", b"op1");
+        assert!(err.is_err());
     }
 
     #[test]

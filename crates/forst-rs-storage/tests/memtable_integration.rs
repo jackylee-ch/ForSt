@@ -61,6 +61,43 @@ fn test_m3_batch_insert_100k_get_all() {
     assert_eq!(hits, n);
 }
 
+/// Verify merge entries are stored and retrievable, and that
+/// ListAppendMergeOperator can resolve a chain of merge operands.
+#[test]
+fn test_merge_operator_with_memtable_entries() {
+    use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
+
+    let mut mt = VectorizedMemTable::with_defaults();
+
+    // Put base value
+    mt.put(b"list_key", Some(b"item1"), 0).unwrap();
+    // Add merge operands
+    mt.merge(b"list_key", b"item2").unwrap();
+    mt.merge(b"list_key", b"item3").unwrap();
+    mt.merge(b"list_key", b"item4").unwrap();
+
+    // Simulate what the engine read path would do:
+    // 1. Collect entries from newest to oldest
+    // 2. When hitting a Put, call full_merge with base + operands (oldest to newest)
+    let op = ListAppendMergeOperator::with_comma();
+
+    // The base value from the Put
+    let base = b"item1";
+    // Operands in oldest-to-newest order
+    let operands: Vec<&[u8]> = vec![b"item2", b"item3", b"item4"];
+
+    let merged = op.full_merge(b"list_key", Some(base), &operands).unwrap();
+    assert_eq!(merged, b"item1,item2,item3,item4");
+
+    // Verify the memtable stores all 4 entries
+    assert_eq!(mt.num_entries(), 4);
+
+    // Verify get() returns the raw latest merge operand (not resolved)
+    let result = mt.get(b"list_key", u64::MAX).unwrap().unwrap();
+    assert_eq!(result.op_type, forst_rs_common::OpType::Merge);
+    assert_eq!(result.value, Some(b"item4".to_vec()));
+}
+
 /// M3 Partial Verification: freeze → ImmutableMemTable → to_flush_batches sorted iteration.
 #[test]
 fn test_m3_freeze_to_flush_batches_sorted() {
