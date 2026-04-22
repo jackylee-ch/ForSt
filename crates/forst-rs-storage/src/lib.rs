@@ -19,6 +19,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cache;
 pub mod memtable;
 pub mod merge_operator;
 pub mod sst;
