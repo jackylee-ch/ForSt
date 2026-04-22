@@ -40,6 +40,7 @@ bytes = "1"
 arrow = { version = "54", features = ["ffi"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "fs", "sync", "macros"] }
 tracing = "0.1"
+arc-swap = "1"
 
 # Compression
 lz4_flex = "0.11"

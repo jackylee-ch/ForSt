@@ -28,6 +28,7 @@ arrow = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 forst-rs-test-utils = { workspace = true }
