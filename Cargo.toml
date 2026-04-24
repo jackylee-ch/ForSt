@@ -14,7 +14,10 @@
 
 [workspace]
 members = [
+    "crates/forst-rs-bench",
     "crates/forst-rs-common",
+    "crates/forst-rs-engine",
+    "crates/forst-rs-ffi",
     "crates/forst-rs-io",
     "crates/forst-rs-storage",
     "crates/forst-rs-test-utils",
@@ -29,7 +32,10 @@ repository = "https://github.com/nicetoseeyou/ForSt"
 
 [workspace.dependencies]
 # Internal crates
+forst-rs-bench = { path = "crates/forst-rs-bench" }
 forst-rs-common = { path = "crates/forst-rs-common" }
+forst-rs-engine = { path = "crates/forst-rs-engine" }
+forst-rs-ffi = { path = "crates/forst-rs-ffi" }
 forst-rs-io = { path = "crates/forst-rs-io" }
 forst-rs-storage = { path = "crates/forst-rs-storage" }
 forst-rs-test-utils = { path = "crates/forst-rs-test-utils" }
