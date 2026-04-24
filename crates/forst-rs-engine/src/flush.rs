@@ -1,0 +1,368 @@
+// Copyright 2026 The ForSt-RS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Flush pipeline: frozen memtable → on-disk SST file. See `2.8_read_write_paths.md` §2.4.
+//!
+//! A [`FlushJob`] is a self-contained unit of work that:
+//! 1. Pulls sorted `RecordBatch`es from a frozen [`VectorizedMemTable`].
+//! 2. Feeds them row-by-row through [`SstWriterImpl`], producing the
+//!    complete SST file bytes.
+//! 3. Writes those bytes atomically to disk via the [`FileSystem`]
+//!    abstraction (use `rename` from a temp file to guarantee crash
+//!    safety).
+//! 4. Returns an [`SstFileMeta`] ready to be recorded in the
+//!    [`VersionSet`](forst_rs_storage::version::VersionSetImpl).
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use arrow::array::{Array, BinaryArray, UInt64Array, UInt8Array};
+use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber};
+use forst_rs_io::{FileSystem, WriteMode};
+use forst_rs_storage::sst::{SstFileInfo, SstWriterImpl, SstWriterOptions};
+use forst_rs_storage::version::SstFileMeta;
+
+use crate::column_family::SharedMemTable;
+
+/// Batch size used when converting memtable rows to SST entries. Larger
+/// batches reduce per-row overhead but increase peak memory usage during
+/// flush. 8192 matches the default Arrow batch size across the project.
+const FLUSH_BATCH_SIZE: usize = 8192;
+
+/// A single flush operation: one frozen memtable → one SST file.
+pub struct FlushJob {
+    memtable: SharedMemTable,
+    file_number: FileNumber,
+    file_path: PathBuf,
+    options: SstWriterOptions,
+    fs: Arc<dyn FileSystem>,
+}
+
+impl FlushJob {
+    /// Constructs a new flush job. The `file_path` must be an absolute or
+    /// engine-relative path at which the SST file will be written. The
+    /// memtable must already be frozen.
+    pub fn new(
+        memtable: SharedMemTable,
+        file_number: FileNumber,
+        file_path: PathBuf,
+        options: SstWriterOptions,
+        fs: Arc<dyn FileSystem>,
+    ) -> Self {
+        Self {
+            memtable,
+            file_number,
+            file_path,
+            options,
+            fs,
+        }
+    }
+
+    /// Runs the flush synchronously. Returns the metadata describing the
+    /// produced SST file, ready to feed into a `VersionEdit`.
+    pub fn run(self) -> ForstResult<SstFileMeta> {
+        // 1. Pull sorted RecordBatches from the memtable. `to_flush_batches`
+        //    requires the memtable to be frozen; the engine must have done
+        //    that before scheduling the flush.
+        let batches = {
+            let guard = self.memtable.read().expect("lock poisoned");
+            if !guard.is_frozen() {
+                return Err(ForstError::invalid_argument(
+                    "FlushJob: memtable is not frozen; call freeze() first",
+                ));
+            }
+            if guard.num_entries() == 0 {
+                return Err(ForstError::invalid_argument(
+                    "FlushJob: memtable is empty; nothing to flush",
+                ));
+            }
+            guard.to_flush_batches(FLUSH_BATCH_SIZE)?
+        };
+
+        // 2. Feed each row into the SST writer. We iterate with `add()` to
+        //    preserve the writer's invariant (entries arrive in sorted order
+        //    by (key ASC, seq DESC) — matching `to_flush_batches`).
+        let mut writer = SstWriterImpl::with_options(self.options.clone());
+        for batch in &batches {
+            let rows = batch.num_rows();
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ForstError::corruption("flush batch: key column not Binary"))?;
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ForstError::corruption("flush batch: value column not Binary"))?;
+            let seqs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| ForstError::corruption("flush batch: sequence column not UInt64"))?;
+            let ops = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| ForstError::corruption("flush batch: op_type column not UInt8"))?;
+
+            for i in 0..rows {
+                let key = keys.value(i);
+                let value = if values.is_null(i) {
+                    None
+                } else {
+                    Some(values.value(i))
+                };
+                let seq = seqs.value(i);
+                let op = ops.value(i);
+                writer.add(key, value, seq, op)?;
+            }
+        }
+
+        let (bytes, info) = writer.finish()?;
+
+        // 3. Atomically write the SST to disk. We write to a temp file and
+        //    rename into place so a mid-write crash never leaves a partial
+        //    SST that the engine might pick up.
+        let parent = self.file_path.parent().ok_or_else(|| {
+            ForstError::invalid_argument(format!(
+                "flush target has no parent directory: {}",
+                self.file_path.display()
+            ))
+        })?;
+        self.fs.create_dir_all(parent)?;
+        let tmp_path = self.temp_path();
+        {
+            let mut writable = self
+                .fs
+                .open_writable_file(&tmp_path, WriteMode::CreateNew)?;
+            writable.append(&bytes)?;
+            writable.flush()?;
+            writable.sync()?;
+        }
+        self.fs.rename(&tmp_path, &self.file_path)?;
+
+        // 4. Build the SstFileMeta that the VersionSet will record.
+        Ok(Self::info_to_meta(self.file_number, info))
+    }
+
+    fn temp_path(&self) -> PathBuf {
+        let mut base = self.file_path.clone();
+        let existing = base
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        base.set_file_name(format!(".{}.tmp", existing));
+        base
+    }
+
+    fn info_to_meta(file_number: FileNumber, info: SstFileInfo) -> SstFileMeta {
+        SstFileMeta {
+            file_number,
+            file_size: info.file_size,
+            smallest_key: info.min_key,
+            largest_key: info.max_key,
+            min_sequence: SequenceNumber(info.min_sequence),
+            max_sequence: SequenceNumber(info.max_sequence),
+            num_entries: info.entry_count,
+        }
+    }
+}
+
+/// Computes the standard SST file path for a given file number under a
+/// database directory. Format: `<db_path>/<file_number:06>.sst`.
+pub fn sst_file_path(db_path: &Path, file_number: FileNumber) -> PathBuf {
+    db_path.join(format!("{:06}.sst", file_number.value()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forst_rs_common::{CompressionType, OpType};
+    use forst_rs_io::MemoryFileSystem;
+    use forst_rs_storage::memtable::VectorizedMemTable;
+    use std::sync::RwLock;
+
+    type MemEntry<'a> = (&'a [u8], Option<&'a [u8]>, u8);
+
+    fn make_memtable(entries: &[MemEntry<'_>]) -> SharedMemTable {
+        let mut mem = VectorizedMemTable::with_defaults();
+        for (k, v, op) in entries {
+            mem.put(k, *v, *op).unwrap();
+        }
+        mem.freeze();
+        Arc::new(RwLock::new(mem))
+    }
+
+    fn default_writer_opts() -> SstWriterOptions {
+        SstWriterOptions {
+            block_size: 4 * 1024,
+            compression: CompressionType::None,
+        }
+    }
+
+    #[test]
+    fn test_flush_rejects_unfrozen_memtable() {
+        let mem = VectorizedMemTable::with_defaults();
+        let shared = Arc::new(RwLock::new(mem));
+        let fs = Arc::new(MemoryFileSystem::new());
+        let job = FlushJob::new(
+            shared,
+            FileNumber(1),
+            PathBuf::from("/db/000001.sst"),
+            default_writer_opts(),
+            fs,
+        );
+        let err = job.run().unwrap_err();
+        assert!(err.to_string().contains("not frozen"));
+    }
+
+    #[test]
+    fn test_flush_rejects_empty_memtable() {
+        let mut mem = VectorizedMemTable::with_defaults();
+        mem.freeze();
+        let shared = Arc::new(RwLock::new(mem));
+        let fs = Arc::new(MemoryFileSystem::new());
+        let job = FlushJob::new(
+            shared,
+            FileNumber(1),
+            PathBuf::from("/db/000001.sst"),
+            default_writer_opts(),
+            fs,
+        );
+        let err = job.run().unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn test_flush_writes_sst_file() {
+        let mem = make_memtable(&[
+            (b"a", Some(b"1"), OpType::Put as u8),
+            (b"b", Some(b"2"), OpType::Put as u8),
+            (b"c", None, OpType::Delete as u8),
+        ]);
+        let fs = Arc::new(MemoryFileSystem::new());
+        let path = PathBuf::from("/db/000007.sst");
+        let job = FlushJob::new(
+            mem,
+            FileNumber(7),
+            path.clone(),
+            default_writer_opts(),
+            fs.clone(),
+        );
+        let meta = job.run().unwrap();
+        assert_eq!(meta.file_number, FileNumber(7));
+        assert_eq!(meta.num_entries, 3);
+        assert_eq!(meta.smallest_key, b"a");
+        assert_eq!(meta.largest_key, b"c");
+        assert!(fs.file_exists(&path).unwrap());
+    }
+
+    #[test]
+    fn test_flush_tmp_file_cleaned_up_on_success() {
+        let mem = make_memtable(&[(b"a", Some(b"1"), OpType::Put as u8)]);
+        let fs = Arc::new(MemoryFileSystem::new());
+        let path = PathBuf::from("/db/000001.sst");
+        let job = FlushJob::new(
+            mem,
+            FileNumber(1),
+            path.clone(),
+            default_writer_opts(),
+            fs.clone(),
+        );
+        job.run().unwrap();
+        let tmp = PathBuf::from("/db/.000001.sst.tmp");
+        assert!(!fs.file_exists(&tmp).unwrap());
+    }
+
+    #[test]
+    fn test_flush_captures_min_max_sequence() {
+        let mut mem = VectorizedMemTable::with_defaults();
+        // put returns seq starting from 1; second put gets seq=2
+        mem.put(b"a", Some(b"1"), OpType::Put as u8).unwrap();
+        mem.put(b"b", Some(b"2"), OpType::Put as u8).unwrap();
+        mem.put(b"a", Some(b"3"), OpType::Put as u8).unwrap();
+        mem.freeze();
+        let shared = Arc::new(RwLock::new(mem));
+
+        let fs = Arc::new(MemoryFileSystem::new());
+        let job = FlushJob::new(
+            shared,
+            FileNumber(1),
+            PathBuf::from("/db/000001.sst"),
+            default_writer_opts(),
+            fs,
+        );
+        let meta = job.run().unwrap();
+        assert_eq!(meta.min_sequence, SequenceNumber(1));
+        assert_eq!(meta.max_sequence, SequenceNumber(3));
+    }
+
+    #[test]
+    fn test_flush_many_entries_spans_multiple_blocks() {
+        let mut mem = VectorizedMemTable::with_defaults();
+        for i in 0..2000u32 {
+            let key = format!("k{:06}", i);
+            let value = format!("v{:06}", i);
+            mem.put(key.as_bytes(), Some(value.as_bytes()), OpType::Put as u8)
+                .unwrap();
+        }
+        mem.freeze();
+        let shared = Arc::new(RwLock::new(mem));
+        let fs = Arc::new(MemoryFileSystem::new());
+        let job = FlushJob::new(
+            shared,
+            FileNumber(42),
+            PathBuf::from("/db/000042.sst"),
+            default_writer_opts(),
+            fs,
+        );
+        let meta = job.run().unwrap();
+        assert_eq!(meta.num_entries, 2000);
+        assert!(meta.file_size > 0);
+        assert_eq!(meta.smallest_key, b"k000000");
+        assert_eq!(meta.largest_key, b"k001999");
+    }
+
+    #[test]
+    fn test_flush_parent_dir_is_created() {
+        let mem = make_memtable(&[(b"a", Some(b"1"), OpType::Put as u8)]);
+        let fs = Arc::new(MemoryFileSystem::new());
+        let deep = PathBuf::from("/a/b/c/d/000001.sst");
+        let job = FlushJob::new(
+            mem,
+            FileNumber(1),
+            deep.clone(),
+            default_writer_opts(),
+            fs.clone(),
+        );
+        job.run().unwrap();
+        assert!(fs.file_exists(&deep).unwrap());
+    }
+
+    #[test]
+    fn test_sst_file_path_formatting() {
+        let base = PathBuf::from("/db");
+        let p = sst_file_path(&base, FileNumber(42));
+        assert_eq!(p, PathBuf::from("/db/000042.sst"));
+    }
+
+    #[test]
+    fn test_sst_file_path_large_number() {
+        let base = PathBuf::from("/db");
+        let p = sst_file_path(&base, FileNumber(123456789));
+        // 6-digit padding but numbers larger than 6 digits are still valid.
+        assert_eq!(p, PathBuf::from("/db/123456789.sst"));
+    }
+}
