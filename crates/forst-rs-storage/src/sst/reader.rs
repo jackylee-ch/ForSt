@@ -35,6 +35,10 @@ use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
 use super::schema::{FILE_HEADER_SIZE, SST_MAGIC};
 use super::sparse_index::{decode_index, search_index, BlockStats, SparseIndexEntry};
 
+/// A single row produced by [`SstReaderImpl::scan`]:
+/// `(key, value, sequence, op_type)`.
+pub type SstScanRow = (Vec<u8>, Option<Vec<u8>>, u64, OpType);
+
 /// Result of a point lookup: the value bytes and operation type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupResult {
@@ -266,6 +270,89 @@ impl SstReaderImpl {
             sequence: best_seq,
             op_type: op,
         }))
+    }
+
+    /// Scans the SST file for all entries in the `[lower, upper)` key range,
+    /// returning them as `(key, value, sequence, op_type)` tuples.
+    ///
+    /// Entries are ordered by `(key ASC, sequence DESC)` (the on-disk order
+    /// produced by [`SstWriterImpl`]). Unlike [`SstReaderImpl::get`], this
+    /// returns ALL versions of each key; callers resolve visibility and
+    /// merges.
+    pub fn scan(
+        &self,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) -> ForstResult<Vec<SstScanRow>> {
+        // Short-circuit if the scan range doesn't intersect [min_key, max_key].
+        if let Some(hi) = upper {
+            if hi <= self.footer.min_key.as_slice() {
+                return Ok(Vec::new());
+            }
+        }
+        if lower > self.footer.max_key.as_slice() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+        for (entry, stats) in self.index_entries.iter().zip(self.index_stats.iter()) {
+            // Skip blocks whose key ranges lie entirely outside [lower, upper).
+            if entry.last_key.as_slice() < lower {
+                continue;
+            }
+            if let Some(hi) = upper {
+                if stats.min_key.as_slice() >= hi {
+                    break;
+                }
+            }
+
+            let batch = self.read_data_block(entry.block_offset, entry.block_size)?;
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("column 0 must be BinaryArray");
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("column 1 must be BinaryArray");
+            let sequences = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("column 2 must be UInt64Array");
+            let op_types = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .expect("column 3 must be UInt8Array");
+
+            for row in 0..batch.num_rows() {
+                let key = keys.value(row);
+                if key < lower {
+                    continue;
+                }
+                if let Some(hi) = upper {
+                    if key >= hi {
+                        break;
+                    }
+                }
+                let value = if values.is_null(row) {
+                    None
+                } else {
+                    Some(values.value(row).to_vec())
+                };
+                let op = OpType::from_u8(op_types.value(row)).ok_or_else(|| {
+                    ForstError::corruption(format!(
+                        "invalid op_type in SST scan: {}",
+                        op_types.value(row)
+                    ))
+                })?;
+                out.push((key.to_vec(), value, sequences.value(row), op));
+            }
+        }
+        Ok(out)
     }
 }
 

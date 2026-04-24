@@ -26,7 +26,7 @@ use arrow::array::{BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstResult, OpType};
 
-use super::{GetResult, MemTableConfig};
+use super::{GetResult, MemTableConfig, ScanRow};
 
 /// Index of a single row within the columnar storage arrays.
 #[derive(Debug, Clone, Copy)]
@@ -332,6 +332,58 @@ impl VectorizedMemTable {
         }
 
         Ok(batches)
+    }
+
+    /// Collects all entries for keys in the `[lower, upper)` range as
+    /// `(key, value, sequence, op_type)` tuples in sorted order
+    /// (key ASC, sequence DESC).
+    ///
+    /// Only entries with `sequence <= read_sequence` are included.
+    /// Passing `lower=&[]` and `upper=None` yields every visible entry.
+    ///
+    /// The MemTable does NOT need to be frozen; unsorted buffer entries are
+    /// merged into the output stream on the fly.
+    pub fn collect_range_entries(
+        &self,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        read_sequence: u64,
+    ) -> Vec<ScanRow> {
+        use std::collections::BTreeMap;
+
+        // Merge sorted + unsorted into a temporary BTreeMap so callers see a
+        // single consistent ordering even when writes have not been folded
+        // into the sorted index yet.
+        let mut combined: BTreeMap<&[u8], Vec<RowIndex>> = BTreeMap::new();
+        for (k, idxs) in self.sorted_index.iter() {
+            combined.insert(k.as_slice(), idxs.clone());
+        }
+        for (k, idxs) in self.unsorted_lookup.iter() {
+            combined
+                .entry(k.as_slice())
+                .and_modify(|v| v.extend_from_slice(idxs))
+                .or_insert_with(|| idxs.clone());
+        }
+
+        let mut out = Vec::new();
+        let range: Box<dyn Iterator<Item = (&&[u8], &Vec<RowIndex>)>> = match upper {
+            Some(hi) => Box::new(combined.range(lower..hi)),
+            None => Box::new(combined.range(lower..)),
+        };
+
+        for (key, indices) in range {
+            // Sort by sequence DESC so the freshest version is first.
+            let mut sorted = indices.clone();
+            sorted.sort_by_key(|idx| std::cmp::Reverse(idx.sequence));
+            for idx in sorted {
+                if idx.sequence > read_sequence {
+                    continue;
+                }
+                let v = self.value_at(idx.offset).map(|s| s.to_vec());
+                out.push((key.to_vec(), v, idx.sequence, idx.op_type));
+            }
+        }
+        out
     }
 
     /// Point lookup: returns the latest entry for `key` with sequence <= `read_sequence`.

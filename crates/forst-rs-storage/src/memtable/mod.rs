@@ -24,6 +24,11 @@ pub use vectorized::VectorizedMemTable;
 
 use forst_rs_common::OpType;
 
+/// Convenience alias for a single scan row produced by
+/// [`VectorizedMemTable::collect_range_entries`]:
+/// `(key, value, sequence, op_type)`.
+pub type ScanRow = (Vec<u8>, Option<Vec<u8>>, u64, OpType);
+
 /// Result of a single-key point lookup in the MemTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetResult {
