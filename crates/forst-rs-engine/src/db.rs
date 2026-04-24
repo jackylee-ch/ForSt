@@ -1712,10 +1712,10 @@ mod tests {
 
     #[test]
     fn test_single_delete_compaction_elides_matching_put() {
-        // Seed one Put then one SingleDelete in separate flushes, so the
-        // two end up in sibling L0 SSTs. L0→L1 compaction on a
-        // non-bottommost level (we stage an empty L1 so this compaction
-        // is *not* bottommost) must elide BOTH entries.
+        // Verify the `[SingleDelete, Put]` pair is elided at compaction time
+        // regardless of bottommost-ness: after compaction the key reads
+        // absent AND a subsequent Put survives (i.e. no stale tombstone is
+        // retained to hide it).
         let db = open();
         let cf = db.default_cf();
         db.put(&cf, b"k", b"v").unwrap();
@@ -1724,7 +1724,16 @@ mod tests {
         db.flush_all().unwrap();
 
         db.compact_all().unwrap();
-        assert!(db.get(&cf, b"k").unwrap().is_none());
+        assert!(
+            db.get(&cf, b"k").unwrap().is_none(),
+            "key must be absent after [SD, Put] elision"
+        );
+
+        // Prove the elision removed the tombstone (not just shadowed it):
+        // a fresh Put should become visible immediately without requiring
+        // another flush+compaction.
+        db.put(&cf, b"k", b"new").unwrap();
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"new".as_ref()));
     }
 
     #[test]
@@ -1745,6 +1754,35 @@ mod tests {
         // The key must still read as absent — the tombstone must win over
         // whichever Put survived the collapse.
         assert!(db.get(&cf, b"k").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_single_delete_with_intervening_merge_does_not_resurrect() {
+        // Regression guard for the Round-3 [SD, Put, Merge]-style shape:
+        // the conservative strategy must NOT elide the SingleDelete when
+        // the version list has more than two entries. The older merged /
+        // put value must stay hidden.
+        use crate::ColumnFamilyDescriptor;
+        use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
+        use std::sync::Arc as StdArc;
+
+        let db = open();
+        let op: StdArc<dyn MergeOperator> = StdArc::new(ListAppendMergeOperator::with_comma());
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("merge_cf").with_merge_operator(op))
+            .unwrap();
+
+        db.put(&cf, b"k", b"base").unwrap();
+        db.merge(&cf, b"k", b"op1").unwrap();
+        db.flush_all().unwrap();
+        db.single_delete(&cf, b"k").unwrap();
+        db.flush_all().unwrap();
+
+        db.compact_all().unwrap();
+        assert!(
+            db.get(&cf, b"k").unwrap().is_none(),
+            "key must remain absent after fallback — Merge must not resurrect"
+        );
     }
 
     #[test]
