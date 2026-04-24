@@ -82,11 +82,17 @@ impl WriteBatch {
         self
     }
 
-    /// Appends a SingleDelete mutation. Semantically identical to `Delete`
-    /// when the key has only a single outstanding Put; undefined (but not
-    /// unsafe) when the key was written multiple times without an
-    /// intervening flush+compaction. Use when the caller can guarantee
-    /// single-write semantics (e.g. changelog records).
+    /// Appends a SingleDelete mutation. Mirrors RocksDB's `SingleDelete`:
+    /// it is semantically equivalent to `Delete` for point reads, but lets
+    /// compaction elide both the tombstone and its matching `Put` in one
+    /// pass when the caller can guarantee the key has been `Put` at most
+    /// once since the last `Delete` or `SingleDelete`.
+    ///
+    /// Misuse is deterministic but wrong: if the key was `Put` multiple
+    /// times, compaction may drop the `SingleDelete` together with only
+    /// the newest `Put`, leaving older shadowed `Put`s visible on the
+    /// next read. Use when the caller owns the write history (e.g.
+    /// changelog producers, CDC sinks).
     pub fn single_delete(&mut self, cf: &ColumnFamilyHandle, key: &[u8]) -> &mut Self {
         self.entries.push(WriteBatchEntry {
             cf_id: cf.id(),

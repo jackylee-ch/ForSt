@@ -238,6 +238,14 @@ impl DbImpl {
         self.write_single(cf, key, None, OpType::Delete)
     }
 
+    /// Deletes the key with `SingleDelete` semantics. See
+    /// [`crate::WriteBatch::single_delete`] for the contract — callers must
+    /// guarantee the key has been `put` at most once since the last
+    /// delete-family operation.
+    pub fn single_delete(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> ForstResult<u64> {
+        self.write_single(cf, key, None, OpType::SingleDelete)
+    }
+
     /// Appends a merge operand for the key.
     pub fn merge(&self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> ForstResult<u64> {
         self.write_single(cf, key, Some(operand), OpType::Merge)
@@ -1675,6 +1683,68 @@ mod tests {
         assert_eq!(db.get(&cf, b"k1").unwrap().as_deref(), Some(b"v1".as_ref()));
         assert_eq!(db.get(&cf, b"k2").unwrap().as_deref(), Some(b"v2".as_ref()));
         assert!(db.get(&cf, b"k3").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_single_delete_point_read_behaves_like_delete() {
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v").unwrap();
+        db.single_delete(&cf, b"k").unwrap();
+        assert!(
+            db.get(&cf, b"k").unwrap().is_none(),
+            "SingleDelete must make the key appear absent to point reads"
+        );
+    }
+
+    #[test]
+    fn test_write_batch_single_delete_roundtrip() {
+        let db = open();
+        let cf = db.default_cf();
+        let mut wb = WriteBatch::new();
+        wb.put(&cf, b"k1", b"v1")
+            .single_delete(&cf, b"k1")
+            .put(&cf, b"k2", b"v2");
+        db.batch_write(wb).unwrap();
+        assert!(db.get(&cf, b"k1").unwrap().is_none());
+        assert_eq!(db.get(&cf, b"k2").unwrap().as_deref(), Some(b"v2".as_ref()));
+    }
+
+    #[test]
+    fn test_single_delete_compaction_elides_matching_put() {
+        // Seed one Put then one SingleDelete in separate flushes, so the
+        // two end up in sibling L0 SSTs. L0→L1 compaction on a
+        // non-bottommost level (we stage an empty L1 so this compaction
+        // is *not* bottommost) must elide BOTH entries.
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v").unwrap();
+        db.flush_all().unwrap();
+        db.single_delete(&cf, b"k").unwrap();
+        db.flush_all().unwrap();
+
+        db.compact_all().unwrap();
+        assert!(db.get(&cf, b"k").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_single_delete_falls_back_when_two_puts_precede() {
+        // Contract violation: two consecutive Puts before the
+        // SingleDelete. Compaction must fall back to normal Delete
+        // semantics so the older Put remains shadowed.
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v1").unwrap();
+        db.flush_all().unwrap();
+        db.put(&cf, b"k", b"v2").unwrap();
+        db.flush_all().unwrap();
+        db.single_delete(&cf, b"k").unwrap();
+        db.flush_all().unwrap();
+
+        db.compact_all().unwrap();
+        // The key must still read as absent — the tombstone must win over
+        // whichever Put survived the collapse.
+        assert!(db.get(&cf, b"k").unwrap().is_none());
     }
 
     #[test]

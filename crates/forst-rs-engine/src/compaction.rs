@@ -234,7 +234,43 @@ impl CompactionJob {
         }
 
         match newest.op_type {
-            OpType::Delete | OpType::SingleDelete => {
+            OpType::SingleDelete => {
+                // SingleDelete optimization (RocksDB semantics):
+                //   [SingleDelete, Put]  or  [SingleDelete, Put, older-non-Put, ...]
+                //   → drop both the tombstone AND the matching Put, even on
+                //     non-bottommost levels.
+                //
+                // The contract requires the caller to have `put` the key
+                // at most once since the last delete-family op. If that
+                // contract is violated (two consecutive `Put`s below the
+                // tombstone) we fall back to plain Delete semantics so we
+                // never leave stale values visible.
+                let can_elide = versions.len() >= 2
+                    && versions[1].op_type == OpType::Put
+                    && (versions.len() < 3 || versions[2].op_type != OpType::Put);
+                if can_elide {
+                    // Drop SingleDelete + its matching Put; retain any
+                    // still-older shadowed versions so they stay tombstoned
+                    // at lower levels.
+                    for v in versions.iter().skip(2) {
+                        writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
+                        *emitted += 1;
+                    }
+                    return Ok(());
+                }
+                // Fallback path — behave like Delete.
+                if self.is_bottommost {
+                    return Ok(());
+                }
+                writer.add(
+                    &newest.key,
+                    newest.value.as_deref(),
+                    newest.sequence,
+                    newest.op_type as u8,
+                )?;
+                *emitted += 1;
+            }
+            OpType::Delete => {
                 if self.is_bottommost {
                     // Drop the tombstone AND every older version entirely.
                     return Ok(());

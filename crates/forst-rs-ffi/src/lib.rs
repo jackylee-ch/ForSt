@@ -60,7 +60,10 @@ pub const FRS_STATUS_NOT_FOUND: i32 = 3;
 pub const FRS_STATUS_INVALID_ARGUMENT: i32 = 4;
 /// Rust panic caught at the FFI boundary.
 pub const FRS_STATUS_PANIC: i32 = 5;
-/// The engine was poisoned (previous panic corrupted internal state).
+/// Reserved. The engine currently recovers from Rust `Mutex` poisoning
+/// transparently via `catch_unwind`, so this code is never returned today.
+/// Retained as a stable ABI slot; a future release may start surfacing it
+/// for unrecoverable lock corruption.
 pub const FRS_STATUS_POISONED: i32 = 6;
 /// I/O error (disk, filesystem, network).
 pub const FRS_STATUS_IO: i32 = 7;
@@ -74,9 +77,14 @@ pub const FRS_STATUS_ABORTED: i32 = 10;
 pub const FRS_STATUS_BUSY: i32 = 11;
 /// Operation did not complete within its deadline.
 pub const FRS_STATUS_TIMED_OUT: i32 = 12;
-/// The referenced item has expired (e.g. TTL elapsed, lease revoked).
+/// The referenced item has expired. Reserved for lease-based APIs; the
+/// current TTL compaction filter drops expired keys at compaction time
+/// rather than surfacing `EXPIRED` on read, so callers will not observe
+/// this status today.
 pub const FRS_STATUS_EXPIRED: i32 = 13;
-/// Operation completed only partially (e.g. partial read, incomplete scan).
+/// Operation completed only partially. Reserved for future cursor-style
+/// APIs (partial scans, chunked reads); no call site emits this status
+/// today.
 pub const FRS_STATUS_INCOMPLETE: i32 = 14;
 
 // ---------------------------------------------------------------------------
@@ -951,9 +959,17 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
                     wb.put(cf, key, values.value(i));
                 }
                 1 => {
+                    // Delete rows must not carry a value.
+                    if !values.is_null(i) {
+                        return FRS_STATUS_INVALID_ARGUMENT;
+                    }
                     wb.delete(cf, key);
                 }
                 2 => {
+                    // SingleDelete rows must not carry a value.
+                    if !values.is_null(i) {
+                        return FRS_STATUS_INVALID_ARGUMENT;
+                    }
                     wb.single_delete(cf, key);
                 }
                 3 => {
@@ -988,12 +1004,6 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
     out_schema: *mut FFI_ArrowSchema,
 ) -> i32 {
     guarded(|| {
-        let Some(db) = db_from_handle(handle) else {
-            return FRS_STATUS_NULL_ARG;
-        };
-        let Some(cf) = cf_ref(cf) else {
-            return FRS_STATUS_NULL_ARG;
-        };
         if keys_array.is_null()
             || keys_schema.is_null()
             || out_array.is_null()
@@ -1001,6 +1011,17 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
         {
             return FRS_STATUS_NULL_ARG;
         }
+        // Initialise outputs to inert empty() so caller-side release is safe
+        // on any early-error path.
+        std::ptr::write(out_array, FFI_ArrowArray::empty());
+        std::ptr::write(out_schema, FFI_ArrowSchema::empty());
+
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
 
         let keys_array_owned = std::ptr::read(keys_array);
         let keys_schema_owned = std::ptr::read(keys_schema);
@@ -1073,6 +1094,11 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
 /// containing every key-value pair whose key starts with `prefix`. The
 /// caller releases the output via the standard Arrow release callbacks.
 ///
+/// **Empty prefix semantics**: if `prefix` is NULL or `prefix_len == 0`, the
+/// call degenerates to a full column-family scan. Every key in the CF is
+/// returned, sorted in ascending byte-wise order. Callers should therefore
+/// treat the zero-length prefix as a potentially unbounded operation.
+///
 /// This is the W26 fast-path for DeltaJoin Lookup: Java consumers can
 /// wrap the returned arrays with `FFI_ArrowArray` / `FFI_ArrowSchema`
 /// pointers and iterate them without further per-row copies.
@@ -1086,15 +1112,21 @@ pub unsafe extern "C" fn frs_prefix_scan_arrow(
     out_schema: *mut FFI_ArrowSchema,
 ) -> i32 {
     guarded(|| {
+        if out_array.is_null() || out_schema.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        // Initialise outputs up-front so callers that blindly invoke the
+        // Arrow release callback on a partial-failure path see an inert
+        // (NULL callback) struct rather than garbage.
+        std::ptr::write(out_array, FFI_ArrowArray::empty());
+        std::ptr::write(out_schema, FFI_ArrowSchema::empty());
+
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
         let Some(cf) = cf_ref(cf) else {
             return FRS_STATUS_NULL_ARG;
         };
-        if out_array.is_null() || out_schema.is_null() {
-            return FRS_STATUS_NULL_ARG;
-        }
         let prefix_slice = if prefix.is_null() || prefix_len == 0 {
             &[][..]
         } else {
@@ -1770,12 +1802,15 @@ mod tests {
 
         unsafe {
             let mut db: FrsDb = ptr::null_mut();
-            frs_db_open_memory(&mut db);
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
             let mut cf: FrsCfHandle = ptr::null_mut();
-            frs_db_default_cf(db, &mut cf);
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
 
             // Seed key that the batch will SingleDelete.
-            frs_put(db, cf, b"k1".as_ptr(), 2, b"v1".as_ptr(), 2);
+            assert_eq!(
+                frs_put(db, cf, b"k1".as_ptr(), 2, b"v1".as_ptr(), 2),
+                FRS_STATUS_OK
+            );
 
             // Build a RecordBatch: SingleDelete k1 (op=2).
             let mut keys = BinaryBuilder::new();
@@ -1806,6 +1841,122 @@ mod tests {
             let mut out = FrsBytes::NULL;
             assert_eq!(frs_get(db, cf, b"k1".as_ptr(), 2, &mut out), FRS_STATUS_OK);
             assert!(out.data.is_null(), "k1 should have been SingleDeleted");
+            assert_eq!(out.len, 0);
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_batch_put_arrow_rejects_value_on_delete_op() {
+        // Regression guard for the Round-2 finding: Delete/SingleDelete
+        // rows must not carry a value.
+        use arrow::array::{BinaryBuilder, StructArray, UInt8Builder};
+        use arrow::datatypes::{DataType, Field};
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            for bad_op in [1u8, 2u8] {
+                let mut keys = BinaryBuilder::new();
+                let mut values = BinaryBuilder::new();
+                let mut ops = UInt8Builder::new();
+                keys.append_value(b"k");
+                values.append_value(b"not-null"); // Invalid: must be NULL.
+                ops.append_value(bad_op);
+                let struct_arr = StructArray::from(vec![
+                    (
+                        std::sync::Arc::new(Field::new("key", DataType::Binary, false)),
+                        std::sync::Arc::new(keys.finish()) as arrow::array::ArrayRef,
+                    ),
+                    (
+                        std::sync::Arc::new(Field::new("value", DataType::Binary, true)),
+                        std::sync::Arc::new(values.finish()) as arrow::array::ArrayRef,
+                    ),
+                    (
+                        std::sync::Arc::new(Field::new("op_type", DataType::UInt8, false)),
+                        std::sync::Arc::new(ops.finish()) as arrow::array::ArrayRef,
+                    ),
+                ]);
+                let (mut a, mut s) = to_ffi(&struct_arr.into_data()).expect("to_ffi");
+                assert_eq!(
+                    frs_batch_put_arrow(db, cf, &mut a, &mut s),
+                    FRS_STATUS_INVALID_ARGUMENT,
+                    "op={} with non-null value must be rejected",
+                    bad_op
+                );
+            }
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_single_delete_via_batch_put_arrow_compacts_away() {
+        // Flush a Put + SingleDelete and compact. Because the engine
+        // treats SingleDelete+Put as a collapsible pair, a *subsequent*
+        // Put of the same key must survive compaction untouched — proving
+        // the SingleDelete was elided rather than retained as a tombstone.
+        use arrow::array::{BinaryBuilder, StructArray, UInt8Builder};
+        use arrow::datatypes::{DataType, Field};
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Seed & flush a Put, then SingleDelete via Arrow batch & flush.
+            assert_eq!(
+                frs_put(db, cf, b"k".as_ptr(), 1, b"v".as_ptr(), 1),
+                FRS_STATUS_OK
+            );
+            assert_eq!(frs_flush(db), FRS_STATUS_OK);
+
+            let mut keys = BinaryBuilder::new();
+            let mut values = BinaryBuilder::new();
+            let mut ops = UInt8Builder::new();
+            keys.append_value(b"k");
+            values.append_null();
+            ops.append_value(2);
+            let struct_arr = StructArray::from(vec![
+                (
+                    std::sync::Arc::new(Field::new("key", DataType::Binary, false)),
+                    std::sync::Arc::new(keys.finish()) as arrow::array::ArrayRef,
+                ),
+                (
+                    std::sync::Arc::new(Field::new("value", DataType::Binary, true)),
+                    std::sync::Arc::new(values.finish()) as arrow::array::ArrayRef,
+                ),
+                (
+                    std::sync::Arc::new(Field::new("op_type", DataType::UInt8, false)),
+                    std::sync::Arc::new(ops.finish()) as arrow::array::ArrayRef,
+                ),
+            ]);
+            let (mut a, mut s) = to_ffi(&struct_arr.into_data()).expect("to_ffi");
+            assert_eq!(frs_batch_put_arrow(db, cf, &mut a, &mut s), FRS_STATUS_OK);
+            assert_eq!(frs_flush(db), FRS_STATUS_OK);
+            assert_eq!(frs_compact_all(db), FRS_STATUS_OK);
+
+            // After compaction, re-Put and read back. If the SingleDelete
+            // had been retained as a Delete tombstone at the bottommost
+            // level it would have been dropped (bottommost-level rule) —
+            // either way the final read should see the new value.
+            assert_eq!(
+                frs_put(db, cf, b"k".as_ptr(), 1, b"new".as_ptr(), 3),
+                FRS_STATUS_OK
+            );
+            let mut out = FrsBytes::NULL;
+            assert_eq!(frs_get(db, cf, b"k".as_ptr(), 1, &mut out), FRS_STATUS_OK);
+            assert!(!out.data.is_null());
+            let slice = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(slice, b"new");
+            frs_bytes_free(&mut out);
 
             frs_cf_close(cf);
             frs_db_close(db);

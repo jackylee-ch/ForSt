@@ -49,15 +49,15 @@ extern "C" {
 #define FRS_STATUS_NOT_FOUND         3
 #define FRS_STATUS_INVALID_ARGUMENT  4
 #define FRS_STATUS_PANIC             5
-#define FRS_STATUS_POISONED          6
+#define FRS_STATUS_POISONED          6   /* reserved — not currently produced */
 #define FRS_STATUS_IO                7
 #define FRS_STATUS_CORRUPTION        8
 #define FRS_STATUS_NOT_SUPPORTED     9
 #define FRS_STATUS_ABORTED           10
 #define FRS_STATUS_BUSY              11
 #define FRS_STATUS_TIMED_OUT         12
-#define FRS_STATUS_EXPIRED           13
-#define FRS_STATUS_INCOMPLETE        14
+#define FRS_STATUS_EXPIRED           13  /* reserved — TTL filter drops keys during compaction */
+#define FRS_STATUS_INCOMPLETE        14  /* reserved — future cursor-style APIs */
 
 /* -------------------------------------------------------------------- */
 /* Handle types                                                         */
