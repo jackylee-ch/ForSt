@@ -88,8 +88,14 @@ mod tests {
         let schema = sst_schema();
         assert!(!schema.field(0).is_nullable(), "key must be non-nullable");
         assert!(schema.field(1).is_nullable(), "value must be nullable");
-        assert!(!schema.field(2).is_nullable(), "sequence must be non-nullable");
-        assert!(!schema.field(3).is_nullable(), "op_type must be non-nullable");
+        assert!(
+            !schema.field(2).is_nullable(),
+            "sequence must be non-nullable"
+        );
+        assert!(
+            !schema.field(3).is_nullable(),
+            "op_type must be non-nullable"
+        );
     }
 
     #[test]

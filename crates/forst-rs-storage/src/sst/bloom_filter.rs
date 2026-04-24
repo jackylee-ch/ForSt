@@ -26,8 +26,7 @@ use forst_rs_common::{ForstError, ForstResult};
 /// Each salt produces one bit position (via `key_bits.wrapping_mul(salt) >> 27`),
 /// giving 8 independent bit probes per block.
 const SALT: [u32; 8] = [
-    0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b, 0x9efc4947,
-    0x5c6bfb31,
+    0x47b6137b, 0x44974d91, 0x8824ad5b, 0xa2b7289d, 0x705495c7, 0x2df1424b, 0x9efc4947, 0x5c6bfb31,
 ];
 
 /// Computes the optimal number of 256-bit blocks for the given number of keys.

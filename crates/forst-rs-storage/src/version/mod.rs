@@ -318,10 +318,7 @@ mod tests {
         let v = Version::new();
         // First add files
         let edit1 = VersionEdit {
-            new_files: vec![
-                (0, make_file(1, b"a", b"c")),
-                (0, make_file(2, b"d", b"f")),
-            ],
+            new_files: vec![(0, make_file(1, b"a", b"c")), (0, make_file(2, b"d", b"f"))],
             ..Default::default()
         };
         let v2 = v.apply_edit(&edit1).unwrap();
@@ -342,10 +339,7 @@ mod tests {
         let v = Version::new();
         // Add L0 files
         let edit1 = VersionEdit {
-            new_files: vec![
-                (0, make_file(1, b"a", b"d")),
-                (0, make_file(2, b"c", b"f")),
-            ],
+            new_files: vec![(0, make_file(1, b"a", b"d")), (0, make_file(2, b"c", b"f"))],
             ..Default::default()
         };
         let v2 = v.apply_edit(&edit1).unwrap();
@@ -411,10 +405,7 @@ mod tests {
     fn test_version_live_sst_files() {
         let v = Version::new();
         let edit = VersionEdit {
-            new_files: vec![
-                (0, make_file(1, b"a", b"c")),
-                (1, make_file(2, b"d", b"f")),
-            ],
+            new_files: vec![(0, make_file(1, b"a", b"c")), (1, make_file(2, b"d", b"f"))],
             ..Default::default()
         };
         let v2 = v.apply_edit(&edit).unwrap();

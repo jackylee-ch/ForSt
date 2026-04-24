@@ -386,12 +386,8 @@ mod tests {
     #[test]
     fn test_cf_data_basic_accessors() {
         let handle = ColumnFamilyHandle::new(ColumnFamilyId(1), "default");
-        let data = ColumnFamilyData::new(
-            handle.clone(),
-            CfOptions::default(),
-            None,
-            empty_snapshot(),
-        );
+        let data =
+            ColumnFamilyData::new(handle.clone(), CfOptions::default(), None, empty_snapshot());
         assert_eq!(data.handle(), &handle);
         assert_eq!(data.imm_count(), 0);
     }
@@ -416,8 +412,7 @@ mod tests {
     #[test]
     fn test_cf_data_swap_active_memtable_moves_to_imm() {
         let handle = ColumnFamilyHandle::new(ColumnFamilyId(1), "default");
-        let data =
-            ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
+        let data = ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
         assert_eq!(data.imm_count(), 0);
         let frozen = data.swap_active_memtable();
         assert!(frozen.read().unwrap().is_frozen());
@@ -427,8 +422,7 @@ mod tests {
     #[test]
     fn test_cf_data_pop_oldest_imm() {
         let handle = ColumnFamilyHandle::new(ColumnFamilyId(1), "default");
-        let data =
-            ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
+        let data = ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
         data.swap_active_memtable();
         data.swap_active_memtable();
         assert_eq!(data.imm_count(), 2);
@@ -440,8 +434,7 @@ mod tests {
     #[test]
     fn test_cf_data_snapshot_store_and_load() {
         let handle = ColumnFamilyHandle::new(ColumnFamilyId(1), "default");
-        let data =
-            ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
+        let data = ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
         let view = data.snapshot_view();
         assert_eq!(view.sequence(), 0);
 

@@ -172,13 +172,7 @@ pub trait BlockCache: Send + Sync {
     fn get(&self, key: &CacheKey) -> Option<Arc<CacheEntry>>;
 
     /// Insert an entry into the cache.
-    fn insert(
-        &self,
-        key: CacheKey,
-        value: CacheEntry,
-        charge: usize,
-        priority: CachePriority,
-    );
+    fn insert(&self, key: CacheKey, value: CacheEntry, charge: usize, priority: CachePriority);
 
     /// Remove a cached entry by key.
     fn erase(&self, key: &CacheKey);

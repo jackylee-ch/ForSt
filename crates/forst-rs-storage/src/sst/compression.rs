@@ -73,8 +73,7 @@ mod tests {
     fn test_lz4_roundtrip() {
         let data = b"The quick brown fox jumps over the lazy dog";
         let compressed = compress(data, CompressionType::Lz4).unwrap();
-        let decompressed =
-            decompress(&compressed, CompressionType::Lz4, data.len()).unwrap();
+        let decompressed = decompress(&compressed, CompressionType::Lz4, data.len()).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -82,8 +81,7 @@ mod tests {
     fn test_zstd_roundtrip() {
         let data = b"The quick brown fox jumps over the lazy dog";
         let compressed = compress(data, CompressionType::Zstd).unwrap();
-        let decompressed =
-            decompress(&compressed, CompressionType::Zstd, data.len()).unwrap();
+        let decompressed = decompress(&compressed, CompressionType::Zstd, data.len()).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -91,8 +89,7 @@ mod tests {
     fn test_lz4_small_data() {
         let data = b"ab";
         let compressed = compress(data, CompressionType::Lz4).unwrap();
-        let decompressed =
-            decompress(&compressed, CompressionType::Lz4, data.len()).unwrap();
+        let decompressed = decompress(&compressed, CompressionType::Lz4, data.len()).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -100,8 +97,7 @@ mod tests {
     fn test_zstd_small_data() {
         let data = b"ab";
         let compressed = compress(data, CompressionType::Zstd).unwrap();
-        let decompressed =
-            decompress(&compressed, CompressionType::Zstd, data.len()).unwrap();
+        let decompressed = decompress(&compressed, CompressionType::Zstd, data.len()).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -109,8 +105,7 @@ mod tests {
     fn test_lz4_empty() {
         let data = b"";
         let compressed = compress(data, CompressionType::Lz4).unwrap();
-        let decompressed =
-            decompress(&compressed, CompressionType::Lz4, 0).unwrap();
+        let decompressed = decompress(&compressed, CompressionType::Lz4, 0).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -118,8 +113,7 @@ mod tests {
     fn test_zstd_empty() {
         let data = b"";
         let compressed = compress(data, CompressionType::Zstd).unwrap();
-        let decompressed =
-            decompress(&compressed, CompressionType::Zstd, 0).unwrap();
+        let decompressed = decompress(&compressed, CompressionType::Zstd, 0).unwrap();
         assert_eq!(decompressed, data);
     }
 

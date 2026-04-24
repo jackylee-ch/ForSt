@@ -55,12 +55,7 @@ pub trait MergeOperator: Send + Sync {
     /// Called during compaction at non-bottommost levels. If partial merge
     /// is not supported, return an error and the engine will keep both
     /// operands as separate entries.
-    fn partial_merge(
-        &self,
-        key: &[u8],
-        left: &[u8],
-        right: &[u8],
-    ) -> ForstResult<Vec<u8>>;
+    fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> ForstResult<Vec<u8>>;
 
     /// Returns the name of this merge operator (used for validation).
     fn name(&self) -> &str;
@@ -120,12 +115,7 @@ impl MergeOperator for ListAppendMergeOperator {
         Ok(result)
     }
 
-    fn partial_merge(
-        &self,
-        _key: &[u8],
-        left: &[u8],
-        right: &[u8],
-    ) -> ForstResult<Vec<u8>> {
+    fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> ForstResult<Vec<u8>> {
         let mut result = Vec::with_capacity(left.len() + 1 + right.len());
         result.extend_from_slice(left);
         result.push(self.delimiter);

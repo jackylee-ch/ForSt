@@ -33,9 +33,7 @@ use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
 use forst_rs_storage::version::{SstFileMeta, Version, VersionEdit, VersionSetImpl};
 
-use crate::checkpoint::{
-    copy_live_ssts, serialize_snapshot, write_blob, CheckpointManifest,
-};
+use crate::checkpoint::{copy_live_ssts, serialize_snapshot, write_blob, CheckpointManifest};
 use crate::column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
 use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::file_deletion_guard::FileDeletionGuard;
@@ -90,9 +88,7 @@ impl DbImpl {
             ));
         }
         if options.db_path.is_empty() {
-            return Err(ForstError::invalid_argument(
-                "db_path must not be empty",
-            ));
+            return Err(ForstError::invalid_argument("db_path must not be empty"));
         }
         let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
         Self::open_with_fs(options, fs)
@@ -100,10 +96,7 @@ impl DbImpl {
 
     /// Creates a new engine with a pluggable [`FileSystem`]. Useful for
     /// in-memory tests with [`MemoryFileSystem`].
-    pub fn open_with_fs(
-        options: EngineOptions,
-        fs: Arc<dyn FileSystem>,
-    ) -> ForstResult<Arc<Self>> {
+    pub fn open_with_fs(options: EngineOptions, fs: Arc<dyn FileSystem>) -> ForstResult<Arc<Self>> {
         if options.write_buffer_size == 0 {
             return Err(ForstError::invalid_argument(
                 "write_buffer_size must be greater than zero",
@@ -330,14 +323,12 @@ impl DbImpl {
                 let mem_arc = cf_data.active_memtable();
                 let mut mem = mem_arc.write().expect("lock poisoned");
 
-                let keys: Vec<&[u8]> =
-                    indices.iter().map(|&i| entries[i].key.as_slice()).collect();
+                let keys: Vec<&[u8]> = indices.iter().map(|&i| entries[i].key.as_slice()).collect();
                 let values: Vec<Option<&[u8]>> = indices
                     .iter()
                     .map(|&i| entries[i].value.as_deref())
                     .collect();
-                let op_types: Vec<u8> =
-                    indices.iter().map(|&i| entries[i].op_type as u8).collect();
+                let op_types: Vec<u8> = indices.iter().map(|&i| entries[i].op_type as u8).collect();
                 mem.batch_insert(&keys, &values, &op_types)?;
                 last_seq = self
                     .sequence_number
@@ -494,8 +485,11 @@ impl DbImpl {
         let base = self.options.max_bytes_for_level_base as f64;
         let mult = self.options.max_bytes_for_level_multiplier;
         for level in 1..(self.options.num_levels - 1) {
-            let total_size: u64 =
-                version.levels[level].files.iter().map(|f| f.file_size).sum();
+            let total_size: u64 = version.levels[level]
+                .files
+                .iter()
+                .map(|f| f.file_size)
+                .sum();
             let target = (base * mult.powi(level as i32 - 1)) as u64;
             if total_size > target {
                 return Some(level as u32);
@@ -559,11 +553,15 @@ impl DbImpl {
             inputs.push((level, f.clone(), self.get_or_open_sst_reader(f)?));
         }
         for f in &overlapping_dst {
-            inputs.push((next_level as u32, f.clone(), self.get_or_open_sst_reader(f)?));
+            inputs.push((
+                next_level as u32,
+                f.clone(),
+                self.get_or_open_sst_reader(f)?,
+            ));
         }
 
-        let is_bottommost = (next_level + 1..version.num_levels())
-            .all(|lvl| version.levels[lvl].files.is_empty());
+        let is_bottommost =
+            (next_level + 1..version.num_levels()).all(|lvl| version.levels[lvl].files.is_empty());
         let output_file_number = self.version_set.allocate_file_number();
         let output_path = compaction_output_path(&self.db_path, output_file_number);
         let writer_options = SstWriterOptions {
@@ -665,12 +663,8 @@ impl DbImpl {
         self.fs.create_dir_all(target_dir)?;
         write_blob(self.fs.as_ref(), target_dir, &blob)?;
 
-        let (sst_bytes, sst_files) = copy_live_ssts(
-            self.fs.as_ref(),
-            &self.db_path,
-            target_dir,
-            &live,
-        )?;
+        let (sst_bytes, sst_files) =
+            copy_live_ssts(self.fs.as_ref(), &self.db_path, target_dir, &live)?;
 
         // PinHandle is released here when `_pin` drops; any deletions that
         // were deferred during the checkpoint will be reaped on the next
@@ -713,13 +707,11 @@ impl DbImpl {
         }
 
         // Build the DbImpl with the restored VersionSet.
-        let version_set = Arc::new(
-            forst_rs_storage::version::VersionSetImpl::from_restored(
-                (*snapshot.version).clone(),
-                snapshot.next_file_number,
-                snapshot.last_sequence,
-            ),
-        );
+        let version_set = Arc::new(forst_rs_storage::version::VersionSetImpl::from_restored(
+            (*snapshot.version).clone(),
+            snapshot.next_file_number,
+            snapshot.last_sequence,
+        ));
 
         let db = Arc::new(Self {
             options,
@@ -771,8 +763,8 @@ impl DbImpl {
         // produces a single bottommost-style file at L1. We mark it as
         // bottommost iff there are no files below L1 (all higher levels
         // empty) so delete tombstones can be eliminated.
-        let is_bottommost = (2..version.num_levels())
-            .all(|lvl| version.levels[lvl].files.is_empty());
+        let is_bottommost =
+            (2..version.num_levels()).all(|lvl| version.levels[lvl].files.is_empty());
 
         let output_file_number = self.version_set.allocate_file_number();
         let output_path = compaction_output_path(&self.db_path, output_file_number);
@@ -901,10 +893,7 @@ impl DbImpl {
         self.scan(cf, prefix, upper.as_deref())
     }
 
-    fn flush_cf_data(
-        &self,
-        cf_data: &Arc<ColumnFamilyData>,
-    ) -> ForstResult<Option<SstFileMeta>> {
+    fn flush_cf_data(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<Option<SstFileMeta>> {
         // Serialize flushes for this CF so concurrent callers cannot pick up
         // the same oldest imm and write it twice.
         let _flush_guard = cf_data.lock_flush();
@@ -979,19 +968,14 @@ impl DbImpl {
 
     /// In-lock portion of the switch decision. Returns `true` if a switch
     /// happened and the caller should flush outside the write lock.
-    fn maybe_switch_memtable_in_lock(
-        &self,
-        cf_data: &Arc<ColumnFamilyData>,
-    ) -> ForstResult<bool> {
+    fn maybe_switch_memtable_in_lock(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<bool> {
         let usage = {
             let mem_arc = cf_data.active_memtable();
             let mem = mem_arc.read().expect("lock poisoned");
             mem.memory_usage()
         };
 
-        let threshold = cf_data
-            .options()
-            .effective_write_buffer_size(&self.options);
+        let threshold = cf_data.options().effective_write_buffer_size(&self.options);
         if usage < threshold {
             return Ok(false);
         }
@@ -1072,22 +1056,23 @@ impl DbImpl {
         match active_hit {
             Some(entry) if entry.op_type == OpType::Put => return Ok(entry.value),
             Some(entry)
-                if entry.op_type == OpType::Delete
-                    || entry.op_type == OpType::SingleDelete =>
+                if entry.op_type == OpType::Delete || entry.op_type == OpType::SingleDelete =>
             {
                 return Ok(None);
             }
             Some(entry) => {
                 // Merge — collect operands and resolve via the merge operator.
                 debug_assert_eq!(entry.op_type, OpType::Merge);
-                let first_operand = entry.value.ok_or_else(|| {
-                    ForstError::corruption("Merge entry missing operand payload")
-                })?;
+                let first_operand = entry
+                    .value
+                    .ok_or_else(|| ForstError::corruption("Merge entry missing operand payload"))?;
                 let mut operands: Vec<Vec<u8>> = Vec::new();
                 operands.push(first_operand);
                 let base =
                     self.collect_merge_operands(cf_data, key, entry.sequence, &mut operands)?;
-                return self.apply_merge_operator(cf_data, key, base, operands).map(Some);
+                return self
+                    .apply_merge_operator(cf_data, key, base, operands)
+                    .map(Some);
             }
             None => {}
         }
@@ -1244,10 +1229,7 @@ impl DbImpl {
         reader.get(key)
     }
 
-    fn get_or_open_sst_reader(
-        &self,
-        meta: &SstFileMeta,
-    ) -> ForstResult<Arc<SstReaderImpl>> {
+    fn get_or_open_sst_reader(&self, meta: &SstFileMeta) -> ForstResult<Arc<SstReaderImpl>> {
         {
             let cache = self.sst_readers.read().expect("lock poisoned");
             if let Some(r) = cache.get(&meta.file_number) {
@@ -1309,9 +1291,7 @@ impl DbImpl {
             Some(first_seq - 1)
         };
         if let Some(cutoff) = initial {
-            if let Some(base) =
-                self.peel_merges_from_memtable(&mem_arc, key, cutoff, operands)?
-            {
+            if let Some(base) = self.peel_merges_from_memtable(&mem_arc, key, cutoff, operands)? {
                 return Ok(base.value);
             }
         }
@@ -1598,10 +1578,7 @@ mod tests {
         let cf = db.default_cf();
         db.put(&cf, b"k", b"old").unwrap();
         db.put(&cf, b"k", b"new").unwrap();
-        assert_eq!(
-            db.get(&cf, b"k").unwrap().as_deref(),
-            Some(b"new".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"new".as_ref()));
     }
 
     #[test]
@@ -1639,9 +1616,7 @@ mod tests {
         let db = open();
         let op: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::with_comma());
         let cf = db
-            .create_column_family(
-                ColumnFamilyDescriptor::new("merge_cf").with_merge_operator(op),
-            )
+            .create_column_family(ColumnFamilyDescriptor::new("merge_cf").with_merge_operator(op))
             .unwrap();
         (db, cf)
     }
@@ -1697,14 +1672,8 @@ mod tests {
             .delete(&cf, b"k3");
         db.batch_write(b).unwrap();
 
-        assert_eq!(
-            db.get(&cf, b"k1").unwrap().as_deref(),
-            Some(b"v1".as_ref())
-        );
-        assert_eq!(
-            db.get(&cf, b"k2").unwrap().as_deref(),
-            Some(b"v2".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k1").unwrap().as_deref(), Some(b"v1".as_ref()));
+        assert_eq!(db.get(&cf, b"k2").unwrap().as_deref(), Some(b"v2".as_ref()));
         assert!(db.get(&cf, b"k3").unwrap().is_none());
     }
 
@@ -1762,10 +1731,7 @@ mod tests {
         db.put(&cf, b"k", b"v").unwrap();
         db.force_switch_memtable(&cf).unwrap();
         // After switch, the value lives in the immutable queue only.
-        assert_eq!(
-            db.get(&cf, b"k").unwrap().as_deref(),
-            Some(b"v".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"v".as_ref()));
     }
 
     #[test]
@@ -1835,14 +1801,8 @@ mod tests {
         let cf_data = db.lookup_cf_by_id(cf.id()).unwrap();
         assert_eq!(cf_data.imm_count(), 0);
         assert_eq!(db.version_set.current().l0_files().len(), 1);
-        assert_eq!(
-            db.get(&cf, b"k1").unwrap().as_deref(),
-            Some(b"v1".as_ref())
-        );
-        assert_eq!(
-            db.get(&cf, b"k2").unwrap().as_deref(),
-            Some(b"v2".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k1").unwrap().as_deref(), Some(b"v1".as_ref()));
+        assert_eq!(db.get(&cf, b"k2").unwrap().as_deref(), Some(b"v2".as_ref()));
         assert!(db.get(&cf, b"missing").unwrap().is_none());
     }
 
@@ -1864,10 +1824,7 @@ mod tests {
         db.switch_and_flush(&cf).unwrap().unwrap();
         // Newer value in fresh active memtable.
         db.put(&cf, b"k", b"new").unwrap();
-        assert_eq!(
-            db.get(&cf, b"k").unwrap().as_deref(),
-            Some(b"new".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"new".as_ref()));
     }
 
     #[test]
@@ -1893,14 +1850,8 @@ mod tests {
         db.force_switch_memtable(&b).unwrap();
         db.flush_all().unwrap();
         assert_eq!(db.version_set.current().l0_files().len(), 2);
-        assert_eq!(
-            db.get(&a, b"ka").unwrap().as_deref(),
-            Some(b"va".as_ref())
-        );
-        assert_eq!(
-            db.get(&b, b"kb").unwrap().as_deref(),
-            Some(b"vb".as_ref())
-        );
+        assert_eq!(db.get(&a, b"ka").unwrap().as_deref(), Some(b"va".as_ref()));
+        assert_eq!(db.get(&b, b"kb").unwrap().as_deref(), Some(b"vb".as_ref()));
     }
 
     #[test]
@@ -1914,10 +1865,7 @@ mod tests {
         db.put(&cf, b"k", b"v3").unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
         assert_eq!(db.version_set.current().l0_files().len(), 3);
-        assert_eq!(
-            db.get(&cf, b"k").unwrap().as_deref(),
-            Some(b"v3".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"v3".as_ref()));
     }
 
     #[test]
@@ -2155,10 +2103,7 @@ mod tests {
         assert_eq!(v.levels[1].files.len(), 1);
         assert_eq!(v.levels[1].files[0].file_number, new_meta.file_number);
         // Read still works.
-        assert_eq!(
-            db.get(&cf, b"k").unwrap().as_deref(),
-            Some(b"v".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"v".as_ref()));
     }
 
     #[test]
@@ -2199,10 +2144,7 @@ mod tests {
         db.compact_l0(&cf).unwrap().unwrap();
         let v = db.version_set.current();
         assert_eq!(v.levels[1].files[0].num_entries, 1); // Only latest kept.
-        assert_eq!(
-            db.get(&cf, b"k").unwrap().as_deref(),
-            Some(b"v3".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"v3".as_ref()));
     }
 
     #[test]
@@ -2295,10 +2237,7 @@ mod tests {
         let v = db.version_set.current();
         assert_eq!(v.levels[1].files.len(), 0);
         assert_eq!(v.levels[2].files.len(), 1);
-        assert_eq!(
-            db.get(&cf, b"k1").unwrap().as_deref(),
-            Some(b"v1".as_ref())
-        );
+        assert_eq!(db.get(&cf, b"k1").unwrap().as_deref(), Some(b"v1".as_ref()));
     }
 
     #[test]
@@ -2384,9 +2323,7 @@ mod tests {
         let filter_now: fn() -> u64 = || 1_000;
         let filter = Arc::new(TtlCompactionFilter::with_clock(50, filter_now));
         let cf = db
-            .create_column_family(
-                ColumnFamilyDescriptor::new("ttl").with_compaction_filter(filter),
-            )
+            .create_column_family(ColumnFamilyDescriptor::new("ttl").with_compaction_filter(filter))
             .unwrap();
 
         // Old entry (ts=500, age at compaction time = 500) should be discarded.
@@ -2414,9 +2351,7 @@ mod tests {
         let now: fn() -> u64 = || 1_000;
         let filter = Arc::new(TtlCompactionFilter::with_clock(0, now));
         let cf = db
-            .create_column_family(
-                ColumnFamilyDescriptor::new("ttl").with_compaction_filter(filter),
-            )
+            .create_column_family(ColumnFamilyDescriptor::new("ttl").with_compaction_filter(filter))
             .unwrap();
 
         db.delete(&cf, b"key").unwrap();
@@ -2433,10 +2368,7 @@ mod tests {
 
     // --- W15.2 checkpoint tests ---
 
-    fn open_in_shared_fs(
-        path: &str,
-        fs: Arc<dyn FileSystem>,
-    ) -> Arc<DbImpl> {
+    fn open_in_shared_fs(path: &str, fs: Arc<dyn FileSystem>) -> Arc<DbImpl> {
         let opts = EngineOptions {
             db_path: path.to_string(),
             ..EngineOptions::default()
@@ -2454,7 +2386,9 @@ mod tests {
         db.put(&cf, b"k2", b"v2").unwrap();
 
         let manifest = db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
-        assert!(fs.file_exists(std::path::Path::new("/ckpt/CHECKPOINT.blob")).unwrap());
+        assert!(fs
+            .file_exists(std::path::Path::new("/ckpt/CHECKPOINT.blob"))
+            .unwrap());
         assert!(!manifest.sst_files.is_empty());
         assert!(manifest.total_bytes > 0);
     }
@@ -2485,7 +2419,8 @@ mod tests {
             assert_eq!(
                 restored.get(&rcf, k.as_bytes()).unwrap().as_deref(),
                 Some(v.as_bytes()),
-                "mismatch at i={}", i
+                "mismatch at i={}",
+                i
             );
         }
     }
@@ -2534,7 +2469,10 @@ mod tests {
         // Compaction attempts to delete `pinned` but the guard defers.
         db.compact_l0(&cf).unwrap().unwrap();
         let path = sst_file_path(&db.db_path, pinned);
-        assert!(db.fs.file_exists(&path).unwrap(), "pinned file must survive");
+        assert!(
+            db.fs.file_exists(&path).unwrap(),
+            "pinned file must survive"
+        );
         drop(pin);
         // Trigger a reap via another flush/compact cycle.
         db.put(&cf, b"other", b"v2").unwrap();

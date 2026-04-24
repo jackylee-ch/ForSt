@@ -30,11 +30,11 @@ use arrow::datatypes::Schema;
 
 use forst_rs_common::{CompressionType, ForstError, ForstResult};
 
+use super::bloom_filter::Sbbf;
 use super::data_block::encode_data_block;
 use super::file_header::FileHeader;
 use super::footer::{ChecksumType, FooterV1};
 use super::schema::{sst_schema, SST_FORMAT_VERSION};
-use super::bloom_filter::Sbbf;
 use super::sparse_index::{encode_index, BlockStats, SparseIndexEntry};
 
 /// Information about a completed SST file.

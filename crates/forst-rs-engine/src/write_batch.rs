@@ -182,7 +182,9 @@ mod tests {
     fn test_chained_put_put_delete() {
         let h = handle(1, "default");
         let mut b = WriteBatch::new();
-        b.put(&h, b"k1", b"v1").put(&h, b"k2", b"v2").delete(&h, b"k3");
+        b.put(&h, b"k1", b"v1")
+            .put(&h, b"k2", b"v2")
+            .delete(&h, b"k3");
         assert_eq!(b.len(), 3);
         assert_eq!(b.entries()[0].key, b"k1");
         assert_eq!(b.entries()[1].key, b"k2");

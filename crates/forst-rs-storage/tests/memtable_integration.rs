@@ -54,7 +54,12 @@ fn test_m3_batch_insert_100k_get_all() {
         let result = mt.get(key.as_bytes(), u64::MAX).unwrap();
         assert!(result.is_some(), "key {} not found at index {}", key, i);
         let r = result.unwrap();
-        assert_eq!(r.value, Some(expected_val.into_bytes()), "mismatch at {}", i);
+        assert_eq!(
+            r.value,
+            Some(expected_val.into_bytes()),
+            "mismatch at {}",
+            i
+        );
         assert_eq!(r.op_type, OpType::Put);
         hits += 1;
     }
@@ -126,8 +131,16 @@ fn test_m3_freeze_to_flush_batches_sorted() {
     let mut prev_key: Vec<u8> = Vec::new();
     let mut count = 0;
     for batch in &batches {
-        let keys = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
-        let seqs = batch.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let seqs = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
 
         for i in 0..batch.num_rows() {
             let key = keys.value(i).to_vec();

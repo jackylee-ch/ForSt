@@ -303,12 +303,7 @@ impl CompactionJob {
                     // Delete so subsequent reads see it.)
                     let _ = stop_on_delete;
                     for v in versions {
-                        writer.add(
-                            &v.key,
-                            v.value.as_deref(),
-                            v.sequence,
-                            v.op_type as u8,
-                        )?;
+                        writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
                         *emitted += 1;
                     }
                 }

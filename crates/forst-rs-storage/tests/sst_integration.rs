@@ -243,7 +243,10 @@ fn test_e2e_bloom_filter_filters_keys() {
     // Decode the bloom filter.
     let bf_start = footer.bloom_filter_offset as usize;
     let bf_end = bf_start + footer.bloom_filter_size as usize;
-    assert!(bf_end <= footer_start, "bloom filter should end before footer");
+    assert!(
+        bf_end <= footer_start,
+        "bloom filter should end before footer"
+    );
     let sbbf = Sbbf::decode(&data[bf_start..bf_end]).unwrap();
 
     // All inserted keys must be found (no false negatives).

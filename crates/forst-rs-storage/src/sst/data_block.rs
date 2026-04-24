@@ -56,12 +56,12 @@ pub fn encode_data_block(
         let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).map_err(|e| {
             ForstError::corruption(format!("Arrow IPC StreamWriter creation failed: {e}"))
         })?;
-        writer.write(batch).map_err(|e| {
-            ForstError::corruption(format!("Arrow IPC write failed: {e}"))
-        })?;
-        writer.finish().map_err(|e| {
-            ForstError::corruption(format!("Arrow IPC finish failed: {e}"))
-        })?;
+        writer
+            .write(batch)
+            .map_err(|e| ForstError::corruption(format!("Arrow IPC write failed: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| ForstError::corruption(format!("Arrow IPC finish failed: {e}")))?;
         buf
     };
 
@@ -139,9 +139,7 @@ pub fn decode_data_block(data: &[u8]) -> ForstResult<RecordBatch> {
     let batch = reader
         .next()
         .ok_or_else(|| ForstError::corruption("Arrow IPC stream contains no record batches"))?
-        .map_err(|e| {
-            ForstError::corruption(format!("Arrow IPC read failed: {e}"))
-        })?;
+        .map_err(|e| ForstError::corruption(format!("Arrow IPC read failed: {e}")))?;
 
     Ok(batch)
 }
@@ -166,11 +164,7 @@ mod tests {
         let schema = Arc::new(super::super::schema::sst_schema());
 
         let key_array = BinaryArray::from_iter_values(keys);
-        let value_array = BinaryArray::from(
-            values
-                .into_iter()
-                .collect::<Vec<Option<&[u8]>>>(),
-        );
+        let value_array = BinaryArray::from(values.into_iter().collect::<Vec<Option<&[u8]>>>());
         let sequence_array = UInt64Array::from(sequences);
         let op_type_array = UInt8Array::from(op_types);
 
@@ -188,12 +182,7 @@ mod tests {
 
     #[test]
     fn test_encode_produces_header_plus_data() {
-        let batch = make_test_batch(
-            vec![b"key1"],
-            vec![Some(b"val1")],
-            vec![1],
-            vec![0],
-        );
+        let batch = make_test_batch(vec![b"key1"], vec![Some(b"val1")], vec![1], vec![0]);
         let encoded = encode_data_block(&batch, CompressionType::None).unwrap();
         assert!(
             encoded.len() > BLOCK_HEADER_SIZE,
@@ -307,12 +296,7 @@ mod tests {
 
     #[test]
     fn test_decode_corrupt_checksum() {
-        let batch = make_test_batch(
-            vec![b"key"],
-            vec![Some(b"val")],
-            vec![1],
-            vec![0],
-        );
+        let batch = make_test_batch(vec![b"key"], vec![Some(b"val")], vec![1], vec![0]);
         let mut encoded = encode_data_block(&batch, CompressionType::None).unwrap();
 
         // Corrupt the checksum (bytes 12-15).
@@ -329,12 +313,7 @@ mod tests {
 
     #[test]
     fn test_decode_truncated_data() {
-        let batch = make_test_batch(
-            vec![b"key"],
-            vec![Some(b"val")],
-            vec![1],
-            vec![0],
-        );
+        let batch = make_test_batch(vec![b"key"], vec![Some(b"val")], vec![1], vec![0]);
         let encoded = encode_data_block(&batch, CompressionType::None).unwrap();
 
         // Truncate: keep header + only half of the payload.
@@ -344,10 +323,7 @@ mod tests {
         let result = decode_data_block(truncated);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("truncated"),
-            "unexpected error: {err_msg}"
-        );
+        assert!(err_msg.contains("truncated"), "unexpected error: {err_msg}");
     }
 
     #[test]
@@ -356,10 +332,7 @@ mod tests {
         let result = decode_data_block(&short);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("too short"),
-            "unexpected error: {err_msg}"
-        );
+        assert!(err_msg.contains("too short"), "unexpected error: {err_msg}");
     }
 
     #[test]
@@ -368,8 +341,9 @@ mod tests {
         // produces smaller output than no compression.
         let n = 200;
         let keys: Vec<&[u8]> = (0..n).map(|_| b"repetitive_key_data".as_slice()).collect();
-        let values: Vec<Option<&[u8]>> =
-            (0..n).map(|_| Some(b"repetitive_value_data".as_slice())).collect();
+        let values: Vec<Option<&[u8]>> = (0..n)
+            .map(|_| Some(b"repetitive_value_data".as_slice()))
+            .collect();
         let sequences: Vec<u64> = (0..n as u64).collect();
         let op_types: Vec<u8> = vec![0; n];
 

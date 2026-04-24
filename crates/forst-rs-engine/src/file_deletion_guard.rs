@@ -199,10 +199,7 @@ mod tests {
         g.pin(FileNumber(3));
         let mut pinned = g.pinned_files();
         pinned.sort_by_key(|f| f.value());
-        assert_eq!(
-            pinned,
-            vec![FileNumber(1), FileNumber(3), FileNumber(7)]
-        );
+        assert_eq!(pinned, vec![FileNumber(1), FileNumber(3), FileNumber(7)]);
     }
 
     #[test]

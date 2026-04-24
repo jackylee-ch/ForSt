@@ -392,13 +392,7 @@ impl BlockCache for ShardedClockCache {
         result
     }
 
-    fn insert(
-        &self,
-        key: CacheKey,
-        value: CacheEntry,
-        charge: usize,
-        priority: CachePriority,
-    ) {
+    fn insert(&self, key: CacheKey, value: CacheEntry, charge: usize, priority: CachePriority) {
         let hash = key.hash();
         let shard_idx = self.shard_index(hash);
 
@@ -535,7 +529,7 @@ mod tests {
     fn test_eviction_under_capacity() {
         // Small cache: 500 bytes
         let cache = ShardedClockCache::new(500, 0); // 1 shard for predictability
-        // Insert entries that exceed capacity
+                                                    // Insert entries that exceed capacity
         for i in 0..10 {
             cache.insert(
                 CacheKey::new(1, i * 4096),
@@ -646,14 +640,9 @@ mod tests {
     #[test]
     fn test_shard_distribution() {
         let cache = ShardedClockCache::new(1024 * 1024, 4); // 16 shards
-        // Insert 1000 entries, they should distribute across shards
+                                                            // Insert 1000 entries, they should distribute across shards
         for i in 0..1000 {
-            cache.insert(
-                CacheKey::new(i, 0),
-                make_entry(64),
-                64,
-                CachePriority::Low,
-            );
+            cache.insert(CacheKey::new(i, 0), make_entry(64), 64, CachePriority::Low);
         }
         // At least half the shards should have entries
         let non_empty_shards = cache

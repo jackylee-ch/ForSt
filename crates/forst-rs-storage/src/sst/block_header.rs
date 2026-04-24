@@ -143,10 +143,7 @@ mod tests {
         let result = BlockHeader::decode(&short);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("too short"),
-            "unexpected error: {err_msg}"
-        );
+        assert!(err_msg.contains("too short"), "unexpected error: {err_msg}");
     }
 
     #[test]

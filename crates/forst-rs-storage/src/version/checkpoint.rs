@@ -334,10 +334,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_binary_keys() {
-        let snap = make_snapshot(vec![(
-            0,
-            make_file(1, &[0x00, 0x01, 0xFF], &[0xFE, 0xFF]),
-        )]);
+        let snap = make_snapshot(vec![(0, make_file(1, &[0x00, 0x01, 0xFF], &[0xFE, 0xFF]))]);
         let blob = serialize_to_blob(&snap).unwrap();
         let restored = restore_from_blob(&blob).unwrap();
         let f = &restored.version.levels[0].files[0];

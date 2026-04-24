@@ -123,12 +123,7 @@ impl VectorizedMemTable {
     /// `op_type_byte`: 0 = Put, 1 = Delete, 2 = SingleDelete, 3 = Merge.
     ///
     /// Returns the assigned sequence number.
-    pub fn put(
-        &mut self,
-        key: &[u8],
-        value: Option<&[u8]>,
-        op_type_byte: u8,
-    ) -> ForstResult<u64> {
+    pub fn put(&mut self, key: &[u8], value: Option<&[u8]>, op_type_byte: u8) -> ForstResult<u64> {
         if self.frozen {
             return Err(forst_rs_common::ForstError::invalid_argument(
                 "cannot write to a frozen MemTable",
@@ -179,8 +174,8 @@ impl VectorizedMemTable {
         self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
 
         // Check if merge is needed.
-        let merge_threshold = ((self.sorted_count as f64) * self.config.unsorted_merge_ratio)
-            .max(1024.0) as usize;
+        let merge_threshold =
+            ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -323,9 +318,7 @@ impl VectorizedMemTable {
                     Arc::new(op_builder.finish()),
                 ],
             )
-            .map_err(|e| {
-                forst_rs_common::ForstError::corruption(format!("Arrow error: {}", e))
-            })?;
+            .map_err(|e| forst_rs_common::ForstError::corruption(format!("Arrow error: {}", e)))?;
 
             batches.push(batch);
             row_idx = chunk_end;
@@ -491,8 +484,8 @@ impl VectorizedMemTable {
         }
 
         // Check merge threshold.
-        let merge_threshold = ((self.sorted_count as f64) * self.config.unsorted_merge_ratio)
-            .max(1024.0) as usize;
+        let merge_threshold =
+            ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -731,9 +724,18 @@ mod tests {
         assert_eq!(count, 3);
         assert_eq!(mt.num_entries(), 3);
 
-        assert_eq!(mt.get(b"a", u64::MAX).unwrap().unwrap().value, Some(b"1".to_vec()));
-        assert_eq!(mt.get(b"b", u64::MAX).unwrap().unwrap().value, Some(b"2".to_vec()));
-        assert_eq!(mt.get(b"c", u64::MAX).unwrap().unwrap().value, Some(b"3".to_vec()));
+        assert_eq!(
+            mt.get(b"a", u64::MAX).unwrap().unwrap().value,
+            Some(b"1".to_vec())
+        );
+        assert_eq!(
+            mt.get(b"b", u64::MAX).unwrap().unwrap().value,
+            Some(b"2".to_vec())
+        );
+        assert_eq!(
+            mt.get(b"c", u64::MAX).unwrap().unwrap().value,
+            Some(b"3".to_vec())
+        );
     }
 
     #[test]
@@ -798,7 +800,12 @@ mod tests {
             let expected = format!("v_{:08}", i);
             let r = mt.get(key.as_bytes(), u64::MAX).unwrap();
             assert!(r.is_some(), "key {} not found", key);
-            assert_eq!(r.unwrap().value, Some(expected.into_bytes()), "mismatch at {}", i);
+            assert_eq!(
+                r.unwrap().value,
+                Some(expected.into_bytes()),
+                "mismatch at {}",
+                i
+            );
         }
     }
 
@@ -815,7 +822,12 @@ mod tests {
             let key = format!("k_{:06}", i);
             let expected_val = format!("v_{:06}", i);
             let r = mt.get(key.as_bytes(), u64::MAX).unwrap().unwrap();
-            assert_eq!(r.value, Some(expected_val.into_bytes()), "mismatch at {}", i);
+            assert_eq!(
+                r.value,
+                Some(expected_val.into_bytes()),
+                "mismatch at {}",
+                i
+            );
         }
     }
 
@@ -859,7 +871,11 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.num_rows(), 3);
 
-        let keys = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
         assert_eq!(keys.value(0), b"alpha");
         assert_eq!(keys.value(1), b"bravo");
         assert_eq!(keys.value(2), b"charlie");
@@ -876,7 +892,11 @@ mod tests {
         let batch = &batches[0];
         assert_eq!(batch.num_rows(), 2);
 
-        let seqs = batch.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
+        let seqs = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
         assert_eq!(seqs.value(0), 2);
         assert_eq!(seqs.value(1), 1);
     }
@@ -905,8 +925,16 @@ mod tests {
 
         let batches = mt.to_flush_batches(1024).unwrap();
         let batch = &batches[0];
-        let values = batch.column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
-        let ops = batch.column(3).as_any().downcast_ref::<UInt8Array>().unwrap();
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let ops = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .unwrap();
 
         assert!(!values.is_null(0));
         assert_eq!(values.value(0), b"val");
@@ -1008,7 +1036,11 @@ mod tests {
 
         let mut prev_key: Option<Vec<u8>> = None;
         for batch in &batches {
-            let keys = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
             for i in 0..batch.num_rows() {
                 let key = keys.value(i).to_vec();
                 if let Some(ref pk) = prev_key {

@@ -98,7 +98,10 @@ impl TtlCompactionFilter {
     /// Creates a filter with a caller-supplied clock (used by tests to
     /// inject deterministic time).
     pub fn with_clock(ttl_seconds: u64, now_fn: fn() -> u64) -> Self {
-        Self { ttl_seconds, now_fn }
+        Self {
+            ttl_seconds,
+            now_fn,
+        }
     }
 
     fn is_expired(&self, value: &[u8]) -> bool {

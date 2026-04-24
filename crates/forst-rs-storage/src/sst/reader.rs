@@ -250,9 +250,8 @@ impl SstReaderImpl {
 
         // 7. Build result based on op_type.
         let op_byte = op_types.value(best_row);
-        let op = OpType::from_u8(op_byte).ok_or_else(|| {
-            ForstError::corruption(format!("invalid op_type byte: {}", op_byte))
-        })?;
+        let op = OpType::from_u8(op_byte)
+            .ok_or_else(|| ForstError::corruption(format!("invalid op_type byte: {}", op_byte)))?;
 
         let value = match op {
             OpType::Delete | OpType::SingleDelete => None,
@@ -279,11 +278,7 @@ impl SstReaderImpl {
     /// produced by [`SstWriterImpl`]). Unlike [`SstReaderImpl::get`], this
     /// returns ALL versions of each key; callers resolve visibility and
     /// merges.
-    pub fn scan(
-        &self,
-        lower: &[u8],
-        upper: Option<&[u8]>,
-    ) -> ForstResult<Vec<SstScanRow>> {
+    pub fn scan(&self, lower: &[u8], upper: Option<&[u8]>) -> ForstResult<Vec<SstScanRow>> {
         // Short-circuit if the scan range doesn't intersect [min_key, max_key].
         if let Some(hi) = upper {
             if hi <= self.footer.min_key.as_slice() {

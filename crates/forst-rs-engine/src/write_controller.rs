@@ -304,8 +304,10 @@ mod tests {
         let wc = WriteController::new(cfg);
         wc.set_stall(true);
         let err = wc.may_throttle().unwrap_err();
-        assert!(err.to_string().to_lowercase().contains("timeout")
-            || err.to_string().to_lowercase().contains("timed"));
+        assert!(
+            err.to_string().to_lowercase().contains("timeout")
+                || err.to_string().to_lowercase().contains("timed")
+        );
     }
 
     #[test]

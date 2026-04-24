@@ -135,10 +135,8 @@ impl FooterV1 {
     pub fn encode(&self) -> Vec<u8> {
         let min_key_len = self.min_key.len() as u16;
         let max_key_len = self.max_key.len() as u16;
-        let total_size = FOOTER_FIXED_FIELDS_SIZE
-            + self.min_key.len()
-            + self.max_key.len()
-            + FOOTER_TAIL_SIZE;
+        let total_size =
+            FOOTER_FIXED_FIELDS_SIZE + self.min_key.len() + self.max_key.len() + FOOTER_TAIL_SIZE;
 
         let mut buf = Vec::with_capacity(total_size);
 
@@ -451,10 +449,7 @@ mod tests {
         let result = FooterV1::decode(&short);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("too short"),
-            "unexpected error: {err_msg}"
-        );
+        assert!(err_msg.contains("too short"), "unexpected error: {err_msg}");
     }
 
     #[test]

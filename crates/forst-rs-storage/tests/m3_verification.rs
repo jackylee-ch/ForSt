@@ -33,9 +33,7 @@ use forst_rs_storage::cache::{BlockCache, CacheEntry, CacheKey, CachePriority};
 use forst_rs_storage::memtable::{MemTableConfig, VectorizedMemTable};
 use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
 use forst_rs_storage::version::checkpoint::{restore_from_blob, serialize_to_blob};
-use forst_rs_storage::version::{
-    SstFileMeta, VersionEdit, VersionSetImpl, VersionSetSnapshot,
-};
+use forst_rs_storage::version::{SstFileMeta, VersionEdit, VersionSetImpl, VersionSetSnapshot};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -213,9 +211,7 @@ fn test_m3_merge_operator_list_append() {
     assert_eq!(result, b"base,op1,op2,op3");
 
     // full_merge without base (Delete or bottommost)
-    let result = op
-        .full_merge(b"key", None, &[b"x", b"y", b"z"])
-        .unwrap();
+    let result = op.full_merge(b"key", None, &[b"x", b"y", b"z"]).unwrap();
     assert_eq!(result, b"x,y,z");
 
     // full_merge with base only
@@ -232,9 +228,7 @@ fn test_m3_merge_operator_list_append() {
 
     // Chained partial_merge (simulating compaction combining 3 operands)
     let r1 = op.partial_merge(b"key", b"a", b"b").unwrap();
-    let r2 = op
-        .partial_merge(b"key", &r1, b"c")
-        .unwrap();
+    let r2 = op.partial_merge(b"key", &r1, b"c").unwrap();
     assert_eq!(r2, b"a,b,c");
 
     // Custom delimiter
@@ -473,7 +467,8 @@ fn test_m3_version_set_concurrent_apply_snapshot() {
 
     // All threads must complete without panics.
     for h in handles {
-        h.join().expect("thread panicked during concurrent VersionSet access");
+        h.join()
+            .expect("thread panicked during concurrent VersionSet access");
     }
 
     // After writer completes, verify final state.
@@ -585,8 +580,11 @@ fn test_m3_checkpoint_serialize_restore_consistent() {
             l_idx
         );
 
-        for (f_idx, (orig_file, rest_file)) in
-            orig_level.files.iter().zip(rest_level.files.iter()).enumerate()
+        for (f_idx, (orig_file, rest_file)) in orig_level
+            .files
+            .iter()
+            .zip(rest_level.files.iter())
+            .enumerate()
         {
             assert_eq!(
                 orig_file, rest_file,
@@ -599,8 +597,16 @@ fn test_m3_checkpoint_serialize_restore_consistent() {
     // Verify expected final state:
     // L0: files 3 (iii-kkk), 5 (lll-zzz) = 2 files
     // L1: file 4 (aaa-hhh) = 1 file
-    assert_eq!(restored_ver.levels[0].files.len(), 2, "L0 should have 2 files");
-    assert_eq!(restored_ver.levels[1].files.len(), 1, "L1 should have 1 file");
+    assert_eq!(
+        restored_ver.levels[0].files.len(),
+        2,
+        "L0 should have 2 files"
+    );
+    assert_eq!(
+        restored_ver.levels[1].files.len(),
+        1,
+        "L1 should have 1 file"
+    );
     assert_eq!(restored_snap.next_file_number, 6);
     assert_eq!(restored_snap.last_sequence, 400);
 

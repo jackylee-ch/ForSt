@@ -54,11 +54,7 @@ pub struct CheckpointManifest {
 
 /// Copies `src` to `dst` through the supplied filesystem. Used by the
 /// checkpoint to duplicate SST files into the checkpoint directory.
-pub fn copy_file(
-    fs: &dyn FileSystem,
-    src: &Path,
-    dst: &Path,
-) -> ForstResult<u64> {
+pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64> {
     let mut reader = fs.open_sequential_file(src)?;
     if let Some(parent) = dst.parent() {
         fs.create_dir_all(parent)?;
@@ -80,11 +76,7 @@ pub fn copy_file(
 }
 
 /// Writes the checkpoint blob bytes atomically via a tmp file + rename.
-pub fn write_blob(
-    fs: &dyn FileSystem,
-    target_dir: &Path,
-    blob: &[u8],
-) -> ForstResult<PathBuf> {
+pub fn write_blob(fs: &dyn FileSystem, target_dir: &Path, blob: &[u8]) -> ForstResult<PathBuf> {
     fs.create_dir_all(target_dir)?;
     let final_path = target_dir.join(CHECKPOINT_BLOB_NAME);
     let tmp_path = target_dir.join(format!(".{}.tmp", CHECKPOINT_BLOB_NAME));
