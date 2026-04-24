@@ -235,22 +235,35 @@ impl CompactionJob {
 
         match newest.op_type {
             OpType::SingleDelete => {
-                // SingleDelete optimization (conservative RocksDB semantics):
+                // SingleDelete optimization (conservative RocksDB semantics).
                 //
-                // Only the strict `[SingleDelete, Put]` pair (exactly two
-                // versions) is elided so that neither entry is written to
-                // the output file. Every other shape — stacked
-                // SingleDeletes, intervening Merges, additional shadowed
-                // Puts — falls back to the regular Delete path.
+                // Contract: `SingleDelete` is valid only when the caller
+                // guarantees the key has been `put` at most once since the
+                // previous delete-family op for this key. Callers that
+                // violate the contract get Delete-equivalent semantics
+                // below; they do NOT get data corruption.
                 //
-                // Rationale: with exactly two versions we can prove — from
-                // the SingleDelete contract alone — that no older Put is
-                // shadowed underneath. In every other shape the safe answer
-                // is to retain the tombstone, because resurrecting a stale
-                // Put from a lower level would violate read-after-delete
-                // semantics.
+                // Policy: Only the strict `[SingleDelete, Put]` pair
+                // (exactly two versions visible to THIS compaction) is
+                // elided — both entries are dropped from this compaction's
+                // output. Every other shape — stacked SingleDeletes,
+                // intervening Merges, additional shadowed Puts — falls
+                // back to the regular Delete path.
+                //
+                // Rationale: with exactly two versions in `versions`, the
+                // SingleDelete contract implies there is no older Put for
+                // this user key shadowed underneath (if there were, it
+                // would appear in `versions`). In every other shape the
+                // safe answer is to retain the tombstone, because
+                // resurrecting a stale Put from a lower level would
+                // violate read-after-delete semantics.
+                //
+                // Note: `versions` is this compaction's view of the user
+                // key (newest-first, across its input SSTs + memtables).
+                // Keys living in SST files outside this compaction's
+                // input set are unaffected by elision.
                 if versions.len() == 2 && versions[1].op_type == OpType::Put {
-                    // Drop both entries entirely.
+                    // Drop both entries entirely from this compaction's output.
                     return Ok(());
                 }
                 // Fallback: behave exactly like Delete.
