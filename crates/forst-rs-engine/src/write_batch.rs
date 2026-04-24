@@ -82,6 +82,21 @@ impl WriteBatch {
         self
     }
 
+    /// Appends a SingleDelete mutation. Semantically identical to `Delete`
+    /// when the key has only a single outstanding Put; undefined (but not
+    /// unsafe) when the key was written multiple times without an
+    /// intervening flush+compaction. Use when the caller can guarantee
+    /// single-write semantics (e.g. changelog records).
+    pub fn single_delete(&mut self, cf: &ColumnFamilyHandle, key: &[u8]) -> &mut Self {
+        self.entries.push(WriteBatchEntry {
+            cf_id: cf.id(),
+            key: key.to_vec(),
+            value: None,
+            op_type: OpType::SingleDelete,
+        });
+        self
+    }
+
     /// Appends a Merge mutation.
     pub fn merge(&mut self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> &mut Self {
         self.entries.push(WriteBatchEntry {

@@ -28,13 +28,14 @@ fn bench_point_lookup(c: &mut Criterion) {
         let db = open_in_memory(8 * 1024 * 1024);
         let cf = db.default_cf();
         seed_sequential(&db, &cf, n, "k{:08}", "v{:08}");
+        // Pre-materialize keys so `format!` does not pollute the hot loop.
+        let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k{:08}", i).into_bytes()).collect();
 
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &count| {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                for i in 0..count {
-                    let k = format!("k{:08}", i);
-                    let _ = db.get(&cf, k.as_bytes()).expect("get");
+                for k in &keys {
+                    let _ = db.get(&cf, k.as_slice()).expect("get");
                 }
             });
         });
@@ -52,13 +53,13 @@ fn bench_point_lookup_with_compaction(c: &mut Criterion) {
         seed_sequential(&db, &cf, n, "k{:08}", "v{:08}");
         db.switch_and_flush(&cf).expect("flush").unwrap();
         db.compact_l0(&cf).expect("compact").unwrap();
+        let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k{:08}", i).into_bytes()).collect();
 
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &count| {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                for i in 0..count {
-                    let k = format!("k{:08}", i);
-                    let _ = db.get(&cf, k.as_bytes()).expect("get");
+                for k in &keys {
+                    let _ = db.get(&cf, k.as_slice()).expect("get");
                 }
             });
         });

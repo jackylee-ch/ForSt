@@ -23,13 +23,13 @@ fn bench_sustained_put(c: &mut Criterion) {
     for &n in &[10_000u32, 50_000] {
         let db = open_in_memory(1024 * 1024); // 1 MB — forces flushes + compactions
         let cf = db.default_cf();
+        let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k{:08}", i).into_bytes()).collect();
 
         group.throughput(Throughput::Elements(n as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &count| {
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                for i in 0..count {
-                    let k = format!("k{:08}", i);
-                    db.put(&cf, k.as_bytes(), b"payload_16_bytes").expect("put");
+                for k in &keys {
+                    db.put(&cf, k.as_slice(), b"payload_16_bytes").expect("put");
                 }
             });
         });

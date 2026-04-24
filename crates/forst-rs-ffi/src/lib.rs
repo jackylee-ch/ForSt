@@ -62,6 +62,22 @@ pub const FRS_STATUS_INVALID_ARGUMENT: i32 = 4;
 pub const FRS_STATUS_PANIC: i32 = 5;
 /// The engine was poisoned (previous panic corrupted internal state).
 pub const FRS_STATUS_POISONED: i32 = 6;
+/// I/O error (disk, filesystem, network).
+pub const FRS_STATUS_IO: i32 = 7;
+/// Data corruption detected (checksum mismatch, bad magic, truncated file).
+pub const FRS_STATUS_CORRUPTION: i32 = 8;
+/// The requested feature or operation is not supported.
+pub const FRS_STATUS_NOT_SUPPORTED: i32 = 9;
+/// Operation was aborted (e.g. by shutdown or external signal).
+pub const FRS_STATUS_ABORTED: i32 = 10;
+/// A required resource is busy (e.g. lock contention, too many open files).
+pub const FRS_STATUS_BUSY: i32 = 11;
+/// Operation did not complete within its deadline.
+pub const FRS_STATUS_TIMED_OUT: i32 = 12;
+/// The referenced item has expired (e.g. TTL elapsed, lease revoked).
+pub const FRS_STATUS_EXPIRED: i32 = 13;
+/// Operation completed only partially (e.g. partial read, incomplete scan).
+pub const FRS_STATUS_INCOMPLETE: i32 = 14;
 
 // ---------------------------------------------------------------------------
 // Opaque handle types
@@ -144,8 +160,11 @@ unsafe fn cf_from_handle(h: FrsCfHandle) -> Option<Box<ColumnFamilyHandle>> {
     if h.is_null() {
         return None;
     }
-    // Do NOT drop; leak back out after use. We convert the ownership back
-    // to a reference the caller can re-use.
+    // Reconstructs the `Box<ColumnFamilyHandle>` from the raw pointer, taking
+    // ownership back from C. When the returned `Box` is dropped the handle is
+    // freed; callers that intend to keep the handle alive must use
+    // [`cf_ref`] instead, or must `Box::into_raw` the returned box before it
+    // goes out of scope.
     let ptr = h as *mut ColumnFamilyHandle;
     Some(Box::from_raw(ptr))
 }
@@ -162,6 +181,22 @@ fn error_to_status(err: &forst_rs_common::ForstError) -> i32 {
         FRS_STATUS_NOT_FOUND
     } else if err.is_invalid_argument() {
         FRS_STATUS_INVALID_ARGUMENT
+    } else if err.is_io() {
+        FRS_STATUS_IO
+    } else if err.is_corruption() {
+        FRS_STATUS_CORRUPTION
+    } else if err.is_not_supported() {
+        FRS_STATUS_NOT_SUPPORTED
+    } else if err.is_aborted() {
+        FRS_STATUS_ABORTED
+    } else if err.is_busy() {
+        FRS_STATUS_BUSY
+    } else if err.is_timed_out() {
+        FRS_STATUS_TIMED_OUT
+    } else if err.is_expired() {
+        FRS_STATUS_EXPIRED
+    } else if err.is_incomplete() {
+        FRS_STATUS_INCOMPLETE
     } else {
         FRS_STATUS_ERROR
     }
@@ -915,8 +950,11 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
                     }
                     wb.put(cf, key, values.value(i));
                 }
-                1 | 2 => {
+                1 => {
                     wb.delete(cf, key);
+                }
+                2 => {
+                    wb.single_delete(cf, key);
                 }
                 3 => {
                     if values.is_null(i) {
@@ -1553,6 +1591,221 @@ mod tests {
                 assert_eq!(values.value(i), expected.as_bytes());
             }
             assert!(!found.value(5));
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_prefix_scan_arrow_returns_sorted_matches() {
+        use arrow::array::{BinaryArray, StructArray};
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Seed: three matching + two non-matching keys.
+            let pairs: &[(&[u8], &[u8])] = &[
+                (b"user:alice", b"A"),
+                (b"user:bob", b"B"),
+                (b"user:carol", b"C"),
+                (b"admin:root", b"R"),
+                (b"zzz", b"Z"),
+            ];
+            for (k, v) in pairs {
+                assert_eq!(
+                    frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                    FRS_STATUS_OK
+                );
+            }
+
+            let prefix = b"user:";
+            let mut out_array = FFI_ArrowArray::empty();
+            let mut out_schema = FFI_ArrowSchema::empty();
+            assert_eq!(
+                frs_prefix_scan_arrow(
+                    db,
+                    cf,
+                    prefix.as_ptr(),
+                    prefix.len(),
+                    &mut out_array,
+                    &mut out_schema,
+                ),
+                FRS_STATUS_OK
+            );
+
+            // Import back via from_ffi.
+            let data = from_ffi(out_array, &out_schema).expect("valid ffi payload");
+            let struct_arr = make_array(data);
+            let struct_arr = struct_arr
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("struct");
+            assert_eq!(struct_arr.num_columns(), 2);
+            assert_eq!(struct_arr.len(), 3);
+            let keys = struct_arr
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("key col is binary");
+            let values = struct_arr
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("value col is binary");
+            // prefix_scan should return keys in sorted order.
+            assert_eq!(keys.value(0), b"user:alice");
+            assert_eq!(keys.value(1), b"user:bob");
+            assert_eq!(keys.value(2), b"user:carol");
+            assert_eq!(values.value(0), b"A");
+            assert_eq!(values.value(1), b"B");
+            assert_eq!(values.value(2), b"C");
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_prefix_scan_arrow_empty_prefix_returns_all() {
+        use arrow::array::StructArray;
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            for i in 0..4u32 {
+                let k = format!("k{:02}", i);
+                let v = format!("v{:02}", i);
+                frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+            }
+
+            let mut out_array = FFI_ArrowArray::empty();
+            let mut out_schema = FFI_ArrowSchema::empty();
+            // Empty prefix (null pointer, zero length) → full scan.
+            assert_eq!(
+                frs_prefix_scan_arrow(db, cf, ptr::null(), 0, &mut out_array, &mut out_schema,),
+                FRS_STATUS_OK
+            );
+            let data = from_ffi(out_array, &out_schema).expect("valid ffi");
+            let struct_arr = make_array(data);
+            let struct_arr = struct_arr
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("struct");
+            assert_eq!(struct_arr.len(), 4);
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_prefix_scan_arrow_no_match_returns_empty_batch() {
+        use arrow::array::StructArray;
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            frs_put(db, cf, b"foo".as_ptr(), 3, b"v".as_ptr(), 1);
+
+            let prefix = b"zzz";
+            let mut out_array = FFI_ArrowArray::empty();
+            let mut out_schema = FFI_ArrowSchema::empty();
+            assert_eq!(
+                frs_prefix_scan_arrow(
+                    db,
+                    cf,
+                    prefix.as_ptr(),
+                    prefix.len(),
+                    &mut out_array,
+                    &mut out_schema,
+                ),
+                FRS_STATUS_OK
+            );
+            let data = from_ffi(out_array, &out_schema).expect("valid ffi");
+            let struct_arr = make_array(data);
+            let struct_arr = struct_arr
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("struct");
+            assert_eq!(struct_arr.len(), 0);
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_prefix_scan_arrow_null_handle_returns_null_arg() {
+        unsafe {
+            let mut out_array = FFI_ArrowArray::empty();
+            let mut out_schema = FFI_ArrowSchema::empty();
+            assert_eq!(
+                frs_prefix_scan_arrow(
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    0,
+                    &mut out_array,
+                    &mut out_schema,
+                ),
+                FRS_STATUS_NULL_ARG
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_put_arrow_single_delete_op() {
+        use arrow::array::{BinaryBuilder, StructArray, UInt8Builder};
+        use arrow::datatypes::{DataType, Field};
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            frs_db_open_memory(&mut db);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            frs_db_default_cf(db, &mut cf);
+
+            // Seed key that the batch will SingleDelete.
+            frs_put(db, cf, b"k1".as_ptr(), 2, b"v1".as_ptr(), 2);
+
+            // Build a RecordBatch: SingleDelete k1 (op=2).
+            let mut keys = BinaryBuilder::new();
+            let mut values = BinaryBuilder::new();
+            let mut ops = UInt8Builder::new();
+            keys.append_value(b"k1");
+            values.append_null();
+            ops.append_value(2); // SingleDelete
+
+            let struct_arr = StructArray::from(vec![
+                (
+                    std::sync::Arc::new(Field::new("key", DataType::Binary, false)),
+                    std::sync::Arc::new(keys.finish()) as arrow::array::ArrayRef,
+                ),
+                (
+                    std::sync::Arc::new(Field::new("value", DataType::Binary, true)),
+                    std::sync::Arc::new(values.finish()) as arrow::array::ArrayRef,
+                ),
+                (
+                    std::sync::Arc::new(Field::new("op_type", DataType::UInt8, false)),
+                    std::sync::Arc::new(ops.finish()) as arrow::array::ArrayRef,
+                ),
+            ]);
+            let (mut a, mut s) = to_ffi(&struct_arr.into_data()).expect("to_ffi");
+            assert_eq!(frs_batch_put_arrow(db, cf, &mut a, &mut s), FRS_STATUS_OK);
+
+            // Key should be gone.
+            let mut out = FrsBytes::NULL;
+            assert_eq!(frs_get(db, cf, b"k1".as_ptr(), 2, &mut out), FRS_STATUS_OK);
+            assert!(out.data.is_null(), "k1 should have been SingleDeleted");
 
             frs_cf_close(cf);
             frs_db_close(db);
