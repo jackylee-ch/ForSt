@@ -61,43 +61,38 @@ Each session should:
 ## STATE (update this at end of every session)
 
 ```yaml
-# Copy entire block before modifying; maintain history below
-last_updated: 2026-04-25T02:30:00Z
-last_session_id: A
-phase: A_DONE
-current_commit: none  # will be C1 in session B
-current_round: 0
+last_updated: 2026-04-25T04:30:00Z
+last_session_id: B
+phase: B_IN_PROGRESS
+current_commit: C1
+current_commit_sha: 68c0bd464  # commit with C1 benchmarks added on review-loop
+current_round: 1
+round_1_status: agents_launched_awaiting_results
 consecutive_clean: 0
-rounds_log: []  # will accumulate {commit, round, H, M, L, fix_sha}
-baselines_built: false
-next_action: "Session B: create worktree, build RocksDB baseline, cherry-pick C1, start C1 Round 1"
-```
-
-## Continuation prompt (paste into next session)
-
-```
-继续 ForSt-RS refactor-review 任务。
-
-工作目录: ~/code/github/ForSt
-Worktree (to create): ~/code/github/ForSt-review (branch: review-loop)
-语言: 中文
-IMPORTANT: Before ANY cargo command:
-  export PATH="/home/users/lijunqing/.cargo/bin:/usr/bin:/bin:/usr/local/bin:$PATH"
-
-1. 读 .planning/refactor-review/SESSION_HANDOFF.md 的 STATE 块
-2. 读 COMMIT_MANIFEST.md + REVIEW_PROTOCOL.md + BENCHMARK_BASELINE.md
-3. 按 next_action 执行；每完成一个里程碑更新 STATE
-4. session 即将耗尽上下文时，更新 STATE + 写出下一个 continuation prompt
-5. 硬性要求: 每 commit 120 轮 10-agent review，终止条件 10 consecutive clean rounds
-6. 性能硬性 3-5x vs RocksDB — benchmark 失败即 H issue
+baselines_built: false  # using reference numbers from baseline.json
+baselines_deferred_to: "user or background task per BUILD_STATUS.md"
+c1_benchmarks_added: 13  # of 20 planned; 7 TODO for next session
+c1_agents_ids:
+  - a315094bb0c2a8251  # A1 Memory
+  - a2d4de574d4fbf736  # A2 Correctness
+  - a1f6a0849a1a1375a  # A3 Concurrency
+  - af2d68d6c4b38ee8d  # A4 Test coverage
+  - afecebf860d223f09  # A5 Error handling
+  - aed0445efd7332014  # A6 Performance
+  - aba5767e53bb42477  # A7 Docs
+  - ab0a8aac6094f9a24  # A8 Rust idiomatic
+  - a978e1c69634eee26  # A9 Security
+  - aa7ead384e348c0d0  # A10 Integration
+next_action: "Wait for 10 agents to complete (~8-10 min), aggregate H/M findings, fix H+M, commit fix, start Round 2"
 ```
 
 ## Session history
 
 | Session | Date | Phase | Commit | Rounds | Status |
 |---------|------|-------|--------|--------|--------|
-| A | 2026-04-25 | Phase A | infra | N/A | Infrastructure docs written |
-| B | TBD | Phase B | C1 common | 0→? | Pending |
+| A | 2026-04-25 | Phase A | infra | N/A | 4 planning docs written |
+| B | 2026-04-25 | Phase B | C1 setup + R1 launch | 0→1 | worktree created, 13 benchmarks added, Round 1 agents launched |
+| C | TBD | Phase B | C1 continue | 1→? | Aggregate R1, fix H/M, continue rounds |
 | ... | | | | | |
 
 ## Risk register
