@@ -5,7 +5,7 @@
 **Round**: 1 / 120
 **Branch**: review-loop at `~/code/github/ForSt-review`
 
-## Severity tally (9/10 agents, A5 pending)
+## Severity tally (10/10 agents, FINAL)
 
 | Agent | Dimension | H | M | L |
 |-------|-----------|---|---|---|
@@ -13,13 +13,23 @@
 | A2 | Correctness | **2** | 6 | 7 |
 | A3 | Concurrency | **3** | 6 | 6 |
 | A4 | Test coverage | **4** | 6 | 5 |
-| A5 | Error handling | *pending* | | |
+| A5 | Error handling | **2** | 5 | 5 |
 | A6 | **Performance** | **8** | 4 | 4 |
 | A7 | Documentation | **3** | 7 | 5 |
 | A8 | Idiomatic Rust | **2** | 6 | 6 |
 | A9 | Security | 0 | 4 | 5 |
 | A10 | Integration | **2** | 5 | 4 |
-| **Total (9/10)** | | **24** | **47** | **50** |
+| **Total** | | **26** | **52** | **55** |
+
+## A5 New H findings (after initial aggregation)
+
+25. **[A5 H-1]** `Arena::allocate` has no fallible variant — OOM on huge `size` aborts the process. Missing `try_allocate(size) -> ForstResult<&mut [u8]>` using `Vec::try_reserve_exact`. Violates CLAUDE.md "handle errors explicitly at every level".
+26. **[A5 H-2]** `perf_gate::check_speedup` silently returns `Ok(1.0)` on missing baseline/entry (duplicate of A4-H1, A7-H1, A10-H2 — strong consensus finding).
+
+## Additional A5 Medium findings
+- **[A5 M-3]** Varint32/64 overflow on LAST byte not caught — matches A2 H-2/H-3 (consolidated)
+- **[A5 M-4]** Error messages omit lengths/offsets (coding.rs insufficient bytes messages)
+- **[A5 M-5]** Bench `.expect()` labels uninformative ("put" vs "put i={i}")
 
 ## 🔴 CRITICAL DECISION POINT — Perf 3x targets largely unachievable
 
