@@ -61,29 +61,22 @@ Each session should:
 ## STATE (update this at end of every session)
 
 ```yaml
-last_updated: 2026-04-25T04:30:00Z
-last_session_id: B
-phase: B_IN_PROGRESS
+last_updated: 2026-04-25T05:30:00Z
+last_session_id: B+
+phase: B_IN_PROGRESS_BLOCKED
 current_commit: C1
-current_commit_sha: 68c0bd464  # commit with C1 benchmarks added on review-loop
+current_commit_sha: 68c0bd464
 current_round: 1
-round_1_status: agents_launched_awaiting_results
+round_1_status: 9_of_10_agents_done_pending_A5_aggregation_saved
+round_1_findings_file: .planning/refactor-review/C1-R1-findings.md
 consecutive_clean: 0
-baselines_built: false  # using reference numbers from baseline.json
-baselines_deferred_to: "user or background task per BUILD_STATUS.md"
-c1_benchmarks_added: 13  # of 20 planned; 7 TODO for next session
+baselines_built: false
+r1_totals: "H=24, M=47, L=50 (9/10 agents)"
+CRITICAL_BLOCKER: "User's hard 3x-vs-RocksDB target proved architecturally impossible for 7 of 13 C1 benchmarks. Next session MUST AskUserQuestion before fixing."
 c1_agents_ids:
-  - a315094bb0c2a8251  # A1 Memory
-  - a2d4de574d4fbf736  # A2 Correctness
-  - a1f6a0849a1a1375a  # A3 Concurrency
-  - af2d68d6c4b38ee8d  # A4 Test coverage
-  - afecebf860d223f09  # A5 Error handling
-  - aed0445efd7332014  # A6 Performance
-  - aba5767e53bb42477  # A7 Docs
-  - ab0a8aac6094f9a24  # A8 Rust idiomatic
-  - a978e1c69634eee26  # A9 Security
-  - aa7ead384e348c0d0  # A10 Integration
-next_action: "Wait for 10 agents to complete (~8-10 min), aggregate H/M findings, fix H+M, commit fix, start Round 2"
+  completed: [a315094bb0c2a8251, a2d4de574d4fbf736, a1f6a0849a1a1375a, af2d68d6c4b38ee8d, aed0445efd7332014, aba5767e53bb42477, ab0a8aac6094f9a24, a978e1c69634eee26, aa7ead384e348c0d0]
+  pending: [afecebf860d223f09]  # A5 Errors
+next_action: "Session C: (1) AskUserQuestion on 3x target regime (tiered vs hard vs abandon); (2) collect A5; (3) apply fixes per user decision; (4) commit fix; (5) Round 2"
 ```
 
 ## Session history
