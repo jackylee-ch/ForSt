@@ -11,14 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md §5/§6 @ 33f85b1c5
+# Plan: .planning/refactor-review/G1_gha_rebuild_plan.md §1.1 @ 89104d8bd
+# Coverage gate: hard floor 80% (G1 §3.1 resolved 2026-04-30); stretch target 90%
 
-name: ForSt-RS CI
+name: ci-rust
 
 on:
   push:
-    branches: [forst-rs]
+    branches: [forst-rs, main]
   pull_request:
-    branches: [forst-rs]
+    branches: [forst-rs, main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -104,9 +108,51 @@ jobs:
             ${{ runner.os }}-cargo-msrv-
       - run: cargo check --workspace
 
-  audit:
-    name: Security Audit
+  coverage:
+    name: Coverage (≥80% gate)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-llvm-cov-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-llvm-cov-
+      - name: Generate coverage report
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  doc:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-doc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-doc-
+      - run: cargo doc --no-deps --workspace --document-private-items

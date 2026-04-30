@@ -1,0 +1,64 @@
+# Dependabot configuration for ForSt-RS
+# Verified well-formed by .github/workflows/ci-security.yml `dependabot-config` job
+#
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md §5 row F @ 33f85b1c5
+# Plan: .planning/refactor-review/G1_gha_rebuild_plan.md Task 5 @ 89104d8bd
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Etc/UTC"
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    open-pull-requests-limit: 5
+    groups:
+      arrow-ecosystem:
+        patterns:
+          - "arrow*"
+      tokio-ecosystem:
+        patterns:
+          - "tokio*"
+      tracing-ecosystem:
+        patterns:
+          - "tracing*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Etc/UTC"
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "Etc/UTC"
+    labels:
+      - dependencies
+      - java
+    commit-message:
+      prefix: "chore(deps-java)"
+      include: "scope"
+    open-pull-requests-limit: 5
+    # Active only after Java module lands (C9). Until then dependabot
+    # reports "no manifests found" and skips silently.

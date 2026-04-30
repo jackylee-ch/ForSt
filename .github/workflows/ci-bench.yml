@@ -1,0 +1,106 @@
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md §5/§6 @ 33f85b1c5
+# Plan: .planning/refactor-review/G1_gha_rebuild_plan.md §1.4 @ 89104d8bd
+#
+# Performance trend tracking. NON-BLOCKING — informational only.
+# The hard ≥3x perf gate runs in forst-rs-bench/benches/Cn/ via cargo
+# test (per REVIEW_PROTOCOL.md "Perf gate"); this workflow runs the
+# criterion suite for trend visualization on GitHub Pages.
+
+name: ci-bench
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # nightly 04:00 UTC
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # for gh-pages branch push
+
+jobs:
+  criterion:
+    name: Criterion benches
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/criterion
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('Cargo.lock', 'crates/forst-rs-bench/**') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Run criterion benches
+        run: cargo bench --workspace -- --output-format bencher | tee bench-output.txt
+
+      - name: Upload raw output
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-output-${{ github.sha }}
+          path: |
+            bench-output.txt
+            target/criterion/**/report/index.html
+            target/criterion/**/report/*.svg
+            target/criterion/**/base/estimates.json
+          retention-days: 30
+
+  upload-perf-trend:
+    name: Publish to GH Pages
+    needs: criterion
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/forst-rs' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bench-output-${{ github.sha }}
+          path: bench-results
+
+      - name: Stage criterion HTML to gh-pages
+        run: |
+          # Append a dated snapshot rather than overwriting; keeps trend history
+          DATE=$(date -u +%Y-%m-%d)
+          DEST="gh-pages/criterion-reports/${DATE}-${GITHUB_SHA::7}"
+          mkdir -p "${DEST}"
+          # Copy criterion HTML reports if they exist in the artifact
+          if [[ -d bench-results/target/criterion ]]; then
+            cp -r bench-results/target/criterion/. "${DEST}/"
+          fi
+          # Update top-level index that lists snapshots
+          cd gh-pages/criterion-reports
+          {
+            echo "<!DOCTYPE html>"
+            echo "<html><head><title>ForSt-RS Criterion Trend</title></head><body>"
+            echo "<h1>Criterion benchmarks — trend snapshots</h1>"
+            echo "<p>Per A1 §6 — perf trend dashboard, not a hard gate.</p>"
+            echo "<ul>"
+            for d in $(ls -1d 20*/ 2>/dev/null | sort -r); do
+              echo "  <li><a href=\"${d}\">${d%/}</a></li>"
+            done
+            echo "</ul>"
+            echo "</body></html>"
+          } > index.html
+
+      - name: Commit + push gh-pages
+        working-directory: gh-pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add criterion-reports/
+          git diff --cached --quiet || git commit -m "ci(bench): criterion snapshot ${GITHUB_SHA::7}"
+          git push origin gh-pages

@@ -1,0 +1,129 @@
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md §5/§6 @ 33f85b1c5
+# Plan: .planning/refactor-review/G1_gha_rebuild_plan.md §1.6 @ 89104d8bd
+#
+# Tag-driven multi-platform release. Builds libforst_rs.{so,dylib} for
+# 4 platforms + the shaded JAR, then attaches them all to the GitHub
+# release for the tag. No tags expected until Phase H acceptance.
+
+name: ci-release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0). Must already exist.'
+        required: true
+
+permissions:
+  contents: write  # for release publish
+
+jobs:
+  build-cdylib:
+    name: cdylib (${{ matrix.target.os }} / ${{ matrix.target.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { os: ubuntu-22.04,    arch: x86_64,  rust-target: x86_64-unknown-linux-gnu,  artifact: libforst_rs.so    }
+          - { os: ubuntu-22.04-arm, arch: aarch64, rust-target: aarch64-unknown-linux-gnu, artifact: libforst_rs.so    }
+          - { os: macos-14,        arch: x86_64,  rust-target: x86_64-apple-darwin,        artifact: libforst_rs.dylib }
+          - { os: macos-14,        arch: arm64,   rust-target: aarch64-apple-darwin,       artifact: libforst_rs.dylib }
+    runs-on: ${{ matrix.target.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.rust-target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.target.arch }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build cdylib
+        run: cargo build --release --target ${{ matrix.target.rust-target }} -p forst-rs-ffi
+      - name: Stage artifact
+        run: |
+          mkdir -p release-staging
+          cp target/${{ matrix.target.rust-target }}/release/${{ matrix.target.artifact }} \
+             release-staging/${{ matrix.target.artifact }}.${{ matrix.target.os }}.${{ matrix.target.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cdylib-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: release-staging/
+
+  build-jar:
+    name: Shaded JAR
+    runs-on: ubuntu-22.04
+    if: hashFiles('**/pom.xml') != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25.0.3'
+          distribution: 'temurin'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+      - run: mvn -B package -DskipTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forst-rs-flink-jar
+          path: forst-rs-flink/target/forst-rs-flink-*.jar
+
+  upload-release:
+    name: Publish GitHub release
+    needs: [build-cdylib, build-jar]
+    runs-on: ubuntu-22.04
+    if: ${{ always() && needs.build-cdylib.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # for release-notes generation
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
+          if [[ -n "${PREV_TAG}" ]]; then
+            RANGE="${PREV_TAG}..${TAG}"
+            HEADING="Changes since ${PREV_TAG}"
+          else
+            RANGE="${TAG}"
+            HEADING="Initial release ${TAG}"
+          fi
+          {
+            echo "## ${HEADING}"
+            echo ""
+            echo "### Features"
+            git log "${RANGE}" --no-merges --pretty=format:"- %s (%h)" | grep -E "^- feat" || echo "_(none)_"
+            echo ""
+            echo "### Fixes"
+            git log "${RANGE}" --no-merges --pretty=format:"- %s (%h)" | grep -E "^- fix"  || echo "_(none)_"
+            echo ""
+            echo "### Docs"
+            git log "${RANGE}" --no-merges --pretty=format:"- %s (%h)" | grep -E "^- docs" || echo "_(none)_"
+            echo ""
+            echo "### Other"
+            git log "${RANGE}" --no-merges --pretty=format:"- %s (%h)" | grep -vE "^- (feat|fix|docs)" || echo "_(none)_"
+          } > release-notes.md
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.notes.outputs.tag }}
+          body_path: release-notes.md
+          files: |
+            release-artifacts/cdylib-*/libforst_rs*
+            release-artifacts/forst-rs-flink-jar/forst-rs-flink-*.jar
+          fail_on_unmatched_files: false

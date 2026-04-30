@@ -1,0 +1,50 @@
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md §5/§6 @ 33f85b1c5
+# Plan: .planning/refactor-review/G1_gha_rebuild_plan.md §1.5 @ 89104d8bd
+#
+# Dedicated security audit. Replaces the `audit` job that previously
+# lived in the now-deleted ci.yml.
+
+name: ci-security
+
+on:
+  push:
+    branches: [forst-rs, main]
+  pull_request:
+    branches: [forst-rs, main]
+  schedule:
+    - cron: '0 8 * * 1'  # weekly Monday 08:00 UTC
+  workflow_dispatch:
+
+jobs:
+  cargo-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  cargo-deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
+
+  dependabot-config:
+    name: dependabot.yml lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify dependabot.yml is well-formed
+        run: |
+          test -f .github/dependabot.yml || (echo "missing .github/dependabot.yml"; exit 1)
+          # Basic YAML validity check via Python's yaml.safe_load
+          python3 -c "import yaml,sys; yaml.safe_load(open('.github/dependabot.yml'))" || \
+            (echo "dependabot.yml is not valid YAML"; exit 1)
+          echo "✓ dependabot.yml is valid"

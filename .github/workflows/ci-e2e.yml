@@ -1,0 +1,100 @@
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md §5/§6 @ 33f85b1c5
+# Plan: .planning/refactor-review/G1_gha_rebuild_plan.md §1.3 @ 89104d8bd
+#
+# Cross-language end-to-end suite. Currently a stub — depends on:
+#   - libforst_rs.so (Rust cdylib, lands in C9 per COMMIT_MANIFEST.md)
+#   - forst-rs-flink-*.jar (Java FFM bridge, lands in C9)
+#   - tests/e2e/docker-compose.yml (lands in Phase G per A1 §5 row G)
+# Until these artifacts exist the integration-suite job no-ops.
+
+name: ci-e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'tests/e2e/**'
+      - 'forst-rs-flink/**'
+      - '.github/workflows/ci-e2e.yml'
+  schedule:
+    - cron: '0 6 * * *'  # nightly 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  integration-suite:
+    name: E2E (MinIO + cdylib + JAR + Flink mini-cluster)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      minio:
+        image: minio/minio:latest
+        ports:
+          - 9000:9000
+          - 9001:9001
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pre-flight — verify required artifacts
+        id: preflight
+        run: |
+          MISSING=()
+          [[ -f tests/e2e/docker-compose.yml ]] || MISSING+=("tests/e2e/docker-compose.yml")
+          [[ -d crates/forst-rs-ffi ]] || MISSING+=("crates/forst-rs-ffi (cdylib source)")
+          [[ -f forst-rs-flink/pom.xml ]] || MISSING+=("forst-rs-flink/pom.xml (Java FFM bridge)")
+          if [[ ${#MISSING[@]} -gt 0 ]]; then
+            echo "missing<<EOF" >> "$GITHUB_OUTPUT"
+            printf '  - %s\n' "${MISSING[@]}" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip notice (deps not yet built)
+        if: steps.preflight.outputs.skip == 'true'
+        run: |
+          echo "::notice::E2E suite skipped — waiting on:"
+          echo "${{ steps.preflight.outputs.missing }}"
+          echo "Per A1 §5 row G, suite activates after C9 + Phase G land docker-compose.yml"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.preflight.outputs.skip == 'false'
+
+      - uses: actions/setup-java@v4
+        if: steps.preflight.outputs.skip == 'false'
+        with:
+          java-version: '25.0.3'
+          distribution: 'temurin'
+
+      - name: Build cdylib
+        if: steps.preflight.outputs.skip == 'false'
+        run: cargo build --release -p forst-rs-ffi
+
+      - name: Build shaded JAR
+        if: steps.preflight.outputs.skip == 'false'
+        run: mvn -B -f forst-rs-flink/pom.xml package -DskipTests
+
+      - name: Bring up compose stack
+        if: steps.preflight.outputs.skip == 'false'
+        run: docker compose -f tests/e2e/docker-compose.yml up -d --wait
+
+      - name: Run Flink integration suite
+        if: steps.preflight.outputs.skip == 'false'
+        run: mvn -B -f forst-rs-flink/pom.xml integration-test
+
+      - name: Tear down
+        if: always() && steps.preflight.outputs.skip == 'false'
+        run: docker compose -f tests/e2e/docker-compose.yml down -v
