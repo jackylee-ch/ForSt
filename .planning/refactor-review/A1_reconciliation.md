@@ -114,11 +114,11 @@ Establish a Nexmark baseline (Flink + original ForSt) so the ≥30–40% E2E tar
 
 ### 4.2 Plan
 
-1. **Research** (Performance Engineer + QA): investigate `https://github.com/apache/flink/tree/release-2.2.0/.github/workflows/` for any Nexmark CI workflow. Cross-check `https://github.com/nexmark/nexmark` (community repo) as fallback.
-   - **Open feasibility risk:** Flink GHA Nexmark infra may not exist as a public reusable workflow. Outcome of research determines whether (a) we mirror Flink GHA, (b) we adopt the community `nexmark/nexmark` harness, or (c) we build from scratch.
-2. **Mirror or build**: based on research outcome, instantiate `.github/workflows/nexmark-baseline.yml` and `nexmark/` directory containing `docker-compose.yml` (Flink mini-cluster + original ForSt + queries q0..q22).
-3. **Establish baseline**: 3× warmup runs + 5× measurement runs; per query record p50, p95, p99 latency and throughput. Commit `.planning/nexmark/baseline.json` with the numbers + reproducibility notes.
-4. **Sign-off**: user reviews `baseline.json` and signs off via commit comment in `.planning/nexmark/baseline-signoff.md` referencing the SHA of the baseline commit.
+1. **Research** (Performance Engineer + QA): investigate `https://github.com/apache/flink/tree/release-2.2/.github/workflows/` for any Nexmark CI workflow. Cross-check `https://github.com/nexmark/nexmark` (community repo) as fallback.
+   - **Outcome (recorded in `N1_nexmark_research.md` @ `eed47d954`)**: Flink upstream has NO Nexmark CI workflow (verified via `gh api` on master and refs/heads/release-2.2). The canonical harness is `nexmark/nexmark` — actively maintained, last commit 2025-12-26, explicitly supports `state.backend.type: forst`. Path **(b) fork-community** is the only viable path; (a) and (c) rejected.
+2. **Vendor harness**: vendor `nexmark/nexmark` at pinned SHA (recommended `6b3646c`, 2025-12-26) under `nexmark/` directory in this repo. Build via `nexmark-flink/build.sh` (Maven; produces `nexmark-flink.tgz`). **NOTE**: harness is Maven-only; there is no docker-compose path. Real-cluster deployment required for canonical baseline (4 worker minimum × 16 cores × 32GB RAM + HDFS).
+3. **Establish baseline**: 3× warmup runs + 5× measurement runs; per query record **`Cores × Time(s)`** (the canonical Nexmark metric — single composite per query, not p50/p99/throughput; per N1 §3.2). Commit `.planning/nexmark/baseline.json` with numbers + reproducibility notes (Flink version, ForSt SHA, hardware spec, run timestamps). The 30–40% speedup gate evaluates as a `Cores × Time` reduction (a 30% reduction in `Cores × Time` ≡ a 30% throughput improvement at constant CPU spend).
+4. **Sign-off**: user reviews `baseline.json` and signs off via commit comment in `.planning/nexmark/baseline-signoff.md` referencing the SHA of the baseline commit. **Note**: actual baseline measurement is hardware-bound and must be run by user-with-cluster — not producible in an LLM session.
 
 ### 4.3 Owner & gates
 
