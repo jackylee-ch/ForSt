@@ -8,27 +8,26 @@
 #   - nexmark-flink Maven build succeeds
 #   - build-baseline.sh wrapper produces nexmark-baseline.tgz
 #
-# NOTE: this workflow will fail until the nexmark/nexmark submodule is
-# vendored (per N2 Lane A Task 1, requires explicit user authorization).
-# Until then, the workflow is gated on workflow_dispatch only.
-#
 # Authoritative spec: .planning/refactor-review/A1_reconciliation.md @ 107bc0ce2
 # Plan: .planning/refactor-review/N2_nexmark_plan.md @ 58484044e
+# Submodule landed: 98fb07ffa (nexmark @ 6b3646c)
 
 name: nexmark-baseline-smoke
 
 on:
-  # Will be re-enabled to push/pull_request after submodule lands.
-  # push:
-  #   paths:
-  #     - 'nexmark-config/**'
-  #     - '.gitmodules'
-  #     - '.github/workflows/nexmark-baseline.yml'
-  # pull_request:
-  #   paths:
-  #     - 'nexmark-config/**'
-  #     - '.gitmodules'
-  #     - '.github/workflows/nexmark-baseline.yml'
+  push:
+    branches: [forst-rs, main]
+    paths:
+      - 'nexmark-config/**'
+      - '.gitmodules'
+      - 'nexmark'
+      - '.github/workflows/nexmark-baseline.yml'
+  pull_request:
+    paths:
+      - 'nexmark-config/**'
+      - '.gitmodules'
+      - 'nexmark'
+      - '.github/workflows/nexmark-baseline.yml'
   workflow_dispatch:
 
 jobs:
@@ -44,11 +43,6 @@ jobs:
 
       - name: Verify nexmark submodule pin
         run: |
-          if [[ ! -d nexmark ]]; then
-            echo "nexmark/ submodule not vendored yet — see N2 Lane A Task 1."
-            echo "Run locally: git submodule add https://github.com/nexmark/nexmark.git nexmark"
-            exit 0  # exit cleanly until submodule lands
-          fi
           cd nexmark
           PINNED_SHA=$(git rev-parse HEAD)
           EXPECTED_PREFIX=6b3646c
@@ -72,24 +66,14 @@ jobs:
           restore-keys: ${{ runner.os }}-m2-
 
       - name: Build via wrapper
-        run: |
-          if [[ ! -d nexmark ]]; then
-            echo "Skipping build — submodule not vendored yet"
-            exit 0
-          fi
-          ./nexmark-config/build-baseline.sh
+        run: ./nexmark-config/build-baseline.sh
 
       - name: Verify output artifact
         run: |
-          if [[ ! -d nexmark ]]; then
-            echo "Skipping verify — submodule not vendored yet"
-            exit 0
-          fi
           test -f nexmark-baseline.tgz || (echo "missing nexmark-baseline.tgz"; exit 1)
           ls -lh nexmark-baseline.tgz
 
       - name: Upload artifact
-        if: hashFiles('nexmark-baseline.tgz') != ''
         uses: actions/upload-artifact@v4
         with:
           name: nexmark-baseline-build

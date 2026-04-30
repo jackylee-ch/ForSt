@@ -152,7 +152,7 @@ The Tech VP signs off only if **all** of the following hold:
 2. **Per-bench perf gate met**: ≥3× vs RocksDB C++ on every benchmark across C1–C9. Architectural misses resolved by §3 arch-pivots; no tiering, no caps, no "accept and document" downgrades.
 3. **Nexmark E2E gate met**: ≥30–40% speedup vs original ForSt + Flink, measured on §4 harness, signed off by user.
 4. **GHA**: all 6 workflows + `nexmark-baseline.yml` green; release dry-run executed once.
-5. **Coverage**: Rust ≥ 90%, Java ≥ 80%.
+5. **Coverage**: hard CI gate ≥ 80% (Rust + Java); stretch target Rust ≥ 90% / Java ≥ 80%; "larger is better" — gate ratchets up over time, never down. Resolved 2026-04-30 (G1 §3.1).
 6. **Flink scenarios**: P0 (KeyedState / Checkpoint / Rescaling / TTL / Local Recovery / Timer) + P1 (Schema Evolution / Savepoint Native+Canonical / State Processor / Fast Recovery / Changelog) all pass E2E. P2 Roadmap doc complete with prereq / effort / risk per entry.
 7. **Soak test**: 72-hour continuous workload (StateBackend + Rescaling + TTL + Schema Evolution concurrent), zero crashes / leaks / Checkpoint failures.
 8. **Migration Guide**: original ForSt → ForSt-RS *and* RocksDB → ForSt-RS, both reproducible by an outside reader.

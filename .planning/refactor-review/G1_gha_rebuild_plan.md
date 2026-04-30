@@ -211,25 +211,17 @@ After all 6 workflows land:
 
 ---
 
-## 3. Open Decisions
+## 3. Resolved Decisions (user 2026-04-30)
 
-1. **`ci-rust.yml` coverage gate threshold**: A1 §6 item 5 says ≥90% for Rust. But existing crates may not yet hit 90% — `cargo llvm-cov --fail-under-lines 90` would block PRs immediately. Three options:
-   - **(a)** Set gate to 90% now; existing PRs blocked until coverage rises (most aligned with spec)
-   - **(b)** Set gate to current coverage level + 5%; ratchet up per Cn (gradual)
-   - **(c)** No gate; warning-only (least pressure)
-   - **Recommendation**: (b) — ratchet from current. Measure current first (via one-off run), then set gate to that + 5%. Document the trajectory in `reports/F1_gha_setup.md`.
+1. **Coverage gate**: hard floor at **80%** (`cargo llvm-cov --fail-under-lines 80`). "Larger is better" — gate ratchets up over time, never down. A1 §6 item 5 stretch target Rust ≥ 90% remains as Phase H acceptance gate (separate enforcement). Implementation: `ci-rust.yml` coverage job uses `--fail-under-lines 80`; gate may be raised in subsequent commits as coverage grows. Document trajectory in `reports/F1_gha_setup.md`.
 
-2. **GH Pages publishing for `ci-bench.yml`**: requires repository to have GH Pages enabled and a `gh-pages` branch. Currently undetermined.
-   - **Action item**: confirm with user before Task 4.3.
+2. **GH Pages**: ✅ enabled. Wire `ci-bench.yml` upload-perf-trend job to push criterion HTML to `gh-pages` branch under `criterion-reports/`. User confirms repo has GH Pages enabled.
 
-3. **macOS arm64 runner availability for `ci-release.yml`**: GitHub now offers `macos-14` arm64 runners; verified available as of 2025.
-   - **No action needed**; proceed with `macos-14`.
+3. **macOS arm64 runner availability for `ci-release.yml`**: GitHub `macos-14` arm64 runners verified available; proceed.
 
-4. **Java-side toolchain version**: A1 spec mentions JDK 25 for FFM. Latest GHA runners (ubuntu-22.04) include up to JDK 21 by default; JDK 25 needs explicit `actions/setup-java@v4` with `java-version: '25'` (early-access).
-   - **Decision**: pin `setup-java` to `25` in `ci-java.yml` and `ci-e2e.yml`. Acceptable risk; if unstable, fall back to JDK 21 with explicit `--enable-preview`.
+4. **JDK version**: ✅ **JDK 25.0.3** (specific patch version). Both `ci-java.yml` and `ci-e2e.yml` pin `actions/setup-java@v4` with `java-version: '25.0.3'`. JDK 25.0.3 is GA-released and stable; no `--enable-preview` flag required for FFM (FFM is finalized in JDK 22+).
 
-5. **Codecov vs Coveralls**: A1 §6 mentions Codecov. Open whether to wire Coveralls as backup.
-   - **Recommendation**: Codecov only. Single uploader is enough; failing-over to two adds complexity.
+5. **Codecov vs Coveralls**: Codecov only. Single uploader is enough; redundancy adds complexity.
 
 ---
 
