@@ -128,15 +128,45 @@ jobs:
           key: ${{ runner.os }}-cargo-llvm-cov-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-llvm-cov-
-      - name: Generate coverage report
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info --fail-under-lines 80
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+      - name: Generate coverage (lcov + HTML + JSON summary; gate ≥80%)
+        run: |
+          # The --fail-under-lines flag enforces the 80% hard gate
+          # (G1 §3.1 resolved 2026-04-30; A1 §6.5 stretch target 90%).
+          cargo llvm-cov --workspace --lcov   --output-path lcov.info       --fail-under-lines 80
+          cargo llvm-cov --workspace --html   --output-dir  target/coverage-html --no-report
+          cargo llvm-cov --workspace --json   --output-path coverage.json   --no-report --summary-only
+
+      - name: Write coverage summary to job summary
+        run: |
+          # Extract overall line coverage % from JSON for visibility in the GHA run page.
+          PCT=$(python3 -c "import json; d=json.load(open('coverage.json')); t=d['data'][0]['totals']['lines']; print(f\"{t['percent']:.2f}\")")
+          {
+            echo "## Coverage report"
+            echo ""
+            echo "**Overall line coverage:** \`${PCT}%\` (gate ≥ 80%)"
+            echo ""
+            echo "**Stretch target (A1 §6.5):** Rust ≥ 90%"
+            echo ""
+            echo "Full HTML report uploaded as artifact \`coverage-html\` (1-week retention)."
+            echo "lcov.info uploaded as artifact \`coverage-lcov\`."
+            echo ""
+            echo "Authoritative spec: \`.planning/refactor-review/A1_reconciliation.md\` §6.5"
+            echo "Plan: \`.planning/refactor-review/G1_gha_rebuild_plan.md\` §3.1"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage HTML
+        uses: actions/upload-artifact@v4
         with:
-          files: lcov.info
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+          name: coverage-html
+          path: target/coverage-html/
+          retention-days: 7
+
+      - name: Upload coverage lcov
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 7
 
   doc:
     name: Rustdoc
