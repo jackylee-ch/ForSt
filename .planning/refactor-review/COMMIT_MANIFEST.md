@@ -1,5 +1,7 @@
 # ForSt-RS Refactor Review — Commit Manifest
 
+> Authoritative spec: `.planning/refactor-review/A1_reconciliation.md` @ 5b82b8d67
+
 ## Goal
 - 对 9 个功能 commits 各执行 120 轮 10-agent review loop
 - 终止: 连续 10 轮 H=0 M=0 或达 120 轮
