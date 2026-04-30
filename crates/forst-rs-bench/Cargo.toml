@@ -15,6 +15,7 @@
 [package]
 name = "forst-rs-bench"
 version = "0.1.0"
+publish = false  # internal-only; never published to crates.io
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -15,6 +15,7 @@
 [package]
 name = "forst-rs-storage"
 version = "0.1.0"
+publish = false  # internal-only; never published to crates.io
 description = "SST file format: data blocks, index, bloom filter, header/footer"
 edition.workspace = true
 rust-version.workspace = true
