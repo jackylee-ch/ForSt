@@ -1,0 +1,3 @@
+[submodule "nexmark"]
+	path = nexmark
+	url = https://github.com/nexmark/nexmark.git
