@@ -16,6 +16,10 @@ ignore = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Workspace path dependencies (e.g. `forst-rs-common = { path = "..." }`)
+# don't carry a version number and would otherwise trip the wildcard
+# check. `allow-wildcard-paths` exempts intra-workspace path deps.
+allow-wildcard-paths = true
 deny = []
 skip = []
 skip-tree = []
@@ -27,6 +31,7 @@ allow = [
     "MIT",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",         # xxhash-rust (Boost Software License — Apache-2.0-friendly)
     "Unicode-3.0",
     "Unicode-DFS-2016",
     "ISC",
