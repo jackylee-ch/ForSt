@@ -55,10 +55,26 @@ jobs:
           name: cdylib-${{ matrix.target.os }}-${{ matrix.target.arch }}
           path: release-staging/
 
+  preflight-java:
+    name: Detect Java module
+    runs-on: ubuntu-22.04
+    outputs:
+      has-java: ${{ steps.detect.outputs.has-java }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          if [[ -n "$(find . -name pom.xml -not -path './nexmark/*' 2>/dev/null | head -1)" ]]; then
+            echo "has-java=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-java=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-jar:
     name: Shaded JAR
+    needs: preflight-java
+    if: needs.preflight-java.outputs.has-java == 'true'
     runs-on: ubuntu-22.04
-    if: hashFiles('**/pom.xml') != ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4

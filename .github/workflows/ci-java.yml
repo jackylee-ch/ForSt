@@ -1,9 +1,11 @@
 # Authoritative spec: .planning/refactor-review/A1_reconciliation.md §5/§6 @ 33f85b1c5
 # Plan: .planning/refactor-review/G1_gha_rebuild_plan.md §1.2 @ 89104d8bd
 #
-# Java side CI. Currently a stub — no Java module exists yet (lands in C9
-# per COMMIT_MANIFEST.md). All jobs guard on hashFiles('**/pom.xml') so
-# they cleanly skip until the Java module is added.
+# Java side CI. Uses a preflight job to detect Java module presence at
+# step level (hashFiles() is not allowed at job-level if).
+# Currently a stub — no Java module exists yet (lands in C9 per
+# COMMIT_MANIFEST.md). The preflight gracefully skips downstream jobs
+# until pom.xml exists.
 
 name: ci-java
 
@@ -23,10 +25,28 @@ on:
   workflow_dispatch:
 
 jobs:
+  preflight:
+    name: Detect Java module
+    runs-on: ubuntu-latest
+    outputs:
+      has-java: ${{ steps.detect.outputs.has-java }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        run: |
+          if [[ -n "$(find . -name pom.xml -not -path './nexmark/*' -not -path './node_modules/*' 2>/dev/null | head -1)" ]]; then
+            echo "has-java=true" >> "$GITHUB_OUTPUT"
+            echo "Java module detected."
+          else
+            echo "has-java=false" >> "$GITHUB_OUTPUT"
+            echo "No Java module yet — downstream jobs will skip. Lands in C9 per COMMIT_MANIFEST."
+          fi
+
   build:
     name: Maven verify
+    needs: preflight
+    if: needs.preflight.outputs.has-java == 'true'
     runs-on: ubuntu-latest
-    if: hashFiles('**/pom.xml') != ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -42,9 +62,9 @@ jobs:
 
   spotbugs:
     name: SpotBugs
+    needs: [preflight, build]
+    if: needs.preflight.outputs.has-java == 'true'
     runs-on: ubuntu-latest
-    if: hashFiles('**/pom.xml') != ''
-    needs: build
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -60,9 +80,9 @@ jobs:
 
   shaded-jar:
     name: Shaded JAR
+    needs: [preflight, build]
+    if: needs.preflight.outputs.has-java == 'true'
     runs-on: ubuntu-latest
-    if: hashFiles('**/pom.xml') != ''
-    needs: build
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -85,12 +105,3 @@ jobs:
           name: forst-rs-flink-jar
           path: forst-rs-flink/target/forst-rs-flink-*.jar
           retention-days: 7
-
-  no-op:
-    name: No Java module yet (skip)
-    runs-on: ubuntu-latest
-    if: hashFiles('**/pom.xml') == ''
-    steps:
-      - run: |
-          echo "No pom.xml in tree — Java module lands in C9 per COMMIT_MANIFEST."
-          echo "This workflow becomes active once the first pom.xml is committed."

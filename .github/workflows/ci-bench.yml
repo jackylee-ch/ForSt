@@ -89,8 +89,8 @@ jobs:
             echo "<h1>Criterion benchmarks — trend snapshots</h1>"
             echo "<p>Per A1 §6 — perf trend dashboard, not a hard gate.</p>"
             echo "<ul>"
-            for d in $(ls -1d 20*/ 2>/dev/null | sort -r); do
-              echo "  <li><a href=\"${d}\">${d%/}</a></li>"
+            find . -mindepth 1 -maxdepth 1 -type d -name '20*' -printf '%f\n' 2>/dev/null | sort -r | while read -r d; do
+              echo "  <li><a href=\"${d}/\">${d}</a></li>"
             done
             echo "</ul>"
             echo "</body></html>"
