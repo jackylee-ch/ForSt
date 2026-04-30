@@ -1,0 +1,40 @@
+# Nexmark Baseline Sign-off
+
+**Baseline file:** `.planning/nexmark/baseline.json` @ commit `<TODO>`
+**Signed by:** `<TODO: user name>`
+**Sign-off date:** `<TODO: ISO 8601>`
+
+## Confirmation
+
+By signing this document, I confirm:
+
+- [ ] The baseline numbers in `.planning/nexmark/baseline.json` were produced
+      on the hardware described in `_hardware` field
+- [ ] All 23 supported queries (q0–q5, q7–q23) ran to completion across
+      all 5 measurement runs
+- [ ] The state backend was original ForSt (`state.backend.type: forst`)
+- [ ] Reproducibility: a fresh run on the same hardware would produce
+      numbers within 1× stddev of the recorded median
+- [ ] Per-query stddev / median ratio is acceptable (< 10% on each query;
+      flag any outliers below)
+
+## Signed-off Numbers
+
+(Copy the `results` block from baseline.json here as a record snapshot.)
+
+```json
+<TODO: paste results block>
+```
+
+## Outliers / Notes
+
+<TODO: any queries with high variance, OOMs, retries, or other concerns>
+
+## Authoritative Spec Reference
+
+- `.planning/refactor-review/A1_reconciliation.md` §4 @ `107bc0ce2`
+- `.planning/refactor-review/N1_nexmark_research.md` @ `eed47d954`
+- `.planning/refactor-review/N2_nexmark_plan.md` @ `58484044e`
+
+After this sign-off lands on `forst-rs` branch, **C5 (`forst-rs-storage` cache)
+review may begin** per A1 §4.3 gating rule.

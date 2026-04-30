@@ -1,0 +1,97 @@
+# CI smoke build for the Nexmark baseline harness.
+#
+# DOES NOT run actual baseline measurements (those require real cluster
+# hardware — see .planning/nexmark/USER_RUNBOOK.md).
+#
+# DOES verify:
+#   - submodule init works
+#   - nexmark-flink Maven build succeeds
+#   - build-baseline.sh wrapper produces nexmark-baseline.tgz
+#
+# NOTE: this workflow will fail until the nexmark/nexmark submodule is
+# vendored (per N2 Lane A Task 1, requires explicit user authorization).
+# Until then, the workflow is gated on workflow_dispatch only.
+#
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md @ 107bc0ce2
+# Plan: .planning/refactor-review/N2_nexmark_plan.md @ 58484044e
+
+name: nexmark-baseline-smoke
+
+on:
+  # Will be re-enabled to push/pull_request after submodule lands.
+  # push:
+  #   paths:
+  #     - 'nexmark-config/**'
+  #     - '.gitmodules'
+  #     - '.github/workflows/nexmark-baseline.yml'
+  # pull_request:
+  #   paths:
+  #     - 'nexmark-config/**'
+  #     - '.gitmodules'
+  #     - '.github/workflows/nexmark-baseline.yml'
+  workflow_dispatch:
+
+jobs:
+  build-harness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify nexmark submodule pin
+        run: |
+          if [[ ! -d nexmark ]]; then
+            echo "nexmark/ submodule not vendored yet — see N2 Lane A Task 1."
+            echo "Run locally: git submodule add https://github.com/nexmark/nexmark.git nexmark"
+            exit 0  # exit cleanly until submodule lands
+          fi
+          cd nexmark
+          PINNED_SHA=$(git rev-parse HEAD)
+          EXPECTED_PREFIX=6b3646c
+          if [[ ! "$PINNED_SHA" =~ ^${EXPECTED_PREFIX} ]]; then
+            echo "Submodule pin drift: expected ${EXPECTED_PREFIX}*, got ${PINNED_SHA}"
+            exit 1
+          fi
+          echo "✓ Submodule pinned at ${PINNED_SHA}"
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-m2-${{ hashFiles('nexmark/**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-m2-
+
+      - name: Build via wrapper
+        run: |
+          if [[ ! -d nexmark ]]; then
+            echo "Skipping build — submodule not vendored yet"
+            exit 0
+          fi
+          ./nexmark-config/build-baseline.sh
+
+      - name: Verify output artifact
+        run: |
+          if [[ ! -d nexmark ]]; then
+            echo "Skipping verify — submodule not vendored yet"
+            exit 0
+          fi
+          test -f nexmark-baseline.tgz || (echo "missing nexmark-baseline.tgz"; exit 1)
+          ls -lh nexmark-baseline.tgz
+
+      - name: Upload artifact
+        if: hashFiles('nexmark-baseline.tgz') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexmark-baseline-build
+          path: nexmark-baseline.tgz
+          retention-days: 7

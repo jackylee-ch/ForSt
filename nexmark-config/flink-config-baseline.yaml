@@ -1,0 +1,25 @@
+# ForSt-RS Nexmark Baseline — Flink overrides
+#
+# Layered on top of nexmark/nexmark-flink/src/main/resources/conf/config_v2.yaml.
+# Apply by: cp this file to flink/conf/config.yaml on master node, OR merge
+# the relevant sections.
+#
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md §4 @ 107bc0ce2
+# Plan: .planning/refactor-review/N2_nexmark_plan.md @ 58484044e
+
+# State backend — the variable we are baselining
+state.backend.type: forst
+
+# Checkpoint storage — REQUIRED for stateful queries (q3..q22 use state)
+# Replace <HDFS_HOST> with your HDFS namenode address.
+execution.checkpointing.dir: hdfs://<HDFS_HOST>/checkpoints/nexmark-baseline
+
+# Local IO temp dirs — recommend SSDs for L0/L1 cache
+# Replace with your worker-node local paths
+io.tmp.dirs: /mnt/disk1/tmp,/mnt/disk2/tmp
+
+# Default parallelism — matches nexmark canonical config
+parallelism.default: 8
+
+# JM/TM addresses — set during cluster deployment
+# jobmanager.rpc.address: <set on master node>

@@ -1,0 +1,67 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "spec_ref": ".planning/refactor-review/A1_reconciliation.md @ 107bc0ce2",
+    "research_ref": ".planning/refactor-review/N1_nexmark_research.md @ eed47d954",
+    "plan_ref": ".planning/refactor-review/N2_nexmark_plan.md @ 58484044e",
+    "metric": "cores_x_time_seconds",
+    "metric_definition": "CPU cores consumed × elapsed wall-clock time in seconds — the canonical Nexmark composite metric per nexmark/nexmark/README.md",
+    "lower_is_better": true
+  },
+  "_provenance": {
+    "harness_repo": "https://github.com/nexmark/nexmark",
+    "harness_sha": "6b3646c",
+    "flink_version": "<TODO: e.g. 2.2.0>",
+    "flink_sha": "<TODO: full SHA from apache/flink>",
+    "forst_variant": "original",
+    "forst_sha": "<TODO: SHA of the ForSt build used>",
+    "state_backend_type": "forst",
+    "checkpoint_storage": "<TODO: e.g. hdfs://...>",
+    "run_timestamps_utc": {
+      "warmup_runs": ["<TODO: 3 ISO 8601 timestamps>"],
+      "measurement_runs": ["<TODO: 5 ISO 8601 timestamps>"]
+    },
+    "operator": "<TODO: name or email of person who ran the baseline>"
+  },
+  "_hardware": {
+    "worker_count": 4,
+    "cores_per_worker": 16,
+    "ram_per_worker_gb": 32,
+    "ssd_per_worker_gb": 100,
+    "network_gbps": 1,
+    "hdfs_data_node_count": "<TODO>",
+    "notes": "<TODO: any deviation from nexmark/nexmark/GUIDE_V2.md minimums>"
+  },
+  "_workload": {
+    "events_total": 100000000,
+    "bid_proportion": 92,
+    "auction_proportion": 6,
+    "person_proportion": 2,
+    "notes": "Defaults from nexmark.yaml; document any overrides here"
+  },
+  "results": {
+    "q0":  {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q1":  {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q2":  {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q3":  {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q4":  {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q5":  {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q7":  {"cores_x_time_seconds": null, "stddev": null, "n": 5, "_note": "q6 not supported by Flink — see FLINK-19059"},
+    "q8":  {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q9":  {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q10": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q11": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q12": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q13": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q14": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q15": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q16": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q17": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q18": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q19": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q20": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q21": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q22": {"cores_x_time_seconds": null, "stddev": null, "n": 5},
+    "q23": {"cores_x_time_seconds": null, "stddev": null, "n": 5, "_note": "Added 2025-12-25 in nexmark/nexmark@8063de6"}
+  }
+}

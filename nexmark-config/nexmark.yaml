@@ -1,0 +1,21 @@
+# ForSt-RS Nexmark Baseline — Nexmark runner overrides
+#
+# Layered on top of nexmark/nexmark-flink/src/main/resources/conf/nexmark_v2.yaml.
+# Replace <MASTER_HOST> with your master-node address.
+#
+# Authoritative spec: .planning/refactor-review/A1_reconciliation.md §4 @ 107bc0ce2
+# Plan: .planning/refactor-review/N2_nexmark_plan.md @ 58484044e
+
+# Metric reporter — collects Cores × Time(s) per query
+nexmark.metric.reporter.host: <MASTER_HOST>
+nexmark.metric.reporter.port: 9099
+
+# Workload — keep canonical defaults for comparability
+# (override only if baseline numbers must match a specific scale)
+# nexmark.workload.events.num: 100000000
+# nexmark.workload.bid.proportion: 92
+# nexmark.workload.auction.proportion: 6
+# nexmark.workload.person.proportion: 2
+
+# Query selection: 'all' = q0..q23 (q23 added 2025-12-25 in nexmark/nexmark@8063de6)
+# nexmark.query.set: all
