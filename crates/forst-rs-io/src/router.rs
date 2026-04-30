@@ -272,7 +272,7 @@ impl FileSystemRouter {
 /// Known ForSt-RS file extensions and their storage locality.
 ///
 /// This is informational only; the routing decision itself is made by
-/// [`FileSystemRouter::is_remote_file`].
+/// `FileSystemRouter::is_remote_file` (private internal helper).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileLocality {
     /// File should be stored on local filesystem (WAL, MANIFEST, etc.).

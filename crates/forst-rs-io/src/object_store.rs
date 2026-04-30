@@ -197,14 +197,14 @@ pub trait ObjectStore: Send + Sync {
 
     /// Initiates a multipart upload.
     ///
-    /// Returns an upload ID that must be passed to [`upload_part`],
-    /// [`complete_multipart_upload`], or [`abort_multipart_upload`].
+    /// Returns an upload ID that must be passed to [`Self::upload_part`],
+    /// [`Self::complete_multipart_upload`], or [`Self::abort_multipart_upload`].
     fn create_multipart_upload(&self, path: &ObjectStorePath) -> ForstResult<String>;
 
     /// Uploads a single part in a multipart upload.
     ///
     /// Returns a [`CompletedPart`] that must be collected and passed to
-    /// [`complete_multipart_upload`].
+    /// [`Self::complete_multipart_upload`].
     fn upload_part(
         &self,
         path: &ObjectStorePath,
@@ -486,7 +486,7 @@ impl ObjectStore for MockObjectStore {
 /// Adapts an [`ObjectStore`] to the [`FileSystem`] trait.
 ///
 /// This adapter maps filesystem paths to object store keys using a
-/// configurable bucket and prefix. It enables the [`FileSystemRouter`] to
+/// configurable bucket and prefix. It enables the [`crate::router::FileSystemRouter`] to
 /// route SST file operations to cloud storage transparently.
 ///
 /// # Path Mapping
@@ -555,7 +555,7 @@ impl SequentialFile for ObjectStoreSequentialFile {
 /// A random-access file backed by an in-memory snapshot of the object data.
 ///
 /// Since the crate uses `#![forbid(unsafe_code)]`, we snapshot the full object
-/// into memory on open (same approach as [`MemoryFileSystem`]).
+/// into memory on open (same approach as [`crate::memory_fs::MemoryFileSystem`]).
 struct ObjectStoreRandomAccessFileSnapshot {
     data: Vec<u8>,
 }
