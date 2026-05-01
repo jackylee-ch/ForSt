@@ -26,10 +26,10 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - { os: ubuntu-22.04,    arch: x86_64,  rust-target: x86_64-unknown-linux-gnu,  artifact: libforst_rs.so    }
-          - { os: ubuntu-22.04-arm, arch: aarch64, rust-target: aarch64-unknown-linux-gnu, artifact: libforst_rs.so    }
-          - { os: macos-14,        arch: x86_64,  rust-target: x86_64-apple-darwin,        artifact: libforst_rs.dylib }
-          - { os: macos-14,        arch: arm64,   rust-target: aarch64-apple-darwin,       artifact: libforst_rs.dylib }
+          - { os: ubuntu-22.04,    arch: x86_64,  rust-target: x86_64-unknown-linux-gnu,  artifact: libforst_rs_ffi.so    }
+          - { os: ubuntu-22.04-arm, arch: aarch64, rust-target: aarch64-unknown-linux-gnu, artifact: libforst_rs_ffi.so    }
+          - { os: macos-14,        arch: x86_64,  rust-target: x86_64-apple-darwin,        artifact: libforst_rs_ffi.dylib }
+          - { os: macos-14,        arch: arm64,   rust-target: aarch64-apple-darwin,       artifact: libforst_rs_ffi.dylib }
     runs-on: ${{ matrix.target.os }}
     steps:
       - uses: actions/checkout@v4
@@ -140,6 +140,6 @@ jobs:
           tag_name: ${{ steps.notes.outputs.tag }}
           body_path: release-notes.md
           files: |
-            release-artifacts/cdylib-*/libforst_rs*
+            release-artifacts/cdylib-*/libforst_rs_ffi*
             release-artifacts/forst-rs-flink-jar/forst-rs-flink-*.jar
           fail_on_unmatched_files: false
