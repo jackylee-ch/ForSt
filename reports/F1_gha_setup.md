@@ -222,3 +222,50 @@ Phase F GHA rebuild is **complete and accepted**. All triggered workflows on `39
 The reviewer may now proceed to:
 - C1 R2 dispatch (Lane 1 — operational, fresh session)
 - Nexmark Lane B baseline runs (hardware-bound; `.planning/nexmark/USER_RUNBOOK.md`)
+
+---
+
+## 6. Addendum (2026-05-02): Rustdoc strict mode + Release dry-run
+
+### 6.1 Rustdoc residuals closed (commit `9697c8e39`)
+
+All 14 broken intra-doc links across `forst-rs-engine` and `forst-rs-storage` were fixed; `RUSTDOCFLAGS=-D warnings` re-enabled in `ci-rust.yml` `doc:` job. The P2 entry in `known_issues.md` is now resolved.
+
+§2.2 above (Rustdoc soft-warn) is **superseded** by this addendum.
+
+### 6.2 Release dry-run executed (commit `fb4ffd2dc`, tag `v0.0.0-rc1`)
+
+Per the §2.5 deferred-item, the release dry-run was executed end-to-end and verified.
+
+**First attempt (run 25222493450 on `9697c8e39`)**: ❌ failed — all 4 cdylib matrix builds reported `cp: cannot stat 'target/<rust-target>/release/libforst_rs.so': No such file or directory`. **Root cause**: `crates/forst-rs-ffi/Cargo.toml` declares `[lib].name = "forst_rs_ffi"`, so the cdylib is `libforst_rs_ffi.{so,dylib}` — the workflow had hardcoded `libforst_rs.{so,dylib}`. Fixed in `fb4ffd2dc` (matrix `artifact:` field + upload-release files glob both updated to `libforst_rs_ffi*`).
+
+**Second attempt (run on `fb4ffd2dc`)**: ✅ all jobs green:
+
+| Job | Outcome |
+|---|---|
+| `Detect Java module` (preflight-java) | success — has-java=false (correct; no pom.xml yet) |
+| `cdylib (ubuntu-22.04 / x86_64)` | success — `libforst_rs_ffi.so` 3.0 MB |
+| `cdylib (ubuntu-22.04-arm / aarch64)` | success — `libforst_rs_ffi.so` 2.4 MB |
+| `cdylib (macos-14 / x86_64)` | success — `libforst_rs_ffi.dylib` 2.4 MB |
+| `cdylib (macos-14 / arm64)` | success — `libforst_rs_ffi.dylib` 2.1 MB |
+| `Shaded JAR` | skipped (correct; preflight-java=false) |
+| `Publish GitHub release` | success — release published with all 4 cdylibs + auto-generated conventional-commit release notes |
+
+**Cleanup**: release + tag both deleted post-verification (`gh release delete v0.0.0-rc1 -y --cleanup-tag`). Production releases will use semver-meaningful tags (e.g. `v0.1.0`).
+
+§2.5 deferred-item "Release workflow dry-run executed once" is now **complete**.
+
+### 6.3 ci-bench first execution
+
+The tag push to `v0.0.0-rc1` also triggered `ci-bench.yml` (which gates on `tags: ['v*']`) for the first time. Both jobs (`criterion` + `upload-perf-trend`) succeeded; the first criterion snapshot landed on `gh-pages` at `criterion-reports/<date>-<sha>/` and is browsable at https://jackylee-ch.github.io/ForSt/criterion-reports/.
+
+### 6.4 Updated final acceptance state (2026-05-02)
+
+| A1 §6.4 acceptance item | State |
+|---|---|
+| All 6 workflows green | ✅ all 7 (incl. nexmark-baseline) green |
+| Rust coverage ≥ 80% (gate); ≥ 90% (stretch) | ✅ gate met |
+| Release workflow dry-run | ✅ executed and verified (this §6.2) |
+| Rustdoc strict mode | ✅ enabled (this §6.1) |
+| First nightly `ci-bench.yml` snapshot on gh-pages | ✅ first snapshot landed (this §6.3) |
+| First Java path PR exercising ci-java preflight→jobs | ⏸ pending C9 (Java FFM bridge) |
