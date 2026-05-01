@@ -182,16 +182,10 @@ jobs:
         run: cargo llvm-cov report --fail-under-lines 80
 
   doc:
-    name: Rustdoc (warn-only; strict mode after C1 R2 cleanup)
+    name: Rustdoc (strict; -D warnings)
     runs-on: ubuntu-latest
-    # NOTE: RUSTDOCFLAGS=-D warnings deliberately NOT set — there are
-    # ~14 residual broken intra-doc links across forst-rs-engine and
-    # forst-rs-storage from earlier dev work. Tracked in
-    # `.planning/refactor-review/known_issues.md` for C1 R2 cleanup.
-    # After C1 R2 fixes the residuals, re-enable strict mode by
-    # uncommenting `RUSTDOCFLAGS: -D warnings` below.
-    # env:
-    #   RUSTDOCFLAGS: -D warnings
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

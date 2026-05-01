@@ -23,7 +23,7 @@
 //! - [`CacheEntry`] — cached value (raw bytes or decoded RecordBatch).
 //! - [`CachePriority`] — eviction priority (High/Low/Bottom).
 //! - [`CacheMetrics`] — atomic hit/miss/eviction counters.
-//! - [`ShardedClockCache`] — the main cache implementation.
+//! - [`crate::cache::clock::ShardedClockCache`] — the main cache implementation.
 
 pub mod clock;
 

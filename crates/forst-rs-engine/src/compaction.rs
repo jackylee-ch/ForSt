@@ -20,7 +20,7 @@
 //! is available. This is the core building block for both the L0 rollup
 //! and L1..Ln size-tiered compactions.
 //!
-//! The minimal W15 flow exposed via [`DbImpl::compact_l0`] picks ALL L0
+//! The minimal W15 flow exposed via [`crate::DbImpl::compact_l0`] picks ALL L0
 //! files plus any overlapping L1 files and produces a single new L1 file
 //! containing the resolved state for every key in the input range.
 
@@ -55,7 +55,7 @@ pub struct CompactionJob {
 
 impl CompactionJob {
     /// Runs the compaction synchronously and returns a [`VersionEdit`] that
-    /// the caller should apply atomically to the [`VersionSet`].
+    /// the caller should apply atomically to the [`forst_rs_storage::version::VersionSetImpl`].
     pub fn run(self) -> ForstResult<Option<VersionEdit>> {
         // 1. Gather every entry from every input SST, tagging each with the
         //    source file_number so we can break ties when two SSTs use the
@@ -364,7 +364,7 @@ struct CompactionEntry {
     op_type: forst_rs_common::OpType,
     /// File number the entry came from. Used to break ties when two inputs
     /// share a memtable-local sequence number (because each
-    /// [`VectorizedMemTable`] starts counting seqs from 1).
+    /// [`forst_rs_storage::memtable::VectorizedMemTable`] starts counting seqs from 1).
     file_number: u64,
 }
 

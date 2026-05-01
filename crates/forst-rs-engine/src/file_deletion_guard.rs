@@ -25,9 +25,9 @@
 //!
 //! Checkpoints acquire a pin for every live SST they reference (via
 //! [`FileDeletionGuard::pin`]) and release it when the checkpoint is no
-//! longer needed. Compactions call [`FileDeletionGuard::try_acquire_delete`]
-//! to "reserve" a deletion — if the file is pinned the reservation is
-//! refused and the compaction skips the file (it will be deleted the next
+//! longer needed. Compactions call [`crate::FileDeletionGuard::can_delete`]
+//! to check if a file can be safely deleted — if the file is pinned the check
+//! returns false and the compaction skips the file (it will be deleted the next
 //! time a compaction runs without the pin).
 
 use std::collections::HashMap;

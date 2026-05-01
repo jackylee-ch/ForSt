@@ -153,8 +153,8 @@ impl WriteController {
         Ok(())
     }
 
-    /// Explicitly sets the stall flag. Writers calling [`may_throttle`] will
-    /// block until [`clear_stall`] or [`on_flush_complete`] wakes them.
+    /// Explicitly sets the stall flag. Writers calling [`Self::may_throttle`] will
+    /// block until [`Self::clear_stall`] or [`Self::on_flush_complete`] wakes them.
     pub fn set_stall(&self, stalled: bool) {
         self.stalled.store(stalled, Ordering::Release);
         if !stalled {

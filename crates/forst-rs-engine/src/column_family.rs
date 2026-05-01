@@ -290,7 +290,7 @@ impl ColumnFamilyData {
         }
     }
 
-    /// Acquires the per-CF flush mutex. Held by [`DbImpl::flush_cf_data`] for
+    /// Acquires the per-CF flush mutex. Held by `DbImpl::flush_cf_data` for
     /// the duration of a flush so concurrent flushes of the same CF do not
     /// duplicate SST output.
     pub fn lock_flush(&self) -> std::sync::MutexGuard<'_, ()> {

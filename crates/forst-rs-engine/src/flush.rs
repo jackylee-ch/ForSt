@@ -15,7 +15,7 @@
 //! Flush pipeline: frozen memtable → on-disk SST file. See `2.8_read_write_paths.md` §2.4.
 //!
 //! A [`FlushJob`] is a self-contained unit of work that:
-//! 1. Pulls sorted `RecordBatch`es from a frozen [`VectorizedMemTable`].
+//! 1. Pulls sorted `RecordBatch`es from a frozen [`forst_rs_storage::memtable::VectorizedMemTable`].
 //! 2. Feeds them row-by-row through [`SstWriterImpl`], producing the
 //!    complete SST file bytes.
 //! 3. Writes those bytes atomically to disk via the [`FileSystem`]

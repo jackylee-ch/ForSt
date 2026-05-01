@@ -27,7 +27,7 @@
 //! pending memtable to an L0 file so the in-memory state is fully captured
 //! in the SST layer.
 //!
-//! Restoration reads the blob, instantiates a [`VersionSetImpl`] from the
+//! Restoration reads the blob, instantiates a [`forst_rs_storage::version::VersionSetImpl`] from the
 //! snapshot, and opens every referenced SST file from the target directory.
 
 use std::path::{Path, PathBuf};

@@ -8,7 +8,19 @@ round or surfaced by CI but not yet addressed. Each entry has a priority
 
 ---
 
-## P2 — Rustdoc strict mode disabled (CI soft-warn)
+## ✅ RESOLVED — Rustdoc strict mode re-enabled (2026-05-02)
+
+All 14 residuals were fixed across `forst-rs-engine` and `forst-rs-storage` and `RUSTDOCFLAGS=-D warnings` was re-enabled in `.github/workflows/ci-rust.yml` `doc:` job. Verified locally with `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --document-private-items` (exit 0).
+
+Fix patterns applied:
+- Same-impl method references → `[Self::method]` (write_controller.rs ×3)
+- Cross-crate types → fully-qualified `[crate_name::module::Type]` (storage types referenced from engine)
+- Same-crate cross-module → `[crate::module::Type]` (sst writer/reader, cache submodules, FileDeletionGuard)
+- Nonexistent / private items → plain code-span (no link) or replaced with the actual existing item (e.g. `try_acquire_delete` → `can_delete`)
+
+---
+
+## ~~P2 — Rustdoc strict mode disabled (CI soft-warn)~~ (historical record below)
 
 **Location:** `.github/workflows/ci-rust.yml` `doc:` job — `RUSTDOCFLAGS: -D warnings` is **commented out**, so the job runs as soft-warn.
 

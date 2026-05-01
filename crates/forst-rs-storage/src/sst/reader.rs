@@ -14,7 +14,7 @@
 
 //! SST file reader for point lookups.
 //!
-//! [`SstReaderImpl`] opens a completed SST file (produced by [`SstWriterImpl`])
+//! [`SstReaderImpl`] opens a completed SST file (produced by [`crate::sst::writer::SstWriterImpl`])
 //! via a [`RandomAccessFile`] handle and serves point lookups through the
 //! following algorithm:
 //!
@@ -275,7 +275,7 @@ impl SstReaderImpl {
     /// returning them as `(key, value, sequence, op_type)` tuples.
     ///
     /// Entries are ordered by `(key ASC, sequence DESC)` (the on-disk order
-    /// produced by [`SstWriterImpl`]). Unlike [`SstReaderImpl::get`], this
+    /// produced by [`crate::sst::writer::SstWriterImpl`]). Unlike [`SstReaderImpl::get`], this
     /// returns ALL versions of each key; callers resolve visibility and
     /// merges.
     pub fn scan(&self, lower: &[u8], upper: Option<&[u8]>) -> ForstResult<Vec<SstScanRow>> {
