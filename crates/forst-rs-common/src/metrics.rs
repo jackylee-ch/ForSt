@@ -489,7 +489,11 @@ mod tests {
     #[test]
     fn test_histogram_default_buckets() {
         let h = Histogram::with_default_buckets();
-        assert_eq!(h.bounds.len(), DEFAULT_BUCKETS.len());
+        // Use the public snapshot() to read bucket count rather than
+        // poking at the private `bounds` field — keeps the test
+        // honest about the public API surface (R2 M#6).
+        let snap = h.snapshot();
+        assert_eq!(snap.bounds.len(), DEFAULT_BUCKETS.len());
     }
 
     #[test]
@@ -548,8 +552,13 @@ mod tests {
 
     #[test]
     fn test_metric_names_are_non_empty() {
-        assert!(!metric_names::WAL_BYTES_WRITTEN.is_empty());
-        assert!(!metric_names::READ_LATENCY_US.is_empty());
+        // `is_empty()` checks on `&'static str` constants are statically
+        // verifiable; clippy `const_is_empty` flags them. Use length
+        // comparison + prefix check that exercise actual string content
+        // rather than the trivially-true const property.
+        assert!(metric_names::WAL_BYTES_WRITTEN.len() > "forst.".len());
+        assert!(metric_names::READ_LATENCY_US.len() > "forst.".len());
         assert!(metric_names::WAL_BYTES_WRITTEN.starts_with("forst."));
+        assert!(metric_names::READ_LATENCY_US.starts_with("forst."));
     }
 }

@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-msrv = "1.75"
+msrv = "1.85"
