@@ -1,2 +1,5 @@
 /target
 **/*.rs.bk
+
+# Locally-downloaded developer tools (not committed)
+/actionlint
