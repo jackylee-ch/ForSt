@@ -269,3 +269,35 @@ The tag push to `v0.0.0-rc1` also triggered `ci-bench.yml` (which gates on `tags
 | Rustdoc strict mode | ✅ enabled (this §6.1) |
 | First nightly `ci-bench.yml` snapshot on gh-pages | ✅ first snapshot landed (this §6.3) |
 | First Java path PR exercising ci-java preflight→jobs | ⏸ pending C9 (Java FFM bridge) |
+
+---
+
+### 6.5 Tech VP cross-phase status checkpoint (2026-05-05)
+
+Re-orientation against the v2 master prompt §6 phase table. v2 informing-only; existing 9-commit C1–C9 framework remains authoritative per A1 spec.
+
+| v2 Phase | v2 Status | Evidence / pointer |
+|---|---|---|
+| A — Status assessment | ✅ Done | `.planning/refactor-review/A1_reconciliation.md` (path-override of v2's `reports/A1_status_assessment.md`) |
+| B — Modular split plan | ✅ Done | `.planning/refactor-review/B1_implementation_plan.md` + `COMMIT_MANIFEST.md` (9-commit C1–C9 framework, not v2's 18-PR — user-approved deviation) |
+| C — Branch baseline | ✅ Done | `forst-rs-bak` exists locally + on `origin` |
+| D — Per-Cn refactor loop | 🟡 In progress | C1 R1 done (H=26, M=52, L=55); C1 R2 unblocked by §6.5.1 below; C2–C9 future sessions |
+| E — Multi-round Review-Fix | 🟡 1 round complete | `.planning/refactor-review/C1-R1-findings.md` |
+| F — GHA rebuild | ✅ Done | This document; 7 workflows green at HEAD `c9805098a` |
+| G — Coverage + scenarios | 🟡 Coverage gate live (80% floor / 90% stretch); test matrix pending | ci-rust coverage job enforces gate; G1/G2 reports pending Phase D convergence |
+| H — Final acceptance | ❌ Pending | gated on D + G + Nexmark Lane B baseline |
+
+**Hard constraints unchanged**: 3× vs RocksDB C++ per-bench; 30–40% Nexmark E2E; OpenDAL only; arch-pivot counter resets on every pivot (§B.2=b).
+
+#### 6.5.1 What unblocks Phase D from this session
+
+The original protocol expected `~/code/github/ForSt-review/` worktree + commit `68c0bd464`; neither is present on this machine. Adapted plan: **C1 R2 reviews `crates/forst-rs-common/` at HEAD `c9805098a`** (the C1 scope per `COMMIT_MANIFEST.md`) directly, dispatching 9 of 10 reviewer dimensions in parallel. Dimension 6 (Performance) deferred until C1 microbenches + RocksDB baseline land — those are user-side ops.
+
+R2 outcome → `.planning/refactor-review/C1-R2-findings.md` (forthcoming).
+
+#### 6.5.2 Genuinely user-side / hardware-bound
+
+- **C1 microbenches + RocksDB baseline** (for Dimension 6 perf reviews and per-bench 3× gating): cherry-pick from prior session's review-loop branch OR re-author + build RocksDB v8.11.3 locally.
+- **Nexmark Lane B baseline measurement** (4 worker cluster + HDFS): follow `.planning/nexmark/USER_RUNBOOK.md`.
+- **C9 Java FFM bridge** (unblocks ci-java preflight→real-jobs path): C-series review work.
+- **72-hour soak test** (Phase G): hardware + time bound.
