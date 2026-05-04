@@ -61,48 +61,51 @@ Each session should:
 ## STATE (update this at end of every session)
 
 ```yaml
-last_updated: 2026-04-30T11:30:00Z
-last_session_id: D
-phase: B_R2_READY
-authoritative_spec: ".planning/refactor-review/A1_reconciliation.md @ 5b82b8d67"
+last_updated: 2026-05-05T22:00:00Z
+last_session_id: G
+phase: B_R3_READY
+authoritative_spec: ".planning/refactor-review/A1_reconciliation.md @ 33f85b1c5"
 arch_pivot_authority: ACTIVE
 current_commit: C1
-current_commit_sha: 68c0bd464
-current_round: 1  # R1 done; R2 ready to dispatch
-round_1_status: TRIAGED_R2_READY_TO_DISPATCH
+current_commit_sha: a5f2d9b0c  # tip of forst-rs after R2 fixes (review against crates/forst-rs-common/ at HEAD)
+current_round: 2  # R1 + R2 done; R3 ready to dispatch
+round_1_status: COMPLETE
 round_1_findings_file: .planning/refactor-review/C1-R1-findings.md
-consecutive_clean: 0
-baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R2
+round_2_status: COMPLETE_FIXES_LANDED  # 4 of 4 H/M tuning items fixed; 2 architectural Hs deferred
+round_2_findings_file: .planning/refactor-review/C1-R2-findings.md
+consecutive_clean: 0  # R2 had 4H + 11M; not yet H=0 ∧ M=0
+baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R3+
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
+r2_totals: "H=4, M=11, L=5 (Tech VP dedup; raw H=7 M=14 L=6 from 9/10 agents — Dim 6 perf deferred)"
+r2_fixes_landed: "a5f2d9b0c — H#3 Arena OOM test, H#4 unwrap→expect, M#6 test bounds, M#7 const_is_empty, M#10 checked_add"
 CRITICAL_BLOCKER: RESOLVED  # via A1 §3 arch-pivot sub-loop (user-confirmed 2026-04-30)
+arch_pivot_pending: |
+  Histogram concurrency redesign (couples R2 H#1 + H#2 + M#1 + M#2):
+    - H#1: snapshot() reads non-atomic compound state (count/sum/buckets)
+    - H#2: CAS sum loop allows permanent NaN poisoning
+    - M#1: misleading atomicity claim in metrics docs
+    - M#2: missing concurrent observe()+snapshot() consistency test
+  Pivot options (to be designed in arch-pivot session):
+    (a) seqlock / version counter around the 4 fields
+    (b) coarse RwLock guarding the snapshot read
+    (c) replace f64 sum with i64 fixed-point (avoids NaN; precision loss)
+    (d) per-thread accumulators with periodic merge
+  When arch-pivot lands: counter resets to 0 per A1 §3.3.2; arch-pivot
+  commit format `arch(C1): pivot Histogram for snapshot+NaN`; log entry
+  in .planning/refactor-review/C1-arch-pivot-log.md.
 c1_agents_ids:
-  completed: [a315094bb0c2a8251, a2d4de574d4fbf736, a1f6a0849a1a1375a, af2d68d6c4b38ee8d, aed0445efd7332014, aba5767e53bb42477, ab0a8aac6094f9a24, a978e1c69634eee26, aa7ead384e348c0d0, afecebf860d223f09]
-  pending: []
-expected_r2_focus: |
-  Re-review C1 with arch-pivot authority active. Per C1-R1-findings.md
-  Agent 6 architectural analysis, 9+ benches that previously could not
-  reach 3x (CRC32C, Counter inc, Gauge set, Histogram observe, Varint
-  encode, Varint decode, Fixed32 encode, Fixed64 encode, Arena) will
-  surface as architectural [H] findings in R2.
-  - For each: triage tuning vs architectural per REVIEW_PROTOCOL §B.
-  - If architectural: fork arch-pivot sub-task within forst-rs-common
-    boundary (NOT crossing into forst-rs-storage or other crates).
-  - On every arch-pivot landing: counter resets to 0; new 10-clean
-    streak starts. Schedule cost ~10-15 round-days per pivot accepted.
+  r1_completed: [a315094bb0c2a8251, a2d4de574d4fbf736, a1f6a0849a1a1375a, af2d68d6c4b38ee8d, aed0445efd7332014, aba5767e53bb42477, ab0a8aac6094f9a24, a978e1c69634eee26, aa7ead384e348c0d0, afecebf860d223f09]
+  r2_completed: [a6526bca3d5e7712f, a8b59dd142d4699a1, a3e7ca53bf0e8ad6e, a6fc17ced24fdab8c, a1cde272063a56195, aae9b5198f35c569b, a78246f26fd486fc7, a38e6a4390d2db7a9, ac940f1c364f1a891]
+  r2_pending: [A6_Performance_DEFERRED]  # blocked on C1 microbenches + RocksDB baseline
 next_action: |
-  Session E: Dispatch C1 R2 with arch-pivot authority active.
-  (1) Verify all infrastructure updates are in HEAD (REVIEW_PROTOCOL §B,
-      COMMIT_MANIFEST Done Criteria + Nexmark columns, this STATE update,
-      C1-arch-pivot-log.md template).
-  (2) Launch 10 parallel review agents per REVIEW_PROTOCOL.md (10 fixed
-      dimensions; agent-id pattern continues from c1_agents_ids).
-  (3) Aggregate R2 findings to .planning/refactor-review/C1-R2-findings.md.
-  (4) Triage R2 H findings per REVIEW_PROTOCOL §B (tuning vs architectural).
-  (5) For architectural: arch-pivot per A1 §3.3 (counter resets);
-      log entry in C1-arch-pivot-log.md;
-      for tuning: standard fix-in-place.
-  (6) Commit fixes; update STATE (last_updated, current_round,
-      consecutive_clean); advance round.
+  Session H (arch-pivot): design + implement Histogram concurrency
+  redesign per arch_pivot_pending block above. Counter resets after pivot.
+  THEN: Session I (R3+ post-pivot): dispatch fresh 9-agent (or 10 once
+  Dim 6 unblocked) C1 review against the pivoted Histogram.
+  ALTERNATIVELY: Session H' (Cn≠C1 advance): start C2 review
+  (forst-rs-io) in parallel — C2 doesn't depend on C1 reaching
+  consecutive_clean=10 yet; documented per A1 §3.3.1 module
+  boundary rule.
 ```
 
 ## Session history
@@ -113,7 +116,10 @@ next_action: |
 | B | 2026-04-25 | Phase B | C1 setup + R1 launch | 0→1 | worktree created, 13 benchmarks added, Round 1 agents launched |
 | C | 2026-04-30 | Phase B | Brainstorming | 1 | A1 reconciliation spec written + committed at 5b82b8d67; arch-pivot authority granted; user confirmed correctness-over-schedule trade-off |
 | D | 2026-04-30 | Phase B | Infra update | 1 | REVIEW_PROTOCOL §B added, COMMIT_MANIFEST annotated, SESSION_HANDOFF STATE updated, C1-arch-pivot-log template created |
-| E | TBD | Phase B | C1 R2 | 1→2 | Dispatch 10 review agents under v2.1 protocol; first round under arch-pivot authority |
+| E | 2026-04-30 → 2026-05-02 | Phase F | GHA rebuild | 1 | All 7 workflows green; F1 acceptance + §6 addendum committed; release dry-run executed and cleaned up |
+| F | 2026-05-05 | Phase A re-orient | 1 | Tech VP cross-phase status checkpoint (F1 §6.5) written |
+| G | 2026-05-05 | Phase B-D | C1 R2 | 1→2 | 9/10 review agents dispatched (Dim 6 deferred); R2 totals H=4 M=11 L=5; 4 H/M tuning items fixed in a5f2d9b0c; 2 architectural Hs queued for next-session arch-pivot |
+| H | TBD | Phase B-D | Histogram arch-pivot | 2→reset to 0 | Implement pivot for R2 H#1+H#2+M#1+M#2 (snapshot consistency + NaN hardening) |
 | ... | | | | | |
 
 ## Risk register
