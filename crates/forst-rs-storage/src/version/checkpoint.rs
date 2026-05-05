@@ -54,7 +54,7 @@
 
 use forst_rs_common::{
     crc32c, get_fixed32, get_fixed64, put_fixed32, put_fixed64, FileNumber, ForstError,
-    ForstResult, SequenceNumber,
+    ForstResult, SequenceNumber, MAX_LEVELS,
 };
 
 use super::{LevelMeta, SstFileMeta, Version, VersionSetImpl, VersionSetSnapshot};
@@ -64,6 +64,13 @@ const CHECKPOINT_MAGIC: &[u8; 4] = b"FRCP";
 
 /// Current format version.
 const FORMAT_VERSION: u16 = 1;
+
+/// Defense-in-depth cap on `num_files` per level decoded from a checkpoint
+/// blob. Prevents OOM-DoS from a crafted blob claiming `num_files = u32::MAX`
+/// driving `Vec::with_capacity` to allocate gigabytes (Sweep R4 H by Reviewers
+/// 2 + 5). Set well above A1 §11's "≤ 100k active SSTs per TM" engineering
+/// bar so legitimate state never trips this gate.
+const MAX_FILES_PER_LEVEL_CHECKPOINT: u32 = 1_000_000;
 
 /// Header size in bytes: magic(4) + version(2) + flags(2) + blob_size(8) = 16.
 const HEADER_SIZE: usize = 16;
@@ -177,6 +184,14 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
     let (num_levels, n) = get_fixed32(&data[pos..])?;
     pos += n;
 
+    // SECURITY: bound num_levels against MAX_LEVELS before allocation to
+    // prevent OOM-DoS from a crafted checkpoint blob (Sweep R4 H).
+    if num_levels as usize > MAX_LEVELS {
+        return Err(ForstError::corruption(format!(
+            "checkpoint num_levels {} exceeds MAX_LEVELS {}",
+            num_levels, MAX_LEVELS
+        )));
+    }
     let mut levels = Vec::with_capacity(num_levels as usize);
     for _ in 0..num_levels {
         let (level_id, n) = get_fixed32(&data[pos..])?;
@@ -184,6 +199,15 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         let (num_files, n) = get_fixed32(&data[pos..])?;
         pos += n;
 
+        // SECURITY: bound num_files against MAX_FILES_PER_LEVEL_CHECKPOINT
+        // before allocation; prevents OOM-DoS from a crafted level claiming
+        // ~4 GiB worth of files (Sweep R4 H).
+        if num_files > MAX_FILES_PER_LEVEL_CHECKPOINT {
+            return Err(ForstError::corruption(format!(
+                "checkpoint num_files {} on level {} exceeds cap {}",
+                num_files, level_id, MAX_FILES_PER_LEVEL_CHECKPOINT
+            )));
+        }
         let mut files = Vec::with_capacity(num_files as usize);
         for _ in 0..num_files {
             let (file_number, n) = get_fixed64(&data[pos..])?;
@@ -361,6 +385,73 @@ mod tests {
         assert_eq!(vs.next_file_number(), 42);
         assert_eq!(vs.last_sequence(), 1000);
         assert_eq!(vs.current().levels[0].files.len(), 1);
+    }
+
+    /// Regression test for Sweep R4 H (Reviewers 2 + 5): a crafted blob
+    /// claiming `num_levels > MAX_LEVELS` must be rejected BEFORE the
+    /// `Vec::with_capacity(num_levels as usize)` allocation, to prevent
+    /// OOM-DoS on attacker-controlled checkpoint input.
+    #[test]
+    fn test_restore_rejects_oversized_num_levels() {
+        // Build a valid empty blob, then mutate the num_levels field
+        // (4 bytes at offset HEADER_SIZE + 8 + 8 = 32) to a huge value.
+        let snap = make_snapshot(vec![]);
+        let mut blob = serialize_to_blob(&snap).unwrap();
+        // Header is 16 bytes; then next_file_number (8) + last_sequence (8)
+        // = 32 bytes used; num_levels is the next u32 (LE).
+        let num_levels_offset = 16 + 8 + 8;
+        blob[num_levels_offset..num_levels_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        // Re-checksum so the blob passes the integrity check.
+        let footer_start = blob.len() - FOOTER_SIZE;
+        let new_crc = crc32c(&blob[..footer_start]);
+        blob[footer_start..footer_start + 4]
+            .copy_from_slice(&new_crc.to_le_bytes());
+
+        let err = match restore_from_blob(&blob) {
+            Ok(_) => panic!("must reject oversized num_levels"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("num_levels") && msg.contains("exceeds MAX_LEVELS"),
+            "expected num_levels cap error; got: {}",
+            msg
+        );
+    }
+
+    /// Regression test for Sweep R4 H (Reviewers 2 + 5): a crafted blob
+    /// claiming `num_files > MAX_FILES_PER_LEVEL_CHECKPOINT` on any level
+    /// must be rejected BEFORE the per-level `Vec::with_capacity(num_files
+    /// as usize)` allocation.
+    #[test]
+    fn test_restore_rejects_oversized_num_files() {
+        // Build a valid blob with one level + zero files, then mutate
+        // num_files on that level to u32::MAX.
+        let snap = make_snapshot(vec![(0, make_file(1, b"a", b"z"))]);
+        let mut blob = serialize_to_blob(&snap).unwrap();
+
+        // Layout: header 16 + next_file_number 8 + last_sequence 8 +
+        //         num_levels 4 + level_id 4 + num_files 4 = 44.
+        // Mutate the num_files field at offset 40.
+        let num_files_offset = 16 + 8 + 8 + 4 + 4;
+        blob[num_files_offset..num_files_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let footer_start = blob.len() - FOOTER_SIZE;
+        let new_crc = crc32c(&blob[..footer_start]);
+        blob[footer_start..footer_start + 4]
+            .copy_from_slice(&new_crc.to_le_bytes());
+
+        let err = match restore_from_blob(&blob) {
+            Ok(_) => panic!("must reject oversized num_files"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("num_files") && msg.contains("exceeds cap"),
+            "expected num_files cap error; got: {}",
+            msg
+        );
     }
 
     #[test]

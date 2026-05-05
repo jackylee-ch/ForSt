@@ -41,6 +41,14 @@ use crate::flush::sst_file_path;
 /// File name used for the serialised checkpoint blob.
 pub const CHECKPOINT_BLOB_NAME: &str = "CHECKPOINT.blob";
 
+/// Defense-in-depth cap on the on-disk checkpoint blob size. The blob carries
+/// only LSM metadata (not data); even at A1 §11's hundred-TB engineering scale
+/// (≤ 100k SSTs × ~200 bytes per SST entry ~= 20 MiB) it remains comfortably
+/// under this cap. A crafted or corrupted blob reporting ~4 GiB would
+/// otherwise drive the `vec![0u8; size]` allocation in `read_blob` to OOM
+/// (Sweep R4 H by Reviewers 2 + 5).
+pub const MAX_CHECKPOINT_BLOB_SIZE: u64 = 100 * 1024 * 1024; // 100 MiB
+
 /// Metadata returned by a successful checkpoint.
 #[derive(Debug, Clone)]
 pub struct CheckpointManifest {
@@ -100,6 +108,17 @@ pub fn read_blob(fs: &dyn FileSystem, target_dir: &Path) -> ForstResult<Vec<u8>>
         )));
     }
     let meta = fs.get_file_metadata(&path)?;
+    // SECURITY: bound the file size before allocation. A malicious or corrupted
+    // checkpoint blob reporting a multi-GiB size would otherwise drive the
+    // `vec![0u8; size]` below to OOM (Sweep R4 H).
+    if meta.size > MAX_CHECKPOINT_BLOB_SIZE {
+        return Err(ForstError::corruption(format!(
+            "checkpoint blob at {} reports size {} bytes, exceeds cap {} bytes",
+            path.display(),
+            meta.size,
+            MAX_CHECKPOINT_BLOB_SIZE
+        )));
+    }
     let mut rac = fs.open_random_access_file(&path)?;
     let _ = &mut rac; // silence unused warning on older rustc paths
     let size = meta.size as usize;
@@ -176,6 +195,34 @@ mod tests {
         fs.create_dir_all(dir).unwrap();
         let err = read_blob(&fs, dir).unwrap_err();
         assert!(err.is_not_found());
+    }
+
+    /// Regression test for Sweep R4 H (Reviewers 2 + 5): a checkpoint blob
+    /// whose filesystem-reported size exceeds `MAX_CHECKPOINT_BLOB_SIZE`
+    /// must be rejected BEFORE the `vec![0u8; size]` allocation, to prevent
+    /// OOM-DoS on a malicious or corrupted blob.
+    ///
+    /// MemoryFileSystem doesn't let us spoof a metadata size larger than
+    /// the actual content, so we instead write a real blob that exceeds the
+    /// cap and assert the cap fires. (Real-world attack vectors would be
+    /// crafted on-disk metadata or symlinks pointing to huge files; we
+    /// only need to verify the gate triggers.)
+    #[test]
+    fn test_read_blob_rejects_oversized_metadata() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/ck");
+        // Write a payload that exceeds MAX_CHECKPOINT_BLOB_SIZE by 1 byte.
+        // 100 MiB + 1 is well above any legitimate checkpoint blob.
+        let oversize = MAX_CHECKPOINT_BLOB_SIZE as usize + 1;
+        let payload = vec![0u8; oversize];
+        let _ = write_blob(&fs, dir, &payload).unwrap();
+        let err = read_blob(&fs, dir).unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds cap"),
+            "expected cap-exceeded error; got: {}",
+            msg
+        );
     }
 
     #[test]
