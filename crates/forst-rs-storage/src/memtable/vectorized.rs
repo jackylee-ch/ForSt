@@ -121,6 +121,7 @@ impl VectorizedMemTable {
     ///
     /// `value` is `None` for delete tombstones.
     /// `op_type_byte`: 0 = Put, 1 = Delete, 2 = SingleDelete, 3 = Merge.
+    /// Other values are rejected with `invalid_argument`.
     ///
     /// Returns the assigned sequence number.
     pub fn put(&mut self, key: &[u8], value: Option<&[u8]>, op_type_byte: u8) -> ForstResult<u64> {
@@ -129,6 +130,18 @@ impl VectorizedMemTable {
                 "cannot write to a frozen MemTable",
             ));
         }
+
+        // SECURITY: validate op_type_byte BEFORE mutating any state, so an
+        // invalid byte is rejected without leaving the memtable's columns
+        // partially populated. Pre-fix, `OpType::from_u8(...).unwrap_or(Put)`
+        // silently accepted any unrecognized byte (4..=255) and treated it
+        // as Put — silent corruption potential (Sweep R13 H by Reviewer 1).
+        let op_type = OpType::from_u8(op_type_byte).ok_or_else(|| {
+            forst_rs_common::ForstError::invalid_argument(format!(
+                "invalid op_type byte {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                op_type_byte
+            ))
+        })?;
 
         let seq = self.next_sequence;
         self.next_sequence += 1;
@@ -155,8 +168,6 @@ impl VectorizedMemTable {
         // Append sequence and op_type.
         self.sequences.push(seq);
         self.op_types.push(op_type_byte);
-
-        let op_type = OpType::from_u8(op_type_byte).unwrap_or(OpType::Put);
         let row_index = RowIndex {
             offset: row_offset,
             sequence: seq,
@@ -436,6 +447,20 @@ impl VectorizedMemTable {
             ));
         }
 
+        // SECURITY: validate ALL op_type bytes BEFORE mutating state. If even
+        // one byte is invalid, reject the whole batch atomically — pre-fix,
+        // the per-row `unwrap_or(Put)` silently downgraded invalid bytes to
+        // Put (Sweep R13 H by Reviewer 1). Rejecting up front also avoids
+        // partially-populated columns on failure.
+        for (i, &b) in op_types.iter().enumerate() {
+            if OpType::from_u8(b).is_none() {
+                return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                    "batch_insert: invalid op_type byte {} at index {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                    b, i
+                )));
+            }
+        }
+
         let count = keys.len();
         let base_seq = self.next_sequence;
         self.next_sequence += count as u64;
@@ -467,7 +492,9 @@ impl VectorizedMemTable {
             self.sequences.push(seq);
             self.op_types.push(op_types[i]);
 
-            let op_type = OpType::from_u8(op_types[i]).unwrap_or(OpType::Put);
+            // Safety: validated up-front above; can never panic here.
+            let op_type = OpType::from_u8(op_types[i])
+                .expect("op_type byte was validated above the loop");
             let row_index = RowIndex {
                 offset: row_offset,
                 sequence: seq,
@@ -1012,6 +1039,61 @@ mod tests {
         mt.freeze();
         let err = mt.merge(b"key1", b"op1");
         assert!(err.is_err());
+    }
+
+    /// Regression test for Sweep R13 H (Reviewer 1): invalid op_type bytes
+    /// (4..=255) must be rejected with `invalid_argument`, not silently
+    /// downgraded to `OpType::Put` via `unwrap_or(Put)`. Pre-fix this
+    /// would have inserted a row labeled Put with the wrong op_type byte
+    /// stored, causing silent data corruption.
+    #[test]
+    fn test_put_rejects_invalid_op_type() {
+        let mut mt = VectorizedMemTable::with_defaults();
+        // 0..=3 are Put/Delete/SingleDelete/Merge — valid.
+        // 4..=255 must be rejected.
+        for invalid in [4u8, 7, 42, 99, 200, 255] {
+            let err = mt.put(b"key", Some(b"value"), invalid);
+            assert!(
+                err.is_err(),
+                "op_type byte {} should be rejected",
+                invalid
+            );
+            let msg = format!("{}", err.unwrap_err());
+            assert!(
+                msg.contains("invalid op_type byte"),
+                "expected 'invalid op_type byte' message; got: {}",
+                msg
+            );
+        }
+        // Sanity: state is unchanged after rejection (no rows inserted).
+        // key_offsets and value_offsets start with [0] sentinel (len=1);
+        // sequences starts empty.
+        assert_eq!(mt.sequences.len(), 0);
+        assert_eq!(mt.key_offsets.len(), 1, "no key offsets pushed");
+        assert_eq!(mt.value_offsets.len(), 1, "no value offsets pushed");
+    }
+
+    /// Regression test for Sweep R13 H (Reviewer 1): batch_insert validates
+    /// ALL op_type bytes up-front and rejects atomically (no partial state
+    /// mutation on failure).
+    #[test]
+    fn test_batch_insert_rejects_invalid_op_type_atomically() {
+        let mut mt = VectorizedMemTable::with_defaults();
+        let keys: Vec<&[u8]> = vec![b"k1", b"k2", b"k3"];
+        let values: Vec<Option<&[u8]>> = vec![Some(b"v1"), Some(b"v2"), Some(b"v3")];
+        // Middle byte is invalid — must reject the whole batch.
+        let op_types: &[u8] = &[0, 99, 0];
+        let err = mt.batch_insert(&keys, &values, op_types);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("invalid op_type byte 99 at index 1"),
+            "expected indexed-byte error message; got: {}",
+            msg
+        );
+        // Atomic rejection: no rows inserted (sentinel preserved).
+        assert_eq!(mt.sequences.len(), 0);
+        assert_eq!(mt.key_offsets.len(), 1, "key_offsets sentinel preserved");
     }
 
     #[test]

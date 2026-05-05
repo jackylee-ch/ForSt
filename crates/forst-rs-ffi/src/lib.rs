@@ -609,6 +609,14 @@ pub unsafe extern "C" fn frs_batch_put(
 
         let mut wb = WriteBatch::with_capacity(count);
         for i in 0..count {
+            // SECURITY: null-check INDIVIDUAL key pointers within the array
+            // before constructing slices. The outer-array null check above
+            // doesn't cover entries (Sweep R13 H by Reviewer 2). UB risk
+            // pre-fix because slice::from_raw_parts(null, N) is UB even for
+            // N=0. Single-op functions (frs_put / frs_get) already do this.
+            if key_ptrs[i].is_null() {
+                return FRS_STATUS_NULL_ARG;
+            }
             let k = slice::from_raw_parts(key_ptrs[i], key_len_arr[i]);
             if value_ptrs[i].is_null() {
                 wb.delete(cf, k);
@@ -659,6 +667,11 @@ pub unsafe extern "C" fn frs_batch_get(
 
         let key_ptrs = slice::from_raw_parts(keys, count);
         let key_len_arr = slice::from_raw_parts(key_lens, count);
+        // SECURITY: null-check INDIVIDUAL key pointers (Sweep R13 H by
+        // Reviewer 2). UB risk pre-fix.
+        if key_ptrs.iter().any(|p| p.is_null()) {
+            return FRS_STATUS_NULL_ARG;
+        }
         let owned_keys: Vec<&[u8]> = (0..count)
             .map(|i| slice::from_raw_parts(key_ptrs[i], key_len_arr[i]))
             .collect();
