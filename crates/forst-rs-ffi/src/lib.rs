@@ -1200,6 +1200,16 @@ pub unsafe extern "C" fn frs_prefix_scan_arrow(
             Err(e) => return error_to_status(&e),
         };
 
+        // SECURITY: same MAX_BATCH_COUNT cap as the batch FFI paths.
+        // Defends against a crafted empty/short prefix that matches
+        // millions of keys → unbounded Arrow array materialization
+        // (Sweep R11 H by Reviewers 1 + 5; parallel of R5/R10 batch
+        // findings, scan-side). The deeper engine-side cap on
+        // `db.prefix_scan` itself remains a follow-up architectural
+        // change (would require passing max-rows through scan API).
+        if rows.len() > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
         let mut key_builder = arrow::array::BinaryBuilder::new();
         let mut value_builder = arrow::array::BinaryBuilder::new();
         for (k, v) in &rows {
