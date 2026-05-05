@@ -157,11 +157,24 @@ fn guarded<F: FnOnce() -> i32>(f: F) -> i32 {
     }
 }
 
-unsafe fn cstr_to_str<'a>(p: *const c_char) -> Option<&'a str> {
+/// Borrow a `&str` from an opaque C string pointer.
+///
+/// Same lifetime-elision trick as `cf_ref`: input is `&*const c_char`,
+/// so Rust elides `<'a>(p: &'a *const c_char) -> Option<&'a str>` and
+/// the returned borrow cannot be inferred as `'static`. SAFETY contract
+/// still requires the caller to guarantee the underlying C string outlives
+/// the returned `&str` (Sweep R6 H by Reviewer 2).
+///
+/// # SAFETY
+/// - `*p` must be either null OR a valid pointer to a NUL-terminated UTF-8
+///   string for the duration of the returned borrow.
+/// - Caller must not mutate or free the underlying C string while the
+///   returned `&str` is in use.
+unsafe fn cstr_to_str(p: &*const c_char) -> Option<&str> {
     if p.is_null() {
         return None;
     }
-    CStr::from_ptr(p).to_str().ok()
+    CStr::from_ptr(*p).to_str().ok()
 }
 
 unsafe fn db_from_handle(h: FrsDb) -> Option<Arc<DbImpl>> {
@@ -249,7 +262,7 @@ pub unsafe extern "C" fn frs_db_open(db_path: *const c_char, out_handle: *mut Fr
         if out_handle.is_null() {
             return FRS_STATUS_NULL_ARG;
         }
-        let path = match cstr_to_str(db_path) {
+        let path = match cstr_to_str(&db_path) {
             Some(p) => p,
             None => return FRS_STATUS_NULL_ARG,
         };
@@ -357,12 +370,12 @@ pub unsafe extern "C" fn frs_db_create_cf_with_merge(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf_name) = cstr_to_str(name) else {
+        let Some(cf_name) = cstr_to_str(&name) else {
             return FRS_STATUS_NULL_ARG;
         };
         let mut desc = ColumnFamilyDescriptor::new(cf_name);
         if !merge_op_name.is_null() {
-            let Some(op_name) = cstr_to_str(merge_op_name) else {
+            let Some(op_name) = cstr_to_str(&merge_op_name) else {
                 return FRS_STATUS_NULL_ARG;
             };
             let op: Arc<dyn MergeOperator> = match op_name {
@@ -396,7 +409,7 @@ pub unsafe extern "C" fn frs_db_open_cf(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf_name) = cstr_to_str(name) else {
+        let Some(cf_name) = cstr_to_str(&name) else {
             return FRS_STATUS_NULL_ARG;
         };
         match db.column_family(cf_name) {
@@ -762,7 +775,7 @@ pub unsafe extern "C" fn frs_create_checkpoint(handle: FrsDb, target_dir: *const
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(path) = cstr_to_str(target_dir) else {
+        let Some(path) = cstr_to_str(&target_dir) else {
             return FRS_STATUS_NULL_ARG;
         };
         match db.create_checkpoint(std::path::Path::new(path)) {
@@ -819,7 +832,7 @@ pub unsafe extern "C" fn frs_db_open_from_checkpoint(
         if out_handle.is_null() {
             return FRS_STATUS_NULL_ARG;
         }
-        let Some(path) = cstr_to_str(target_dir) else {
+        let Some(path) = cstr_to_str(&target_dir) else {
             return FRS_STATUS_NULL_ARG;
         };
         let opts = EngineOptions {
@@ -849,7 +862,7 @@ pub unsafe extern "C" fn frs_db_open_from_checkpoint_memory(
         if out_handle.is_null() {
             return FRS_STATUS_NULL_ARG;
         }
-        let Some(path) = cstr_to_str(target_dir) else {
+        let Some(path) = cstr_to_str(&target_dir) else {
             return FRS_STATUS_NULL_ARG;
         };
         let opts = EngineOptions {

@@ -180,14 +180,22 @@ pub struct VersionSetSnapshot {
     pub last_sequence: u64,
 }
 
-/// Lock-free version management using ArcSwap.
+/// Lock-free reads + serialized writes for version management.
 ///
-/// Readers call `current()` to get the latest `Arc<Version>` without locking.
-/// Writers call `apply()` to atomically install a new version.
+/// Readers call `current()` to get the latest `Arc<Version>` without locking
+/// (ArcSwap-based). Writers call `apply()` which is **serialized via
+/// `apply_lock`** so concurrent calls cannot lose each other's updates
+/// (Sweep R6 H by Reviewer 1: pre-fix, two concurrent applies could load
+/// the same `V0`, compute `V1 = V0+edit_A` and `V2 = V0+edit_B`, then have
+/// the second `store` overwrite the first — a classic lost-update race).
+/// Reads remain lock-free; only writers contend on the `apply_lock`.
 pub struct VersionSetImpl {
     current: ArcSwap<Version>,
     next_file_number: AtomicU64,
     last_sequence: AtomicU64,
+    /// Serializes `apply()` so the (load, edit, store) sequence is atomic
+    /// across concurrent writers (flush and compaction can both call apply).
+    apply_lock: std::sync::Mutex<()>,
 }
 
 impl VersionSetImpl {
@@ -197,6 +205,7 @@ impl VersionSetImpl {
             current: ArcSwap::from_pointee(Version::new()),
             next_file_number: AtomicU64::new(1),
             last_sequence: AtomicU64::new(0),
+            apply_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -206,6 +215,7 @@ impl VersionSetImpl {
             current: ArcSwap::from_pointee(version),
             next_file_number: AtomicU64::new(next_file_number),
             last_sequence: AtomicU64::new(last_sequence),
+            apply_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -216,8 +226,16 @@ impl VersionSetImpl {
 
     /// Atomically apply a VersionEdit and install a new version.
     ///
+    /// Serialized via `apply_lock` so concurrent flush/compaction calls do
+    /// not lose each other's updates (the (load, edit, store) sequence
+    /// must be atomic with respect to other writers).
+    ///
     /// Returns the new version.
     pub fn apply(&self, edit: &VersionEdit) -> ForstResult<Arc<Version>> {
+        let _guard = self
+            .apply_lock
+            .lock()
+            .expect("VersionSetImpl::apply_lock poisoned");
         let old = self.current.load_full();
         let new_version = old.apply_edit(edit)?;
 
@@ -540,5 +558,46 @@ mod tests {
         assert_eq!(vs.next_file_number(), 10);
         assert_eq!(vs.last_sequence(), 500);
         assert_eq!(vs.current().levels[0].files.len(), 1);
+    }
+
+    /// Regression test for Sweep R6 H (Reviewer 1): two concurrent
+    /// `apply()` calls must NOT lose either update. Pre-fix, two threads
+    /// could both load V0, compute V1=V0+edit_A and V2=V0+edit_B, then
+    /// have the second store overwrite the first — a classic lost-update
+    /// race. The Mutex around apply() serializes the (load, edit, store)
+    /// sequence so both updates land.
+    #[test]
+    fn test_version_set_concurrent_writers_no_lost_update() {
+        use std::thread;
+        let vs = Arc::new(VersionSetImpl::new());
+        const WRITERS: u64 = 4;
+        const FILES_PER_WRITER: u64 = 50;
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let vs_clone = Arc::clone(&vs);
+            handles.push(thread::spawn(move || {
+                for i in 0..FILES_PER_WRITER {
+                    let file_num = 1 + w * FILES_PER_WRITER + i;
+                    let edit = VersionEdit {
+                        new_files: vec![(0, make_file(file_num, b"a", b"z"))],
+                        ..Default::default()
+                    };
+                    vs_clone.apply(&edit).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // All WRITERS × FILES_PER_WRITER updates must be visible. Pre-fix,
+        // some updates would be lost to races, so file count would be
+        // strictly less than the expected total.
+        let v = vs.current();
+        assert_eq!(
+            v.levels[0].files.len() as u64,
+            WRITERS * FILES_PER_WRITER,
+            "lost-update race: missing {} files after concurrent applies",
+            WRITERS * FILES_PER_WRITER - v.levels[0].files.len() as u64
+        );
     }
 }
