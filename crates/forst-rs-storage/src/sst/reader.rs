@@ -92,6 +92,11 @@ fn search_key_in_batch(batch: &RecordBatch, target_key: &[u8]) -> Option<usize> 
 /// and sparse index into memory. DataBlocks are read on-demand during `get()`.
 pub struct SstReaderImpl {
     file: Box<dyn RandomAccessFile>,
+    /// Cached at `open()` to avoid per-`read_data_block` syscall on the
+    /// hot lookup path. Used to bound-check untrusted `block_size` values
+    /// from the sparse index before allocating the read buffer (Sweep
+    /// R3 H by Reviewers 2 + 5).
+    file_size: u64,
     footer: FooterV1,
     index_entries: Vec<SparseIndexEntry>,
     #[allow(dead_code)] // Stored for future range-scan and compaction support.
@@ -180,6 +185,7 @@ impl SstReaderImpl {
 
         Ok(Self {
             file,
+            file_size,
             footer,
             index_entries,
             index_stats,
@@ -208,7 +214,23 @@ impl SstReaderImpl {
     }
 
     /// Reads and decodes a DataBlock at the given offset and size.
+    ///
+    /// SECURITY: validates `block_offset + block_size` fits within
+    /// `self.file_size` before allocating the read buffer. This prevents
+    /// OOM-DoS from a crafted sparse index claiming an oversized
+    /// `block_size` (Sweep R3 H by Reviewers 2 + 5). The `file_size`
+    /// is cached at `open()` so this check costs no syscall on the
+    /// hot lookup path.
     fn read_data_block(&self, block_offset: u64, block_size: u32) -> ForstResult<RecordBatch> {
+        let block_end = block_offset.checked_add(block_size as u64).ok_or_else(|| {
+            ForstError::corruption("SST data block offset+size overflow")
+        })?;
+        if block_end > self.file_size {
+            return Err(ForstError::corruption(format!(
+                "SST data block range [{}, {}) exceeds file_size {}",
+                block_offset, block_end, self.file_size
+            )));
+        }
         let mut buf = vec![0u8; block_size as usize];
         self.file.read_at(block_offset, &mut buf)?;
         decode_data_block(&buf)
@@ -637,6 +659,34 @@ mod tests {
         assert_eq!(lr.value, Some(b"val_00050".to_vec()));
         assert_eq!(lr.sequence, 51);
         assert_eq!(lr.op_type, OpType::Put);
+    }
+
+    /// Regression test for Sweep R3 H (Reviewers 2 + 5): a sparse-index
+    /// entry claiming a `block_size` that overflows past the file end
+    /// must be rejected by `read_data_block` BEFORE allocation, not
+    /// after attempting `read_at` (which might OOM on the
+    /// `vec![0u8; block_size as usize]` first). We simulate the
+    /// malicious-index condition by mutating the cached `file_size`
+    /// to a value smaller than any real block range — the validation
+    /// then trips on otherwise-valid block reads.
+    #[test]
+    fn test_read_data_block_rejects_oob_range() {
+        let sst_data = write_test_sst(100);
+        let file = Box::new(MemRandomAccessFile { data: sst_data });
+        let mut reader = SstReaderImpl::open(file).unwrap();
+        // Pretend the file is 16 bytes — any real block read will trip
+        // the `block_end > self.file_size` check.
+        reader.file_size = 16;
+        let err = match reader.get(b"key_00050") {
+            Ok(_) => panic!("read_data_block must reject OOB block range"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("data block range") && msg.contains("exceeds file_size"),
+            "expected OOB-block error message; got: {}",
+            msg
+        );
     }
 
     #[test]
