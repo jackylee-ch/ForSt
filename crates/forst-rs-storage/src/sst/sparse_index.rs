@@ -129,6 +129,25 @@ pub fn decode_index(data: &[u8]) -> ForstResult<(Vec<SparseIndexEntry>, Vec<Bloc
     offset += n;
     let num_blocks = num_blocks as usize;
 
+    // SECURITY: bound num_blocks before `Vec::with_capacity` to prevent
+    // OOM-DoS from a crafted index section claiming `num_blocks = u32::MAX`
+    // (Sweep R5 H by Reviewer 2). Each entry needs ≥ 14 bytes
+    // (key_len(2) + 0-byte-key + block_offset(8) + block_size(4)) and each
+    // BlockStats also needs ≥ 14 bytes, so num_blocks * 28 ≤ data.len() is
+    // the structural minimum.
+    const MIN_BYTES_PER_PAIR: usize = 28;
+    if num_blocks
+        .checked_mul(MIN_BYTES_PER_PAIR)
+        .is_none_or(|min| min > data.len())
+    {
+        return Err(ForstError::corruption(format!(
+            "index section num_blocks {} exceeds structural cap (data.len()={}, min_per_pair={})",
+            num_blocks,
+            data.len(),
+            MIN_BYTES_PER_PAIR
+        )));
+    }
+
     // Decode SparseIndex entries
     let mut entries = Vec::with_capacity(num_blocks);
     for _ in 0..num_blocks {
@@ -395,5 +414,26 @@ mod tests {
             encode_index(&sample_entries(), &[]);
         });
         assert!(result.is_err());
+    }
+
+    /// Regression test for Sweep R5 H (Reviewer 2): a crafted index
+    /// section with `num_blocks * 28 > data.len()` must be rejected
+    /// BEFORE the `Vec::with_capacity(num_blocks)` allocation.
+    #[test]
+    fn test_decode_index_rejects_oversized_num_blocks() {
+        // Build a 32-byte buffer where num_blocks claims u32::MAX. Per
+        // the structural cap (≥28 bytes per pair), this must fail.
+        let mut data = vec![0u8; 32];
+        data[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = match decode_index(&data) {
+            Ok(_) => panic!("must reject oversized num_blocks"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("num_blocks") && msg.contains("structural cap"),
+            "expected num_blocks structural cap error; got: {}",
+            msg
+        );
     }
 }

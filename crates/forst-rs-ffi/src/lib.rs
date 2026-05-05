@@ -44,6 +44,14 @@ use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, WriteB
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
 use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
 
+/// Defense-in-depth cap on `count` (or row count) passed to FFI batch
+/// operations. Untrusted C-side caller could otherwise drive
+/// `WriteBatch::with_capacity(count)` or other count-driven allocations
+/// to OOM (Sweep R5 H by Reviewer 2). 1M entries is well above any
+/// realistic per-call batch size; calling code that needs more should
+/// chunk into multiple calls.
+pub const MAX_BATCH_COUNT: usize = 1_000_000;
+
 // ---------------------------------------------------------------------------
 // Status codes
 // ---------------------------------------------------------------------------
@@ -574,6 +582,9 @@ pub unsafe extern "C" fn frs_batch_put(
         if count == 0 {
             return FRS_STATUS_OK;
         }
+        if count > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
         if keys.is_null() || key_lens.is_null() || values.is_null() || value_lens.is_null() {
             return FRS_STATUS_NULL_ARG;
         }
@@ -625,6 +636,9 @@ pub unsafe extern "C" fn frs_batch_get(
         };
         if count == 0 {
             return FRS_STATUS_OK;
+        }
+        if count > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
         }
         if keys.is_null() || key_lens.is_null() {
             return FRS_STATUS_NULL_ARG;
@@ -966,6 +980,12 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
             None => return FRS_STATUS_INVALID_ARGUMENT,
         };
 
+        // SECURITY: same MAX_BATCH_COUNT cap as the non-Arrow path
+        // (Sweep R5 H by Reviewer 2). batch.num_rows() comes from the
+        // C-side Arrow array; cap defends against a crafted batch.
+        if batch.num_rows() > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
         let mut wb = WriteBatch::with_capacity(batch.num_rows());
         for i in 0..batch.num_rows() {
             let key = keys.value(i);

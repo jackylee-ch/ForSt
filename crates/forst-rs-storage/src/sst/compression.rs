@@ -36,20 +36,38 @@ pub fn compress(data: &[u8], compression: CompressionType) -> ForstResult<Vec<u8
 
 /// Decompress `data` that was compressed with the specified [`CompressionType`].
 ///
-/// The `_uncompressed_size` parameter is reserved for future use (e.g.,
-/// pre-allocating the output buffer) and is currently ignored.
+/// The `uncompressed_size` parameter is the trusted upper bound (read from
+/// the BlockHeader at SST decode time) on the legitimate output size. After
+/// decompression, the actual output is verified to match `uncompressed_size`.
+/// This prevents a DoS via a crafted compressed frame whose internal size
+/// header claims gigabytes — both `lz4_flex::decompress_size_prepended` and
+/// `zstd::decode_all` would otherwise allocate based on the untrusted frame
+/// header (Sweep R5 H by Reviewer 5).
 pub fn decompress(
     data: &[u8],
     compression: CompressionType,
-    _uncompressed_size: usize,
+    uncompressed_size: usize,
 ) -> ForstResult<Vec<u8>> {
-    match compression {
+    let result: ForstResult<Vec<u8>> = match compression {
         CompressionType::None => Ok(data.to_vec()),
         CompressionType::Lz4 => lz4_flex::decompress_size_prepended(data)
             .map_err(|e| ForstError::corruption(format!("LZ4 decompression failed: {e}"))),
         CompressionType::Zstd => zstd::decode_all(data)
             .map_err(|e| ForstError::corruption(format!("Zstd decompression failed: {e}"))),
+    };
+    let out = result?;
+    // SECURITY: validate the decompressed length against the trusted
+    // BlockHeader-supplied size. Mismatch indicates a crafted compressed
+    // frame; reject before passing the buffer downstream.
+    if out.len() != uncompressed_size {
+        return Err(ForstError::corruption(format!(
+            "decompressed size {} does not match expected {} for {:?}",
+            out.len(),
+            uncompressed_size,
+            compression
+        )));
     }
+    Ok(out)
 }
 
 // ===========================================================================
@@ -115,6 +133,28 @@ mod tests {
         let compressed = compress(data, CompressionType::Zstd).unwrap();
         let decompressed = decompress(&compressed, CompressionType::Zstd, 0).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    /// Regression test for Sweep R5 H (Reviewer 5): if the actual
+    /// decompressed length doesn't match the trusted `uncompressed_size`
+    /// from the BlockHeader, the function must reject. Defends against
+    /// crafted compressed frames whose internal size header lies.
+    #[test]
+    fn test_decompress_rejects_size_mismatch() {
+        let data = b"some data of definite length";
+        // Compress with LZ4 — actual decompressed length will be data.len().
+        let compressed = compress(data, CompressionType::Lz4).unwrap();
+        // Pass a wrong expected size — must reject.
+        let err = match decompress(&compressed, CompressionType::Lz4, data.len() + 100) {
+            Ok(_) => panic!("must reject size mismatch"),
+            Err(e) => e,
+        };
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("decompressed size") && msg.contains("does not match expected"),
+            "expected size-mismatch error; got: {}",
+            msg
+        );
     }
 
     #[test]
