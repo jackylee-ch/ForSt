@@ -155,7 +155,7 @@ impl SstWriterImpl {
         debug_assert!(
             self.last_added_key
                 .as_ref()
-                .map_or(true, |prev| key >= prev.as_slice()),
+                .is_none_or(|prev| key >= prev.as_slice()),
             "entries must be added in sorted key order"
         );
 

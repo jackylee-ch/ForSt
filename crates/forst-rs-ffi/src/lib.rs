@@ -177,11 +177,31 @@ unsafe fn cf_from_handle(h: FrsCfHandle) -> Option<Box<ColumnFamilyHandle>> {
     Some(Box::from_raw(ptr))
 }
 
-unsafe fn cf_ref<'a>(h: FrsCfHandle) -> Option<&'a ColumnFamilyHandle> {
+/// Borrow a `ColumnFamilyHandle` from an opaque FFI handle.
+///
+/// The returned reference's lifetime is tied to the input borrow `&'h h`,
+/// preventing rustc from inferring `'static` and silently allowing the
+/// returned reference to outlive the FFI call frame.
+///
+/// # SAFETY
+/// - Caller must guarantee `*h` is either null OR a valid pointer
+///   originally produced by `Box::into_raw(Box::new(ColumnFamilyHandle))`
+///   (i.e., from a successful prior `frs_cf_create_*` / `frs_cf_open_*`).
+/// - Caller must guarantee no concurrent call to `frs_cf_close(*h)` (or
+///   any other deallocation) for the entire duration the returned
+///   reference is in use. External synchronization is required if the
+///   handle may be closed from another thread.
+/// - `*h` must be properly aligned for `ColumnFamilyHandle` (guaranteed
+///   by `Box::new` allocation paths).
+unsafe fn cf_ref(h: &FrsCfHandle) -> Option<&ColumnFamilyHandle> {
+    // Lifetime elided: Rust derives `fn cf_ref<'h>(h: &'h FrsCfHandle)
+    // -> Option<&'h ColumnFamilyHandle>` from the single-input-borrow
+    // rule, which is exactly the soundness constraint we want (output
+    // borrow bounded by input borrow, NOT 'static).
     if h.is_null() {
         return None;
     }
-    Some(&*(h as *const ColumnFamilyHandle))
+    Some(&*(*h as *const ColumnFamilyHandle))
 }
 
 fn error_to_status(err: &forst_rs_common::ForstError) -> i32 {
@@ -412,7 +432,7 @@ pub unsafe extern "C" fn frs_put(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         if key.is_null() {
@@ -443,7 +463,7 @@ pub unsafe extern "C" fn frs_delete(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         if key.is_null() {
@@ -471,7 +491,7 @@ pub unsafe extern "C" fn frs_merge(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         if key.is_null() || operand.is_null() {
@@ -506,7 +526,7 @@ pub unsafe extern "C" fn frs_get(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         if key.is_null() {
@@ -548,7 +568,7 @@ pub unsafe extern "C" fn frs_batch_put(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         if count == 0 {
@@ -600,7 +620,7 @@ pub unsafe extern "C" fn frs_batch_get(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         if count == 0 {
@@ -680,7 +700,7 @@ pub unsafe extern "C" fn frs_flush_cf(handle: FrsDb, cf: FrsCfHandle) -> i32 {
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         match db.flush_cf(cf) {
@@ -697,7 +717,7 @@ pub unsafe extern "C" fn frs_compact_cf(handle: FrsDb, cf: FrsCfHandle) -> i32 {
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         match db.compact_l0(cf) {
@@ -897,7 +917,7 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         if array.is_null() || schema.is_null() {
@@ -1019,7 +1039,7 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
 
@@ -1124,7 +1144,7 @@ pub unsafe extern "C" fn frs_prefix_scan_arrow(
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let Some(cf) = cf_ref(cf) else {
+        let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
         let prefix_slice = if prefix.is_null() || prefix_len == 0 {
