@@ -1,5 +1,21 @@
 # Session Handoff — State Machine
 
+> **v3.2 wrap layer (2026-05-08)**: A three-goal (G-A / G-B / G-C) supplement was added at
+> `docs/superpowers/planning/v3.2/reports/A1_status_assessment.md`. v3.2 wraps the existing C1–C9
+> framework — Phase D = ongoing C1 R3+ review-loop per `REVIEW_PROTOCOL.md`; Phase B adds C10
+> (Delta Join Rust-side FFI) + L1–L6 (Flink-side paired PRs). This SESSION_HANDOFF remains the
+> STATE source-of-truth. `.planning/refactor-review/A1_reconciliation.md @ 33f85b1c5` remains the
+> arch-pivot authority. v3.2's stricter-than-existing rules (e.g., 7→12 reviewers, "10 rounds zero-H"
+> termination) are REJECTED in favor of the existing `H=0 ∧ M=0 × 10 / 120-cap` per
+> `A1_reconciliation §2.3`.
+>
+> **Phase-A Flink bootstrap (L1+L2+L3 MVP) landed 2026-05-08** in Flink repo `forst-rs-jdk25`
+> branch (`flink-state-backends/flink-statebackend-forst-rs/`). `ForStRsRoundTripTest`
+> demonstrates FFM round-trip into `libforst_rs_ffi.dylib` (open/put/get/close via JDK 25
+> MethodHandle downcalls). A1 Stage 3 verdict advanced from ❌ Not Done to 🟡 Partial-strong.
+> Plan: `docs/superpowers/planning/v3.2/plans/2026-05-08-phase-a-flink-bootstrap.md`.
+> Next: schedule C1 R2 Histogram arch-pivot session (per `arch_pivot_pending` block below).
+
 ## Current state (as of 2026-04-25, session A finished)
 
 ```

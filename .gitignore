@@ -3,3 +3,10 @@
 
 # Locally-downloaded developer tools (not committed)
 /actionlint
+
+# planning-with-files skill scratchpads (skill writes to repo root by default).
+# These are session-local; authoritative planning lives in .planning/refactor-review/
+# and docs/superpowers/planning/.
+/findings.md
+/progress.md
+/task_plan.md
