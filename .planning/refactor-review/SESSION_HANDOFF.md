@@ -77,38 +77,31 @@ Each session should:
 ## STATE (update this at end of every session)
 
 ```yaml
-last_updated: 2026-05-05T22:00:00Z
-last_session_id: G
-phase: B_R3_READY
+last_updated: 2026-05-08T01:00:00+08:00
+last_session_id: H_arch_pivot
+phase: C1_R1_READY_AFTER_PIVOT  # round counter reset after Pivot 1
 authoritative_spec: ".planning/refactor-review/A1_reconciliation.md @ 33f85b1c5"
 arch_pivot_authority: ACTIVE
 current_commit: C1
-current_commit_sha: a5f2d9b0c  # tip of forst-rs after R2 fixes (review against crates/forst-rs-common/ at HEAD)
-current_round: 2  # R1 + R2 done; R3 ready to dispatch
-round_1_status: COMPLETE
+current_commit_sha: HEAD  # post Pivot 1 commit; check git log for sha
+current_round: 0  # RESET per A1 §3.3.2 after Pivot 1 landed
+round_1_status: COMPLETE  # historical; pre-pivot
 round_1_findings_file: .planning/refactor-review/C1-R1-findings.md
-round_2_status: COMPLETE_FIXES_LANDED  # 4 of 4 H/M tuning items fixed; 2 architectural Hs deferred
+round_2_status: COMPLETE_FIXES_LANDED  # historical; pre-pivot (4 H/M tuning fixed; 2 architectural Hs resolved by Pivot 1)
 round_2_findings_file: .planning/refactor-review/C1-R2-findings.md
-consecutive_clean: 0  # R2 had 4H + 11M; not yet H=0 ∧ M=0
-baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R3+
+consecutive_clean: 0  # fresh streak post-pivot
+baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
 r2_totals: "H=4, M=11, L=5 (Tech VP dedup; raw H=7 M=14 L=6 from 9/10 agents — Dim 6 perf deferred)"
 r2_fixes_landed: "a5f2d9b0c — H#3 Arena OOM test, H#4 unwrap→expect, M#6 test bounds, M#7 const_is_empty, M#10 checked_add"
-CRITICAL_BLOCKER: RESOLVED  # via A1 §3 arch-pivot sub-loop (user-confirmed 2026-04-30)
+pivot_1_landed: |
+  i64 fixed-point sum + approximate-snapshot doc — see C1-arch-pivot-log.md Pivot 1.
+  Resolves R2 H#1 + H#2 + M#1 + M#2. 135 tests pass (132 + 3 new); clippy clean.
+CRITICAL_BLOCKER: RESOLVED  # via A1 §3 arch-pivot sub-loop (user-confirmed 2026-04-30); Pivot 1 landed 2026-05-08
 arch_pivot_pending: |
-  Histogram concurrency redesign (couples R2 H#1 + H#2 + M#1 + M#2):
-    - H#1: snapshot() reads non-atomic compound state (count/sum/buckets)
-    - H#2: CAS sum loop allows permanent NaN poisoning
-    - M#1: misleading atomicity claim in metrics docs
-    - M#2: missing concurrent observe()+snapshot() consistency test
-  Pivot options (to be designed in arch-pivot session):
-    (a) seqlock / version counter around the 4 fields
-    (b) coarse RwLock guarding the snapshot read
-    (c) replace f64 sum with i64 fixed-point (avoids NaN; precision loss)
-    (d) per-thread accumulators with periodic merge
-  When arch-pivot lands: counter resets to 0 per A1 §3.3.2; arch-pivot
-  commit format `arch(C1): pivot Histogram for snapshot+NaN`; log entry
-  in .planning/refactor-review/C1-arch-pivot-log.md.
+  None. Pivot 1 (Histogram concurrency redesign) landed 2026-05-08 — see
+  C1-arch-pivot-log.md Pivot 1. Round counter reset; ready for fresh R1
+  dispatch via REVIEW_PROTOCOL.md against the pivoted code.
 c1_agents_ids:
   r1_completed: [a315094bb0c2a8251, a2d4de574d4fbf736, a1f6a0849a1a1375a, af2d68d6c4b38ee8d, aed0445efd7332014, aba5767e53bb42477, ab0a8aac6094f9a24, a978e1c69634eee26, aa7ead384e348c0d0, afecebf860d223f09]
   r2_completed: [a6526bca3d5e7712f, a8b59dd142d4699a1, a3e7ca53bf0e8ad6e, a6fc17ced24fdab8c, a1cde272063a56195, aae9b5198f35c569b, a78246f26fd486fc7, a38e6a4390d2db7a9, ac940f1c364f1a891]
@@ -135,7 +128,8 @@ next_action: |
 | E | 2026-04-30 → 2026-05-02 | Phase F | GHA rebuild | 1 | All 7 workflows green; F1 acceptance + §6 addendum committed; release dry-run executed and cleaned up |
 | F | 2026-05-05 | Phase A re-orient | 1 | Tech VP cross-phase status checkpoint (F1 §6.5) written |
 | G | 2026-05-05 | Phase B-D | C1 R2 | 1→2 | 9/10 review agents dispatched (Dim 6 deferred); R2 totals H=4 M=11 L=5; 4 H/M tuning items fixed in a5f2d9b0c; 2 architectural Hs queued for next-session arch-pivot |
-| H | TBD | Phase B-D | Histogram arch-pivot | 2→reset to 0 | Implement pivot for R2 H#1+H#2+M#1+M#2 (snapshot consistency + NaN hardening) |
+| H | 2026-05-08 | Phase B-D | Histogram arch-pivot | 2→reset to 0 | **DONE.** Pivot 1 landed: i64 fixed-point sum + approximate-snapshot docs. R2 H#1 + H#2 + M#1 + M#2 resolved. 135 tests pass (132 + 3 new regressions). Clippy clean. Counter reset to 0. See C1-arch-pivot-log.md Pivot 1. |
+| Phase A v3.2 | 2026-05-08 | Phase A finalize + B + Flink bootstrap | 7164cb6e6 (ForSt) + eb760121ce5 (Flink) | N/A | Phase A status assessment + B PR split plan + Flink-side L1+L2+L3 MVP (flink-statebackend-forst-rs Maven module + JDK 25 FFM bridge + ForStRsRoundTripTest green). Stage 3 verdict 🟡 Partial-strong. |
 | ... | | | | | |
 
 ## Risk register
