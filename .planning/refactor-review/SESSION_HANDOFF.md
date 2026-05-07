@@ -77,19 +77,21 @@ Each session should:
 ## STATE (update this at end of every session)
 
 ```yaml
-last_updated: 2026-05-08T01:00:00+08:00
-last_session_id: H_arch_pivot
-phase: C1_R1_READY_AFTER_PIVOT  # round counter reset after Pivot 1
+last_updated: 2026-05-08T02:00:00+08:00
+last_session_id: I_post_pivot_R1
+phase: C1_R2_READY  # post-pivot R1 completed; R2 ready
 authoritative_spec: ".planning/refactor-review/A1_reconciliation.md @ 33f85b1c5"
 arch_pivot_authority: ACTIVE
 current_commit: C1
-current_commit_sha: HEAD  # post Pivot 1 commit; check git log for sha
-current_round: 0  # RESET per A1 §3.3.2 after Pivot 1 landed
-round_1_status: COMPLETE  # historical; pre-pivot
+current_commit_sha: HEAD  # post R1-post-pivot commit; check git log for sha
+current_round: 1  # post-pivot R1 done; post-pivot R2 ready to dispatch
+round_1_status: COMPLETE  # historical pre-pivot
 round_1_findings_file: .planning/refactor-review/C1-R1-findings.md
-round_2_status: COMPLETE_FIXES_LANDED  # historical; pre-pivot (4 H/M tuning fixed; 2 architectural Hs resolved by Pivot 1)
+round_2_status: COMPLETE_FIXES_LANDED  # historical pre-pivot
 round_2_findings_file: .planning/refactor-review/C1-R2-findings.md
-consecutive_clean: 0  # fresh streak post-pivot
+post_pivot_r1_status: COMPLETE_FIXES_LANDED  # 9/10 dimensions reviewed (Dim 6 deferred); 12 raw H + 53 raw M; Tier-1 fixes landed
+post_pivot_r1_findings_file: .planning/refactor-review/C1-R1-post-pivot-findings.md
+consecutive_clean: 0  # post-R1 still has unfixed M items deferred to R2 + 1 H escalated (InternalKey)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
 r2_totals: "H=4, M=11, L=5 (Tech VP dedup; raw H=7 M=14 L=6 from 9/10 agents — Dim 6 perf deferred)"
@@ -129,7 +131,8 @@ next_action: |
 | F | 2026-05-05 | Phase A re-orient | 1 | Tech VP cross-phase status checkpoint (F1 §6.5) written |
 | G | 2026-05-05 | Phase B-D | C1 R2 | 1→2 | 9/10 review agents dispatched (Dim 6 deferred); R2 totals H=4 M=11 L=5; 4 H/M tuning items fixed in a5f2d9b0c; 2 architectural Hs queued for next-session arch-pivot |
 | H | 2026-05-08 | Phase B-D | Histogram arch-pivot | 2→reset to 0 | **DONE.** Pivot 1 landed: i64 fixed-point sum + approximate-snapshot docs. R2 H#1 + H#2 + M#1 + M#2 resolved. 135 tests pass (132 + 3 new regressions). Clippy clean. Counter reset to 0. See C1-arch-pivot-log.md Pivot 1. |
-| Phase A v3.2 | 2026-05-08 | Phase A finalize + B + Flink bootstrap | 7164cb6e6 (ForSt) + eb760121ce5 (Flink) | N/A | Phase A status assessment + B PR split plan + Flink-side L1+L2+L3 MVP (flink-statebackend-forst-rs Maven module + JDK 25 FFM bridge + ForStRsRoundTripTest green). Stage 3 verdict 🟡 Partial-strong. |
+| Phase A v3.2 | 2026-05-08 | Phase A finalize + B + Flink bootstrap | 7164cb6e6 (ForSt) + eb760121ce5 (Flink) + bfc5a7ff7b7 (Flink Maven enforcer widen) | N/A | Phase A status assessment + B PR split plan + Flink-side L1+L2+L3 MVP (flink-statebackend-forst-rs Maven module + JDK 25 FFM bridge + ForStRsRoundTripTest green). Stage 3 verdict 🟡 Partial-strong. |
+| I | 2026-05-08 | Phase B-D | C1 post-pivot R1 | 0→1 | **DONE.** 9 parallel reviewers dispatched (Dim 6 deferred); 12 raw H + 53 raw M findings. Tech VP dedup → fix-this-round Tier 1: 3 doc/code mismatches (sorted-bounds assert, counts[i] semantics, ≤1-obs concurrency bound), 2 wire-format strictness fixes (varint32/64 5th/10th-byte canonical-encoding rejection per RocksDB), 4 doc tightenings (NaN/Inf bucket placement, snapshot approximate, sum wrap, Arena OOM-aborts), 2 API-shape fixes (`SUM_MULTIPLIER` → `pub(crate)`, `ForstError` → `#[non_exhaustive]`), 4 new regression tests (NaN bucket placement, ±∞ bucket placement, all-overflow percentile, varint canonical/non-canonical). 142 tests pass (135 + 7); clippy clean. 1 H escalated as architectural cross-boundary (InternalKey op_type ordering vs RocksDB tag-descending). consecutive_clean stays 0. See C1-R1-post-pivot-findings.md. |
 | ... | | | | | |
 
 ## Risk register

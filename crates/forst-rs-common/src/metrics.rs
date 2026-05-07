@@ -156,7 +156,11 @@ pub const DEFAULT_BUCKETS: &[f64] = &[
 ///
 /// 6 decimal places (`1_000_000`) is enough for sub-microsecond timing
 /// metrics; sum range is `i64::MAX / SUM_MULTIPLIER ≈ 9.2 × 10^12`.
-pub const SUM_MULTIPLIER: f64 = 1_000_000.0;
+///
+/// `pub(crate)` because this is an implementation detail of the
+/// fixed-point trick — exposing it as `pub` would calcify the
+/// representation as part of the SemVer surface (R1-post-pivot M#5).
+pub(crate) const SUM_MULTIPLIER: f64 = 1_000_000.0;
 
 /// A histogram that records observed values into fixed buckets.
 ///
@@ -165,46 +169,83 @@ pub const SUM_MULTIPLIER: f64 = 1_000_000.0;
 /// Each field of the histogram (`total_count`, `sum_fixed`, per-bucket
 /// `counts[i]`, `overflow`) is updated atomically via `fetch_add`. The
 /// composite [`HistogramSnapshot`] returned by [`Self::snapshot`] is
-/// **point-in-time approximate**: under heavy concurrency, count and sum
-/// may diverge by ≤1 observation (one of the two ops may be visible while
-/// the peer is still in flight on another thread). This is acceptable for
-/// monitoring use; callers needing strict atomicity should serialize
-/// externally.
+/// **point-in-time approximate**: individual atomic reads of the four
+/// field families are each linearizable, but the composition is not —
+/// under N concurrently-in-flight observers a snapshot may witness up to
+/// N partial observation states (one observer past `total_count.fetch_add`
+/// but before `sum_fixed.fetch_add`, another past sum but before
+/// `counts[i].fetch_add`, etc.). The reachable divergence is therefore
+/// `O(N_observers)`, not O(1). Acceptable for monitoring; callers needing
+/// strict atomicity should serialize externally.
 ///
 /// # Sum semantics
 ///
 /// `sum_fixed` is an `i64` fixed-point accumulation with multiplier
-/// [`SUM_MULTIPLIER`]. NaN inputs to [`Self::observe`] silently drop from
-/// sum (saturating cast → 0); `total_count` still increments so the
-/// upstream NaN-producing bug remains observable. Inf inputs saturate to
-/// `i64::MAX/MIN` per Rust float-to-int spec; subsequent [`Self::sum`]
-/// reads return ±∞ for typical magnitudes.
+/// `SUM_MULTIPLIER` (1_000_000 = 6 decimal places). NaN inputs to
+/// [`Self::observe`] silently drop from sum (saturating cast → 0);
+/// `total_count` still increments so the upstream NaN-producing bug
+/// remains observable. Inf inputs saturate the per-call `as i64` cast to
+/// `i64::MAX/MIN`; once landed, **subsequent positive observations wrap
+/// `fetch_add` two's-complement** — `AtomicI64::fetch_add` does not
+/// saturate. After ~`i64::MAX / SUM_MULTIPLIER ≈ 9.2 × 10^12` real
+/// accumulated units, `sum_fixed` wraps similarly. Callers monitoring
+/// across multi-day windows at high rates should periodically reset or
+/// recreate the histogram.
+///
+/// # Bucket placement (NaN / ±Inf)
+///
+/// Bucket assignment uses `value <= bound`. By IEEE 754:
+/// - **`NaN`** comparisons all return `false` ⇒ NaN observations land in
+///   `overflow` (along with values exceeding all bounds — overflow
+///   conflates "above max" with "NaN"; callers should surface upstream
+///   NaN at the source if distinction matters).
+/// - **`+∞`** comparisons all return `false` ⇒ `+∞` lands in `overflow`.
+/// - **`-∞`** is `<= bounds[0]` ⇒ `-∞` lands in `counts[0]` (the smallest
+///   bucket).
 pub struct Histogram {
-    /// Bucket upper bounds (sorted ascending).
+    /// Bucket upper bounds (sorted ascending; verified by [`Self::new`]).
     bounds: Vec<f64>,
-    /// Count of observations in each bucket. `counts[i]` is the number of
-    /// observations <= `bounds[i]`.
+    /// Count of observations falling in `(bounds[i-1], bounds[i]]`
+    /// (with `bounds[-1] = -∞`) — i.e. the smallest bucket whose upper
+    /// bound is `>= value`. Each observation is counted in **exactly one**
+    /// bucket; this is bucket-exclusive, not cumulative.
+    /// Allocated once in [`Self::new`], never resized; stable addresses
+    /// are required for concurrent observers' lock-free `fetch_add`.
     counts: Vec<AtomicU64>,
-    /// Count of observations that exceed all bucket bounds (overflow).
+    /// Count of observations exceeding all bucket bounds, plus NaN and
+    /// `+∞` observations (see "Bucket placement" in [`Histogram`] doc).
     overflow: AtomicU64,
     /// Total number of observations.
     total_count: AtomicU64,
     /// Sum of all observed values, stored as i64 fixed-point with
-    /// multiplier [`SUM_MULTIPLIER`]. Updated via single lock-free
+    /// multiplier `SUM_MULTIPLIER`. Updated via single lock-free
     /// `fetch_add`; immune to NaN poisoning by data-type construction.
+    /// **Wraps two's-complement on overflow** (see "Sum semantics").
     sum_fixed: AtomicI64,
 }
 
 impl Histogram {
     /// Creates a new histogram with the given bucket boundaries.
     ///
-    /// `bounds` must be sorted ascending and non-empty.
+    /// `bounds` must be sorted ascending and non-empty. Both preconditions
+    /// are checked at construction time (R1-post-pivot H#2).
     ///
     /// # Panics
     ///
-    /// Panics if `bounds` is empty.
+    /// - if `bounds` is empty.
+    /// - if `bounds` is not strictly ascending (a NaN entry, a duplicate,
+    ///   or out-of-order entries).
     pub fn new(bounds: &[f64]) -> Self {
         assert!(!bounds.is_empty(), "histogram bounds must not be empty");
+        // Verify strictly-ascending, no-NaN. Without this, `observe()` would
+        // silently misclassify into the first bucket where `value <= bound`,
+        // producing meaningless histograms (R1-post-pivot H#2).
+        for window in bounds.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "histogram bounds must be strictly ascending (no NaN, no duplicates)"
+            );
+        }
         let counts = (0..bounds.len()).map(|_| AtomicU64::new(0)).collect();
         Histogram {
             bounds: bounds.to_vec(),
@@ -317,7 +358,13 @@ impl Default for Histogram {
     }
 }
 
-/// An immutable snapshot of a [`Histogram`] at a point in time.
+/// An approximate snapshot of a [`Histogram`].
+///
+/// See [`Histogram::snapshot`] for the consistency caveats — under
+/// concurrent observers the four atomic fields are sampled independently,
+/// so the composition may witness a state that did not exist at any
+/// single instant. For monitoring this is acceptable; for correctness
+/// callers should serialize externally.
 #[derive(Debug, Clone)]
 pub struct HistogramSnapshot {
     /// Bucket upper bounds.
@@ -612,6 +659,10 @@ mod tests {
     /// would set `sum_bits` to the NaN bit pattern, after which every
     /// future `observe(v)` saw `sum = NaN + v = NaN` and wrote NaN back —
     /// permanent corruption.
+    ///
+    /// R1-post-pivot extension: also asserts NaN bucket placement (NaN
+    /// comparisons all return `false` ⇒ NaN lands in `overflow`). See
+    /// `Histogram` "Bucket placement" doc.
     #[test]
     fn nan_input_does_not_poison_sum() {
         let h = Histogram::with_default_buckets();
@@ -632,12 +683,25 @@ mod tests {
             "expected sum=6.0 (NaN dropped), got {}",
             h.sum()
         );
+
+        // NaN observations land in `overflow` per Histogram bucket-
+        // placement doc (NaN <= bound is always false). The 3 finite
+        // observations (1.0, 2.0, 3.0) fall into in-bounds buckets;
+        // overflow holds exactly the 2 NaN observations.
+        let (bucket_counts, overflow) = h.bucket_counts();
+        let in_bounds: u64 = bucket_counts.iter().sum();
+        assert_eq!(in_bounds, 3, "finite observations land in buckets");
+        assert_eq!(overflow, 2, "NaN observations land in overflow");
     }
 
     /// Regression test for ±∞ input handling: float-to-i64 cast saturates
     /// per Rust spec, so `+∞ * MULT` → `i64::MAX` and `-∞ * MULT` →
     /// `i64::MIN`. After Inf is observed, `sum()` returns ±∞ via
     /// `(i64::MAX as f64) / MULT == f64::INFINITY` for typical magnitudes.
+    ///
+    /// R1-post-pivot extension: also asserts bucket placement.
+    /// `+∞ <= bound` is always false ⇒ +∞ lands in `overflow`.
+    /// `-∞ <= bounds[0]` is true ⇒ -∞ lands in `counts[0]`.
     #[test]
     fn inf_input_saturates_safely() {
         let h_pos = Histogram::with_default_buckets();
@@ -654,6 +718,10 @@ mod tests {
             "expected sum saturated near ±∞ after +∞ observe, got {}",
             s_pos
         );
+        // +∞ to overflow; the 1.0 observation to bucket[0] (DEFAULT_BUCKETS[0]=1.0).
+        let (bucket_counts_pos, overflow_pos) = h_pos.bucket_counts();
+        assert_eq!(overflow_pos, 1, "+∞ lands in overflow");
+        assert_eq!(bucket_counts_pos[0], 1, "1.0 lands in counts[0]");
 
         let h_neg = Histogram::with_default_buckets();
         h_neg.observe(f64::NEG_INFINITY);
@@ -663,6 +731,44 @@ mod tests {
             "expected sum saturated near -∞, got {}",
             h_neg.sum()
         );
+        // -∞ <= bounds[0] is true, so -∞ goes into counts[0], not overflow.
+        let (bucket_counts_neg, overflow_neg) = h_neg.bucket_counts();
+        assert_eq!(overflow_neg, 0, "-∞ does NOT land in overflow");
+        assert_eq!(bucket_counts_neg[0], 1, "-∞ lands in counts[0]");
+    }
+
+    /// Regression test for R1-post-pivot H#2 (sorted bounds assertion).
+    /// `Histogram::new` must reject unsorted bounds; otherwise `observe`
+    /// silently misclassifies into the first bucket where `value <= bound`.
+    #[test]
+    #[should_panic(expected = "strictly ascending")]
+    fn test_histogram_unsorted_bounds_panics() {
+        let _ = Histogram::new(&[10.0, 5.0, 100.0]);
+    }
+
+    /// Regression test for R1-post-pivot H#2: NaN in bounds is rejected.
+    #[test]
+    #[should_panic(expected = "strictly ascending")]
+    fn test_histogram_nan_bounds_panics() {
+        let _ = Histogram::new(&[1.0, f64::NAN, 100.0]);
+    }
+
+    /// Regression test for R1-post-pivot M#7 (downgraded from R4 H#2).
+    /// `HistogramSnapshot::percentile` "all observations in overflow" tail
+    /// branch returns the largest bound rather than infinity. Documents
+    /// expected behavior so a future refactor doesn't silently change it.
+    #[test]
+    fn test_percentile_all_overflow() {
+        let h = Histogram::new(&[10.0, 50.0, 100.0]);
+        h.observe(200.0);
+        h.observe(300.0);
+        h.observe(500.0);
+        let snap = h.snapshot();
+        assert_eq!(snap.overflow, 3);
+        // p99 of all-overflow data: cumulative loop never reaches target,
+        // falls through to bounds.last() == 100.0.
+        assert_eq!(snap.percentile(0.99), 100.0);
+        assert_eq!(snap.percentile(0.5), 100.0);
     }
 
     /// Regression test for C1 R2 H#1 (snapshot consistency under

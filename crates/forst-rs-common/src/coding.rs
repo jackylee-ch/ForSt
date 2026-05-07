@@ -116,8 +116,11 @@ pub fn put_varint64(dst: &mut Vec<u8>, mut value: u64) {
 /// Decodes a varint-encoded `u32` from the start of `src`.
 ///
 /// Returns `(value, bytes_consumed)`. At most [`MAX_VARINT32_LEN`] bytes
-/// are read. Returns [`ForstError::Corruption`] on truncated or overlong
-/// input.
+/// are read. Returns [`ForstError::Corruption`] on truncated, overlong,
+/// or non-canonical input (overlong here = the 5th byte sets bits beyond
+/// the 4 that fit in `u32` after the `<< 28` shift, which would otherwise
+/// silently truncate; matches RocksDB `GetVarint32Ptr` strictness — see
+/// R1-post-pivot H#1).
 pub fn get_varint32(src: &[u8]) -> ForstResult<(u32, usize)> {
     let mut result: u32 = 0;
     let mut shift: u32 = 0;
@@ -130,6 +133,17 @@ pub fn get_varint32(src: &[u8]) -> ForstResult<(u32, usize)> {
         // Guard against overflow: if shift >= 32 the value doesn't fit u32.
         if shift >= 32 {
             return Err(ForstError::corruption("varint32 overflow"));
+        }
+        // Final byte (i = MAX_VARINT32_LEN - 1 = 4, shift = 28): only the
+        // low 4 bits of `value_bits` legally land in the result; bits 4..6
+        // would shift past bit 31 and be silently truncated. Reject such
+        // non-canonical encodings so a malformed `[0x80,0x80,0x80,0x80,0x10]`
+        // does NOT silently decode to a wrong-but-different value than its
+        // intended overlong form. (R1-post-pivot H#1; A2/A1/A4/A7/A9.)
+        if i == MAX_VARINT32_LEN - 1 && (byte & 0x70) != 0 {
+            return Err(ForstError::corruption(
+                "varint32 non-canonical: 5th byte has bits beyond the low 4",
+            ));
         }
         result |= value_bits << shift;
         shift += 7;
@@ -147,7 +161,10 @@ pub fn get_varint32(src: &[u8]) -> ForstResult<(u32, usize)> {
 /// Decodes a varint-encoded `u64` from the start of `src`.
 ///
 /// Returns `(value, bytes_consumed)`. At most [`MAX_VARINT64_LEN`] bytes
-/// are read.
+/// are read. Returns [`ForstError::Corruption`] on truncated, overlong,
+/// or non-canonical input (overlong here = the 10th byte sets bits beyond
+/// the single bit that fits in `u64` after the `<< 63` shift; matches
+/// RocksDB `GetVarint64Ptr` strictness — see R1-post-pivot H#1).
 pub fn get_varint64(src: &[u8]) -> ForstResult<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
@@ -159,6 +176,15 @@ pub fn get_varint64(src: &[u8]) -> ForstResult<(u64, usize)> {
         let value_bits = (byte & 0x7F) as u64;
         if shift >= 64 {
             return Err(ForstError::corruption("varint64 overflow"));
+        }
+        // Final byte (i = MAX_VARINT64_LEN - 1 = 9, shift = 63): only bit 0
+        // of `value_bits` legally lands in the result; bits 1..6 would
+        // shift past bit 63 and be silently truncated. Reject as
+        // non-canonical. (R1-post-pivot H#1.)
+        if i == MAX_VARINT64_LEN - 1 && (byte & 0x7E) != 0 {
+            return Err(ForstError::corruption(
+                "varint64 non-canonical: 10th byte has bits beyond the low 1",
+            ));
         }
         result |= value_bits << shift;
         shift += 7;
@@ -362,5 +388,73 @@ mod tests {
         assert_eq!(v2, 999);
         let (v3, _) = get_fixed64(&buf[n1 + n2..]).unwrap();
         assert_eq!(v3, 123456789);
+    }
+
+    // ─── R1-post-pivot H#1 regressions (varint canonical-encoding strictness)
+    //     Reject 5th-byte / 10th-byte high-bit overflow that previously
+    //     silently truncated to a different value than encoded.
+
+    /// 5-byte varint32 with 5th byte `0x10` would shift bit 4 past bit 31
+    /// and silently produce 0. Now rejected as non-canonical.
+    #[test]
+    fn test_varint32_non_canonical_5th_byte_high_bits() {
+        let buf: [u8; 5] = [0x80, 0x80, 0x80, 0x80, 0x10];
+        let res = get_varint32(&buf);
+        assert!(res.is_err(), "expected corruption, got {:?}", res);
+        let err = res.unwrap_err();
+        assert!(
+            err.is_corruption(),
+            "expected Corruption variant, got {:?}",
+            err
+        );
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("non-canonical") && msg.contains("5th byte"),
+            "expected non-canonical 5th-byte error, got: {}",
+            msg
+        );
+    }
+
+    /// Canonical 5-byte varint32 (5th byte ≤ 0x0F) still decodes correctly.
+    #[test]
+    fn test_varint32_canonical_5th_byte_low_bits_ok() {
+        // Encode u32::MAX (0xFFFF_FFFF). Bytes:
+        //   0xFF, 0xFF, 0xFF, 0xFF, 0x0F  (5th byte has low 4 bits set; legal)
+        let mut buf = Vec::new();
+        put_varint32(&mut buf, u32::MAX);
+        let (v, n) = get_varint32(&buf).unwrap();
+        assert_eq!(v, u32::MAX);
+        assert_eq!(n, 5);
+    }
+
+    /// 10-byte varint64 with 10th byte `0x02` would shift bit 1 past bit 63
+    /// and silently produce 0. Now rejected as non-canonical.
+    #[test]
+    fn test_varint64_non_canonical_10th_byte_high_bits() {
+        let buf: [u8; 10] = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02];
+        let res = get_varint64(&buf);
+        assert!(res.is_err(), "expected corruption, got {:?}", res);
+        let err = res.unwrap_err();
+        assert!(
+            err.is_corruption(),
+            "expected Corruption variant, got {:?}",
+            err
+        );
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("non-canonical") && msg.contains("10th byte"),
+            "expected non-canonical 10th-byte error, got: {}",
+            msg
+        );
+    }
+
+    /// Canonical 10-byte varint64 (10th byte ≤ 0x01) still decodes correctly.
+    #[test]
+    fn test_varint64_canonical_10th_byte_low_bit_ok() {
+        let mut buf = Vec::new();
+        put_varint64(&mut buf, u64::MAX);
+        let (v, n) = get_varint64(&buf).unwrap();
+        assert_eq!(v, u64::MAX);
+        assert_eq!(n, 10);
     }
 }

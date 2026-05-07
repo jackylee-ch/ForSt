@@ -77,6 +77,15 @@ impl Arena {
     /// If `size` fits within the remaining space of the current block,
     /// it is carved out directly. Otherwise, a new standard block is
     /// allocated.
+    ///
+    /// # Aborts (not panics)
+    ///
+    /// Allocation failure inside `vec![0u8; size]` invokes the global
+    /// allocator's OOM handler, which **aborts the process** rather than
+    /// returning an error. A fallible `try_allocate` API is tracked as an
+    /// architectural follow-up (R1 A5-H1, R1-post-pivot M#10); until it
+    /// lands, callers receiving `size` from untrusted sources (FFI / SST
+    /// decoder) should bound it externally before calling here.
     pub fn allocate(&mut self, size: usize) -> &mut [u8] {
         if size == 0 {
             return &mut [];
@@ -122,6 +131,15 @@ impl Arena {
     /// # Panics
     ///
     /// Panics if `align` is not a power of two.
+    ///
+    /// # Aborts
+    ///
+    /// Inherits the OOM-aborts behavior of [`Self::allocate`]; if
+    /// `size + padding` would overflow `usize`, falls through to a
+    /// new-block allocation (which itself may abort on OOM). Best-effort
+    /// alignment in the fall-through path is the Vec allocator's
+    /// guarantee (typically ≥8 bytes); R1-post-pivot M#10 tracks a
+    /// stricter contract.
     pub fn allocate_aligned(&mut self, size: usize, align: usize) -> &mut [u8] {
         assert!(align.is_power_of_two(), "alignment must be a power of two");
         if size == 0 {

@@ -26,6 +26,7 @@ use std::io;
 /// compatibility when bridging between the Rust engine and existing
 /// RocksDB/ForSt consumers.
 #[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
 pub enum ForstError {
     /// An I/O error occurred during a file-system or network operation.
     #[error("IO error: {0}")]
