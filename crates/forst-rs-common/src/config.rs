@@ -40,6 +40,32 @@ use crate::types::{CompressionType, MAX_LEVELS};
 /// fix targeted (R-loop r4 H#1 regression of own r3 fix).
 pub const MAX_LEVEL_MULTIPLIER: f64 = 1024.0;
 
+/// Upper bound on `EngineOptions::max_bytes_for_level_base` (1 PiB).
+///
+/// Realistic LSM L1 capacity is ≪ 1 PiB; this cap prevents an untrusted
+/// `usize::MAX` from reaching the engine's `pick_compaction_level` and
+/// disabling compaction entirely (R-loop r5 Sec H#1).
+pub const MAX_LEVEL_BASE: usize = 1 << 50;
+
+/// Upper bound on `EngineOptions::write_buffer_size` (1 TiB).
+///
+/// A `usize::MAX` write-buffer means the memtable threshold is never
+/// crossed → unbounded heap growth → OOM (R-loop r5 Sec H#2).
+pub const MAX_WRITE_BUFFER_SIZE: usize = 1 << 40;
+
+/// Upper bound on `EngineOptions::block_cache_size` (1 PiB).
+///
+/// Prevents an untrusted `usize::MAX` from triggering OOM-abort in
+/// block-cache initialization (R-loop r5 Sec H#2).
+pub const MAX_BLOCK_CACHE_SIZE: usize = 1 << 50;
+
+/// Upper bound on `EngineOptions::max_background_compactions` /
+/// `max_background_flushes`.
+///
+/// Prevents an untrusted `usize::MAX` from spawning unbounded threads
+/// (FD/thread-limit exhaustion DoS — R-loop r5 Sec H#2).
+pub const MAX_BACKGROUND_THREADS: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // EngineOptions
 // ---------------------------------------------------------------------------
@@ -188,6 +214,40 @@ impl EngineOptions {
             return Err(ForstError::invalid_argument(format!(
                 "max_bytes_for_level_multiplier must be finite and in (1.0, {}], got {}",
                 MAX_LEVEL_MULTIPLIER, self.max_bytes_for_level_multiplier
+            )));
+        }
+        // R-loop r5 Sec H#1: cap level-base so the base axis cannot drive
+        // saturation downstream the same way the multiplier axis did.
+        if self.max_bytes_for_level_base > MAX_LEVEL_BASE {
+            return Err(ForstError::invalid_argument(format!(
+                "max_bytes_for_level_base must be ≤ {} bytes (1 PiB), got {}",
+                MAX_LEVEL_BASE, self.max_bytes_for_level_base
+            )));
+        }
+        // R-loop r5 Sec H#2: cap untrusted-input fields that flow into
+        // allocator / thread-spawn paths.
+        if self.write_buffer_size > MAX_WRITE_BUFFER_SIZE {
+            return Err(ForstError::invalid_argument(format!(
+                "write_buffer_size must be ≤ {} bytes (1 TiB), got {}",
+                MAX_WRITE_BUFFER_SIZE, self.write_buffer_size
+            )));
+        }
+        if self.block_cache_size > MAX_BLOCK_CACHE_SIZE {
+            return Err(ForstError::invalid_argument(format!(
+                "block_cache_size must be ≤ {} bytes (1 PiB), got {}",
+                MAX_BLOCK_CACHE_SIZE, self.block_cache_size
+            )));
+        }
+        if self.max_background_compactions > MAX_BACKGROUND_THREADS {
+            return Err(ForstError::invalid_argument(format!(
+                "max_background_compactions must be ≤ {}, got {}",
+                MAX_BACKGROUND_THREADS, self.max_background_compactions
+            )));
+        }
+        if self.max_background_flushes > MAX_BACKGROUND_THREADS {
+            return Err(ForstError::invalid_argument(format!(
+                "max_background_flushes must be ≤ {}, got {}",
+                MAX_BACKGROUND_THREADS, self.max_background_flushes
             )));
         }
         Ok(())
@@ -681,6 +741,71 @@ mod tests {
                 v
             );
         }
+    }
+
+    /// R-loop r5 Sec H#1: cap on `max_bytes_for_level_base` so an
+    /// untrusted `usize::MAX` cannot drive the same saturation DoS via
+    /// the base axis that the multiplier axis was capped against.
+    #[test]
+    fn test_validate_rejects_oversized_level_base() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_base(MAX_LEVEL_BASE + 1)
+            .build();
+        assert!(opts.validate().is_err());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_base(usize::MAX)
+            .build();
+        assert!(opts.validate().is_err());
+        // The cap itself is accepted.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_base(MAX_LEVEL_BASE)
+            .build();
+        assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r5 Sec H#2: caps on resource-exhaustion-prone fields.
+    #[test]
+    fn test_validate_rejects_oversized_resource_fields() {
+        // write_buffer_size
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(MAX_WRITE_BUFFER_SIZE + 1)
+            .build();
+        assert!(opts.validate().is_err());
+
+        // block_cache_size
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .block_cache_size(MAX_BLOCK_CACHE_SIZE + 1)
+            .build();
+        assert!(opts.validate().is_err());
+
+        // max_background_compactions
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_background_compactions(MAX_BACKGROUND_THREADS + 1)
+            .build();
+        assert!(opts.validate().is_err());
+
+        // max_background_flushes
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_background_flushes(MAX_BACKGROUND_THREADS + 1)
+            .build();
+        assert!(opts.validate().is_err());
+
+        // Each cap itself is accepted.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(MAX_WRITE_BUFFER_SIZE)
+            .block_cache_size(MAX_BLOCK_CACHE_SIZE)
+            .max_background_compactions(MAX_BACKGROUND_THREADS)
+            .max_background_flushes(MAX_BACKGROUND_THREADS)
+            .build();
+        assert!(opts.validate().is_ok());
     }
 
     /// R-loop r4 H#1: regression — finite-but-astronomical multiplier (e.g.

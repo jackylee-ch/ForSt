@@ -102,7 +102,8 @@ user_r_loop_round_1_status: COMPLETE  # post-pivot R2; H_TOTAL = 0 across all 5 
 user_r_loop_round_2_status: COMPLETE_FIXES_LANDED  # post-pivot R3; H_TOTAL = 1 (Correctness: SequenceNumber 56-bit invariant unenforced) — fix landed: try_new + debug_assert in InternalKey::new + 3 tests
 user_r_loop_round_3_status: COMPLETE_FIXES_LANDED  # post-pivot R4; H_TOTAL = 1 (Security: validate() missing NaN/Inf/non-positive check on max_bytes_for_level_multiplier) — fix landed: validate() now rejects with explanatory error + 3 tests
 user_r_loop_round_4_status: COMPLETE_FIXES_LANDED  # post-pivot R5; H_TOTAL = 4 raw → Tech VP: fix 2 (Security r4 H#1 multiplier upper bound + Errors r4 H#2 Level::try_new) + defer 2 to M (Errors r4 H#1 CfOptions validate gap, Errors r4 H#3 Histogram::new panics on user-supplied bounds — neither has FFI exposure in this crate)
-consecutive_zero_high: 0  # r3 + r4 both found Hs
+user_r_loop_round_5_status: COMPLETE_FIXES_LANDED  # post-pivot R6; H_TOTAL = 2 (Security r5 H#1+H#2: validate() upper-bound gaps for max_bytes_for_level_base, block_cache_size, write_buffer_size, max_background_*) — fixes landed: 4 new MAX_* consts + bounded validate() + 2 new tests
+consecutive_zero_high: 0  # r3, r4, r5 all found Hs
 consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
