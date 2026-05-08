@@ -140,6 +140,14 @@ impl EngineOptions {
     /// - `num_levels` must be in `1..=MAX_LEVELS`.
     /// - `write_buffer_size` must be greater than zero.
     /// - `block_size` must be greater than zero.
+    /// - `max_bytes_for_level_multiplier` must be **finite** and **strictly
+    ///   greater than 1.0** (R-loop r3 H#1, 2026-05-08). The downstream
+    ///   per-level capacity formula is `base * multiplier^(L-1)`; a NaN /
+    ///   ±∞ / negative / `≤ 1.0` value either saturates capacities to
+    ///   `usize::MAX`, collapses them to 0 (causing infinite compaction
+    ///   storms), or never grows the LSM, all of which are DoS vectors
+    ///   when the config originates from an untrusted source (FFI / on-
+    ///   disk decode).
     pub fn validate(&self) -> ForstResult<()> {
         if self.db_path.is_empty() {
             return Err(ForstError::invalid_argument("db_path must not be empty"));
@@ -159,6 +167,17 @@ impl EngineOptions {
             return Err(ForstError::invalid_argument(
                 "block_size must be greater than zero",
             ));
+        }
+        // R-loop r3 H#1: reject NaN / ±∞ / non-positive multiplier so the
+        // downstream level-capacity formula `base * multiplier^(L-1)` cannot
+        // saturate or collapse under untrusted config.
+        if !self.max_bytes_for_level_multiplier.is_finite()
+            || self.max_bytes_for_level_multiplier <= 1.0
+        {
+            return Err(ForstError::invalid_argument(format!(
+                "max_bytes_for_level_multiplier must be finite and > 1.0, got {}",
+                self.max_bytes_for_level_multiplier
+            )));
         }
         Ok(())
     }
@@ -603,6 +622,54 @@ mod tests {
         let err = opts.validate().unwrap_err();
         assert!(err.is_invalid_argument());
         assert!(err.to_string().contains("num_levels"));
+    }
+
+    /// Regression test for R-loop r3 H#1: `validate()` rejects NaN
+    /// `max_bytes_for_level_multiplier` (would saturate level capacities to 0,
+    /// causing infinite compaction storms).
+    #[test]
+    fn test_validate_rejects_nan_multiplier() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_multiplier(f64::NAN)
+            .build();
+        let err = opts.validate().unwrap_err();
+        assert!(err.is_invalid_argument());
+        assert!(err.to_string().contains("max_bytes_for_level_multiplier"));
+    }
+
+    /// R-loop r3 H#1: rejects ±Inf multiplier (would saturate capacities to
+    /// usize::MAX cascading through level computations).
+    #[test]
+    fn test_validate_rejects_inf_multiplier() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_multiplier(f64::INFINITY)
+            .build();
+        assert!(opts.validate().is_err());
+
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_multiplier(f64::NEG_INFINITY)
+            .build();
+        assert!(opts.validate().is_err());
+    }
+
+    /// R-loop r3 H#1: rejects multiplier ≤ 1.0 (LSM doesn't grow → write
+    /// amplification cascade or compaction storm).
+    #[test]
+    fn test_validate_rejects_multiplier_le_one() {
+        for v in [0.0f64, 1.0, -1.0, 0.5] {
+            let opts = EngineOptions::builder()
+                .db_path("/tmp/db")
+                .max_bytes_for_level_multiplier(v)
+                .build();
+            assert!(
+                opts.validate().is_err(),
+                "multiplier={} should be rejected",
+                v
+            );
+        }
     }
 
     #[test]

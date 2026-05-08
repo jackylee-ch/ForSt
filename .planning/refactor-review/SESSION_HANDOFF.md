@@ -100,7 +100,8 @@ user_r_loop_protocol: |
   Architectural escalations remain (InternalKey ordering decision; etc.)
 user_r_loop_round_1_status: COMPLETE  # post-pivot R2; H_TOTAL = 0 across all 5 dimensions
 user_r_loop_round_2_status: COMPLETE_FIXES_LANDED  # post-pivot R3; H_TOTAL = 1 (Correctness: SequenceNumber 56-bit invariant unenforced) — fix landed: try_new + debug_assert in InternalKey::new + 3 tests
-consecutive_zero_high: 0  # RESET from 1 after R-loop r2 found 1 H
+user_r_loop_round_3_status: COMPLETE_FIXES_LANDED  # post-pivot R4; H_TOTAL = 1 (Security: validate() missing NaN/Inf/non-positive check on max_bytes_for_level_multiplier) — fix landed: validate() now rejects with explanatory error + 3 tests
+consecutive_zero_high: 0  # RESET from 1 after R-loop r2; r3 also found 1 H
 consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
