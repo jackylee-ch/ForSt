@@ -721,6 +721,89 @@ impl CfOptions {
     pub fn effective_compression(&self, engine: &EngineOptions) -> CompressionType {
         self.compression.unwrap_or(engine.compression)
     }
+
+    /// Validates per-CF overrides against the same DoS-bound checks
+    /// [`EngineOptions::validate`] applies (R-loop S2-r9 H#1).
+    ///
+    /// `effective_*` accessors silently return `Some(usize::MAX)` (or any
+    /// caller-supplied value) without re-checking the per-axis floors and
+    /// caps that S2-r5/r7/r8 added on the engine axis. Untrusted CfOptions
+    /// from FFI / RPC / on-disk decode could therefore reproduce the exact
+    /// inode-exhaustion / write-stall / compaction-storm DoS vectors that
+    /// the engine-side caps closed. Call this from any code path that
+    /// accepts CfOptions from a non-trusted source.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForstError::InvalidArgument`] for any override that
+    /// violates the same per-axis caps and joint memtable cap as
+    /// [`EngineOptions::validate`].
+    pub fn validate(&self, engine: &EngineOptions) -> ForstResult<()> {
+        if let Some(write_buffer_size) = self.write_buffer_size {
+            if write_buffer_size == 0 {
+                return Err(ForstError::invalid_argument(
+                    "CfOptions.write_buffer_size override must be > 0",
+                ));
+            }
+            if write_buffer_size < MIN_WRITE_BUFFER_SIZE {
+                return Err(ForstError::invalid_argument(format!(
+                    "CfOptions.write_buffer_size override must be ≥ {} bytes (4 KiB), got {}",
+                    MIN_WRITE_BUFFER_SIZE, write_buffer_size
+                )));
+            }
+            if write_buffer_size > MAX_WRITE_BUFFER_SIZE {
+                return Err(ForstError::invalid_argument(format!(
+                    "CfOptions.write_buffer_size override must be ≤ {} bytes (1 TiB), got {}",
+                    MAX_WRITE_BUFFER_SIZE, write_buffer_size
+                )));
+            }
+        }
+        if let Some(max_write_buffer_number) = self.max_write_buffer_number {
+            if max_write_buffer_number == 0 {
+                return Err(ForstError::invalid_argument(
+                    "CfOptions.max_write_buffer_number override must be > 0",
+                ));
+            }
+            if max_write_buffer_number > MAX_WRITE_BUFFER_NUMBER {
+                return Err(ForstError::invalid_argument(format!(
+                    "CfOptions.max_write_buffer_number override must be ≤ {}, got {}",
+                    MAX_WRITE_BUFFER_NUMBER, max_write_buffer_number
+                )));
+            }
+        }
+        if let Some(target_file_size_base) = self.target_file_size_base {
+            if target_file_size_base == 0 {
+                return Err(ForstError::invalid_argument(
+                    "CfOptions.target_file_size_base override must be > 0",
+                ));
+            }
+            if target_file_size_base < MIN_TARGET_FILE_SIZE_BASE {
+                return Err(ForstError::invalid_argument(format!(
+                    "CfOptions.target_file_size_base override must be ≥ {} bytes (4 KiB), got {}",
+                    MIN_TARGET_FILE_SIZE_BASE, target_file_size_base
+                )));
+            }
+            if target_file_size_base > MAX_TARGET_FILE_SIZE_BASE {
+                return Err(ForstError::invalid_argument(format!(
+                    "CfOptions.target_file_size_base override must be ≤ {} bytes (1 TiB), got {}",
+                    MAX_TARGET_FILE_SIZE_BASE, target_file_size_base
+                )));
+            }
+        }
+        // Joint memtable cap: re-run with effective values (override or
+        // engine fallback) — same threat as r19 H#1 on the engine axis.
+        let eff_buffer = self.effective_write_buffer_size(engine);
+        let eff_count = self.effective_max_write_buffer_number(engine);
+        let memtable_peak = (eff_buffer as u128).saturating_mul(eff_count as u128);
+        if memtable_peak > MAX_JOINT_MEMTABLE_BYTES as u128 {
+            return Err(ForstError::invalid_argument(format!(
+                "CfOptions joint write_buffer_size × max_write_buffer_number = {} bytes exceeds {} bytes \
+                 (peak per-CF memtable RAM commitment would OOM-abort)",
+                memtable_peak, MAX_JOINT_MEMTABLE_BYTES
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,5 +1688,62 @@ mod tests {
         let debug = format!("{:?}", opts);
         assert!(debug.contains("EngineOptions"));
         assert!(debug.contains("/tmp/debug"));
+    }
+
+    /// R-loop S2-r9 Correctness H#1: CfOptions::validate rejects per-CF
+    /// overrides that bypass the per-axis floors/caps (parallel-symmetry
+    /// continuation of S2-r7+r8 on the per-CF axis).
+    #[test]
+    fn test_cf_options_validate_rejects_under_floor_overrides() {
+        let engine = EngineOptions::builder().db_path("/tmp/db").build();
+        // write_buffer_size = 1 → rejected (under 4 KiB floor).
+        let cf = CfOptions {
+            write_buffer_size: Some(1),
+            ..Default::default()
+        };
+        assert!(cf.validate(&engine).is_err());
+        // target_file_size_base = 1 → rejected.
+        let cf = CfOptions {
+            target_file_size_base: Some(1),
+            ..Default::default()
+        };
+        assert!(cf.validate(&engine).is_err());
+        // max_write_buffer_number = 0 → rejected.
+        let cf = CfOptions {
+            max_write_buffer_number: Some(0),
+            ..Default::default()
+        };
+        assert!(cf.validate(&engine).is_err());
+        // All None (inherit engine) → OK.
+        let cf = CfOptions::default();
+        assert!(cf.validate(&engine).is_ok());
+        // Override at floor → OK.
+        let cf = CfOptions {
+            write_buffer_size: Some(MIN_WRITE_BUFFER_SIZE),
+            target_file_size_base: Some(MIN_TARGET_FILE_SIZE_BASE),
+            max_write_buffer_number: Some(1),
+            ..Default::default()
+        };
+        assert!(cf.validate(&engine).is_ok());
+    }
+
+    /// R-loop S2-r9 Correctness H#1: CfOptions::validate also rejects
+    /// over-cap overrides + joint memtable RAM cap.
+    #[test]
+    fn test_cf_options_validate_rejects_over_cap_overrides() {
+        let engine = EngineOptions::builder().db_path("/tmp/db").build();
+        // write_buffer_size > MAX → rejected.
+        let cf = CfOptions {
+            write_buffer_size: Some(MAX_WRITE_BUFFER_SIZE + 1),
+            ..Default::default()
+        };
+        assert!(cf.validate(&engine).is_err());
+        // Joint memtable cap: 1 TiB × 1024 = 1 PiB > 8 TiB → rejected.
+        let cf = CfOptions {
+            write_buffer_size: Some(MAX_WRITE_BUFFER_SIZE),
+            max_write_buffer_number: Some(MAX_WRITE_BUFFER_NUMBER),
+            ..Default::default()
+        };
+        assert!(cf.validate(&engine).is_err());
     }
 }
