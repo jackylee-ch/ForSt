@@ -113,7 +113,8 @@ user_r_loop_round_12_status: COMPLETE_FIXES_LANDED  # post-pivot R13; H_TOTAL = 
 user_r_loop_round_13_status: CLEAN  # post-pivot R14; H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 0 → 1.
 user_r_loop_round_14_status: COMPLETE_FIXES_LANDED  # post-pivot R15; H_TOTAL = 1 (Errors r14 H#1: taxonomy mismatch — try_from_u8 returns Corruption while try_new returns InvalidArgument; downstream is_corruption()-based SST quarantine misses bad sequence/level bytes). Fix: aligned SequenceNumber::try_new and Level::try_new to return ForstError::Corruption (matches OpType::try_from_u8 R13 precedent). consecutive_zero_high RESET 1 → 0.
 user_r_loop_round_15_status: CLEAN  # post-pivot R16; H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 0 → 1.
-consecutive_zero_high: 1  # r15 clean
+user_r_loop_round_16_status: CLEAN  # post-pivot R17; H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 1 → 2.
+consecutive_zero_high: 2  # r15+r16 both clean; need 8 more
 consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
