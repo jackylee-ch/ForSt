@@ -370,8 +370,7 @@ impl EngineOptions {
         // r6 MIN_BLOCK_SIZE). At <4 KiB, the SST writer rolls per-record
         // → inode/FD exhaustion DoS during a single memtable flush.
         // Zero-check above (line 298) handles 0; this catches 1..MIN-1.
-        if self.target_file_size_base != 0
-            && self.target_file_size_base < MIN_TARGET_FILE_SIZE_BASE
+        if self.target_file_size_base != 0 && self.target_file_size_base < MIN_TARGET_FILE_SIZE_BASE
         {
             return Err(ForstError::invalid_argument(format!(
                 "target_file_size_base must be ≥ {} bytes (4 KiB), got {}",
