@@ -802,6 +802,24 @@ impl CfOptions {
                 memtable_peak, MAX_JOINT_MEMTABLE_BYTES
             )));
         }
+        // R-loop S2-r10 Sec H#1: joint per-SST bloom-filter cap parallel
+        // to r19 H#2 on the engine axis. CfOptions only carries the
+        // target_file_size_base override (no per-CF bloom_bits_per_key),
+        // so combine the effective file size with the engine-level
+        // bloom_bits_per_key to project the per-SST bloom byte budget.
+        const MIN_AVG_ENTRY_BYTES: usize = 16;
+        let eff_file = self.effective_target_file_size_base(engine);
+        let projected_bloom_bytes = eff_file
+            .saturating_div(MIN_AVG_ENTRY_BYTES)
+            .saturating_mul(engine.bloom_bits_per_key)
+            .saturating_div(8);
+        if projected_bloom_bytes > MAX_JOINT_BLOOM_BYTES {
+            return Err(ForstError::invalid_argument(format!(
+                "CfOptions joint bloom_bits_per_key × (target_file_size_base / {}) / 8 = {} bytes \
+                 exceeds {} bytes (per-CF SST bloom allocation would OOM-abort)",
+                MIN_AVG_ENTRY_BYTES, projected_bloom_bytes, MAX_JOINT_BLOOM_BYTES
+            )));
+        }
         Ok(())
     }
 }
@@ -1742,6 +1760,23 @@ mod tests {
         let cf = CfOptions {
             write_buffer_size: Some(MAX_WRITE_BUFFER_SIZE),
             max_write_buffer_number: Some(MAX_WRITE_BUFFER_NUMBER),
+            ..Default::default()
+        };
+        assert!(cf.validate(&engine).is_err());
+    }
+
+    /// R-loop S2-r10 Sec H#1: CfOptions::validate joint-bloom cap parallel
+    /// to r19 H#2 on engine axis.
+    #[test]
+    fn test_cf_options_validate_rejects_joint_bloom_oom() {
+        // Engine with max bloom_bits_per_key, plus per-CF target_file at
+        // max → joint bloom 2 TiB > 256 GiB cap.
+        let engine = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .bloom_bits_per_key(MAX_BLOOM_BITS_PER_KEY)
+            .build();
+        let cf = CfOptions {
+            target_file_size_base: Some(MAX_TARGET_FILE_SIZE_BASE),
             ..Default::default()
         };
         assert!(cf.validate(&engine).is_err());
