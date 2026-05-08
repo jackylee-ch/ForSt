@@ -66,6 +66,17 @@ pub const MAX_BLOCK_CACHE_SIZE: usize = 1 << 50;
 /// (FD/thread-limit exhaustion DoS — R-loop r5 Sec H#2).
 pub const MAX_BACKGROUND_THREADS: usize = 1024;
 
+/// Upper bound on `EngineOptions::bloom_bits_per_key` (R-loop r9 Sec H#1).
+///
+/// RocksDB defaults at 10; values above 30 are already wasteful. 256 is a
+/// generous cap that prevents OOM-abort during Bloom filter allocation
+/// (`bits_per_key * num_keys` can overflow / saturate / explode).
+pub const MAX_BLOOM_BITS_PER_KEY: usize = 256;
+
+/// Upper bound on `EngineOptions::db_path` length in bytes (R-loop r9 Sec
+/// H#2). Matches POSIX `PATH_MAX`.
+pub const MAX_DB_PATH_LEN: usize = 4096;
+
 /// Lower bound on `EngineOptions::block_size` (R-loop r6 Sec H#3).
 ///
 /// `block_size = 1` with default `write_buffer_size` causes the SST
@@ -221,6 +232,22 @@ impl EngineOptions {
         if self.db_path.is_empty() {
             return Err(ForstError::invalid_argument("db_path must not be empty"));
         }
+        // R-loop r9 Sec H#2: cap path length and reject embedded NUL.
+        // Traversal-component rejection is consumer-crate scope (filesystem
+        // layer); we cover length-DoS + the NUL-truncation TOCTOU between
+        // Rust and C string views.
+        if self.db_path.len() > MAX_DB_PATH_LEN {
+            return Err(ForstError::invalid_argument(format!(
+                "db_path length must be ≤ {} bytes (POSIX PATH_MAX), got {}",
+                MAX_DB_PATH_LEN,
+                self.db_path.len()
+            )));
+        }
+        if self.db_path.as_bytes().contains(&0u8) {
+            return Err(ForstError::invalid_argument(
+                "db_path must not contain embedded NUL bytes",
+            ));
+        }
         if self.num_levels == 0 || self.num_levels > MAX_LEVELS {
             return Err(ForstError::invalid_argument(format!(
                 "num_levels must be in 1..={}, got {}",
@@ -275,6 +302,14 @@ impl EngineOptions {
             return Err(ForstError::invalid_argument(
                 "max_write_buffer_number must be greater than zero",
             ));
+        }
+        // R-loop r9 Sec H#1: cap bloom_bits_per_key so `bits * num_keys`
+        // can't OOM-abort during Bloom filter allocation.
+        if self.bloom_bits_per_key > MAX_BLOOM_BITS_PER_KEY {
+            return Err(ForstError::invalid_argument(format!(
+                "bloom_bits_per_key must be ≤ {}, got {}",
+                MAX_BLOOM_BITS_PER_KEY, self.bloom_bits_per_key
+            )));
         }
         // R-loop r6 Sec H#1+H#3 / Errors H_F1: bound block_size both ways.
         // Upper: SST writer's `Vec::with_capacity(block_size + 1024)` would
@@ -863,6 +898,39 @@ mod tests {
             .max_bytes_for_level_base(MAX_LEVEL_BASE)
             .build();
         assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r9 Sec H#1: bloom_bits_per_key capped at 256.
+    #[test]
+    fn test_validate_rejects_oversized_bloom_bits_per_key() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .bloom_bits_per_key(MAX_BLOOM_BITS_PER_KEY + 1)
+            .build();
+        assert!(opts.validate().is_err());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .bloom_bits_per_key(MAX_BLOOM_BITS_PER_KEY)
+            .build();
+        assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r9 Sec H#2: db_path length + NUL-byte rejection.
+    #[test]
+    fn test_validate_db_path_length_and_nul() {
+        // Length cap.
+        let long_path: String = "/".repeat(MAX_DB_PATH_LEN + 1);
+        let opts = EngineOptions::builder().db_path(long_path).build();
+        assert!(opts.validate().is_err());
+        // Exactly at the cap is accepted.
+        let path_at_cap: String = "/".repeat(MAX_DB_PATH_LEN);
+        let opts = EngineOptions::builder().db_path(path_at_cap).build();
+        assert!(opts.validate().is_ok());
+        // Embedded NUL — malicious FFI/C-view TOCTOU.
+        let opts = EngineOptions::builder()
+            .db_path("/safe/path\0/../../etc/passwd")
+            .build();
+        assert!(opts.validate().is_err());
     }
 
     /// R-loop r7 Errors H_F1+H_F2+H_F3: symmetric lower-bound (zero)
