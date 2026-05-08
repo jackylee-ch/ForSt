@@ -99,7 +99,8 @@ user_r_loop_protocol: |
     - Diverges from formal protocol's 10-agent / H=0 ∧ M=0 / 120-cap
   Architectural escalations remain (InternalKey ordering decision; etc.)
 user_r_loop_round_1_status: COMPLETE  # post-pivot R2; H_TOTAL = 0 across all 5 dimensions
-consecutive_zero_high: 1  # advanced from 0 after R-loop round 1
+user_r_loop_round_2_status: COMPLETE_FIXES_LANDED  # post-pivot R3; H_TOTAL = 1 (Correctness: SequenceNumber 56-bit invariant unenforced) — fix landed: try_new + debug_assert in InternalKey::new + 3 tests
+consecutive_zero_high: 0  # RESET from 1 after R-loop r2 found 1 H
 consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
@@ -143,6 +144,7 @@ next_action: |
 | Phase A v3.2 | 2026-05-08 | Phase A finalize + B + Flink bootstrap | 7164cb6e6 (ForSt) + eb760121ce5 (Flink) + bfc5a7ff7b7 (Flink Maven enforcer widen) | N/A | Phase A status assessment + B PR split plan + Flink-side L1+L2+L3 MVP (flink-statebackend-forst-rs Maven module + JDK 25 FFM bridge + ForStRsRoundTripTest green). Stage 3 verdict 🟡 Partial-strong. |
 | I | 2026-05-08 | Phase B-D | C1 post-pivot R1 | 0→1 | **DONE.** 9 parallel reviewers dispatched (Dim 6 deferred); 12 raw H + 53 raw M findings. Tech VP dedup → fix-this-round Tier 1: 3 doc/code mismatches (sorted-bounds assert, counts[i] semantics, ≤1-obs concurrency bound), 2 wire-format strictness fixes (varint32/64 5th/10th-byte canonical-encoding rejection per RocksDB), 4 doc tightenings (NaN/Inf bucket placement, snapshot approximate, sum wrap, Arena OOM-aborts), 2 API-shape fixes (`SUM_MULTIPLIER` → `pub(crate)`, `ForstError` → `#[non_exhaustive]`), 4 new regression tests (NaN bucket placement, ±∞ bucket placement, all-overflow percentile, varint canonical/non-canonical). 142 tests pass (135 + 7); clippy clean. 1 H escalated as architectural cross-boundary (InternalKey op_type ordering vs RocksDB tag-descending). consecutive_clean stays 0. See C1-R1-post-pivot-findings.md. |
 | J round 1 | 2026-05-08 | Phase B-D | C1 user R-loop r1 (post-pivot R2) | 1→2 | **CLEAN.** User-directed variant: 5 agents (Memory / Correctness / Concurrency / Errors / Security). H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 0 → 1. No fixes required; SESSION_HANDOFF advance only. |
+| J round 2 | 2026-05-08 | Phase B-D | C1 user R-loop r2 (post-pivot R3) | 2→3 | **1 H fixed.** 5 agents; Correctness found `SequenceNumber.0` is `pub` and the documented 56-bit invariant is unenforced (downstream packing into `(seq << 8) \| op_type` tag silently corrupts on out-of-range values). Fix: added `SequenceNumber::try_new(value) -> ForstResult<Self>` checked constructor + `debug_assert!` in `InternalKey::new` + 3 regression tests + loud doc on the invariant. Field stays `pub` to preserve consumer compat (~20 sites). 145 tests pass (142 + 3); clippy clean; workspace green. consecutive_zero_high: 1 → 0 (reset). |
 | ... | | | | | |
 
 ## Risk register

@@ -29,6 +29,8 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+use crate::error::{ForstError, ForstResult};
+
 // ---------------------------------------------------------------------------
 // OpType
 // ---------------------------------------------------------------------------
@@ -111,8 +113,31 @@ impl FileNumber {
 /// Newtype wrapper for MVCC sequence numbers.
 ///
 /// RocksDB packs the sequence number into the upper 56 bits of a 64-bit
-/// internal key tag.  Therefore the maximum representable sequence number
-/// is `u64::MAX >> 8`.
+/// internal key tag (the low 8 bits hold an `OpType` discriminant). The
+/// maximum representable sequence number is therefore [`MAX_SEQUENCE_NUMBER`]
+/// (`u64::MAX >> 8`).
+///
+/// # Invariant — and how it is (only loosely) enforced
+///
+/// The 56-bit invariant is **not** enforced at construction time, because
+/// the inner `u64` field is `pub` for ergonomic literal construction
+/// (`SequenceNumber(42)`). Use [`Self::try_new`] for a checked constructor
+/// when accepting untrusted input. Internal-key construction
+/// ([`InternalKey::new`]) carries a `debug_assert!` that traps out-of-range
+/// values in debug builds; release builds rely on caller diligence (matches
+/// RocksDB's analogous `kMaxSequenceNumber` convention).
+///
+/// # R-loop r2 H#1 (recorded 2026-05-08)
+///
+/// A reviewer flagged the public-field/no-assert combination as a type-
+/// invariant correctness concern: a `SequenceNumber(u64::MAX)` shifted left
+/// by 8 collides with the OpType byte and silently corrupts the packed tag.
+/// The packing happens in `forst-rs-storage` (downstream), which trusts the
+/// invariant. The mitigation here adds (1) a `try_new` checked constructor,
+/// (2) a `debug_assert!` in `InternalKey::new`, and (3) explicit doc on the
+/// invariant + the open `pub` field. Making the field private is deferred
+/// as a workspace-wide breaking change (would touch ~20 call sites in tests
+/// and `forst-rs-engine`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SequenceNumber(pub u64);
 
@@ -130,6 +155,23 @@ impl SequenceNumber {
     #[inline]
     pub fn value(self) -> u64 {
         self.0
+    }
+
+    /// Checked constructor: returns `Err` if `value > MAX_SEQUENCE_NUMBER`.
+    ///
+    /// Prefer this over the open `pub` field when accepting an untrusted
+    /// `u64` (e.g. from FFI or on-disk decode), since constructing a value
+    /// outside the 56-bit range corrupts the packed tag downstream.
+    /// (R-loop r2 H#1, 2026-05-08.)
+    #[inline]
+    pub fn try_new(value: u64) -> ForstResult<Self> {
+        if value > MAX_SEQUENCE_NUMBER.0 {
+            return Err(ForstError::invalid_argument(format!(
+                "sequence number {} exceeds 56-bit limit ({})",
+                value, MAX_SEQUENCE_NUMBER.0
+            )));
+        }
+        Ok(SequenceNumber(value))
     }
 }
 
@@ -247,7 +289,22 @@ pub struct InternalKey {
 
 impl InternalKey {
     /// Creates a new [`InternalKey`].
+    ///
+    /// # Debug-only check
+    ///
+    /// Carries a `debug_assert!` that `sequence <= MAX_SEQUENCE_NUMBER`
+    /// (the 56-bit limit imposed by RocksDB's tag-packing convention).
+    /// In release builds the check is elided; callers handling untrusted
+    /// `u64` values should use [`SequenceNumber::try_new`] beforehand.
+    /// (R-loop r2 H#1, 2026-05-08.)
     pub fn new(user_key: Vec<u8>, sequence: SequenceNumber, op_type: OpType) -> Self {
+        debug_assert!(
+            sequence.0 <= MAX_SEQUENCE_NUMBER.0,
+            "InternalKey: sequence {} exceeds 56-bit MAX_SEQUENCE_NUMBER {}; \
+             out-of-range values silently corrupt the packed (seq << 8) | op_type tag downstream",
+            sequence.0,
+            MAX_SEQUENCE_NUMBER.0
+        );
         Self {
             user_key,
             sequence,
@@ -461,6 +518,40 @@ mod tests {
     #[test]
     fn test_sequence_number_display() {
         assert_eq!(format!("{}", SequenceNumber(12345)), "12345");
+    }
+
+    /// Regression test for R-loop r2 H#1: `SequenceNumber::try_new`
+    /// rejects values exceeding the 56-bit MAX.
+    #[test]
+    fn test_sequence_number_try_new_in_range() {
+        let s = SequenceNumber::try_new(0).unwrap();
+        assert_eq!(s, SequenceNumber(0));
+        let s = SequenceNumber::try_new(MAX_SEQUENCE_NUMBER.0).unwrap();
+        assert_eq!(s, MAX_SEQUENCE_NUMBER);
+    }
+
+    #[test]
+    fn test_sequence_number_try_new_rejects_above_56_bits() {
+        let res = SequenceNumber::try_new(MAX_SEQUENCE_NUMBER.0 + 1);
+        assert!(res.is_err(), "expected error, got {:?}", res);
+        let err = res.unwrap_err();
+        assert!(
+            err.is_invalid_argument(),
+            "expected InvalidArgument variant, got {:?}",
+            err
+        );
+        let res = SequenceNumber::try_new(u64::MAX);
+        assert!(res.is_err(), "u64::MAX must be rejected");
+    }
+
+    /// Regression test for R-loop r2 H#1: `InternalKey::new` debug-asserts
+    /// that the sequence is within the 56-bit limit. Release builds elide
+    /// this check; debug builds (where `cargo test` runs) catch the misuse.
+    #[test]
+    #[should_panic(expected = "exceeds 56-bit MAX_SEQUENCE_NUMBER")]
+    fn test_internal_key_new_panics_on_oversize_sequence_in_debug() {
+        // Release builds will NOT panic — this test only fires in debug.
+        let _ = InternalKey::new(b"k".to_vec(), SequenceNumber(u64::MAX), OpType::Put);
     }
 
     // -----------------------------------------------------------------------
