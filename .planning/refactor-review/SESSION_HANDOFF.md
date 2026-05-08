@@ -115,7 +115,8 @@ user_r_loop_round_14_status: COMPLETE_FIXES_LANDED  # post-pivot R15; H_TOTAL = 
 user_r_loop_round_15_status: CLEAN  # post-pivot R16; H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 0 → 1.
 user_r_loop_round_16_status: CLEAN  # post-pivot R17; H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 1 → 2.
 user_r_loop_round_17_status: CLEAN  # post-pivot R18; H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 2 → 3.
-consecutive_zero_high: 3  # r15+r16+r17 clean; need 7 more
+user_r_loop_round_18_status: COMPLETE_FIXES_LANDED  # post-pivot R19; H_TOTAL = 1 (Security r18 H#1 + Correctness r18 H_F1 — same finding from 2 reviewers: joint product `base * multiplier^(num_levels-1)` saturates usize::MAX even with per-axis r4/r5 caps at boundary; reopens DoS r3/r4/r5 targeted). Fix landed: validate() now adds joint product check rejecting projected > usize::MAX/2. consecutive_zero_high RESET 3 → 0.
+consecutive_zero_high: 0  # r18 found 1 H, reset
 consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"

@@ -350,6 +350,32 @@ impl EngineOptions {
                 MAX_LEVEL_MULTIPLIER, self.max_bytes_for_level_multiplier
             )));
         }
+        // R-loop r18 Security H#1 + Correctness H_F1: per-axis r3/r4/r5 caps
+        // bound base, multiplier, and num_levels INDEPENDENTLY but their
+        // joint product `base * multiplier^(num_levels-1)` can still
+        // saturate the downstream `as usize` cast even with all axes at
+        // boundary (e.g. 2^50 × 1024^6 = 2^110 >> usize::MAX = 2^64). This
+        // re-opens the exact DoS that r3/r4/r5 targeted (level cap
+        // collapses to usize::MAX → upper levels never compact → unbounded
+        // growth). Bound the product space directly so saturation is
+        // structurally impossible. Half of usize::MAX gives a safety
+        // margin for downstream arithmetic that may double the value
+        // (e.g. cap + buffer).
+        let max_level_idx = self.num_levels.saturating_sub(1) as i32;
+        let projected = (self.max_bytes_for_level_base as f64)
+            * self.max_bytes_for_level_multiplier.powi(max_level_idx);
+        let usize_half = (usize::MAX as f64) / 2.0;
+        if !projected.is_finite() || projected > usize_half {
+            return Err(ForstError::invalid_argument(format!(
+                "joint level-capacity product saturates: \
+                 base={}, multiplier={}, num_levels={} → projected={:e} > usize::MAX/2 ({:e})",
+                self.max_bytes_for_level_base,
+                self.max_bytes_for_level_multiplier,
+                self.num_levels,
+                projected,
+                usize_half
+            )));
+        }
         // R-loop r5 Sec H#1: cap level-base so the base axis cannot drive
         // saturation downstream the same way the multiplier axis did.
         if self.max_bytes_for_level_base > MAX_LEVEL_BASE {
@@ -920,10 +946,14 @@ mod tests {
             .max_bytes_for_level_base(usize::MAX)
             .build();
         assert!(opts.validate().is_err());
-        // The cap itself is accepted.
+        // The per-axis cap itself is accepted IF combined with a small
+        // multiplier (post r18, the joint product check rejects boundary
+        // base × default multiplier × 7 levels).
         let opts = EngineOptions::builder()
             .db_path("/tmp/db")
             .max_bytes_for_level_base(MAX_LEVEL_BASE)
+            .max_bytes_for_level_multiplier(1.001)
+            .num_levels(2)
             .build();
         assert!(opts.validate().is_ok());
     }
@@ -1117,6 +1147,46 @@ mod tests {
         assert!(opts.validate().is_ok());
     }
 
+    /// R-loop r18 Security H#1 + Correctness H_F1: joint product
+    /// `base * multiplier^(num_levels-1)` saturates `usize` even with
+    /// per-axis caps at boundary. Each axis individually accepted, but
+    /// the cross-product must be rejected.
+    #[test]
+    fn test_validate_rejects_joint_product_saturation() {
+        // All three axes at their respective caps individually pass —
+        // but jointly cascade to `usize::MAX`, which is the DoS r3/r4/r5
+        // targeted via per-axis caps but never closed jointly.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_base(MAX_LEVEL_BASE)
+            .max_bytes_for_level_multiplier(MAX_LEVEL_MULTIPLIER)
+            .num_levels(7)
+            .build();
+        assert!(
+            opts.validate().is_err(),
+            "joint maxima should be rejected (would saturate `usize` downstream)"
+        );
+
+        // A more modest example also rejects — base=MAX_LEVEL_BASE,
+        // multiplier=8 (well below 1024 cap), num_levels=7:
+        // 2^50 × 8^6 = 2^68 > 2^64.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_base(MAX_LEVEL_BASE)
+            .max_bytes_for_level_multiplier(8.0)
+            .num_levels(7)
+            .build();
+        assert!(
+            opts.validate().is_err(),
+            "base=1PiB, mul=8, levels=7 saturates usize"
+        );
+
+        // Default config (256MB base × 10× × 7 levels) is well within
+        // bounds — this should still pass.
+        let opts = EngineOptions::builder().db_path("/tmp/db").build();
+        assert!(opts.validate().is_ok(), "default config should validate");
+    }
+
     /// R-loop r4 H#1: regression — finite-but-astronomical multiplier (e.g.
     /// `f64::MAX`) was bypassing the r3 check. Now bounded above by
     /// `MAX_LEVEL_MULTIPLIER`.
@@ -1139,14 +1209,18 @@ mod tests {
                 v
             );
         }
-        // MAX_LEVEL_MULTIPLIER itself is the inclusive upper bound — accepted.
+        // The per-axis cap itself is accepted IF combined with a small
+        // base/levels (post r18, joint product check rejects
+        // default-base × MAX_LEVEL_MULTIPLIER × 7 levels).
         let opts = EngineOptions::builder()
             .db_path("/tmp/db")
             .max_bytes_for_level_multiplier(MAX_LEVEL_MULTIPLIER)
+            .max_bytes_for_level_base(1)
+            .num_levels(2)
             .build();
         assert!(
             opts.validate().is_ok(),
-            "MAX_LEVEL_MULTIPLIER itself is accepted"
+            "MAX_LEVEL_MULTIPLIER itself is accepted with small base+levels"
         );
     }
 
