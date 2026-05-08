@@ -77,21 +77,30 @@ Each session should:
 ## STATE (update this at end of every session)
 
 ```yaml
-last_updated: 2026-05-08T02:00:00+08:00
-last_session_id: I_post_pivot_R1
-phase: C1_R2_READY  # post-pivot R1 completed; R2 ready
+last_updated: 2026-05-08T03:00:00+08:00
+last_session_id: J_user_directed_R_loop
+phase: C1_USER_R_LOOP  # user-directed variant: 5 agents/round, fix-H-only, 150-cap or 10-consecutive-zero-H
 authoritative_spec: ".planning/refactor-review/A1_reconciliation.md @ 33f85b1c5"
 arch_pivot_authority: ACTIVE
 current_commit: C1
-current_commit_sha: HEAD  # post R1-post-pivot commit; check git log for sha
-current_round: 1  # post-pivot R1 done; post-pivot R2 ready to dispatch
-round_1_status: COMPLETE  # historical pre-pivot
+current_commit_sha: HEAD  # see git log
+current_round: 2  # post-pivot R1 + R-loop round 1 (= post-pivot R2)
+round_1_status: COMPLETE  # historical pre-pivot (10 agents)
 round_1_findings_file: .planning/refactor-review/C1-R1-findings.md
-round_2_status: COMPLETE_FIXES_LANDED  # historical pre-pivot
+round_2_status: COMPLETE_FIXES_LANDED  # historical pre-pivot (9 agents)
 round_2_findings_file: .planning/refactor-review/C1-R2-findings.md
-post_pivot_r1_status: COMPLETE_FIXES_LANDED  # 9/10 dimensions reviewed (Dim 6 deferred); 12 raw H + 53 raw M; Tier-1 fixes landed
+post_pivot_r1_status: COMPLETE_FIXES_LANDED  # 9 agents; 12 raw H + 53 raw M; Tier-1 fixes landed in 54903fb02
 post_pivot_r1_findings_file: .planning/refactor-review/C1-R1-post-pivot-findings.md
-consecutive_clean: 0  # post-R1 still has unfixed M items deferred to R2 + 1 H escalated (InternalKey)
+user_r_loop_protocol: |
+  Variant of REVIEW_PROTOCOL.md, user-authorized 2026-05-08:
+    - 5 agents per round (Memory / Correctness / Concurrency / Errors / Security)
+    - Fix HIGH issues only; M/L deferred to backlog
+    - Termination: 150 rounds OR 10 consecutive zero-H rounds
+    - Diverges from formal protocol's 10-agent / H=0 ∧ M=0 / 120-cap
+  Architectural escalations remain (InternalKey ordering decision; etc.)
+user_r_loop_round_1_status: COMPLETE  # post-pivot R2; H_TOTAL = 0 across all 5 dimensions
+consecutive_zero_high: 1  # advanced from 0 after R-loop round 1
+consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
 r2_totals: "H=4, M=11, L=5 (Tech VP dedup; raw H=7 M=14 L=6 from 9/10 agents — Dim 6 perf deferred)"
@@ -133,6 +142,7 @@ next_action: |
 | H | 2026-05-08 | Phase B-D | Histogram arch-pivot | 2→reset to 0 | **DONE.** Pivot 1 landed: i64 fixed-point sum + approximate-snapshot docs. R2 H#1 + H#2 + M#1 + M#2 resolved. 135 tests pass (132 + 3 new regressions). Clippy clean. Counter reset to 0. See C1-arch-pivot-log.md Pivot 1. |
 | Phase A v3.2 | 2026-05-08 | Phase A finalize + B + Flink bootstrap | 7164cb6e6 (ForSt) + eb760121ce5 (Flink) + bfc5a7ff7b7 (Flink Maven enforcer widen) | N/A | Phase A status assessment + B PR split plan + Flink-side L1+L2+L3 MVP (flink-statebackend-forst-rs Maven module + JDK 25 FFM bridge + ForStRsRoundTripTest green). Stage 3 verdict 🟡 Partial-strong. |
 | I | 2026-05-08 | Phase B-D | C1 post-pivot R1 | 0→1 | **DONE.** 9 parallel reviewers dispatched (Dim 6 deferred); 12 raw H + 53 raw M findings. Tech VP dedup → fix-this-round Tier 1: 3 doc/code mismatches (sorted-bounds assert, counts[i] semantics, ≤1-obs concurrency bound), 2 wire-format strictness fixes (varint32/64 5th/10th-byte canonical-encoding rejection per RocksDB), 4 doc tightenings (NaN/Inf bucket placement, snapshot approximate, sum wrap, Arena OOM-aborts), 2 API-shape fixes (`SUM_MULTIPLIER` → `pub(crate)`, `ForstError` → `#[non_exhaustive]`), 4 new regression tests (NaN bucket placement, ±∞ bucket placement, all-overflow percentile, varint canonical/non-canonical). 142 tests pass (135 + 7); clippy clean. 1 H escalated as architectural cross-boundary (InternalKey op_type ordering vs RocksDB tag-descending). consecutive_clean stays 0. See C1-R1-post-pivot-findings.md. |
+| J round 1 | 2026-05-08 | Phase B-D | C1 user R-loop r1 (post-pivot R2) | 1→2 | **CLEAN.** User-directed variant: 5 agents (Memory / Correctness / Concurrency / Errors / Security). H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 0 → 1. No fixes required; SESSION_HANDOFF advance only. |
 | ... | | | | | |
 
 ## Risk register
