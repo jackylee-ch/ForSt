@@ -131,14 +131,12 @@ impl SstReaderImpl {
         // Untrusted input from a crafted SST could otherwise drive
         // `vec![0u8; footer_length as usize]` to allocate up to ~4 GiB and OOM
         // the process (Sweep R2 H by Reviewer 5).
-        let footer_start = file_size
-            .checked_sub(footer_length as u64)
-            .ok_or_else(|| {
-                ForstError::corruption(format!(
-                    "SST footer_length {} exceeds file_size {}",
-                    footer_length, file_size
-                ))
-            })?;
+        let footer_start = file_size.checked_sub(footer_length as u64).ok_or_else(|| {
+            ForstError::corruption(format!(
+                "SST footer_length {} exceeds file_size {}",
+                footer_length, file_size
+            ))
+        })?;
         // Also guard against footer_length == 0 (would zero-size alloc + decode fail later
         // anyway, but explicit rejection produces a clearer error).
         if footer_length == 0 {
@@ -153,9 +151,7 @@ impl SstReaderImpl {
         // file_size to prevent OOM from a crafted footer.
         let bloom_end = (footer.bloom_filter_offset)
             .checked_add(footer.bloom_filter_size as u64)
-            .ok_or_else(|| {
-                ForstError::corruption("SST bloom_filter offset+size overflow")
-            })?;
+            .ok_or_else(|| ForstError::corruption("SST bloom_filter offset+size overflow"))?;
         if bloom_end > file_size {
             return Err(ForstError::corruption(format!(
                 "SST bloom_filter range [{}, {}) exceeds file_size {}",
@@ -170,9 +166,7 @@ impl SstReaderImpl {
         // SECURITY: same bounds check as bloom filter range.
         let index_end = (footer.index_offset)
             .checked_add(footer.index_size as u64)
-            .ok_or_else(|| {
-                ForstError::corruption("SST index offset+size overflow")
-            })?;
+            .ok_or_else(|| ForstError::corruption("SST index offset+size overflow"))?;
         if index_end > file_size {
             return Err(ForstError::corruption(format!(
                 "SST index range [{}, {}) exceeds file_size {}",
@@ -222,9 +216,9 @@ impl SstReaderImpl {
     /// is cached at `open()` so this check costs no syscall on the
     /// hot lookup path.
     fn read_data_block(&self, block_offset: u64, block_size: u32) -> ForstResult<RecordBatch> {
-        let block_end = block_offset.checked_add(block_size as u64).ok_or_else(|| {
-            ForstError::corruption("SST data block offset+size overflow")
-        })?;
+        let block_end = block_offset
+            .checked_add(block_size as u64)
+            .ok_or_else(|| ForstError::corruption("SST data block offset+size overflow"))?;
         if block_end > self.file_size {
             return Err(ForstError::corruption(format!(
                 "SST data block range [{}, {}) exceeds file_size {}",

@@ -493,8 +493,8 @@ impl VectorizedMemTable {
             self.op_types.push(op_types[i]);
 
             // Safety: validated up-front above; can never panic here.
-            let op_type = OpType::from_u8(op_types[i])
-                .expect("op_type byte was validated above the loop");
+            let op_type =
+                OpType::from_u8(op_types[i]).expect("op_type byte was validated above the loop");
             let row_index = RowIndex {
                 offset: row_offset,
                 sequence: seq,
@@ -1053,11 +1053,7 @@ mod tests {
         // 4..=255 must be rejected.
         for invalid in [4u8, 7, 42, 99, 200, 255] {
             let err = mt.put(b"key", Some(b"value"), invalid);
-            assert!(
-                err.is_err(),
-                "op_type byte {} should be rejected",
-                invalid
-            );
+            assert!(err.is_err(), "op_type byte {} should be rejected", invalid);
             let msg = format!("{}", err.unwrap_err());
             assert!(
                 msg.contains("invalid op_type byte"),

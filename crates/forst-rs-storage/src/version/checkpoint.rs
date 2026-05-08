@@ -400,13 +400,11 @@ mod tests {
         // Header is 16 bytes; then next_file_number (8) + last_sequence (8)
         // = 32 bytes used; num_levels is the next u32 (LE).
         let num_levels_offset = 16 + 8 + 8;
-        blob[num_levels_offset..num_levels_offset + 4]
-            .copy_from_slice(&u32::MAX.to_le_bytes());
+        blob[num_levels_offset..num_levels_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         // Re-checksum so the blob passes the integrity check.
         let footer_start = blob.len() - FOOTER_SIZE;
         let new_crc = crc32c(&blob[..footer_start]);
-        blob[footer_start..footer_start + 4]
-            .copy_from_slice(&new_crc.to_le_bytes());
+        blob[footer_start..footer_start + 4].copy_from_slice(&new_crc.to_le_bytes());
 
         let err = match restore_from_blob(&blob) {
             Ok(_) => panic!("must reject oversized num_levels"),
@@ -435,12 +433,10 @@ mod tests {
         //         num_levels 4 + level_id 4 + num_files 4 = 44.
         // Mutate the num_files field at offset 40.
         let num_files_offset = 16 + 8 + 8 + 4 + 4;
-        blob[num_files_offset..num_files_offset + 4]
-            .copy_from_slice(&u32::MAX.to_le_bytes());
+        blob[num_files_offset..num_files_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let footer_start = blob.len() - FOOTER_SIZE;
         let new_crc = crc32c(&blob[..footer_start]);
-        blob[footer_start..footer_start + 4]
-            .copy_from_slice(&new_crc.to_le_bytes());
+        blob[footer_start..footer_start + 4].copy_from_slice(&new_crc.to_le_bytes());
 
         let err = match restore_from_blob(&blob) {
             Ok(_) => panic!("must reject oversized num_files"),

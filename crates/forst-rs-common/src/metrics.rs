@@ -297,10 +297,11 @@ impl Histogram {
 
     /// Returns the sum of all observed values.
     ///
-    /// Reads the i64 fixed-point accumulator and divides by
-    /// [`SUM_MULTIPLIER`]. NaN inputs to [`Self::observe`] do not contribute
-    /// to this sum (see [`Histogram`] "Sum semantics"); ±Inf inputs may
-    /// surface as ±∞ here once the i64 accumulator has saturated.
+    /// Reads the i64 fixed-point accumulator and divides by `SUM_MULTIPLIER`
+    /// (a crate-private 6-decimal-place scaling factor). NaN inputs to
+    /// [`Self::observe`] do not contribute to this sum (see [`Histogram`]
+    /// "Sum semantics"); ±Inf inputs may surface as ±∞ here once the i64
+    /// accumulator has saturated.
     #[inline]
     pub fn sum(&self) -> f64 {
         (self.sum_fixed.load(Ordering::Relaxed) as f64) / SUM_MULTIPLIER
