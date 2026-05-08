@@ -237,6 +237,45 @@ impl EngineOptions {
                 "block_size must be greater than zero",
             ));
         }
+        // R-loop r7 Errors H_F1+H_F2+H_F3: symmetric lower-bound checks
+        // for fields the r5/r6 upper caps already covered. Each `== 0`
+        // case is a distinct DoS vector:
+        //
+        //   max_bytes_for_level_base = 0    →  every level cap = 0
+        //                                       ⇒ permanent compaction storm
+        //   target_file_size_base    = 0    →  SST writer rolls per write
+        //                                       ⇒ inode/FD exhaustion
+        //   max_background_compactions = 0  →  no compaction threads
+        //                                       ⇒ L0 grows unbounded
+        //   max_background_flushes   = 0    →  no flush threads
+        //                                       ⇒ memtable count rises until stall
+        //   max_write_buffer_number  = 0    →  imm_count >= 0 always true
+        //                                       ⇒ writes stall on every op
+        if self.max_bytes_for_level_base == 0 {
+            return Err(ForstError::invalid_argument(
+                "max_bytes_for_level_base must be greater than zero",
+            ));
+        }
+        if self.target_file_size_base == 0 {
+            return Err(ForstError::invalid_argument(
+                "target_file_size_base must be greater than zero",
+            ));
+        }
+        if self.max_background_compactions == 0 {
+            return Err(ForstError::invalid_argument(
+                "max_background_compactions must be greater than zero",
+            ));
+        }
+        if self.max_background_flushes == 0 {
+            return Err(ForstError::invalid_argument(
+                "max_background_flushes must be greater than zero",
+            ));
+        }
+        if self.max_write_buffer_number == 0 {
+            return Err(ForstError::invalid_argument(
+                "max_write_buffer_number must be greater than zero",
+            ));
+        }
         // R-loop r6 Sec H#1+H#3 / Errors H_F1: bound block_size both ways.
         // Upper: SST writer's `Vec::with_capacity(block_size + 1024)` would
         //        OOM/wrap on usize::MAX.
@@ -824,6 +863,36 @@ mod tests {
             .max_bytes_for_level_base(MAX_LEVEL_BASE)
             .build();
         assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r7 Errors H_F1+H_F2+H_F3: symmetric lower-bound (zero)
+    /// rejection for fields whose upper bound was capped in r5/r6.
+    #[test]
+    fn test_validate_rejects_zero_lower_bounds() {
+        for builder_fn in [
+            EngineOptions::builder()
+                .db_path("/tmp/db")
+                .max_bytes_for_level_base(0),
+            EngineOptions::builder()
+                .db_path("/tmp/db")
+                .target_file_size_base(0),
+            EngineOptions::builder()
+                .db_path("/tmp/db")
+                .max_background_compactions(0),
+            EngineOptions::builder()
+                .db_path("/tmp/db")
+                .max_background_flushes(0),
+            EngineOptions::builder()
+                .db_path("/tmp/db")
+                .max_write_buffer_number(0),
+        ] {
+            let opts = builder_fn.build();
+            assert!(
+                opts.validate().is_err(),
+                "zero value should be rejected, got: {:?}",
+                opts
+            );
+        }
     }
 
     /// R-loop r6 Sec H#1+H#3 / Errors H_F1: block_size both lower and
