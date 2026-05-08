@@ -184,10 +184,15 @@ impl SequenceNumber {
     /// `u64` (e.g. from FFI or on-disk decode), since constructing a value
     /// outside the 56-bit range corrupts the packed tag downstream.
     /// (R-loop r2 H#1, 2026-05-08.)
+    ///
+    /// Returns `ForstError::Corruption` (aligned with `OpType::try_from_u8`
+    /// per R-loop r14 Errors H#1 taxonomy fix; out-of-range bytes from
+    /// untrusted decode paths are corruption signals downstream consumers
+    /// can route via `is_corruption()`).
     #[inline]
     pub fn try_new(value: u64) -> ForstResult<Self> {
         if value > MAX_SEQUENCE_NUMBER.0 {
-            return Err(ForstError::invalid_argument(format!(
+            return Err(ForstError::corruption(format!(
                 "sequence number {} exceeds 56-bit limit ({})",
                 value, MAX_SEQUENCE_NUMBER.0
             )));
@@ -291,10 +296,13 @@ impl Level {
     /// `value >= MAX_LEVELS` would panic on downstream
     /// `levels[level.value() as usize]` indexing.
     /// (R-loop r4 H#2, 2026-05-08; mirrors `SequenceNumber::try_new`.)
+    ///
+    /// Returns `ForstError::Corruption` (aligned with `OpType::try_from_u8`
+    /// per R-loop r14 Errors H#1 taxonomy fix).
     #[inline]
     pub fn try_new(value: u8) -> ForstResult<Self> {
         if (value as usize) >= MAX_LEVELS {
-            return Err(ForstError::invalid_argument(format!(
+            return Err(ForstError::corruption(format!(
                 "level {} exceeds MAX_LEVELS ({})",
                 value, MAX_LEVELS
             )));
@@ -574,9 +582,11 @@ mod tests {
         let res = SequenceNumber::try_new(MAX_SEQUENCE_NUMBER.0 + 1);
         assert!(res.is_err(), "expected error, got {:?}", res);
         let err = res.unwrap_err();
+        // R-loop r14 Errors H#1: taxonomy aligned to Corruption
+        // (matches OpType::try_from_u8); was InvalidArgument pre-r14.
         assert!(
-            err.is_invalid_argument(),
-            "expected InvalidArgument variant, got {:?}",
+            err.is_corruption(),
+            "expected Corruption variant, got {:?}",
             err
         );
         let res = SequenceNumber::try_new(u64::MAX);
@@ -608,7 +618,8 @@ mod tests {
         let res = Level::try_new(MAX_LEVELS as u8);
         assert!(res.is_err(), "Level({}) should be rejected", MAX_LEVELS);
         let err = res.unwrap_err();
-        assert!(err.is_invalid_argument());
+        // R-loop r14 Errors H#1: taxonomy aligned to Corruption.
+        assert!(err.is_corruption());
         let res = Level::try_new(255);
         assert!(res.is_err(), "Level(255) should be rejected");
     }

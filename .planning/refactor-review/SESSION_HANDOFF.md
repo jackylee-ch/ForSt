@@ -111,7 +111,8 @@ user_r_loop_round_10_status: CLEAN  # post-pivot R11; H_TOTAL = 0 across all 5 d
 user_r_loop_round_11_status: CLEAN  # post-pivot R12; effective H_TOTAL = 0 (Memory/Concurrency/Errors/Security = 0; Correctness reported 1 H but reviewer self-classified as subsumed by pre-escalated try_allocate-incl-aligned scope from r9 H#3). consecutive_zero_high: 1 → 2.
 user_r_loop_round_12_status: COMPLETE_FIXES_LANDED  # post-pivot R13; H_TOTAL = 2 (r12 Errors H#1: EngineOptionsBuilder::build() returns unvalidated config bypassing all DoS caps; r12 Errors H#2: HistogramSnapshot::percentile silently returns 0.0 for NaN p — slips past p<=0.0 and p>=1.0 IEEE-754 NaN-false comparisons). Fixes: try_build() returning ForstResult added; percentile gains !p.is_finite() guard. consecutive_zero_high RESET 2 → 0.
 user_r_loop_round_13_status: CLEAN  # post-pivot R14; H_TOTAL = 0 across all 5 dimensions. consecutive_zero_high: 0 → 1.
-consecutive_zero_high: 1  # r13 clean; need 9 more
+user_r_loop_round_14_status: COMPLETE_FIXES_LANDED  # post-pivot R15; H_TOTAL = 1 (Errors r14 H#1: taxonomy mismatch — try_from_u8 returns Corruption while try_new returns InvalidArgument; downstream is_corruption()-based SST quarantine misses bad sequence/level bytes). Fix: aligned SequenceNumber::try_new and Level::try_new to return ForstError::Corruption (matches OpType::try_from_u8 R13 precedent). consecutive_zero_high RESET 1 → 0.
+consecutive_zero_high: 0  # r14 found 1 H, reset
 consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
