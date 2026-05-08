@@ -102,6 +102,17 @@ pub const MAX_BLOCK_SIZE: usize = 1 << 30;
 /// with `MAX_LEVEL_BASE`.
 pub const MAX_TARGET_FILE_SIZE_BASE: usize = 1 << 40;
 
+/// Lower bound on `EngineOptions::target_file_size_base` (4 KiB; R-loop
+/// S2-r7 Sec H#1).
+///
+/// Symmetric to [`MIN_BLOCK_SIZE`]: at `target_file_size_base = 1..4095`,
+/// the SST writer rolls a new file every few records, producing thousands
+/// of tiny SST files per memtable flush → inode / FD exhaustion DoS. 4 KiB
+/// (one OS page) is generous: realistic SSTs are MiB-scale, but the floor
+/// blocks the pathological per-record-rollover regime without breaking
+/// small-scale unit tests.
+pub const MIN_TARGET_FILE_SIZE_BASE: usize = 1 << 12;
+
 /// Upper bound on `EngineOptions::max_write_buffer_number` (R-loop r6
 /// Sec H#2).
 ///
@@ -332,6 +343,18 @@ impl EngineOptions {
             return Err(ForstError::invalid_argument(format!(
                 "block_size must be in [{}, {}] bytes, got {}",
                 MIN_BLOCK_SIZE, MAX_BLOCK_SIZE, self.block_size
+            )));
+        }
+        // R-loop S2-r7 Sec H#1: floor target_file_size_base (symmetric to
+        // r6 MIN_BLOCK_SIZE). At <4 KiB, the SST writer rolls per-record
+        // → inode/FD exhaustion DoS during a single memtable flush.
+        // Zero-check above (line 298) handles 0; this catches 1..MIN-1.
+        if self.target_file_size_base != 0
+            && self.target_file_size_base < MIN_TARGET_FILE_SIZE_BASE
+        {
+            return Err(ForstError::invalid_argument(format!(
+                "target_file_size_base must be ≥ {} bytes (4 KiB), got {}",
+                MIN_TARGET_FILE_SIZE_BASE, self.target_file_size_base
             )));
         }
         // R-loop r6 Errors H_F2: cap target_file_size_base.
@@ -1140,6 +1163,34 @@ mod tests {
             .db_path("/tmp/db")
             .target_file_size_base(MAX_TARGET_FILE_SIZE_BASE)
             .build();
+        assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop S2-r7 Sec H#1: target_file_size_base must be ≥ 4 KiB to
+    /// prevent per-record SST rollover → inode/FD exhaustion DoS.
+    /// Symmetric to r6 MIN_BLOCK_SIZE.
+    #[test]
+    fn test_validate_rejects_undersized_target_file_size_base() {
+        // 1 byte → rejected (per-record rollover).
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .target_file_size_base(1)
+            .build();
+        assert!(opts.validate().is_err());
+        // MIN - 1 → rejected.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .target_file_size_base(MIN_TARGET_FILE_SIZE_BASE - 1)
+            .build();
+        assert!(opts.validate().is_err());
+        // Exactly MIN → accepted.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .target_file_size_base(MIN_TARGET_FILE_SIZE_BASE)
+            .build();
+        assert!(opts.validate().is_ok());
+        // Default (64 MiB) → accepted.
+        let opts = EngineOptions::builder().db_path("/tmp/db").build();
         assert!(opts.validate().is_ok());
     }
 
