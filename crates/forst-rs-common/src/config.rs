@@ -66,6 +66,40 @@ pub const MAX_BLOCK_CACHE_SIZE: usize = 1 << 50;
 /// (FD/thread-limit exhaustion DoS — R-loop r5 Sec H#2).
 pub const MAX_BACKGROUND_THREADS: usize = 1024;
 
+/// Lower bound on `EngineOptions::block_size` (R-loop r6 Sec H#3).
+///
+/// `block_size = 1` with default `write_buffer_size` causes the SST
+/// writer to flush a block per entry, producing multi-GiB index +
+/// Bloom-filter payloads per SST → slow-amplification DoS.
+pub const MIN_BLOCK_SIZE: usize = 512;
+
+/// Upper bound on `EngineOptions::block_size` (1 GiB; R-loop r6 Sec H#1
+/// + r6 Errors H_F1).
+///
+/// Mirrors the r5 cap on `block_cache_size` / `write_buffer_size`. The
+/// SST writer's hot-path `Vec::with_capacity(block_size + 1024)` would
+/// OOM-abort or wrap on `usize::MAX`. RocksDB's largest sane block is
+/// ~256 KiB; 1 GiB is a generous safety margin.
+pub const MAX_BLOCK_SIZE: usize = 1 << 30;
+
+/// Upper bound on `EngineOptions::target_file_size_base` (1 TiB;
+/// R-loop r6 Errors H_F2).
+///
+/// Prevents an untrusted `usize::MAX` per-SST file budget from never
+/// triggering a roll → unbounded heap/disk growth, and from saturating
+/// `base * multiplier^(L-1)`-style level-target arithmetic when paired
+/// with `MAX_LEVEL_BASE`.
+pub const MAX_TARGET_FILE_SIZE_BASE: usize = 1 << 40;
+
+/// Upper bound on `EngineOptions::max_write_buffer_number` (R-loop r6
+/// Sec H#2).
+///
+/// `usize::MAX` makes the immutable-memtable count comparison
+/// `imm >= max_write_buffer_number` never true, bypassing
+/// `WriteController` write-stall backpressure → unbounded heap growth.
+/// RocksDB defaults at 2–4; 1024 is generous.
+pub const MAX_WRITE_BUFFER_NUMBER: usize = 1024;
+
 // ---------------------------------------------------------------------------
 // EngineOptions
 // ---------------------------------------------------------------------------
@@ -202,6 +236,32 @@ impl EngineOptions {
             return Err(ForstError::invalid_argument(
                 "block_size must be greater than zero",
             ));
+        }
+        // R-loop r6 Sec H#1+H#3 / Errors H_F1: bound block_size both ways.
+        // Upper: SST writer's `Vec::with_capacity(block_size + 1024)` would
+        //        OOM/wrap on usize::MAX.
+        // Lower: tiny block_size causes per-entry flushes → multi-GiB
+        //        index/bloom payloads → slow-amplification DoS.
+        if self.block_size < MIN_BLOCK_SIZE || self.block_size > MAX_BLOCK_SIZE {
+            return Err(ForstError::invalid_argument(format!(
+                "block_size must be in [{}, {}] bytes, got {}",
+                MIN_BLOCK_SIZE, MAX_BLOCK_SIZE, self.block_size
+            )));
+        }
+        // R-loop r6 Errors H_F2: cap target_file_size_base.
+        if self.target_file_size_base > MAX_TARGET_FILE_SIZE_BASE {
+            return Err(ForstError::invalid_argument(format!(
+                "target_file_size_base must be ≤ {} bytes (1 TiB), got {}",
+                MAX_TARGET_FILE_SIZE_BASE, self.target_file_size_base
+            )));
+        }
+        // R-loop r6 Sec H#2: cap max_write_buffer_number to prevent
+        // write-stall backpressure bypass.
+        if self.max_write_buffer_number > MAX_WRITE_BUFFER_NUMBER {
+            return Err(ForstError::invalid_argument(format!(
+                "max_write_buffer_number must be ≤ {}, got {}",
+                MAX_WRITE_BUFFER_NUMBER, self.max_write_buffer_number
+            )));
         }
         // R-loop r3 H#1 + r4 H#1: reject NaN / ±∞ / non-positive AND
         // cap the upper bound at MAX_LEVEL_MULTIPLIER so the downstream
@@ -762,6 +822,67 @@ mod tests {
         let opts = EngineOptions::builder()
             .db_path("/tmp/db")
             .max_bytes_for_level_base(MAX_LEVEL_BASE)
+            .build();
+        assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r6 Sec H#1+H#3 / Errors H_F1: block_size both lower and
+    /// upper-bounded.
+    #[test]
+    fn test_validate_block_size_bounds() {
+        // Below MIN_BLOCK_SIZE (but > 0 to skip the older check).
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .block_size(MIN_BLOCK_SIZE - 1)
+            .build();
+        assert!(opts.validate().is_err());
+
+        // Above MAX_BLOCK_SIZE.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .block_size(MAX_BLOCK_SIZE + 1)
+            .build();
+        assert!(opts.validate().is_err());
+
+        // Both bounds inclusive.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .block_size(MIN_BLOCK_SIZE)
+            .build();
+        assert!(opts.validate().is_ok());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .block_size(MAX_BLOCK_SIZE)
+            .build();
+        assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r6 Errors H_F2: target_file_size_base capped.
+    #[test]
+    fn test_validate_rejects_oversized_target_file_size_base() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .target_file_size_base(MAX_TARGET_FILE_SIZE_BASE + 1)
+            .build();
+        assert!(opts.validate().is_err());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .target_file_size_base(MAX_TARGET_FILE_SIZE_BASE)
+            .build();
+        assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r6 Sec H#2: max_write_buffer_number capped.
+    #[test]
+    fn test_validate_rejects_oversized_max_write_buffer_number() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_write_buffer_number(MAX_WRITE_BUFFER_NUMBER + 1)
+            .build();
+        assert!(opts.validate().is_err());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_write_buffer_number(MAX_WRITE_BUFFER_NUMBER)
             .build();
         assert!(opts.validate().is_ok());
     }

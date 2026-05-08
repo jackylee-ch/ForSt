@@ -69,6 +69,10 @@ impl OpType {
     /// Try to convert a raw `u8` into an [`OpType`].
     ///
     /// Returns `None` if the value does not correspond to a known variant.
+    /// For decoding paths from untrusted bytes (FFI / on-disk SST/WAL),
+    /// prefer [`Self::try_from_u8`] which produces a structured
+    /// [`ForstError::Corruption`] with the offending byte preserved
+    /// (R-loop r6 Errors H_F3).
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(OpType::Put),
@@ -77,6 +81,23 @@ impl OpType {
             3 => Some(OpType::Merge),
             _ => None,
         }
+    }
+
+    /// Checked decoder for an `OpType` byte that returns a structured
+    /// error rather than `Option::None` (R-loop r6 Errors H_F3, mirrors
+    /// `SequenceNumber::try_new` / `Level::try_new`).
+    ///
+    /// Use this for any path that decodes an `OpType` byte from
+    /// untrusted input — the unknown discriminant is preserved in the
+    /// error message for triage. The previous R13 sweep ("OpType silent
+    /// default") fixed a downstream consumer that papered over `None`
+    /// with a default; this constructor closes the upstream cause by
+    /// making "what byte was bad" visible in the error channel.
+    #[inline]
+    pub fn try_from_u8(value: u8) -> ForstResult<Self> {
+        Self::from_u8(value).ok_or_else(|| {
+            ForstError::corruption(format!("invalid OpType discriminant: {}", value))
+        })
     }
 }
 
@@ -590,6 +611,26 @@ mod tests {
         assert!(err.is_invalid_argument());
         let res = Level::try_new(255);
         assert!(res.is_err(), "Level(255) should be rejected");
+    }
+
+    /// R-loop r6 Errors H_F3: OpType::try_from_u8 returns ForstResult.
+    #[test]
+    fn test_op_type_try_from_u8_valid() {
+        assert_eq!(OpType::try_from_u8(0).unwrap(), OpType::Put);
+        assert_eq!(OpType::try_from_u8(1).unwrap(), OpType::Delete);
+        assert_eq!(OpType::try_from_u8(2).unwrap(), OpType::SingleDelete);
+        assert_eq!(OpType::try_from_u8(3).unwrap(), OpType::Merge);
+    }
+
+    #[test]
+    fn test_op_type_try_from_u8_rejects_invalid() {
+        for byte in [4u8, 7, 100, 255] {
+            let res = OpType::try_from_u8(byte);
+            assert!(res.is_err(), "byte {} should be rejected", byte);
+            let err = res.unwrap_err();
+            assert!(err.is_corruption());
+            assert!(err.to_string().contains(&byte.to_string()));
+        }
     }
 
     // -----------------------------------------------------------------------
