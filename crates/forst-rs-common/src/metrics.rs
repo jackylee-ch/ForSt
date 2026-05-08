@@ -392,6 +392,16 @@ impl HistogramSnapshot {
     /// (FFI/deserialization) that would otherwise panic on
     /// `bounds[i]` indexing.
     pub fn percentile(&self, p: f64) -> f64 {
+        // R-loop r12 Errors H#2: reject NaN explicitly — IEEE 754 makes
+        // every NaN comparison false, so the original `p <= 0.0` and
+        // `p >= 1.0` clamps both fall through, letting `(NaN * total_count
+        // as f64).ceil() as u64 = 0` produce a silent 0.0 result that
+        // monitoring callers can't distinguish from a real `p = 0.0`
+        // query. Treat non-finite as invalid → 0.0 sentinel (consistent
+        // with `total_count == 0` and `p <= 0.0` clamps).
+        if !p.is_finite() {
+            return 0.0;
+        }
         if self.total_count == 0 || p <= 0.0 {
             return 0.0;
         }
@@ -766,6 +776,22 @@ mod tests {
     #[should_panic(expected = "strictly ascending")]
     fn test_histogram_nan_bounds_panics() {
         let _ = Histogram::new(&[1.0, f64::NAN, 100.0]);
+    }
+
+    /// Regression test for R-loop r12 Errors H#2: NaN p input is rejected
+    /// up-front (returns 0.0 sentinel) instead of slipping past the
+    /// `p <= 0.0` / `p >= 1.0` IEEE-754 NaN-false-comparisons.
+    #[test]
+    fn test_percentile_nan_input_returns_zero() {
+        let h = Histogram::with_default_buckets();
+        h.observe(5.0);
+        h.observe(50.0);
+        h.observe(500.0);
+        let snap = h.snapshot();
+        assert_eq!(snap.percentile(f64::NAN), 0.0);
+        // ±Inf are also non-finite — also rejected to 0.0 (defensive).
+        assert_eq!(snap.percentile(f64::INFINITY), 0.0);
+        assert_eq!(snap.percentile(f64::NEG_INFINITY), 0.0);
     }
 
     /// Regression test for R-loop r8 Errors H#1: caller-constructed

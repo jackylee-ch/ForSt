@@ -492,9 +492,37 @@ impl EngineOptionsBuilder {
         self
     }
 
-    /// Consumes the builder and returns the configured [`EngineOptions`].
+    /// Consumes the builder and returns the configured [`EngineOptions`]
+    /// **without validation**.
+    ///
+    /// Prefer [`Self::try_build`] when accepting untrusted configuration —
+    /// `build()` skips every DoS-bound check landed by R-loops r3–r9 (path
+    /// length, multiplier saturation, write-buffer cap, block-cache cap,
+    /// background-thread count, bloom_bits cap, block_size lower/upper,
+    /// target_file_size cap, max_write_buffer_number, level_base cap, NaN /
+    /// ±Inf multiplier rejection, embedded NUL in db_path, etc.).
+    /// `build()` remains for trusted-call-site ergonomics and existing
+    /// callers (R-loop r12 Errors H#1 mitigation).
     pub fn build(self) -> EngineOptions {
         self.inner
+    }
+
+    /// Consumes the builder and returns the configured [`EngineOptions`]
+    /// **after running [`EngineOptions::validate`]**.
+    ///
+    /// This is the recommended entry point for any caller that may receive
+    /// untrusted configuration (FFI / on-disk decode / RPC). All upper /
+    /// lower bounds and content checks established by R-loops r3–r9 fire
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForstError::InvalidArgument`] for any validation failure;
+    /// see [`EngineOptions::validate`] for the precise checks.
+    pub fn try_build(self) -> ForstResult<EngineOptions> {
+        let opts = self.inner;
+        opts.validate()?;
+        Ok(opts)
     }
 }
 
@@ -913,6 +941,29 @@ mod tests {
             .bloom_bits_per_key(MAX_BLOOM_BITS_PER_KEY)
             .build();
         assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r12 Errors H#1: try_build runs validate; build does not.
+    #[test]
+    fn test_try_build_validates_runs_caps() {
+        // build() accepts unvalidated huge values (caller-trusted path).
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(usize::MAX)
+            .build();
+        assert_eq!(opts.write_buffer_size, usize::MAX);
+        // try_build() catches the same value.
+        let res = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(usize::MAX)
+            .try_build();
+        assert!(res.is_err());
+        // try_build with valid config returns Ok.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .try_build()
+            .unwrap();
+        assert_eq!(opts.db_path, "/tmp/db");
     }
 
     /// R-loop r9 Sec H#2: db_path length + NUL-byte rejection.
