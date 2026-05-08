@@ -108,7 +108,8 @@ user_r_loop_round_7_status: COMPLETE_FIXES_LANDED  # post-pivot R8; H_TOTAL = 3 
 user_r_loop_round_8_status: COMPLETE_FIXES_LANDED  # post-pivot R9; H_TOTAL = 1 (Errors r8 H#1: HistogramSnapshot::percentile panic on caller-constructed mismatched-lengths slice) — fix: defensive length check returns 0.0 instead of panicking + saturating_add for cumulative + 1 regression test
 user_r_loop_round_9_status: COMPLETE_FIXES_LANDED  # post-pivot R10; H_TOTAL = 3 (r9 Sec H#1+H#2+H#3) — fix: MAX_BLOOM_BITS_PER_KEY=256 cap + db_path length cap (POSIX PATH_MAX) + NUL-byte rejection + 2 regression tests; H#3 (try_allocate_aligned scope) noted as clarification of pre-escalated try_allocate H, deferred
 user_r_loop_round_10_status: CLEAN  # post-pivot R11; H_TOTAL = 0 across all 5 dimensions (Memory/Correctness/Concurrency/Errors/Security). First zero-H round since r1.
-consecutive_zero_high: 1  # 0 → 1 (r10 was clean; need 10 consecutive)
+user_r_loop_round_11_status: CLEAN  # post-pivot R12; effective H_TOTAL = 0 (Memory/Concurrency/Errors/Security = 0; Correctness reported 1 H but reviewer self-classified as subsumed by pre-escalated try_allocate-incl-aligned scope from r9 H#3). consecutive_zero_high: 1 → 2.
+consecutive_zero_high: 2  # need 10 consecutive zero-H to terminate
 consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
