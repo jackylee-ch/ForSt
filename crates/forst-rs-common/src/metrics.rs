@@ -383,9 +383,24 @@ impl HistogramSnapshot {
     /// Estimates the value at the given percentile (0.0–1.0).
     ///
     /// Uses linear interpolation within the target bucket. Returns 0.0
-    /// if no observations exist.
+    /// if no observations exist OR if the snapshot's `bounds` and
+    /// `bucket_counts` slices have mismatched lengths (e.g., caller-
+    /// constructed via the public fields, R-loop r8 Errors H#1). The
+    /// internally-produced snapshot from [`Histogram::snapshot`] always
+    /// satisfies `bounds.len() == bucket_counts.len()`; the defensive
+    /// length check guards against malformed external construction
+    /// (FFI/deserialization) that would otherwise panic on
+    /// `bounds[i]` indexing.
     pub fn percentile(&self, p: f64) -> f64 {
         if self.total_count == 0 || p <= 0.0 {
+            return 0.0;
+        }
+        // Guard against caller-constructed inconsistent snapshots:
+        // walking bucket_counts farther than bounds.len() would panic on
+        // the `self.bounds[i]` index. The internally-produced snapshot
+        // upholds the equal-length invariant; this is only a defense
+        // against external misuse of the `pub` fields.
+        if self.bucket_counts.len() != self.bounds.len() {
             return 0.0;
         }
         if p >= 1.0 {
@@ -396,7 +411,7 @@ impl HistogramSnapshot {
         let mut cumulative: u64 = 0;
 
         for (i, &count) in self.bucket_counts.iter().enumerate() {
-            cumulative += count;
+            cumulative = cumulative.saturating_add(count);
             if cumulative >= target {
                 // Linear interpolation within this bucket.
                 let lower = if i == 0 { 0.0 } else { self.bounds[i - 1] };
@@ -751,6 +766,34 @@ mod tests {
     #[should_panic(expected = "strictly ascending")]
     fn test_histogram_nan_bounds_panics() {
         let _ = Histogram::new(&[1.0, f64::NAN, 100.0]);
+    }
+
+    /// Regression test for R-loop r8 Errors H#1: caller-constructed
+    /// `HistogramSnapshot` with mismatched-length `bounds` /
+    /// `bucket_counts` MUST NOT panic; defensive length check returns 0.0.
+    #[test]
+    fn test_percentile_caller_constructed_mismatched_lengths_does_not_panic() {
+        // Mismatched: bounds shorter than bucket_counts (would panic at
+        // `self.bounds[i]` indexing without the defensive guard).
+        let snap = HistogramSnapshot {
+            bounds: vec![10.0],
+            bucket_counts: vec![5, 5, 5],
+            overflow: 0,
+            total_count: 15,
+            sum: 0.0,
+        };
+        // No panic; returns 0.0 by the defensive guard.
+        assert_eq!(snap.percentile(0.5), 0.0);
+
+        // Symmetric mismatch: bounds longer than bucket_counts.
+        let snap = HistogramSnapshot {
+            bounds: vec![10.0, 50.0, 100.0],
+            bucket_counts: vec![1],
+            overflow: 0,
+            total_count: 1,
+            sum: 0.0,
+        };
+        assert_eq!(snap.percentile(0.5), 0.0);
     }
 
     /// Regression test for R1-post-pivot M#7 (downgraded from R4 H#2).

@@ -105,7 +105,8 @@ user_r_loop_round_4_status: COMPLETE_FIXES_LANDED  # post-pivot R5; H_TOTAL = 4 
 user_r_loop_round_5_status: COMPLETE_FIXES_LANDED  # post-pivot R6; H_TOTAL = 2 (Security r5 H#1+H#2: validate() upper-bound gaps for max_bytes_for_level_base, block_cache_size, write_buffer_size, max_background_*) — fixes landed: 4 new MAX_* consts + bounded validate() + 2 new tests
 user_r_loop_round_6_status: COMPLETE_FIXES_LANDED  # post-pivot R7; H_TOTAL = 5 effective (Errors r6 H_F1+H_F2+H_F3 + Sec r6 H#1+H#2+H#3, dedup of block_size convergence) — fixes landed: 4 new MIN/MAX_* consts (MIN_BLOCK_SIZE=512, MAX_BLOCK_SIZE=1<<30, MAX_TARGET_FILE_SIZE_BASE=1<<40, MAX_WRITE_BUFFER_NUMBER=1024) + 4 new validate() arms + OpType::try_from_u8 + 5 new tests
 user_r_loop_round_7_status: COMPLETE_FIXES_LANDED  # post-pivot R8; H_TOTAL = 3 (Errors r7 H_F1+H_F2+H_F3 — lower-bound zero-rejection for max_bytes_for_level_base, target_file_size_base, max_background_compactions, max_background_flushes, max_write_buffer_number; symmetric to r5/r6 upper caps) — fixes landed
-consecutive_zero_high: 0  # r3, r4, r5, r6, r7 all found Hs
+user_r_loop_round_8_status: COMPLETE_FIXES_LANDED  # post-pivot R9; H_TOTAL = 1 (Errors r8 H#1: HistogramSnapshot::percentile panic on caller-constructed mismatched-lengths slice) — fix: defensive length check returns 0.0 instead of panicking + saturating_add for cumulative + 1 regression test
+consecutive_zero_high: 0  # r3-r8 all found Hs
 consecutive_clean: 0  # original protocol's H=0 ∧ M=0 metric — unchanged (M items still deferred)
 baselines_built: false  # blocked on C5 dependency per A1 §4.3; not blocking C1 R1-post-pivot
 r1_totals: "H=26, M=52, L=55 (10/10 agents FINAL — A5 included)"
