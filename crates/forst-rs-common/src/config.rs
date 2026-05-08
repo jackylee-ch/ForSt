@@ -113,6 +113,27 @@ pub const MAX_TARGET_FILE_SIZE_BASE: usize = 1 << 40;
 /// small-scale unit tests.
 pub const MIN_TARGET_FILE_SIZE_BASE: usize = 1 << 12;
 
+/// Lower bound on `EngineOptions::write_buffer_size` (4 KiB; R-loop
+/// S2-r8 Sec H#1).
+///
+/// Symmetric to [`MIN_TARGET_FILE_SIZE_BASE`]: at `write_buffer_size =
+/// 1..4095`, every put trips the active-memtable threshold → forced
+/// per-record flush → tiny SST per record (inode/FD exhaustion) AND
+/// rapidly saturates `max_write_buffer_number` triggering write-stall.
+/// Compounds inode DoS with backpressure-stall DoS.
+pub const MIN_WRITE_BUFFER_SIZE: usize = 1 << 12;
+
+/// Lower bound on `EngineOptions::max_bytes_for_level_base` (1 MiB; R-loop
+/// S2-r8 Sec H#2).
+///
+/// At `max_bytes_for_level_base = 1..N`, every level-1 SST exceeds its
+/// target capacity → continuous compaction loop → CPU / IO storm. The
+/// r7 doc comment for the zero-check explicitly calls out this scenario
+/// as "permanent compaction storm" but the per-axis check only rejects
+/// `== 0`. 1 MiB is below realistic deployments (RocksDB defaults at
+/// 256 MiB) but well above the per-record-pathological regime.
+pub const MIN_LEVEL_BASE: usize = 1 << 20;
+
 /// Upper bound on `EngineOptions::max_write_buffer_number` (R-loop r6
 /// Sec H#2).
 ///
@@ -355,6 +376,25 @@ impl EngineOptions {
             return Err(ForstError::invalid_argument(format!(
                 "target_file_size_base must be ≥ {} bytes (4 KiB), got {}",
                 MIN_TARGET_FILE_SIZE_BASE, self.target_file_size_base
+            )));
+        }
+        // R-loop S2-r8 Sec H#1: floor write_buffer_size (parallel-symmetry
+        // gap S2-r7 missed). At <4 KiB, every put trips memtable threshold
+        // → per-record flush → inode + write-stall DoS.
+        if self.write_buffer_size != 0 && self.write_buffer_size < MIN_WRITE_BUFFER_SIZE {
+            return Err(ForstError::invalid_argument(format!(
+                "write_buffer_size must be ≥ {} bytes (4 KiB), got {}",
+                MIN_WRITE_BUFFER_SIZE, self.write_buffer_size
+            )));
+        }
+        // R-loop S2-r8 Sec H#2: floor max_bytes_for_level_base. At <1 MiB,
+        // every L1 SST exceeds level capacity → permanent compaction
+        // storm (CPU/IO DoS). The r7 doc comment already names this
+        // vector but only the zero-check guards it.
+        if self.max_bytes_for_level_base != 0 && self.max_bytes_for_level_base < MIN_LEVEL_BASE {
+            return Err(ForstError::invalid_argument(format!(
+                "max_bytes_for_level_base must be ≥ {} bytes (1 MiB), got {}",
+                MIN_LEVEL_BASE, self.max_bytes_for_level_base
             )));
         }
         // R-loop r6 Errors H_F2: cap target_file_size_base.
@@ -1166,6 +1206,48 @@ mod tests {
         assert!(opts.validate().is_ok());
     }
 
+    /// R-loop S2-r8 Sec H#1: write_buffer_size must be ≥ 4 KiB to
+    /// prevent per-record memtable flush → inode + write-stall DoS.
+    #[test]
+    fn test_validate_rejects_undersized_write_buffer_size() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(1)
+            .build();
+        assert!(opts.validate().is_err());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(MIN_WRITE_BUFFER_SIZE - 1)
+            .build();
+        assert!(opts.validate().is_err());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(MIN_WRITE_BUFFER_SIZE)
+            .build();
+        assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop S2-r8 Sec H#2: max_bytes_for_level_base must be ≥ 1 MiB
+    /// to prevent permanent compaction storm.
+    #[test]
+    fn test_validate_rejects_undersized_max_bytes_for_level_base() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_base(1)
+            .build();
+        assert!(opts.validate().is_err());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_base(MIN_LEVEL_BASE - 1)
+            .build();
+        assert!(opts.validate().is_err());
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_base(MIN_LEVEL_BASE)
+            .build();
+        assert!(opts.validate().is_ok());
+    }
+
     /// R-loop S2-r7 Sec H#1: target_file_size_base must be ≥ 4 KiB to
     /// prevent per-record SST rollover → inode/FD exhaustion DoS.
     /// Symmetric to r6 MIN_BLOCK_SIZE.
@@ -1361,11 +1443,12 @@ mod tests {
         }
         // The per-axis cap itself is accepted IF combined with a small
         // base/levels (post r18, joint product check rejects
-        // default-base × MAX_LEVEL_MULTIPLIER × 7 levels).
+        // default-base × MAX_LEVEL_MULTIPLIER × 7 levels). Post S2-r8
+        // the level_base must be ≥ MIN_LEVEL_BASE = 1 MiB.
         let opts = EngineOptions::builder()
             .db_path("/tmp/db")
             .max_bytes_for_level_multiplier(MAX_LEVEL_MULTIPLIER)
-            .max_bytes_for_level_base(1)
+            .max_bytes_for_level_base(MIN_LEVEL_BASE)
             .num_levels(2)
             .build();
         assert!(
