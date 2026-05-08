@@ -111,6 +111,18 @@ pub const MAX_TARGET_FILE_SIZE_BASE: usize = 1 << 40;
 /// RocksDB defaults at 2–4; 1024 is generous.
 pub const MAX_WRITE_BUFFER_NUMBER: usize = 1024;
 
+/// R-loop r19 Sec H#1: joint cap on `write_buffer_size × max_write_buffer_number`.
+/// Per-axis caps admit 1 TiB × 1024 = 1 PiB — beyond any plausible physical
+/// RAM. 8 TiB picked to defend against the pathological joint product while
+/// preserving headroom above existing per-axis acceptance assertions.
+pub const MAX_JOINT_MEMTABLE_BYTES: usize = 1 << 43;
+
+/// R-loop r19 Sec H#2: joint cap on per-SST bloom-filter allocation
+/// `bloom_bits_per_key × (target_file_size_base / 16) / 8`. Per-axis caps
+/// admit 256 × 1 TiB / 128 = 2 TiB per-SST. 256 GiB cap rejects pathological
+/// configs while preserving headroom above existing per-axis assertions.
+pub const MAX_JOINT_BLOOM_BYTES: usize = 1 << 38;
+
 // ---------------------------------------------------------------------------
 // EngineOptions
 // ---------------------------------------------------------------------------
@@ -374,6 +386,47 @@ impl EngineOptions {
                 self.num_levels,
                 projected,
                 usize_half
+            )));
+        }
+        // R-loop r19 Sec H#1: peak memtable RAM commitment joint cap.
+        // Per-axis caps (r5 write_buffer_size ≤ 1 TiB, r6
+        // max_write_buffer_number ≤ 1024) admit a 1 PiB joint product —
+        // far beyond any plausible physical RAM. A single config call
+        // from untrusted input can therefore pin the process toward
+        // OOM under flush stall. The pointer-saturation framing
+        // (`> usize::MAX/2`) is vacuous on 64-bit (9.2 EiB ceiling), so
+        // bound against a physical-RAM ceiling instead. 8 TiB picked to
+        // reject the pathological 1 PiB while preserving headroom above
+        // existing per-axis acceptance tests (max single buffer × default
+        // count = 3 TiB).
+        let memtable_peak =
+            (self.write_buffer_size as u128).saturating_mul(self.max_write_buffer_number as u128);
+        if memtable_peak > MAX_JOINT_MEMTABLE_BYTES as u128 {
+            return Err(ForstError::invalid_argument(format!(
+                "joint write_buffer_size × max_write_buffer_number = {} bytes exceeds {} bytes \
+                 (peak memtable RAM commitment would OOM-abort under flush stall)",
+                memtable_peak, MAX_JOINT_MEMTABLE_BYTES
+            )));
+        }
+        // R-loop r19 Sec H#2: per-SST bloom-filter allocation joint cap.
+        // Per-axis caps (r6 target_file_size_base ≤ 1 TiB, r9
+        // bloom_bits_per_key ≤ 256) admit a 2 TiB per-SST bloom (16-byte
+        // entry floor: 1 TiB / 16 × 256 / 8 = 2 TiB). A single SST
+        // committing 2 TiB of bloom-filter pages exhausts host memory.
+        // 256 GiB cap rejects the pathological 2 TiB while preserving
+        // headroom above existing per-axis tests (max file × default
+        // bloom = 80 GiB).
+        const MIN_AVG_ENTRY_BYTES: usize = 16;
+        let projected_bloom_bytes = self
+            .target_file_size_base
+            .saturating_div(MIN_AVG_ENTRY_BYTES)
+            .saturating_mul(self.bloom_bits_per_key)
+            .saturating_div(8);
+        if projected_bloom_bytes > MAX_JOINT_BLOOM_BYTES {
+            return Err(ForstError::invalid_argument(format!(
+                "joint bloom_bits_per_key × (target_file_size_base / {}) / 8 = {} bytes \
+                 exceeds {} bytes (per-SST bloom allocation would OOM-abort)",
+                MIN_AVG_ENTRY_BYTES, projected_bloom_bytes, MAX_JOINT_BLOOM_BYTES
             )));
         }
         // R-loop r5 Sec H#1: cap level-base so the base axis cannot drive
@@ -1144,6 +1197,52 @@ mod tests {
             .max_background_compactions(MAX_BACKGROUND_THREADS)
             .max_background_flushes(MAX_BACKGROUND_THREADS)
             .build();
+        assert!(opts.validate().is_ok());
+    }
+
+    /// R-loop r19 Sec H#1: write_buffer_size × max_write_buffer_number
+    /// joint product must be capped (peak memtable RAM commitment).
+    #[test]
+    fn test_validate_rejects_joint_memtable_oom() {
+        // Both at max: 1 TiB × 1024 = 1 PiB > 8 TiB cap. Rejected.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(MAX_WRITE_BUFFER_SIZE)
+            .max_write_buffer_number(MAX_WRITE_BUFFER_NUMBER)
+            .build();
+        assert!(opts.validate().is_err());
+        // Default (64 MiB × 3 = 192 MiB) accepted.
+        let opts = EngineOptions::builder().db_path("/tmp/db").build();
+        assert!(opts.validate().is_ok());
+        // At cap (8 TiB exactly): 1 TiB × 8 = 8 TiB. Accepted.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(MAX_WRITE_BUFFER_SIZE)
+            .max_write_buffer_number(8)
+            .build();
+        assert!(opts.validate().is_ok());
+        // 1 above cap: 1 TiB × 9 = 9 TiB. Rejected.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .write_buffer_size(MAX_WRITE_BUFFER_SIZE)
+            .max_write_buffer_number(9)
+            .build();
+        assert!(opts.validate().is_err());
+    }
+
+    /// R-loop r19 Sec H#2: bloom × target_file_size / 16 / 8 joint
+    /// product must be capped (per-SST bloom allocation OOM).
+    #[test]
+    fn test_validate_rejects_joint_bloom_oom() {
+        // bloom=256 × file=1 TiB / 16 / 8 = 2 TiB > 256 GiB cap. Rejected.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .bloom_bits_per_key(MAX_BLOOM_BITS_PER_KEY)
+            .target_file_size_base(MAX_TARGET_FILE_SIZE_BASE)
+            .build();
+        assert!(opts.validate().is_err());
+        // Default (64 MiB / 16 × 10 / 8 = 5 MiB) accepted.
+        let opts = EngineOptions::builder().db_path("/tmp/db").build();
         assert!(opts.validate().is_ok());
     }
 
