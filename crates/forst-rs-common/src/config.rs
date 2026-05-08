@@ -31,6 +31,15 @@
 use crate::error::{ForstError, ForstResult};
 use crate::types::{CompressionType, MAX_LEVELS};
 
+/// Upper bound on `EngineOptions::max_bytes_for_level_multiplier`.
+///
+/// 1024 covers every realistic LSM tuning (RocksDB defaults at 10×; even
+/// 100× is already extreme). Values above this would cascade
+/// `base * multiplier^(L-1)` past `f64::MAX` and saturate per-level
+/// capacities to `usize::MAX` — re-opening the DoS vector that the r3
+/// fix targeted (R-loop r4 H#1 regression of own r3 fix).
+pub const MAX_LEVEL_MULTIPLIER: f64 = 1024.0;
+
 // ---------------------------------------------------------------------------
 // EngineOptions
 // ---------------------------------------------------------------------------
@@ -168,15 +177,17 @@ impl EngineOptions {
                 "block_size must be greater than zero",
             ));
         }
-        // R-loop r3 H#1: reject NaN / ±∞ / non-positive multiplier so the
-        // downstream level-capacity formula `base * multiplier^(L-1)` cannot
-        // saturate or collapse under untrusted config.
+        // R-loop r3 H#1 + r4 H#1: reject NaN / ±∞ / non-positive AND
+        // cap the upper bound at MAX_LEVEL_MULTIPLIER so the downstream
+        // `base * multiplier^(L-1)` cannot saturate to `usize::MAX` via
+        // a finite-but-astronomical input (e.g. `f64::MAX`).
         if !self.max_bytes_for_level_multiplier.is_finite()
             || self.max_bytes_for_level_multiplier <= 1.0
+            || self.max_bytes_for_level_multiplier > MAX_LEVEL_MULTIPLIER
         {
             return Err(ForstError::invalid_argument(format!(
-                "max_bytes_for_level_multiplier must be finite and > 1.0, got {}",
-                self.max_bytes_for_level_multiplier
+                "max_bytes_for_level_multiplier must be finite and in (1.0, {}], got {}",
+                MAX_LEVEL_MULTIPLIER, self.max_bytes_for_level_multiplier
             )));
         }
         Ok(())
@@ -670,6 +681,39 @@ mod tests {
                 v
             );
         }
+    }
+
+    /// R-loop r4 H#1: regression — finite-but-astronomical multiplier (e.g.
+    /// `f64::MAX`) was bypassing the r3 check. Now bounded above by
+    /// `MAX_LEVEL_MULTIPLIER`.
+    #[test]
+    fn test_validate_rejects_multiplier_above_max() {
+        for v in [
+            MAX_LEVEL_MULTIPLIER + 1.0,
+            1.0e10,
+            1.0e100,
+            1.0e308,
+            f64::MAX,
+        ] {
+            let opts = EngineOptions::builder()
+                .db_path("/tmp/db")
+                .max_bytes_for_level_multiplier(v)
+                .build();
+            assert!(
+                opts.validate().is_err(),
+                "multiplier={} should be rejected (would saturate downstream level capacities to usize::MAX)",
+                v
+            );
+        }
+        // MAX_LEVEL_MULTIPLIER itself is the inclusive upper bound — accepted.
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/db")
+            .max_bytes_for_level_multiplier(MAX_LEVEL_MULTIPLIER)
+            .build();
+        assert!(
+            opts.validate().is_ok(),
+            "MAX_LEVEL_MULTIPLIER itself is accepted"
+        );
     }
 
     #[test]

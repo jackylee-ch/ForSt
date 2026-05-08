@@ -262,6 +262,24 @@ impl Level {
     pub fn value(self) -> u8 {
         self.0
     }
+
+    /// Checked constructor: returns `Err` if `value >= MAX_LEVELS`.
+    ///
+    /// Prefer this over the open `pub` field when accepting an untrusted
+    /// `u8` (e.g. from FFI or on-disk decode); `Level(value)` with
+    /// `value >= MAX_LEVELS` would panic on downstream
+    /// `levels[level.value() as usize]` indexing.
+    /// (R-loop r4 H#2, 2026-05-08; mirrors `SequenceNumber::try_new`.)
+    #[inline]
+    pub fn try_new(value: u8) -> ForstResult<Self> {
+        if (value as usize) >= MAX_LEVELS {
+            return Err(ForstError::invalid_argument(format!(
+                "level {} exceeds MAX_LEVELS ({})",
+                value, MAX_LEVELS
+            )));
+        }
+        Ok(Level(value))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -552,6 +570,26 @@ mod tests {
     fn test_internal_key_new_panics_on_oversize_sequence_in_debug() {
         // Release builds will NOT panic — this test only fires in debug.
         let _ = InternalKey::new(b"k".to_vec(), SequenceNumber(u64::MAX), OpType::Put);
+    }
+
+    /// Regression test for R-loop r4 H#2: `Level::try_new` rejects values
+    /// `>= MAX_LEVELS` (which would panic on downstream level-array indexing).
+    #[test]
+    fn test_level_try_new_in_range() {
+        for v in 0..MAX_LEVELS as u8 {
+            let lvl = Level::try_new(v).unwrap();
+            assert_eq!(lvl, Level(v));
+        }
+    }
+
+    #[test]
+    fn test_level_try_new_rejects_out_of_range() {
+        let res = Level::try_new(MAX_LEVELS as u8);
+        assert!(res.is_err(), "Level({}) should be rejected", MAX_LEVELS);
+        let err = res.unwrap_err();
+        assert!(err.is_invalid_argument());
+        let res = Level::try_new(255);
+        assert!(res.is_err(), "Level(255) should be rejected");
     }
 
     // -----------------------------------------------------------------------
