@@ -33,6 +33,14 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+/// JNI compatibility shim — exports `Java_org_forstdb_RocksDB_*` symbols
+/// so the resulting cdylib is a drop-in for the community
+/// `libforstjni.so` that Apache Flink's `flink-statebackend-forst`
+/// loads. Gated behind the `compat-jni` Cargo feature; see the module
+/// docs for the G-A drop-in goal and threat model.
+#[cfg(feature = "compat-jni")]
+pub mod compat_jni;
+
 use std::ffi::{c_char, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;

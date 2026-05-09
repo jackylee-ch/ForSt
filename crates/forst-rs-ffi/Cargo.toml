@@ -32,3 +32,17 @@ forst-rs-engine = { workspace = true }
 forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
 arrow = { workspace = true }
+
+# Optional JNI shim for G-A drop-in replacement of community ForSt's
+# `libforstjni.so`. Pulled in only when the `compat-jni` feature is enabled
+# so non-Java consumers (and the bulk of CI) don't pay the dependency cost.
+# See `src/compat_jni.rs` and design doc 2.5.
+jni = { version = "0.21", optional = true }
+
+[features]
+default = []
+# Builds the `compat_jni` module exposing `Java_org_forstdb_*` symbols so
+# the resulting cdylib can be renamed to `libforstjni.so` and dropped in
+# place of `com.ververica:forstjni:0.1.8` for an existing Flink
+# `flink-statebackend-forst` deployment (G-A acceptance, design doc 2.5).
+compat-jni = ["dep:jni"]
