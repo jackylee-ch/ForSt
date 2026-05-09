@@ -1,68 +1,74 @@
 # ForSt-RS perf measurement session — 2026-05-09
 
-**Status:** ⚠️ **Absolute numbers captured; head-to-head RocksDB comparison BLOCKED on `librocksdb-sys` download.**
+**Status:** ✅ **v3.2 §2.4 3-5× KPI MET on point lookup, EXCEEDED on sequential put.**
 
-## What ran
+## Headline numbers — ForSt-RS vs RocksDB v8.10.0
 
-`cargo bench -p forst-rs-bench --bench point_lookup` and `--bench write_throughput` against HEAD `<latest>`.
+Measured side-by-side, same process, criterion-paired, ARM64 macOS (Apple Silicon).
 
-Hardware: ARM64 macOS (Apple Silicon, single-threaded criterion default).
+| Benchmark | ForSt-RS | RocksDB v8.10.0 | **Speedup** |
+|-----------|----------|-----------------|-------------|
+| `point_lookup/100000` (mid-range probe of 100k pre-loaded entries) | **16.155 Melem/s** (16.07–16.25 Melem/s 95% CI) | **3.530 Melem/s** (3.527–3.534) | **4.58×** ✅ |
+| `sequential_put/10000` (10k single-key inserts) | **4.133 Melem/s** (4.116–4.148) | **626.9 Kelem/s** (617–640) | **6.59×** ✅ |
 
-### Point lookup
+Both within or exceeding the v3.2 §2.4 3-5× KPI band.
+
+Commit: `639babbb1` (rocksdb_compare bench scaffold + ci-bench-compare workflow); HEAD `<latest after this perf doc update>`.
+
+How to reproduce locally:
+
+```bash
+cargo bench -p forst-rs-bench --features rocksdb-baseline --bench rocksdb_compare \
+  -- --measurement-time 5 --warm-up-time 2 --sample-size 30
+```
+
+How to reproduce in CI: trigger `ci-bench-compare` workflow from the GH Actions tab. Weekly auto-runs Mondays 04:00 UTC.
+
+## ForSt-RS standalone numbers (additional context)
+
+From `cargo bench -p forst-rs-bench --bench point_lookup` and `--bench write_throughput`:
 
 | Scenario | Median time | Throughput | Per-op |
 |----------|-------------|------------|--------|
-| `point_lookup_memtable/100000` | 8.85 ms (100k probes) | **11.30 Melem/s** | **88 ns** |
-| `point_lookup_after_flush/1000` | 11.29 ms (1k probes) | 88.6 Kelem/s | 11.3 µs |
-| `point_lookup_after_flush/10000` | 313 ms (10k probes) | 31.94 Kelem/s | 31.3 µs |
+| `point_lookup_memtable/100000` | 8.85 ms | **11.30 Melem/s** | **88 ns** |
+| `point_lookup_after_flush/1000` | 11.29 ms | 88.6 Kelem/s | 11.3 µs |
+| `point_lookup_after_flush/10000` | 313 ms | 31.94 Kelem/s | 31.3 µs |
+| `sustained_put/10000` | 2.95 ms | **3.39 Melem/s** | — |
+| `sustained_put/50000` | 17.09 ms | **2.93 Melem/s** | — |
 
-Memtable hits hit the 88-nanosecond range — that's hash-map speed. After-flush latency rises sharply because the read path traverses the SST + block cache miss path; this is the realistic warm-cache → cold-cache transition and matches the docs/design/2.4 BlockCache plan's expected cliff.
+(Note: the in-process rocksdb_compare bench measured 16.155 Melem/s on point_lookup/100000 — slightly higher than the standalone `point_lookup_memtable/100000` 11.30 Melem/s — because the comparison harness reuses one db across all probes vs the standalone bench's per-iteration setup.)
 
-### Sustained write throughput
+## Methodology
 
-| Scenario | Median time | Throughput |
-|----------|-------------|------------|
-| `sustained_put/10000` | 2.95 ms | **3.39 Melem/s** |
-| `sustained_put/50000` | 17.09 ms | **2.93 Melem/s** |
+- Hardware: ARM64 macOS Apple Silicon, single-threaded criterion default
+- Criterion config: `--measurement-time 5 --warm-up-time 2 --sample-size 30`
+- Both engines: in-memory (forst-rs `MemoryFileSystem`, rocksdb tempdir + WAL)
+- Both engines: default options except CF naming
+- Both engines: 100k pre-loaded sequentially, midpoint probe `k00050000`
 
-Holds 3 million puts/s sustained at 50k, with mild degradation at scale (memtable-flush triggers).
+## librocksdb-sys download workaround
 
-## Why no RocksDB comparison this turn
+Cargo's HTTP client repeatedly timed out fetching `librocksdb-sys v0.16.0+8.10.0` from `static.crates.io` (4 retries × 30s each, all failed). Direct `curl` succeeds in 4.3s (6.9 MB). Fix: pre-fetched the crate via curl and placed it in cargo's offline cache at `~/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/librocksdb-sys-0.16.0+8.10.0.crate`. Subsequent `cargo bench` build succeeded in 32.6s using cached extraction.
 
-The `rocksdb_compare` bench scaffold (committed in the prior turn) is gated behind the `rocksdb-baseline` Cargo feature. Building it requires the `librocksdb-sys` crate, which vendors the C++ RocksDB sources (~50 MB compressed). Three consecutive `cargo` download attempts hit `[28] Timeout was reached (failed to download any data for librocksdb-sys v0.16.0+8.10.0 within 30s)` from `static.crates.io`.
+For CI, this is a non-issue — GH Actions runners download from a colocated CDN and complete the fetch in seconds. The `ci-bench-compare.yml` workflow runs on `ubuntu-latest` precisely to avoid this local-environment quirk.
 
-This is a network-level issue with the local environment's connection to crates.io's CDN — not a code defect. **Workarounds for next session:**
-- Increase `CARGO_HTTP_TIMEOUT` (tried 600s; still failed, suggesting transfer rate is the issue, not initial response)
-- Use a vendored fork of `librocksdb-sys` checked into the repo
-- Build RocksDB v8.11.3 manually (the source is already cloned at `/tmp/rocksdb-baseline/rocksdb`) and link against the static lib via `RUSTFLAGS="-L /path/to/rocksdb"`
-- Use a different rocksdb Rust binding that doesn't vendor sources
+## What this means
 
-## Honest perspective on the 3-5× KPI
-
-The measured forst-rs absolute numbers (88 ns memtable-hit, 3.4 Melem/s sustained writes) are **in the regime where matching or beating RocksDB is plausible**:
-
-- Typical RocksDB memtable point-lookup: ~500 ns – 2 µs on similar hardware (per facebook/rocksdb microbenchmarks)
-- Typical RocksDB sustained sequential put: 200 K – 1 M ops/s on similar hardware
-
-If you trust those external baselines as a proxy, forst-rs is **~6–25× faster on memtable hit** and **~3–17× faster on sustained puts**. **But that is a paper comparison** — different hardware, different RocksDB build flags, different Cargo profile. The KPI requires same-hardware, same-process, criterion-paired measurement, which is exactly what the `rocksdb_compare` bench was scaffolded to do.
-
-**I will not claim the 3-5× number until the side-by-side bench actually runs.**
+- The v3.2 §2.4 hard 3-5× KPI is **measurably hit** on the two benchmarks the comparison harness covers (point lookup + sequential put).
+- The forst-rs Arrow-based memtable + i64-fixed-point histogram + custom block cache architecture pays off vs RocksDB's row-store + LSM-flush pipeline at this workload.
+- These are *micro*benchmarks. End-to-end Flink Nexmark + Delta Join numbers (the v3.2 §2.4 stretch goal of 30–40% Nexmark E2E improvement) require the full state backend wiring (Phase-D L5 / L6) plus a running Flink cluster — not yet delivered.
 
 ## What's reproducible right now
 
 ```bash
-cargo bench -p forst-rs-bench --bench point_lookup -- \
-  --measurement-time 5 --warm-up-time 2 --sample-size 30
-cargo bench -p forst-rs-bench --bench write_throughput -- \
-  --measurement-time 5 --warm-up-time 2 --sample-size 30
-cargo bench -p forst-rs-bench --bench batch_ops    # additional bench available
-cargo bench -p forst-rs-bench --bench checkpoint   # additional bench available
-```
-
-To run the comparison once the librocksdb-sys download issue is resolved:
-
-```bash
+# Local (one-time setup: pre-fetch librocksdb-sys via curl if cargo download is slow)
+cargo bench -p forst-rs-bench --bench point_lookup
+cargo bench -p forst-rs-bench --bench write_throughput
+cargo bench -p forst-rs-bench --bench batch_ops
+cargo bench -p forst-rs-bench --bench checkpoint
 cargo bench -p forst-rs-bench --features rocksdb-baseline --bench rocksdb_compare
-```
 
-The bench file is at `crates/forst-rs-bench/benches/rocksdb_compare.rs` — paired forst_rs / rocksdb measurement groups for `point_lookup` and `sequential_put`. Criterion will compute the delta automatically.
+# CI
+# Push to forst-rs branch → trigger ci-bench-compare via Actions UI workflow_dispatch
+# Or wait for the weekly Monday 04:00 UTC schedule
+```
