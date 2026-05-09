@@ -83,17 +83,34 @@ Source: `flink-state-backends/flink-statebackend-forst-rs/JMH_BENCHMARK.md` for 
 
 The FFM bridge brings the Java-layer pointLookup throughput (6.81 M ops/s) to **within 2.3× of the Rust engine ceiling** (15.54 M). The JNI shim is **5× off the engine ceiling**. So FFM eliminates roughly half the Java-layer overhead.
 
-### KPI status
+### KPI status (refreshed 2026-05-10 after FFM critical-mode + RocksDB-JNI + batched-put adds)
 
 **v3.2 §2.4 hard KPI: 3× vs RocksDB micros + 30–40% Nexmark E2E.**
 
-The 3× micro-bench KPI is now MET at TWO layers:
-- ✅ Engine (Rust criterion): 4.34× / 6.41×
-- ✅ Java FFM (JMH): 4.08× pointLookup; 1.29× sequentialPut (engine-bound)
+| Layer | Workload | Speedup vs Community ForSt | KPI status |
+|-------|----------|----------------------------|------------|
+| Engine (Rust criterion) | point_lookup | 4.34× | ✅ |
+| Engine (Rust criterion) | sequential_put (10k batched) | 6.41× | ✅ |
+| Engine (Rust criterion) | batched_put (1k WriteBatch) | 3.76× | ✅ |
+| Java JMH (FFM critical) | pointLookup | **3.29×** | ✅ |
+| Java JMH (FFM critical) | sequentialPut single-row | 1.36× | ❌ |
+| Java JMH (FFM critical) | **batchedPut (1k WriteBatch, 25s sustained)** | **0.80×** | ❌ |
 
-The JNI shim path (G-A) is below 3× and is for binary compat, not perf.
+The 3× KPI is met at the engine layer for ALL three workloads (read, single-write, batched-write). At the Java FFM layer, only point-lookup hits 3×.
 
-The Nexmark E2E KPI (30-40% on Flink Nexmark) is still pending — requires the full `CheckpointableKeyedStateBackend` interface compliance (Phase-D L6) plus a running Flink cluster.
+**Why the divergence on batched-write**: criterion uses `iter_batched` which resets the engine per timing window — never crosses a memtable-flush threshold. JMH runs 25 s sustained. The 64 MB memtable budget saturates, and ForSt-RS spends a meaningful chunk of the window on L0 flush + L0→L1 compaction. Community ForSt's RocksDB-fork compaction pacing has been tuned over years; ForSt-RS's hasn't yet. This is a real engineering gap, not a bridge artifact (the FFM bench pre-stages all keys/values + pointer arrays in a long-lived native arena, so downcall+Rust work IS the bottleneck, and the bottleneck is L0/L1 compaction throughput).
+
+**The JNI shim path (G-A drop-in)** is uniformly below 3× — that path is for binary compat, not perf.
+
+**The Nexmark E2E KPI (30-40% on Flink Nexmark)** is still pending — requires the full `CheckpointableKeyedStateBackend` interface compliance (Phase-D L6) plus a running Flink cluster.
+
+**About a "ForSt on the native side" comparison**: community ForSt is C++/Java only — its native engine is a RocksDB v8.x fork with stream-state patches. There's no native Rust binding. The closest native-layer proxy is the rocksdb-rs criterion numbers already in the table (3.58 M point_lookup vs forst-rs 15.54 M). Building forst's C++ from source for direct native-layer measurement is significant separate work (vendor the v8.x fork, build static lib, link via build.rs).
+
+### Next steps to close the Java-layer write gap
+
+1. **Tune ForSt-RS L0 compaction pace** under sustained 1k-row WriteBatch ingestion at the 64 MB memtable budget — engine-team work, would close the JMH gap without changing the bridge.
+2. **Larger memtable budget** for write-heavy workloads (config knob already exposed; just hasn't been tuned in the bench).
+3. **Arrow-vectorized memtable** from design doc 2.3 — would reduce per-row insertion cost which raises the memtable-flush ceiling.
 
 ### How to reproduce
 

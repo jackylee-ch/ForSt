@@ -34,7 +34,11 @@ use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use forst_rs_bench::{create_cf, open_in_memory, seed_sequential};
-use rocksdb::{ColumnFamilyDescriptor as RocksCfDesc, Options as RocksOpts, DB as RocksDb};
+use forst_rs_engine::WriteBatch as FrsWriteBatch;
+use rocksdb::{
+    ColumnFamilyDescriptor as RocksCfDesc, Options as RocksOpts, WriteBatch as RocksWriteBatch,
+    DB as RocksDb,
+};
 use tempfile::TempDir;
 
 /// BM-1.1 — point lookup latency. Compares 100k pre-loaded entries.
@@ -150,5 +154,80 @@ fn bench_sequential_put(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(rocksdb_compare, bench_point_lookup, bench_sequential_put);
+/// BM-1.4 — batched put throughput.
+///
+/// Mirrors the Java JMH `batchedPut` workload: BATCH_SIZE rows per WriteBatch,
+/// per timing iteration. This is the realistic write hot path for production
+/// state backends (Flink emits WriteBatches at checkpoint barriers); the
+/// per-row LSM cost is amortized over the batch and the RocksDB-vs-ForSt-RS
+/// engine ratio compresses to the steady-state SST-write ratio.
+fn bench_batched_put(c: &mut Criterion) {
+    const N: u32 = 1_000;
+    let mut group = c.benchmark_group("batched_put");
+    group.throughput(Throughput::Elements(N as u64));
+
+    // Pre-generate the batch payload once; the per-iter cost is just batch
+    // construction + apply, no key/value allocation in the hot loop.
+    let payload: Vec<(Vec<u8>, Vec<u8>)> = (0..N)
+        .map(|i| {
+            let k = format!("bk{:010}", i).into_bytes();
+            let v = format!("bv{:010}", i).into_bytes();
+            (k, v)
+        })
+        .collect();
+
+    group.bench_function(BenchmarkId::new("forst_rs", N), |b| {
+        b.iter_batched(
+            || {
+                let db = open_in_memory(64 * 1024 * 1024);
+                let cf = create_cf(&db, "bench-cf");
+                (db, cf)
+            },
+            |(db, cf)| {
+                let mut wb = FrsWriteBatch::with_capacity(N as usize);
+                for (k, v) in &payload {
+                    wb.put(&cf, k, v);
+                }
+                db.batch_write(wb).expect("frs batch_write");
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function(BenchmarkId::new("rocksdb", N), |b| {
+        b.iter_batched(
+            || {
+                let tmp = TempDir::new().expect("tempdir");
+                let mut opts = RocksOpts::default();
+                opts.create_if_missing(true);
+                opts.create_missing_column_families(true);
+                let db = RocksDb::open_cf_descriptors(
+                    &opts,
+                    tmp.path(),
+                    vec![RocksCfDesc::new("bench", RocksOpts::default())],
+                )
+                .expect("rocksdb open");
+                (db, tmp)
+            },
+            |(db, _tmp)| {
+                let cf = db.cf_handle("bench").expect("rocksdb cf");
+                let mut wb = RocksWriteBatch::default();
+                for (k, v) in &payload {
+                    wb.put_cf(&cf, k, v);
+                }
+                db.write(wb).expect("rocksdb write");
+            },
+            criterion::BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    rocksdb_compare,
+    bench_point_lookup,
+    bench_sequential_put,
+    bench_batched_put
+);
 criterion_main!(rocksdb_compare);
