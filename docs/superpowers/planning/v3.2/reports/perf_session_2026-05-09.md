@@ -1,6 +1,10 @@
-# ForSt-RS perf measurement session — 2026-05-09
+# ForSt-RS perf measurement session — 2026-05-09 / 2026-05-10
 
-**Status:** ✅ **v3.2 §2.4 3-5× KPI MET on point lookup, EXCEEDED on sequential put.**
+**Status (engine-level, native Rust):** ✅ **v3.2 §2.4 3-5× KPI MET on point lookup, EXCEEDED on sequential put.**
+
+**Status (Flink-user-visible, Java/JNI):** ⚠️ **1.3–1.5× vs community ForSt — meaningful gain but BELOW 3× KPI when measured at the JNI surface where Flink users actually consume the engine.**
+
+The 3-way comparison the user asked for (rocksdb / community-ForSt / forst-rs) is now complete. See "3-way numbers" section below.
 
 ## Headline numbers — ForSt-RS vs RocksDB v8.10.0
 
@@ -51,6 +55,23 @@ From `cargo bench -p forst-rs-bench --bench point_lookup` and `--bench write_thr
 Cargo's HTTP client repeatedly timed out fetching `librocksdb-sys v0.16.0+8.10.0` from `static.crates.io` (4 retries × 30s each, all failed). Direct `curl` succeeds in 4.3s (6.9 MB). Fix: pre-fetched the crate via curl and placed it in cargo's offline cache at `~/.cargo/registry/cache/index.crates.io-1949cf8c6b5b557f/librocksdb-sys-0.16.0+8.10.0.crate`. Subsequent `cargo bench` build succeeded in 32.6s using cached extraction.
 
 For CI, this is a non-issue — GH Actions runners download from a colocated CDN and complete the fetch in seconds. The `ci-bench-compare.yml` workflow runs on `ubuntu-latest` precisely to avoid this local-environment quirk.
+
+## 3-way numbers (added 2026-05-10)
+
+| Layer | Workload | ForSt-RS | Comparison engine | Speedup |
+|-------|----------|----------|-------------------|---------|
+| **Rust criterion** | point_lookup/100k | 16.155 Melem/s | RocksDB v8.10.0: 3.530 Melem/s | **4.58×** ✅ |
+| **Rust criterion** | sequential_put/10k | 4.133 Melem/s | RocksDB v8.10.0: 627 Kelem/s | **6.59×** ✅ |
+| **Java JMH (JNI shim)** | pointLookup memtable | 3.10 Melem/s | Community ForSt: 2.06 Melem/s | **1.50×** ⚠️ |
+| **Java JMH (JNI shim)** | sequentialPut | 751 Kelem/s | Community ForSt: 583 Kelem/s | **1.29×** ⚠️ |
+
+Source: `flink-state-backends/flink-statebackend-forst-rs/JMH_BENCHMARK.md` for the JMH numbers; `crates/forst-rs-bench/benches/rocksdb_compare.rs` for the criterion numbers.
+
+**The honest read:** the engine-level Rust speed advantage (4.58–6.59×) is significantly attenuated by JNI marshaling cost when consumed via the G-A drop-in shim path (Java → JNI → frs_*). A Flink user who renames `libforst_rs_ffi.dylib` to `libforstjni.dylib` and substitutes it for community ForSt's cdylib will see ~1.3–1.5× perf, not 4–7×.
+
+**Implication for the v3.2 §2.4 KPI:** the 3× KPI is met if "micros" is interpreted at the engine (Rust) level. It is NOT met at the JNI-consumed Java level. The full 4-7× engine win is recoverable only via the G-B FFM-bridge path (`ForStRsStateBackend` via JDK 25 `Linker`/`MemorySegment`, bypassing JNI), but that path requires Flink-side wiring (Phase-D L5/L6) and isn't yet wired through the actual Flink keyed-state-handle machinery.
+
+**Future bench**: extend `ForStCompareBenchmark` with a third "via-FFM" variant using `ForStRsLinker` directly to isolate JNI cost from FFM cost from native cost.
 
 ## What this means
 
