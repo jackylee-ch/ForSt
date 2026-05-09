@@ -27,6 +27,7 @@ forst-rs-common = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+opendal = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

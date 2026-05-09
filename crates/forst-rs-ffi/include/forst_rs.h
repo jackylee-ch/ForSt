@@ -33,6 +33,7 @@
  * across the FFI boundary.
  */
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -65,6 +66,7 @@ extern "C" {
 
 typedef void* FrsDb;
 typedef void* FrsCfHandle;
+typedef void* FrsIterator;
 
 typedef struct {
     uint8_t* data;
@@ -189,6 +191,57 @@ int32_t frs_prefix_scan_arrow(FrsDb handle, FrsCfHandle cf,
                               const uint8_t* prefix, size_t prefix_len,
                               struct FFI_ArrowArray* out_array,
                               struct FFI_ArrowSchema* out_schema);
+
+/* -------------------------------------------------------------------- */
+/* 9. Delta-Join lookup (single-key + iterator)                         */
+/* -------------------------------------------------------------------- */
+/*
+ * Backs the Flink Delta-Join localization story
+ * (docs/design/2.13_deltajoin_localization.md): exact-match probes via
+ * frs_lookup_kv, prefix / range scans via the iterator family.
+ *
+ * NOTE: the current iterator implementation snapshot-and-collects all
+ * matching rows at open time — memory cost is O(scanned bytes). Bound
+ * the range with frs_prefix_lookup_open or seek closely until a true
+ * streaming iterator lands.
+ *
+ * On a missing key, frs_lookup_kv returns FRS_STATUS_OK with
+ * out_value->data = NULL (mirrors frs_get).
+ *
+ * frs_iterator_next sets *out_valid = false on exhaustion, with status
+ * still FRS_STATUS_OK. Returned FrsBytes are heap-owned by Rust; the
+ * caller must release each via frs_bytes_free.
+ */
+
+int32_t frs_lookup_kv(FrsDb handle, FrsCfHandle cf,
+                      const uint8_t* key, size_t key_len,
+                      FrsBytes* out_value);
+
+int32_t frs_iterator_open(FrsDb handle, FrsCfHandle cf,
+                          FrsIterator* out_iter);
+
+int32_t frs_iterator_seek(FrsIterator iter,
+                          const uint8_t* key, size_t key_len);
+
+int32_t frs_iterator_next(FrsIterator iter,
+                          FrsBytes* out_key,
+                          FrsBytes* out_value,
+                          bool* out_valid);
+
+int32_t frs_iterator_close(FrsIterator iter);
+
+int32_t frs_prefix_lookup_open(FrsDb handle, FrsCfHandle cf,
+                               const uint8_t* prefix, size_t prefix_len,
+                               FrsIterator* out_iter);
+
+/* Convenience aliases for the prefix iterator family — internally these
+ * forward to frs_iterator_next / frs_iterator_close. */
+int32_t frs_prefix_lookup_next(FrsIterator iter,
+                               FrsBytes* out_key,
+                               FrsBytes* out_value,
+                               bool* out_valid);
+
+int32_t frs_prefix_lookup_close(FrsIterator iter);
 
 #ifdef __cplusplus
 } /* extern "C" */

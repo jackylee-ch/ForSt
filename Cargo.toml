@@ -51,6 +51,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "io-util", "fs", "sync",
 tracing = "0.1"
 arc-swap = "1"
 
+# Object-storage / unified I/O (S3, GCS, Azure, local FS, memory)
+# `layers-blocking` is required so OpendalFileSystem can serve sync FileSystem
+# trait calls from any thread (with or without an ambient tokio runtime).
+opendal = { version = "0.50", default-features = false, features = ["services-fs", "services-memory", "services-s3", "layers-blocking"] }
+
 # Compression
 lz4_flex = "0.11"
 zstd = "0.13"

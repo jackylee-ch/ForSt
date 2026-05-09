@@ -28,7 +28,8 @@
 //! This design follows the RocksDB/ForSt `Env` routing pattern and aligns
 //! with the DeltaJoin localization design (Section 5.2).
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use forst_rs_common::error::{ForstError, ForstResult};
@@ -85,6 +86,14 @@ use crate::filesystem::{
 pub struct FileSystemRouter {
     local_fs: Arc<dyn FileSystem>,
     remote_fs: Option<Arc<dyn FileSystem>>,
+    /// Optional scheme-prefix → filesystem registry.
+    ///
+    /// When a path starts with one of these prefixes (e.g., `s3://`,
+    /// `opendal://`), the router strips the prefix and dispatches to the
+    /// registered filesystem. This is independent of the legacy SST→remote
+    /// extension routing (which still applies to non-prefixed paths) and
+    /// is the recommended way to wire OpenDAL-backed services.
+    scheme_fs: HashMap<String, Arc<dyn FileSystem>>,
 }
 
 impl FileSystemRouter {
@@ -96,6 +105,7 @@ impl FileSystemRouter {
         Self {
             local_fs,
             remote_fs: None,
+            scheme_fs: HashMap::new(),
         }
     }
 
@@ -107,7 +117,51 @@ impl FileSystemRouter {
         Self {
             local_fs,
             remote_fs: Some(remote_fs),
+            scheme_fs: HashMap::new(),
         }
+    }
+
+    /// Registers a filesystem under a scheme prefix (e.g., `"s3://"`,
+    /// `"opendal://"`).
+    ///
+    /// After registration, any path that starts with `prefix` is routed
+    /// to `fs`, with the prefix stripped before being passed downstream.
+    /// This is the recommended way to wire OpenDAL-backed remote stores
+    /// alongside the local filesystem.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use forst_rs_io::filesystem::FileSystem;
+    /// use forst_rs_io::memory_fs::MemoryFileSystem;
+    /// use forst_rs_io::opendal_backend::OpendalFileSystem;
+    /// use forst_rs_io::router::FileSystemRouter;
+    ///
+    /// let local = Arc::new(MemoryFileSystem::new());
+    /// let mut router = FileSystemRouter::new(local);
+    /// let remote = Arc::new(OpendalFileSystem::memory().unwrap());
+    /// router.register_scheme("opendal://", remote);
+    /// ```
+    pub fn register_scheme(&mut self, prefix: &str, fs: Arc<dyn FileSystem>) {
+        self.scheme_fs.insert(prefix.to_string(), fs);
+    }
+
+    /// Returns the registered filesystem for `prefix`, if any.
+    pub fn scheme_fs(&self, prefix: &str) -> Option<&Arc<dyn FileSystem>> {
+        self.scheme_fs.get(prefix)
+    }
+
+    /// If `path` starts with any registered scheme prefix, returns
+    /// `(filesystem, stripped_path)`. Otherwise returns `None`.
+    fn match_scheme<'a>(&'a self, path: &Path) -> Option<(&'a Arc<dyn FileSystem>, PathBuf)> {
+        let s = path.to_str()?;
+        for (prefix, fs) in &self.scheme_fs {
+            if let Some(rest) = s.strip_prefix(prefix.as_str()) {
+                return Some((fs, PathBuf::from(rest)));
+            }
+        }
+        None
     }
 
     /// Returns `true` if the file at `path` should be stored remotely.
@@ -153,10 +207,16 @@ impl FileSystemRouter {
 
 impl FileSystem for FileSystemRouter {
     fn open_sequential_file(&self, path: &Path) -> ForstResult<Box<dyn SequentialFile>> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.open_sequential_file(&stripped);
+        }
         self.route(path).open_sequential_file(path)
     }
 
     fn open_random_access_file(&self, path: &Path) -> ForstResult<Box<dyn RandomAccessFile>> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.open_random_access_file(&stripped);
+        }
         self.route(path).open_random_access_file(path)
     }
 
@@ -165,18 +225,30 @@ impl FileSystem for FileSystemRouter {
         path: &Path,
         mode: WriteMode,
     ) -> ForstResult<Box<dyn WritableFile>> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.open_writable_file(&stripped, mode);
+        }
         self.route(path).open_writable_file(path, mode)
     }
 
     fn file_exists(&self, path: &Path) -> ForstResult<bool> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.file_exists(&stripped);
+        }
         self.route(path).file_exists(path)
     }
 
     fn get_file_metadata(&self, path: &Path) -> ForstResult<FileMetadata> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.get_file_metadata(&stripped);
+        }
         self.route(path).get_file_metadata(path)
     }
 
     fn list_dir(&self, dir: &Path) -> ForstResult<Vec<FileMetadata>> {
+        if let Some((fs, stripped)) = self.match_scheme(dir) {
+            return fs.list_dir(&stripped);
+        }
         // Directory listing is always handled by the local filesystem,
         // because directories (WAL dir, db dir, etc.) live locally.
         //
@@ -188,21 +260,55 @@ impl FileSystem for FileSystemRouter {
     }
 
     fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+        if let Some((fs, stripped)) = self.match_scheme(dir) {
+            return fs.create_dir_all(&stripped);
+        }
         // Directories are always local; remote object stores typically
         // do not have real directories.
         self.local_fs.create_dir_all(dir)
     }
 
     fn delete_file(&self, path: &Path) -> ForstResult<()> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.delete_file(&stripped);
+        }
         self.route(path).delete_file(path)
     }
 
     fn delete_dir(&self, path: &Path, recursive: bool) -> ForstResult<()> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.delete_dir(&stripped, recursive);
+        }
         // Directories are always local.
         self.local_fs.delete_dir(path, recursive)
     }
 
     fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+        // Scheme-prefixed renames must stay within the same registered
+        // filesystem (we cannot move bytes across backends in one op).
+        let src_match = self.match_scheme(src);
+        let dst_match = self.match_scheme(dst);
+        match (src_match, dst_match) {
+            (Some((sfs, ssrc)), Some((dfs, sdst))) => {
+                if !Arc::ptr_eq(sfs, dfs) {
+                    return Err(ForstError::invalid_argument(format!(
+                        "cannot rename across registered schemes: src={} dst={}",
+                        src.display(),
+                        dst.display(),
+                    )));
+                }
+                return sfs.rename(&ssrc, &sdst);
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ForstError::invalid_argument(format!(
+                    "cannot rename across filesystems (scheme vs unscheme): src={} dst={}",
+                    src.display(),
+                    dst.display(),
+                )));
+            }
+            (None, None) => {}
+        }
+
         // Both src and dst must be on the same filesystem.
         let src_remote = Self::is_remote_file(src);
         let dst_remote = Self::is_remote_file(dst);
@@ -748,6 +854,53 @@ mod tests {
         let (_, _, router) = create_tiered_router();
         assert!(router.remote_fs().is_some());
         assert_eq!(router.remote_fs().unwrap().name(), "MemoryFileSystem");
+    }
+
+    // -- Scheme registry -----------------------------------------------------
+
+    #[test]
+    fn test_register_scheme_routes_writes_and_reads() {
+        let local = Arc::new(MemoryFileSystem::new());
+        let remote = Arc::new(MemoryFileSystem::new());
+        let mut router = FileSystemRouter::new(Arc::clone(&local) as Arc<dyn FileSystem>);
+        router.register_scheme("opendal://", Arc::clone(&remote) as Arc<dyn FileSystem>);
+
+        // Pre-create the target directory on the remote so
+        // MemoryFileSystem accepts the write (mirrors POSIX).
+        remote.create_dir_all(Path::new("data")).unwrap();
+
+        // Write through the scheme prefix.
+        let mut w = router
+            .open_writable_file(Path::new("opendal://data/000001.sst"), WriteMode::CreateNew)
+            .unwrap();
+        w.append(b"remote-via-scheme").unwrap();
+        drop(w);
+
+        // The bytes live on the registered remote (without the prefix).
+        assert!(remote.file_exists(Path::new("data/000001.sst")).unwrap());
+        // And NOT on the local filesystem under either name.
+        assert!(!local
+            .file_exists(Path::new("opendal://data/000001.sst"))
+            .unwrap());
+        assert!(!local.file_exists(Path::new("data/000001.sst")).unwrap());
+
+        // Read back through the scheme prefix.
+        let mut r = router
+            .open_sequential_file(Path::new("opendal://data/000001.sst"))
+            .unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = r.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"remote-via-scheme");
+    }
+
+    #[test]
+    fn test_register_scheme_accessor() {
+        let local = Arc::new(MemoryFileSystem::new());
+        let remote = Arc::new(MemoryFileSystem::new());
+        let mut router = FileSystemRouter::new(local);
+        router.register_scheme("s3://", Arc::clone(&remote) as Arc<dyn FileSystem>);
+        assert!(router.scheme_fs("s3://").is_some());
+        assert!(router.scheme_fs("gs://").is_none());
     }
 
     #[test]

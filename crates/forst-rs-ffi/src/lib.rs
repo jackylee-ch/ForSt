@@ -52,6 +52,14 @@ use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
 /// chunk into multiple calls.
 pub const MAX_BATCH_COUNT: usize = 1_000_000;
 
+/// Defense-in-depth cap on per-key (or per-prefix) byte length. The C
+/// caller could otherwise push a fabricated `key_len` or `prefix_len`
+/// at `slice::from_raw_parts`, driving the engine to scan / hash / index
+/// bogus untrusted memory. 1 MiB is well above any realistic key size
+/// for an LSM (RocksDB recommends ≤ 8 KiB); see Delta-Join Lookup design
+/// (2.13_deltajoin_localization.md) for the consumer-side budget.
+pub const MAX_KEY_LEN: usize = 1 << 20;
+
 // ---------------------------------------------------------------------------
 // Status codes
 // ---------------------------------------------------------------------------
@@ -108,6 +116,17 @@ pub type FrsDb = *mut c_void;
 /// `frs_cf_close`. Safe to share across threads — all engine operations are
 /// thread-safe.
 pub type FrsCfHandle = *mut c_void;
+
+/// A handle to an open iterator. Created by `frs_iterator_open` (full CF
+/// scan) or `frs_prefix_lookup_open` (prefix-bounded scan). Destroyed by
+/// `frs_iterator_close` / `frs_prefix_lookup_close`.
+///
+/// The current implementation materializes the full key/value set at
+/// open time (snapshot-and-collect) because the underlying engine does
+/// not yet expose a streaming iterator (see W26 follow-up). Memory cost
+/// is therefore O(scanned bytes); callers should constrain the iteration
+/// range via `frs_prefix_lookup_open` or seek closely.
+pub type FrsIterator = *mut c_void;
 
 /// Byte slice owned by Rust; consumers must call [`frs_bytes_free`] to
 /// release after use.
@@ -1254,6 +1273,268 @@ pub unsafe extern "C" fn frs_prefix_scan_arrow(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 9. Delta-Join Lookup (single-key + iterator)
+// ---------------------------------------------------------------------------
+//
+// These entry points back the Delta-Join localization story
+// (`docs/design/2.13_deltajoin_localization.md`). Flink calls
+// `frs_lookup_kv` for exact-match probes and the iterator family for
+// prefix / range scans against the local lookup CF.
+//
+// Iterators here use a **snapshot + collect** approach: at `_open` time
+// we materialize all matching key/value pairs into an owned `Vec` and
+// then advance through them via a cursor. This is functionally correct
+// and snapshot-isolated against subsequent writes, but memory cost is
+// O(materialized bytes) rather than O(1). When the engine grows a true
+// streaming iterator (W26+), this layer can be rewritten without ABI
+// change.
+
+/// Iterator state held behind the opaque [`FrsIterator`] pointer.
+///
+/// Fields are intentionally `pub(crate)` — only this module mutates the
+/// cursor; callers see only the opaque handle.
+struct IteratorState {
+    /// Materialized (key, value) pairs in ascending key order.
+    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Index of the *next* row to be returned by `frs_iterator_next`.
+    cursor: usize,
+}
+
+impl IteratorState {
+    fn new(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        Self { rows, cursor: 0 }
+    }
+}
+
+/// Single-key exact-match lookup, optimised for the Delta-Join probe
+/// path. Semantically equivalent to [`frs_get`] but kept as a separate
+/// symbol so future revisions can specialise (e.g., caching layer,
+/// micro-batch coalescing) without churning the Get ABI.
+///
+/// On a missing key, returns `FRS_STATUS_OK` with `out_value->data = NULL`
+/// and `out_value->len = 0` (matching [`frs_get`] semantics — callers
+/// distinguish hit vs miss by checking `data`).
+#[no_mangle]
+pub unsafe extern "C" fn frs_lookup_kv(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    key: *const u8,
+    key_len: usize,
+    out_value: *mut FrsBytes,
+) -> i32 {
+    guarded(|| {
+        if out_value.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if key.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        // SECURITY: bound the C-side key length before constructing the
+        // slice. An untrusted Java/JNI caller could otherwise pass an
+        // attacker-chosen `key_len` and trigger an out-of-bounds read on
+        // engine-internal hash / comparator paths.
+        if key_len > MAX_KEY_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let k = slice::from_raw_parts(key, key_len);
+        match db.get(cf, k) {
+            Ok(Some(v)) => {
+                *out_value = FrsBytes::from_vec(v);
+                FRS_STATUS_OK
+            }
+            Ok(None) => {
+                *out_value = FrsBytes::NULL;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Opens a forward iterator over the entire column family.
+///
+/// Implementation: snapshot the CF via `db.scan` (empty lower bound, no
+/// upper bound) and stash the rows behind the returned handle. See the
+/// module-level Delta-Join comment for the memory caveat.
+#[no_mangle]
+pub unsafe extern "C" fn frs_iterator_open(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    out_iter: *mut FrsIterator,
+) -> i32 {
+    guarded(|| {
+        if out_iter.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        // Empty lower / unbounded upper → full scan.
+        let rows = match db.scan(cf, &[][..], None) {
+            Ok(r) => r,
+            Err(e) => return error_to_status(&e),
+        };
+        let boxed = Box::new(IteratorState::new(rows));
+        *out_iter = Box::into_raw(boxed) as *mut c_void;
+        FRS_STATUS_OK
+    })
+}
+
+/// Opens a forward iterator bounded to the keys whose byte prefix
+/// matches `prefix`. A NULL/empty prefix degenerates to a full CF scan
+/// (matching [`frs_prefix_scan_arrow`] semantics).
+#[no_mangle]
+pub unsafe extern "C" fn frs_prefix_lookup_open(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    prefix: *const u8,
+    prefix_len: usize,
+    out_iter: *mut FrsIterator,
+) -> i32 {
+    guarded(|| {
+        if out_iter.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        // SECURITY: bound the prefix length, same rationale as
+        // frs_lookup_kv's `key_len` cap.
+        if prefix_len > MAX_KEY_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let prefix_slice = if prefix.is_null() || prefix_len == 0 {
+            &[][..]
+        } else {
+            slice::from_raw_parts(prefix, prefix_len)
+        };
+        let rows = match db.prefix_scan(cf, prefix_slice) {
+            Ok(r) => r,
+            Err(e) => return error_to_status(&e),
+        };
+        let boxed = Box::new(IteratorState::new(rows));
+        *out_iter = Box::into_raw(boxed) as *mut c_void;
+        FRS_STATUS_OK
+    })
+}
+
+/// Repositions the cursor at the first key `>= key`. After this call,
+/// the next [`frs_iterator_next`] returns that key (or `valid = false`
+/// if no such key exists in the materialized set).
+///
+/// `key = NULL` / `key_len = 0` is treated as "seek to first" — equivalent
+/// to a fresh open.
+#[no_mangle]
+pub unsafe extern "C" fn frs_iterator_seek(
+    iter: FrsIterator,
+    key: *const u8,
+    key_len: usize,
+) -> i32 {
+    guarded(|| {
+        if iter.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        if key_len > MAX_KEY_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let state = &mut *(iter as *mut IteratorState);
+        let needle: &[u8] = if key.is_null() || key_len == 0 {
+            &[][..]
+        } else {
+            slice::from_raw_parts(key, key_len)
+        };
+        // Binary search for the first key >= needle; saturate at len.
+        state.cursor = state
+            .rows
+            .binary_search_by(|(k, _)| k.as_slice().cmp(needle))
+            .unwrap_or_else(|insert| insert);
+        FRS_STATUS_OK
+    })
+}
+
+/// Advances the iterator and returns the current key/value. On exhaustion
+/// `*out_valid` is set to `false`, both `FrsBytes` slots are `NULL`, and
+/// the status is still `FRS_STATUS_OK`.
+///
+/// Returned `FrsBytes` are heap-owned by Rust; the caller MUST release
+/// them via [`frs_bytes_free`] after use.
+#[no_mangle]
+pub unsafe extern "C" fn frs_iterator_next(
+    iter: FrsIterator,
+    out_key: *mut FrsBytes,
+    out_value: *mut FrsBytes,
+    out_valid: *mut bool,
+) -> i32 {
+    guarded(|| {
+        if iter.is_null() || out_key.is_null() || out_value.is_null() || out_valid.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let state = &mut *(iter as *mut IteratorState);
+        if state.cursor >= state.rows.len() {
+            *out_key = FrsBytes::NULL;
+            *out_value = FrsBytes::NULL;
+            *out_valid = false;
+            return FRS_STATUS_OK;
+        }
+        // Move out of the row by swap so the engine's snapshot vec keeps
+        // its slots populated with empty placeholders (no Vec re-shift).
+        let (k, v) = std::mem::take(&mut state.rows[state.cursor]);
+        state.cursor += 1;
+        *out_key = FrsBytes::from_vec(k);
+        *out_value = FrsBytes::from_vec(v);
+        *out_valid = true;
+        FRS_STATUS_OK
+    })
+}
+
+/// Releases an iterator opened by [`frs_iterator_open`] or
+/// [`frs_prefix_lookup_open`]. Safe to call with NULL (no-op).
+#[no_mangle]
+pub unsafe extern "C" fn frs_iterator_close(iter: FrsIterator) -> i32 {
+    guarded(|| {
+        if iter.is_null() {
+            return FRS_STATUS_OK;
+        }
+        let ptr = iter as *mut IteratorState;
+        drop(Box::from_raw(ptr));
+        FRS_STATUS_OK
+    })
+}
+
+/// Convenience alias for prefix-iterator callers — semantically identical
+/// to [`frs_iterator_close`]. Exposed so the C header can document a
+/// `frs_prefix_lookup_*` family that mirrors `frs_iterator_*`.
+#[no_mangle]
+pub unsafe extern "C" fn frs_prefix_lookup_close(iter: FrsIterator) -> i32 {
+    frs_iterator_close(iter)
+}
+
+/// Convenience alias for prefix-iterator callers — semantically identical
+/// to [`frs_iterator_next`]. Exposed for symmetry with
+/// [`frs_prefix_lookup_open`] / [`frs_prefix_lookup_close`].
+#[no_mangle]
+pub unsafe extern "C" fn frs_prefix_lookup_next(
+    iter: FrsIterator,
+    out_key: *mut FrsBytes,
+    out_value: *mut FrsBytes,
+    out_valid: *mut bool,
+) -> i32 {
+    frs_iterator_next(iter, out_key, out_value, out_valid)
+}
+
 fn put_batch_schema() -> std::sync::Arc<Schema> {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("key", DataType::Binary, false),
@@ -2044,6 +2325,323 @@ mod tests {
             frs_bytes_free(&mut out);
 
             frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    // --- Delta-Join lookup FFI tests ---
+
+    #[test]
+    fn test_lookup_kv_existing() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let k = b"hello";
+            let v = b"world";
+            assert_eq!(
+                frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                FRS_STATUS_OK
+            );
+
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_lookup_kv(db, cf, k.as_ptr(), k.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            assert!(!out.data.is_null());
+            assert_eq!(slice::from_raw_parts(out.data, out.len), v);
+            frs_bytes_free(&mut out);
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_lookup_kv_missing() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let k = b"absent";
+            let mut out = FrsBytes::NULL;
+            // Missing key → Ok status, NULL FrsBytes (matches frs_get).
+            assert_eq!(
+                frs_lookup_kv(db, cf, k.as_ptr(), k.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            assert!(out.data.is_null());
+            assert_eq!(out.len, 0);
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_lookup_kv_validates_pointers() {
+        unsafe {
+            // out_value NULL.
+            assert_eq!(
+                frs_lookup_kv(
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    0,
+                    ptr::null_mut()
+                ),
+                FRS_STATUS_NULL_ARG
+            );
+
+            // db NULL but other args sane.
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_lookup_kv(ptr::null_mut(), ptr::null_mut(), b"k".as_ptr(), 1, &mut out,),
+                FRS_STATUS_NULL_ARG
+            );
+
+            // cf NULL: db open but cf null.
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_lookup_kv(db, ptr::null_mut(), b"k".as_ptr(), 1, &mut out),
+                FRS_STATUS_NULL_ARG
+            );
+
+            // key NULL but key_len > 0.
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            frs_db_default_cf(db, &mut cf);
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_lookup_kv(db, cf, ptr::null(), 4, &mut out),
+                FRS_STATUS_NULL_ARG
+            );
+
+            // key_len > MAX_KEY_LEN must be rejected.
+            let bogus_ptr = b"k".as_ptr();
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_lookup_kv(db, cf, bogus_ptr, MAX_KEY_LEN + 1, &mut out),
+                FRS_STATUS_INVALID_ARGUMENT
+            );
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_iterator_full_scan() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Insert in non-sorted order so we can verify the iterator
+            // returns sorted output.
+            let pairs: &[(&[u8], &[u8])] = &[
+                (b"k3", b"v3"),
+                (b"k1", b"v1"),
+                (b"k5", b"v5"),
+                (b"k2", b"v2"),
+                (b"k4", b"v4"),
+            ];
+            for (k, v) in pairs {
+                assert_eq!(
+                    frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                    FRS_STATUS_OK
+                );
+            }
+
+            let mut iter: FrsIterator = ptr::null_mut();
+            assert_eq!(frs_iterator_open(db, cf, &mut iter), FRS_STATUS_OK);
+            assert!(!iter.is_null());
+
+            let mut collected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            loop {
+                let mut k_out = FrsBytes::NULL;
+                let mut v_out = FrsBytes::NULL;
+                let mut valid = false;
+                assert_eq!(
+                    frs_iterator_next(iter, &mut k_out, &mut v_out, &mut valid),
+                    FRS_STATUS_OK
+                );
+                if !valid {
+                    break;
+                }
+                let k_vec = slice::from_raw_parts(k_out.data, k_out.len).to_vec();
+                let v_vec = slice::from_raw_parts(v_out.data, v_out.len).to_vec();
+                collected.push((k_vec, v_vec));
+                frs_bytes_free(&mut k_out);
+                frs_bytes_free(&mut v_out);
+            }
+
+            assert_eq!(collected.len(), 5);
+            // Engine returns keys in sorted (ascending byte) order.
+            assert_eq!(collected[0].0, b"k1");
+            assert_eq!(collected[1].0, b"k2");
+            assert_eq!(collected[2].0, b"k3");
+            assert_eq!(collected[3].0, b"k4");
+            assert_eq!(collected[4].0, b"k5");
+            assert_eq!(collected[0].1, b"v1");
+            assert_eq!(collected[4].1, b"v5");
+
+            assert_eq!(frs_iterator_close(iter), FRS_STATUS_OK);
+            // Closing twice (NULL after first close) is safe — guarded by the
+            // is_null branch.
+            assert_eq!(frs_iterator_close(ptr::null_mut()), FRS_STATUS_OK);
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_iterator_seek() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            for i in 0..5u32 {
+                let k = format!("k{}", i);
+                let v = format!("v{}", i);
+                frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+            }
+
+            let mut iter: FrsIterator = ptr::null_mut();
+            assert_eq!(frs_iterator_open(db, cf, &mut iter), FRS_STATUS_OK);
+
+            // Seek to "k3" — first read should be k3.
+            assert_eq!(frs_iterator_seek(iter, b"k3".as_ptr(), 2), FRS_STATUS_OK);
+            let mut k_out = FrsBytes::NULL;
+            let mut v_out = FrsBytes::NULL;
+            let mut valid = false;
+            frs_iterator_next(iter, &mut k_out, &mut v_out, &mut valid);
+            assert!(valid);
+            assert_eq!(slice::from_raw_parts(k_out.data, k_out.len), b"k3");
+            assert_eq!(slice::from_raw_parts(v_out.data, v_out.len), b"v3");
+            frs_bytes_free(&mut k_out);
+            frs_bytes_free(&mut v_out);
+
+            // Seek past the end — first read should be invalid.
+            assert_eq!(frs_iterator_seek(iter, b"zzz".as_ptr(), 3), FRS_STATUS_OK);
+            let mut k_out = FrsBytes::NULL;
+            let mut v_out = FrsBytes::NULL;
+            let mut valid = true;
+            frs_iterator_next(iter, &mut k_out, &mut v_out, &mut valid);
+            assert!(!valid);
+            assert!(k_out.data.is_null());
+
+            // Seek back to start with NULL key — should read k0.
+            assert_eq!(frs_iterator_seek(iter, ptr::null(), 0), FRS_STATUS_OK);
+            let mut k_out = FrsBytes::NULL;
+            let mut v_out = FrsBytes::NULL;
+            let mut valid = false;
+            frs_iterator_next(iter, &mut k_out, &mut v_out, &mut valid);
+            assert!(valid);
+            assert_eq!(slice::from_raw_parts(k_out.data, k_out.len), b"k0");
+            frs_bytes_free(&mut k_out);
+            frs_bytes_free(&mut v_out);
+
+            frs_iterator_close(iter);
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_prefix_lookup() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // 3 keys under prefix "k", 1 under prefix "a" (must NOT match).
+            let pairs: &[(&[u8], &[u8])] = &[
+                (b"k1", b"v1"),
+                (b"k2", b"v2"),
+                (b"k3", b"v3"),
+                (b"a1", b"va"),
+            ];
+            for (k, v) in pairs {
+                frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+            }
+
+            let prefix = b"k";
+            let mut iter: FrsIterator = ptr::null_mut();
+            assert_eq!(
+                frs_prefix_lookup_open(db, cf, prefix.as_ptr(), prefix.len(), &mut iter),
+                FRS_STATUS_OK
+            );
+
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let mut k_out = FrsBytes::NULL;
+                let mut v_out = FrsBytes::NULL;
+                let mut valid = false;
+                frs_prefix_lookup_next(iter, &mut k_out, &mut v_out, &mut valid);
+                if !valid {
+                    break;
+                }
+                keys.push(slice::from_raw_parts(k_out.data, k_out.len).to_vec());
+                frs_bytes_free(&mut k_out);
+                frs_bytes_free(&mut v_out);
+            }
+            assert_eq!(keys.len(), 3, "prefix `k` must match exactly 3 entries");
+            assert_eq!(keys[0], b"k1");
+            assert_eq!(keys[1], b"k2");
+            assert_eq!(keys[2], b"k3");
+
+            assert_eq!(frs_prefix_lookup_close(iter), FRS_STATUS_OK);
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_iterator_open_validates_pointers() {
+        unsafe {
+            // out_iter NULL.
+            assert_eq!(
+                frs_iterator_open(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()),
+                FRS_STATUS_NULL_ARG
+            );
+
+            // db NULL.
+            let mut iter: FrsIterator = ptr::null_mut();
+            assert_eq!(
+                frs_iterator_open(ptr::null_mut(), ptr::null_mut(), &mut iter),
+                FRS_STATUS_NULL_ARG
+            );
+
+            // cf NULL.
+            let mut db: FrsDb = ptr::null_mut();
+            frs_db_open_memory(&mut db);
+            let mut iter: FrsIterator = ptr::null_mut();
+            assert_eq!(
+                frs_iterator_open(db, ptr::null_mut(), &mut iter),
+                FRS_STATUS_NULL_ARG
+            );
+
+            // frs_iterator_next with NULL handles.
+            let mut k = FrsBytes::NULL;
+            let mut v = FrsBytes::NULL;
+            let mut valid = false;
+            assert_eq!(
+                frs_iterator_next(ptr::null_mut(), &mut k, &mut v, &mut valid),
+                FRS_STATUS_NULL_ARG
+            );
+
             frs_db_close(db);
         }
     }
