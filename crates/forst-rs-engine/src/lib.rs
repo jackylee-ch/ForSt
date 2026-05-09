@@ -27,6 +27,49 @@
 //! - [`write_controller`] — back-pressure (stall / slowdown / L0 triggers).
 //! - [`snapshot_view`] — Immutable snapshot view over a column family.
 //! - [`db`] — [`DbImpl`], the top-level engine struct.
+//!
+//! # Storage backends
+//!
+//! Two equivalent injection paths exist for the on-disk layer; pick the
+//! one that fits your call site:
+//!
+//! 1. **Legacy direct injection** — call
+//!    [`db::DbImpl::open_with_fs`] with any
+//!    `Arc<dyn forst_rs_io::FileSystem>`. Native backends shipped in
+//!    `forst-rs-io` are [`forst_rs_io::LocalFileSystem`] (default for
+//!    [`db::DbImpl::open`]) and [`forst_rs_io::MemoryFileSystem`]
+//!    (used by [`db::DbImpl::open_default`] for tests). Lowest
+//!    overhead — no async bridge, no operator dispatch.
+//!
+//! 2. **OpenDAL universal backend** — call
+//!    [`db::DbImpl::open_with_opendal`] with an
+//!    [`opendal::Operator`], or one of the targeted helpers
+//!    [`db::DbImpl::open_local_opendal`] /
+//!    [`db::DbImpl::open_memory_opendal`] /
+//!    [`db::DbImpl::open_s3`]. Internally these wrap
+//!    [`forst_rs_io::OpendalFileSystem`] as
+//!    `Arc<dyn forst_rs_io::FileSystem>` and dispatch through the
+//!    legacy path, so behavior is identical from the engine's
+//!    perspective — only the I/O substrate differs.
+//!
+//! ## Supported OpenDAL services
+//!
+//! The workspace enables only the services we exercise in tests today:
+//! `services-fs`, `services-memory`, and `services-s3`. To target other
+//! services (GCS, Azure Blob, OSS, R2 native, …) build the
+//! [`opendal::Operator`] yourself and hand it to
+//! [`db::DbImpl::open_with_opendal`]; the engine never sees the
+//! service-specific surface.
+//!
+//! ## Performance note
+//!
+//! [`forst_rs_io::OpendalFileSystem`] adds ~1 layer of indirection
+//! (sync→async bridge via `tokio::runtime::Handle::block_on`) versus a
+//! native [`forst_rs_io::LocalFileSystem`]. The cost is dominated by
+//! the per-operation operator dispatch and is invisible at the SST
+//! granularity, but for hot-path point lookups against local SSD
+//! prefer [`db::DbImpl::open`]. For remote object stores OpenDAL is
+//! the primary supported path.
 
 #![forbid(unsafe_code)]
 

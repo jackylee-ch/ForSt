@@ -32,9 +32,21 @@ forst-rs-common = { workspace = true }
 forst-rs-engine = { workspace = true }
 forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
+# Optional RocksDB comparison baseline. Pulled in only when the
+# `rocksdb-baseline` feature is on (gates a long ~15 min build of the
+# bundled C++ rocksdb sources). Lives under `[dependencies]` rather
+# than `[dev-dependencies]` because Cargo forbids optional dev-deps.
+rocksdb = { version = "0.22", optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default = []
+# Enable side-by-side RocksDB v8.x comparison benches. Long build time
+# (~15 min on first cargo build for the bundled C++ rocksdb sources).
+rocksdb-baseline = ["dep:rocksdb"]
 
 [[bench]]
 name = "point_lookup"
@@ -51,3 +63,8 @@ harness = false
 [[bench]]
 name = "checkpoint"
 harness = false
+
+[[bench]]
+name = "rocksdb_compare"
+harness = false
+required-features = ["rocksdb-baseline"]

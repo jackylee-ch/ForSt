@@ -33,3 +33,4 @@ arc-swap = { workspace = true }
 
 [dev-dependencies]
 forst-rs-test-utils = { workspace = true }
+tempfile = { workspace = true }

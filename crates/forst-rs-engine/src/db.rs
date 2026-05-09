@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use forst_rs_common::{
     ColumnFamilyId, EngineOptions, FileNumber, ForstError, ForstResult, OpType, DEFAULT_CF_ID,
 };
-use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
+use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSystem};
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
 use forst_rs_storage::version::{SstFileMeta, Version, VersionEdit, VersionSetImpl};
 
@@ -138,6 +138,82 @@ impl DbImpl {
         };
         let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
         Self::open_with_fs(opts, fs)
+    }
+
+    // -----------------------------------------------------------------
+    // OpenDAL convenience constructors
+    //
+    // These wrap [`OpendalFileSystem`] as `Arc<dyn FileSystem>` and call
+    // [`Self::open_with_fs`]. They exist purely for ergonomics — there
+    // is no behavioral difference vs. building the OpendalFileSystem by
+    // hand and passing it through the legacy injection path.
+    //
+    // Performance note: OpenDAL adds one indirection layer (sync→async
+    // bridge + per-request operator dispatch) over the bare
+    // [`LocalFileSystem`]. For latency-critical local-disk workloads,
+    // prefer [`Self::open`] (uses [`LocalFileSystem`] directly). For
+    // remote backends (S3, GCS, …) OpenDAL is the only first-class
+    // option today.
+    // -----------------------------------------------------------------
+
+    /// Opens the engine on top of an arbitrary [`opendal::Operator`].
+    ///
+    /// Use this when you have constructed and configured an operator
+    /// yourself (custom layers, retry policy, presigned credentials,
+    /// in-house service builder, …). For common cases prefer the more
+    /// targeted helpers below.
+    pub fn open_with_opendal(
+        options: EngineOptions,
+        op: opendal::Operator,
+    ) -> ForstResult<Arc<Self>> {
+        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::with_operator(op)?);
+        Self::open_with_fs(options, fs)
+    }
+
+    /// Opens the engine on top of an OpenDAL local-FS operator rooted at
+    /// `root`. The directory is created on first write.
+    ///
+    /// Equivalent to [`Self::open`] for most local-disk uses, but goes
+    /// through OpenDAL — useful for parity testing across local and
+    /// remote backends.
+    pub fn open_local_opendal(
+        options: EngineOptions,
+        root: &std::path::Path,
+    ) -> ForstResult<Arc<Self>> {
+        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::local(root)?);
+        Self::open_with_fs(options, fs)
+    }
+
+    /// Opens the engine on top of an OpenDAL in-memory operator. Useful
+    /// for unit tests and ephemeral pipelines that want OpenDAL's
+    /// observability layers without touching disk.
+    pub fn open_memory_opendal(options: EngineOptions) -> ForstResult<Arc<Self>> {
+        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::memory()?);
+        Self::open_with_fs(options, fs)
+    }
+
+    /// Opens the engine on top of an OpenDAL S3 operator.
+    ///
+    /// `endpoint` lets the caller target S3-compatible services (MinIO,
+    /// Ceph RGW, R2, …). `access_key_id` / `secret_access_key` are
+    /// optional — when `None`, OpenDAL falls back to the AWS SDK
+    /// default credential chain (env vars, instance profile, …).
+    pub fn open_s3(
+        options: EngineOptions,
+        bucket: &str,
+        region: &str,
+        endpoint: Option<&str>,
+        access_key_id: Option<&str>,
+        secret_access_key: Option<&str>,
+    ) -> ForstResult<Arc<Self>> {
+        let fs: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::s3(
+            bucket,
+            region,
+            endpoint,
+            access_key_id,
+            secret_access_key,
+        )?);
+        Self::open_with_fs(options, fs)
     }
 
     /// Returns a handle to the default column family.

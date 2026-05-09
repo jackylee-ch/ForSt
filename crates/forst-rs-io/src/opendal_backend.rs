@@ -619,10 +619,47 @@ impl FileSystem for OpendalFileSystem {
         let s = path_str(src, "rename src")?;
         let d = path_str(dst, "rename dst")?;
         // OpenDAL's `rename` is supported on services that have native
-        // move (S3 with copy+delete fallback in newer versions, FS).
-        // Some services return Unsupported; we surface that to the caller.
-        self.block_on(self.op.rename(s, d))
-            .map_err(|e| map_opendal_err(e, &format!("rename: {s} -> {d}")))
+        // move (FS, GCS, …); others return `Unsupported`. The engine
+        // flush path relies on rename for atomic temp→final SST moves,
+        // so we transparently fall back to copy+delete on services that
+        // lack native rename. This is non-atomic but matches what
+        // OpenDAL itself does internally for S3 today, and matches the
+        // user's expectation that any FileSystem-backed engine works
+        // regardless of substrate.
+        match self.block_on(self.op.rename(s, d)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == OdErrorKind::Unsupported => {
+                // copy() is also Unsupported on some services (notably
+                // services-memory). Emulate via read + write + delete
+                // as a last resort. PUT is atomic per object, so the
+                // destination either appears whole or not at all; the
+                // source delete that follows might leave behind a stale
+                // copy if it fails, but that is the same risk profile
+                // as OpenDAL's own copy+delete fallback.
+                let copy_res = self.block_on(self.op.copy(s, d));
+                match copy_res {
+                    Ok(()) => {}
+                    Err(ce) if ce.kind() == OdErrorKind::Unsupported => {
+                        let buf = self.block_on(self.op.read(s)).map_err(|re| {
+                            map_opendal_err(re, &format!("rename fallback read: {s}"))
+                        })?;
+                        self.block_on(self.op.write(d, buf)).map_err(|we| {
+                            map_opendal_err(we, &format!("rename fallback write: {d}"))
+                        })?;
+                    }
+                    Err(ce) => {
+                        return Err(map_opendal_err(
+                            ce,
+                            &format!("rename copy fallback: {s} -> {d}"),
+                        ))
+                    }
+                }
+                self.block_on(self.op.delete(s))
+                    .map_err(|de| map_opendal_err(de, &format!("rename delete src: {s}")))?;
+                Ok(())
+            }
+            Err(e) => Err(map_opendal_err(e, &format!("rename: {s} -> {d}"))),
+        }
     }
 
     fn name(&self) -> &str {
@@ -854,5 +891,47 @@ mod tests {
         assert!(fs.name().contains("Opendal"), "got {}", fs.name());
         let dbg = format!("{fs:?}");
         assert!(dbg.contains("OpendalFileSystem"), "got {dbg}");
+    }
+
+    // --- rename fallback on services without native rename ------------------
+    //
+    // The in-memory service rejects `rename` with `Unsupported`. We added a
+    // copy+delete fallback so the engine's atomic-temp-file flush path keeps
+    // working on these substrates. This test pins that contract: rename must
+    // succeed end-to-end on memory backend, and the destination must contain
+    // the source bytes while the source disappears.
+    #[test]
+    fn test_opendal_rename_fallback_on_unsupported() {
+        let fs = OpendalFileSystem::memory().unwrap();
+        let src = Path::new("rename/src.dat");
+        let dst = Path::new("rename/dst.dat");
+
+        let payload = b"rename-fallback-payload";
+        {
+            let mut w = fs
+                .open_writable_file(src, WriteMode::CreateOrTruncate)
+                .unwrap();
+            w.append(payload).unwrap();
+            w.sync().unwrap();
+        }
+        assert!(fs.file_exists(src).unwrap());
+        assert!(!fs.file_exists(dst).unwrap());
+
+        fs.rename(src, dst)
+            .expect("rename via copy+delete fallback");
+
+        assert!(
+            !fs.file_exists(src).unwrap(),
+            "source must be gone after rename"
+        );
+        assert!(
+            fs.file_exists(dst).unwrap(),
+            "destination must exist after rename"
+        );
+
+        let mut r = fs.open_sequential_file(dst).unwrap();
+        let mut buf = vec![0u8; payload.len() + 8];
+        let n = r.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], payload, "rename must preserve content");
     }
 }

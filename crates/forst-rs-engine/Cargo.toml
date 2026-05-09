@@ -28,6 +28,7 @@ forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
+opendal = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
