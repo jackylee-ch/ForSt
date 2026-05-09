@@ -1,0 +1,185 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Side-by-side ForSt-RS vs RocksDB v8.x benchmark workflow.
+#
+# Triggered:
+#  - manual workflow_dispatch (default; choose this for ad-hoc baseline runs)
+#  - weekly schedule (Mondays 04:00 UTC) so regressions get caught early
+#
+# Why this lives in CI rather than local runs:
+#  - librocksdb-sys vendors the C++ RocksDB sources (~50 MB) and times
+#    out on slow / firewalled local connections. GH Actions runners
+#    download from a colocated CDN region and complete the fetch in
+#    seconds.
+#  - The runner provides a stable hardware baseline (ubuntu-latest =
+#    typically 2-vCPU x86_64 with consistent CPU model) — useful for
+#    perf regression tracking. Use --runs-on=self-hosted later when
+#    you need beefier hardware for the v3.2 §2.4 KPI sign-off.
+#
+# Modeled on Apache Paimon / Spark's JMH-on-CI pattern: run the
+# microbenchmark in a known environment, archive the results as a build
+# artifact, gate merges on regression-detection rules.
+
+name: ci-bench-compare
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'  # weekly Monday 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: 'Criterion sample size (default 30)'
+        required: false
+        default: '30'
+        type: string
+      measurement_time:
+        description: 'Criterion measurement time in seconds (default 5)'
+        required: false
+        default: '5'
+        type: string
+
+permissions: read-all
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_TIMEOUT: '600'
+  CARGO_NET_RETRY: '10'
+
+jobs:
+  bench-compare:
+    name: "ForSt-RS vs RocksDB v8.x"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install RocksDB build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libclang-dev \
+            clang \
+            cmake \
+            libsnappy-dev \
+            liblz4-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            libbz2-dev
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-bench-compare-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-compare-
+
+      - name: Cache target dir (long-lived, includes vendored librocksdb-sys build)
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-bench-compare-${{ hashFiles('Cargo.lock', 'crates/forst-rs-bench/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-target-bench-compare-
+
+      - name: Build benchmarks (cold-build of librocksdb-sys may take ~15 min first time)
+        run: |
+          cargo bench -p forst-rs-bench \
+            --features rocksdb-baseline \
+            --bench rocksdb_compare \
+            --no-run
+
+      - name: Run side-by-side comparison bench
+        env:
+          # Pin frequency-scaling-affected runs by warming the CPU first
+          # (criterion does its own warm-up, but this primes the runner).
+          CRITERION_HOME: ${{ github.workspace }}/criterion-results
+        run: |
+          mkdir -p "$CRITERION_HOME"
+          cargo bench -p forst-rs-bench \
+            --features rocksdb-baseline \
+            --bench rocksdb_compare \
+            -- \
+            --measurement-time ${{ github.event.inputs.measurement_time || '5' }} \
+            --warm-up-time 2 \
+            --sample-size ${{ github.event.inputs.sample_size || '30' }} \
+            2>&1 | tee bench-results.txt
+
+      - name: Compute perf delta (forst-rs vs rocksdb)
+        run: |
+          set -e
+          # Extract throughput numbers from the bench output. Criterion
+          # prints lines like:
+          #   point_lookup/forst_rs/100000  thrpt: [11.232 Melem/s ...]
+          # We grep + awk to compute the ratio.
+          python3 - <<'PY'
+          import re, sys
+          text = open('bench-results.txt').read()
+          # Pattern: name + thrpt: [low median high <unit>]
+          # We pair forst_rs with the rocksdb line in the same group.
+          groups = {}
+          for m in re.finditer(r'(\w+)/(forst_rs|rocksdb)/(\d+)\s+(?:.*\n)*?\s+thrpt:\s+\[\S+\s+([\d.]+)\s+(\w+)', text):
+              gname, impl, n, val, unit = m.groups()
+              key = (gname, n)
+              groups.setdefault(key, {})[impl] = (float(val), unit)
+          print('=' * 70)
+          print(f"{'Benchmark':<35}{'forst-rs':>15}{'rocksdb':>15}{'speedup':>10}")
+          print('=' * 70)
+          for (gname, n), pair in sorted(groups.items()):
+              if 'forst_rs' in pair and 'rocksdb' in pair:
+                  fr, fu = pair['forst_rs']
+                  rb, ru = pair['rocksdb']
+                  if fu != ru:
+                      print(f"{gname}/{n:<25} unit mismatch: {fu} vs {ru}")
+                      continue
+                  ratio = fr / rb
+                  print(f"{gname}/{n:<25}{fr:>10.2f}{fu:>5}{rb:>10.2f}{ru:>5}{ratio:>9.2f}x")
+          print('=' * 70)
+          PY
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.sha }}
+          path: |
+            bench-results.txt
+            target/criterion
+          retention-days: 30
+
+      - name: Write to job summary
+        if: always()
+        run: |
+          {
+            echo "## ForSt-RS vs RocksDB benchmark"
+            echo ""
+            echo "**Commit:** \`${{ github.sha }}\`"
+            echo "**Trigger:** \`${{ github.event_name }}\`"
+            echo "**Sample size:** \`${{ github.event.inputs.sample_size || '30' }}\`"
+            echo "**Measurement time:** \`${{ github.event.inputs.measurement_time || '5' }}s\`"
+            echo ""
+            echo "Full HTML report uploaded as artifact \`bench-results-${{ github.sha }}\`."
+            echo ""
+            echo '### Raw output (last 80 lines)'
+            echo '```'
+            tail -80 bench-results.txt 2>/dev/null || echo "(bench-results.txt missing)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
