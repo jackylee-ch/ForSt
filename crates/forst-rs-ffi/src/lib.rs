@@ -333,6 +333,66 @@ pub unsafe extern "C" fn frs_db_open_memory(out_handle: *mut FrsDb) -> i32 {
     })
 }
 
+/// Opens an in-memory engine with caller-supplied write-path tuning knobs.
+///
+/// This is the **performance-tuning** companion to [`frs_db_open_memory`]:
+/// the four parameters map 1:1 onto the matching `EngineOptions` fields,
+/// while every other knob (compression, block cache, level multiplier, …)
+/// stays at its default. Pass `0` for any of the four to keep that
+/// individual default.
+///
+/// All four values flow through [`EngineOptionsBuilder::try_build`] so the
+/// full validation stack (R-loop r3–r19 caps and joint-product checks)
+/// fires; an out-of-range parameter returns `FRS_STATUS_INVALID_ARGUMENT`
+/// rather than panicking. This makes the FFI safe to call from JMH-style
+/// benches that sweep large configuration ranges.
+///
+/// Used by JMH benches and integration tests that want to probe the
+/// memtable-budget / background-compaction sensitivity of the write path.
+/// Production consumers should keep using [`frs_db_open`] /
+/// [`frs_db_open_memory`] and configure the engine through their own JSON
+/// (or future structured-config) layer.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_memory_tuned(
+    write_buffer_size: usize,
+    max_write_buffer_number: usize,
+    max_background_compactions: usize,
+    max_background_flushes: usize,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if out_handle.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let mut builder = EngineOptions::builder().db_path("/db");
+        if write_buffer_size != 0 {
+            builder = builder.write_buffer_size(write_buffer_size);
+        }
+        if max_write_buffer_number != 0 {
+            builder = builder.max_write_buffer_number(max_write_buffer_number);
+        }
+        if max_background_compactions != 0 {
+            builder = builder.max_background_compactions(max_background_compactions);
+        }
+        if max_background_flushes != 0 {
+            builder = builder.max_background_flushes(max_background_flushes);
+        }
+        let opts = match builder.try_build() {
+            Ok(o) => o,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        match DbImpl::open_with_fs(opts, fs) {
+            Ok(db) => {
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
 /// Closes an engine previously returned by [`frs_db_open`]. After this
 /// call the handle must not be used again. Always returns `FRS_STATUS_OK`.
 #[no_mangle]
@@ -2651,6 +2711,90 @@ mod tests {
             );
 
             frs_db_close(db);
+        }
+    }
+
+    /// `frs_db_open_memory_tuned` accepts well-formed knobs and produces a
+    /// usable engine that survives a basic put/get round-trip. The tuned
+    /// values exercise both an enlarged memtable budget and an enlarged
+    /// per-axis background-thread count.
+    #[test]
+    fn test_open_memory_tuned_roundtrip() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(
+                frs_db_open_memory_tuned(
+                    256 * 1024 * 1024, // write_buffer_size
+                    8,                 // max_write_buffer_number
+                    4,                 // max_background_compactions
+                    4,                 // max_background_flushes
+                    &mut db,
+                ),
+                FRS_STATUS_OK
+            );
+            assert!(!db.is_null());
+
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"tuned-key";
+            let value = b"tuned-value";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+                FRS_STATUS_OK
+            );
+
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            assert!(!out.data.is_null());
+            assert_eq!(slice::from_raw_parts(out.data, out.len), value);
+            frs_bytes_free(&mut out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Passing `0` for every knob means "use the engine default for that
+    /// field" — verifies the per-knob branch in `frs_db_open_memory_tuned`
+    /// that skips the builder setter when the FFI argument is zero.
+    #[test]
+    fn test_open_memory_tuned_zero_means_default() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory_tuned(0, 0, 0, 0, &mut db), FRS_STATUS_OK);
+            assert!(!db.is_null());
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Out-of-range knob (1-byte memtable, well below the 4 KiB floor
+    /// `MIN_WRITE_BUFFER_SIZE`) is rejected via `try_build` and surfaced
+    /// as `FRS_STATUS_INVALID_ARGUMENT` rather than aborting / panicking.
+    #[test]
+    fn test_open_memory_tuned_rejects_undersized_buffer() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(
+                frs_db_open_memory_tuned(1, 0, 0, 0, &mut db),
+                FRS_STATUS_INVALID_ARGUMENT
+            );
+            assert!(db.is_null());
+        }
+    }
+
+    /// Null `out_handle` is rejected up-front (matches the
+    /// `frs_db_open_memory` contract; r5/r6 hardening).
+    #[test]
+    fn test_open_memory_tuned_null_arg() {
+        unsafe {
+            assert_eq!(
+                frs_db_open_memory_tuned(0, 0, 0, 0, ptr::null_mut()),
+                FRS_STATUS_NULL_ARG
+            );
         }
     }
 }
