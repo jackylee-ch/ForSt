@@ -24,7 +24,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::thread::JoinHandle;
 
 use forst_rs_common::{
     ColumnFamilyId, EngineOptions, FileNumber, ForstError, ForstResult, OpType, DEFAULT_CF_ID,
@@ -37,10 +38,16 @@ use crate::checkpoint::{copy_live_ssts, serialize_snapshot, write_blob, Checkpoi
 use crate::column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
 use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::file_deletion_guard::FileDeletionGuard;
-use crate::flush::{sst_file_path, FlushJob};
+use crate::flush::{sst_file_path, FlushExecutor, FlushJob, FlushQueue, FlushRequest};
 use crate::snapshot_view::SnapshotView;
 use crate::write_batch::WriteBatch;
 use crate::write_controller::WriteController;
+
+/// Bounded capacity for the background flush queue. Sized comfortably above
+/// `max_write_buffer_number` so the writer's `try_send` rarely blocks; real
+/// backpressure is handled by [`WriteController::set_imm_count`] which
+/// stalls writers when imm count >= the configured cap.
+const FLUSH_QUEUE_CAPACITY: usize = 64;
 
 /// Name of the default column family (always id 0).
 pub const DEFAULT_CF_NAME: &str = "default";
@@ -76,6 +83,25 @@ pub struct DbImpl {
     write_mutex: Mutex<()>,
     /// Allocator for new CF ids.
     next_cf_id: AtomicU32,
+    /// Background flush queue (B1: writers enqueue, worker drains). The
+    /// sender lives in here; the receiver is taken once by the worker on
+    /// startup. Dropping this `Arc` drops the sender, which closes the
+    /// channel and signals the worker to exit.
+    flush_queue: Arc<FlushQueue>,
+    /// Handle to the background flush worker thread. `Some` while the
+    /// engine is alive; taken and joined in [`Drop`] for clean shutdown.
+    flush_worker: Mutex<Option<JoinHandle<()>>>,
+    /// Most recent error from a background flush. Surfaced to the next
+    /// writer that calls [`Self::write_single`] / [`Self::batch_write`] so
+    /// the application learns about flush failures even though the failing
+    /// flush ran off the writer's stack. Cleared after the writer observes
+    /// it.
+    flush_error: Mutex<Option<ForstError>>,
+    /// Count of flush requests enqueued but not yet completed by the
+    /// worker. Used by [`Self::wait_for_pending_flushes`] to know when the
+    /// worker has drained everything we asked it to. Bumped on enqueue,
+    /// decremented after `run_flush` returns (success or failure).
+    pending_flush_count: AtomicU32,
 }
 
 impl DbImpl {
@@ -122,10 +148,15 @@ impl DbImpl {
             write_controller: Arc::new(WriteController::with_defaults()),
             write_mutex: Mutex::new(()),
             next_cf_id: AtomicU32::new(1),
+            flush_queue: Arc::new(FlushQueue::new(FLUSH_QUEUE_CAPACITY)),
+            flush_worker: Mutex::new(None),
+            flush_error: Mutex::new(None),
+            pending_flush_count: AtomicU32::new(0),
         });
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
+        Self::spawn_flush_worker(&db);
         Ok(db)
     }
 
@@ -334,14 +365,18 @@ impl DbImpl {
         value: Option<&[u8]>,
         op: OpType,
     ) -> ForstResult<u64> {
+        // Surface any error from a prior background flush before we accept
+        // a new write — the application learns about flush failures at the
+        // next write boundary even though the failure happened off-thread.
+        self.consume_flush_error()?;
         self.write_controller.may_throttle()?;
         let cf_data = self.lookup_cf_by_id(cf.id())?;
 
         // Phase 1 (under write_mutex): serialize memtable writes + decide
         // whether to switch the active memtable. If a switch happens we do
-        // it inline so the next writer sees the fresh memtable, but we defer
-        // the expensive SST flush to Phase 2 below so concurrent writers
-        // don't block on disk I/O.
+        // it inline so the next writer sees the fresh memtable, but we
+        // hand the expensive SST flush off to the background worker so
+        // this writer (and concurrent writers) never block on disk I/O.
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
 
@@ -355,13 +390,13 @@ impl DbImpl {
             self.maybe_switch_memtable_in_lock(&cf_data)?
         };
 
-        // Phase 2 (outside write_mutex): flush the imm memtable. Other
-        // writers can proceed in parallel against the new active memtable.
+        // Phase 2 (outside write_mutex): enqueue the imm memtable for the
+        // background flush worker. Backpressure is handled by the
+        // WriteController stall above — when imm count >= cap the next
+        // writer's `may_throttle()` call blocks until the worker drains
+        // an imm and calls `set_imm_count(new_lower)`.
         if needs_flush {
-            self.flush_cf_data(&cf_data)?;
-            // After flush, auto-compact if L0 file count has grown past the
-            // slowdown trigger so we stay far from the write-stall ceiling.
-            self.maybe_auto_compact(&cf_data)?;
+            self.enqueue_flush(cf_data.clone())?;
         }
 
         Ok(self.sequence_number.load(Ordering::Acquire))
@@ -383,6 +418,7 @@ impl DbImpl {
         if batch.is_empty() {
             return Ok(self.sequence_number());
         }
+        self.consume_flush_error()?;
         self.write_controller.may_throttle()?;
 
         // Resolve and cache CF lookups up front so we fail fast on missing CFs.
@@ -429,17 +465,22 @@ impl DbImpl {
             }
         }
 
-        // Phase 2: flush outside the write lock so subsequent writers can
-        // progress against the fresh active memtables.
+        // Phase 2: hand each frozen imm to the background flush worker so
+        // this writer returns immediately. Backpressure is enforced by the
+        // WriteController on the next writer's `may_throttle()`.
         for cf_data in &cfs_to_flush {
-            self.flush_cf_data(cf_data)?;
-            self.maybe_auto_compact(cf_data)?;
+            self.enqueue_flush(cf_data.clone())?;
         }
 
         Ok(last_seq)
     }
 
     /// Forces the active memtable of a CF to switch (for flush testing).
+    ///
+    /// Note: this does NOT enqueue the resulting imm onto the background
+    /// flush queue — callers (mostly tests) typically follow up with
+    /// `flush_cf` / `flush_all` to drain synchronously, and we don't want
+    /// duplicate work bouncing through the worker.
     pub fn force_switch_memtable(&self, cf: &ColumnFamilyHandle) -> ForstResult<()> {
         let cf_data = self.lookup_cf_by_id(cf.id())?;
         let _writer = self.write_mutex.lock().expect("lock poisoned");
@@ -466,12 +507,24 @@ impl DbImpl {
     }
 
     /// Flushes all pending immutable memtables across all column families.
+    ///
+    /// This walks each CF and synchronously drains its imm queue. Any imms
+    /// already enqueued for the background worker may also be processed
+    /// here — the per-CF flush mutex serializes us against the worker so
+    /// the same memtable cannot be flushed twice.
     pub fn flush_all(&self) -> ForstResult<()> {
         let cfs: Vec<Arc<ColumnFamilyData>> = {
             let guard = self.cfs.read().expect("lock poisoned");
             guard.values().cloned().collect()
         };
+        // First, give the background worker a chance to land any
+        // already-enqueued requests so the synchronous drain below isn't
+        // fighting it for the per-CF flush mutex.
+        self.wait_for_pending_flushes();
         for cf_data in cfs {
+            // Drain anything still pending (e.g. imms from
+            // `force_switch_memtable` that bypassed the queue) so callers
+            // see a fully-flushed state.
             while cf_data.imm_count() > 0 {
                 if self.flush_cf_data(&cf_data)?.is_none() {
                     break;
@@ -811,10 +864,15 @@ impl DbImpl {
             write_controller: Arc::new(WriteController::with_defaults()),
             write_mutex: Mutex::new(()),
             next_cf_id: AtomicU32::new(1),
+            flush_queue: Arc::new(FlushQueue::new(FLUSH_QUEUE_CAPACITY)),
+            flush_worker: Mutex::new(None),
+            flush_error: Mutex::new(None),
+            pending_flush_count: AtomicU32::new(0),
         });
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
+        Self::spawn_flush_worker(&db);
         Ok(db)
     }
 
@@ -1048,6 +1106,105 @@ impl DbImpl {
             self.flush_cf_data(cf_data)?;
         }
         Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Background flush worker plumbing (B1)
+    // ---------------------------------------------------------------
+
+    /// Spawns the background flush worker thread. Called once during
+    /// engine construction. The worker holds a `Weak<DbImpl>` so the
+    /// engine can still be dropped while the worker is mid-recv.
+    fn spawn_flush_worker(db: &Arc<Self>) {
+        let rx = match db.flush_queue.take_receiver() {
+            Some(rx) => rx,
+            None => {
+                // Should never happen — only called once per construction.
+                debug_assert!(false, "flush worker spawned more than once");
+                return;
+            }
+        };
+        let weak: Weak<DbImpl> = Arc::downgrade(db);
+        let weak_for_err = Weak::clone(&weak);
+        let handle = std::thread::Builder::new()
+            .name("forst-rs-flush".to_string())
+            .spawn(move || {
+                crate::flush::flush_loop(rx, weak, move |err| {
+                    if let Some(db) = weak_for_err.upgrade() {
+                        db.record_flush_error(err);
+                    }
+                });
+            })
+            .expect("failed to spawn flush worker thread");
+        *db.flush_worker.lock().expect("lock poisoned") = Some(handle);
+    }
+
+    /// Pushes a flush request onto the background queue. The writer never
+    /// blocks on disk I/O; backpressure is supplied by the WriteController
+    /// stall on the next writer's `may_throttle()` call when imm count
+    /// >= `max_write_buffer_number`.
+    ///
+    /// Returns an error only if the engine is shutting down (the worker
+    /// has dropped its receiver) — in which case the writer surfaces the
+    /// error to its caller.
+    fn enqueue_flush(&self, cf_data: Arc<ColumnFamilyData>) -> ForstResult<()> {
+        self.pending_flush_count.fetch_add(1, Ordering::AcqRel);
+        match self.flush_queue.enqueue(FlushRequest { cf_data }) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Roll back the counter so a shutdown-time failure can't
+                // wedge a `wait_for_pending_flushes` caller.
+                self.pending_flush_count.fetch_sub(1, Ordering::AcqRel);
+                Err(e)
+            }
+        }
+    }
+
+    /// Records the most recent background flush error so the next writer
+    /// can surface it via [`Self::consume_flush_error`].
+    fn record_flush_error(&self, err: ForstError) {
+        let mut slot = self.flush_error.lock().expect("lock poisoned");
+        // Keep the first error; subsequent errors are dropped to avoid
+        // swamping the log if the disk is permanently unhappy. The next
+        // successful writer clears the slot.
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    }
+
+    /// If a background flush has failed since the last call, returns the
+    /// stored error and clears the slot. The next writer/batch_write will
+    /// see `Ok(())` so the engine recovers automatically once the
+    /// underlying issue (e.g. disk full) is resolved.
+    fn consume_flush_error(&self) -> ForstResult<()> {
+        let mut slot = self.flush_error.lock().expect("lock poisoned");
+        if let Some(err) = slot.take() {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Blocks until every flush request that has been *enqueued* has been
+    /// processed by the background worker. Used by [`Self::flush_all`],
+    /// checkpoints, and `Drop` so callers see a consistent on-disk state
+    /// without bouncing the per-CF flush mutex against the worker.
+    ///
+    /// Imms produced by direct `force_switch_memtable` (which doesn't
+    /// enqueue) won't be counted here — callers must flush those
+    /// synchronously via `flush_cf` / `flush_all`'s drain loop.
+    ///
+    /// The polling loop is bounded so a stuck worker can't deadlock the
+    /// caller; it sleeps in 1 ms increments which is fine for tests and
+    /// shutdown latency.
+    fn wait_for_pending_flushes(&self) {
+        let timeout = self.write_controller.config().stall_timeout;
+        let start = std::time::Instant::now();
+        while self.pending_flush_count.load(Ordering::Acquire) > 0 {
+            if start.elapsed() >= timeout {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// In-lock portion of the switch decision. Returns `true` if a switch
@@ -1552,6 +1709,76 @@ impl DbImpl {
             }
         }
         *pending = still_pending;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Background flush worker callback
+// ---------------------------------------------------------------------
+
+/// Bridges `crate::flush::flush_loop` into the engine. The worker thread
+/// receives a [`FlushRequest`] and calls [`Self::run_flush`] to actually
+/// run the flush + auto-compaction, mirroring the work that `write_single`
+/// / `batch_write` used to do inline.
+impl FlushExecutor for DbImpl {
+    fn run_flush(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
+        // Use a guard so the counter is always decremented, even if a
+        // panic or early-return happens inside flush_cf_data.
+        struct Guard<'a>(&'a AtomicU32);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _guard = Guard(&self.pending_flush_count);
+
+        // It's possible the queue collapsed two requests for the same CF
+        // (writer1 enqueues, then before the worker recvs writer2 enqueues
+        // again). The second `flush_cf_data` will simply find an empty
+        // imm list and return `Ok(None)`, so we treat that as a no-op.
+        self.flush_cf_data(cf_data)?;
+        // Auto-compact L0 if it has grown past the slowdown trigger so
+        // the engine stays well clear of the write-stall ceiling.
+        self.maybe_auto_compact(cf_data)?;
+        Ok(())
+    }
+}
+
+/// Drains pending flushes and joins the worker thread on shutdown so no
+/// data is lost. We never panic in `Drop` (would abort the process under
+/// double-panic) — instead we log and continue. The Mutex around the
+/// JoinHandle lets us `take()` it cleanly.
+impl Drop for DbImpl {
+    fn drop(&mut self) {
+        // 1. Wait for every flush we've already enqueued to land. We do
+        //    this BEFORE touching the worker handle so anything that
+        //    arrived in the queue before drop gets a chance to flush to
+        //    disk. (Imms produced by `force_switch_memtable` that were
+        //    never enqueued are NOT flushed here — callers must call
+        //    `flush_all` explicitly before dropping the engine if they
+        //    care about those.)
+        self.wait_for_pending_flushes();
+
+        // 2. Drop our last sender by replacing the queue with an empty
+        //    one. This closes the channel and the worker's `recv()`
+        //    returns `Err`, exiting `flush_loop`.
+        //
+        //    Note: `Arc::strong_count(&self.flush_queue)` may still be > 1
+        //    if any in-flight `enqueue_flush` call holds a clone, but
+        //    those are bounded — they'll drop the clone before returning
+        //    to the writer.
+        self.flush_queue = Arc::new(FlushQueue::new(1));
+
+        // 3. Take and join the worker. If the thread has already exited
+        //    (e.g. because we dropped the queue above), `join` returns
+        //    immediately. We log on join error rather than panic per the
+        //    contract: a poisoned thread must not abort the runtime.
+        let handle = self.flush_worker.lock().ok().and_then(|mut g| g.take());
+        if let Some(h) = handle {
+            if let Err(e) = h.join() {
+                eprintln!("forst-rs: flush worker panicked during shutdown: {:?}", e);
+            }
+        }
     }
 }
 

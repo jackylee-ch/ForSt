@@ -77,7 +77,16 @@ pub struct VectorizedMemTable {
     /// Unsorted buffer: row offsets not yet merged into sorted_index.
     unsorted_entries: Vec<u32>,
     /// Unsorted lookup: key -> list of RowIndex for quick point lookups.
-    unsorted_lookup: HashMap<Vec<u8>, Vec<RowIndex>>,
+    ///
+    /// PERF (B2): keyed by `Box<[u8]>` rather than `Vec<u8>` — saves 8 bytes
+    /// per entry (no `cap` field) and uses a right-sized allocation instead of
+    /// the `to_vec()` over-alloc + realloc pattern. The hot path uses
+    /// `get_mut`-then-`insert` rather than `entry()` so collisions on the
+    /// same key (e.g. per-key aggregations) skip the key-allocation entirely.
+    unsorted_lookup: HashMap<Box<[u8]>, Vec<RowIndex>>,
+    /// Pool of recycled `Vec<RowIndex>` allocations released by the merge step.
+    /// PERF (B2): avoids re-allocating the per-key index list on every put.
+    rowindex_vec_pool: Vec<Vec<RowIndex>>,
 
     // -- State --
     /// Current sequence counter (incremented on each insert).
@@ -92,19 +101,37 @@ pub struct VectorizedMemTable {
 
 impl VectorizedMemTable {
     /// Creates a new, empty VectorizedMemTable.
+    ///
+    /// PERF (B2): pre-reserves column buffer capacity so the first ~64 KiB of
+    /// key+value bytes can be appended without `Vec` growth-reallocation. The
+    /// reservation is a one-time cost when a fresh memtable is created and a
+    /// lower bound on the eventual memory footprint anyway (the configured
+    /// `max_size` is many MiB).
     pub fn new(config: MemTableConfig) -> Self {
+        // Initial column buffer reservation. Keep small so creating many empty
+        // memtables (e.g. per-CF) doesn't blow up RSS, but large enough to
+        // cover the first JMH warm-up batch.
+        const INIT_CAPACITY_BYTES: usize = 64 * 1024;
+        const INIT_ROWS_HINT: usize = 1024;
+
+        let mut key_offsets = Vec::with_capacity(INIT_ROWS_HINT + 1);
+        key_offsets.push(0); // sentinel
+        let mut value_offsets = Vec::with_capacity(INIT_ROWS_HINT + 1);
+        value_offsets.push(0); // sentinel
+
         Self {
-            key_data: Vec::new(),
-            key_offsets: vec![0], // sentinel
-            value_data: Vec::new(),
-            value_offsets: vec![0], // sentinel
-            value_nulls: Vec::new(),
-            sequences: Vec::new(),
-            op_types: Vec::new(),
+            key_data: Vec::with_capacity(INIT_CAPACITY_BYTES),
+            key_offsets,
+            value_data: Vec::with_capacity(INIT_CAPACITY_BYTES),
+            value_offsets,
+            value_nulls: Vec::with_capacity(INIT_ROWS_HINT),
+            sequences: Vec::with_capacity(INIT_ROWS_HINT),
+            op_types: Vec::with_capacity(INIT_ROWS_HINT),
             sorted_index: BTreeMap::new(),
             sorted_count: 0,
-            unsorted_entries: Vec::new(),
-            unsorted_lookup: HashMap::new(),
+            unsorted_entries: Vec::with_capacity(INIT_ROWS_HINT),
+            unsorted_lookup: HashMap::with_capacity(INIT_ROWS_HINT),
+            rowindex_vec_pool: Vec::new(),
             next_sequence: 1,
             memory_used: 0,
             frozen: false,
@@ -175,11 +202,18 @@ impl VectorizedMemTable {
         };
 
         // Add to unsorted zone.
+        // PERF (B2): use `get_mut` THEN `insert` instead of `entry().or_default()`
+        // so the `key.to_vec()`/`Box::from` cost is paid only when the key is
+        // genuinely new (the `entry()` API consumes the key unconditionally).
+        // For per-key aggregations this saves an allocation per repeat.
         self.unsorted_entries.push(row_offset);
-        self.unsorted_lookup
-            .entry(key.to_vec())
-            .or_default()
-            .push(row_index);
+        if let Some(slot) = self.unsorted_lookup.get_mut(key) {
+            slot.push(row_index);
+        } else {
+            let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
+            slot.push(row_index);
+            self.unsorted_lookup.insert(Box::from(key), slot);
+        }
 
         // Update memory tracking (approximate).
         self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
@@ -244,12 +278,35 @@ impl VectorizedMemTable {
     }
 
     /// Merges all unsorted entries into the sorted BTreeMap index.
+    ///
+    /// PERF (B2): drained `Vec<RowIndex>` allocations are recycled into
+    /// `rowindex_vec_pool` so subsequent `put()` calls re-use them instead of
+    /// allocating fresh ones. The `Box<[u8]>` keys are converted into
+    /// `Vec<u8>` for the sorted index — this is a one-time per-key conversion
+    /// (no per-row alloc on the hot path) and `Box<[u8]> -> Vec<u8>` is a
+    /// pointer/length copy without re-allocation.
     pub fn merge_unsorted_to_sorted(&mut self) {
+        // Cap pool size to avoid unbounded memory retention if a workload
+        // produces a huge spike of unique keys then quiesces.
+        const POOL_CAP: usize = 4096;
+
         for (key, mut indices) in self.unsorted_lookup.drain() {
-            let entry = self.sorted_index.entry(key).or_default();
-            entry.append(&mut indices);
-            // Sort by sequence descending so newest is first.
-            entry.sort_by_key(|idx| Reverse(idx.sequence));
+            let owned_key: Vec<u8> = key.into_vec();
+            match self.sorted_index.get_mut(&owned_key) {
+                Some(entry) => {
+                    entry.append(&mut indices);
+                    entry.sort_by_key(|idx| Reverse(idx.sequence));
+                    // `indices` is now empty — return it to the pool.
+                    if self.rowindex_vec_pool.len() < POOL_CAP {
+                        self.rowindex_vec_pool.push(indices);
+                    }
+                }
+                None => {
+                    // Sort by sequence descending so newest is first.
+                    indices.sort_by_key(|idx| Reverse(idx.sequence));
+                    self.sorted_index.insert(owned_key, indices);
+                }
+            }
         }
         self.sorted_count += self.unsorted_entries.len() as u32;
         self.unsorted_entries.clear();
@@ -363,8 +420,9 @@ impl VectorizedMemTable {
             combined.insert(k.as_slice(), idxs.clone());
         }
         for (k, idxs) in self.unsorted_lookup.iter() {
+            // PERF (B2): `k` is `Box<[u8]>` — deref to `&[u8]` directly.
             combined
-                .entry(k.as_slice())
+                .entry(&**k)
                 .and_modify(|v| v.extend_from_slice(idxs))
                 .or_insert_with(|| idxs.clone());
         }
@@ -501,11 +559,18 @@ impl VectorizedMemTable {
                 op_type,
             };
 
+            // PERF (B2): same `get_mut` THEN `insert` pattern as `put()` —
+            // skips the `Box::from(key)` allocation when the same key appears
+            // multiple times within a single batch (a common state-update
+            // pattern in streaming workloads).
             self.unsorted_entries.push(row_offset);
-            self.unsorted_lookup
-                .entry(key.to_vec())
-                .or_default()
-                .push(row_index);
+            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
+                slot.push(row_index);
+            } else {
+                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
+                slot.push(row_index);
+                self.unsorted_lookup.insert(Box::from(key), slot);
+            }
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
@@ -1127,5 +1192,209 @@ mod tests {
                 prev_key = Some(key);
             }
         }
+    }
+
+    // === B2 PERF tests: Box<[u8]> key + RowIndex Vec pool ===
+
+    /// 1000 unique keys via batch_insert + per-key get must round-trip.
+    /// Validates the new `Box<[u8]>` HashMap key + `get_mut`-then-`insert`
+    /// hot path with no collisions.
+    #[test]
+    fn test_b2_unsorted_lookup_box_key_unique_keys_1000() {
+        let mut mt = VectorizedMemTable::new(MemTableConfig {
+            max_size: 64 * 1024 * 1024,
+            unsorted_merge_ratio: 1024.0, // never auto-merge during this test
+        });
+        let keys: Vec<Vec<u8>> = (0..1000u32)
+            .map(|i| format!("uniq_{:06}", i).into_bytes())
+            .collect();
+        let vals: Vec<Vec<u8>> = (0..1000u32)
+            .map(|i| format!("val_{:06}", i).into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();
+        let ops = vec![0u8; 1000];
+
+        mt.batch_insert(&key_refs, &val_refs, &ops).unwrap();
+        // All 1000 should be in unsorted_lookup (no merge yet).
+        assert_eq!(mt.unsorted_lookup.len(), 1000);
+        assert_eq!(mt.sorted_count, 0);
+
+        for i in 0..1000u32 {
+            let key = format!("uniq_{:06}", i);
+            let expected = format!("val_{:06}", i);
+            let r = mt.get(key.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(r.value, Some(expected.into_bytes()), "mismatch at {}", i);
+        }
+    }
+
+    /// Repeated keys exercise the `get_mut`-hits-existing-slot path AND
+    /// confirm multi-version semantics still work.
+    #[test]
+    fn test_b2_unsorted_lookup_repeated_keys_no_realloc() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        // 100 distinct keys, each updated 10 times — `get_mut` path on every
+        // update after the first.
+        for round in 0..10u32 {
+            for i in 0..100u32 {
+                let k = format!("rep_{:03}", i);
+                let v = format!("v{:02}_r{}", i, round);
+                mt.put(k.as_bytes(), Some(v.as_bytes()), 0).unwrap();
+            }
+        }
+        // 1000 inserts but only 100 distinct keys in the lookup.
+        assert_eq!(mt.unsorted_lookup.len(), 100);
+        // Each lookup slot should hold all 10 versions.
+        for i in 0..100u32 {
+            let k = format!("rep_{:03}", i);
+            let slot = mt.unsorted_lookup.get(k.as_bytes()).unwrap();
+            assert_eq!(slot.len(), 10, "key {} should have 10 versions", k);
+        }
+        // Latest version must come back from get().
+        for i in 0..100u32 {
+            let k = format!("rep_{:03}", i);
+            let expected = format!("v{:02}_r9", i);
+            let r = mt.get(k.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(r.value, Some(expected.into_bytes()));
+        }
+    }
+
+    /// Merge → re-fill cycle should recycle Vec<RowIndex> allocations into
+    /// the pool. Verifies the pool grows after a merge and shrinks back as
+    /// new puts consume it.
+    #[test]
+    fn test_b2_rowindex_vec_pool_recycle_round_trip() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        for i in 0..50u32 {
+            let k = format!("k_{:03}", i);
+            mt.put(k.as_bytes(), Some(b"v"), 0).unwrap();
+        }
+        assert_eq!(mt.unsorted_lookup.len(), 50);
+        assert_eq!(mt.rowindex_vec_pool.len(), 0);
+
+        // Force merge; all 50 keys are first-time-seen so they go into
+        // sorted_index via insert (NOT append) → no Vec recycled yet.
+        mt.merge_unsorted_to_sorted();
+        assert_eq!(mt.unsorted_lookup.len(), 0);
+        assert_eq!(mt.sorted_count, 50);
+        assert_eq!(
+            mt.rowindex_vec_pool.len(),
+            0,
+            "first merge inserts into sorted_index, no recycled vecs"
+        );
+
+        // Re-write the SAME 50 keys + then merge again → these collide with
+        // existing sorted_index entries, so the unsorted Vecs are appended &
+        // recycled into the pool.
+        for i in 0..50u32 {
+            let k = format!("k_{:03}", i);
+            mt.put(k.as_bytes(), Some(b"v2"), 0).unwrap();
+        }
+        mt.merge_unsorted_to_sorted();
+        assert_eq!(
+            mt.rowindex_vec_pool.len(),
+            50,
+            "second merge collides on every key — all 50 vecs recycled"
+        );
+
+        // Next put should consume from the pool.
+        let pool_before = mt.rowindex_vec_pool.len();
+        mt.put(b"new_key", Some(b"vv"), 0).unwrap();
+        assert_eq!(
+            mt.rowindex_vec_pool.len(),
+            pool_before - 1,
+            "put on a brand-new key should pop one Vec from the pool"
+        );
+
+        // Correctness sanity after recycling.
+        let r = mt.get(b"new_key", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"vv".to_vec()));
+    }
+
+    /// Multi-version semantics survive a merge cycle with the new
+    /// Box<[u8]> -> Vec<u8> key conversion.
+    #[test]
+    fn test_b2_merge_preserves_multi_version_after_box_to_vec() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"k", Some(b"v1"), 0).unwrap(); // seq=1
+        mt.put(b"k", Some(b"v2"), 0).unwrap(); // seq=2
+        mt.merge_unsorted_to_sorted();
+        mt.put(b"k", Some(b"v3"), 0).unwrap(); // seq=3 (post-merge)
+        mt.merge_unsorted_to_sorted();
+
+        let entries = mt.sorted_index.get(b"k".as_slice()).unwrap();
+        assert_eq!(entries.len(), 3);
+        // Sorted DESC by sequence.
+        assert_eq!(entries[0].sequence, 3);
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[2].sequence, 1);
+
+        // Read at each sequence boundary.
+        assert_eq!(
+            mt.get(b"k", 1).unwrap().unwrap().value,
+            Some(b"v1".to_vec())
+        );
+        assert_eq!(
+            mt.get(b"k", 2).unwrap().unwrap().value,
+            Some(b"v2".to_vec())
+        );
+        assert_eq!(
+            mt.get(b"k", 3).unwrap().unwrap().value,
+            Some(b"v3".to_vec())
+        );
+    }
+
+    /// Mixed put / batch_insert / get / merge sequence — end-to-end
+    /// regression for B2 changes.
+    #[test]
+    fn test_b2_mixed_workload_e2e() {
+        let mut mt = VectorizedMemTable::new(MemTableConfig {
+            max_size: 32 * 1024 * 1024,
+            unsorted_merge_ratio: 0.5,
+        });
+        // Phase 1: 200 single puts.
+        for i in 0..200u32 {
+            let k = format!("p_{:04}", i);
+            mt.put(k.as_bytes(), Some(b"px"), 0).unwrap();
+        }
+        // Phase 2: a batch of 500 puts overlapping with phase 1 keys.
+        let keys: Vec<Vec<u8>> = (100..600u32)
+            .map(|i| format!("p_{:04}", i).into_bytes())
+            .collect();
+        let vals: Vec<Vec<u8>> = (100..600u32)
+            .map(|i| format!("bv{:04}", i).into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();
+        let ops = vec![0u8; 500];
+        mt.batch_insert(&key_refs, &val_refs, &ops).unwrap();
+
+        // Phase 3: range-collect to validate ordering & all-versions visible.
+        let entries = mt.collect_range_entries(b"", None, u64::MAX);
+        // Distinct keys: p_0000..p_0599 = 600.
+        let distinct: std::collections::BTreeSet<_> =
+            entries.iter().map(|(k, _, _, _)| k.clone()).collect();
+        assert_eq!(distinct.len(), 600);
+
+        // Phase 4: get on overlapping keys returns batch value (newer).
+        for i in 100..200u32 {
+            let k = format!("p_{:04}", i);
+            let expected = format!("bv{:04}", i);
+            let r = mt.get(k.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(r.value, Some(expected.into_bytes()), "key={}", k);
+        }
+        // Non-overlapping keys still return original.
+        for i in 0..100u32 {
+            let k = format!("p_{:04}", i);
+            let r = mt.get(k.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(r.value, Some(b"px".to_vec()));
+        }
+
+        // Phase 5: freeze + flush.
+        mt.freeze();
+        let batches = mt.to_flush_batches(256).unwrap();
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        // 200 + 500 = 700 raw rows.
+        assert_eq!(total_rows, 700);
     }
 }

@@ -25,7 +25,8 @@
 //!    [`VersionSet`](forst_rs_storage::version::VersionSetImpl).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, Weak};
 
 use arrow::array::{Array, BinaryArray, UInt64Array, UInt8Array};
 use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber};
@@ -33,7 +34,7 @@ use forst_rs_io::{FileSystem, WriteMode};
 use forst_rs_storage::sst::{SstFileInfo, SstWriterImpl, SstWriterOptions};
 use forst_rs_storage::version::SstFileMeta;
 
-use crate::column_family::SharedMemTable;
+use crate::column_family::{ColumnFamilyData, SharedMemTable};
 
 /// Batch size used when converting memtable rows to SST entries. Larger
 /// batches reduce per-row overhead but increase peak memory usage during
@@ -184,6 +185,128 @@ impl FlushJob {
 /// database directory. Format: `<db_path>/<file_number:06>.sst`.
 pub fn sst_file_path(db_path: &Path, file_number: FileNumber) -> PathBuf {
     db_path.join(format!("{:06}.sst", file_number.value()))
+}
+
+// ---------------------------------------------------------------------
+// Background flush worker plumbing (B1, design §2.4.2).
+//
+// Writers move flush work off the critical path by enqueuing a
+// [`FlushRequest`] onto a [`FlushQueue`]; a single worker thread spawned
+// by [`crate::DbImpl`] drains the queue and runs `flush_cf_data` for
+// each request. Backpressure is provided by the existing
+// [`crate::WriteController`] (`max_write_buffer_number` cap on the
+// imm queue) — when too many imms are queued the WriteController stalls
+// new writers until the worker drains one and calls
+// `set_imm_count(new_lower)`.
+// ---------------------------------------------------------------------
+
+/// A single asynchronous flush job: "please flush the next imm in this CF."
+///
+/// We carry the [`Arc<ColumnFamilyData>`] (rather than the imm itself) so
+/// the worker can look up the *current* oldest imm under the per-CF flush
+/// mutex. This lets the worker collapse multiple requests for the same CF
+/// into one no-op when the queue is bursty (the second request finds an
+/// empty imm list and returns early).
+pub(crate) struct FlushRequest {
+    pub cf_data: Arc<ColumnFamilyData>,
+}
+
+/// MPSC channel used to hand flush requests from writer threads to the
+/// background worker. The receiver is held inside the queue under a Mutex
+/// so the worker can take it once on startup; the sender is cheaply
+/// cloneable via the queue's `enqueue` method.
+///
+/// Bounded capacity prevents a runaway producer from ballooning queued
+/// requests; the bound is large enough that ordinary backpressure flows
+/// through the WriteController instead.
+pub(crate) struct FlushQueue {
+    tx: SyncSender<FlushRequest>,
+    rx: Mutex<Option<Receiver<FlushRequest>>>,
+}
+
+impl FlushQueue {
+    /// Constructs a new queue with the given bounded capacity. Returns the
+    /// queue plus a one-time-takeable receiver consumer (kept inside the
+    /// queue under a Mutex so the worker can acquire it on startup).
+    pub(crate) fn new(capacity: usize) -> Self {
+        let (tx, rx) = sync_channel::<FlushRequest>(capacity);
+        Self {
+            tx,
+            rx: Mutex::new(Some(rx)),
+        }
+    }
+
+    /// Hands the receiver to the worker thread. Returns `None` if a worker
+    /// has already taken it (which would be a programming error — only one
+    /// worker is intended).
+    pub(crate) fn take_receiver(&self) -> Option<Receiver<FlushRequest>> {
+        self.rx.lock().expect("lock poisoned").take()
+    }
+
+    /// Non-blocking enqueue — used by writers on the critical path. If the
+    /// queue is full (worker is far behind), falls back to a blocking
+    /// `send`. This still bounds the writer's wait by the worker's flush
+    /// latency rather than the kernel write/syscall latency on every
+    /// switch, which is the whole point of B1.
+    ///
+    /// Returns `Err` only if the receiver has been dropped (i.e. the engine
+    /// is shutting down). The writer should treat that as a no-op since the
+    /// engine is going away anyway.
+    pub(crate) fn enqueue(&self, req: FlushRequest) -> ForstResult<()> {
+        match self.tx.try_send(req) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(req)) => self.tx.send(req).map_err(|_| {
+                ForstError::aborted("flush queue receiver dropped (engine shutting down)")
+            }),
+            Err(TrySendError::Disconnected(_)) => Err(ForstError::aborted(
+                "flush queue receiver dropped (engine shutting down)",
+            )),
+        }
+    }
+}
+
+/// Trait abstracting the engine method the flush worker calls back into.
+/// We keep this private to avoid pulling `DbImpl` into this module's
+/// public surface.
+pub(crate) trait FlushExecutor: Send + Sync {
+    /// Synchronously flush the oldest imm of `cf_data`. Returns `Ok(())`
+    /// even if the imm list is empty (treated as a no-op).
+    fn run_flush(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()>;
+}
+
+/// Worker loop: drains the flush queue and dispatches each request to the
+/// engine via the [`FlushExecutor`] callback.
+///
+/// Holds `Weak<E>` so the engine can be dropped while the worker is mid-
+/// recv; in that case the upgrade fails and we exit. On a normal shutdown
+/// the engine drops the queue's `tx`, which closes the channel and
+/// `recv()` returns `Err`.
+///
+/// Errors from `run_flush` are recorded via `record_error` so the next
+/// writer can observe and surface them. We never panic the worker on
+/// flush errors — the engine should remain usable for reads even if a
+/// flush is failing repeatedly.
+pub(crate) fn flush_loop<E>(
+    rx: Receiver<FlushRequest>,
+    engine_weak: Weak<E>,
+    record_error: impl Fn(ForstError) + Send + 'static,
+) where
+    E: FlushExecutor + 'static,
+{
+    while let Ok(req) = rx.recv() {
+        // If the engine has been dropped, exit cleanly.
+        let Some(engine) = engine_weak.upgrade() else {
+            break;
+        };
+
+        if let Err(e) = engine.run_flush(&req.cf_data) {
+            // Stash the error for the next writer to surface. We continue
+            // looping so subsequent flushes (possibly for other CFs) get a
+            // chance — a transient I/O hiccup shouldn't permanently disable
+            // background flushing.
+            record_error(e);
+        }
+    }
 }
 
 #[cfg(test)]
