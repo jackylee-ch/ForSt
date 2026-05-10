@@ -197,7 +197,7 @@ impl ShardedMemTable {
         for (i, &b) in op_types.iter().enumerate() {
             if OpType::from_u8(b).is_none() {
                 return Err(ForstError::invalid_argument(format!(
-                    "batch_insert: invalid op_type byte {} at index {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                    "batch_insert: invalid op_type byte {} at index {} (expected 0=Delete, 1=Put, 2=Merge, 7=SingleDelete)",
                     b, i
                 )));
             }
@@ -323,7 +323,7 @@ impl ShardedMemTable {
         for (i, &b) in op_values.iter().enumerate() {
             if OpType::from_u8(b).is_none() {
                 return Err(ForstError::invalid_argument(format!(
-                    "batch_put_arrow: invalid op_type byte {} at index {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                    "batch_put_arrow: invalid op_type byte {} at index {} (expected 0=Delete, 1=Put, 2=Merge, 7=SingleDelete)",
                     b, i
                 )));
             }

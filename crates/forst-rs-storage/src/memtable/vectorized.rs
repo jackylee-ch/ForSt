@@ -195,7 +195,7 @@ impl VectorizedMemTable {
         // as Put — silent corruption potential (Sweep R13 H by Reviewer 1).
         let op_type = OpType::from_u8(op_type_byte).ok_or_else(|| {
             forst_rs_common::ForstError::invalid_argument(format!(
-                "invalid op_type byte {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                "invalid op_type byte {} (expected 0=Delete, 1=Put, 2=Merge, 7=SingleDelete)",
                 op_type_byte
             ))
         })?;
@@ -579,7 +579,7 @@ impl VectorizedMemTable {
         for (i, &b) in op_types.iter().enumerate() {
             if OpType::from_u8(b).is_none() {
                 return Err(forst_rs_common::ForstError::invalid_argument(format!(
-                    "batch_insert: invalid op_type byte {} at index {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                    "batch_insert: invalid op_type byte {} at index {} (expected 0=Delete, 1=Put, 2=Merge, 7=SingleDelete)",
                     b, i
                 )));
             }
@@ -691,7 +691,7 @@ impl VectorizedMemTable {
         for (i, &b) in op_types.iter().enumerate() {
             if OpType::from_u8(b).is_none() {
                 return Err(forst_rs_common::ForstError::invalid_argument(format!(
-                    "batch_insert_with_explicit_seqs: invalid op_type byte {} at index {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                    "batch_insert_with_explicit_seqs: invalid op_type byte {} at index {} (expected 0=Delete, 1=Put, 2=Merge, 7=SingleDelete)",
                     b, i
                 )));
             }
@@ -871,7 +871,7 @@ impl VectorizedMemTable {
         for (i, &b) in op_values.iter().enumerate() {
             if OpType::from_u8(b).is_none() {
                 return Err(forst_rs_common::ForstError::invalid_argument(format!(
-                    "batch_put_arrow: invalid op_type byte {} at index {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                    "batch_put_arrow: invalid op_type byte {} at index {} (expected 0=Delete, 1=Put, 2=Merge, 7=SingleDelete)",
                     b, i
                 )));
             }
