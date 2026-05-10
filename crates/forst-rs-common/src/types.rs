@@ -184,6 +184,24 @@ impl SequenceNumber {
         self.0
     }
 
+    /// Infallible constructor (for trusted call-sites that already know the
+    /// value is within the 56-bit range — e.g. the engine's monotonically-
+    /// incrementing sequence-number allocator). Carries a `debug_assert!`
+    /// against the 56-bit invariant so misuse traps in debug builds; release
+    /// builds elide the check. For untrusted input (FFI / on-disk decode)
+    /// use [`Self::try_new`] instead.
+    #[inline]
+    pub fn new(value: u64) -> Self {
+        debug_assert!(
+            value <= MAX_SEQUENCE_NUMBER.0,
+            "SequenceNumber::new: value {} exceeds 56-bit MAX_SEQUENCE_NUMBER {}; \
+             out-of-range values silently corrupt the packed (seq << 8) | op_type tag downstream",
+            value,
+            MAX_SEQUENCE_NUMBER.0
+        );
+        SequenceNumber(value)
+    }
+
     /// Checked constructor: returns `Err` if `value > MAX_SEQUENCE_NUMBER`.
     ///
     /// Prefer this over the open `pub` field when accepting an untrusted
@@ -381,6 +399,37 @@ impl InternalKey {
     #[inline]
     pub fn op_type(&self) -> OpType {
         self.op_type
+    }
+
+    /// Encodes this key in the RocksDB on-disk format:
+    /// `user_key || tag(8 bytes little-endian)` where `tag = (seq << 8) | type`.
+    /// Byte-compatible with RocksDB's InternalKey, so tools like `sst_dump`
+    /// decode forst-rs SSTs unchanged.
+    pub fn encode_to_disk(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.user_key.len() + 8);
+        out.extend_from_slice(&self.user_key);
+        let tag: u64 = (self.sequence.0 << 8) | (self.op_type as u8 as u64);
+        out.extend_from_slice(&tag.to_le_bytes());
+        out
+    }
+
+    /// Inverse of [`encode_to_disk`]. Returns Err on inputs shorter than 8 bytes
+    /// or on unknown op_type ordinals.
+    pub fn decode_from_disk(bytes: &[u8]) -> crate::ForstResult<Self> {
+        if bytes.len() < 8 {
+            return Err(crate::ForstError::corruption(format!(
+                "InternalKey on-disk decode: input length {} < 8 (tag size)",
+                bytes.len()
+            )));
+        }
+        let split = bytes.len() - 8;
+        let user_key = bytes[..split].to_vec();
+        let tag_bytes: [u8; 8] = bytes[split..].try_into().unwrap();
+        let tag = u64::from_le_bytes(tag_bytes);
+        let type_byte = (tag & 0xFF) as u8;
+        let seq = SequenceNumber::new(tag >> 8);
+        let op_type = OpType::try_from_u8(type_byte)?;
+        Ok(InternalKey::new(user_key, seq, op_type))
     }
 }
 
@@ -825,5 +874,50 @@ mod tests {
     fn test_key_range_display() {
         let range = KeyRange::new(b"\x00\xff".to_vec(), b"\x01\x00".to_vec());
         assert_eq!(format!("{}", range), "[00ff, 0100)");
+    }
+}
+
+#[cfg(test)]
+mod disk_format_tests {
+    use super::*;
+
+    #[test]
+    fn rocksdb_byte_layout_value() {
+        let key = InternalKey::new(b"hello".to_vec(), SequenceNumber::new(0x123456_u64), OpType::Put);
+        let bytes = key.encode_to_disk();
+        // tag = (0x123456 << 8) | 1 = 0x12345601
+        // little-endian: 01 56 34 12 00 00 00 00
+        assert_eq!(bytes, b"hello\x01\x56\x34\x12\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn rocksdb_byte_layout_delete() {
+        let key = InternalKey::new(b"k".to_vec(), SequenceNumber::new(7), OpType::Delete);
+        let bytes = key.encode_to_disk();
+        // tag = (7 << 8) | 0 = 0x000700, LE: 00 07 00 00 00 00 00 00
+        assert_eq!(bytes, b"k\x00\x07\x00\x00\x00\x00\x00\x00");
+    }
+
+    #[test]
+    fn round_trip_decode() {
+        let original = InternalKey::new(b"abc".to_vec(), SequenceNumber::new(99), OpType::Put);
+        let bytes = original.encode_to_disk();
+        let decoded = InternalKey::decode_from_disk(&bytes).unwrap();
+        assert_eq!(decoded.user_key(), original.user_key());
+        assert_eq!(decoded.sequence(), original.sequence());
+        assert_eq!(decoded.op_type(), original.op_type());
+    }
+
+    #[test]
+    fn decode_too_short_returns_err() {
+        let bytes = b"k\x01\x02\x03";
+        assert!(InternalKey::decode_from_disk(bytes).is_err());
+    }
+
+    #[test]
+    fn decode_unknown_op_type_returns_err() {
+        // user_key="k", type byte = 99 (not in the valid set 0/1/2/7)
+        let bytes = b"k\x63\x00\x00\x00\x00\x00\x00\x00";
+        assert!(InternalKey::decode_from_disk(bytes).is_err());
     }
 }
