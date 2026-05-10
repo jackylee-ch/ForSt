@@ -1363,17 +1363,18 @@ pub unsafe extern "C" fn frs_prefix_scan_arrow(
 
 /// Iterator state held behind the opaque [`FrsIterator`] pointer.
 ///
-/// Fields are intentionally `pub(crate)` — only this module mutates the
-/// cursor; callers see only the opaque handle.
-struct IteratorState {
+/// Fields are `pub(crate)` so the JNI compat shim (`compat_jni`) can drive
+/// `seekToLast` / `prev` cursor moves that the public C ABI does not yet
+/// expose. External callers see only the opaque handle.
+pub(crate) struct IteratorState {
     /// Materialized (key, value) pairs in ascending key order.
-    rows: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) rows: Vec<(Vec<u8>, Vec<u8>)>,
     /// Index of the *next* row to be returned by `frs_iterator_next`.
-    cursor: usize,
+    pub(crate) cursor: usize,
 }
 
 impl IteratorState {
-    fn new(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+    pub(crate) fn new(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
         Self { rows, cursor: 0 }
     }
 }
