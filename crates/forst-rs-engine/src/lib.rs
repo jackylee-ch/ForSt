@@ -80,6 +80,7 @@ pub mod compaction_filter;
 pub mod db;
 pub mod file_deletion_guard;
 pub mod flush;
+pub mod mvcc;
 pub mod snapshot_view;
 pub mod write_batch;
 pub mod write_controller;
@@ -94,6 +95,7 @@ pub use compaction_filter::{
 pub use db::{DbImpl, LiveFileInfo, DEFAULT_CF_NAME};
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};
+pub use mvcc::{DbId, Snapshot, SnapshotRegistry};
 pub use snapshot_view::SnapshotView;
 pub use write_batch::{WriteBatch, WriteBatchEntry};
 pub use write_controller::WriteController;
