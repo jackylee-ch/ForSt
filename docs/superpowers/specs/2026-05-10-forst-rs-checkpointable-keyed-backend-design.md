@@ -138,38 +138,80 @@ length-prefixed serializers this is unambiguous in practice.
 
 ## 6a. MVCC engine subsystem
 
-**Internal key layout** (RocksDB-style, already partially in `forst-rs-common::InternalKey`):
+### 6a.1 InternalKey: byte-level RocksDB compatibility (NORMATIVE)
+
+forst-rs commits to **byte-level on-disk compatibility** with RocksDB's InternalKey
+encoding so that production diagnostic tooling (`sst_dump`, `ldb`, third-party SST
+inspectors) remains usable against forst-rs SSTs. This is a **major operational asset**
+worth preserving and not negotiable.
+
+**On-disk layout** (matches `rocksdb/db/dbformat.h`):
 
 ```
-InternalKey bytes = user_key || sequence(7 bytes BE) || op_type(1 byte)
+InternalKey bytes = user_key || tag(8 bytes, little-endian)
 
-op_type ordinals:
-  0x00 = DELETION
-  0x01 = VALUE
-  0x02 = MERGE         (reserved for future)
-  0x03 = SINGLE_DELETION (reserved)
+tag = (sequence << 8) | type
+    where sequence ∈ [0, 2^56) (7 bytes worth)
+          type     ∈ [0, 256)  (1 byte)
+
+On-disk byte order of the tag (little-endian):
+  byte 0:    type
+  bytes 1-7: sequence in little-endian
 ```
 
-Memtable + SSTs store `InternalKey → value` pairs sorted by `(user_key ASC, sequence DESC)`,
-so a forward iterator over `user_key` yields the latest-seq version first.
+**Type ordinals** (must match RocksDB's `ValueType` enum exactly):
 
-**Snapshot type & registry**:
+| Ordinal | Name | Status in forst-rs v1 |
+|---|---|---|
+| 0x0 | kTypeDeletion | implemented |
+| 0x1 | kTypeValue | implemented |
+| 0x2 | kTypeMerge | reserved (errors at write time; no merge operator yet) |
+| 0x4 | kTypeColumnFamilyDeletion | reserved |
+| 0x5 | kTypeColumnFamilyValue | reserved |
+| 0x7 | kTypeSingleDeletion | reserved |
+| 0xB | kTypeRangeDeletion | reserved |
+| 0xF | kTypeBlobIndex | reserved |
+| (others) | reserved by RocksDB | reject at read time with `FRS_STATUS_UNSUPPORTED_VERSION` |
+
+**Implementation constraints**:
+
+- Sort order: `(user_key ASC, sequence DESC)` — same as RocksDB. Latest version of a key
+  comes first in a forward iterator.
+- Comparator: byte-wise on user_key, then numeric DESC on sequence. Implemented as a single
+  byte-wise comparison if user_key bytes precede the tag (which they do in this layout).
+- The existing `forst-rs-common::InternalKey` already has `seq + op_type` fields; P0 work
+  changes the encoder/decoder to match the RocksDB byte layout described above (was a
+  forst-rs-internal layout previously).
+
+**Verification gate**: P0 ships with a test that writes 3 keys to a forst-rs SST, opens it
+with the upstream `sst_dump --command=scan` binary, and asserts the dumped keys + sequences
++ types match. This is a hard CI gate.
+
+### 6a.2 Snapshot type & registry
 
 ```rust
 pub struct Snapshot {
     seq: SequenceNumber,
+    db_id: DbId,                   // (4) — bind to DB instance for lifetime check
+    captured_at: Instant,          // (3) — for snapshot_max_age_ms enforcement
     registry: Arc<SnapshotRegistry>,
 }
 
 pub struct SnapshotRegistry {
     // BTreeMap<seq, ref_count> — sorted access for finding the minimum live seq
     active: Mutex<BTreeMap<SequenceNumber, AtomicUsize>>,
+    // Cached min_active for hot-path compaction reads (avoids lock).
+    // Updated on every capture/release; stale reads return a value SAFER than truth
+    // (i.e., older seq, retains more versions) so compaction never drops too aggressively.
+    cached_min: AtomicU64,
 }
 
 impl SnapshotRegistry {
-    pub fn capture(&self, current_seq: SequenceNumber) -> Snapshot { ... }
+    pub fn capture(&self, db_id: DbId, current_seq: SequenceNumber) -> Snapshot { ... }
     pub fn release(&self, seq: SequenceNumber) { ... }
-    pub fn min_active(&self) -> SequenceNumber { ... } // returns SequenceNumber::MAX if empty
+    pub fn min_active(&self) -> SequenceNumber { ... } // u64::MAX if empty
+    pub fn oldest_age_ms(&self) -> u64 { ... }
+    pub fn active_count(&self) -> usize { ... }
 }
 
 impl Drop for Snapshot {
@@ -177,7 +219,43 @@ impl Drop for Snapshot {
 }
 ```
 
-**Read path** (`get_at(snapshot, user_key)`):
+### 6a.3 Long-lived snapshot policy (NORMATIVE)
+
+Long-lived snapshots pin storage and degrade compaction efficiency. The engine enforces:
+
+| Knob | Default | Behavior |
+|---|---|---|
+| Config: `forst-rs.mvcc.snapshot.max_age_ms` | `300000` (5 min) | Soft limit |
+| **On overage** | — | **WARN only**, **NEVER auto-release** (auto-release would silently break correctness contracts) |
+| Metric: `forst.snapshot.oldest_age_ms` | — | Gauge; emitted once per metric scrape interval |
+| Metric: `forst.snapshot.active_count` | — | Gauge; emitted once per metric scrape interval |
+| Metric: `forst.snapshot.pinned_bytes` | — | Estimated bytes retained because of active snapshots |
+
+The warn line includes: snapshot age, captured_at, db_id, and a hint pointing at the
+operator runbook. Production operators are expected to monitor `oldest_age_ms` and alert
+when it crosses the configured threshold; runaway snapshot leaks are a programmer bug,
+not something the engine can safely paper over.
+
+### 6a.4 Sequence number overflow policy (NORMATIVE)
+
+Sequence numbers are 56-bit (7 bytes). At 1 M writes/sec sustained, the space lasts
+~2,285 years. At 1 G writes/sec it lasts ~2.3 years. The engine treats `seq ≥ 2^60`
+(64× safety margin from the 56-bit on-disk space, allowing room for future 8-byte
+expansion) as a fatal condition:
+
+| Threshold | Behavior |
+|---|---|
+| `seq >= 2^59` | WARN: "sequence number high; consider checkpoint + restart" |
+| `seq >= 2^60` | FATAL: log + return `FRS_STATUS_INTERNAL` from every write; backend stops accepting writes; reads continue |
+
+**Recovery**: operator restarts the backend from the latest checkpoint. The engine
+restores its global sequence counter from `manifest.checkpoint_seq`, NOT from zero —
+this preserves MVCC ordering across restart. The checkpoint manifest written in §10b
+already carries `snapshot_seq`; that's the recovery source.
+
+### 6a.5 Read & iterator paths
+
+**Read path** (`get_at(snapshot, user_key)` — assumes `snapshot.db_id == this_db.id`):
 
 1. Probe memtable for entries `(user_key, *, *)`; pick the one with largest `seq <= snapshot.seq`
 2. If the picked entry's `op_type == DELETION`: return `Ok(None)`
@@ -326,7 +404,29 @@ preserves CF identity across restore.
 
 ## 10. New engine FFI
 
-Six new C ABI exports in `crates/forst-rs-ffi/src/lib.rs`:
+Six new C ABI exports in `crates/forst-rs-ffi/src/lib.rs`.
+
+### 10.0 ABI lifetime contract for snapshot handles (NORMATIVE)
+
+These constraints are part of the FFI contract; **adding/changing them post-v1 is a
+breaking ABI change**. They are enforced at the boundary by explicit checks (not just
+documentation) wherever feasible.
+
+| Constraint | Enforcement |
+|---|---|
+| **Same-DB**: a snapshot must be released against the SAME `FrsDb` instance that issued it. Cross-DB release is undefined behavior. | Snapshot carries `db_id` field (§6a.2). `frs_db_release_snapshot` checks `snapshot.db_id == db.id` and returns `FRS_STATUS_INVALID_ARGUMENT` on mismatch. |
+| **No use-after-release**: snapshot handles passed to `frs_get_at` / `frs_iterator_open_at` must not race with `frs_db_release_snapshot` on another thread. | Snapshot ref-counts via `Arc`; release decrements. Concurrent `get_at` holds an `Arc` clone for the call duration; final release runs Drop only when ref-count reaches zero. Engine therefore tolerates the race **technically** but documents it as caller-beware: don't release a snapshot while a thread is still using it. |
+| **Bounded lifetime**: snapshot handles must NOT outlive the checkpoint barrier they were created for. Checkpoint snapshots are managed entirely by the backend; operators MUST NOT hold them across barriers. | Backend owns all snapshots; user-facing FFI surface (compat_jni + ForStRsLinker) does NOT expose `dbSnapshot()` / `releaseSnapshot()` to Flink user code. Long-lived analytics snapshots (if added in v2) get a separate "named snapshot" API with explicit operator opt-in. |
+| **DB close while iterators alive**: closing `FrsDb` while iterators (or get_at calls) still hold a snapshot must FAIL LOUDLY, never leak silently. | `frs_db_close` checks `db.outstanding_handles_count > 0` and returns `FRS_STATUS_RESOURCE_BUSY`. If forced (`frs_db_force_close`), iterators outstanding return `FRS_STATUS_DB_CLOSED` on next `iterator_next`. The default `frs_db_close` never panics; force-close is an explicit, separate symbol. |
+| **Iterator lifetime ≤ snapshot lifetime**: an iterator opened with `iterator_open_at(snapshot)` must be closed before the snapshot is released. | Iterator carries an `Arc<Snapshot>` clone, so the snapshot stays alive as long as the iterator exists. Release on a snapshot still in use just decrements the user's ref count; engine continues to hold it via the iterator. |
+
+These rules are tested via:
+- Cross-DB release attempt (returns INVALID_ARGUMENT)
+- Close-with-outstanding-iter (returns RESOURCE_BUSY)
+- Force-close-with-outstanding-iter (next iterator_next returns DB_CLOSED, no panic)
+- Concurrent release-while-reading stress test (1000 iterations, no UAF/no panic)
+
+### 10a. MVCC primitives
 
 ### 10a. MVCC primitives
 
@@ -497,9 +597,10 @@ needs it.
 | Rescaling perf (O(N) iterate per restore) | Acceptable for v1; optimize via per-key-group SST split in v2 if measured slow |
 | Per-state CF count explosion (jobs with 100+ states) | Document soft limit at 256 CFs; fail fast at backend init with explicit guidance to switch to `cf.mode=single` |
 | Manifest format versioning | Include `manifest_version: 2` field (bumped from v1 spec since cfMap + snapshot_seq added); restore checks compatibility; future bumps add migration path |
-| MVCC: long-lived snapshots pin storage | Document operator guide; expose `frs.metrics.active_snapshots` + `frs.metrics.pinned_bytes`; consider abandoning snapshots older than `state.backend.forst-rs.mvcc.snapshot.max_age_sec` (default ∞) in v1.5 if observed |
-| MVCC: compaction policy bug → silent data loss | Property-test the compaction policy: for any (set of writes, set of snapshots) sequence, verify reads at each snapshot return the correct value; fuzz with proptest |
-| MVCC: per-key seq overflow (7 bytes = 2^56 seq, very large but bounded) | At 1M writes/sec sustained, fills in ~2,000 years. Acceptable; documented |
+| MVCC: long-lived snapshots pin storage | **Normative constraint in §6a.3** — config `snapshot.max_age_ms`, warn-only behavior, `forst.snapshot.oldest_age_ms` + `active_count` + `pinned_bytes` gauges, runbook hint in warn line. Operator monitors and alerts. |
+| MVCC: compaction policy bug → silent data loss | Property-test the compaction policy: for any (set of writes, set of snapshots) sequence, verify reads at each snapshot return the correct value; fuzz with proptest. CI gate. |
+| MVCC: sequence number overflow (56-bit on-disk, 60-bit safety threshold) | **Normative constraint in §6a.4** — fatal at seq ≥ 2^60, log + writes return INTERNAL, reads continue, recovery via checkpoint manifest's `snapshot_seq`. At 1 M writes/sec the threshold is ~36,500 years away; operationally unreachable but defined. |
+| RocksDB byte-compat: divergence in InternalKey layout would silently break sst_dump | **Normative constraint in §6a.1** — CI gate runs `sst_dump --command=scan` against a forst-rs SST and asserts byte-equivalent output. P0 cannot land without this test green. |
 
 ## 15. Out of scope (will re-enter design later)
 
@@ -526,9 +627,33 @@ needs it.
   on next compaction cycle (verify SST file count + manifest entries shrink)
 
 **Non-functional**:
+
 - 10k-checkpoint soak: SST registry size remains bounded by configured retention; engine
   Snapshot count returns to zero after each checkpoint completes
-- **Snapshot sync phase < 1 ms (95p) at 1 GB state** (MVCC enables this; was 50-200 ms with
-  flush-based path)
 - Async snapshot completes within `state.backend.forst-rs.snapshot.timeout` (default 60s)
   for 1 GB state on local-FS CheckpointStorage
+
+**Sync-phase latency (split into two sub-metrics, measured under load)**:
+
+| Sub-metric | Threshold | What it verifies |
+|---|---|---|
+| `dbSnapshot()` call itself | **< 100 µs P99** | `captureSeq` is genuinely O(1); `SnapshotRegistry` has no lock contention |
+| Sync phase end-to-end (barrier → ack) | **< 1 ms P95** | No surprises in JNI boundary, `createIncrementalCheckpointAt` setup, metadata serialization |
+
+**Measurement condition**: 100 concurrent in-flight snapshots held during the test (NOT
+serial single-snapshot). This matches the async state API workload, where multiple
+operators may be checkpointing simultaneously, and prevents low-concurrency tests from
+masking lock-contention regressions that only show up in production.
+
+The sub-metric split exists because end-to-end can hide design regressions: a future
+refactor adding a lock that's invisible at low concurrency degrades to 100 ms in
+production. The `dbSnapshot()` sub-metric catches such regressions in isolation.
+
+**Long-lived snapshot acceptance test** (per §6a.3 normative constraint):
+
+- Hold a snapshot for 10 minutes (2× the default `snapshot_max_age_ms = 300000`)
+- Verify: warning fires after 5 min and again at scrape interval
+- Verify: backend continues accepting reads + writes throughout
+- Verify: `forst.snapshot.oldest_age_ms` gauge advances correctly
+- Verify: snapshot is NEVER auto-released (the read view stays valid for the full 10 min)
+- After release: verify pinned versions are reclaimed by next compaction cycle
