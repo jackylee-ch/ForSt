@@ -427,7 +427,7 @@ impl InternalKey {
         let tag_bytes: [u8; 8] = bytes[split..].try_into().unwrap();
         let tag = u64::from_le_bytes(tag_bytes);
         let type_byte = (tag & 0xFF) as u8;
-        let seq = SequenceNumber::new(tag >> 8);
+        let seq = SequenceNumber::try_new(tag >> 8)?;
         let op_type = OpType::try_from_u8(type_byte)?;
         Ok(InternalKey::new(user_key, seq, op_type))
     }
@@ -883,7 +883,11 @@ mod disk_format_tests {
 
     #[test]
     fn rocksdb_byte_layout_value() {
-        let key = InternalKey::new(b"hello".to_vec(), SequenceNumber::new(0x123456_u64), OpType::Put);
+        let key = InternalKey::new(
+            b"hello".to_vec(),
+            SequenceNumber::new(0x123456_u64),
+            OpType::Put,
+        );
         let bytes = key.encode_to_disk();
         // tag = (0x123456 << 8) | 1 = 0x12345601
         // little-endian: 01 56 34 12 00 00 00 00
