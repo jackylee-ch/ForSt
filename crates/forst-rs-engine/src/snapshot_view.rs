@@ -22,16 +22,16 @@
 //! Compaction operations install a new snapshot atomically without affecting
 //! existing readers.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use forst_rs_storage::memtable::VectorizedMemTable;
+use forst_rs_storage::memtable::ShardedMemTable;
 use forst_rs_storage::version::Version;
 
 /// Immutable read view over a column family at a specific sequence number.
 #[derive(Clone)]
 pub struct SnapshotView {
-    active_memtable: Option<Arc<RwLock<VectorizedMemTable>>>,
-    imm_list: Vec<Arc<RwLock<VectorizedMemTable>>>,
+    active_memtable: Option<Arc<ShardedMemTable>>,
+    imm_list: Vec<Arc<ShardedMemTable>>,
     version: Arc<Version>,
     sequence: u64,
 }
@@ -39,8 +39,8 @@ pub struct SnapshotView {
 impl SnapshotView {
     /// Creates a snapshot view with the given components.
     pub fn new(
-        active_memtable: Arc<RwLock<VectorizedMemTable>>,
-        imm_list: Vec<Arc<RwLock<VectorizedMemTable>>>,
+        active_memtable: Arc<ShardedMemTable>,
+        imm_list: Vec<Arc<ShardedMemTable>>,
         version: Arc<Version>,
         sequence: u64,
     ) -> Self {
@@ -64,12 +64,12 @@ impl SnapshotView {
     }
 
     /// Returns the active memtable, if any.
-    pub fn active_memtable(&self) -> Option<&Arc<RwLock<VectorizedMemTable>>> {
+    pub fn active_memtable(&self) -> Option<&Arc<ShardedMemTable>> {
         self.active_memtable.as_ref()
     }
 
     /// Returns the list of immutable memtables (oldest first, newest last).
-    pub fn imm_list(&self) -> &[Arc<RwLock<VectorizedMemTable>>] {
+    pub fn imm_list(&self) -> &[Arc<ShardedMemTable>] {
         &self.imm_list
     }
 
@@ -128,8 +128,8 @@ mod tests {
 
     #[test]
     fn test_snapshot_new_exposes_components() {
-        let mem = Arc::new(RwLock::new(VectorizedMemTable::with_defaults()));
-        let imm = vec![Arc::new(RwLock::new(VectorizedMemTable::with_defaults()))];
+        let mem = Arc::new(ShardedMemTable::with_defaults());
+        let imm = vec![Arc::new(ShardedMemTable::with_defaults())];
         let version = Arc::new(Version::new());
         let s = SnapshotView::new(mem.clone(), imm, version, 99);
         assert!(s.active_memtable().is_some());

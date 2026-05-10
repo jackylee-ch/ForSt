@@ -73,23 +73,22 @@ impl FlushJob {
     /// Runs the flush synchronously. Returns the metadata describing the
     /// produced SST file, ready to feed into a `VersionEdit`.
     pub fn run(self) -> ForstResult<SstFileMeta> {
-        // 1. Pull sorted RecordBatches from the memtable. `to_flush_batches`
-        //    requires the memtable to be frozen; the engine must have done
-        //    that before scheduling the flush.
-        let batches = {
-            let guard = self.memtable.read().expect("lock poisoned");
-            if !guard.is_frozen() {
-                return Err(ForstError::invalid_argument(
-                    "FlushJob: memtable is not frozen; call freeze() first",
-                ));
-            }
-            if guard.num_entries() == 0 {
-                return Err(ForstError::invalid_argument(
-                    "FlushJob: memtable is empty; nothing to flush",
-                ));
-            }
-            guard.to_flush_batches(FLUSH_BATCH_SIZE)?
-        };
+        // 1. Pull sorted RecordBatches from the sharded memtable.
+        //    `to_flush_batches` requires every shard to be frozen; the
+        //    engine must have done that via `ShardedMemTable::freeze`
+        //    before scheduling the flush. The sharded impl merges across
+        //    shards, returning a globally sorted (key ASC, seq DESC) stream.
+        if !self.memtable.is_frozen() {
+            return Err(ForstError::invalid_argument(
+                "FlushJob: memtable is not frozen; call freeze() first",
+            ));
+        }
+        if self.memtable.num_entries() == 0 {
+            return Err(ForstError::invalid_argument(
+                "FlushJob: memtable is empty; nothing to flush",
+            ));
+        }
+        let batches = self.memtable.to_flush_batches(FLUSH_BATCH_SIZE)?;
 
         // 2. Feed each row into the SST writer. We iterate with `add()` to
         //    preserve the writer's invariant (entries arrive in sorted order
@@ -314,18 +313,17 @@ mod tests {
     use super::*;
     use forst_rs_common::{CompressionType, OpType};
     use forst_rs_io::MemoryFileSystem;
-    use forst_rs_storage::memtable::VectorizedMemTable;
-    use std::sync::RwLock;
+    use forst_rs_storage::memtable::ShardedMemTable;
 
     type MemEntry<'a> = (&'a [u8], Option<&'a [u8]>, u8);
 
     fn make_memtable(entries: &[MemEntry<'_>]) -> SharedMemTable {
-        let mut mem = VectorizedMemTable::with_defaults();
+        let mem = ShardedMemTable::with_defaults();
         for (k, v, op) in entries {
             mem.put(k, *v, *op).unwrap();
         }
         mem.freeze();
-        Arc::new(RwLock::new(mem))
+        Arc::new(mem)
     }
 
     fn default_writer_opts() -> SstWriterOptions {
@@ -337,8 +335,8 @@ mod tests {
 
     #[test]
     fn test_flush_rejects_unfrozen_memtable() {
-        let mem = VectorizedMemTable::with_defaults();
-        let shared = Arc::new(RwLock::new(mem));
+        let mem = ShardedMemTable::with_defaults();
+        let shared = Arc::new(mem);
         let fs = Arc::new(MemoryFileSystem::new());
         let job = FlushJob::new(
             shared,
@@ -353,9 +351,9 @@ mod tests {
 
     #[test]
     fn test_flush_rejects_empty_memtable() {
-        let mut mem = VectorizedMemTable::with_defaults();
+        let mem = ShardedMemTable::with_defaults();
         mem.freeze();
-        let shared = Arc::new(RwLock::new(mem));
+        let shared = Arc::new(mem);
         let fs = Arc::new(MemoryFileSystem::new());
         let job = FlushJob::new(
             shared,
@@ -411,13 +409,16 @@ mod tests {
 
     #[test]
     fn test_flush_captures_min_max_sequence() {
-        let mut mem = VectorizedMemTable::with_defaults();
-        // put returns seq starting from 1; second put gets seq=2
-        mem.put(b"a", Some(b"1"), OpType::Put as u8).unwrap();
-        mem.put(b"b", Some(b"2"), OpType::Put as u8).unwrap();
-        mem.put(b"a", Some(b"3"), OpType::Put as u8).unwrap();
+        let mem = ShardedMemTable::with_defaults();
+        // Use put_with_seq so seq numbering is deterministic across shards.
+        mem.put_with_seq(b"a", Some(b"1"), OpType::Put as u8, 1)
+            .unwrap();
+        mem.put_with_seq(b"b", Some(b"2"), OpType::Put as u8, 2)
+            .unwrap();
+        mem.put_with_seq(b"a", Some(b"3"), OpType::Put as u8, 3)
+            .unwrap();
         mem.freeze();
-        let shared = Arc::new(RwLock::new(mem));
+        let shared = Arc::new(mem);
 
         let fs = Arc::new(MemoryFileSystem::new());
         let job = FlushJob::new(
@@ -434,15 +435,20 @@ mod tests {
 
     #[test]
     fn test_flush_many_entries_spans_multiple_blocks() {
-        let mut mem = VectorizedMemTable::with_defaults();
+        let mem = ShardedMemTable::with_defaults();
         for i in 0..2000u32 {
             let key = format!("k{:06}", i);
             let value = format!("v{:06}", i);
-            mem.put(key.as_bytes(), Some(value.as_bytes()), OpType::Put as u8)
-                .unwrap();
+            mem.put_with_seq(
+                key.as_bytes(),
+                Some(value.as_bytes()),
+                OpType::Put as u8,
+                i as u64 + 1,
+            )
+            .unwrap();
         }
         mem.freeze();
-        let shared = Arc::new(RwLock::new(mem));
+        let shared = Arc::new(mem);
         let fs = Arc::new(MemoryFileSystem::new());
         let job = FlushJob::new(
             shared,

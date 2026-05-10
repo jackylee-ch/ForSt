@@ -286,12 +286,13 @@ impl DbImpl {
         let handle = ColumnFamilyHandle::new(id, &name);
 
         let initial_snapshot = Arc::new(SnapshotView::empty());
-        let cf_data = Arc::new(ColumnFamilyData::new_with_filter(
+        let cf_data = Arc::new(ColumnFamilyData::new_with_filter_and_shards(
             handle.clone(),
             options,
             merge_op,
             filter,
             initial_snapshot,
+            self.options.memtable_shards,
         ));
 
         {
@@ -383,20 +384,17 @@ impl DbImpl {
         // `read()` boundaries that establish the necessary happens-before.
         let seq = self.sequence_number.fetch_add(1, Ordering::Relaxed) + 1;
 
-        // Phase 1 (under write_mutex): serialize memtable writes + decide
-        // whether to switch the active memtable. If a switch happens we do
-        // it inline so the next writer sees the fresh memtable, but we
-        // hand the expensive SST flush off to the background worker so
-        // this writer (and concurrent writers) never block on disk I/O.
+        // E1: with `ShardedMemTable` the put hot path holds only the
+        // owning shard's `RwLock` (one of N), so concurrent writers hashing
+        // to different shards never block each other. We do NOT take
+        // `write_mutex` for the put itself — only for the switch decision
+        // below, so the active-memtable swap remains serialized.
+        {
+            let mem_arc = cf_data.active_memtable();
+            mem_arc.put_with_seq(key, value, op as u8, seq)?;
+        }
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
-
-            {
-                let mem_arc = cf_data.active_memtable();
-                let mut mem = mem_arc.write().expect("lock poisoned");
-                mem.put_with_seq(key, value, op as u8, seq)?;
-            }
-
             self.maybe_switch_memtable_in_lock(&cf_data)?
         };
 
@@ -453,38 +451,31 @@ impl DbImpl {
             .fetch_add(total_count, Ordering::Relaxed);
         let last_seq = prev + total_count;
 
-        // Phase 1 (under write_mutex): perform all memtable writes and any
-        // in-lock switch decisions, collecting CFs whose memtable needs to
-        // be flushed outside the lock.
+        // E1: per-CF batch insert routes rows by shard; each shard takes
+        // its own write lock independently, so concurrent batches across
+        // distinct keys see no engine-level serialization. The switch
+        // decision still goes through `write_mutex` to keep
+        // `active_memtable` swaps serialized.
+        let entries = batch.into_entries();
+        let mut group_offset: u64 = 1; // first owned seq is `prev + 1`
+        for (cf_id, indices) in &groups {
+            let cf_data = cf_datas.get(cf_id).expect("cf_data pre-populated");
+            let mem_arc = cf_data.active_memtable();
+
+            let keys: Vec<&[u8]> = indices.iter().map(|&i| entries[i].key.as_slice()).collect();
+            let values: Vec<Option<&[u8]>> = indices
+                .iter()
+                .map(|&i| entries[i].value.as_deref())
+                .collect();
+            let op_types: Vec<u8> = indices.iter().map(|&i| entries[i].op_type as u8).collect();
+            let base_seq = prev + group_offset;
+            mem_arc.batch_insert_with_base_seq(&keys, &values, &op_types, base_seq)?;
+            group_offset += indices.len() as u64;
+        }
+
         let mut cfs_to_flush: Vec<Arc<ColumnFamilyData>> = Vec::new();
         {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
-            let entries = batch.into_entries();
-
-            // Walk groups in a deterministic order so per-CF base seqs are
-            // assigned reproducibly regardless of HashMap iteration order.
-            // Within a single batch we don't care about the cross-CF order
-            // (each row carries its own seq, the memtable sorts on lookup),
-            // but tests benefit from determinism.
-            let mut group_offset: u64 = 1; // first owned seq is `prev + 1`
-            for (cf_id, indices) in &groups {
-                let cf_data = cf_datas.get(cf_id).expect("cf_data pre-populated");
-                let mem_arc = cf_data.active_memtable();
-                let mut mem = mem_arc.write().expect("lock poisoned");
-
-                let keys: Vec<&[u8]> = indices.iter().map(|&i| entries[i].key.as_slice()).collect();
-                let values: Vec<Option<&[u8]>> = indices
-                    .iter()
-                    .map(|&i| entries[i].value.as_deref())
-                    .collect();
-                let op_types: Vec<u8> = indices.iter().map(|&i| entries[i].op_type as u8).collect();
-                let base_seq = prev + group_offset;
-                mem.batch_insert_with_base_seq(&keys, &values, &op_types, base_seq)?;
-                group_offset += indices.len() as u64;
-            }
-
-            // Check each CF's threshold and switch in-lock; defer flush to
-            // Phase 2 below to avoid blocking other writers on disk I/O.
             for cf_data in cf_datas.values() {
                 if self.maybe_switch_memtable_in_lock(cf_data)? {
                     cfs_to_flush.push(cf_data.clone());
@@ -541,15 +532,16 @@ impl DbImpl {
         let last_seq = prev + count as u64;
         let base_seq = prev + 1;
 
-        // Phase 1 (under write_mutex): drive the columnar insert + decide
-        // whether to switch the active memtable.
+        // E1: arrow batch is partitioned across shards in `ShardedMemTable`;
+        // each shard takes its own lock so concurrent batches don't
+        // serialize on a single memtable lock. Switch decision still
+        // serializes on `write_mutex`.
+        {
+            let mem_arc = cf_data.active_memtable();
+            mem_arc.batch_put_arrow_with_base_seq(batch, base_seq)?;
+        }
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
-            {
-                let mem_arc = cf_data.active_memtable();
-                let mut mem = mem_arc.write().expect("lock poisoned");
-                mem.batch_put_arrow_with_base_seq(batch, base_seq)?;
-            }
             self.maybe_switch_memtable_in_lock(&cf_data)?
         };
 
@@ -860,8 +852,7 @@ impl DbImpl {
             // Only switch + flush when the active memtable has data.
             let has_data = {
                 let mem_arc = cf_data.active_memtable();
-                let mem = mem_arc.read().expect("lock poisoned");
-                mem.num_entries() > 0
+                mem_arc.num_entries() > 0
             };
             if has_data {
                 let _writer = self.write_mutex.lock().expect("lock poisoned");
@@ -1070,18 +1061,16 @@ impl DbImpl {
         let cf_data = self.lookup_cf_by_id(cf.id())?;
         let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
 
-        // Active memtable.
+        // Active memtable (sharded — `collect_range_entries` merges across shards).
         {
             let mem_arc = cf_data.active_memtable();
-            let mem = mem_arc.read().expect("lock poisoned");
-            for (k, _, _, _) in mem.collect_range_entries(lower, upper, u64::MAX) {
+            for (k, _, _, _) in mem_arc.collect_range_entries(lower, upper, u64::MAX) {
                 keys.insert(k);
             }
         }
         // Immutable memtables.
         for imm in cf_data.imm_memtables() {
-            let mem = imm.read().expect("lock poisoned");
-            for (k, _, _, _) in mem.collect_range_entries(lower, upper, u64::MAX) {
+            for (k, _, _, _) in imm.collect_range_entries(lower, upper, u64::MAX) {
                 keys.insert(k);
             }
         }
@@ -1297,11 +1286,7 @@ impl DbImpl {
     /// In-lock portion of the switch decision. Returns `true` if a switch
     /// happened and the caller should flush outside the write lock.
     fn maybe_switch_memtable_in_lock(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<bool> {
-        let usage = {
-            let mem_arc = cf_data.active_memtable();
-            let mem = mem_arc.read().expect("lock poisoned");
-            mem.memory_usage()
-        };
+        let usage = cf_data.active_memtable().memory_usage();
 
         let threshold = cf_data.options().effective_write_buffer_size(&self.options);
         if usage < threshold {
@@ -1365,11 +1350,8 @@ impl DbImpl {
         read_seq: u64,
     ) -> ForstResult<Option<Vec<u8>>> {
         // Stage 1: Active memtable — peek at the newest visible entry.
-        let active_hit = {
-            let mem_arc = cf_data.active_memtable();
-            let mem = mem_arc.read().expect("lock poisoned");
-            mem.get(key, read_seq)?
-        };
+        // E1: ShardedMemTable::get hashes the key to one shard internally.
+        let active_hit = cf_data.active_memtable().get(key, read_seq)?;
         match active_hit {
             Some(entry) if entry.op_type == OpType::Put => return Ok(entry.value),
             Some(entry)
@@ -1397,10 +1379,7 @@ impl DbImpl {
         // Stage 2: Immutable memtables (newest → oldest).
         let imm_list = cf_data.imm_memtables();
         for imm in imm_list.iter().rev() {
-            let hit = {
-                let guard = imm.read().expect("lock poisoned");
-                guard.get(key, read_seq)?
-            };
+            let hit = imm.get(key, read_seq)?;
             let Some(entry) = hit else { continue };
             match entry.op_type {
                 OpType::Put => return Ok(entry.value),
@@ -1719,10 +1698,7 @@ impl DbImpl {
     ) -> ForstResult<Option<MergeBase>> {
         let mut cutoff = start_cutoff;
         loop {
-            let hit = {
-                let guard = mem_arc.read().expect("lock poisoned");
-                guard.get(key, cutoff)?
-            };
+            let hit = mem_arc.get(key, cutoff)?;
             let Some(entry) = hit else { return Ok(None) };
             match entry.op_type {
                 OpType::Put => return Ok(Some(MergeBase { value: entry.value })),

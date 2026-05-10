@@ -17,8 +17,10 @@
 //! This module provides the [`crate::memtable::VectorizedMemTable`] implementation based on a hybrid
 //! Sorted Run Array + BTreeMap index architecture (design doc 2.3).
 
+pub mod sharded;
 pub mod vectorized;
 
+pub use sharded::{ShardedMemTable, DEFAULT_SHARD_COUNT, MAX_SHARD_COUNT};
 pub use vectorized::VectorizedMemTable;
 
 use forst_rs_common::OpType;

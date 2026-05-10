@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
 use forst_rs_common::{CfOptions, ColumnFamilyId};
-use forst_rs_storage::memtable::VectorizedMemTable;
+use forst_rs_storage::memtable::{MemTableConfig, ShardedMemTable};
 use forst_rs_storage::merge_operator::MergeOperator;
 
 use crate::compaction_filter::CompactionFilter;
@@ -151,11 +151,16 @@ impl std::fmt::Debug for ColumnFamilyDescriptor {
     }
 }
 
-/// Type alias for a shared, lockable memtable. Used for both the active
-/// memtable and the immutable queue. Once a memtable is moved to the
-/// immutable queue it is frozen internally, so further writes will be
-/// rejected even though the `RwLock` remains in place.
-pub type SharedMemTable = Arc<RwLock<VectorizedMemTable>>;
+/// Type alias for a shared, internally-locked memtable. Used for both the
+/// active memtable and the immutable queue.
+///
+/// E1: backed by [`ShardedMemTable`], which owns N independent
+/// `RwLock<VectorizedMemTable>` shards. Writers hash by key into one shard;
+/// readers consult one shard for `get` / merge across shards for `scan` and
+/// `to_flush_batches`. Once moved to the immutable queue the memtable is
+/// frozen via [`ShardedMemTable::freeze`] (every shard frozen
+/// individually) so further writes are rejected at the shard level.
+pub type SharedMemTable = Arc<ShardedMemTable>;
 
 /// Mutable, per-column-family runtime state.
 ///
@@ -174,6 +179,9 @@ pub struct ColumnFamilyData {
     /// Serializes per-CF flush operations so concurrent callers cannot
     /// flush the same oldest imm twice.
     flush_mutex: Mutex<()>,
+    /// Shard count for fresh memtables installed by `swap_active_memtable`.
+    /// `0` falls back to [`forst_rs_storage::memtable::DEFAULT_SHARD_COUNT`].
+    shard_count: usize,
 }
 
 impl ColumnFamilyData {
@@ -188,6 +196,11 @@ impl ColumnFamilyData {
     }
 
     /// Creates a new column family data object attaching a compaction filter.
+    ///
+    /// Uses [`forst_rs_storage::memtable::DEFAULT_SHARD_COUNT`] for the
+    /// active memtable. Engine callers should prefer
+    /// [`Self::new_with_filter_and_shards`] so the shard count is driven
+    /// by `EngineOptions::memtable_shards`.
     pub fn new_with_filter(
         handle: ColumnFamilyHandle,
         options: CfOptions,
@@ -195,7 +208,28 @@ impl ColumnFamilyData {
         compaction_filter: Option<Arc<dyn CompactionFilter>>,
         initial_snapshot: Arc<SnapshotView>,
     ) -> Self {
-        let memtable = Arc::new(RwLock::new(VectorizedMemTable::with_defaults()));
+        Self::new_with_filter_and_shards(
+            handle,
+            options,
+            merge_operator,
+            compaction_filter,
+            initial_snapshot,
+            0, // 0 → use DEFAULT_SHARD_COUNT
+        )
+    }
+
+    /// Creates a new column family data object attaching a compaction
+    /// filter and an explicit `shard_count`. `shard_count == 0` is treated
+    /// as "use the default shard count" (clamped to `[1, MAX_SHARD_COUNT]`).
+    pub fn new_with_filter_and_shards(
+        handle: ColumnFamilyHandle,
+        options: CfOptions,
+        merge_operator: Option<Arc<dyn MergeOperator>>,
+        compaction_filter: Option<Arc<dyn CompactionFilter>>,
+        initial_snapshot: Arc<SnapshotView>,
+        shard_count: usize,
+    ) -> Self {
+        let memtable = Arc::new(ShardedMemTable::new(shard_count, MemTableConfig::default()));
         Self {
             handle,
             options,
@@ -205,6 +239,7 @@ impl ColumnFamilyData {
             imm_list: RwLock::new(Vec::new()),
             cached_snapshot_view: ArcSwap::new(initial_snapshot),
             flush_mutex: Mutex::new(()),
+            shard_count,
         }
     }
 
@@ -251,21 +286,22 @@ impl ColumnFamilyData {
 
     /// Freezes the current active memtable and pushes it onto the immutable
     /// queue, installing a fresh empty memtable in its place. Returns the
-    /// frozen memtable (shared `Arc<RwLock<...>>`).
+    /// frozen memtable (shared `Arc<ShardedMemTable>`).
     pub fn swap_active_memtable(&self) -> SharedMemTable {
         let mut active_guard = self.active_memtable.write().expect("lock poisoned");
         let old = std::mem::replace(
             &mut *active_guard,
-            Arc::new(RwLock::new(VectorizedMemTable::with_defaults())),
+            Arc::new(ShardedMemTable::new(
+                self.shard_count,
+                MemTableConfig::default(),
+            )),
         );
         drop(active_guard);
 
-        // Freeze the old memtable. Subsequent writes will return an error;
-        // readers can still acquire read locks.
-        {
-            let mut old_mem = old.write().expect("lock poisoned");
-            old_mem.freeze();
-        }
+        // Freeze the old memtable. Subsequent shard-level writes return an
+        // error; readers go through the sharded read API directly (no outer
+        // lock to take).
+        old.freeze();
 
         self.imm_list
             .write()
@@ -415,7 +451,7 @@ mod tests {
         let data = ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
         assert_eq!(data.imm_count(), 0);
         let frozen = data.swap_active_memtable();
-        assert!(frozen.read().unwrap().is_frozen());
+        assert!(frozen.is_frozen());
         assert_eq!(data.imm_count(), 1);
     }
 

@@ -272,6 +272,15 @@ impl VectorizedMemTable {
         self.put(key, Some(operand), OpType::Merge as u8)
     }
 
+    /// Returns the memtable's next-to-be-allocated local sequence number.
+    ///
+    /// Used by [`crate::memtable::ShardedMemTable`]'s test-convenience
+    /// constructors to derive a `base_seq` for batches that don't go
+    /// through the engine's shared atomic. NOT for the engine hot path.
+    pub fn peek_next_sequence(&self) -> u64 {
+        self.next_sequence
+    }
+
     /// Returns the total number of entries (rows) in the MemTable.
     pub fn num_entries(&self) -> usize {
         self.sequences.len()
@@ -643,6 +652,110 @@ impl VectorizedMemTable {
             self.merge_unsorted_to_sorted();
         }
 
+        Ok(count)
+    }
+
+    /// Batch-inserts multiple entries using a per-row sequence number array.
+    ///
+    /// Unlike [`Self::batch_insert_with_base_seq`] (which assigns
+    /// `base_seq, base_seq+1, …`), this method takes an EXPLICIT seq for
+    /// each row. This is the contract used by
+    /// [`crate::memtable::ShardedMemTable`]: the engine reserves a global
+    /// seq range with one `fetch_add(N)`, and each per-shard sub-batch
+    /// receives its rows' `base_seq + original_global_index` values — which
+    /// are NOT contiguous because rows interleave between shards.
+    ///
+    /// All four arrays must have the same length. Op-type validation is
+    /// atomic (rejects the whole batch on first invalid byte) — same
+    /// contract as `batch_insert_with_base_seq`.
+    ///
+    /// `next_sequence` is bumped to `max(self.next_sequence,
+    /// max(seqs) + 1)` so legacy self-allocating callers cannot collide.
+    pub fn batch_insert_with_explicit_seqs(
+        &mut self,
+        keys: &[&[u8]],
+        values: &[Option<&[u8]>],
+        op_types: &[u8],
+        seqs: &[u64],
+    ) -> ForstResult<usize> {
+        if self.frozen {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "cannot write to a frozen MemTable",
+            ));
+        }
+        if keys.len() != values.len() || keys.len() != op_types.len() || keys.len() != seqs.len() {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "batch_insert_with_explicit_seqs: all arrays must have the same length",
+            ));
+        }
+        for (i, &b) in op_types.iter().enumerate() {
+            if OpType::from_u8(b).is_none() {
+                return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                    "batch_insert_with_explicit_seqs: invalid op_type byte {} at index {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                    b, i
+                )));
+            }
+        }
+
+        let count = keys.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        // Bump next_sequence to one past the highest seq we'll write.
+        let max_seq = *seqs.iter().max().expect("count > 0");
+        if self.next_sequence <= max_seq {
+            self.next_sequence = max_seq + 1;
+        }
+        let base_offset = self.sequences.len() as u32;
+
+        for i in 0..count {
+            let key = keys[i];
+            let value = values[i];
+            let seq = seqs[i];
+            let row_offset = base_offset + i as u32;
+
+            self.key_data.extend_from_slice(key);
+            self.key_offsets.push(self.key_data.len() as u32);
+
+            match value {
+                Some(v) => {
+                    self.value_data.extend_from_slice(v);
+                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_nulls.push(false);
+                }
+                None => {
+                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_nulls.push(true);
+                }
+            }
+
+            self.sequences.push(seq);
+            self.op_types.push(op_types[i]);
+            let op_type =
+                OpType::from_u8(op_types[i]).expect("op_type byte was validated above the loop");
+            let row_index = RowIndex {
+                offset: row_offset,
+                sequence: seq,
+                op_type,
+            };
+
+            self.unsorted_entries.push(row_offset);
+            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
+                slot.push(row_index);
+            } else {
+                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
+                slot.push(row_index);
+                self.unsorted_lookup.insert(Box::from(key), slot);
+            }
+
+            self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
+        }
+
+        let merge_threshold =
+            ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
+        if self.unsorted_entries.len() > merge_threshold {
+            self.merge_unsorted_to_sorted();
+        }
         Ok(count)
     }
 

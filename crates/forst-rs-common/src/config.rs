@@ -224,6 +224,17 @@ pub struct EngineOptions {
 
     /// Filesystem path for the database directory. Must be set before opening.
     pub db_path: String,
+
+    /// Number of shards used by each per-CF active memtable
+    /// (`ShardedMemTable`). Concurrent writers hashing to different shards
+    /// never block each other on the per-shard `RwLock`.
+    ///
+    /// Default: 16 — enough for typical multi-core hosts (≥ JMH bench
+    /// `availableProcessors()`) while keeping the per-CF memtable footprint
+    /// low. Power-of-two values give a cheap AND-mask shard lookup; other
+    /// values fall back to modulus. Clamped to `[1, 256]` by the
+    /// `ShardedMemTable` constructor (0 → default).
+    pub memtable_shards: usize,
 }
 
 impl Default for EngineOptions {
@@ -243,6 +254,7 @@ impl Default for EngineOptions {
             compression: CompressionType::Lz4,
             enable_statistics: true,
             db_path: String::new(),
+            memtable_shards: 16,
         }
     }
 }
@@ -630,6 +642,12 @@ impl EngineOptionsBuilder {
     /// Enables or disables internal statistics collection.
     pub fn enable_statistics(mut self, enable: bool) -> Self {
         self.inner.enable_statistics = enable;
+        self
+    }
+
+    /// Sets the number of shards in the active memtable (E1).
+    pub fn memtable_shards(mut self, n: usize) -> Self {
+        self.inner.memtable_shards = n;
         self
     }
 
