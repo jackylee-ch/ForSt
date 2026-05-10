@@ -34,4 +34,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 forst-rs-test-utils = { workspace = true }
+proptest = { workspace = true }
 tempfile = { workspace = true }
