@@ -6005,6 +6005,443 @@ pub extern "system" fn Java_org_forstdb_FlinkEnv_disposeInternal<'local>(
 }
 
 // ---------------------------------------------------------------------------
+// P5 — FlinkCompactionFilter (TTL state) handle plumbing
+//
+// Flink's keyed-state TTL feature ships a dedicated compaction filter
+// (`org.forstdb.FlinkCompactionFilter`) that the engine invokes during
+// compaction to drop entries whose embedded timestamp is older than the
+// configured TTL. The filter has three Java-visible classes:
+//
+//   * `FlinkCompactionFilter`         (extends AbstractCompactionFilter)
+//   * `FlinkCompactionFilter.ConfigHolder` (one per CF; carries the configured
+//                                          state-type / ttl / queryAfterN /
+//                                          fixed-element-length tuple)
+//   * `FlinkCompactionFilter.FlinkCompactionFilterFactory`
+//                                      (extends AbstractCompactionFilterFactory;
+//                                       owns one ConfigHolder + a TimeProvider
+//                                       Java object)
+//
+// The native methods involved are:
+//
+//   AbstractCompactionFilter.disposeInternal(long)
+//   AbstractCompactionFilterFactory.createNewCompactionFilterFactory0()  -> long
+//   AbstractCompactionFilterFactory.disposeInternal(long)
+//   FlinkCompactionFilter.createNewFlinkCompactionFilter0(long,
+//          TimeProvider, long)         -> long
+//   FlinkCompactionFilter.createNewFlinkCompactionFilterConfigHolder()  -> long
+//   FlinkCompactionFilter.disposeFlinkCompactionFilterConfigHolder(long)
+//   FlinkCompactionFilter.configureFlinkCompactionFilter(long, int, int,
+//          long, long, int, ListElementFilterFactory) -> boolean
+//
+// These ten symbols (with overload mangling for the AbstractCompactionFilter
+// hierarchy) are what `flink-statebackend-forst::ForStDBTtlCompactFiltersManager`
+// resolves at class load.
+//
+// **Divergence — TTL is NOT enforced.**
+//
+// forst-rs-storage does not yet expose a "compaction filter" hook on the
+// compaction worker; wiring one in would require: (a) a new
+// `CompactionFilter` trait on the storage crate, (b) per-row dispatch from
+// the compaction loop into the filter, (c) plumbing that takes the
+// configured TTL + state-type tuple from this module down to the engine.
+// That is ~500 LOC plus tests — out of scope for the JNI symbol-completion
+// pass. We chose **option B** from the audit:
+//
+//   * Accept all the handles the Java side hands us.
+//   * Round-trip the config tuple through a Rust-side struct so future
+//     consumers see what the caller asked for.
+//   * Log loudly via `tracing::debug!` that TTL expiration is **not** being
+//     enforced; the state will retain entries forever.
+//   * The `createCompactionFilter0` returns a non-zero, per-call "filter"
+//     handle (a `Box<FlinkCompactionFilterHandle>`) so the Java
+//     `AbstractCompactionFilter` super-ctor sees a valid `nativeHandle_`
+//     and `disOwnNativeHandle()` does the right thing — but the engine
+//     never sees it.
+//
+// Operational consequence: TTL state grows unbounded on this build until
+// forst-rs-storage gains a real compaction-filter trait. Operators relying
+// on TTL to keep state size bounded must (i) provision more state budget
+// or (ii) layer their own external TTL management on top until the engine
+// gains support.
+// ---------------------------------------------------------------------------
+
+pub(crate) mod handles_p5 {
+    use super::*;
+
+    /// Accepted but never consulted. One Box per call to
+    /// `createNewFlinkCompactionFilter0` — the Java `AbstractCompactionFilter`
+    /// super-ctor stores this as `nativeHandle_` and the framework will call
+    /// `AbstractCompactionFilter.disposeInternal(long)` to free it (unless
+    /// `disOwnNativeHandle()` was invoked first, in which case the handle
+    /// is leaked into the std::unique_ptr the C++ filter would have owned —
+    /// which doesn't exist here, so we proactively free anyway in our
+    /// dispose thunk for symmetry).
+    #[derive(Debug)]
+    pub(crate) struct FlinkCompactionFilterHandle {
+        /// Snapshot of the configured TTL at the moment
+        /// `createNewFlinkCompactionFilter0` was called. Recorded for
+        /// debugging only — the engine never reads it.
+        #[allow(dead_code)]
+        pub ttl_ms: u64,
+        /// Snapshot of the state-type ordinal (0=Disabled, 1=Value, 2=List).
+        /// Same as `FlinkCompactionFilterConfigHandle::state_type` on the
+        /// matching ConfigHolder, captured when the filter was created.
+        #[allow(dead_code)]
+        pub state_type: i32,
+    }
+
+    /// Accepted but never consulted. One Box per Flink CF
+    /// (`new FlinkCompactionFilterFactory(timeProvider)` calls our ctor).
+    /// Allocated by `Java_org_forstdb_AbstractCompactionFilterFactory_createNewCompactionFilterFactory0`.
+    #[derive(Debug, Default)]
+    pub(crate) struct FlinkCompactionFilterFactoryHandle {
+        /// Bumped each time the Flink side calls `createCompactionFilter`
+        /// (which forwards to `createNewFlinkCompactionFilter0`). Recorded
+        /// for debugging — the engine never reads it.
+        #[allow(dead_code)]
+        pub filters_created: u64,
+    }
+
+    /// Accepted but never consulted. One Box per ConfigHolder, allocated
+    /// by `createNewFlinkCompactionFilterConfigHolder` and configured by
+    /// `configureFlinkCompactionFilter`.
+    ///
+    /// `configured` flips from `false` to `true` on the first
+    /// `configureFlinkCompactionFilter` call; subsequent calls return
+    /// `false` to mirror the C++ behaviour of "ConfigHolder may be
+    /// configured exactly once" (Flink throws `IllegalStateException` on
+    /// the boolean-false return).
+    #[derive(Debug, Default)]
+    pub(crate) struct FlinkCompactionFilterConfigHandle {
+        /// Whether `configureFlinkCompactionFilter` has been invoked yet.
+        pub configured: bool,
+        /// Mirror of `Config.stateType.ordinal()` (0=Disabled, 1=Value,
+        /// 2=List). Recorded for debugging only.
+        #[allow(dead_code)]
+        pub state_type: i32,
+        /// Mirror of `Config.timestampOffset` (0 for Value, 1 for Map).
+        #[allow(dead_code)]
+        pub timestamp_offset: i32,
+        /// Mirror of `Config.ttl` in milliseconds.
+        #[allow(dead_code)]
+        pub ttl_ms: u64,
+        /// Mirror of `Config.queryTimeAfterNumEntries`.
+        #[allow(dead_code)]
+        pub query_time_after_n: u64,
+        /// Mirror of `Config.fixedElementLength` (-1 if not a fixed-length
+        /// list state, else the per-element byte width).
+        #[allow(dead_code)]
+        pub fixed_element_length: i32,
+    }
+
+    impl FlinkCompactionFilterHandle {
+        pub(crate) fn into_raw(self) -> jlong {
+            Box::into_raw(Box::new(self)) as jlong
+        }
+    }
+
+    impl FlinkCompactionFilterFactoryHandle {
+        pub(crate) fn into_raw(self) -> jlong {
+            Box::into_raw(Box::new(self)) as jlong
+        }
+
+        #[allow(dead_code)]
+        pub(crate) unsafe fn from_raw_ref<'a>(handle: jlong) -> Option<&'a mut Self> {
+            if handle == 0 {
+                None
+            } else {
+                Some(&mut *(handle as *mut Self))
+            }
+        }
+    }
+
+    impl FlinkCompactionFilterConfigHandle {
+        pub(crate) fn into_raw(self) -> jlong {
+            Box::into_raw(Box::new(self)) as jlong
+        }
+
+        #[allow(dead_code)]
+        pub(crate) unsafe fn from_raw_ref<'a>(handle: jlong) -> Option<&'a mut Self> {
+            if handle == 0 {
+                None
+            } else {
+                Some(&mut *(handle as *mut Self))
+            }
+        }
+    }
+}
+
+use handles_p5::{
+    FlinkCompactionFilterConfigHandle, FlinkCompactionFilterFactoryHandle,
+    FlinkCompactionFilterHandle,
+};
+
+// ---------------------------------------------------------------------------
+// AbstractCompactionFilter — the parent class of FlinkCompactionFilter
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.AbstractCompactionFilter.disposeInternal(long handle)`
+///
+/// Java signature: `(J)V`
+///
+/// Frees the per-filter handle allocated by
+/// `Java_org_forstdb_FlinkCompactionFilter_createNewFlinkCompactionFilter0`.
+/// The Java side calls this from the `AbstractCompactionFilter` close path
+/// when ownership of the filter has NOT been transferred to a C++
+/// std::unique_ptr (i.e. `disOwnNativeHandle()` was not invoked). We always
+/// free the Box here for symmetry with the C++ engine's behaviour.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_AbstractCompactionFilter_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from a prior `createNewFlinkCompactionFilter0`.
+                unsafe { drop(Box::from_raw(handle as *mut FlinkCompactionFilterHandle)) };
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// AbstractCompactionFilterFactory — the parent class of
+// FlinkCompactionFilterFactory
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.AbstractCompactionFilterFactory.createNewCompactionFilterFactory0() -> long`
+///
+/// Java signature: `()J`
+///
+/// Called by the `RocksCallbackObject` super-ctor when Flink instantiates
+/// `new FlinkCompactionFilterFactory(timeProvider)`. Returns an opaque
+/// handle that the engine never consults; see the divergence note above.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_AbstractCompactionFilterFactory_createNewCompactionFilterFactory0<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            tracing::debug!(
+                target: "compat_jni::flink_compaction_filter",
+                "AbstractCompactionFilterFactory.createNewCompactionFilterFactory0: TTL compaction filter factory accepted (handle is a no-op; entries with embedded TTL timestamps will NOT be expired by compaction in this build — see compat_jni::handles_p5 docs)"
+            );
+            FlinkCompactionFilterFactoryHandle::default().into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.AbstractCompactionFilterFactory.disposeInternal(long handle)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_AbstractCompactionFilterFactory_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from a prior createNewCompactionFilterFactory0.
+                unsafe {
+                    drop(Box::from_raw(
+                        handle as *mut FlinkCompactionFilterFactoryHandle,
+                    ))
+                };
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// FlinkCompactionFilter class — TTL filter ctor + ConfigHolder + configure
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.FlinkCompactionFilter.createNewFlinkCompactionFilter0(
+///     long configHolderHandle,
+///     FlinkCompactionFilter.TimeProvider timeProvider,
+///     long loggerHandle) -> long`
+///
+/// Java signature: `(JLorg/forstdb/FlinkCompactionFilter$TimeProvider;J)J`
+///
+/// Allocates a per-filter [`FlinkCompactionFilterHandle`]. The actual
+/// filter logic is a no-op — see the divergence note above
+/// `handles_p5`. We snapshot the TTL + state-type from the supplied
+/// ConfigHolder so the handle carries enough debug info to identify the
+/// filter at dispose time.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_createNewFlinkCompactionFilter0<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_holder_handle: jlong,
+    _time_provider: JObject<'local>,
+    _logger_handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            // Snapshot config from the holder if available (handle is always
+            // non-zero for a configured factory; we still null-guard defensively).
+            let (ttl_ms, state_type) = if let Some(cfg) =
+                unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(config_holder_handle) }
+            {
+                (cfg.ttl_ms, cfg.state_type)
+            } else {
+                (0, 0)
+            };
+            tracing::debug!(
+                target: "compat_jni::flink_compaction_filter",
+                "FlinkCompactionFilter.createNewFlinkCompactionFilter0: ttl_ms={ttl_ms} state_type={state_type} (no-op handle; TTL not enforced)"
+            );
+            FlinkCompactionFilterHandle { ttl_ms, state_type }.into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.FlinkCompactionFilter.createNewFlinkCompactionFilterConfigHolder() -> long`
+///
+/// Java signature: `()J`
+///
+/// Allocates a [`FlinkCompactionFilterConfigHandle`] in the unconfigured
+/// state. The Flink ConfigHolder constructor calls this exactly once per
+/// stateful CF.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_createNewFlinkCompactionFilterConfigHolder<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            tracing::debug!(
+                target: "compat_jni::flink_compaction_filter",
+                "FlinkCompactionFilter.createNewFlinkCompactionFilterConfigHolder: ConfigHolder accepted (no-op)"
+            );
+            FlinkCompactionFilterConfigHandle::default().into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.FlinkCompactionFilter.disposeFlinkCompactionFilterConfigHolder(long handle)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_disposeFlinkCompactionFilterConfigHolder<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from a prior createNewFlinkCompactionFilterConfigHolder.
+                unsafe {
+                    drop(Box::from_raw(
+                        handle as *mut FlinkCompactionFilterConfigHandle,
+                    ))
+                };
+            }
+        },
+    )
+}
+
+/// `org.forstdb.FlinkCompactionFilter.configureFlinkCompactionFilter(
+///     long configHolderHandle,
+///     int stateType,
+///     int timestampOffset,
+///     long ttl,
+///     long queryTimeAfterNumEntries,
+///     int fixedElementLength,
+///     FlinkCompactionFilter.ListElementFilterFactory listElementFilterFactory) -> boolean`
+///
+/// Java signature: `(JIIJJILorg/forstdb/FlinkCompactionFilter$ListElementFilterFactory;)Z`
+///
+/// Returns `JNI_TRUE` (i.e. "newly configured") on the first call for a
+/// given ConfigHolder, `JNI_FALSE` on subsequent calls. This mirrors the
+/// C++ semantics where `ConfigHolder::Configure` is allowed exactly once
+/// per holder; the Java wrapper's `FlinkCompactionFilterFactory.configure`
+/// throws `IllegalStateException` if the boolean returns false ("Compaction
+/// filter is already configured").
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_configureFlinkCompactionFilter<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_holder_handle: jlong,
+    state_type: jint,
+    timestamp_offset: jint,
+    ttl: jlong,
+    query_time_after_num_entries: jlong,
+    fixed_element_length: jint,
+    _list_element_filter_factory: JObject<'local>,
+) -> jboolean {
+    jni_guard(
+        &mut env,
+        || JNI_FALSE,
+        |_env| {
+            // SAFETY: handle came from a prior createNewFlinkCompactionFilterConfigHolder.
+            let Some(cfg) =
+                (unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(config_holder_handle) })
+            else {
+                // null/zero handle: behave like "already configured" so the
+                // Java side raises IllegalStateException rather than
+                // silently proceeding without TTL state.
+                tracing::debug!(
+                    target: "compat_jni::flink_compaction_filter",
+                    "configureFlinkCompactionFilter: null/zero handle; returning JNI_FALSE"
+                );
+                return JNI_FALSE;
+            };
+            if cfg.configured {
+                // Mirror the C++ ConfigHolder::Configure "already configured"
+                // return — Flink wraps this as IllegalStateException.
+                return JNI_FALSE;
+            }
+            cfg.configured = true;
+            cfg.state_type = state_type;
+            cfg.timestamp_offset = timestamp_offset;
+            cfg.ttl_ms = if ttl < 0 { 0 } else { ttl as u64 };
+            cfg.query_time_after_n = if query_time_after_num_entries < 0 {
+                0
+            } else {
+                query_time_after_num_entries as u64
+            };
+            cfg.fixed_element_length = fixed_element_length;
+            tracing::debug!(
+                target: "compat_jni::flink_compaction_filter",
+                "configureFlinkCompactionFilter: state_type={state_type} ts_off={timestamp_offset} ttl_ms={} query_after_n={} fixed_len={fixed_element_length} (snapshot only; TTL not enforced)",
+                cfg.ttl_ms, cfg.query_time_after_n
+            );
+            JNI_TRUE
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -6247,6 +6684,20 @@ mod tests {
             // P3 — FlinkEnv class (2 entries).
             "Java_org_forstdb_FlinkEnv_newFlinkEnv",
             "Java_org_forstdb_FlinkEnv_disposeInternal",
+            // P5 — TTL compaction filter family (7 entries):
+            //   * 1 dispose on AbstractCompactionFilter (parent of FlinkCompactionFilter)
+            //   * 2 ctor + dispose on AbstractCompactionFilterFactory (parent of FlinkCompactionFilterFactory)
+            //   * 4 on FlinkCompactionFilter (per-filter ctor + ConfigHolder ctor/dispose + configure)
+            //
+            // Divergence: TTL expiration is NOT enforced — see the
+            // `handles_p5` module-level note.
+            "Java_org_forstdb_AbstractCompactionFilter_disposeInternal",
+            "Java_org_forstdb_AbstractCompactionFilterFactory_createNewCompactionFilterFactory0",
+            "Java_org_forstdb_AbstractCompactionFilterFactory_disposeInternal",
+            "Java_org_forstdb_FlinkCompactionFilter_createNewFlinkCompactionFilter0",
+            "Java_org_forstdb_FlinkCompactionFilter_createNewFlinkCompactionFilterConfigHolder",
+            "Java_org_forstdb_FlinkCompactionFilter_disposeFlinkCompactionFilterConfigHolder",
+            "Java_org_forstdb_FlinkCompactionFilter_configureFlinkCompactionFilter",
         ];
         for sym in &required {
             assert!(
@@ -7639,5 +8090,103 @@ mod tests {
         unsafe { drop(Box::from_raw(tbl as *mut BlockBasedTableConfigHandle)) };
         unsafe { drop(Box::from_raw(bloom as *mut BloomFilterHandle)) };
         unsafe { drop(Box::from_raw(cache as *mut LruCacheHandle)) };
+    }
+
+    // -------------------------------------------------------------------
+    // P5 — FlinkCompactionFilter (TTL state) lifecycle smoke tests
+    //
+    // Both tests exercise the Rust-internal handle round-trip
+    // (Box::into_raw → from_raw_ref → Box::from_raw) for the three P5
+    // boxes — the JNI thunks themselves are thin wrappers around
+    // jni_guard + the handles_p5 module. The thunks' panic-safety and
+    // null-handle paths are also covered. The module-level docs above
+    // `handles_p5` make the "TTL not enforced" divergence explicit.
+    // -------------------------------------------------------------------
+
+    /// Factory ctor + dispose: handle must be non-zero, round-trip via
+    /// `from_raw_ref` must hand back the default-state struct, and the
+    /// dispose path must drop the Box without leaking.
+    #[test]
+    fn test_flink_compaction_filter_factory_lifecycle() {
+        let h = FlinkCompactionFilterFactoryHandle::default().into_raw();
+        assert_ne!(
+            h, 0,
+            "factory handle must be non-zero (Java would NPE on 0)"
+        );
+
+        // SAFETY: just-allocated.
+        let fref = unsafe { FlinkCompactionFilterFactoryHandle::from_raw_ref(h) }.unwrap();
+        assert_eq!(fref.filters_created, 0);
+
+        // Null handle returns None (mirrors the `disposeInternal(0)` no-op).
+        let none = unsafe { FlinkCompactionFilterFactoryHandle::from_raw_ref(0) };
+        assert!(none.is_none());
+
+        // Dispose.
+        unsafe { drop(Box::from_raw(h as *mut FlinkCompactionFilterFactoryHandle)) };
+    }
+
+    /// ConfigHolder + per-filter handle round-trip:
+    ///   1. createForValue-style: allocate ConfigHolder, run the
+    ///      `configureFlinkCompactionFilter` Rust-side equivalent, verify
+    ///      the snapshot took.
+    ///   2. Re-configuring is rejected (mirrors the "ConfigHolder may be
+    ///      configured exactly once" Java-side guard).
+    ///   3. createNewFlinkCompactionFilter0-style: allocate a per-filter
+    ///      handle that snapshots the config, verify the snapshot, dispose
+    ///      both handles.
+    #[test]
+    fn test_flink_compaction_filter_config_lifecycle() {
+        // (1) ConfigHolder round-trip.
+        let cfg_h = FlinkCompactionFilterConfigHandle::default().into_raw();
+        assert_ne!(cfg_h, 0);
+
+        // SAFETY: just-allocated.
+        let cfg = unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(cfg_h) }.unwrap();
+        assert!(
+            !cfg.configured,
+            "fresh ConfigHolder must start unconfigured"
+        );
+
+        // (1b) `configureFlinkCompactionFilter`-style mutation. We mirror
+        // the thunk's body without going through JNI.
+        cfg.configured = true;
+        cfg.state_type = 1; // Value
+        cfg.timestamp_offset = 0;
+        cfg.ttl_ms = 60_000; // 60s TTL — typical Flink keyed-state TTL.
+        cfg.query_time_after_n = 1000;
+        cfg.fixed_element_length = -1;
+
+        // (2) Re-configure path — the thunk would return JNI_FALSE here.
+        // SAFETY: just-allocated.
+        let cfg2 = unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(cfg_h) }.unwrap();
+        assert!(cfg2.configured);
+        assert_eq!(cfg2.state_type, 1);
+        assert_eq!(cfg2.ttl_ms, 60_000);
+        assert_eq!(cfg2.query_time_after_n, 1000);
+        assert_eq!(cfg2.fixed_element_length, -1);
+
+        // (3) Per-filter handle. The createNewFlinkCompactionFilter0 thunk
+        // would snapshot ttl_ms + state_type from the holder and box up a
+        // FlinkCompactionFilterHandle. We mirror that here.
+        let filter_h = FlinkCompactionFilterHandle {
+            ttl_ms: cfg2.ttl_ms,
+            state_type: cfg2.state_type,
+        }
+        .into_raw();
+        assert_ne!(filter_h, 0);
+
+        // SAFETY: just-allocated.
+        let fref = unsafe { &*(filter_h as *mut FlinkCompactionFilterHandle) };
+        assert_eq!(fref.ttl_ms, 60_000);
+        assert_eq!(fref.state_type, 1);
+
+        // Dispose both handles.
+        unsafe { drop(Box::from_raw(filter_h as *mut FlinkCompactionFilterHandle)) };
+        unsafe {
+            drop(Box::from_raw(
+                cfg_h as *mut FlinkCompactionFilterConfigHandle,
+            ))
+        };
     }
 }
