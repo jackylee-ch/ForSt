@@ -413,7 +413,7 @@ impl InternalKey {
         out
     }
 
-    /// Inverse of [`encode_to_disk`]. Returns Err on inputs shorter than 8 bytes
+    /// Inverse of [`Self::encode_to_disk`]. Returns Err on inputs shorter than 8 bytes
     /// or on unknown op_type ordinals.
     pub fn decode_from_disk(bytes: &[u8]) -> crate::ForstResult<Self> {
         if bytes.len() < 8 {
