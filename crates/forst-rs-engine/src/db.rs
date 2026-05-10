@@ -40,9 +40,17 @@ use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::compaction_filter::CompactionFilter;
 use crate::file_deletion_guard::FileDeletionGuard;
 use crate::flush::{sst_file_path, FlushExecutor, FlushJob, FlushQueue, FlushRequest};
+use crate::mvcc::{DbId, SnapshotRegistry};
 use crate::snapshot_view::SnapshotView;
 use crate::write_batch::WriteBatch;
 use crate::write_controller::WriteController;
+
+/// Process-wide allocator for [`DbId`] values.
+///
+/// Every `DbImpl::open*` path mints a fresh id via `fetch_add(1, Relaxed)`.
+/// Bound into every `Snapshot` at capture time (spec §15 "Same-DB"
+/// invariant) so the FFI release path can detect cross-DB releases.
+static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Bounded capacity for the background flush queue. Sized comfortably above
 /// `max_write_buffer_number` so the writer's `try_send` rarely blocks; real
@@ -128,6 +136,15 @@ pub struct DbImpl {
     /// worker has drained everything we asked it to. Bumped on enqueue,
     /// decremented after `run_flush` returns (success or failure).
     pending_flush_count: AtomicU32,
+    /// MVCC snapshot registry. Owns the ref-counted set of live snapshot
+    /// sequence numbers. Compaction reads `min_active()` once per pass
+    /// and consults [`crate::mvcc::should_drop`] per entry to decide
+    /// whether a version may be reclaimed. See spec §6a.2.
+    snapshot_registry: Arc<SnapshotRegistry>,
+    /// Process-monotonic id stamped onto every `Snapshot` issued by this
+    /// engine. The FFI release path checks this against the calling
+    /// `DbImpl` to enforce the spec §15 "Same-DB" invariant.
+    db_id: DbId,
 }
 
 impl DbImpl {
@@ -178,6 +195,8 @@ impl DbImpl {
             flush_worker: Mutex::new(None),
             flush_error: Mutex::new(None),
             pending_flush_count: AtomicU32::new(0),
+            snapshot_registry: SnapshotRegistry::new(),
+            db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
         });
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
@@ -386,6 +405,21 @@ impl DbImpl {
     /// by tests asserting flush behaviour.
     pub fn l0_file_count(&self) -> u32 {
         self.version_set.current().l0_files().len() as u32
+    }
+
+    /// Returns the MVCC snapshot registry. The FFI / engine bindings call
+    /// `capture(db_id, current_seq)` on the returned `Arc` to mint a new
+    /// `Snapshot`; compaction reads `min_active()` to gate reclamation.
+    /// See spec §6a.2.
+    pub fn snapshot_registry(&self) -> &Arc<SnapshotRegistry> {
+        &self.snapshot_registry
+    }
+
+    /// Returns the process-monotonic `DbId` stamped onto every snapshot
+    /// captured against this engine. Used by the FFI release path to
+    /// reject cross-DB releases (spec §15 "Same-DB" invariant).
+    pub fn db_id(&self) -> DbId {
+        self.db_id
     }
 
     // ---------------------------------------------------------------
@@ -898,6 +932,12 @@ impl DbImpl {
             compression: self.options.compression,
         };
 
+        // Snapshot the registry's min-active sequence ONCE per pass so the
+        // compaction job sees a stable horizon while it runs. A snapshot
+        // captured AFTER this read (i.e. lower min_active) only matters
+        // for FUTURE compactions — its retention contract is forward
+        // -looking, not retroactive. See spec §6a.5.
+        let min_active_snapshot = self.snapshot_registry.min_active();
         let job = CompactionJob {
             inputs,
             output_level: next_level as u32,
@@ -908,6 +948,7 @@ impl DbImpl {
             merge_operator: cf_data.merge_operator().cloned(),
             compaction_filter: cf_data.compaction_filter(),
             is_bottommost,
+            min_active_snapshot,
         };
 
         let Some(edit) = job.run()? else {
@@ -1059,6 +1100,8 @@ impl DbImpl {
             flush_worker: Mutex::new(None),
             flush_error: Mutex::new(None),
             pending_flush_count: AtomicU32::new(0),
+            snapshot_registry: SnapshotRegistry::new(),
+            db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
         });
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
@@ -1106,6 +1149,9 @@ impl DbImpl {
             compression: self.options.compression,
         };
 
+        // Snapshot the registry's min-active sequence ONCE per pass — see
+        // the matching read in `compact_level_for_cf` for rationale.
+        let min_active_snapshot = self.snapshot_registry.min_active();
         let job = CompactionJob {
             inputs,
             output_level: 1,
@@ -1116,6 +1162,7 @@ impl DbImpl {
             merge_operator: cf_data.merge_operator().cloned(),
             compaction_filter: cf_data.compaction_filter(),
             is_bottommost,
+            min_active_snapshot,
         };
 
         let Some(edit) = job.run()? else {

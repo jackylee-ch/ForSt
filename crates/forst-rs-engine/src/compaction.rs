@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use forst_rs_common::{FileNumber, ForstError, ForstResult};
+use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber};
 use forst_rs_io::FileSystem;
 use forst_rs_storage::merge_operator::MergeOperator;
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterImpl, SstWriterOptions};
@@ -35,6 +35,7 @@ use forst_rs_storage::version::{SstFileMeta, VersionEdit};
 
 use crate::compaction_filter::{CompactionDecision, CompactionFilter};
 use crate::flush::sst_file_path;
+use crate::mvcc;
 
 /// Description of a single compaction task: merge `inputs` into a new file
 /// `output_file_number` placed at level `output_level`.
@@ -51,6 +52,14 @@ pub struct CompactionJob {
     /// tombstones can be eliminated because no older SST contains data for
     /// the key.
     pub is_bottommost: bool,
+    /// Smallest sequence number held by any live snapshot at the moment
+    /// this job was constructed (snapshot of
+    /// [`crate::mvcc::SnapshotRegistry::min_active`]). Versions with
+    /// `seq >= min_active_snapshot` are pinned for snapshot reads and
+    /// must be retained verbatim — see [`crate::mvcc::should_drop`] and
+    /// spec §6a.5. Pass `SequenceNumber(u64::MAX)` when there are no
+    /// snapshots, which lets the consolidation logic run unconstrained.
+    pub min_active_snapshot: SequenceNumber,
 }
 
 impl CompactionJob {
@@ -202,11 +211,90 @@ impl CompactionJob {
         // index 0.
 
         use forst_rs_common::OpType;
-        let newest = &versions[0];
 
-        // Run the optional compaction filter on the newest version — if it
-        // says Discard, drop the entire key. (Running against all versions
-        // would be wasteful since older versions are already shadowed.)
+        // ---------------------------------------------------------------
+        // MVCC snapshot retention (spec §6a.5).
+        //
+        // Versions with `seq >= min_active_snapshot` are visible to at
+        // least one live snapshot and must be emitted verbatim — they
+        // cannot be folded into the newest-wins consolidation below.
+        //
+        // The slice splits into a snapshot-pinned prefix and an
+        // unconstrained tail:
+        //   * prefix `pinned = versions[..split_idx]` — every entry
+        //     `seq >= min_active`. Emitted as-is via the per-entry
+        //     `mvcc::should_drop` check (which here returns `false` for
+        //     all of them, since `seq >= min_active` ⇒ keep). For each
+        //     successfully emitted entry we mark "newer emitted for this
+        //     user_key" so subsequent older entries below `min_active`
+        //     can be reclaimed.
+        //   * tail `tail = versions[split_idx..]` — `seq < min_active`.
+        //     The newest tail entry (or the only pinned entry, if the
+        //     tail is empty AND the pinned slice has length ≤ 1) feeds
+        //     into the existing newest-wins consolidation that handles
+        //     SingleDelete elision, Delete tombstone shedding, and
+        //     Merge-chain resolution.
+        //
+        // When `min_active == u64::MAX` (no live snapshots), pinned is
+        // empty and behaviour collapses to pre-MVCC compaction.
+        let split_idx = versions
+            .iter()
+            .position(|v| v.sequence < self.min_active_snapshot.0)
+            .unwrap_or(versions.len());
+        let pinned = &versions[..split_idx];
+        let tail = &versions[split_idx..];
+
+        // Track whether we've already emitted any version for this user
+        // key in the current call. The MVCC contract says a tail entry
+        // can be dropped only when a newer version exists for the same
+        // key — once we emit any pinned entry, that flag is satisfied
+        // for every tail entry that follows.
+        let mut newer_emitted_for_key = false;
+        for v in pinned {
+            // `should_drop` returns `false` for `seq >= min_active`, so
+            // this is effectively an unconditional emit; the call form
+            // documents the policy and stays consistent with the tail
+            // path's gating.
+            if mvcc::should_drop(
+                SequenceNumber(v.sequence),
+                v.op_type,
+                newer_emitted_for_key,
+                self.min_active_snapshot,
+            ) {
+                continue;
+            }
+            writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
+            *emitted += 1;
+            newer_emitted_for_key = true;
+        }
+
+        // If the tail is empty there is nothing left to consolidate —
+        // every snapshot-pinned version has already been written.
+        if tail.is_empty() {
+            return Ok(());
+        }
+        // If pinned was non-empty, every tail entry has `seq < min_active`
+        // AND a newer version was already emitted for this user_key —
+        // [`mvcc::should_drop`] returns `true` for all of them. Reclaim
+        // the entire tail without running the consolidation logic
+        // (which would resurrect the tail's newest entry as a Put / Delete
+        // tombstone visible to readers below `min_active`, contradicting
+        // MVCC's contract that everything below `min_active` is fair
+        // game once shadowed).
+        if newer_emitted_for_key {
+            return Ok(());
+        }
+        // Pinned was empty (no live snapshots see this key's history) —
+        // fall through to the pre-MVCC newest-wins consolidation over the
+        // tail. The tail's newest is the only candidate the reduction may
+        // emit; older tail entries are shadowed.
+        let reduction = tail;
+        let newest = &reduction[0];
+
+        // Run the optional compaction filter on the consolidation root —
+        // if it says Discard, drop the root. (Pinned siblings emitted
+        // above are not re-evaluated; they're contractually required by
+        // an active snapshot.)
         if let Some(ref filter) = self.compaction_filter {
             let mut scratch = Vec::new();
             let decision = filter.filter(
@@ -232,6 +320,11 @@ impl CompactionJob {
                 }
             }
         }
+
+        // The reduction below mirrors the pre-MVCC newest-wins logic.
+        // It operates over `reduction`; the variable `versions` is
+        // shadowed so each per-shape branch sees the correct slice.
+        let versions = reduction;
 
         match newest.op_type {
             OpType::SingleDelete => {
