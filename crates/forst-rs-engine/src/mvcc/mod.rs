@@ -25,6 +25,8 @@
 //! - [`SnapshotRegistry`] — tracks the set of live snapshot sequence
 //!   numbers for compaction's `min_active_snapshot` query.
 
+pub mod reader;
 pub mod snapshot;
 
+pub use reader::{get_at, VersionedEntry};
 pub use snapshot::{DbId, Snapshot, SnapshotRegistry};
