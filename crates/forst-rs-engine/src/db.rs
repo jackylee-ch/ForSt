@@ -28,7 +28,8 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
 
 use forst_rs_common::{
-    ColumnFamilyId, EngineOptions, FileNumber, ForstError, ForstResult, OpType, DEFAULT_CF_ID,
+    ColumnFamilyId, EngineOptions, FileNumber, ForstError, ForstResult, InternalKey, OpType,
+    SequenceNumber, DEFAULT_CF_ID,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSystem};
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
@@ -40,7 +41,7 @@ use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::compaction_filter::CompactionFilter;
 use crate::file_deletion_guard::FileDeletionGuard;
 use crate::flush::{sst_file_path, FlushExecutor, FlushJob, FlushQueue, FlushRequest};
-use crate::mvcc::{DbId, SnapshotRegistry};
+use crate::mvcc::{self, DbId, Snapshot, SnapshotRegistry};
 use crate::snapshot_view::SnapshotView;
 use crate::write_batch::WriteBatch;
 use crate::write_controller::WriteController;
@@ -420,6 +421,159 @@ impl DbImpl {
     /// reject cross-DB releases (spec §15 "Same-DB" invariant).
     pub fn db_id(&self) -> DbId {
         self.db_id
+    }
+
+    // ---------------------------------------------------------------
+    // MVCC snapshot API (spec §6a.5)
+    //
+    // `snapshot()` mints a `Snapshot` pinned at the current sequence number;
+    // `get_at()` runs a versioned point-lookup against that snapshot;
+    // `release_snapshot()` is the explicit-drop alias offered by the FFI for
+    // C callers that prefer named release over RAII drop. The cross-DB check
+    // in `get_at()` enforces the spec §15 "Same-DB" invariant on the read
+    // path so the FFI doesn't have to re-validate at the boundary.
+    // ---------------------------------------------------------------
+
+    /// Captures a snapshot at the current sequence number.
+    ///
+    /// The returned [`Snapshot`] is RAII: dropping it releases the
+    /// ref-count back to the registry so compaction's `min_active`
+    /// query advances. Use [`Self::release_snapshot`] for callers that
+    /// prefer an explicit named release.
+    pub fn snapshot(&self) -> Snapshot {
+        let seq = SequenceNumber::new(self.sequence_number());
+        self.snapshot_registry.capture(self.db_id, seq)
+    }
+
+    /// Releases the snapshot. Equivalent to `drop(snapshot)`; provided
+    /// so the FFI surface can expose a named release entry point. Always
+    /// idempotent — moving the snapshot in here drops it exactly once.
+    pub fn release_snapshot(&self, snapshot: Snapshot) {
+        // Snapshot::Drop fires here and decrements the registry ref-count.
+        drop(snapshot);
+    }
+
+    /// Reads the latest version of `key` (in the default CF) with seq
+    /// <= snapshot.seq.
+    ///
+    /// Returns `Ok(None)` when no version is visible at snapshot time
+    /// or the latest visible version is a deletion tombstone. Returns
+    /// `Err(InvalidArgument)` when `snapshot` was issued by a different
+    /// `DbImpl` instance, per spec §10.0 ABI contract — the FFI relies
+    /// on this same-DB check happening here so it doesn't have to
+    /// re-validate at the C boundary.
+    pub fn get_at(&self, snapshot: &Snapshot, key: &[u8]) -> ForstResult<Option<Vec<u8>>> {
+        if snapshot.db_id() != self.db_id {
+            return Err(ForstError::invalid_argument(
+                "Snapshot was issued by a different DbImpl instance",
+            ));
+        }
+        let cf = self.default_cf();
+        self.get_at_cf(&cf, snapshot, key)
+    }
+
+    /// Per-CF variant of [`Self::get_at`]. Useful for callers that hold
+    /// a non-default `ColumnFamilyHandle`. Same cross-DB invariant.
+    pub fn get_at_cf(
+        &self,
+        cf: &ColumnFamilyHandle,
+        snapshot: &Snapshot,
+        key: &[u8],
+    ) -> ForstResult<Option<Vec<u8>>> {
+        if snapshot.db_id() != self.db_id {
+            return Err(ForstError::invalid_argument(
+                "Snapshot was issued by a different DbImpl instance",
+            ));
+        }
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let candidates = self.iter_versions_of(&cf_data, key)?;
+        // Borrow-extend the owned (key, value) pairs into VersionedEntry
+        // refs for `mvcc::get_at` — entries live for the duration of the
+        // iterator's traversal (one synchronous call), so the references
+        // are valid throughout.
+        let result = mvcc::get_at(
+            snapshot,
+            key,
+            candidates.iter().map(|(k, v)| mvcc::VersionedEntry {
+                key: k,
+                value: v.as_slice(),
+            }),
+        )
+        .map(|s| s.to_vec());
+        Ok(result)
+    }
+
+    /// Collects every version of `user_key` from memtable + L0 + lower
+    /// levels in the order required by [`mvcc::get_at`]: `(user_key
+    /// ASC, sequence DESC)`.
+    ///
+    /// The returned Vec owns its keys and values so the borrow held by
+    /// the [`mvcc::VersionedEntry`] adapter built in [`Self::get_at_cf`]
+    /// stays alive for the duration of the read. This is intentionally
+    /// straightforward (gather-then-sort) rather than a true k-way
+    /// merge — point reads visit O(versions per key) entries which is
+    /// tiny in practice; the merge cost dominates only for full-range
+    /// scans (handled by [`Self::scan`]).
+    fn iter_versions_of(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+        user_key: &[u8],
+    ) -> ForstResult<Vec<(InternalKey, Vec<u8>)>> {
+        // Single-key range: [user_key, user_key + 0x00) i.e. exclusive
+        // upper of `user_key.push(0)`. We pass `read_sequence = u64::MAX`
+        // so `collect_range_entries` returns ALL versions and let
+        // `mvcc::get_at` do the snapshot-visibility filter.
+        let mut upper = user_key.to_vec();
+        upper.push(0u8);
+        let mut entries: Vec<(InternalKey, Vec<u8>)> = Vec::new();
+
+        // Active memtable.
+        {
+            let mem = cf_data.active_memtable();
+            for (k, v, seq, op) in mem.collect_range_entries(user_key, Some(&upper), u64::MAX) {
+                if k != user_key {
+                    continue;
+                }
+                let ik = InternalKey::new(k, SequenceNumber::new(seq), op);
+                entries.push((ik, v.unwrap_or_default()));
+            }
+        }
+
+        // Immutable memtables (any order — we sort below).
+        for imm in cf_data.imm_memtables() {
+            for (k, v, seq, op) in imm.collect_range_entries(user_key, Some(&upper), u64::MAX) {
+                if k != user_key {
+                    continue;
+                }
+                let ik = InternalKey::new(k, SequenceNumber::new(seq), op);
+                entries.push((ik, v.unwrap_or_default()));
+            }
+        }
+
+        // SST layer — every file whose key range covers `user_key`.
+        let version = self.version_set.current();
+        for sst in version.live_sst_files() {
+            if user_key < sst.smallest_key.as_slice() || user_key > sst.largest_key.as_slice() {
+                continue;
+            }
+            let reader = self.get_or_open_sst_reader(&sst)?;
+            for (k, v, seq, op) in reader.scan(user_key, Some(&upper))? {
+                if k != user_key {
+                    continue;
+                }
+                let ik = InternalKey::new(k, SequenceNumber::new(seq), op);
+                entries.push((ik, v.unwrap_or_default()));
+            }
+        }
+
+        // Sort by (user_key ASC, sequence DESC) — only one user_key here,
+        // so this collapses to a stable sort by sequence DESC.
+        entries.sort_by(|a, b| {
+            a.0.user_key()
+                .cmp(b.0.user_key())
+                .then_with(|| b.0.sequence().0.cmp(&a.0.sequence().0))
+        });
+        Ok(entries)
     }
 
     // ---------------------------------------------------------------
@@ -3604,5 +3758,49 @@ mod tests {
         );
         assert_eq!(*all.first().unwrap(), 1);
         assert_eq!(*all.last().unwrap(), total);
+    }
+
+    // -----------------------------------------------------------------
+    // MVCC snapshot API (Task 0.10)
+    // -----------------------------------------------------------------
+
+    /// snapshot() taken between two puts must see the pre-snapshot value
+    /// while a regular get() sees the post-snapshot value.
+    #[test]
+    fn snapshot_and_get_at_round_trip() {
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v1").unwrap();
+        let snap = db.snapshot();
+        db.put(&cf, b"k", b"v2").unwrap();
+        assert_eq!(db.get_at(&snap, b"k").unwrap(), Some(b"v1".to_vec()));
+        // Confirm "current" view sees v2.
+        assert_eq!(db.get(&cf, b"k").unwrap(), Some(b"v2".to_vec()));
+        db.release_snapshot(snap);
+    }
+
+    /// release_snapshot() must drop the registry ref so active_count
+    /// returns to 0 — proves the snapshot's `Drop` actually runs.
+    #[test]
+    fn snapshot_release_drops_registry_entry() {
+        let db = open();
+        let snap = db.snapshot();
+        assert_eq!(db.snapshot_registry().active_count(), 1);
+        db.release_snapshot(snap);
+        assert_eq!(db.snapshot_registry().active_count(), 0);
+    }
+
+    /// Cross-DB snapshot use must error with InvalidArgument per spec
+    /// §15 "Same-DB" invariant; the FFI relies on this validation.
+    #[test]
+    fn cross_db_snapshot_rejected() {
+        let db1 = open();
+        let db2 = open();
+        let snap1 = db1.snapshot();
+        let result = db2.get_at(&snap1, b"k");
+        assert!(
+            result.is_err(),
+            "expected InvalidArgument for cross-DB snapshot, got Ok"
+        );
     }
 }
