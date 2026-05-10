@@ -392,57 +392,20 @@ EOF
 )"
 ```
 
-### Task 0.3: Memtable + SST writers use new InternalKey encoding
+### Task 0.3: ~~Memtable + SST writers refactor~~ (DROPPED — false premise)
 
-**Files:**
-- Modify: `crates/forst-rs-engine/src/memtable.rs` (or wherever InternalKey is encoded for storage)
-- Modify: `crates/forst-rs-storage/src/sst/builder.rs` (or equivalent)
-- Test: existing memtable/SST tests should still pass after the format swap
+**Status (2026-05-11)**: DROPPED. Implementer subagent surfaced that forst-rs SSTs +
+memtable use Apache Arrow columnar layout (4 separate columns: key, value, sequence,
+op_type), NOT byte-concat InternalKey storage. There are zero inline tag-packing call
+sites to refactor. `InternalKey::encode_to_disk()` from Task 0.2 has no SST callers and
+remains as a pure utility for future RocksDB-shaped paths (FFI, WAL, dumper tools).
 
-- [ ] **Step 1: Locate current InternalKey encoding sites**
+A drive-by fix from this investigation landed in commit `1de51b5ff` updating 6 stale
+OpType ordinal error messages in `crates/forst-rs-storage/src/memtable/{vectorized,sharded}.rs`
+that Task 0.1 had missed.
 
-```bash
-grep -rn "encode_internal_key\|to_bytes\|.user_key\(\).iter\|sequence\.0 <<" crates/forst-rs-engine/src crates/forst-rs-storage/src
-```
-Expected: a list of call sites in memtable + SST writer paths. Capture them for review.
-
-- [ ] **Step 2: Refactor each site to call `InternalKey::encode_to_disk()`**
-
-For each match found in Step 1, replace ad-hoc encoding with:
-```rust
-let bytes = internal_key.encode_to_disk();
-```
-Likewise replace decode paths with `InternalKey::decode_from_disk(&bytes)?`.
-
-- [ ] **Step 3: Run engine + storage tests**
-
-```bash
-cargo test -p forst-rs-engine -p forst-rs-storage -q
-```
-Expected: all pass. If a test fails on byte comparison, that test was hardcoding the old (wrong) layout — update it to expect the RocksDB-compat layout.
-
-- [ ] **Step 4: Run full workspace**
-
-```bash
-cargo test --workspace -q
-```
-Expected: all pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add crates/forst-rs-engine/src/ crates/forst-rs-storage/src/
-git commit -m "$(cat <<'EOF'
-refactor(engine,storage): route InternalKey encoding through encode_to_disk
-
-Memtable + SST writers now call InternalKey::encode_to_disk() instead of
-inlining the tag-packing logic. Single source of truth for the on-disk
-byte layout.
-
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
-EOF
-)"
-```
+Spec §6a.1 was revised to scope the RocksDB-compat claim to OpType ordinals + the
+encode/decode utility methods only. SST format stays Arrow.
 
 ### Task 0.4: SnapshotRegistry — capture/release/min_active
 
@@ -1441,21 +1404,19 @@ EOF
 )"
 ```
 
-### Task 0.11: Verify with sst_dump (CI gate per §6a.1)
+### Task 0.11: ~~sst_dump CI gate~~ (DROPPED — incompatible with Arrow SST format)
 
-**Files:**
-- Create: `crates/forst-rs-engine/tests/sst_dump_compat.rs`
+**Status (2026-05-11)**: DROPPED. forst-rs SSTs are Apache Arrow columnar files;
+RocksDB's `sst_dump` cannot decode them by design. Spec §6a.1 was revised to drop
+the sst_dump compat claim and pivot diagnostic tooling to `parquet-tools` (which
+works on Arrow SSTs out of the box) plus a future forst-rs-specific dumper CLI
+(not gated on B-Prod).
 
-- [ ] **Step 1: Verify sst_dump availability locally**
+**Original task content preserved below for historical reference** (do not execute):
 
-```bash
-which sst_dump || echo "MISSING: install via 'brew install rocksdb' or apt 'rocksdb-tools'"
+```rust
+// historical example follows; superseded
 ```
-If MISSING, install. CI will install via apt step (added in P0 final task).
-
-- [ ] **Step 2: Write the sst_dump compat test**
-
-Create `crates/forst-rs-engine/tests/sst_dump_compat.rs`:
 ```rust
 //! CI gate per spec §6a.1 — sst_dump must read forst-rs SSTs unchanged.
 

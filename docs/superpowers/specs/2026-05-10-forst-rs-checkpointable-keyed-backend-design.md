@@ -169,54 +169,52 @@ length-prefixed serializers this is unambiguous in practice.
 
 ## 6a. MVCC engine subsystem
 
-### 6a.1 InternalKey: byte-level RocksDB compatibility (NORMATIVE)
+### 6a.1 InternalKey: type ordinal compatibility with RocksDB (NORMATIVE)
 
-forst-rs commits to **byte-level on-disk compatibility** with RocksDB's InternalKey
-encoding so that production diagnostic tooling (`sst_dump`, `ldb`, third-party SST
-inspectors) remains usable against forst-rs SSTs. This is a **major operational asset**
-worth preserving and not negotiable.
+forst-rs's SST file format is **Apache Arrow / Parquet-style columnar** (4 columns: key,
+value, sequence, op_type stored as separate Arrow arrays per SST). It is **NOT byte-compatible
+with RocksDB's block-based SST format** — `sst_dump` cannot decode forst-rs SSTs and is not
+attempted as a CI gate. The Arrow layout is foundational to the vectorization wins
+(Goal G-B; Arrow-driven memtable + SST is core to the perf delta).
 
-**On-disk layout** (matches `rocksdb/db/dbformat.h`):
+What IS RocksDB-compatible:
 
-```
-InternalKey bytes = user_key || tag(8 bytes, little-endian)
+- **OpType discriminants match RocksDB's `ValueType` enum** so any future surface that needs
+  to round-trip op_type bytes through a RocksDB-shaped pipeline (FFI bridges, future WAL,
+  one-off migration tools) can do so without a translation layer.
+- **`InternalKey::encode_to_disk` / `decode_from_disk` utility methods** produce/consume the
+  classic `user_key || tag(8B LE), tag = (seq<<8)|type` layout. Today they have no SST
+  callers (the columnar layout doesn't need them), but they exist as a stable utility for
+  any future RocksDB-shaped path.
 
-tag = (sequence << 8) | type
-    where sequence ∈ [0, 2^56) (7 bytes worth)
-          type     ∈ [0, 256)  (1 byte)
-
-On-disk byte order of the tag (little-endian):
-  byte 0:    type
-  bytes 1-7: sequence in little-endian
-```
-
-**Type ordinals** (must match RocksDB's `ValueType` enum exactly):
+**Type ordinals** (must match RocksDB's `ValueType` enum exactly for the OpType
+discriminants forst-rs uses):
 
 | Ordinal | Name | Status in forst-rs v1 |
 |---|---|---|
-| 0x0 | kTypeDeletion | implemented |
-| 0x1 | kTypeValue | implemented |
-| 0x2 | kTypeMerge | reserved (errors at write time; no merge operator yet) |
-| 0x4 | kTypeColumnFamilyDeletion | reserved |
-| 0x5 | kTypeColumnFamilyValue | reserved |
-| 0x7 | kTypeSingleDeletion | reserved |
-| 0xB | kTypeRangeDeletion | reserved |
-| 0xF | kTypeBlobIndex | reserved |
-| (others) | reserved by RocksDB | reject at read time with `FRS_STATUS_UNSUPPORTED_VERSION` |
+| 0x0 | kTypeDeletion (`OpType::Delete`) | implemented |
+| 0x1 | kTypeValue (`OpType::Put`) | implemented |
+| 0x2 | kTypeMerge (`OpType::Merge`) | reserved (errors at write time; no merge operator yet) |
+| 0x7 | kTypeSingleDeletion (`OpType::SingleDelete`) | reserved |
+| (other RocksDB ordinals) | not used in forst-rs | unknown ordinals returned as `Corruption` from decode paths |
 
 **Implementation constraints**:
 
-- Sort order: `(user_key ASC, sequence DESC)` — same as RocksDB. Latest version of a key
-  comes first in a forward iterator.
-- Comparator: byte-wise on user_key, then numeric DESC on sequence. Implemented as a single
-  byte-wise comparison if user_key bytes precede the tag (which they do in this layout).
-- The existing `forst-rs-common::InternalKey` already has `seq + op_type` fields; P0 work
-  changes the encoder/decoder to match the RocksDB byte layout described above (was a
-  forst-rs-internal layout previously).
+- Sort order in memtable + SST iteration: `(user_key ASC, sequence DESC)` — same as RocksDB.
+  Latest version of a key comes first in a forward iterator.
+- Existing `forst-rs-common::OpType` ordinals were swapped to RocksDB-matching values in
+  Task 0.1; existing `InternalKey::encode_to_disk/decode_from_disk` utility methods landed
+  in Task 0.2. SST writer/reader paths remain Arrow-columnar (Task 0.3 dropped — no
+  byte-concat call sites to refactor).
 
-**Verification gate**: P0 ships with a test that writes 3 keys to a forst-rs SST, opens it
-with the upstream `sst_dump --command=scan` binary, and asserts the dumped keys + sequences
-+ types match. This is a hard CI gate.
+**Verification**: Task 0.1 + 0.2 unit tests (5 disk-format tests + ordinal table) gate the
+ordinal+utility surface. SST file format is verified by the existing engine integration
+tests (memtable + SST round-trip + compaction). The earlier-spec'd `sst_dump` CI gate is
+dropped because the Arrow SST format is incompatible with `sst_dump` by design.
+
+**Diagnostic tooling**: Arrow SSTs can be inspected with `parquet-tools` and any Arrow-aware
+viewer. A forst-rs-specific dumper (CLI shipping the Arrow schema + decoder) is queued as a
+future operational improvement; not gated on B-Prod.
 
 ### 6a.2 Snapshot type & registry
 
@@ -808,7 +806,7 @@ E2E (~4):
 | MVCC: long-lived snapshots pin storage | **Normative constraint in §6a.3** — config `snapshot.max_age_ms`, warn-only behavior, `forst.snapshot.oldest_age_ms` + `active_count` + `pinned_bytes` gauges, runbook hint in warn line. Operator monitors and alerts. |
 | MVCC: compaction policy bug → silent data loss | Property-test the compaction policy: for any (set of writes, set of snapshots) sequence, verify reads at each snapshot return the correct value; fuzz with proptest. CI gate. |
 | MVCC: sequence number overflow (56-bit on-disk, 60-bit safety threshold) | **Normative constraint in §6a.4** — fatal at seq ≥ 2^60, log + writes return INTERNAL, reads continue, recovery via checkpoint manifest's `snapshot_seq`. At 1 M writes/sec the threshold is ~36,500 years away; operationally unreachable but defined. |
-| RocksDB byte-compat: divergence in InternalKey layout would silently break sst_dump | **Normative constraint in §6a.1** — CI gate runs `sst_dump --command=scan` against a forst-rs SST and asserts byte-equivalent output. P0 cannot land without this test green. |
+| RocksDB-compat misunderstanding: spec previously claimed sst_dump compat | **Resolved 2026-05-11**: SSTs are Arrow-columnar by design (key vectorization win); sst_dump cannot decode them. Spec §6a.1 revised to scope the compat claim to OpType ordinals + InternalKey encode/decode utility methods only. Diagnostic tooling pivot: parquet-tools + future forst-rs dumper. |
 
 ## 15. Out of scope (will re-enter design later)
 
