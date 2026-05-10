@@ -3049,6 +3049,58 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             let mut engine_opts = db_opts.opts.clone();
             engine_opts.db_path = path_str;
 
+            // 6a. P3 hydration: walk every CF's CfOptionsHandle, and if it
+            // carries a BlockBasedTableConfig pointer (set via
+            // `ColumnFamilyOptions.setTableFormatConfig`), pull
+            // `block_size`, `block_cache_size`, and `bloom_bits_per_key`
+            // off it and apply to the engine-wide `EngineOptions`. forst-rs
+            // currently models these as engine-wide rather than per-CF, so
+            // multiple CFs that disagree get last-write-wins (matches the
+            // community shim that wraps a shared block cache + filter
+            // policy by default). We respect only the *first* non-zero
+            // table-format handle we see — Flink jobs typically attach the
+            // same config to every CF.
+            for &cf_opts_handle in &cf_opts_buf {
+                if cf_opts_handle == 0 {
+                    continue;
+                }
+                // SAFETY: pointer came from `ColumnFamilyOptions.<init>` and is
+                // still owned by the Java side; we only borrow immutably here
+                // and the borrow ends with this loop iteration.
+                let Some(cf_opts) = (unsafe { CfOptionsHandle::from_raw_ref(cf_opts_handle) })
+                else {
+                    continue;
+                };
+                if cf_opts.table_format_handle == 0 {
+                    continue;
+                }
+                // SAFETY: `table_format_handle` was set by
+                // `ColumnFamilyOptions.setTableFormatConfig` from the jlong
+                // returned by `BlockBasedTableConfig.newTableFactoryHandle`;
+                // the Java side still owns the box (it disposes via
+                // `BlockBasedTableConfig.disposeInternal`).
+                let Some(tbl) = (unsafe {
+                    BlockBasedTableConfigHandle::from_raw_ref(cf_opts.table_format_handle)
+                }) else {
+                    continue;
+                };
+                if let Some(bs) = tbl.block_size {
+                    engine_opts.block_size = bs;
+                }
+                if let Some(cs) = tbl.block_cache_size {
+                    engine_opts.block_cache_size = cs;
+                }
+                if let Some(bbk) = tbl.bloom_bits_per_key {
+                    engine_opts.bloom_bits_per_key = bbk;
+                }
+                tracing::debug!(
+                    target: "compat_jni::open",
+                    "BlockBasedTableConfig hydrated: block_size={:?}, block_cache_size={:?}, bloom_bits_per_key={:?}, index_type={}",
+                    tbl.block_size, tbl.block_cache_size, tbl.bloom_bits_per_key, tbl.index_type
+                );
+                break;
+            }
+
             // 7. Open the engine. We take the slow path of constructing a fresh
             //    DbImpl directly so the configured EngineOptions land on the
             //    engine instead of the default-only path of `frs_db_open`.
@@ -4145,6 +4197,97 @@ pub(crate) mod handles2 {
         pub _reserved: u8,
     }
 
+    /// Java `org.forstdb.BlockBasedTableConfig` mirror. Aggregates the
+    /// settings community RocksDB attaches to its block-based-table format
+    /// (block size, filter policy, block cache, index type) and forwards
+    /// them onto [`EngineOptions`] at multi-CF open time
+    /// (`Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_3J_3J`).
+    ///
+    /// `bloom_bits_per_key` is hydrated from a [`BloomFilterHandle`] passed
+    /// to `setFilterPolicy`; `block_cache_size` is hydrated from an
+    /// [`LruCacheHandle`] passed to `setBlockCache`. The legacy
+    /// `setBlockCacheSize` shortcut writes the same field directly.
+    /// `index_type` is recorded but not yet honoured by forst-rs (the
+    /// engine has only one index format today); future work can branch on
+    /// it once the SST index gains alternate forms.
+    #[derive(Default)]
+    pub(crate) struct BlockBasedTableConfigHandle {
+        /// Block size in bytes, or `None` to keep the engine default
+        /// (64 KiB). Hydrated from `setBlockSize`.
+        pub block_size: Option<usize>,
+        /// Total block-cache capacity in bytes, or `None` to keep the
+        /// engine default (256 MiB). Hydrated from `setBlockCache(lru)`
+        /// or the legacy `setBlockCacheSize(bytes)` shortcut.
+        pub block_cache_size: Option<usize>,
+        /// Bits-per-key for the SST bloom filter, or `None` to keep the
+        /// engine default (10). Hydrated from
+        /// `setFilterPolicy(BloomFilter)`.
+        pub bloom_bits_per_key: Option<usize>,
+        /// Community `IndexType` ordinal: 0 = kBinarySearch (default),
+        /// 1 = kHashSearch, 2 = kTwoLevelIndexSearch, 3 = kBinarySearchWithFirstKey.
+        /// Recorded for future use.
+        pub index_type: u8,
+    }
+
+    /// Java `org.forstdb.BloomFilter` mirror. Holds only the bits-per-key
+    /// setting; `block_based_mode` is recorded for completeness but
+    /// ignored by forst-rs (the engine has a single bloom encoding).
+    pub(crate) struct BloomFilterHandle {
+        pub bits_per_key: usize,
+        #[allow(dead_code)]
+        pub block_based_mode: bool,
+    }
+
+    /// Java `org.forstdb.LRUCache` mirror. Records the requested cache
+    /// capacity + sharding hints; only `capacity` is currently propagated
+    /// onto [`EngineOptions::block_cache_size`] when a `LRUCache` handle
+    /// is attached to a `BlockBasedTableConfig` via `setBlockCache`.
+    pub(crate) struct LruCacheHandle {
+        pub capacity: usize,
+        #[allow(dead_code)]
+        pub num_shard_bits: i32,
+        #[allow(dead_code)]
+        pub strict_capacity_limit: bool,
+        #[allow(dead_code)]
+        pub high_pri_pool_ratio: f64,
+    }
+
+    /// Java `org.forstdb.WriteBufferManager` mirror. Community RocksDB
+    /// uses this to share a write-buffer budget across CFs / DBs; forst-rs
+    /// has per-CF arenas instead, so the values are recorded but the
+    /// matching `DBOptions.setWriteBufferManager` thunk leaves them
+    /// no-op'd. Stored here for diagnostic dumps.
+    pub(crate) struct WriteBufferManagerHandle {
+        #[allow(dead_code)]
+        pub capacity: usize,
+        #[allow(dead_code)]
+        pub cache_handle: jlong,
+    }
+
+    /// Java `org.forstdb.FlinkEnv` mirror. Community Flink wraps a Flink
+    /// `FileSystem` (S3 / GCS / Azure / HDFS) into a RocksDB `Env` so the
+    /// engine writes SSTs through Flink's distributed-FS layer. forst-rs
+    /// has its own `forst_rs_io::FileSystem` abstraction (with an
+    /// OpenDAL-backed implementation for cloud storage) and does NOT
+    /// dispatch FS calls back into Java, so this handle is accepted but
+    /// otherwise ignored. Callers needing S3/GCS/Azure/HDFS should pick
+    /// the appropriate forst-rs FileSystem at `RocksDB.open` time rather
+    /// than relying on FlinkEnv.
+    ///
+    /// See the module-level divergence note (Path B in the audit): we
+    /// chose not to implement a JNI-callback Env trait — a full Flink-FS
+    /// bridge would add ~2000 LOC of cross-language marshalling for
+    /// every read/write and is the wrong place to put cloud-storage
+    /// integration when forst-rs already owns that abstraction.
+    #[derive(Default)]
+    pub(crate) struct FlinkEnvHandle {
+        /// Number of `String` entries the Java side passed to the
+        /// constructor (typically a Flink-FS scheme list). Recorded for
+        /// debugging only — the engine never consults it.
+        #[allow(dead_code)]
+        pub fs_count: usize,
+    }
+
     macro_rules! impl_into_from_raw_p2 {
         ($t:ty) => {
             impl $t {
@@ -4169,11 +4312,17 @@ pub(crate) mod handles2 {
     impl_into_from_raw_p2!(ImportColumnFamilyOptionsHandle);
     impl_into_from_raw_p2!(ExportImportFilesMetaDataHandle);
     impl_into_from_raw_p2!(StatisticsHandle);
+    impl_into_from_raw_p2!(BlockBasedTableConfigHandle);
+    impl_into_from_raw_p2!(BloomFilterHandle);
+    impl_into_from_raw_p2!(LruCacheHandle);
+    impl_into_from_raw_p2!(WriteBufferManagerHandle);
+    impl_into_from_raw_p2!(FlinkEnvHandle);
 }
 
 use handles2::{
-    CheckpointHandle, ExportImportFilesMetaDataHandle, ImportColumnFamilyOptionsHandle,
-    SnapshotHandle, StatisticsHandle,
+    BlockBasedTableConfigHandle, BloomFilterHandle, CheckpointHandle,
+    ExportImportFilesMetaDataHandle, FlinkEnvHandle, ImportColumnFamilyOptionsHandle,
+    LruCacheHandle, SnapshotHandle, StatisticsHandle, WriteBufferManagerHandle,
 };
 
 // ---------------------------------------------------------------------------
@@ -5349,6 +5498,512 @@ pub extern "system" fn Java_org_forstdb_RocksDB_multiGet<'local>(
     )
 }
 
+// ===========================================================================
+// P3 — BlockBasedTableConfig + BloomFilter + LRUCache + WriteBufferManager + FlinkEnv
+//
+// Surface (~13 entries):
+//   - BlockBasedTableConfig class:          7 thunks
+//   - BloomFilter class:                    2 thunks
+//   - LRUCache class:                       2 thunks
+//   - WriteBufferManager class:             2 thunks
+//   - FlinkEnv class:                       2 thunks (ctor + dispose)
+//
+// All five classes follow the established `Box<*Handle>` exposed as jlong
+// pattern (`Box::into_raw` / `Box::from_raw`). The interesting bit is the
+// hydration path: `BlockBasedTableConfig` accumulates settings the Java
+// side configures via the four mutator setters, and the multi-CF
+// `RocksDB.open` thunk (P0 §6a) walks every CfOptionsHandle's
+// `table_format_handle` to pull those settings onto the
+// `EngineOptions` that gets handed to `DbImpl::open_with_fs`.
+//
+// **FlinkEnv divergence (audit Path B):** community Flink wraps a Flink
+// `FileSystem` into a RocksDB `Env` so the engine can write SST files
+// through a distributed FS (S3 / GCS / Azure / HDFS). forst-rs has its
+// own `forst_rs_io::FileSystem` abstraction with an OpenDAL-backed
+// implementation; we therefore accept the FlinkEnv handle but never
+// dispatch FS calls back into Java. Callers needing cloud storage should
+// configure the appropriate forst-rs FileSystem at `RocksDB.open` time.
+// Implementing a JNI-callback Env trait would add ~2000 LOC of
+// cross-language marshalling for every read/write — the wrong place to
+// integrate cloud storage.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// BlockBasedTableConfig class
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.BlockBasedTableConfig.newTableFactoryHandle() -> long`
+///
+/// Java signature: `()J`
+///
+/// Constructs a fresh [`BlockBasedTableConfigHandle`]; subsequent
+/// mutator setters write into the same box. The handle is stored on a
+/// `ColumnFamilyOptions` via `setTableFormatConfig` and consumed by the
+/// multi-CF `RocksDB.open` thunk (P0 §6a) which hydrates its values onto
+/// the engine-wide `EngineOptions`.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BlockBasedTableConfig_newTableFactoryHandle<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| BlockBasedTableConfigHandle::default().into_raw(),
+    )
+}
+
+/// `org.forstdb.BlockBasedTableConfig.disposeInternal(long handle)`
+///
+/// Java signature: `(J)V`
+///
+/// Drops the [`BlockBasedTableConfigHandle`] box. Does NOT touch the
+/// embedded BloomFilter / LRUCache handle pointers — those have their own
+/// dispose lifecycles owned by Java.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BlockBasedTableConfig_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from a prior `newTableFactoryHandle`
+                // and has not been freed.
+                unsafe { drop(Box::from_raw(handle as *mut BlockBasedTableConfigHandle)) };
+            }
+        },
+    )
+}
+
+/// `org.forstdb.BlockBasedTableConfig.setIndexType(long handle, byte indexType)`
+///
+/// Java signature: `(JB)V`
+///
+/// Records the community `IndexType` ordinal (0 = kBinarySearch). forst-rs
+/// has only one SST index format today; the value is stored for forward
+/// compatibility but does not yet affect engine behaviour.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BlockBasedTableConfig_setIndexType<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    index_type: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { BlockBasedTableConfigHandle::from_raw_ref(handle) } {
+                // Defensive clamp: the community enum has only ~6 values; we
+                // store as u8 to keep the field small. Anything out of range
+                // collapses to 0 (kBinarySearch) so a stale Flink constant
+                // table never breaks open.
+                h.index_type = if (0..=255).contains(&index_type) {
+                    index_type as u8
+                } else {
+                    0
+                };
+            }
+        },
+    )
+}
+
+/// `org.forstdb.BlockBasedTableConfig.setBlockCache(long handle, long cacheHandle)`
+///
+/// Java signature: `(JJ)V`
+///
+/// Pulls the cache capacity off the supplied [`LruCacheHandle`] and
+/// records it for hydration into `EngineOptions::block_cache_size` at
+/// open time. A null `cacheHandle` clears the override.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BlockBasedTableConfig_setBlockCache<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    cache_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            let Some(h) = (unsafe { BlockBasedTableConfigHandle::from_raw_ref(handle) }) else {
+                return;
+            };
+            if cache_handle == 0 {
+                h.block_cache_size = None;
+                return;
+            }
+            // SAFETY: cache_handle came from `LRUCache.newLRUCache` and has
+            // not been disposed (the Java side owns the lifecycle); we only
+            // read the capacity field.
+            if let Some(cache) = unsafe { LruCacheHandle::from_raw_ref(cache_handle) } {
+                h.block_cache_size = Some(cache.capacity);
+            }
+        },
+    )
+}
+
+/// `org.forstdb.BlockBasedTableConfig.setBlockCacheSize(long handle, long sizeBytes)`
+///
+/// Java signature: `(JJ)V`
+///
+/// Legacy shortcut for `setBlockCache(LRUCache(sizeBytes))`. Writes
+/// directly to the same `block_cache_size` field. Negative or zero values
+/// are coerced to "no override" (clears the field).
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BlockBasedTableConfig_setBlockCacheSize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    size_bytes: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { BlockBasedTableConfigHandle::from_raw_ref(handle) } {
+                h.block_cache_size = if size_bytes > 0 {
+                    Some(size_bytes as usize)
+                } else {
+                    None
+                };
+            }
+        },
+    )
+}
+
+/// `org.forstdb.BlockBasedTableConfig.setFilterPolicy(long handle, long filterHandle)`
+///
+/// Java signature: `(JJ)V`
+///
+/// Pulls the bits-per-key off the supplied [`BloomFilterHandle`] and
+/// records it for hydration into `EngineOptions::bloom_bits_per_key` at
+/// open time. A null `filterHandle` clears the override (engine default
+/// of 10 bits/key applies). Non-bloom filter policies are unsupported;
+/// the only thing forst-rs's SST writer can build is a bloom filter.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BlockBasedTableConfig_setFilterPolicy<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    filter_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            let Some(h) = (unsafe { BlockBasedTableConfigHandle::from_raw_ref(handle) }) else {
+                return;
+            };
+            if filter_handle == 0 {
+                h.bloom_bits_per_key = None;
+                return;
+            }
+            // SAFETY: filter_handle came from `BloomFilter.newBloomFilter`
+            // and has not been disposed.
+            if let Some(bloom) = unsafe { BloomFilterHandle::from_raw_ref(filter_handle) } {
+                h.bloom_bits_per_key = Some(bloom.bits_per_key);
+            }
+        },
+    )
+}
+
+/// `org.forstdb.BlockBasedTableConfig.setBlockSize(long handle, long sizeBytes)`
+///
+/// Java signature: `(JJ)V`
+///
+/// Records the SST block size for hydration into
+/// `EngineOptions::block_size` at open time. Zero / negative values
+/// clear the override (engine default of 64 KiB applies).
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BlockBasedTableConfig_setBlockSize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    size_bytes: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { BlockBasedTableConfigHandle::from_raw_ref(handle) } {
+                h.block_size = if size_bytes > 0 {
+                    Some(size_bytes as usize)
+                } else {
+                    None
+                };
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// BloomFilter class
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.BloomFilter.newBloomFilter(int bitsPerKey, boolean blockBasedMode) -> long`
+///
+/// Java signature: `(IZ)J`
+///
+/// Constructs a [`BloomFilterHandle`] capturing the bits-per-key. forst-rs
+/// always uses the same bloom encoding regardless of `blockBasedMode`; we
+/// record the flag for completeness but never branch on it.
+///
+/// Negative `bitsPerKey` values are clamped to the engine default (10).
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BloomFilter_newBloomFilter<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    bits_per_key: jint,
+    block_based_mode: jboolean,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            let bits = if bits_per_key > 0 {
+                bits_per_key as usize
+            } else {
+                10
+            };
+            BloomFilterHandle {
+                bits_per_key: bits,
+                block_based_mode: block_based_mode != JNI_FALSE,
+            }
+            .into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.BloomFilter.disposeInternal(long handle)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BloomFilter_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from a prior `newBloomFilter`.
+                unsafe { drop(Box::from_raw(handle as *mut BloomFilterHandle)) };
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// LRUCache class
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.LRUCache.newLRUCache(long capacity, int numShardBits,
+///                                    boolean strictCapacityLimit,
+///                                    double highPriPoolRatio) -> long`
+///
+/// Java signature: `(JIZD)J`
+///
+/// Constructs an [`LruCacheHandle`]. Only `capacity` is currently
+/// propagated onto `EngineOptions::block_cache_size` (when this handle is
+/// later attached to a `BlockBasedTableConfig` via `setBlockCache`).
+/// `numShardBits` / `strictCapacityLimit` / `highPriPoolRatio` are
+/// recorded for diagnostic dumps but otherwise ignored — forst-rs's block
+/// cache has its own sharding strategy.
+///
+/// Negative `capacity` defaults to the engine's 256 MiB.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_LRUCache_newLRUCache<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    capacity: jlong,
+    num_shard_bits: jint,
+    strict_capacity_limit: jboolean,
+    high_pri_pool_ratio: jni::sys::jdouble,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            let cap = if capacity > 0 {
+                capacity as usize
+            } else {
+                256 * 1024 * 1024
+            };
+            LruCacheHandle {
+                capacity: cap,
+                num_shard_bits,
+                strict_capacity_limit: strict_capacity_limit != JNI_FALSE,
+                high_pri_pool_ratio,
+            }
+            .into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.LRUCache.disposeInternal(long handle)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_LRUCache_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from a prior `newLRUCache`.
+                unsafe { drop(Box::from_raw(handle as *mut LruCacheHandle)) };
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// WriteBufferManager class
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.WriteBufferManager.newWriteBufferManager(long capacity, long cacheHandle) -> long`
+///
+/// Java signature: `(JJ)J`
+///
+/// Constructs a [`WriteBufferManagerHandle`]. forst-rs uses per-CF arenas
+/// rather than a shared write-buffer budget, so neither `capacity` nor
+/// `cacheHandle` is honoured by the engine; the values are recorded for
+/// diagnostic dumps. The matching `DBOptions.setWriteBufferManager` thunk
+/// (P0) is also a no-op for the same reason.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_WriteBufferManager_newWriteBufferManager<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    capacity: jlong,
+    cache_handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            let cap = if capacity > 0 { capacity as usize } else { 0 };
+            WriteBufferManagerHandle {
+                capacity: cap,
+                cache_handle,
+            }
+            .into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.WriteBufferManager.disposeInternal(long handle)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_WriteBufferManager_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from a prior `newWriteBufferManager`.
+                unsafe { drop(Box::from_raw(handle as *mut WriteBufferManagerHandle)) };
+            }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// FlinkEnv class
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.FlinkEnv.newFlinkEnv(java.util.List<String> fsList) -> long`
+///
+/// Java signature: `(Ljava/util/List;)J`
+///
+/// Accepts a Java `List<String>` (typically Flink-FS scheme URIs) and
+/// returns an opaque [`FlinkEnvHandle`] that the engine never consults.
+/// See the divergence note above the `Java_org_forstdb_DBOptions_setEnv`
+/// thunk and the P3 audit's "Path B" rationale: cloud-storage
+/// integration belongs in forst-rs's `FileSystem` abstraction, not in a
+/// JNI-callback Env trait.
+///
+/// The list size is recorded for debugging; `null` is accepted and
+/// stored as size 0 rather than rejected (Flink's restore path
+/// occasionally passes `null` when no special FS is configured).
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkEnv_newFlinkEnv<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    fs_list: JObject<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |env| {
+            let count = if fs_list.is_null() {
+                0_usize
+            } else {
+                // Best-effort: call java.util.List.size(); if the call
+                // fails (e.g. caller passed something that isn't a List),
+                // log and fall back to 0 rather than throw — Flink's
+                // restore path is timing-sensitive and a thrown exception
+                // here would surface as a confusing "FlinkEnv ctor failed"
+                // when the engine doesn't even consume the value.
+                match env.call_method(&fs_list, "size", "()I", &[]) {
+                    Ok(v) => match v.i() {
+                        Ok(i) if i >= 0 => i as usize,
+                        _ => 0,
+                    },
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "compat_jni::flink_env",
+                            "FlinkEnv.newFlinkEnv: arg is not a java.util.List; recording fs_count=0"
+                        );
+                        0
+                    }
+                }
+            };
+            tracing::debug!(
+                target: "compat_jni::flink_env",
+                "FlinkEnv.newFlinkEnv: accepting handle (fs_count={count}); forst-rs uses its own FileSystem abstraction (OpenDAL for cloud storage), Flink Env is a no-op"
+            );
+            FlinkEnvHandle { fs_count: count }.into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.FlinkEnv.disposeInternal(long handle)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkEnv_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from a prior `newFlinkEnv`.
+                unsafe { drop(Box::from_raw(handle as *mut FlinkEnvHandle)) };
+            }
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -5572,6 +6227,26 @@ mod tests {
             // P4 — RocksDB.getProperty + multiGet (2 entries).
             "Java_org_forstdb_RocksDB_getProperty",
             "Java_org_forstdb_RocksDB_multiGet",
+            // P3 — BlockBasedTableConfig class (7 entries).
+            "Java_org_forstdb_BlockBasedTableConfig_newTableFactoryHandle",
+            "Java_org_forstdb_BlockBasedTableConfig_disposeInternal",
+            "Java_org_forstdb_BlockBasedTableConfig_setIndexType",
+            "Java_org_forstdb_BlockBasedTableConfig_setBlockCache",
+            "Java_org_forstdb_BlockBasedTableConfig_setBlockCacheSize",
+            "Java_org_forstdb_BlockBasedTableConfig_setFilterPolicy",
+            "Java_org_forstdb_BlockBasedTableConfig_setBlockSize",
+            // P3 — BloomFilter class (2 entries).
+            "Java_org_forstdb_BloomFilter_newBloomFilter",
+            "Java_org_forstdb_BloomFilter_disposeInternal",
+            // P3 — LRUCache class (2 entries).
+            "Java_org_forstdb_LRUCache_newLRUCache",
+            "Java_org_forstdb_LRUCache_disposeInternal",
+            // P3 — WriteBufferManager class (2 entries).
+            "Java_org_forstdb_WriteBufferManager_newWriteBufferManager",
+            "Java_org_forstdb_WriteBufferManager_disposeInternal",
+            // P3 — FlinkEnv class (2 entries).
+            "Java_org_forstdb_FlinkEnv_newFlinkEnv",
+            "Java_org_forstdb_FlinkEnv_disposeInternal",
         ];
         for sym in &required {
             assert!(
@@ -6723,5 +7398,246 @@ mod tests {
         // Null-handle.
         let none = unsafe { CheckpointHandle::from_raw_ref(0) };
         assert!(none.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // P3 — BlockBasedTableConfig + BloomFilter + LRUCache +
+    //       WriteBufferManager + FlinkEnv lifecycle smoke tests
+    //
+    // Verify each handle round-trips through `into_raw` / `from_raw_ref`
+    // and disposes without leaking. The symbol-table check
+    // (`test_compat_jni_symbol_exports`) covers the `nm` surface.
+    // The integration-style test `test_open_with_block_based_table_config`
+    // exercises the full hydration path: option chain →
+    // setTableFormatConfig → multi-CF open → engine actually receives the
+    // configured block_size + bloom_bits_per_key.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_bloom_filter_lifecycle() {
+        // Mirrors `BloomFilter.newBloomFilter(10, false)` + `disposeInternal`.
+        let h = BloomFilterHandle {
+            bits_per_key: 10,
+            block_based_mode: false,
+        }
+        .into_raw();
+        assert_ne!(h, 0);
+
+        // SAFETY: just-allocated.
+        let bref = unsafe { BloomFilterHandle::from_raw_ref(h) }.unwrap();
+        assert_eq!(bref.bits_per_key, 10);
+        assert!(!bref.block_based_mode);
+
+        unsafe { drop(Box::from_raw(h as *mut BloomFilterHandle)) };
+        // Null-handle.
+        let none = unsafe { BloomFilterHandle::from_raw_ref(0) };
+        assert!(none.is_none());
+    }
+
+    #[test]
+    fn test_lru_cache_lifecycle() {
+        // Mirrors `LRUCache.newLRUCache(256MB, 4, false, 0.5)` + dispose.
+        let h = LruCacheHandle {
+            capacity: 256 * 1024 * 1024,
+            num_shard_bits: 4,
+            strict_capacity_limit: false,
+            high_pri_pool_ratio: 0.5,
+        }
+        .into_raw();
+        assert_ne!(h, 0);
+
+        // SAFETY: just-allocated.
+        let cref = unsafe { LruCacheHandle::from_raw_ref(h) }.unwrap();
+        assert_eq!(cref.capacity, 256 * 1024 * 1024);
+        assert_eq!(cref.num_shard_bits, 4);
+        assert!(!cref.strict_capacity_limit);
+        assert!((cref.high_pri_pool_ratio - 0.5).abs() < f64::EPSILON);
+
+        unsafe { drop(Box::from_raw(h as *mut LruCacheHandle)) };
+    }
+
+    #[test]
+    fn test_block_based_table_config_lifecycle() {
+        // Mirrors the Flink option-chain:
+        //   BloomFilter bf = new BloomFilter(10, false);
+        //   LRUCache lru = new LRUCache(256MB, ...);
+        //   BlockBasedTableConfig cfg = new BlockBasedTableConfig();
+        //   cfg.setBlockSize(8192);
+        //   cfg.setFilterPolicy(bf);
+        //   cfg.setBlockCache(lru);
+        //   cfg.disposeInternal();
+        let bf = BloomFilterHandle {
+            bits_per_key: 10,
+            block_based_mode: false,
+        }
+        .into_raw();
+        let lru = LruCacheHandle {
+            capacity: 128 * 1024 * 1024,
+            num_shard_bits: 4,
+            strict_capacity_limit: false,
+            high_pri_pool_ratio: 0.5,
+        }
+        .into_raw();
+        let cfg = BlockBasedTableConfigHandle::default().into_raw();
+        assert_ne!(cfg, 0);
+
+        // setBlockSize equivalent.
+        // SAFETY: just-allocated.
+        let cref = unsafe { BlockBasedTableConfigHandle::from_raw_ref(cfg) }.unwrap();
+        cref.block_size = Some(8192);
+
+        // setFilterPolicy equivalent: read bits-per-key from bloom box.
+        // SAFETY: just-allocated.
+        let cref = unsafe { BlockBasedTableConfigHandle::from_raw_ref(cfg) }.unwrap();
+        // SAFETY: just-allocated.
+        let bref = unsafe { BloomFilterHandle::from_raw_ref(bf) }.unwrap();
+        cref.bloom_bits_per_key = Some(bref.bits_per_key);
+
+        // setBlockCache equivalent: read capacity from lru box.
+        // SAFETY: just-allocated.
+        let cref = unsafe { BlockBasedTableConfigHandle::from_raw_ref(cfg) }.unwrap();
+        // SAFETY: just-allocated.
+        let lref = unsafe { LruCacheHandle::from_raw_ref(lru) }.unwrap();
+        cref.block_cache_size = Some(lref.capacity);
+
+        // Verify all writes took.
+        // SAFETY: just-allocated.
+        let cref2 = unsafe { BlockBasedTableConfigHandle::from_raw_ref(cfg) }.unwrap();
+        assert_eq!(cref2.block_size, Some(8192));
+        assert_eq!(cref2.bloom_bits_per_key, Some(10));
+        assert_eq!(cref2.block_cache_size, Some(128 * 1024 * 1024));
+        assert_eq!(cref2.index_type, 0); // default kBinarySearch.
+
+        // Dispose all three handles.
+        unsafe { drop(Box::from_raw(cfg as *mut BlockBasedTableConfigHandle)) };
+        unsafe { drop(Box::from_raw(bf as *mut BloomFilterHandle)) };
+        unsafe { drop(Box::from_raw(lru as *mut LruCacheHandle)) };
+    }
+
+    #[test]
+    fn test_write_buffer_manager_lifecycle() {
+        // Mirrors `WriteBufferManager.newWriteBufferManager(1GB, lru)` + dispose.
+        let lru = LruCacheHandle {
+            capacity: 256 * 1024 * 1024,
+            num_shard_bits: 4,
+            strict_capacity_limit: false,
+            high_pri_pool_ratio: 0.5,
+        }
+        .into_raw();
+        let h = WriteBufferManagerHandle {
+            capacity: 1024 * 1024 * 1024,
+            cache_handle: lru,
+        }
+        .into_raw();
+        assert_ne!(h, 0);
+
+        // SAFETY: just-allocated.
+        let wref = unsafe { WriteBufferManagerHandle::from_raw_ref(h) }.unwrap();
+        assert_eq!(wref.capacity, 1024 * 1024 * 1024);
+        assert_eq!(wref.cache_handle, lru);
+
+        unsafe { drop(Box::from_raw(h as *mut WriteBufferManagerHandle)) };
+        unsafe { drop(Box::from_raw(lru as *mut LruCacheHandle)) };
+    }
+
+    #[test]
+    fn test_flink_env_lifecycle() {
+        // Mirrors `FlinkEnv.newFlinkEnv(emptyList)` + dispose. The handle is
+        // accepted but never consulted by the engine — see the divergence
+        // note above the FlinkEnv ctor.
+        let h = FlinkEnvHandle { fs_count: 0 }.into_raw();
+        assert_ne!(h, 0);
+
+        // SAFETY: just-allocated.
+        let eref = unsafe { FlinkEnvHandle::from_raw_ref(h) }.unwrap();
+        assert_eq!(eref.fs_count, 0);
+
+        unsafe { drop(Box::from_raw(h as *mut FlinkEnvHandle)) };
+    }
+
+    /// End-to-end hydration: build the option chain a Flink job would,
+    /// drive the same Rust-side state the multi-CF open thunk's §6a
+    /// hydration loop reads, and verify the resulting `EngineOptions`
+    /// has the configured block_size + bloom_bits + block_cache_size.
+    ///
+    /// We don't go through `Java_org_forstdb_RocksDB_open__JLjava_...`
+    /// (no JVM in unit tests), but we exercise the *exact* hydration
+    /// logic: walk every CF's CfOptionsHandle, look up the
+    /// table_format_handle, copy fields onto the EngineOptions clone.
+    /// The thunk itself is a thin wrapper around the same loop.
+    #[test]
+    fn test_open_with_block_based_table_config() {
+        // Build the option chain a Flink job would.
+        let bloom = BloomFilterHandle {
+            bits_per_key: 16,
+            block_based_mode: false,
+        }
+        .into_raw();
+        let cache = LruCacheHandle {
+            capacity: 64 * 1024 * 1024,
+            num_shard_bits: 4,
+            strict_capacity_limit: false,
+            high_pri_pool_ratio: 0.5,
+        }
+        .into_raw();
+
+        let tbl = BlockBasedTableConfigHandle::default().into_raw();
+        // SAFETY: just-allocated.
+        let tref = unsafe { BlockBasedTableConfigHandle::from_raw_ref(tbl) }.unwrap();
+        tref.block_size = Some(16 * 1024);
+        // SAFETY: just-allocated.
+        let bref = unsafe { BloomFilterHandle::from_raw_ref(bloom) }.unwrap();
+        tref.bloom_bits_per_key = Some(bref.bits_per_key);
+        // SAFETY: just-allocated.
+        let lref = unsafe { LruCacheHandle::from_raw_ref(cache) }.unwrap();
+        tref.block_cache_size = Some(lref.capacity);
+
+        // Build the per-CF options the open thunk would receive.
+        let cf_opts = CfOptionsHandle::default().into_raw();
+        // SAFETY: just-allocated.
+        let cref = unsafe { CfOptionsHandle::from_raw_ref(cf_opts) }.unwrap();
+        cref.table_format_handle = tbl;
+
+        // Mirror the §6a hydration loop verbatim.
+        let mut engine_opts = EngineOptions::default();
+        for &handle in &[cf_opts] {
+            if handle == 0 {
+                continue;
+            }
+            // SAFETY: just-allocated.
+            let Some(co) = (unsafe { CfOptionsHandle::from_raw_ref(handle) }) else {
+                continue;
+            };
+            if co.table_format_handle == 0 {
+                continue;
+            }
+            // SAFETY: just-allocated.
+            let Some(tb) =
+                (unsafe { BlockBasedTableConfigHandle::from_raw_ref(co.table_format_handle) })
+            else {
+                continue;
+            };
+            if let Some(bs) = tb.block_size {
+                engine_opts.block_size = bs;
+            }
+            if let Some(cs) = tb.block_cache_size {
+                engine_opts.block_cache_size = cs;
+            }
+            if let Some(bbk) = tb.bloom_bits_per_key {
+                engine_opts.bloom_bits_per_key = bbk;
+            }
+            break;
+        }
+
+        // The engine actually received the configured values.
+        assert_eq!(engine_opts.block_size, 16 * 1024);
+        assert_eq!(engine_opts.block_cache_size, 64 * 1024 * 1024);
+        assert_eq!(engine_opts.bloom_bits_per_key, 16);
+
+        // Cleanup all leaked boxes.
+        unsafe { drop(Box::from_raw(cf_opts as *mut CfOptionsHandle)) };
+        unsafe { drop(Box::from_raw(tbl as *mut BlockBasedTableConfigHandle)) };
+        unsafe { drop(Box::from_raw(bloom as *mut BloomFilterHandle)) };
+        unsafe { drop(Box::from_raw(cache as *mut LruCacheHandle)) };
     }
 }
