@@ -19,6 +19,9 @@ encoding. That layout cannot plug into Flink's checkpoint protocol:
 - Doesn't extend `AbstractKeyedStateBackend<K>`, so the keyed state SPI registries never see
   the registered state handles in the form Flink's runtime expects
 
+Furthermore, the engine has no MVCC: snapshots conceptually need to flush the memtable to be
+self-contained, which blocks the task thread for 100s of ms under write pressure.
+
 Result: forst-rs is unusable as a drop-in `state.backend` for production Flink jobs. Local /
 embedded / test usage works; checkpoint-driven recovery does not.
 
@@ -27,6 +30,9 @@ embedded / test usage works; checkpoint-driven recovery does not.
 Make `ForStRsKeyedStateBackend extends AbstractKeyedStateBackend<K>` with full
 `CheckpointableKeyedStateBackend<K>` SPI compliance, supporting:
 
+- **MVCC snapshot isolation** at the engine layer (RocksDB-style sequence-tagged keys +
+  snapshot-bounded version retention). Lets the snapshot sync phase capture a seq number
+  without blocking on memtable flush.
 - **Async incremental snapshots** with shared SST registry
 - **Rescaling** via `SavepointKeyedStateHandle` (parallelism change between savepoint/restore)
 - **Strict restore** semantics (missing baseline SST → `CheckpointRestoreException`)
@@ -39,9 +45,10 @@ Make `ForStRsKeyedStateBackend extends AbstractKeyedStateBackend<K>` with full
 
 - PB-scale state per backend instance — needs distributed sharding (G-C track)
 - Cross-app shared SST deduplication — out of scope; SST registry is per-backend
-- Multi-version / MVCC reads during snapshot — accept point-in-time snapshot semantics
 - TTL-aware snapshot pruning — TTL filter runs at compaction time, not snapshot time
 - Per-state TTL when `cf.mode=single` — needs the per-state CF mode (covered here)
+- Time-travel reads beyond active snapshots — MVCC retention is snapshot-bounded only;
+  versions are dropped once `min_active_snapshot.seq` advances past them
 
 ## 4. Scaling envelope
 
@@ -58,21 +65,48 @@ G-C distributed-forst track replaces this design entirely.
 
 ## 5. Component layout
 
+### 5a. Engine + FFI (Rust)
+
 ```
-flink-statebackend-forst-rs/src/main/java/.../keyed/
-├── ForStRsKeyedStateBackend.java          (rewrite — extends AbstractKeyedStateBackend<K>)
-├── ForStRsKeyedStateBackendBuilder.java   (NEW — Flink builder convention)
-├── ForStRsSnapshotStrategy.java           (NEW — implements SnapshotStrategy)
-├── ForStRsRestoreOperation.java           (NEW — handles full + incremental + rescaling)
-├── ForStRsIncrementalKeyedStateHandle.java (NEW — implements IncrementalKeyedStateHandle)
-├── ForStRsKeyGroupedSerializer.java       (NEW — composite key encoding helper)
-├── cf/
-│   ├── CfRouter.java                      (NEW — interface; routes stateName → FrsCfHandle)
-│   ├── SingleCfRouter.java                (NEW — one CF for all states; default)
-│   └── PerStateCfRouter.java              (NEW — one CF per registered state)
-└── sst/
-    ├── ForStRsSstRegistry.java            (NEW — per-backend shared SST tracking)
-    └── ForStRsSstUploader.java            (NEW — virtual-thread uploader to CheckpointStorage)
+crates/forst-rs-engine/src/
+├── mvcc/                                  (NEW — MVCC subsystem)
+│   ├── mod.rs
+│   ├── snapshot.rs                        (Snapshot type + SnapshotRegistry; atomic min-seq tracker)
+│   ├── reader.rs                          (versioned read paths; latest-version-≤-seq lookup)
+│   └── compaction_policy.rs               (min_active_snapshot_seq invariant; drop-old-version rule)
+├── memtable.rs                            (UPDATE — store InternalKey with seq+type tags)
+└── compaction.rs                          (UPDATE — call compaction_policy::should_drop)
+
+crates/forst-rs-common/src/types.rs        (UPDATE — InternalKey already has seq+type fields;
+                                            extend builders + add op_type constants)
+
+crates/forst-rs-ffi/src/lib.rs             (NEW exports: frs_db_snapshot, frs_db_release_snapshot,
+                                            frs_get_at, frs_iterator_open_at,
+                                            frs_create_incremental_checkpoint_at,
+                                            frs_db_open_from_incremental)
+```
+
+### 5b. Flink module (Java)
+
+```
+flink-statebackend-forst-rs/src/main/java/.../
+├── ffm/
+│   ├── ForStRsLinker.java                 (UPDATE — bind 6 new FFI methods; add FrsSnapshot)
+│   └── FrsSnapshot.java                   (NEW — snapshot handle, AutoCloseable)
+└── keyed/
+    ├── ForStRsKeyedStateBackend.java      (rewrite — extends AbstractKeyedStateBackend<K>)
+    ├── ForStRsKeyedStateBackendBuilder.java (NEW — Flink builder convention)
+    ├── ForStRsSnapshotStrategy.java       (NEW — implements SnapshotStrategy; uses MVCC seq capture)
+    ├── ForStRsRestoreOperation.java       (NEW — full + incremental + rescaling)
+    ├── ForStRsIncrementalKeyedStateHandle.java (NEW — implements IncrementalKeyedStateHandle)
+    ├── ForStRsKeyGroupedSerializer.java   (NEW — composite key encoding helper)
+    ├── cf/
+    │   ├── CfRouter.java                  (NEW — interface)
+    │   ├── SingleCfRouter.java            (NEW — default)
+    │   └── PerStateCfRouter.java          (NEW)
+    └── sst/
+        ├── ForStRsSstRegistry.java        (NEW — per-backend shared SST tracking)
+        └── ForStRsSstUploader.java        (NEW — virtual-thread uploader)
 ```
 
 Existing state classes (`ForStRsValueState` etc.) get a thin update: composite key prefix
@@ -102,6 +136,87 @@ For Map (with user-key UK):
 map UK suffixes never confuse the boundary). Documented as a constraint; for Flink's standard
 length-prefixed serializers this is unambiguous in practice.
 
+## 6a. MVCC engine subsystem
+
+**Internal key layout** (RocksDB-style, already partially in `forst-rs-common::InternalKey`):
+
+```
+InternalKey bytes = user_key || sequence(7 bytes BE) || op_type(1 byte)
+
+op_type ordinals:
+  0x00 = DELETION
+  0x01 = VALUE
+  0x02 = MERGE         (reserved for future)
+  0x03 = SINGLE_DELETION (reserved)
+```
+
+Memtable + SSTs store `InternalKey → value` pairs sorted by `(user_key ASC, sequence DESC)`,
+so a forward iterator over `user_key` yields the latest-seq version first.
+
+**Snapshot type & registry**:
+
+```rust
+pub struct Snapshot {
+    seq: SequenceNumber,
+    registry: Arc<SnapshotRegistry>,
+}
+
+pub struct SnapshotRegistry {
+    // BTreeMap<seq, ref_count> — sorted access for finding the minimum live seq
+    active: Mutex<BTreeMap<SequenceNumber, AtomicUsize>>,
+}
+
+impl SnapshotRegistry {
+    pub fn capture(&self, current_seq: SequenceNumber) -> Snapshot { ... }
+    pub fn release(&self, seq: SequenceNumber) { ... }
+    pub fn min_active(&self) -> SequenceNumber { ... } // returns SequenceNumber::MAX if empty
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) { self.registry.release(self.seq); }
+}
+```
+
+**Read path** (`get_at(snapshot, user_key)`):
+
+1. Probe memtable for entries `(user_key, *, *)`; pick the one with largest `seq <= snapshot.seq`
+2. If the picked entry's `op_type == DELETION`: return `Ok(None)`
+3. If found: return `Ok(Some(value))`
+4. Otherwise (no memtable hit): probe L0/L1/Lmax SSTs in order; same latest-seq-≤-snapshot logic
+5. If no version exists with `seq <= snapshot.seq`: return `Ok(None)` (key didn't exist at snapshot time)
+
+**Iterator path** (`iter_at(snapshot)`):
+
+- Standard merging iterator over memtable + L0 + L1 + Lmax
+- Filters by `seq <= snapshot.seq` per user_key (skip same user_key after the first hit)
+- Skip entries with `op_type == DELETION`
+
+**Compaction policy** (`compaction_policy::should_drop`):
+
+```rust
+fn should_drop(entry: &InternalKey, newer_version_exists: bool, min_active_snapshot: Seq) -> bool {
+    // Keep if any active snapshot might need this version.
+    if entry.seq >= min_active_snapshot { return false; }
+    // Drop only if a newer version exists for the same user_key (that newer version
+    // serves all snapshots seq >= entry.seq + 1).
+    newer_version_exists
+}
+```
+
+**Concurrency**:
+- `SnapshotRegistry` is `Arc<Mutex<BTreeMap>>` — fine because snapshot create/release is rare
+  vs read/write traffic
+- `min_active` is read by every compaction; cache the value with epoch counter to avoid
+  taking the lock on the hot path
+- Engine writes increment a global `AtomicU64` sequence counter; snapshots capture its current
+  value
+
+**Memory & storage cost**:
+- Per snapshot: ~32 bytes (Snapshot struct + registry entry)
+- Per stale version retained: `sizeof(InternalKey + value)` until compaction can drop it
+- Worst case: long-lived analytics snapshot pins versions for hours; documented in operator
+  guide
+
 ## 7. CfRouter abstraction
 
 ```java
@@ -129,31 +244,43 @@ public interface CfRouter extends Closeable {
 The router is constructed by `ForStRsKeyedStateBackendBuilder` based on
 `state.backend.forst-rs.cf.mode`.
 
-## 8. Snapshot flow (incremental)
+## 8. Snapshot flow (incremental, MVCC-based)
 
 ```
 snapshot(checkpointId, ts, factory, options) -> RunnableFuture<SnapshotResult<KeyedStateHandle>>
   │
-  ├─ SYNC PHASE (task thread, < ~1 ms):
-  │  1. linker.flush(db) on every CF in router.allCfs()
-  │     — forces L0 from memtable so all in-flight writes land in SSTs
-  │  2. result = linker.createIncrementalCheckpoint(db, checkpointId, lastCompletedId)
-  │     → returns: { newSstFiles: [path...], sharedSstFiles: [path...], manifestPath,
-  │                  cfMap: {name → cf_id} }
-  │  3. Snapshot resources captured: { result, keyGroupRange, factory, sstRegistry }
+  ├─ SYNC PHASE (task thread, target < 1 ms; MVCC makes this near-zero):
+  │  1. snapshot = linker.dbSnapshot(db)
+  │     — captures current global seq into a Snapshot handle; ZERO blocking
+  │     — pins all versions with seq ≤ snapshot.seq from compaction-time deletion
+  │  2. result = linker.createIncrementalCheckpointAt(db, snapshot, checkpointId, lastCompletedId)
+  │     — engine ASYNCHRONOUSLY persists memtable contents at snapshot.seq into a new SST
+  │     — combines that SST + existing SSTs into a manifest tagged with checkpointId
+  │     — returns IMMEDIATELY with manifest reference:
+  │     → { newSstFiles: [path...], sharedSstFiles: [path...], manifestPath,
+  │         cfMap: {name → cf_id}, snapshot_handle (still alive) }
+  │  3. Sync phase ends — task thread released back to checkpoint barrier propagation
   │
   └─ ASYNC PHASE (virtual thread, runs after sync returns):
-     1. For each newSstFile not yet in sstRegistry:
+     1. WAIT for engine background flush of memtable-at-snapshot.seq to finish (poll/cv)
+     2. For each newSstFile not yet in sstRegistry:
         — factory.createCheckpointStreamFactory().upload(file) → StreamStateHandle
         — register in privateState
-     2. For each sharedSstFile:
+     3. For each sharedSstFile:
         — if registry knows it for this checkpoint chain: reuse existing handle
         — otherwise: upload + register in sharedState
-     3. Upload manifest (compact JSON with cfMap, kgRange, base_id) → metaStateHandle
-     4. Return ForStRsIncrementalKeyedStateHandle(
+     4. Upload manifest (compact JSON with cfMap, kgRange, base_id, snapshot_seq)
+        → metaStateHandle
+     5. linker.dbReleaseSnapshot(snapshot) — UNPIN versions; compaction can resume normal
+        retention
+     6. Return ForStRsIncrementalKeyedStateHandle(
             backendId, keyGroupRange, checkpointId, baseId,
             sharedState, privateState, metaStateHandle, cfMap)
 ```
+
+**Key MVCC win**: the sync phase no longer calls `flush()` (which can take 100-500ms under
+write pressure). It captures a seq number, queues memtable persistence asynchronously, and
+returns. Checkpoint barrier latency drops from ~hundreds of ms to ~µs.
 
 `notifyCheckpointComplete(id)`: mark earlier checkpoints' SSTs no longer in shared use →
 registry decrements ref counts → CheckpointStorage cleanup runs on next checkpoint.
@@ -199,16 +326,65 @@ preserves CF identity across restore.
 
 ## 10. New engine FFI
 
-Two new C ABI exports in `crates/forst-rs-ffi/src/lib.rs`:
+Six new C ABI exports in `crates/forst-rs-ffi/src/lib.rs`:
+
+### 10a. MVCC primitives
 
 ```rust
-/// Persists a manifest snapshot tagged with checkpoint_id; returns the SST list
-/// separated into "new since base" and "shared". base_checkpoint_id == 0 means
-/// full snapshot (all SSTs are "new"). Reuses internal logic from
-/// frs_db_get_live_files (prior turn) plus manifest persistence.
+/// Captures a snapshot at the current global sequence number. The snapshot pins
+/// all versions with seq ≤ captured_seq from compaction-time deletion.
+/// Caller MUST eventually call frs_db_release_snapshot or leak versions forever.
 #[no_mangle]
-pub unsafe extern "C" fn frs_create_incremental_checkpoint(
+pub unsafe extern "C" fn frs_db_snapshot(
     db: FrsDb,
+    out_snapshot: *mut FrsSnapshot,
+) -> i32;
+
+/// Releases a snapshot. Idempotent on null. After release, compaction can drop
+/// versions with seq ≤ the released snapshot's seq if newer versions exist.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_release_snapshot(
+    db: FrsDb,
+    snapshot: FrsSnapshot,
+) -> i32;
+
+/// Reads the latest version of `key` with seq ≤ snapshot.seq. Returns
+/// FRS_STATUS_NOT_FOUND if no version exists at snapshot time, or if the
+/// latest version is a deletion tombstone.
+#[no_mangle]
+pub unsafe extern "C" fn frs_get_at(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    snapshot: FrsSnapshot,
+    key: *const u8,
+    key_len: usize,
+    out_value: *mut FrsBytes,
+) -> i32;
+
+/// Opens an iterator that filters by snapshot.seq — yields the latest version of
+/// each user_key with seq ≤ snapshot.seq, skipping deletion tombstones.
+#[no_mangle]
+pub unsafe extern "C" fn frs_iterator_open_at(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    snapshot: FrsSnapshot,
+    out_iter: *mut FrsIterator,
+) -> i32;
+```
+
+### 10b. Snapshot-aware checkpoint primitives
+
+```rust
+/// Persists a manifest snapshot tagged with checkpoint_id, capturing state at
+/// snapshot.seq. Engine ASYNCHRONOUSLY flushes the memtable subset visible at
+/// snapshot.seq into a new SST and returns IMMEDIATELY with the manifest path.
+/// Caller polls/waits via metadata before uploading.
+/// Returns SST list separated into "new since base" and "shared".
+/// base_checkpoint_id == 0 means full snapshot.
+#[no_mangle]
+pub unsafe extern "C" fn frs_create_incremental_checkpoint_at(
+    db: FrsDb,
+    snapshot: FrsSnapshot,
     checkpoint_id: u64,
     base_checkpoint_id: u64,
     out: *mut FrsIncrementalCheckpointResult,
@@ -219,6 +395,7 @@ pub struct FrsIncrementalCheckpointResult {
     pub manifest_path: *mut c_char,         // points into engine-owned dir; freed by caller
     pub new_ssts: *mut FrsLiveFileList,     // SSTs new since base_checkpoint_id
     pub shared_ssts: *mut FrsLiveFileList,  // SSTs shared with base_checkpoint_id
+    pub flush_done_eventfd: c_int,          // poll/wait this fd for memtable flush completion
 }
 
 /// Reconstructs a DB at target_dir from base manifest + extra SST files.
@@ -233,8 +410,8 @@ pub unsafe extern "C" fn frs_db_open_from_incremental(
 ) -> i32;
 ```
 
-Both reuse code from the `frs_db_get_live_files` work landed in the previous turn. New FFI
-implementation: ~150 LOC + ~10 unit tests.
+MVCC primitives: ~400 LOC engine + ~150 LOC FFI + 30+ tests.
+Checkpoint primitives reuse the prior turn's `frs_db_get_live_files` work: ~200 LOC + 15 tests.
 
 ## 11. Error handling
 
@@ -251,41 +428,63 @@ implementation: ~150 LOC + ~10 unit tests.
 ## 12. Testing strategy
 
 ```
-Unit tests (~30):
+Engine MVCC unit tests (~30 — Rust):
+  - InternalKey encode/decode round-trip with seq + op_type
+  - Memtable insert/get with MVCC: latest seq ≤ snapshot.seq returned
+  - SnapshotRegistry: capture/release ref counting; min_active correctness
+  - Reader: get_at returns None when key was deleted at-or-before snapshot.seq
+  - Reader: get_at returns prior version when delete happens AFTER snapshot.seq
+  - Iterator: skips DELETION tombstones; respects snapshot.seq filter
+  - Iterator: dedupes user_key (returns latest version with seq ≤ snapshot.seq only)
+  - Compaction policy: drops version when (seq < min_active && newer exists)
+  - Compaction policy: keeps version when seq ≥ min_active
+  - Compaction policy: keeps tombstone if it's the latest version visible to any snapshot
+  - Concurrent snapshot + writes: 1k writes during snapshot read must not affect snapshot
+  - Snapshot drop releases registry entry (Drop impl correctness)
+
+Java unit tests (~30):
   - KeyGroup encoding round-trip (encode → decode → equals)
   - KeyGroup prefix-scan boundary (kg=0, kg=maxParallelism-1, kg=middle)
   - SingleCfRouter / PerStateCfRouter conformance (same CfRouter contract)
   - ForStRsSstRegistry: ref counting, retention across checkpoints
   - ForStRsKeyGroupedSerializer: stateName collision avoidance (last-marker scan)
-  - Manifest serialize/deserialize round-trip including cfMap
+  - Manifest serialize/deserialize round-trip including cfMap + snapshot_seq
+  - FrsSnapshot AutoCloseable correctly releases on close + on try-with-resources exception
 
-Integration tests (~15):
+Integration tests (~18):
   - Full snapshot + restore round-trip (no parallelism change), both cf modes
   - 3-checkpoint incremental chain + restore from checkpoint 3
   - Rescale 4 → 8 → 4 (verify state preserved)
   - Strict-restore: delete an SST after upload, expect CheckpointRestoreException
   - TTL during snapshot (expired entries excluded from snapshot SSTs)
   - Empty-state snapshot edge case
-  - Concurrent snapshot + write (snapshot must see point-in-time consistent)
+  - **MVCC: 100k concurrent writes during snapshot — snapshot reads see only pre-snapshot state**
+  - **MVCC: snapshot held while compaction runs — pinned versions survive**
+  - **MVCC: after releaseSnapshot, compaction reclaims pinned space**
   - cf.mode=per-state with 8 distinct states: verify 8 CFs created and snapshotted
 
-E2E (~3):
+E2E (~4):
   - MiniCluster job: keyBy + ValueState + checkpoint + restart from checkpoint
   - MiniCluster: same as above + rescale on restore (4 → 6)
-  - Long-running soak: 10k checkpoints, verify SST registry doesn't leak
+  - **MiniCluster: snapshot sync phase < 1 ms latency under 100k-writes/sec load (proves MVCC win)**
+  - Long-running soak: 10k checkpoints, verify SST registry + snapshot registry don't leak
 ```
 
-## 13. Implementation order (5 PRs)
+## 13. Implementation order (6 PRs)
 
 | PR | Scope | Effort | Depends on |
 |---|---|---|---|
-| **B-Prod-P1** | KeyGroup encoding + state class updates + AbstractKeyedStateBackend skeleton + CfRouter interface + SingleCfRouter + PerStateCfRouter | 4-5 days | none |
-| **B-Prod-P2** | Engine FFI: `frs_create_incremental_checkpoint` + `frs_db_open_from_incremental` + Rust tests | 2 days | none (parallel with P1) |
-| **B-Prod-P3** | ForStRsSnapshotStrategy + ForStRsIncrementalKeyedStateHandle + ForStRsSstRegistry + virtual-thread uploader | 5 days | P1, P2 |
+| **B-Prod-P0** | Engine MVCC: InternalKey (extend), SnapshotRegistry, versioned reader, compaction policy + 30+ Rust tests | 8-10 days | none |
+| **B-Prod-P1** | KeyGroup encoding + state class updates + AbstractKeyedStateBackend skeleton + CfRouter interface + SingleCfRouter + PerStateCfRouter | 4-5 days | none (parallel with P0) |
+| **B-Prod-P2** | Engine FFI: `frs_db_snapshot/release_snapshot/get_at/iterator_open_at` (MVCC) + `frs_create_incremental_checkpoint_at/db_open_from_incremental` + Rust tests + ForStRsLinker bindings + FrsSnapshot Java type | 3 days | P0 |
+| **B-Prod-P3** | ForStRsSnapshotStrategy (using MVCC seq capture) + ForStRsIncrementalKeyedStateHandle + ForStRsSstRegistry + virtual-thread uploader | 5 days | P1, P2 |
 | **B-Prod-P4** | ForStRsRestoreOperation (full + incremental + rescaling, both cf modes) + integration tests + MiniCluster E2E | 5 days | P3 |
-| **B-Prod-P5** | Benchmarks comparing single-CF vs per-state-CF at increasing state sizes (100MB → 1GB → 10GB) + tuning guide | 2-3 days | P4 |
+| **B-Prod-P5** | Benchmarks: single-CF vs per-state-CF at increasing state sizes (100MB → 1GB → 10GB → 100GB if feasible) + sync-phase latency w/wo MVCC + tuning guide | 3 days | P4 |
 
-**Total**: ~18-20 working days = ~3.5 weeks single-track. P1 + P2 parallel ⇒ ~3 weeks.
+**Total**: ~28-31 working days = ~5-6 weeks single-track. P0 + P1 parallel ⇒ ~5 weeks.
+
+Critical path: P0 → P2 → P3 → P4 → P5. P1 runs in parallel with P0 and lands by the time P3
+needs it.
 
 ## 14. Risks & open questions
 
@@ -297,7 +496,10 @@ E2E (~3):
 | Composite key collision if `serialize(K)` contains `'/' || stateName || '/'` | Last-marker bias documented; for Flink's length-prefixed serializers this is unambiguous; if proven wrong in benches, add length prefix in P1 |
 | Rescaling perf (O(N) iterate per restore) | Acceptable for v1; optimize via per-key-group SST split in v2 if measured slow |
 | Per-state CF count explosion (jobs with 100+ states) | Document soft limit at 256 CFs; fail fast at backend init with explicit guidance to switch to `cf.mode=single` |
-| Manifest format versioning | Include `manifest_version: 1` field; restore checks compatibility; future bumps add migration path |
+| Manifest format versioning | Include `manifest_version: 2` field (bumped from v1 spec since cfMap + snapshot_seq added); restore checks compatibility; future bumps add migration path |
+| MVCC: long-lived snapshots pin storage | Document operator guide; expose `frs.metrics.active_snapshots` + `frs.metrics.pinned_bytes`; consider abandoning snapshots older than `state.backend.forst-rs.mvcc.snapshot.max_age_sec` (default ∞) in v1.5 if observed |
+| MVCC: compaction policy bug → silent data loss | Property-test the compaction policy: for any (set of writes, set of snapshots) sequence, verify reads at each snapshot return the correct value; fuzz with proptest |
+| MVCC: per-key seq overflow (7 bytes = 2^56 seq, very large but bounded) | At 1M writes/sec sustained, fills in ~2,000 years. Acceptable; documented |
 
 ## 15. Out of scope (will re-enter design later)
 
@@ -305,11 +507,10 @@ E2E (~3):
   consistent-hash sharding across many backend instances. Separate spec.
 - **Item #2 (Flink planner rule for Fluss DJ replacement)** — needs the Distributed-Forst
   primitives first, then a planner-side spec.
-- **Multi-engine usage of forst-rs (Spark, Doris, etc.)** — orthogonal; needs a stable cdylib
-  ABI guarantee + multi-engine compat layer. Separate spec.
 
 ## 16. Acceptance criteria
 
+**Functional**:
 - A Flink MiniCluster job using `ForStRsStateBackend` with `cf.mode=single`:
   1. Runs keyBy + ValueState/MapState
   2. Checkpoints successfully (incremental, async)
@@ -318,5 +519,16 @@ E2E (~3):
 - Same job under `cf.mode=per-state` passes the same 4 criteria
 - Strict-restore test: deleting an SST from CheckpointStorage causes
   `CheckpointRestoreException`, not silent data loss
-- 10k-checkpoint soak: SST registry size remains bounded by the configured retention
-- Snapshot path doesn't block task thread for more than 5 ms (95p) at 1 GB state
+- **MVCC isolation test**: a long-running snapshot that runs concurrently with 100k writes
+  must see exactly the state-at-snapshot-time (writes after `dbSnapshot()` invisible to the
+  snapshot's reads/iteration)
+- **MVCC retention test**: after `releaseSnapshot()`, compaction drops the pinned versions
+  on next compaction cycle (verify SST file count + manifest entries shrink)
+
+**Non-functional**:
+- 10k-checkpoint soak: SST registry size remains bounded by configured retention; engine
+  Snapshot count returns to zero after each checkpoint completes
+- **Snapshot sync phase < 1 ms (95p) at 1 GB state** (MVCC enables this; was 50-200 ms with
+  flush-based path)
+- Async snapshot completes within `state.backend.forst-rs.snapshot.timeout` (default 60s)
+  for 1 GB state on local-FS CheckpointStorage
