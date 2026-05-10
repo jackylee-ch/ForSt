@@ -49,7 +49,7 @@ fn build_sst_bytes(n: usize) -> Vec<u8> {
         let key = format!("key_{i:06}");
         let val = format!("val_{i:06}");
         writer
-            .add(key.as_bytes(), Some(val.as_bytes()), (i + 1) as u64, 0)
+            .add(key.as_bytes(), Some(val.as_bytes()), (i + 1) as u64, 1) // Put (OpType::Put = 1, RocksDB byte-compat)
             .expect("writer.add must succeed for sorted unique keys");
     }
     let (bytes, info) = writer.finish().expect("writer.finish");

@@ -1034,7 +1034,7 @@ mod tests {
     #[test]
     fn test_put_single_entry() {
         let mut mt = VectorizedMemTable::new(test_config());
-        let seq = mt.put(b"key1", Some(b"val1"), 0).unwrap();
+        let seq = mt.put(b"key1", Some(b"val1"), 1).unwrap();
         assert_eq!(seq, 1);
         assert_eq!(mt.num_entries(), 1);
     }
@@ -1045,7 +1045,7 @@ mod tests {
         for i in 0..100u32 {
             let key = format!("key_{:05}", i);
             let val = format!("val_{:05}", i);
-            let seq = mt.put(key.as_bytes(), Some(val.as_bytes()), 0).unwrap();
+            let seq = mt.put(key.as_bytes(), Some(val.as_bytes()), 1).unwrap();
             assert_eq!(seq, i as u64 + 1);
         }
         assert_eq!(mt.num_entries(), 100);
@@ -1054,7 +1054,7 @@ mod tests {
     #[test]
     fn test_put_delete_tombstone() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"del_key", None, 1).unwrap(); // Delete
+        mt.put(b"del_key", None, 0).unwrap(); // Delete
         assert_eq!(mt.num_entries(), 1);
         assert!(mt.value_at(0).is_none());
     }
@@ -1063,16 +1063,16 @@ mod tests {
     fn test_put_frozen_fails() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.frozen = true;
-        let result = mt.put(b"k", Some(b"v"), 0);
+        let result = mt.put(b"k", Some(b"v"), 1);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_key_at_value_at() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"alpha", Some(b"one"), 0).unwrap();
-        mt.put(b"beta", Some(b"two"), 0).unwrap();
-        mt.put(b"gamma", None, 1).unwrap(); // delete
+        mt.put(b"alpha", Some(b"one"), 1).unwrap();
+        mt.put(b"beta", Some(b"two"), 1).unwrap();
+        mt.put(b"gamma", None, 0).unwrap(); // delete
 
         assert_eq!(mt.key_at(0), b"alpha");
         assert_eq!(mt.key_at(1), b"beta");
@@ -1085,9 +1085,9 @@ mod tests {
     #[test]
     fn test_merge_unsorted_to_sorted() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"c", Some(b"3"), 0).unwrap();
-        mt.put(b"a", Some(b"1"), 0).unwrap();
-        mt.put(b"b", Some(b"2"), 0).unwrap();
+        mt.put(b"c", Some(b"3"), 1).unwrap();
+        mt.put(b"a", Some(b"1"), 1).unwrap();
+        mt.put(b"b", Some(b"2"), 1).unwrap();
 
         assert_eq!(mt.unsorted_entries.len(), 3);
         assert_eq!(mt.sorted_count, 0);
@@ -1105,8 +1105,8 @@ mod tests {
     #[test]
     fn test_merge_multi_version_same_key() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"key", Some(b"v1"), 0).unwrap(); // seq=1
-        mt.put(b"key", Some(b"v2"), 0).unwrap(); // seq=2
+        mt.put(b"key", Some(b"v1"), 1).unwrap(); // seq=1
+        mt.put(b"key", Some(b"v2"), 1).unwrap(); // seq=2
 
         mt.merge_unsorted_to_sorted();
 
@@ -1120,9 +1120,9 @@ mod tests {
     #[test]
     fn test_sequence_monotonically_increasing() {
         let mut mt = VectorizedMemTable::new(test_config());
-        let s1 = mt.put(b"a", Some(b"1"), 0).unwrap();
-        let s2 = mt.put(b"b", Some(b"2"), 0).unwrap();
-        let s3 = mt.put(b"c", Some(b"3"), 0).unwrap();
+        let s1 = mt.put(b"a", Some(b"1"), 1).unwrap();
+        let s2 = mt.put(b"b", Some(b"2"), 1).unwrap();
+        let s3 = mt.put(b"c", Some(b"3"), 1).unwrap();
         assert!(s1 < s2);
         assert!(s2 < s3);
     }
@@ -1131,14 +1131,14 @@ mod tests {
     fn test_memory_usage_increases() {
         let mut mt = VectorizedMemTable::new(test_config());
         assert_eq!(mt.memory_usage(), 0);
-        mt.put(b"key", Some(b"value"), 0).unwrap();
+        mt.put(b"key", Some(b"value"), 1).unwrap();
         assert!(mt.memory_usage() > 0);
     }
 
     #[test]
     fn test_get_existing_key() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"hello", Some(b"world"), 0).unwrap();
+        mt.put(b"hello", Some(b"world"), 1).unwrap();
         let result = mt.get(b"hello", u64::MAX).unwrap();
         assert!(result.is_some());
         let r = result.unwrap();
@@ -1157,9 +1157,9 @@ mod tests {
     #[test]
     fn test_get_returns_latest_version() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"key", Some(b"v1"), 0).unwrap();
-        mt.put(b"key", Some(b"v2"), 0).unwrap();
-        mt.put(b"key", Some(b"v3"), 0).unwrap();
+        mt.put(b"key", Some(b"v1"), 1).unwrap();
+        mt.put(b"key", Some(b"v2"), 1).unwrap();
+        mt.put(b"key", Some(b"v3"), 1).unwrap();
 
         let r = mt.get(b"key", u64::MAX).unwrap().unwrap();
         assert_eq!(r.value, Some(b"v3".to_vec()));
@@ -1169,9 +1169,9 @@ mod tests {
     #[test]
     fn test_get_respects_read_sequence() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"key", Some(b"v1"), 0).unwrap();
-        mt.put(b"key", Some(b"v2"), 0).unwrap();
-        mt.put(b"key", Some(b"v3"), 0).unwrap();
+        mt.put(b"key", Some(b"v1"), 1).unwrap();
+        mt.put(b"key", Some(b"v2"), 1).unwrap();
+        mt.put(b"key", Some(b"v3"), 1).unwrap();
 
         let r = mt.get(b"key", 2).unwrap().unwrap();
         assert_eq!(r.value, Some(b"v2".to_vec()));
@@ -1184,8 +1184,8 @@ mod tests {
     #[test]
     fn test_get_delete_tombstone() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"key", Some(b"val"), 0).unwrap();
-        mt.put(b"key", None, 1).unwrap();
+        mt.put(b"key", Some(b"val"), 1).unwrap();
+        mt.put(b"key", None, 0).unwrap();
 
         let r = mt.get(b"key", u64::MAX).unwrap().unwrap();
         assert_eq!(r.value, None);
@@ -1196,11 +1196,11 @@ mod tests {
     #[test]
     fn test_get_after_merge_to_sorted() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"a", Some(b"1"), 0).unwrap();
-        mt.put(b"b", Some(b"2"), 0).unwrap();
+        mt.put(b"a", Some(b"1"), 1).unwrap();
+        mt.put(b"b", Some(b"2"), 1).unwrap();
         mt.merge_unsorted_to_sorted();
 
-        mt.put(b"a", Some(b"updated"), 0).unwrap();
+        mt.put(b"a", Some(b"updated"), 1).unwrap();
 
         let r = mt.get(b"a", u64::MAX).unwrap().unwrap();
         assert_eq!(r.value, Some(b"updated".to_vec()));
@@ -1240,7 +1240,7 @@ mod tests {
         let mut mt = VectorizedMemTable::new(test_config());
         let keys: Vec<&[u8]> = vec![b"x", b"y"];
         let values: Vec<Option<&[u8]>> = vec![Some(b"val"), None];
-        let ops = vec![0u8, 1]; // Put, Delete
+        let ops = vec![1u8, 0]; // Put (1), Delete (0) — RocksDB byte-compat
 
         mt.batch_insert(&keys, &values, &ops).unwrap();
 
@@ -1312,7 +1312,7 @@ mod tests {
         for i in 0..1000u32 {
             let key = format!("k_{:06}", i);
             let val = format!("v_{:06}", i);
-            mt.put(key.as_bytes(), Some(val.as_bytes()), 0).unwrap();
+            mt.put(key.as_bytes(), Some(val.as_bytes()), 1).unwrap();
         }
 
         for i in 0..1000u32 {
@@ -1331,17 +1331,17 @@ mod tests {
     #[test]
     fn test_freeze_makes_immutable() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"k", Some(b"v"), 0).unwrap();
+        mt.put(b"k", Some(b"v"), 1).unwrap();
         mt.freeze();
         assert!(mt.is_frozen());
-        assert!(mt.put(b"k2", Some(b"v2"), 0).is_err());
+        assert!(mt.put(b"k2", Some(b"v2"), 1).is_err());
     }
 
     #[test]
     fn test_freeze_merges_unsorted() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"c", Some(b"3"), 0).unwrap();
-        mt.put(b"a", Some(b"1"), 0).unwrap();
+        mt.put(b"c", Some(b"3"), 1).unwrap();
+        mt.put(b"a", Some(b"1"), 1).unwrap();
         assert!(!mt.unsorted_entries.is_empty());
         mt.freeze();
         assert!(mt.unsorted_entries.is_empty());
@@ -1357,9 +1357,9 @@ mod tests {
     #[test]
     fn test_to_flush_batches_sorted_output() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"charlie", Some(b"3"), 0).unwrap();
-        mt.put(b"alpha", Some(b"1"), 0).unwrap();
-        mt.put(b"bravo", Some(b"2"), 0).unwrap();
+        mt.put(b"charlie", Some(b"3"), 1).unwrap();
+        mt.put(b"alpha", Some(b"1"), 1).unwrap();
+        mt.put(b"bravo", Some(b"2"), 1).unwrap();
         mt.freeze();
 
         let batches = mt.to_flush_batches(1024).unwrap();
@@ -1381,8 +1381,8 @@ mod tests {
     #[test]
     fn test_to_flush_batches_multi_version() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"key", Some(b"v1"), 0).unwrap();
-        mt.put(b"key", Some(b"v2"), 0).unwrap();
+        mt.put(b"key", Some(b"v1"), 1).unwrap();
+        mt.put(b"key", Some(b"v2"), 1).unwrap();
         mt.freeze();
 
         let batches = mt.to_flush_batches(1024).unwrap();
@@ -1403,7 +1403,7 @@ mod tests {
         let mut mt = VectorizedMemTable::new(test_config());
         for i in 0..100u32 {
             let key = format!("k_{:05}", i);
-            mt.put(key.as_bytes(), Some(b"v"), 0).unwrap();
+            mt.put(key.as_bytes(), Some(b"v"), 1).unwrap();
         }
         mt.freeze();
 
@@ -1416,8 +1416,8 @@ mod tests {
     #[test]
     fn test_to_flush_batches_with_tombstones() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"alive", Some(b"val"), 0).unwrap();
-        mt.put(b"dead", None, 1).unwrap();
+        mt.put(b"alive", Some(b"val"), 1).unwrap();
+        mt.put(b"dead", None, 0).unwrap();
         mt.freeze();
 
         let batches = mt.to_flush_batches(1024).unwrap();
@@ -1435,10 +1435,10 @@ mod tests {
 
         assert!(!values.is_null(0));
         assert_eq!(values.value(0), b"val");
-        assert_eq!(ops.value(0), 0);
+        assert_eq!(ops.value(0), 1); // Put (OpType::Put = 1, RocksDB byte-compat)
 
         assert!(values.is_null(1));
-        assert_eq!(ops.value(1), 1);
+        assert_eq!(ops.value(1), 0); // Delete (OpType::Delete = 0, RocksDB byte-compat)
     }
 
     // --- merge() convenience method tests ---
@@ -1474,7 +1474,7 @@ mod tests {
     #[test]
     fn test_merge_after_put() {
         let mut mt = VectorizedMemTable::with_defaults();
-        mt.put(b"key1", Some(b"base"), 0).unwrap(); // Put
+        mt.put(b"key1", Some(b"base"), 1).unwrap(); // Put
         mt.merge(b"key1", b"append1").unwrap(); // Merge
         mt.merge(b"key1", b"append2").unwrap(); // Merge
 
@@ -1488,7 +1488,7 @@ mod tests {
     #[test]
     fn test_merge_read_sequence_filtering() {
         let mut mt = VectorizedMemTable::with_defaults();
-        mt.put(b"key1", Some(b"base"), 0).unwrap(); // seq=1
+        mt.put(b"key1", Some(b"base"), 1).unwrap(); // seq=1
         mt.merge(b"key1", b"op1").unwrap(); // seq=2
         mt.merge(b"key1", b"op2").unwrap(); // seq=3
 
@@ -1519,9 +1519,9 @@ mod tests {
     #[test]
     fn test_put_rejects_invalid_op_type() {
         let mut mt = VectorizedMemTable::with_defaults();
-        // 0..=3 are Put/Delete/SingleDelete/Merge — valid.
-        // 4..=255 must be rejected.
-        for invalid in [4u8, 7, 42, 99, 200, 255] {
+        // RocksDB byte-compat: 0=Delete, 1=Put, 2=Merge, 7=SingleDelete — valid.
+        // All others must be rejected.
+        for invalid in [3u8, 4, 5, 6, 8, 42, 99, 200, 255] {
             let err = mt.put(b"key", Some(b"value"), invalid);
             assert!(err.is_err(), "op_type byte {} should be rejected", invalid);
             let msg = format!("{}", err.unwrap_err());
@@ -1573,7 +1573,7 @@ mod tests {
         for i in 0..n {
             let key = format!("rk_{:08}", i);
             let val = format!("rv_{:08}", i);
-            mt.put(key.as_bytes(), Some(val.as_bytes()), 0).unwrap();
+            mt.put(key.as_bytes(), Some(val.as_bytes()), 1).unwrap();
         }
         mt.freeze();
 
@@ -1644,7 +1644,7 @@ mod tests {
             for i in 0..100u32 {
                 let k = format!("rep_{:03}", i);
                 let v = format!("v{:02}_r{}", i, round);
-                mt.put(k.as_bytes(), Some(v.as_bytes()), 0).unwrap();
+                mt.put(k.as_bytes(), Some(v.as_bytes()), 1).unwrap();
             }
         }
         // 1000 inserts but only 100 distinct keys in the lookup.
@@ -1672,7 +1672,7 @@ mod tests {
         let mut mt = VectorizedMemTable::new(test_config());
         for i in 0..50u32 {
             let k = format!("k_{:03}", i);
-            mt.put(k.as_bytes(), Some(b"v"), 0).unwrap();
+            mt.put(k.as_bytes(), Some(b"v"), 1).unwrap();
         }
         assert_eq!(mt.unsorted_lookup.len(), 50);
         assert_eq!(mt.rowindex_vec_pool.len(), 0);
@@ -1693,7 +1693,7 @@ mod tests {
         // recycled into the pool.
         for i in 0..50u32 {
             let k = format!("k_{:03}", i);
-            mt.put(k.as_bytes(), Some(b"v2"), 0).unwrap();
+            mt.put(k.as_bytes(), Some(b"v2"), 1).unwrap();
         }
         mt.merge_unsorted_to_sorted();
         assert_eq!(
@@ -1704,7 +1704,7 @@ mod tests {
 
         // Next put should consume from the pool.
         let pool_before = mt.rowindex_vec_pool.len();
-        mt.put(b"new_key", Some(b"vv"), 0).unwrap();
+        mt.put(b"new_key", Some(b"vv"), 1).unwrap();
         assert_eq!(
             mt.rowindex_vec_pool.len(),
             pool_before - 1,
@@ -1721,10 +1721,10 @@ mod tests {
     #[test]
     fn test_b2_merge_preserves_multi_version_after_box_to_vec() {
         let mut mt = VectorizedMemTable::new(test_config());
-        mt.put(b"k", Some(b"v1"), 0).unwrap(); // seq=1
-        mt.put(b"k", Some(b"v2"), 0).unwrap(); // seq=2
+        mt.put(b"k", Some(b"v1"), 1).unwrap(); // seq=1
+        mt.put(b"k", Some(b"v2"), 1).unwrap(); // seq=2
         mt.merge_unsorted_to_sorted();
-        mt.put(b"k", Some(b"v3"), 0).unwrap(); // seq=3 (post-merge)
+        mt.put(b"k", Some(b"v3"), 1).unwrap(); // seq=3 (post-merge)
         mt.merge_unsorted_to_sorted();
 
         let entries = mt.sorted_index.get(b"k".as_slice()).unwrap();
@@ -1839,7 +1839,7 @@ mod tests {
             .collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         let val_refs: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
-        let ops = vec![0u8; 100];
+        let ops = vec![1u8; 100]; // Put (OpType::Put = 1, RocksDB byte-compat)
         let batch = make_arrow_batch(&key_refs, &val_refs, &ops);
 
         mt.batch_put_arrow(&batch).unwrap();
@@ -1861,7 +1861,7 @@ mod tests {
         let mut mt = VectorizedMemTable::new(test_config());
         let keys: Vec<&[u8]> = vec![b"a", b"b", b"c"];
         let values: Vec<Option<&[u8]>> = vec![Some(b"1"), None, Some(b"3")];
-        let ops: Vec<u8> = vec![0, 1, 0]; // Put, Delete, Put
+        let ops: Vec<u8> = vec![1, 0, 1]; // Put (1), Delete (0), Put (1) — RocksDB byte-compat
         let batch = make_arrow_batch(&keys, &values, &ops);
 
         mt.batch_put_arrow(&batch).unwrap();
@@ -1968,7 +1968,7 @@ mod tests {
         // Phase 1: 200 single puts.
         for i in 0..200u32 {
             let k = format!("p_{:04}", i);
-            mt.put(k.as_bytes(), Some(b"px"), 0).unwrap();
+            mt.put(k.as_bytes(), Some(b"px"), 1).unwrap();
         }
         // Phase 2: a batch of 500 puts overlapping with phase 1 keys.
         let keys: Vec<Vec<u8>> = (100..600u32)

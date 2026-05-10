@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn test_put_and_get_single_shard() {
         let mt = ShardedMemTable::new(8, cfg());
-        let _ = mt.put_with_seq(b"alpha", Some(b"one"), 0, 1).unwrap();
+        let _ = mt.put_with_seq(b"alpha", Some(b"one"), 1, 1).unwrap();
         let r = mt.get(b"alpha", u64::MAX).unwrap().unwrap();
         assert_eq!(r.value, Some(b"one".to_vec()));
         assert_eq!(r.sequence, 1);
@@ -624,7 +624,7 @@ mod tests {
         for i in 0..50u32 {
             let k = format!("k{:05}", i);
             let v = format!("v{:05}", i);
-            mt.put_with_seq(k.as_bytes(), Some(v.as_bytes()), 0, i as u64 + 1)
+            mt.put_with_seq(k.as_bytes(), Some(v.as_bytes()), 1, i as u64 + 1)
                 .unwrap();
         }
         for i in 0..50u32 {
@@ -653,7 +653,7 @@ mod tests {
                     let k = format!("t{:02}-k{:05}", t, i);
                     let v = format!("t{:02}-v{:05}", t, i);
                     let s = seq.fetch_add(1, Ordering::Relaxed) + 1;
-                    mt.put_with_seq(k.as_bytes(), Some(v.as_bytes()), 0, s)
+                    mt.put_with_seq(k.as_bytes(), Some(v.as_bytes()), 1, s)
                         .unwrap();
                 }
             }));
@@ -692,7 +692,7 @@ mod tests {
                 for i in 0..n_per {
                     let k = format!("t{}-k{}", t, i);
                     let s = seq.fetch_add(1, Ordering::Relaxed) + 1;
-                    mt.put_with_seq(k.as_bytes(), Some(b"v"), 0, s).unwrap();
+                    mt.put_with_seq(k.as_bytes(), Some(b"v"), 1, s).unwrap();
                 }
             }));
         }
@@ -724,9 +724,9 @@ mod tests {
     #[test]
     fn test_sharded_get_returns_correct_value() {
         let mt = ShardedMemTable::new(8, cfg());
-        mt.put_with_seq(b"k1", Some(b"v1"), 0, 1).unwrap();
-        mt.put_with_seq(b"k2", Some(b"v2"), 0, 2).unwrap();
-        mt.put_with_seq(b"k3", None, 1, 3).unwrap(); // delete tombstone
+        mt.put_with_seq(b"k1", Some(b"v1"), 1, 1).unwrap(); // Put (OpType::Put = 1, RocksDB byte-compat)
+        mt.put_with_seq(b"k2", Some(b"v2"), 1, 2).unwrap(); // Put (OpType::Put = 1, RocksDB byte-compat)
+        mt.put_with_seq(b"k3", None, 0, 3).unwrap(); // delete tombstone (OpType::Delete = 0, RocksDB byte-compat)
         assert_eq!(
             mt.get(b"k1", u64::MAX).unwrap().unwrap().value,
             Some(b"v1".to_vec())
@@ -746,7 +746,7 @@ mod tests {
         let n = 1000;
         for i in 0..n {
             let k = format!("k{:05}", i);
-            mt.put_with_seq(k.as_bytes(), Some(b"v"), 0, i as u64 + 1)
+            mt.put_with_seq(k.as_bytes(), Some(b"v"), 1, i as u64 + 1)
                 .unwrap();
         }
         mt.freeze();
@@ -760,7 +760,7 @@ mod tests {
         let mt = ShardedMemTable::new(4, cfg());
         for i in 0..100 {
             let k = format!("k{:05}", i);
-            mt.put_with_seq(k.as_bytes(), Some(b"value"), 0, i as u64 + 1)
+            mt.put_with_seq(k.as_bytes(), Some(b"value"), 1, i as u64 + 1)
                 .unwrap();
         }
         let total = mt.memory_usage();
@@ -802,10 +802,10 @@ mod tests {
     #[test]
     fn test_freeze_blocks_subsequent_writes() {
         let mt = ShardedMemTable::new(4, cfg());
-        mt.put_with_seq(b"k", Some(b"v"), 0, 1).unwrap();
+        mt.put_with_seq(b"k", Some(b"v"), 1, 1).unwrap();
         mt.freeze();
         assert!(mt.is_frozen());
-        let result = mt.put_with_seq(b"k2", Some(b"v2"), 0, 2);
+        let result = mt.put_with_seq(b"k2", Some(b"v2"), 1, 2);
         assert!(result.is_err());
     }
 
@@ -815,7 +815,7 @@ mod tests {
         // Scatter 100 keys across shards, then scan; output must be sorted.
         for i in 0..100u32 {
             let k = format!("k{:05}", i);
-            mt.put_with_seq(k.as_bytes(), Some(k.as_bytes()), 0, i as u64 + 1)
+            mt.put_with_seq(k.as_bytes(), Some(k.as_bytes()), 1, i as u64 + 1)
                 .unwrap();
         }
         let rows = mt.collect_range_entries(&[], None, u64::MAX);

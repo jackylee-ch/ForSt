@@ -3215,7 +3215,7 @@ mod tests {
             .collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         let val_refs: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();
-        let ops = vec![0u8; n as usize];
+        let ops = vec![1u8; n as usize]; // OpType::Put = 1 (RocksDB byte-compat)
         let batch = make_put_arrow_batch(&key_refs, &val_refs, &ops);
 
         let last_seq = db.batch_put_arrow(&cf, &batch).unwrap();
@@ -3252,7 +3252,7 @@ mod tests {
             .collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         let val_refs: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();
-        let ops = vec![0u8; n as usize];
+        let ops = vec![1u8; n as usize]; // OpType::Put = 1 (RocksDB byte-compat)
 
         // Arrow path
         let batch = make_put_arrow_batch(&key_refs, &val_refs, &ops);
@@ -3293,7 +3293,7 @@ mod tests {
 
         let keys: Vec<&[u8]> = vec![b"new_a", b"to_delete", b"new_b"];
         let values: Vec<Option<&[u8]>> = vec![Some(b"va"), None, Some(b"vb")];
-        let ops: Vec<u8> = vec![0, 1, 0]; // Put, Delete, Put
+        let ops: Vec<u8> = vec![1, 0, 1]; // Put (1), Delete (0), Put (1) — RocksDB byte-compat
         let batch = make_put_arrow_batch(&keys, &values, &ops);
 
         db.batch_put_arrow(&cf, &batch).unwrap();

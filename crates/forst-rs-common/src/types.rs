@@ -40,18 +40,24 @@ use crate::error::{ForstError, ForstResult};
 /// Each write operation in the LSM-tree is tagged with an `OpType` that
 /// determines how the engine processes the key-value pair during compaction
 /// and reads.
+///
+/// Discriminants match RocksDB byte-level InternalKey format:
+/// - Delete = 0 (kTypeDeletion)
+/// - Put = 1 (kTypeValue)
+/// - Merge = 2 (kTypeMerge)
+/// - SingleDelete = 7 (kTypeSingleDeletion)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OpType {
-    /// Standard key-value insertion.
-    Put = 0,
     /// Tombstone marker — deletes all prior versions of the key.
-    Delete = 1,
-    /// Optimised delete that assumes at most one prior `Put` exists.
-    SingleDelete = 2,
+    Delete = 0,
+    /// Standard key-value insertion.
+    Put = 1,
     /// Merge operand — combined with existing value via a user-defined merge
     /// operator during compaction or read.
-    Merge = 3,
+    Merge = 2,
+    /// Optimised delete that assumes at most one prior `Put` exists.
+    SingleDelete = 7,
 }
 
 impl fmt::Display for OpType {
@@ -75,10 +81,10 @@ impl OpType {
     /// (R-loop r6 Errors H_F3).
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
-            0 => Some(OpType::Put),
-            1 => Some(OpType::Delete),
-            2 => Some(OpType::SingleDelete),
-            3 => Some(OpType::Merge),
+            0 => Some(OpType::Delete),
+            1 => Some(OpType::Put),
+            2 => Some(OpType::Merge),
+            7 => Some(OpType::SingleDelete),
             _ => None,
         }
     }
@@ -491,18 +497,18 @@ mod tests {
 
     #[test]
     fn test_op_type_repr_values() {
-        assert_eq!(OpType::Put as u8, 0);
-        assert_eq!(OpType::Delete as u8, 1);
-        assert_eq!(OpType::SingleDelete as u8, 2);
-        assert_eq!(OpType::Merge as u8, 3);
+        assert_eq!(OpType::Delete as u8, 0);
+        assert_eq!(OpType::Put as u8, 1);
+        assert_eq!(OpType::Merge as u8, 2);
+        assert_eq!(OpType::SingleDelete as u8, 7);
     }
 
     #[test]
     fn test_op_type_from_u8_valid() {
-        assert_eq!(OpType::from_u8(0), Some(OpType::Put));
-        assert_eq!(OpType::from_u8(1), Some(OpType::Delete));
-        assert_eq!(OpType::from_u8(2), Some(OpType::SingleDelete));
-        assert_eq!(OpType::from_u8(3), Some(OpType::Merge));
+        assert_eq!(OpType::from_u8(0), Some(OpType::Delete));
+        assert_eq!(OpType::from_u8(1), Some(OpType::Put));
+        assert_eq!(OpType::from_u8(2), Some(OpType::Merge));
+        assert_eq!(OpType::from_u8(7), Some(OpType::SingleDelete));
     }
 
     #[test]
@@ -627,15 +633,15 @@ mod tests {
     /// R-loop r6 Errors H_F3: OpType::try_from_u8 returns ForstResult.
     #[test]
     fn test_op_type_try_from_u8_valid() {
-        assert_eq!(OpType::try_from_u8(0).unwrap(), OpType::Put);
-        assert_eq!(OpType::try_from_u8(1).unwrap(), OpType::Delete);
-        assert_eq!(OpType::try_from_u8(2).unwrap(), OpType::SingleDelete);
-        assert_eq!(OpType::try_from_u8(3).unwrap(), OpType::Merge);
+        assert_eq!(OpType::try_from_u8(0).unwrap(), OpType::Delete);
+        assert_eq!(OpType::try_from_u8(1).unwrap(), OpType::Put);
+        assert_eq!(OpType::try_from_u8(2).unwrap(), OpType::Merge);
+        assert_eq!(OpType::try_from_u8(7).unwrap(), OpType::SingleDelete);
     }
 
     #[test]
     fn test_op_type_try_from_u8_rejects_invalid() {
-        for byte in [4u8, 7, 100, 255] {
+        for byte in [3u8, 4, 5, 6, 8, 100, 255] {
             let res = OpType::try_from_u8(byte);
             assert!(res.is_err(), "byte {} should be rejected", byte);
             let err = res.unwrap_err();
@@ -735,9 +741,10 @@ mod tests {
     #[test]
     fn test_internal_key_ordering_op_type_tiebreak() {
         // Same user_key and sequence — op_type ascending by discriminant.
-        let put = InternalKey::new(b"key".to_vec(), SequenceNumber(1), OpType::Put);
+        // Delete=0, Put=1 per RocksDB byte-compat; so Delete < Put.
         let del = InternalKey::new(b"key".to_vec(), SequenceNumber(1), OpType::Delete);
-        assert!(put < del);
+        let put = InternalKey::new(b"key".to_vec(), SequenceNumber(1), OpType::Put);
+        assert!(del < put);
     }
 
     #[test]

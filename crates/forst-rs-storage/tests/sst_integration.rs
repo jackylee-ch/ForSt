@@ -299,7 +299,7 @@ fn test_m2_write_10k_read_all() {
         let key = format!("m2k_{:06}", i);
         let val = format!("m2v_{:06}", i);
         writer
-            .add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 0)
+            .add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 1) // Put (OpType::Put = 1, RocksDB byte-compat)
             .unwrap();
     }
 
@@ -389,11 +389,11 @@ fn test_m2_reader_full_pipeline_with_deletes() {
     for i in 0..1000u64 {
         let key = format!("pipe_{:05}", i);
         if i % 10 == 0 {
-            writer.add(key.as_bytes(), None, i + 1, 1).unwrap(); // Delete
+            writer.add(key.as_bytes(), None, i + 1, 0).unwrap(); // Delete (OpType::Delete = 0, RocksDB byte-compat)
         } else {
             let val = format!("pval_{:05}", i);
             writer
-                .add(key.as_bytes(), Some(val.as_bytes()), i + 1, 0)
+                .add(key.as_bytes(), Some(val.as_bytes()), i + 1, 1) // Put (OpType::Put = 1, RocksDB byte-compat)
                 .unwrap();
         }
     }

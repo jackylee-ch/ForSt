@@ -39,7 +39,7 @@ fn test_m3_batch_insert_100k_get_all() {
             .collect();
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         let val_refs: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
-        let ops = vec![0u8; batch_end - batch_start];
+        let ops = vec![1u8; batch_end - batch_start]; // Put (OpType::Put = 1, RocksDB byte-compat)
 
         mt.batch_insert(&key_refs, &val_refs, &ops).unwrap();
     }

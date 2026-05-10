@@ -448,7 +448,7 @@ mod tests {
             let key = format!("key_{:05}", i);
             let val = format!("val_{:05}", i);
             writer
-                .add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 0)
+                .add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 1) // OpType::Put = 1 (RocksDB byte-compat)
                 .unwrap();
         }
         let (data, _info) = writer.finish().unwrap();
@@ -729,9 +729,9 @@ mod tests {
             block_size: 4096,
             compression: CompressionType::None,
         });
-        writer.add(b"aaa", Some(b"val"), 1, 0).unwrap();
-        writer.add(b"bbb", None, 2, 1).unwrap(); // Delete
-        writer.add(b"ccc", Some(b"val3"), 3, 0).unwrap();
+        writer.add(b"aaa", Some(b"val"), 1, 1).unwrap(); // Put (OpType::Put = 1, RocksDB byte-compat)
+        writer.add(b"bbb", None, 2, 0).unwrap(); // Delete (OpType::Delete = 0, RocksDB byte-compat)
+        writer.add(b"ccc", Some(b"val3"), 3, 1).unwrap(); // Put (OpType::Put = 1, RocksDB byte-compat)
         let (data, _) = writer.finish().unwrap();
 
         let file = Box::new(MemRandomAccessFile {
@@ -772,7 +772,7 @@ mod tests {
             let key = format!("mb_{:05}", i);
             let val = format!("v_{:05}", i);
             writer
-                .add(key.as_bytes(), Some(val.as_bytes()), i + 1, 0)
+                .add(key.as_bytes(), Some(val.as_bytes()), i + 1, 1) // Put (OpType::Put = 1, RocksDB byte-compat)
                 .unwrap();
         }
         let (data, info) = writer.finish().unwrap();
@@ -802,7 +802,7 @@ mod tests {
         for i in 0..100u64 {
             let key = format!("lz4_{:05}", i);
             writer
-                .add(key.as_bytes(), Some(b"value"), i + 1, 0)
+                .add(key.as_bytes(), Some(b"value"), i + 1, 1) // Put (OpType::Put = 1, RocksDB byte-compat)
                 .unwrap();
         }
         let (data, _) = writer.finish().unwrap();
@@ -827,7 +827,7 @@ mod tests {
         for i in 0..100u64 {
             let key = format!("zstd_{:05}", i);
             writer
-                .add(key.as_bytes(), Some(b"value"), i + 1, 0)
+                .add(key.as_bytes(), Some(b"value"), i + 1, 1) // Put (OpType::Put = 1, RocksDB byte-compat)
                 .unwrap();
         }
         let (data, _) = writer.finish().unwrap();

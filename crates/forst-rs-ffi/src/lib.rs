@@ -1271,8 +1271,10 @@ use arrow::ffi::{from_ffi, to_ffi, FFI_ArrowArray, FFI_ArrowSchema};
 /// Schema expected by [`frs_batch_put_arrow`]:
 /// `key: Binary, value: Binary (nullable), op_type: UInt8`.
 ///
-/// `op_type` encoding mirrors `OpType`: 0 Put, 1 Delete, 2 SingleDelete,
-/// 3 Merge. Null `value` is allowed only for Delete/SingleDelete.
+/// `op_type` encoding mirrors `OpType` (RocksDB byte-compat):
+/// 0 Delete (kTypeDeletion), 1 Put (kTypeValue), 2 Merge (kTypeMerge),
+/// 7 SingleDelete (kTypeSingleDeletion). Null `value` is allowed only for
+/// Delete/SingleDelete.
 ///
 /// Returns the canonical Arrow schema as an exported `FFI_ArrowSchema` the
 /// caller can compare against. Ownership of the returned schema is
@@ -1385,14 +1387,15 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
         // memtable's `batch_put_arrow` path itself only validates op_type
         // bytes — the null-vs-op invariant lives at the FFI boundary because
         // it depends on the OpType discriminant semantics this module owns.
+        // RocksDB byte-compat: 0=Delete, 1=Put, 2=Merge, 7=SingleDelete.
         for i in 0..batch.num_rows() {
             let op = ops.value(i);
             let v_null = values.is_null(i);
             let bad = match op {
-                0 => v_null,  // Put requires value
-                1 => !v_null, // Delete forbids value
-                2 => !v_null, // SingleDelete forbids value
-                3 => v_null,  // Merge requires operand
+                0 => !v_null, // Delete forbids value
+                1 => v_null,  // Put requires value
+                2 => v_null,  // Merge requires operand
+                7 => !v_null, // SingleDelete forbids value
                 _ => return FRS_STATUS_INVALID_ARGUMENT,
             };
             if bad {
@@ -2163,7 +2166,7 @@ mod tests {
             for i in 0..3u32 {
                 keys.append_value(format!("k{}", i));
                 values.append_value(format!("v{}", i));
-                ops.append_value(0); // Put
+                ops.append_value(1); // Put (OpType::Put = 1, RocksDB byte-compat)
             }
             let struct_arr = StructArray::from(vec![
                 (
@@ -2226,15 +2229,15 @@ mod tests {
 
             keys.append_value(b"k1");
             values.append_value(b"v1");
-            ops.append_value(0); // Put
+            ops.append_value(1); // Put (OpType::Put = 1, RocksDB byte-compat)
 
             keys.append_value(b"k2");
             values.append_null();
-            ops.append_value(1); // Delete
+            ops.append_value(0); // Delete (OpType::Delete = 0, RocksDB byte-compat)
 
             keys.append_value(b"k3");
             values.append_value(b"v3");
-            ops.append_value(0);
+            ops.append_value(1); // Put (OpType::Put = 1, RocksDB byte-compat)
 
             let struct_arr = StructArray::from(vec![
                 (
@@ -2519,13 +2522,13 @@ mod tests {
                 FRS_STATUS_OK
             );
 
-            // Build a RecordBatch: SingleDelete k1 (op=2).
+            // Build a RecordBatch: SingleDelete k1 (op=7, RocksDB byte-compat).
             let mut keys = BinaryBuilder::new();
             let mut values = BinaryBuilder::new();
             let mut ops = UInt8Builder::new();
             keys.append_value(b"k1");
             values.append_null();
-            ops.append_value(2); // SingleDelete
+            ops.append_value(7); // SingleDelete (OpType::SingleDelete = 7, RocksDB byte-compat)
 
             let struct_arr = StructArray::from(vec![
                 (
@@ -2568,7 +2571,8 @@ mod tests {
             let mut cf: FrsCfHandle = ptr::null_mut();
             assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
 
-            for bad_op in [1u8, 2u8] {
+            // Delete (0) and SingleDelete (7) must have NULL values.
+            for bad_op in [0u8, 7u8] {
                 let mut keys = BinaryBuilder::new();
                 let mut values = BinaryBuilder::new();
                 let mut ops = UInt8Builder::new();
@@ -2630,7 +2634,7 @@ mod tests {
             let mut ops = UInt8Builder::new();
             keys.append_value(b"k");
             values.append_null();
-            ops.append_value(2);
+            ops.append_value(7); // SingleDelete (OpType::SingleDelete = 7, RocksDB byte-compat)
             let struct_arr = StructArray::from(vec![
                 (
                     std::sync::Arc::new(Field::new("key", DataType::Binary, false)),
