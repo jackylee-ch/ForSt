@@ -633,9 +633,26 @@ impl DbImpl {
         // to different shards never block each other. We do NOT take
         // `write_mutex` for the put itself — only for the switch decision
         // below, so the active-memtable swap remains serialized.
+        //
+        // Race retry: there's a brief window between `active_memtable()` capture
+        // and `put_with_seq` where the flush worker may have frozen the memtable
+        // and the writer thread may have swapped a fresh active in. The frozen
+        // state is transient (always followed by a swap); retry up to 8 times
+        // to re-acquire the new active. The race surfaces under llvm-cov
+        // instrumentation slowdown but is rare in production.
         {
-            let mem_arc = cf_data.active_memtable();
-            mem_arc.put_with_seq(key, value, op as u8, seq)?;
+            let mut attempt = 0;
+            loop {
+                let mem_arc = cf_data.active_memtable();
+                match mem_arc.put_with_seq(key, value, op as u8, seq) {
+                    Ok(_) => break,
+                    Err(e) if attempt < 8 && e.to_string().contains("frozen MemTable") => {
+                        attempt += 1;
+                        std::thread::yield_now();
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
