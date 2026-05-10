@@ -242,6 +242,22 @@ impl SnapshotRegistry {
             .unwrap_or(0)
     }
 
+    /// Returns an estimate of bytes retained because of active snapshots.
+    /// The closure is invoked with the current min_active seq and is expected
+    /// to return the bytes pinned by versions with seq >= min_active that
+    /// have a newer version superseding them. Returns 0 when no snapshots.
+    ///
+    /// Implementation note: the registry doesn't know the data layout, so
+    /// the actual byte estimation is delegated to the caller (memtable +
+    /// SST scan). Per spec §6a.3, this is the metric `forst.snapshot.pinned_bytes`.
+    pub fn pinned_bytes_estimate<F: FnOnce(SequenceNumber) -> u64>(&self, walker: F) -> u64 {
+        let min = self.min_active();
+        if min.0 == u64::MAX {
+            return 0;
+        }
+        walker(min)
+    }
+
     /// Recomputes `cached_min` from the current `active` map. Called
     /// under the `active` lock so the cached value is consistent with
     /// any state a concurrent reader might observe via `min_active`.
@@ -362,5 +378,24 @@ mod tests {
         drop(s_b);
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.min_active(), SequenceNumber(u64::MAX));
+    }
+
+    #[test]
+    fn pinned_bytes_estimate_returns_zero_when_no_snapshots() {
+        let reg = SnapshotRegistry::new();
+        let estimate = reg.pinned_bytes_estimate(|_min_seq| 0);
+        assert_eq!(estimate, 0);
+    }
+
+    #[test]
+    fn pinned_bytes_estimate_invokes_callback_with_min() {
+        let reg = SnapshotRegistry::new();
+        let _s = reg.capture(db_id(), SequenceNumber::new(42));
+        let received = std::sync::Mutex::new(SequenceNumber::new(0));
+        let _ = reg.pinned_bytes_estimate(|min| {
+            *received.lock().unwrap() = min;
+            12345
+        });
+        assert_eq!(received.lock().unwrap().0, 42);
     }
 }
