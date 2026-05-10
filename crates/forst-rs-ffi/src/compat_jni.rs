@@ -6246,32 +6246,49 @@ pub extern "system" fn Java_org_forstdb_FlinkEnv_disposeInternal<'local>(
 // hierarchy) are what `flink-statebackend-forst::ForStDBTtlCompactFiltersManager`
 // resolves at class load.
 //
-// **Divergence — TTL is NOT enforced.**
+// **Engine support — present (since 2026-05-10), but the JNI shim cannot
+// auto-wire it without Java-side cooperation.**
 //
-// forst-rs-storage does not yet expose a "compaction filter" hook on the
-// compaction worker; wiring one in would require: (a) a new
-// `CompactionFilter` trait on the storage crate, (b) per-row dispatch from
-// the compaction loop into the filter, (c) plumbing that takes the
-// configured TTL + state-type tuple from this module down to the engine.
-// That is ~500 LOC plus tests — out of scope for the JNI symbol-completion
-// pass. We chose **option B** from the audit:
+// forst-rs-engine now ships `FlinkTtlCompactionFilter` (Disabled/Value/List)
+// reachable via the C ABI export `frs_cf_set_compaction_filter_ttl(db, cf,
+// ttl_ms, state_type, timestamp_offset)` (see `crates/forst-rs-ffi/src/lib.rs`).
+// The engine attaches the filter to a CF and runs it at flush + L0→L1
+// compaction. The FFM module C wires this up directly via
+// `ForStRsLinker.setCompactionFilterTtl(...)` — that path is the production
+// blessed channel for TTL.
 //
-//   * Accept all the handles the Java side hands us.
-//   * Round-trip the config tuple through a Rust-side struct so future
-//     consumers see what the caller asked for.
-//   * Log loudly via `tracing::debug!` that TTL expiration is **not** being
-//     enforced; the state will retain entries forever.
+// On THIS JNI compat shim, the Flink-side TTL flow is:
+//
+//   1. `factory = new FlinkCompactionFilterFactory(timeProvider)`
+//   2. `cfOpts.setCompactionFilterFactory(factory)`              ← we see this
+//   3. RocksDB opens CF; calls `factory.createCompactionFilter()` ← internal
+//   4. `factory.configure(config)` → `configureFlinkCompactionFilter(holder)`
+//                                                                 ← we see this
+//
+// The link factory ↔ holder is a pure-Java field assignment that JNI cannot
+// observe. Without it we have no path from a `configureFlinkCompactionFilter`
+// call back to "which CF should receive this TTL". Bridging it would require
+// either patching upstream `org.forstdb.FlinkCompactionFilter` (breaking G-A
+// drop-in) or shipping a custom shim JAR.
+//
+// We therefore chose option B from the audit for the JNI compat surface:
+//
+//   * Accept all the handles the Java side hands us (no `UnsatisfiedLinkError`).
+//   * Snapshot the configure() payload onto the holder for debugging /
+//     introspection.
 //   * The `createCompactionFilter0` returns a non-zero, per-call "filter"
 //     handle (a `Box<FlinkCompactionFilterHandle>`) so the Java
 //     `AbstractCompactionFilter` super-ctor sees a valid `nativeHandle_`
-//     and `disOwnNativeHandle()` does the right thing — but the engine
-//     never sees it.
+//     and `disOwnNativeHandle()` does the right thing.
+//   * **TTL is NOT enforced through the JNI compat path.** Production
+//     deployments that need TTL must use the FFM-based `ForStRsStateBackend`
+//     (module C) and call `ForStRsLinker.setCompactionFilterTtl(...)` directly
+//     from the keyed-state lifecycle.
 //
-// Operational consequence: TTL state grows unbounded on this build until
-// forst-rs-storage gains a real compaction-filter trait. Operators relying
-// on TTL to keep state size bounded must (i) provision more state budget
-// or (ii) layer their own external TTL management on top until the engine
-// gains support.
+// Operational consequence for jobs that load this libforstjni and rely on
+// TTL via the community-Flink `ForStDBTtlCompactFiltersManager`: state grows
+// unbounded. Either migrate to the FFM backend (recommended for new jobs)
+// or provision additional state budget.
 // ---------------------------------------------------------------------------
 
 pub(crate) mod handles_p5 {
