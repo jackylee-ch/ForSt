@@ -1073,7 +1073,7 @@ fn _pathbuf_usage(_p: PathBuf) {}
 /// One live SST file's descriptor (Rust-owned strings, ABI-stable layout).
 ///
 /// `path` and `cf_name` are NUL-terminated C strings allocated by Rust via
-/// [`CString::into_raw`]; both must be released by
+/// `CString::into_raw`; both must be released by
 /// [`frs_db_live_file_list_free`] (which walks the array and reclaims each
 /// string). Do NOT free them individually.
 #[repr(C)]

@@ -92,11 +92,11 @@ jobs:
       - run: cargo build --release --workspace
 
   msrv:
-    name: MSRV Check (Rust 1.86)
+    name: MSRV Check (Rust 1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.86
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: actions/cache@v4
         with:
           path: |

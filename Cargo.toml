@@ -26,12 +26,11 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-# MSRV bumped from 1.85 → 1.86 because OpenDAL 0.50 transitively pulls
-# icu_collections/icu_locale_core/icu_normalizer/icu_properties/
-# icu_provider/idna_adapter (all 1.86+) plus home@0.5.12 (1.88).
-# Verified by ci-rust MSRV job failure on 2026-05-10. The OpenDAL backend
-# is required for cloud-storage support so we accept the bump.
-rust-version = "1.86"
+# MSRV bumped from 1.85 → 1.88 because OpenDAL 0.50 transitively pulls
+# icu_*/idna_adapter (1.86+) plus home@0.5.12 (1.88). Verified by ci-rust
+# MSRV job failures on 2026-05-10. The OpenDAL backend is required for
+# cloud-storage support so we accept the bump.
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/nicetoseeyou/ForSt"
 
