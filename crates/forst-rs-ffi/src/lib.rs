@@ -1080,10 +1080,19 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
         if batch.num_columns() != 3 {
             return FRS_STATUS_INVALID_ARGUMENT;
         }
-        let keys = match batch.column(0).as_any().downcast_ref::<BinaryArray>() {
-            Some(a) => a,
-            None => return FRS_STATUS_INVALID_ARGUMENT,
-        };
+        // Schema sanity-check: column 0 must be Binary (key), column 1 must
+        // be Binary nullable (value), column 2 must be UInt8 (op_type). The
+        // memtable re-validates the same shape, but failing here returns the
+        // FFI-friendly INVALID_ARGUMENT status without going through the
+        // engine's ForstError → status mapping.
+        if batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .is_none()
+        {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
         let values = match batch.column(1).as_any().downcast_ref::<BinaryArray>() {
             Some(a) => a,
             None => return FRS_STATUS_INVALID_ARGUMENT,
@@ -1099,42 +1108,36 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
         if batch.num_rows() > MAX_BATCH_COUNT {
             return FRS_STATUS_INVALID_ARGUMENT;
         }
-        let mut wb = WriteBatch::with_capacity(batch.num_rows());
+
+        // Cross-column null/op invariant: Delete / SingleDelete rows MUST
+        // carry a null value; Put / Merge MUST carry a non-null value. We
+        // check this once up-front so an invalid row rejects the whole batch
+        // before any column data is dispatched into the memtable. The
+        // memtable's `batch_put_arrow` path itself only validates op_type
+        // bytes — the null-vs-op invariant lives at the FFI boundary because
+        // it depends on the OpType discriminant semantics this module owns.
         for i in 0..batch.num_rows() {
-            let key = keys.value(i);
             let op = ops.value(i);
-            match op {
-                0 => {
-                    // Put
-                    if values.is_null(i) {
-                        return FRS_STATUS_INVALID_ARGUMENT;
-                    }
-                    wb.put(cf, key, values.value(i));
-                }
-                1 => {
-                    // Delete rows must not carry a value.
-                    if !values.is_null(i) {
-                        return FRS_STATUS_INVALID_ARGUMENT;
-                    }
-                    wb.delete(cf, key);
-                }
-                2 => {
-                    // SingleDelete rows must not carry a value.
-                    if !values.is_null(i) {
-                        return FRS_STATUS_INVALID_ARGUMENT;
-                    }
-                    wb.single_delete(cf, key);
-                }
-                3 => {
-                    if values.is_null(i) {
-                        return FRS_STATUS_INVALID_ARGUMENT;
-                    }
-                    wb.merge(cf, key, values.value(i));
-                }
+            let v_null = values.is_null(i);
+            let bad = match op {
+                0 => v_null,  // Put requires value
+                1 => !v_null, // Delete forbids value
+                2 => !v_null, // SingleDelete forbids value
+                3 => v_null,  // Merge requires operand
                 _ => return FRS_STATUS_INVALID_ARGUMENT,
+            };
+            if bad {
+                return FRS_STATUS_INVALID_ARGUMENT;
             }
         }
-        match db.batch_write(wb) {
+
+        // C1 (zero-copy hot path): dispatch the RecordBatch DIRECTLY into the
+        // memtable's column buffers via slice-copy. No intermediate
+        // WriteBatch (avoids per-row Vec<u8> allocation + the subsequent
+        // re-borrow into Vec<&[u8]> that the legacy `batch_write` path paid).
+        // See `DbImpl::batch_put_arrow` and
+        // `VectorizedMemTable::batch_put_arrow_with_base_seq` for mechanics.
+        match db.batch_put_arrow(cf, &batch) {
             Ok(_) => FRS_STATUS_OK,
             Err(e) => error_to_status(&e),
         }

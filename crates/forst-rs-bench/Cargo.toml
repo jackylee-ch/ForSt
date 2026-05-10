@@ -39,6 +39,7 @@ forst-rs-storage = { workspace = true }
 rocksdb = { version = "0.22", optional = true }
 
 [dev-dependencies]
+arrow = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 
@@ -54,6 +55,10 @@ harness = false
 
 [[bench]]
 name = "batch_ops"
+harness = false
+
+[[bench]]
+name = "batch_put_arrow_vs_write_batch"
 harness = false
 
 [[bench]]

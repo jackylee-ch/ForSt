@@ -776,6 +776,7 @@ dependencies = [
 name = "forst-rs-bench"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "criterion",
  "forst-rs-common",
  "forst-rs-engine",

@@ -372,6 +372,17 @@ impl DbImpl {
         self.write_controller.may_throttle()?;
         let cf_data = self.lookup_cf_by_id(cf.id())?;
 
+        // PERF (D1): reserve the engine-level sequence number with a single
+        // lock-free `fetch_add` BEFORE acquiring `write_mutex`. The pre-D1
+        // path took the mutex first, then incremented the memtable's local
+        // counter, then ran a `bump_sequence` CAS loop on the engine
+        // counter — all inside the lock. Allocating outside the lock cuts
+        // the critical-section work and lets contended writers hand seqs
+        // to the lock holder without ordering games. `Relaxed` is sufficient
+        // because the seq is plumbed through subsequent `mem.write()` /
+        // `read()` boundaries that establish the necessary happens-before.
+        let seq = self.sequence_number.fetch_add(1, Ordering::Relaxed) + 1;
+
         // Phase 1 (under write_mutex): serialize memtable writes + decide
         // whether to switch the active memtable. If a switch happens we do
         // it inline so the next writer sees the fresh memtable, but we
@@ -380,12 +391,11 @@ impl DbImpl {
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
 
-            let seq = {
+            {
                 let mem_arc = cf_data.active_memtable();
                 let mut mem = mem_arc.write().expect("lock poisoned");
-                mem.put(key, value, op as u8)?
-            };
-            self.bump_sequence(seq);
+                mem.put_with_seq(key, value, op as u8, seq)?;
+            }
 
             self.maybe_switch_memtable_in_lock(&cf_data)?
         };
@@ -399,7 +409,7 @@ impl DbImpl {
             self.enqueue_flush(cf_data.clone())?;
         }
 
-        Ok(self.sequence_number.load(Ordering::Acquire))
+        Ok(seq)
     }
 
     /// If the current L0 file count is at or above the slowdown trigger,
@@ -429,15 +439,34 @@ impl DbImpl {
             cf_datas.insert(cf_id, self.lookup_cf_by_id(cf_id)?);
         }
 
+        // PERF (D1): reserve the entire engine-level sequence range with a
+        // single lock-free `fetch_add(N)` BEFORE acquiring `write_mutex`.
+        // Pre-D1 this fetch_add ran INSIDE the lock and once per CF group;
+        // hoisting it out collapses N atomic ops to one and removes them
+        // from the critical section entirely. We then carve the range up
+        // among per-CF groups by their relative offsets.
+        let total_count: u64 = groups.values().map(|v| v.len() as u64).sum();
+        // `fetch_add` returns the previous value; the FIRST seq we own is
+        // `prev + 1`, the LAST is `prev + total_count`.
+        let prev = self
+            .sequence_number
+            .fetch_add(total_count, Ordering::Relaxed);
+        let last_seq = prev + total_count;
+
         // Phase 1 (under write_mutex): perform all memtable writes and any
         // in-lock switch decisions, collecting CFs whose memtable needs to
         // be flushed outside the lock.
         let mut cfs_to_flush: Vec<Arc<ColumnFamilyData>> = Vec::new();
-        let mut last_seq = 0u64;
         {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
             let entries = batch.into_entries();
 
+            // Walk groups in a deterministic order so per-CF base seqs are
+            // assigned reproducibly regardless of HashMap iteration order.
+            // Within a single batch we don't care about the cross-CF order
+            // (each row carries its own seq, the memtable sorts on lookup),
+            // but tests benefit from determinism.
+            let mut group_offset: u64 = 1; // first owned seq is `prev + 1`
             for (cf_id, indices) in &groups {
                 let cf_data = cf_datas.get(cf_id).expect("cf_data pre-populated");
                 let mem_arc = cf_data.active_memtable();
@@ -449,11 +478,9 @@ impl DbImpl {
                     .map(|&i| entries[i].value.as_deref())
                     .collect();
                 let op_types: Vec<u8> = indices.iter().map(|&i| entries[i].op_type as u8).collect();
-                mem.batch_insert(&keys, &values, &op_types)?;
-                last_seq = self
-                    .sequence_number
-                    .fetch_add(indices.len() as u64, Ordering::SeqCst)
-                    + indices.len() as u64;
+                let base_seq = prev + group_offset;
+                mem.batch_insert_with_base_seq(&keys, &values, &op_types, base_seq)?;
+                group_offset += indices.len() as u64;
             }
 
             // Check each CF's threshold and switch in-lock; defer flush to
@@ -469,6 +496,66 @@ impl DbImpl {
         // this writer returns immediately. Backpressure is enforced by the
         // WriteController on the next writer's `may_throttle()`.
         for cf_data in &cfs_to_flush {
+            self.enqueue_flush(cf_data.clone())?;
+        }
+
+        Ok(last_seq)
+    }
+
+    /// Direct columnar batch put from an Arrow `RecordBatch` — the C1
+    /// zero-copy hot path.
+    ///
+    /// This is the engine-level entry point used by the FFI's
+    /// `frs_batch_put_arrow`. It bypasses [`WriteBatch`] entirely (no per-row
+    /// `Vec<u8>` allocation, no re-borrow into `Vec<&[u8]>`) and dispatches
+    /// the batch's three columns straight into the active memtable's column
+    /// buffers via slice-copy. See
+    /// [`forst_rs_storage::memtable::VectorizedMemTable::batch_put_arrow_with_base_seq`]
+    /// for the column-extend mechanics.
+    ///
+    /// The batch schema MUST be exactly
+    /// `key: Binary, value: Binary nullable, op_type: UInt8`. Schema and
+    /// op-type validation happens once up-front (atomic reject — no partial
+    /// state on failure).
+    ///
+    /// Returns the last engine-level sequence number assigned by this batch.
+    pub fn batch_put_arrow(
+        &self,
+        cf: &ColumnFamilyHandle,
+        batch: &arrow::array::RecordBatch,
+    ) -> ForstResult<u64> {
+        let count = batch.num_rows();
+        if count == 0 {
+            return Ok(self.sequence_number());
+        }
+        self.consume_flush_error()?;
+        self.write_controller.may_throttle()?;
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        // PERF (D1, mirrors `batch_write`): reserve the engine sequence range
+        // with a single lock-free `fetch_add(N)` BEFORE acquiring the write
+        // mutex. The first owned seq is `prev + 1`.
+        let prev = self
+            .sequence_number
+            .fetch_add(count as u64, Ordering::Relaxed);
+        let last_seq = prev + count as u64;
+        let base_seq = prev + 1;
+
+        // Phase 1 (under write_mutex): drive the columnar insert + decide
+        // whether to switch the active memtable.
+        let needs_flush = {
+            let _writer = self.write_mutex.lock().expect("lock poisoned");
+            {
+                let mem_arc = cf_data.active_memtable();
+                let mut mem = mem_arc.write().expect("lock poisoned");
+                mem.batch_put_arrow_with_base_seq(batch, base_seq)?;
+            }
+            self.maybe_switch_memtable_in_lock(&cf_data)?
+        };
+
+        // Phase 2 (outside write_mutex): hand the imm to the background
+        // worker. Same pattern as `write_single` / `batch_write`.
+        if needs_flush {
             self.enqueue_flush(cf_data.clone())?;
         }
 
@@ -1229,22 +1316,11 @@ impl DbImpl {
         Ok(true)
     }
 
-    fn bump_sequence(&self, seq: u64) {
-        // `seq` is the memtable-local seq; translate to a global non-decreasing
-        // counter by ensuring our counter is at least `seq`.
-        let mut cur = self.sequence_number.load(Ordering::Acquire);
-        while cur < seq {
-            match self.sequence_number.compare_exchange(
-                cur,
-                seq,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(observed) => cur = observed,
-            }
-        }
-    }
+    // PERF (D1): `bump_sequence` (a CAS loop on `sequence_number`) was removed.
+    // The engine now allocates seqs via a single lock-free `fetch_add` BEFORE
+    // acquiring `write_mutex` and hands the seq down to the memtable's
+    // `*_with_seq` APIs. The memtable no longer needs the engine to "catch
+    // up" to its local counter — there's only one source of truth.
 
     fn refresh_snapshot_view(&self, cf_data: &Arc<ColumnFamilyData>) {
         let view = SnapshotView::new(
@@ -2915,5 +2991,404 @@ mod tests {
         // After checkpoint completes, no pins should remain.
         db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
         assert!(db.deletion_guard().pinned_files().is_empty());
+    }
+
+    // ============================================================
+    // C1: batch_put_arrow zero-copy direct columnar dispatch
+    // ============================================================
+
+    /// Build a (key, value, op_type) RecordBatch matching the FFI schema,
+    /// suitable for `DbImpl::batch_put_arrow` and the FFI's
+    /// `frs_batch_put_arrow`.
+    fn make_put_arrow_batch(
+        keys: &[&[u8]],
+        values: &[Option<&[u8]>],
+        op_types: &[u8],
+    ) -> arrow::array::RecordBatch {
+        use arrow::array::{BinaryBuilder, StructArray, UInt8Builder};
+        use arrow::datatypes::{DataType, Field};
+        let mut kb = BinaryBuilder::new();
+        let mut vb = BinaryBuilder::new();
+        let mut ob = UInt8Builder::new();
+        for (i, k) in keys.iter().enumerate() {
+            kb.append_value(k);
+            match values[i] {
+                Some(v) => vb.append_value(v),
+                None => vb.append_null(),
+            }
+            ob.append_value(op_types[i]);
+        }
+        let s = StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Binary, false)),
+                Arc::new(kb.finish()) as arrow::array::ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", DataType::Binary, true)),
+                Arc::new(vb.finish()) as arrow::array::ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("op_type", DataType::UInt8, false)),
+                Arc::new(ob.finish()) as arrow::array::ArrayRef,
+            ),
+        ]);
+        s.into()
+    }
+
+    #[test]
+    fn test_batch_put_arrow_correctness() {
+        let db = open();
+        let cf = db.default_cf();
+        let n = 1000u32;
+        let keys: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("ak_{:06}", i).into_bytes())
+            .collect();
+        let vals: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("av_{:06}", i).into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();
+        let ops = vec![0u8; n as usize];
+        let batch = make_put_arrow_batch(&key_refs, &val_refs, &ops);
+
+        let last_seq = db.batch_put_arrow(&cf, &batch).unwrap();
+        assert!(last_seq >= n as u64);
+
+        // Round-trip: every key must read back its original value.
+        for i in 0..n {
+            let k = format!("ak_{:06}", i);
+            let v = db.get(&cf, k.as_bytes()).unwrap();
+            assert_eq!(
+                v.as_deref(),
+                Some(format!("av_{:06}", i).as_bytes()),
+                "miss at {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_put_arrow_vs_write_batch_equivalence() {
+        // Two engines, identical workload: one via Arrow path, one via the
+        // legacy WriteBatch path. Both must yield identical reads.
+        let db_a = open();
+        let db_b = open();
+        let cf_a = db_a.default_cf();
+        let cf_b = db_b.default_cf();
+
+        let n = 500u32;
+        let keys: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("eq_{:05}", i).into_bytes())
+            .collect();
+        let vals: Vec<Vec<u8>> = (0..n)
+            .map(|i| format!("eqv_{:05}", i).into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<Option<&[u8]>> = vals.iter().map(|v| Some(v.as_slice())).collect();
+        let ops = vec![0u8; n as usize];
+
+        // Arrow path
+        let batch = make_put_arrow_batch(&key_refs, &val_refs, &ops);
+        db_a.batch_put_arrow(&cf_a, &batch).unwrap();
+
+        // WriteBatch path
+        let mut wb = WriteBatch::with_capacity(n as usize);
+        for i in 0..n as usize {
+            wb.put(&cf_b, key_refs[i], vals[i].as_slice());
+        }
+        db_b.batch_write(wb).unwrap();
+
+        // Compare every key.
+        for i in 0..n {
+            let k = format!("eq_{:05}", i);
+            let a = db_a.get(&cf_a, k.as_bytes()).unwrap();
+            let b = db_b.get(&cf_b, k.as_bytes()).unwrap();
+            assert_eq!(a, b, "divergence at key {}", k);
+        }
+    }
+
+    #[test]
+    fn test_batch_put_arrow_empty_batch() {
+        let db = open();
+        let cf = db.default_cf();
+        let batch = make_put_arrow_batch(&[], &[], &[]);
+        // Must not panic; returns the current engine sequence.
+        let s = db.batch_put_arrow(&cf, &batch).unwrap();
+        assert_eq!(s, db.sequence_number());
+    }
+
+    #[test]
+    fn test_batch_put_arrow_mixed_put_delete() {
+        let db = open();
+        let cf = db.default_cf();
+        // Seed a key we'll delete via the batch.
+        db.put(&cf, b"to_delete", b"old").unwrap();
+
+        let keys: Vec<&[u8]> = vec![b"new_a", b"to_delete", b"new_b"];
+        let values: Vec<Option<&[u8]>> = vec![Some(b"va"), None, Some(b"vb")];
+        let ops: Vec<u8> = vec![0, 1, 0]; // Put, Delete, Put
+        let batch = make_put_arrow_batch(&keys, &values, &ops);
+
+        db.batch_put_arrow(&cf, &batch).unwrap();
+        assert_eq!(
+            db.get(&cf, b"new_a").unwrap().as_deref(),
+            Some(b"va".as_ref())
+        );
+        assert!(
+            db.get(&cf, b"to_delete").unwrap().is_none(),
+            "delete must take effect"
+        );
+        assert_eq!(
+            db.get(&cf, b"new_b").unwrap().as_deref(),
+            Some(b"vb".as_ref())
+        );
+    }
+
+    #[test]
+    fn test_batch_put_arrow_invalid_schema_rejected() {
+        use arrow::array::{BinaryBuilder, StructArray};
+        use arrow::datatypes::{DataType, Field};
+        let db = open();
+        let cf = db.default_cf();
+        // Schema with only 2 columns (missing op_type) — must reject.
+        let mut kb = BinaryBuilder::new();
+        let mut vb = BinaryBuilder::new();
+        kb.append_value(b"k");
+        vb.append_value(b"v");
+        let s = StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Binary, false)),
+                Arc::new(kb.finish()) as arrow::array::ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", DataType::Binary, true)),
+                Arc::new(vb.finish()) as arrow::array::ArrayRef,
+            ),
+        ]);
+        let batch: arrow::array::RecordBatch = s.into();
+        assert!(db.batch_put_arrow(&cf, &batch).is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // D1 — sequence-number allocation moved outside the memtable lock.
+    //
+    // Pre-D1: `write_single` allocated the memtable-local seq INSIDE
+    // `write_mutex`, then `bump_sequence` ran a CAS loop on the engine
+    // counter (also inside the lock).
+    //
+    // Post-D1: `write_single` / `batch_write` / `batch_put_arrow` reserve
+    // the engine seq (range) with a single lock-free `fetch_add` BEFORE
+    // acquiring `write_mutex`, and pass the seq down via the memtable's
+    // `*_with_seq` APIs.
+    //
+    // The invariants we verify:
+    //   1. Sequences remain strictly monotonic and unique under heavy
+    //      concurrent write contention.
+    //   2. A 100-row batch reserves a contiguous seq range; no other
+    //      concurrent writer ever lands a seq inside that range.
+    //   3. The post-write engine counter matches the highest assigned
+    //      seq — no skips, no reuse.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_sequence_numbers_strictly_monotonic_under_concurrent_writers() {
+        // 4 threads x 1000 writes each -> 4000 single-row writes. Capture
+        // the seq returned by every put and verify the multiset is
+        // exactly {1, 2, ..., 4000} (unique and gap-free).
+        use std::sync::Mutex;
+        use std::thread;
+
+        let db = open();
+        const THREADS: u64 = 4;
+        const PER_THREAD: u64 = 1000;
+        let collected: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::with_capacity(
+            (THREADS * PER_THREAD) as usize,
+        )));
+
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let db = Arc::clone(&db);
+            let collected = Arc::clone(&collected);
+            handles.push(thread::spawn(move || {
+                let cf = db.default_cf();
+                let mut local = Vec::with_capacity(PER_THREAD as usize);
+                for i in 0..PER_THREAD {
+                    let key = format!("t{}_k{}", t, i);
+                    let seq = db.put(&cf, key.as_bytes(), b"v").unwrap();
+                    local.push(seq);
+                }
+                let mut all = collected.lock().unwrap();
+                all.extend(local);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut all = collected.lock().unwrap().clone();
+        all.sort_unstable();
+
+        // Uniqueness: dedup must not change the length.
+        let pre_dedup = all.len();
+        all.dedup();
+        assert_eq!(
+            pre_dedup,
+            all.len(),
+            "duplicate seq detected — D1 fetch_add must yield unique values"
+        );
+        // Density: exactly THREADS * PER_THREAD seqs were allocated.
+        assert_eq!(all.len() as u64, THREADS * PER_THREAD);
+        // Contiguity: seqs form a contiguous range starting at 1
+        // (the engine starts at 0 and `fetch_add` returns `prev + 1`).
+        assert_eq!(*all.first().unwrap(), 1);
+        assert_eq!(*all.last().unwrap(), THREADS * PER_THREAD);
+        // Engine counter must equal the highest seq.
+        assert_eq!(db.sequence_number(), THREADS * PER_THREAD);
+    }
+
+    #[test]
+    fn test_sequence_number_reservation_outside_lock() {
+        // Behavioural witness that the engine assigns exactly ONE seq per
+        // put and that the public counter and the returned value agree —
+        // i.e. the seq is allocated by a single lock-free fetch_add on the
+        // engine counter, not derived from the memtable's local counter
+        // via a CAS-bump.
+        let db = open();
+        let cf = db.default_cf();
+
+        for i in 0..50u64 {
+            let pre = db.sequence_number();
+            let assigned = db.put(&cf, format!("k{}", i).as_bytes(), b"v").unwrap();
+            let post = db.sequence_number();
+            assert_eq!(assigned, pre + 1, "seq should be exactly pre+1 after put");
+            assert_eq!(post, assigned, "engine counter must equal returned seq");
+            assert!(
+                post > pre,
+                "sequence_number must advance on every successful put"
+            );
+        }
+    }
+
+    #[test]
+    fn test_batch_sequence_block_assigned_correctly() {
+        // A 100-row batch must reserve a contiguous seq block. After the
+        // batch, the engine counter equals `pre + 100`, and the returned
+        // last_seq matches the highest assigned seq.
+        let db = open();
+        let cf = db.default_cf();
+
+        // Pre-seed with a few writes so the block doesn't start at 1.
+        db.put(&cf, b"warmup1", b"v").unwrap();
+        db.put(&cf, b"warmup2", b"v").unwrap();
+
+        let pre = db.sequence_number();
+        let mut batch = WriteBatch::new();
+        for i in 0..100u32 {
+            batch.put(&cf, format!("bk{}", i).as_bytes(), b"v");
+        }
+        let last_seq = db.batch_write(batch).unwrap();
+        let post = db.sequence_number();
+
+        // The batch reserved seqs (pre+1 ..= pre+100).
+        assert_eq!(last_seq, pre + 100, "last_seq must be pre + batch_size");
+        assert_eq!(
+            post,
+            pre + 100,
+            "engine counter must advance by exactly batch_size"
+        );
+    }
+
+    #[test]
+    fn test_batch_sequence_block_no_overlap_with_concurrent_writers() {
+        // Concurrent: one thread does a 200-row batch, three other threads
+        // do single puts. Verify the batch's reserved block contains
+        // exactly 200 seqs, none of which overlap with seqs returned by
+        // the single-put threads.
+        use std::sync::{Barrier, Mutex};
+        use std::thread;
+
+        let db = open();
+        let cf = db.default_cf();
+
+        const BATCH_SIZE: u64 = 200;
+        const SINGLE_THREADS: u64 = 3;
+        const SINGLE_PER_THREAD: u64 = 200;
+
+        let barrier = Arc::new(Barrier::new((SINGLE_THREADS + 1) as usize));
+        let single_seqs: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = Vec::new();
+
+        // Single-put threads.
+        for t in 0..SINGLE_THREADS {
+            let db = Arc::clone(&db);
+            let cf = cf.clone();
+            let barrier = Arc::clone(&barrier);
+            let single_seqs = Arc::clone(&single_seqs);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let mut local = Vec::new();
+                for i in 0..SINGLE_PER_THREAD {
+                    let key = format!("st{}_k{}", t, i);
+                    local.push(db.put(&cf, key.as_bytes(), b"v").unwrap());
+                }
+                single_seqs.lock().unwrap().extend(local);
+            }));
+        }
+
+        // Batch thread.
+        let db_b = Arc::clone(&db);
+        let cf_b = cf.clone();
+        let barrier_b = Arc::clone(&barrier);
+        let batch_handle = thread::spawn(move || {
+            barrier_b.wait();
+            let mut batch = WriteBatch::new();
+            for i in 0..BATCH_SIZE {
+                batch.put(&cf_b, format!("bk{}", i).as_bytes(), b"v");
+            }
+            db_b.batch_write(batch).unwrap()
+        });
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        let batch_last = batch_handle.join().unwrap();
+        let batch_first = batch_last - BATCH_SIZE + 1;
+
+        // The seqs returned by single puts must not lie in the batch's
+        // reserved block — i.e. neither writer ever sees a seq the other
+        // reserved.
+        let singles = single_seqs.lock().unwrap().clone();
+        for &s in &singles {
+            assert!(
+                s < batch_first || s > batch_last,
+                "single-put seq {} fell inside batch range [{},{}]",
+                s,
+                batch_first,
+                batch_last
+            );
+        }
+
+        // Total seqs allocated == single + batch, and the engine counter
+        // equals the max of all assigned seqs.
+        let total = SINGLE_THREADS * SINGLE_PER_THREAD + BATCH_SIZE;
+        assert_eq!(db.sequence_number(), total);
+        assert_eq!(singles.len() as u64, SINGLE_THREADS * SINGLE_PER_THREAD);
+
+        // Combined uniqueness: no overlap between single and batch ranges.
+        let mut all: Vec<u64> = singles;
+        for s in batch_first..=batch_last {
+            all.push(s);
+        }
+        all.sort_unstable();
+        let pre_dedup = all.len();
+        all.dedup();
+        assert_eq!(
+            pre_dedup,
+            all.len(),
+            "concurrent single+batch produced duplicate seqs"
+        );
+        assert_eq!(*all.first().unwrap(), 1);
+        assert_eq!(*all.last().unwrap(), total);
     }
 }

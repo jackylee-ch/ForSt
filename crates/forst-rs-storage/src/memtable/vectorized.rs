@@ -22,7 +22,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use arrow::array::{BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
+use arrow::array::{Array, BinaryArray, BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstResult, OpType};
 
@@ -144,14 +144,44 @@ impl VectorizedMemTable {
         Self::new(MemTableConfig::default())
     }
 
-    /// Inserts a single key-value pair.
+    /// Inserts a single key-value pair, allocating the sequence locally.
     ///
     /// `value` is `None` for delete tombstones.
     /// `op_type_byte`: 0 = Put, 1 = Delete, 2 = SingleDelete, 3 = Merge.
     /// Other values are rejected with `invalid_argument`.
     ///
     /// Returns the assigned sequence number.
+    ///
+    /// PERF (D1): when the engine drives writes it should use
+    /// [`Self::put_with_seq`] so the engine-level seq counter (a single
+    /// `fetch_add`) is reserved OUTSIDE the memtable lock. This `put` keeps
+    /// the legacy "memtable owns its sequence" contract for unit tests and
+    /// standalone memtable users.
     pub fn put(&mut self, key: &[u8], value: Option<&[u8]>, op_type_byte: u8) -> ForstResult<u64> {
+        let seq = self.next_sequence;
+        self.put_with_seq(key, value, op_type_byte, seq)
+    }
+
+    /// Inserts a single key-value pair using a pre-allocated sequence number.
+    ///
+    /// PERF (D1): the engine reserves `seq` via a single
+    /// `AtomicU64::fetch_add` BEFORE acquiring the per-memtable write lock,
+    /// so the engine-level sequence allocation is contention-free. The old
+    /// path went through `put` (memtable allocates) + `bump_sequence` (CAS
+    /// loop on the engine counter) — both inside the lock. The CAS loop
+    /// is now removed; the engine just hands the seq down.
+    ///
+    /// The memtable still bumps `next_sequence` to `max(next_sequence,
+    /// seq + 1)` so that any later legacy [`Self::put`] / [`Self::merge`]
+    /// call (e.g. tests, recovery, fallback paths) keeps producing strictly
+    /// increasing local sequences.
+    pub fn put_with_seq(
+        &mut self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        op_type_byte: u8,
+        seq: u64,
+    ) -> ForstResult<u64> {
         if self.frozen {
             return Err(forst_rs_common::ForstError::invalid_argument(
                 "cannot write to a frozen MemTable",
@@ -170,8 +200,12 @@ impl VectorizedMemTable {
             ))
         })?;
 
-        let seq = self.next_sequence;
-        self.next_sequence += 1;
+        // Keep the legacy `next_sequence` monotonically ahead of any
+        // externally-supplied seq so a follow-up `put`/`merge` (which still
+        // self-allocate) cannot collide.
+        if self.next_sequence <= seq {
+            self.next_sequence = seq + 1;
+        }
 
         let row_offset = self.sequences.len() as u32;
 
@@ -488,11 +522,34 @@ impl VectorizedMemTable {
     /// Sequences are assigned monotonically starting from `self.next_sequence`.
     ///
     /// Returns the number of entries inserted.
+    ///
+    /// PERF (D1): when the engine drives the batch it should use
+    /// [`Self::batch_insert_with_base_seq`] so the engine-level seq range is
+    /// reserved by a single `fetch_add(N)` BEFORE the memtable lock is
+    /// acquired. This entry point keeps the legacy contract (memtable
+    /// allocates the seq range from its own counter).
     pub fn batch_insert(
         &mut self,
         keys: &[&[u8]],
         values: &[Option<&[u8]>],
         op_types: &[u8],
+    ) -> ForstResult<usize> {
+        let base_seq = self.next_sequence;
+        self.batch_insert_with_base_seq(keys, values, op_types, base_seq)
+    }
+
+    /// Batch-inserts multiple entries using a pre-allocated sequence range.
+    ///
+    /// Sequence numbers `base_seq, base_seq+1, …, base_seq+keys.len()-1` are
+    /// assigned in order. The engine allocates the entire range with one
+    /// `AtomicU64::fetch_add(N)` outside the memtable lock so concurrent
+    /// writers never serialize on the engine counter.
+    pub fn batch_insert_with_base_seq(
+        &mut self,
+        keys: &[&[u8]],
+        values: &[Option<&[u8]>],
+        op_types: &[u8],
+        base_seq: u64,
     ) -> ForstResult<usize> {
         if self.frozen {
             return Err(forst_rs_common::ForstError::invalid_argument(
@@ -520,8 +577,12 @@ impl VectorizedMemTable {
         }
 
         let count = keys.len();
-        let base_seq = self.next_sequence;
-        self.next_sequence += count as u64;
+        // Keep `next_sequence` monotonically ahead of any externally-supplied
+        // range so legacy callers that self-allocate cannot collide.
+        let end_seq = base_seq.saturating_add(count as u64);
+        if self.next_sequence < end_seq {
+            self.next_sequence = end_seq;
+        }
         let base_offset = self.sequences.len() as u32;
 
         for i in 0..count {
@@ -576,6 +637,237 @@ impl VectorizedMemTable {
         }
 
         // Check merge threshold.
+        let merge_threshold =
+            ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
+        if self.unsorted_entries.len() > merge_threshold {
+            self.merge_unsorted_to_sorted();
+        }
+
+        Ok(count)
+    }
+
+    /// Direct columnar batch insert from an Arrow `RecordBatch`. Delegates
+    /// to [`Self::batch_put_arrow_with_base_seq`] using the memtable's own
+    /// `next_sequence` counter — appropriate for tests / standalone callers.
+    /// The engine should use the `_with_base_seq` variant so the engine-level
+    /// sequence range is allocated by a single `fetch_add(N)` outside the
+    /// memtable lock (D1 pattern, mirrors `batch_insert`).
+    pub fn batch_put_arrow(&mut self, batch: &RecordBatch) -> ForstResult<usize> {
+        let base_seq = self.next_sequence;
+        self.batch_put_arrow_with_base_seq(batch, base_seq)
+    }
+
+    /// Direct columnar batch insert from an Arrow `RecordBatch` using a
+    /// pre-allocated sequence range.
+    ///
+    /// **C1 (zero-copy hot path):** the FFM bench's `batchedPutArrow` workload
+    /// hands the engine a `key | value | op_type` `RecordBatch` straight from
+    /// Java. Pre-C1 the FFI path decoded the batch into a per-row
+    /// `WriteBatch` of owned `Vec<u8>`, then `db.batch_write` re-borrowed
+    /// those into `Vec<&[u8]>` and called `batch_insert` — two round-trips of
+    /// alloc + copy that defeated the zero-copy promise from
+    /// `2.3_memtable_design.md` §2.4.2.
+    ///
+    /// This path appends the batch's three columns (`key: Binary`,
+    /// `value: Binary nullable`, `op_type: UInt8`) directly into the
+    /// memtable's column buffers via slice-copy:
+    ///
+    /// - `key_data` / `value_data` get a single `extend_from_slice` of the
+    ///   underlying Arrow `value_data` buffer (concatenated key bytes / value
+    ///   bytes), so the per-row payload is one memcpy total.
+    /// - `key_offsets` / `value_offsets` are extended with rebased offsets
+    ///   from the Arrow `value_offsets` array.
+    /// - `value_nulls` mirrors the Arrow null bitmap.
+    /// - `sequences` is filled with `base_seq..base_seq+count`.
+    /// - `op_types` is a single `extend_from_slice` of the Arrow `UInt8Array`
+    ///   value buffer.
+    ///
+    /// `unsorted_lookup` still pays per-row hash + insert (needed for
+    /// point-lookup correctness), but the key bytes come directly from the
+    /// Arrow buffer — no per-row `Vec<u8>` allocation chain.
+    ///
+    /// Schema validation: the batch MUST be exactly
+    /// `key: Binary, value: Binary nullable, op_type: UInt8`. Other shapes
+    /// return `invalid_argument`.
+    ///
+    /// Op-type validation matches `batch_insert`: ALL bytes are validated
+    /// up-front so an invalid byte rejects the whole batch atomically (no
+    /// partial column mutation).
+    ///
+    /// Returns the number of rows inserted (= `batch.num_rows()`).
+    pub fn batch_put_arrow_with_base_seq(
+        &mut self,
+        batch: &RecordBatch,
+        base_seq: u64,
+    ) -> ForstResult<usize> {
+        if self.frozen {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "cannot write to a frozen MemTable",
+            ));
+        }
+
+        // ---- schema validation ----
+        if batch.num_columns() != 3 {
+            return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                "batch_put_arrow: expected 3 columns (key, value, op_type); got {}",
+                batch.num_columns()
+            )));
+        }
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                forst_rs_common::ForstError::invalid_argument(
+                    "batch_put_arrow: column 0 must be BinaryArray (key)",
+                )
+            })?;
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                forst_rs_common::ForstError::invalid_argument(
+                    "batch_put_arrow: column 1 must be BinaryArray (value)",
+                )
+            })?;
+        let ops = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt8Array>()
+            .ok_or_else(|| {
+                forst_rs_common::ForstError::invalid_argument(
+                    "batch_put_arrow: column 2 must be UInt8Array (op_type)",
+                )
+            })?;
+
+        let count = batch.num_rows();
+        if count == 0 {
+            return Ok(0);
+        }
+        if keys.len() != count || values.len() != count || ops.len() != count {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "batch_put_arrow: column lengths disagree with batch.num_rows()",
+            ));
+        }
+
+        // ---- op_type pre-validation (atomic reject) ----
+        // SECURITY: same up-front validation as `batch_insert` (Sweep R13 H).
+        // Walk the op_type buffer once; reject if any byte is unknown.
+        let op_values: &[u8] = ops.values();
+        for (i, &b) in op_values.iter().enumerate() {
+            if OpType::from_u8(b).is_none() {
+                return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                    "batch_put_arrow: invalid op_type byte {} at index {} (expected 0=Put, 1=Delete, 2=SingleDelete, 3=Merge)",
+                    b, i
+                )));
+            }
+        }
+
+        // Per-row null-vs-op_type cross-check is NOT done here: the FFI layer
+        // (which is the only intended caller) already enforces "Delete /
+        // SingleDelete must have a null value" and "Put / Merge must have a
+        // non-null value" before invoking this function. Repeating the check
+        // here would defeat the whole point of the columnar fast path.
+
+        // ---- bulk column extends ----
+        // Engine-allocated `base_seq` may be ahead of `next_sequence` when the
+        // engine reserves the range with a single `fetch_add` outside the
+        // memtable lock. Mirror `batch_insert_with_base_seq`: keep
+        // `next_sequence` monotonic so legacy self-allocating callers can't
+        // collide with engine-driven ranges.
+        let end_seq = base_seq.saturating_add(count as u64);
+        if self.next_sequence < end_seq {
+            self.next_sequence = end_seq;
+        }
+        let base_offset = self.sequences.len() as u32;
+
+        // 1. key_data: single memcpy of the concatenated key bytes.
+        //    Arrow BinaryArray stores values back-to-back in `value_data` and
+        //    indexes them via `value_offsets[i]..value_offsets[i+1]`. We
+        //    rebase those offsets onto our running `key_data.len()`.
+        let key_value_buf: &[u8] = keys.value_data();
+        let key_offsets_arr = keys.value_offsets(); // OffsetBuffer<i32>
+        let key_data_base = self.key_data.len() as u32;
+        // The Arrow BinaryArray slice may not start at offset zero; the first
+        // element of value_offsets is the start of the slice. Anchor on it.
+        let key_slice_start = key_offsets_arr[0] as usize;
+        let key_slice_end = key_offsets_arr[count] as usize;
+        self.key_data
+            .extend_from_slice(&key_value_buf[key_slice_start..key_slice_end]);
+        self.key_offsets.reserve(count);
+        // Append offsets [1..=count], rebased so that offset[i+1] - offset[i]
+        // gives the same byte length as the source row.
+        for i in 1..=count {
+            let rebased = key_data_base + (key_offsets_arr[i] as u32 - key_offsets_arr[0] as u32);
+            self.key_offsets.push(rebased);
+        }
+
+        // 2. value_data + value_offsets + value_nulls.
+        let val_value_buf: &[u8] = values.value_data();
+        let val_offsets_arr = values.value_offsets();
+        let val_data_base = self.value_data.len() as u32;
+        let val_slice_start = val_offsets_arr[0] as usize;
+        let val_slice_end = val_offsets_arr[count] as usize;
+        self.value_data
+            .extend_from_slice(&val_value_buf[val_slice_start..val_slice_end]);
+        self.value_offsets.reserve(count);
+        self.value_nulls.reserve(count);
+        for i in 0..count {
+            // Always push the rebased end-offset — value_data has been extended
+            // with the FULL concatenated buffer, including the zero-length
+            // slots that null rows occupy. value_at() consults value_nulls so
+            // the offset for a null row is meaningless but valid.
+            let rebased =
+                val_data_base + (val_offsets_arr[i + 1] as u32 - val_offsets_arr[0] as u32);
+            self.value_offsets.push(rebased);
+            self.value_nulls.push(values.is_null(i));
+        }
+
+        // 3. sequences: monotonically increasing from base_seq.
+        self.sequences.reserve(count);
+        for i in 0..count {
+            self.sequences.push(base_seq + i as u64);
+        }
+
+        // 4. op_types: single memcpy of the validated UInt8 buffer.
+        self.op_types.extend_from_slice(op_values);
+
+        // 5. unsorted_lookup + unsorted_entries: per-row hash + insert.
+        //    Hot path uses `get_mut` so repeated keys within the batch don't
+        //    re-allocate the Box<[u8]> key.
+        self.unsorted_entries.reserve(count);
+        for i in 0..count {
+            let row_offset = base_offset + i as u32;
+            let seq = base_seq + i as u64;
+            let key = keys.value(i);
+            // Safety: op_types validated above the loop.
+            let op_type =
+                OpType::from_u8(op_values[i]).expect("op_type byte was validated above the loop");
+            let row_index = RowIndex {
+                offset: row_offset,
+                sequence: seq,
+                op_type,
+            };
+            self.unsorted_entries.push(row_offset);
+            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
+                slot.push(row_index);
+            } else {
+                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
+                slot.push(row_index);
+                self.unsorted_lookup.insert(Box::from(key), slot);
+            }
+
+            // Approximate memory accounting matching put()/batch_insert().
+            let v_len = if values.is_null(i) {
+                0
+            } else {
+                (val_offsets_arr[i + 1] - val_offsets_arr[i]) as usize
+            };
+            self.memory_used += key.len() + v_len + 8 + 1 + 48;
+        }
+
+        // 6. Merge threshold (same logic as batch_insert).
         let merge_threshold =
             ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
         if self.unsorted_entries.len() > merge_threshold {
@@ -1342,6 +1634,214 @@ mod tests {
             mt.get(b"k", 3).unwrap().unwrap().value,
             Some(b"v3".to_vec())
         );
+    }
+
+    // === C1: batch_put_arrow zero-copy direct columnar path ===
+
+    /// Build a (key, value, op_type) RecordBatch matching the FFI schema.
+    fn make_arrow_batch(
+        keys: &[&[u8]],
+        values: &[Option<&[u8]>],
+        op_types: &[u8],
+    ) -> arrow::array::RecordBatch {
+        use arrow::array::{BinaryBuilder, StructArray, UInt8Builder};
+        use arrow::datatypes::Field;
+        let mut kb = BinaryBuilder::new();
+        let mut vb = BinaryBuilder::new();
+        let mut ob = UInt8Builder::new();
+        for (i, k) in keys.iter().enumerate() {
+            kb.append_value(k);
+            match values[i] {
+                Some(v) => vb.append_value(v),
+                None => vb.append_null(),
+            }
+            ob.append_value(op_types[i]);
+        }
+        let s = StructArray::from(vec![
+            (
+                Arc::new(Field::new("key", DataType::Binary, false)),
+                Arc::new(kb.finish()) as arrow::array::ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("value", DataType::Binary, true)),
+                Arc::new(vb.finish()) as arrow::array::ArrayRef,
+            ),
+            (
+                Arc::new(Field::new("op_type", DataType::UInt8, false)),
+                Arc::new(ob.finish()) as arrow::array::ArrayRef,
+            ),
+        ]);
+        s.into()
+    }
+
+    /// 100-row batch lands in the column buffers with the correct
+    /// concatenated key/value bytes, sequences allocated in order, and the
+    /// op_type column populated. Validates the column-extend slice-copy
+    /// path is well-formed.
+    #[test]
+    fn test_batch_put_arrow_appends_columns_directly() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let keys: Vec<Vec<u8>> = (0..100u32)
+            .map(|i| format!("k{:04}", i).into_bytes())
+            .collect();
+        let values: Vec<Vec<u8>> = (0..100u32)
+            .map(|i| format!("v{:04}", i).into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
+        let ops = vec![0u8; 100];
+        let batch = make_arrow_batch(&key_refs, &val_refs, &ops);
+
+        let inserted = mt.batch_put_arrow(&batch).unwrap();
+        assert_eq!(inserted, 100);
+        assert_eq!(mt.num_entries(), 100);
+
+        // Sequences are 1..=100 (next_sequence starts at 1).
+        for i in 0..100 {
+            assert_eq!(mt.sequences[i], (i as u64) + 1);
+        }
+        // op_types extend mirrored the input bytes.
+        assert!(mt.op_types.iter().all(|&b| b == 0));
+        // Column-byte extents: each row's key_at()/value_at() must round-trip
+        // to the original input bytes (via the rebased offset arrays).
+        for i in 0..100u32 {
+            let expected_key = format!("k{:04}", i);
+            let expected_val = format!("v{:04}", i);
+            assert_eq!(mt.key_at(i), expected_key.as_bytes());
+            assert_eq!(mt.value_at(i), Some(expected_val.as_bytes()));
+            assert!(!mt.value_nulls[i as usize]);
+        }
+    }
+
+    /// All 100 keys must be retrievable via get() — verifies the
+    /// unsorted_lookup HashMap is populated correctly.
+    #[test]
+    fn test_batch_put_arrow_unsorted_lookup_correct() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let keys: Vec<Vec<u8>> = (0..100u32)
+            .map(|i| format!("k{:04}", i).into_bytes())
+            .collect();
+        let values: Vec<Vec<u8>> = (0..100u32)
+            .map(|i| format!("v{:04}", i).into_bytes())
+            .collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
+        let ops = vec![0u8; 100];
+        let batch = make_arrow_batch(&key_refs, &val_refs, &ops);
+
+        mt.batch_put_arrow(&batch).unwrap();
+
+        for i in 0..100u32 {
+            let k = format!("k{:04}", i);
+            let expected = format!("v{:04}", i);
+            let r = mt.get(k.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(r.value, Some(expected.into_bytes()));
+            assert_eq!(r.sequence, (i as u64) + 1);
+            assert_eq!(r.op_type, OpType::Put);
+        }
+    }
+
+    /// Mixed Put/Delete in a single batch — Delete carries a null value and
+    /// must be reflected by `value_nulls[i] == true` and a tombstone read.
+    #[test]
+    fn test_batch_put_arrow_mixed_put_delete() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let keys: Vec<&[u8]> = vec![b"a", b"b", b"c"];
+        let values: Vec<Option<&[u8]>> = vec![Some(b"1"), None, Some(b"3")];
+        let ops: Vec<u8> = vec![0, 1, 0]; // Put, Delete, Put
+        let batch = make_arrow_batch(&keys, &values, &ops);
+
+        mt.batch_put_arrow(&batch).unwrap();
+        assert_eq!(mt.num_entries(), 3);
+
+        let r = mt.get(b"a", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"1".to_vec()));
+        let r = mt.get(b"b", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.op_type, OpType::Delete);
+        assert_eq!(r.value, None);
+        let r = mt.get(b"c", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"3".to_vec()));
+    }
+
+    /// Empty batch must be a no-op — no panic, no state change, returns 0.
+    #[test]
+    fn test_batch_put_arrow_empty_batch_noop() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let batch = make_arrow_batch(&[], &[], &[]);
+        let inserted = mt.batch_put_arrow(&batch).unwrap();
+        assert_eq!(inserted, 0);
+        assert_eq!(mt.num_entries(), 0);
+        assert_eq!(mt.next_sequence, 1);
+    }
+
+    /// Reject the whole batch if any op_type byte is unknown — column buffers
+    /// must remain pristine (sentinel preserved).
+    #[test]
+    fn test_batch_put_arrow_rejects_invalid_op_atomically() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let keys: Vec<&[u8]> = vec![b"k1", b"k2", b"k3"];
+        let values: Vec<Option<&[u8]>> = vec![Some(b"v1"), Some(b"v2"), Some(b"v3")];
+        let ops: Vec<u8> = vec![0, 99, 0]; // 99 invalid
+        let batch = make_arrow_batch(&keys, &values, &ops);
+        let err = mt.batch_put_arrow(&batch);
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("invalid op_type byte 99 at index 1"),
+            "got: {}",
+            msg
+        );
+        // No partial state.
+        assert_eq!(mt.sequences.len(), 0);
+        assert_eq!(mt.key_offsets.len(), 1);
+        assert_eq!(mt.value_offsets.len(), 1);
+    }
+
+    /// Frozen memtable rejects batch_put_arrow.
+    #[test]
+    fn test_batch_put_arrow_rejects_when_frozen() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.freeze();
+        let batch = make_arrow_batch(&[b"k"], &[Some(b"v")], &[0u8]);
+        assert!(mt.batch_put_arrow(&batch).is_err());
+    }
+
+    /// Equivalence: batch_put_arrow vs batch_insert produce the same
+    /// observable state for the same input.
+    #[test]
+    fn test_batch_put_arrow_vs_batch_insert_equivalence() {
+        let n = 200u32;
+        let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k_{:05}", i).into_bytes()).collect();
+        let values: Vec<Vec<u8>> = (0..n).map(|i| format!("v_{:05}", i).into_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<Option<&[u8]>> = values.iter().map(|v| Some(v.as_slice())).collect();
+        let ops = vec![0u8; n as usize];
+
+        let mut mt_arrow = VectorizedMemTable::new(MemTableConfig {
+            max_size: 32 * 1024 * 1024,
+            unsorted_merge_ratio: 1024.0, // suppress merge to compare raw column state
+        });
+        let mt_batch_cfg = mt_arrow.config.clone();
+        let mut mt_legacy = VectorizedMemTable::new(mt_batch_cfg);
+        let batch = make_arrow_batch(&key_refs, &val_refs, &ops);
+        mt_arrow.batch_put_arrow(&batch).unwrap();
+        mt_legacy.batch_insert(&key_refs, &val_refs, &ops).unwrap();
+
+        // Same row count, same sequences, same op_types, same key/value bytes.
+        assert_eq!(mt_arrow.num_entries(), mt_legacy.num_entries());
+        assert_eq!(mt_arrow.sequences, mt_legacy.sequences);
+        assert_eq!(mt_arrow.op_types, mt_legacy.op_types);
+        for i in 0..n {
+            assert_eq!(mt_arrow.key_at(i), mt_legacy.key_at(i), "key {}", i);
+            assert_eq!(mt_arrow.value_at(i), mt_legacy.value_at(i), "value {}", i);
+        }
+        // Get-equivalence for every key.
+        for i in 0..n {
+            let k = &keys[i as usize];
+            let r_a = mt_arrow.get(k, u64::MAX).unwrap();
+            let r_l = mt_legacy.get(k, u64::MAX).unwrap();
+            assert_eq!(r_a, r_l, "get mismatch at {}", i);
+        }
     }
 
     /// Mixed put / batch_insert / get / merge sequence — end-to-end
