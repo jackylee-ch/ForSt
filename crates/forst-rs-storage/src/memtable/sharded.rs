@@ -29,7 +29,7 @@
 //!
 //! ## Sequence numbers
 //!
-//! Sequence numbers come from a single shared [`AtomicU64`] (the
+//! Sequence numbers come from a single shared `AtomicU64` (the
 //! engine-level counter) so global monotonicity holds across shards. For
 //! `batch_*` calls the engine reserves a contiguous range with one
 //! `fetch_add(N)` and passes `base_seq` down; this struct sub-allocates seqs
@@ -484,7 +484,7 @@ impl ShardedMemTable {
     /// Per-shard `to_flush_batches` already sorts within a shard. We collect
     /// all rows, k-way merge across shards, and slice into chunks of
     /// `batch_size` rows. The output is sorted by (key ASC, sequence DESC)
-    /// which is exactly what [`SstWriterImpl`] expects.
+    /// which is exactly what `SstWriterImpl` expects.
     ///
     /// Each shard MUST be frozen (matching the per-shard contract).
     pub fn to_flush_batches(&self, batch_size: usize) -> ForstResult<Vec<RecordBatch>> {

@@ -341,7 +341,7 @@ pub unsafe extern "C" fn frs_db_open_memory(out_handle: *mut FrsDb) -> i32 {
 /// stays at its default. Pass `0` for any of the four to keep that
 /// individual default.
 ///
-/// All four values flow through [`EngineOptionsBuilder::try_build`] so the
+/// All four values flow through `EngineOptionsBuilder::try_build` so the
 /// full validation stack (R-loop r3–r19 caps and joint-product checks)
 /// fires; an out-of-range parameter returns `FRS_STATUS_INVALID_ARGUMENT`
 /// rather than panicking. This makes the FFI safe to call from JMH-style

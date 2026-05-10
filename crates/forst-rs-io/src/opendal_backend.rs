@@ -124,7 +124,7 @@ impl RuntimeHandle {
 // ---------------------------------------------------------------------------
 
 /// Converts an [`opendal::Error`] into a [`ForstError`], preserving the
-/// [`ErrorKind::NotFound`] variant so that callers can use the engine's
+/// `ErrorKind::NotFound` variant so that callers can use the engine's
 /// usual `is_not_found()` predicate.
 fn map_opendal_err(err: opendal::Error, context: &str) -> ForstError {
     match err.kind() {
