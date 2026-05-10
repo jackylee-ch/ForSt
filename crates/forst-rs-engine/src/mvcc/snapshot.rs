@@ -27,9 +27,8 @@
 //! more versions → never drop too aggressively); see spec §6a.2 inline
 //! comment on `cached_min`.
 //!
-//! `oldest_age_ms` is stubbed to `0` in this task (B-Prod-P0 Task 0.4) —
-//! Task 0.5 refines it to walk the BTreeMap and return the maximum
-//! `captured_at.elapsed().as_millis()`.
+//! `oldest_age_ms` walks the BTreeMap and returns the maximum
+//! `captured_at.elapsed().as_millis()` (B-Prod-P0 Task 0.5; spec §6a.3).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -56,7 +55,6 @@ struct RegistryEntry {
     /// Wall-clock time of the *first* capture at this seq. Subsequent
     /// captures at the same seq do NOT refresh this — the oldest pin
     /// is what matters for `oldest_age_ms` accounting.
-    #[allow(dead_code)] // Wired up by Task 0.5 (see module docs).
     captured_at: Instant,
 }
 
@@ -232,13 +230,16 @@ impl SnapshotRegistry {
     /// Maximum `captured_at.elapsed().as_millis()` across all live
     /// snapshots, or 0 when empty.
     ///
-    /// **STUB** for B-Prod-P0 Task 0.4. Returns `0` unconditionally;
-    /// Task 0.5 refines this to walk `active` under the lock and pick
-    /// the max age (per spec §6a.3 `forst.snapshot.oldest_age_ms`
-    /// gauge). The stub is safe because the metric is operator-facing
-    /// only — no engine logic branches on its value in this task.
+    /// Per spec §6a.3 `forst.snapshot.oldest_age_ms` gauge. Walks
+    /// `active` under the lock; cost is O(n) in live distinct seqs.
+    /// Operator-facing metric — not on the compaction hot path.
     pub fn oldest_age_ms(&self) -> u64 {
-        0
+        let g = self.active.lock().expect("SnapshotRegistry mutex poisoned");
+        g.values()
+            .map(|e| e.captured_at.elapsed().as_millis())
+            .max()
+            .map(|m| u64::try_from(m).unwrap_or(u64::MAX))
+            .unwrap_or(0)
     }
 
     /// Recomputes `cached_min` from the current `active` map. Called
@@ -264,6 +265,10 @@ mod tests {
 
     fn seq(v: u64) -> SequenceNumber {
         SequenceNumber::new(v)
+    }
+
+    fn db_id() -> DbId {
+        DbId(1)
     }
 
     /// Test 1: capture two snapshots → active_count = 2; drop one → 1.
@@ -317,6 +322,27 @@ mod tests {
             "snapshot age should be >= 20ms after sleep, got {}",
             snap.age_ms()
         );
+    }
+
+    #[test]
+    fn oldest_age_ms_tracks_oldest() {
+        let reg = SnapshotRegistry::new();
+        assert_eq!(reg.oldest_age_ms(), 0);
+        let s1 = reg.capture(db_id(), SequenceNumber::new(1));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let s2 = reg.capture(db_id(), SequenceNumber::new(2));
+        let age = reg.oldest_age_ms();
+        assert!(age >= 30, "oldest_age_ms = {}", age);
+        drop(s1);
+        let age2 = reg.oldest_age_ms();
+        assert!(
+            age2 < age,
+            "after dropping s1, oldest should be the younger s2 (age2={}, age={})",
+            age2,
+            age
+        );
+        drop(s2);
+        assert_eq!(reg.oldest_age_ms(), 0);
     }
 
     /// Test 5: two captures at the same seq share a ref-count entry;
