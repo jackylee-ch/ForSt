@@ -44,6 +44,11 @@ jni = { version = "0.21", optional = true }
 # don't pay the dependency cost.
 tracing = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Used by P2 compat-jni tests to materialise on-disk checkpoint dirs that
+# the engine writes into; never linked into the production cdylib.
+tempfile = { workspace = true }
+
 [features]
 default = []
 # Builds the `compat_jni` module exposing `Java_org_forstdb_*` symbols so
