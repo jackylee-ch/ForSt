@@ -37,6 +37,7 @@ use forst_rs_storage::version::{SstFileMeta, Version, VersionEdit, VersionSetImp
 use crate::checkpoint::{copy_live_ssts, serialize_snapshot, write_blob, CheckpointManifest};
 use crate::column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
 use crate::compaction::{compaction_output_path, CompactionJob};
+use crate::compaction_filter::CompactionFilter;
 use crate::file_deletion_guard::FileDeletionGuard;
 use crate::flush::{sst_file_path, FlushExecutor, FlushJob, FlushQueue, FlushRequest};
 use crate::snapshot_view::SnapshotView;
@@ -51,6 +52,31 @@ const FLUSH_QUEUE_CAPACITY: usize = 64;
 
 /// Name of the default column family (always id 0).
 pub const DEFAULT_CF_NAME: &str = "default";
+
+/// Per-SST descriptor returned by [`DbImpl::list_live_files`].
+///
+/// The Vec is enumerated in (level, smallest_key) order so callers can
+/// treat the result as a stable manifest of the LSM-tree's on-disk state at
+/// the moment of the call. Memory ownership: returned [`String`]s are owned;
+/// the Vec is freed when dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveFileInfo {
+    /// Absolute on-disk path of the SST file (resolved against
+    /// `EngineOptions::db_path`).
+    pub path: PathBuf,
+    /// File size in bytes (as recorded by the writer; not re-statted).
+    pub size: u64,
+    /// Largest sequence number contained in the file. Mirrors the RocksDB
+    /// `largest_seqno` field that Flink's incremental restore consults.
+    pub sequence: u64,
+    /// LSM level the file currently lives on. 0..MAX_LEVELS.
+    pub level: u8,
+    /// Owning column family name. forst-rs's VersionSet does not currently
+    /// partition SST files by CF (one global level layout); this field is
+    /// always [`DEFAULT_CF_NAME`] today, but is exposed so the FFI surface
+    /// is forward-compatible with a future per-CF VersionSet.
+    pub cf_name: String,
+}
 
 /// The top-level engine struct.
 pub struct DbImpl {
@@ -317,6 +343,29 @@ impl DbImpl {
         cfs.get(&id).map(|cf| cf.handle().clone())
     }
 
+    /// Installs (or replaces) the compaction filter on a column family
+    /// after it has already been created. Pass `None` to clear the filter.
+    ///
+    /// This is the post-`open` configuration path that the FFI export
+    /// `frs_cf_set_compaction_filter_ttl` uses to wire a Flink TTL filter
+    /// onto a CF without re-creating it. The next compaction job built
+    /// for the CF observes the new filter; in-flight jobs run to
+    /// completion against the snapshot they already captured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForstError::InvalidArgument`] when the handle does not
+    /// match a known column family.
+    pub fn set_compaction_filter(
+        &self,
+        cf: &ColumnFamilyHandle,
+        filter: Option<Arc<dyn CompactionFilter>>,
+    ) -> ForstResult<()> {
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        cf_data.set_compaction_filter(filter);
+        Ok(())
+    }
+
     /// Returns a reference to the engine options.
     pub fn options(&self) -> &EngineOptions {
         &self.options
@@ -330,6 +379,13 @@ impl DbImpl {
     /// Returns the current sequence number (latest assigned).
     pub fn sequence_number(&self) -> u64 {
         self.sequence_number.load(Ordering::Acquire)
+    }
+
+    /// Returns the number of L0 SST files in the current Version. Read by
+    /// the FFI metadata surface (`frs_l0_file_count`) and used internally
+    /// by tests asserting flush behaviour.
+    pub fn l0_file_count(&self) -> u32 {
+        self.version_set.current().l0_files().len() as u32
     }
 
     // ---------------------------------------------------------------
@@ -620,6 +676,63 @@ impl DbImpl {
         self.flush_cf(cf)
     }
 
+    /// Enumerates every live SST file in the current Version.
+    ///
+    /// If `flush_memtable` is true the engine first runs [`Self::flush_all`]
+    /// so newly written rows still in memtables are persisted and become
+    /// visible in the returned list — this is the contract Flink's
+    /// incremental restore relies on (see `RocksDB.getLiveFiles(true)`).
+    ///
+    /// Iteration walks levels 0..MAX_LEVELS in order; within each level
+    /// files are returned in `smallest_key` order (the same order
+    /// [`Version::apply_edit`] sorts them). Returned [`LiveFileInfo::path`]
+    /// is the absolute path under [`EngineOptions::db_path`].
+    pub fn list_live_files(&self, flush_memtable: bool) -> ForstResult<Vec<LiveFileInfo>> {
+        if flush_memtable {
+            // Mirror RocksDB's `getLiveFiles(true)`: force-switch every CF's
+            // active memtable into an imm, then drain. Without the switch,
+            // `flush_all` only drains existing imms and rows still sitting
+            // in the active memtable would not be persisted to an SST yet.
+            let cfs: Vec<Arc<ColumnFamilyData>> = {
+                let guard = self.cfs.read().expect("lock poisoned");
+                guard.values().cloned().collect()
+            };
+            for cf_data in &cfs {
+                let handle = cf_data.handle().clone();
+                self.force_switch_memtable(&handle)?;
+            }
+            self.flush_all()?;
+        }
+        let version = self.version_set.current();
+        let mut out = Vec::new();
+        for (level_idx, level_meta) in version.levels.iter().enumerate() {
+            for file in &level_meta.files {
+                out.push(LiveFileInfo {
+                    path: sst_file_path(&self.db_path, file.file_number),
+                    size: file.file_size,
+                    sequence: file.max_sequence.value(),
+                    level: level_idx as u8,
+                    cf_name: DEFAULT_CF_NAME.to_string(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Returns the size of the manifest. forst-rs persists the version
+    /// manifest as a single CHECKPOINT.blob next to the live SSTs (rather
+    /// than RocksDB's MANIFEST log). When the manifest does not yet exist
+    /// (a fresh DB that has never been checkpointed) this returns 0 — that
+    /// matches how RocksDB reports manifest size before the first WAL
+    /// switch, so Flink's incremental restore handles it identically.
+    pub fn manifest_file_size(&self) -> u64 {
+        let manifest_path = self.db_path.join(crate::checkpoint::CHECKPOINT_BLOB_NAME);
+        match self.fs.get_file_metadata(&manifest_path) {
+            Ok(meta) => meta.size,
+            Err(_) => 0,
+        }
+    }
+
     // ---------------------------------------------------------------
     // Compaction path
     // ---------------------------------------------------------------
@@ -793,7 +906,7 @@ impl DbImpl {
             writer_options,
             fs: self.fs.clone(),
             merge_operator: cf_data.merge_operator().cloned(),
-            compaction_filter: cf_data.compaction_filter().cloned(),
+            compaction_filter: cf_data.compaction_filter(),
             is_bottommost,
         };
 
@@ -1001,7 +1114,7 @@ impl DbImpl {
             writer_options,
             fs: self.fs.clone(),
             merge_operator: cf_data.merge_operator().cloned(),
-            compaction_filter: cf_data.compaction_filter().cloned(),
+            compaction_filter: cf_data.compaction_filter(),
             is_bottommost,
         };
 
@@ -2805,6 +2918,84 @@ mod tests {
         // fresh_key → still present.
         let got = db.get(&cf, b"fresh_key").unwrap();
         assert!(got.is_some());
+    }
+
+    /// Post-creation install via [`DbImpl::set_compaction_filter`] using
+    /// [`FlinkTtlCompactionFilter`]. Mirrors the FFI path that
+    /// `frs_cf_set_compaction_filter_ttl` walks: open CF without a filter,
+    /// install one later, then verify expired entries are dropped at the
+    /// next compaction.
+    #[test]
+    fn test_set_compaction_filter_post_create_with_flink_filter() {
+        use crate::compaction_filter::{FlinkTtlCompactionFilter, TtlStateType};
+        let db = open();
+        // Create the CF with NO filter, then install one afterwards.
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("flink-ttl"))
+            .unwrap();
+
+        // Inject a deterministic clock at "now=2000ms" with TTL=500ms so
+        // a timestamp of 0ms is expired (age=2000 > 500) and a timestamp
+        // of 1800ms is fresh (age=200 < 500).
+        let supplier: crate::compaction_filter::CurrentTimeSupplier = Arc::new(|| 2000);
+        let filter = Arc::new(FlinkTtlCompactionFilter::with_supplier(
+            500,
+            TtlStateType::Value,
+            0,
+            supplier,
+        ));
+        db.set_compaction_filter(&cf, Some(filter)).unwrap();
+
+        // ts=0 → expired → discarded.
+        let mut expired_value = Vec::new();
+        expired_value.extend_from_slice(&0u64.to_le_bytes());
+        expired_value.extend_from_slice(b"old");
+        db.put(&cf, b"old", &expired_value).unwrap();
+
+        // ts=1800 → fresh → kept.
+        let mut fresh_value = Vec::new();
+        fresh_value.extend_from_slice(&1800u64.to_le_bytes());
+        fresh_value.extend_from_slice(b"new");
+        db.put(&cf, b"new", &fresh_value).unwrap();
+
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+
+        assert!(db.get(&cf, b"old").unwrap().is_none(), "expired key kept");
+        assert!(db.get(&cf, b"new").unwrap().is_some(), "fresh key dropped");
+    }
+
+    /// Clearing a previously-installed filter via
+    /// [`DbImpl::set_compaction_filter`] with `None` must restore "keep
+    /// every entry" semantics on the next compaction.
+    #[test]
+    fn test_set_compaction_filter_clear_restores_no_filter() {
+        use crate::compaction_filter::{FlinkTtlCompactionFilter, TtlStateType};
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("flink-clear"))
+            .unwrap();
+
+        // Install a filter that would expire EVERY value.
+        let supplier: crate::compaction_filter::CurrentTimeSupplier = Arc::new(|| u64::MAX);
+        let filter = Arc::new(FlinkTtlCompactionFilter::with_supplier(
+            1,
+            TtlStateType::Value,
+            0,
+            supplier,
+        ));
+        db.set_compaction_filter(&cf, Some(filter)).unwrap();
+        // Now clear it.
+        db.set_compaction_filter(&cf, None).unwrap();
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&0u64.to_le_bytes());
+        value.extend_from_slice(b"payload");
+        db.put(&cf, b"k", &value).unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+        // No filter → entry survives.
+        assert!(db.get(&cf, b"k").unwrap().is_some());
     }
 
     #[test]

@@ -522,6 +522,69 @@ pub unsafe extern "C" fn frs_cf_close(handle: FrsCfHandle) -> i32 {
     })
 }
 
+/// Installs a Flink-compatible TTL compaction filter on the CF.
+///
+/// The filter expires entries whose embedded `u64` Little-Endian millisecond
+/// timestamp at `value[timestamp_offset..+8]` is older than `ttl_ms` from
+/// the current wall clock. See
+/// [`forst_rs_engine::FlinkTtlCompactionFilter`] for the decision matrix
+/// (tombstones are always kept; values shorter than `timestamp_offset + 8`
+/// are kept; `state_type = 0` / Disabled installs a no-op filter; `ttl_ms
+/// = 0` means "never expire").
+///
+/// `state_type` ordinal:
+/// - `0` — Disabled (no-op filter installed)
+/// - `1` — Value (Flink ValueState / ReducingState / AggregatingState)
+/// - `2` — List (treated as Value for whole-state expiry; per-element
+///   pruning is a follow-up)
+///
+/// Unknown ordinals fall back to `Disabled`.
+///
+/// This is the post-`open` configuration entry point used by Flink's
+/// `RocksDbTtlCompactionFilter` plumbing once the JNI shim records a
+/// `state_type / ttl_ms / timestamp_offset` triple via
+/// `Java_org_forstdb_FlinkCompactionFilter_configureFlinkCompactionFilter`.
+/// Until the JNI side passes the destination CF handle through, this FFI
+/// export is the supported way to bind the Flink-shaped TTL filter to a
+/// CF from non-JNI consumers.
+///
+/// Returns:
+/// - `FRS_STATUS_OK` on successful install.
+/// - `FRS_STATUS_NULL_ARG` if `db` or `cf` is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` if the engine rejects the handle (e.g.
+///   the CF has been closed concurrently).
+///
+/// # SAFETY
+///
+/// - `db` must be a handle returned by `frs_db_open*` and not yet closed.
+/// - `cf` must be a handle returned by `frs_db_create_cf*` /
+///   `frs_db_open_cf` for the same database, not yet closed.
+#[no_mangle]
+pub unsafe extern "C" fn frs_cf_set_compaction_filter_ttl(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    ttl_ms: u64,
+    state_type: i32,
+    timestamp_offset: usize,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let state = forst_rs_engine::TtlStateType::from_ordinal(state_type);
+        let filter: Arc<dyn forst_rs_engine::CompactionFilter> = Arc::new(
+            forst_rs_engine::FlinkTtlCompactionFilter::new(ttl_ms, state, timestamp_offset),
+        );
+        match db.set_compaction_filter(cf, Some(filter)) {
+            Ok(()) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 3. Point operations
 // ---------------------------------------------------------------------------
@@ -914,10 +977,7 @@ pub unsafe extern "C" fn frs_l0_file_count(handle: FrsDb, out_count: *mut u32) -
         let Some(db) = db_from_handle(handle) else {
             return FRS_STATUS_NULL_ARG;
         };
-        let _ = db;
-        // Engine does not currently expose Version directly; we leave this
-        // metric at 0 until the read accessor lands.
-        *out_count = 0;
+        *out_count = db.l0_file_count();
         FRS_STATUS_OK
     })
 }
@@ -984,6 +1044,215 @@ pub unsafe extern "C" fn frs_db_open_from_checkpoint_memory(
 // Suppress dead_code warning for _path used above.
 #[allow(dead_code)]
 fn _pathbuf_usage(_p: PathBuf) {}
+
+// ---------------------------------------------------------------------------
+// 7b. Live-file enumeration (Flink incremental-restore primitive)
+// ---------------------------------------------------------------------------
+//
+// Flink's `RocksDBIncrementalRestoreOperation` calls `RocksDB.getLiveFiles`
+// after a checkpoint to enumerate every SST file the engine considers part
+// of the live LSM-tree, then re-uploads / re-references those files in the
+// next checkpoint instead of doing a full state copy. Without per-file
+// enumeration the restore path silently degrades to "always full copy",
+// which is functionally correct but wipes out the entire incremental-state
+// optimisation.
+//
+// These three exports — `frs_db_get_live_files`,
+// `frs_db_get_live_files_metadata`, and `frs_db_live_file_list_free` —
+// surface the Rust-side [`forst_rs_engine::DbImpl::list_live_files`] API
+// across the C ABI in a self-contained, repr(C) shape so both the JNI shim
+// (compat_jni.rs) and any direct C/FFM consumer can use it.
+//
+// Memory ownership: the [`FrsLiveFile`] entries (and their `path` /
+// `cf_name` C strings) are allocated by Rust. Callers MUST call
+// [`frs_db_live_file_list_free`] exactly once per [`FrsLiveFileList`] to
+// release the inner `files` array AND every owned C string inside it. The
+// `out` outer struct itself is caller-allocated (typical
+// stack-or-Java-heap pattern) so we do NOT free `list` itself.
+
+/// One live SST file's descriptor (Rust-owned strings, ABI-stable layout).
+///
+/// `path` and `cf_name` are NUL-terminated C strings allocated by Rust via
+/// [`CString::into_raw`]; both must be released by
+/// [`frs_db_live_file_list_free`] (which walks the array and reclaims each
+/// string). Do NOT free them individually.
+#[repr(C)]
+pub struct FrsLiveFile {
+    /// Absolute on-disk path of the SST file (UTF-8, NUL-terminated).
+    pub path: *mut c_char,
+    /// File size in bytes.
+    pub size: u64,
+    /// Largest sequence number contained in the file (mirrors the
+    /// RocksDB `largest_seqno` field).
+    pub sequence: u64,
+    /// LSM level the file currently lives on (0..MAX_LEVELS).
+    pub level: u8,
+    /// Owning column family name (UTF-8, NUL-terminated). forst-rs
+    /// presently has a single global VersionSet so this is always
+    /// `"default"` today; reserved for future per-CF VersionSet.
+    pub cf_name: *mut c_char,
+}
+
+/// A list of live SST files plus aggregate manifest metadata, returned
+/// from [`frs_db_get_live_files`] / [`frs_db_get_live_files_metadata`].
+///
+/// `files` is a contiguous array of `count` [`FrsLiveFile`]s. The whole
+/// list (array + each entry's owned strings) MUST be released via
+/// [`frs_db_live_file_list_free`]; the outer struct itself is
+/// caller-allocated.
+#[repr(C)]
+pub struct FrsLiveFileList {
+    pub files: *mut FrsLiveFile,
+    pub count: usize,
+    /// Size of the on-disk version manifest in bytes (Flink's
+    /// `manifestFileSize` field). 0 if no manifest has been persisted yet
+    /// (e.g. fresh DB with no checkpoints) — Flink handles 0 the same way
+    /// RocksDB reports a freshly opened DB.
+    pub manifest_size: u64,
+}
+
+impl FrsLiveFileList {
+    const EMPTY: Self = Self {
+        files: std::ptr::null_mut(),
+        count: 0,
+        manifest_size: 0,
+    };
+}
+
+/// Internal helper: convert a Rust [`forst_rs_engine::LiveFileInfo`] vec
+/// plus a manifest size into the C-ABI shape, leaking the `Vec`'s buffer
+/// and each owned C string. Pairs with [`frs_db_live_file_list_free`].
+fn into_ffi_list(files: Vec<forst_rs_engine::LiveFileInfo>, manifest_size: u64) -> FrsLiveFileList {
+    if files.is_empty() {
+        return FrsLiveFileList {
+            files: std::ptr::null_mut(),
+            count: 0,
+            manifest_size,
+        };
+    }
+    let mut converted: Vec<FrsLiveFile> = Vec::with_capacity(files.len());
+    for f in files {
+        // Convert PathBuf → CString. Path strings on Unix may contain
+        // non-UTF-8 bytes; engine constructs them via `format!` against the
+        // db_path so they should be valid UTF-8. Fall back to a lossy
+        // representation rather than panicking — preserving the file's
+        // existence to the caller is more important than path purity.
+        let path_str = f.path.to_string_lossy().into_owned();
+        let path_c = std::ffi::CString::new(path_str)
+            .unwrap_or_else(|_| std::ffi::CString::new("<invalid-path>").expect("static literal"));
+        let cf_c = std::ffi::CString::new(f.cf_name)
+            .unwrap_or_else(|_| std::ffi::CString::new("default").expect("static literal"));
+        converted.push(FrsLiveFile {
+            path: path_c.into_raw(),
+            size: f.size,
+            sequence: f.sequence,
+            level: f.level,
+            cf_name: cf_c.into_raw(),
+        });
+    }
+    converted.shrink_to_fit();
+    let count = converted.len();
+    let ptr = converted.as_mut_ptr();
+    std::mem::forget(converted);
+    FrsLiveFileList {
+        files: ptr,
+        count,
+        manifest_size,
+    }
+}
+
+/// Enumerates every live SST file in the engine's current Version.
+///
+/// If `flush_memtable` is non-zero the engine first runs a synchronous
+/// flush of every CF's pending memtables so newly written rows that have
+/// not yet been persisted are included in the returned list — this is the
+/// contract Flink's `getLiveFiles(true)` relies on.
+///
+/// The output struct `*out` is caller-allocated. On success the function
+/// fills `*out` with a Rust-owned list; the caller MUST call
+/// [`frs_db_live_file_list_free`] exactly once per successful call.
+///
+/// Returns `FRS_STATUS_OK` on success, `FRS_STATUS_NULL_ARG` if `db` or
+/// `out` is null, or one of the I/O / ERROR codes if the optional flush
+/// fails.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_get_live_files(
+    db: FrsDb,
+    flush_memtable: bool,
+    out: *mut FrsLiveFileList,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        // Initialise to a safe-empty value first so a failure path leaves
+        // the caller with a deterministic (and free-safe) struct.
+        *out = FrsLiveFileList::EMPTY;
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let manifest_size = db.manifest_file_size();
+        match db.list_live_files(flush_memtable) {
+            Ok(files) => {
+                *out = into_ffi_list(files, manifest_size);
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Enumerates every live SST file's metadata (no flush). This is the
+/// counterpart to [`frs_db_get_live_files`] used by the
+/// `getLiveFilesMetaData()` Java surface, which never triggers a flush.
+///
+/// Memory ownership rules are identical: caller MUST free via
+/// [`frs_db_live_file_list_free`].
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_get_live_files_metadata(
+    db: FrsDb,
+    out: *mut FrsLiveFileList,
+) -> i32 {
+    frs_db_get_live_files(db, false, out)
+}
+
+/// Releases the inner `files` array AND every owned C string inside it.
+///
+/// Safe to call exactly once per `FrsLiveFileList` returned by
+/// [`frs_db_get_live_files`] / [`frs_db_get_live_files_metadata`]. After
+/// this call the list's `files` pointer is reset to NULL and `count` to 0,
+/// so a redundant second call is a no-op (does not double-free).
+///
+/// The outer `*list` struct itself is NOT freed — it's typically caller
+/// stack memory or Java-heap memory and not Rust-owned.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_live_file_list_free(list: *mut FrsLiveFileList) -> i32 {
+    guarded(|| {
+        if list.is_null() {
+            return FRS_STATUS_OK;
+        }
+        let l = &mut *list;
+        if l.files.is_null() || l.count == 0 {
+            // Idempotent: clearing twice is a no-op.
+            l.files = std::ptr::null_mut();
+            l.count = 0;
+            return FRS_STATUS_OK;
+        }
+        // Reconstruct the Vec to drop its buffer.
+        let files = Vec::from_raw_parts(l.files, l.count, l.count);
+        for f in files {
+            if !f.path.is_null() {
+                drop(std::ffi::CString::from_raw(f.path));
+            }
+            if !f.cf_name.is_null() {
+                drop(std::ffi::CString::from_raw(f.cf_name));
+            }
+        }
+        l.files = std::ptr::null_mut();
+        l.count = 0;
+        FRS_STATUS_OK
+    })
+}
 
 // ---------------------------------------------------------------------------
 // 8. Arrow C Data Interface (zero-copy batch ops)
@@ -2799,6 +3068,266 @@ mod tests {
                 frs_db_open_memory_tuned(0, 0, 0, 0, ptr::null_mut()),
                 FRS_STATUS_NULL_ARG
             );
+        }
+    }
+
+    /// `frs_cf_set_compaction_filter_ttl` accepts a Value-state filter,
+    /// installs it on the CF, and leaves subsequent put/get traffic
+    /// unaffected (the filter only fires at compaction time, which the
+    /// in-memory test backend does not exercise here — but the install
+    /// path itself must not break the read/write path).
+    ///
+    /// Also covers the Disabled-state and unknown-ordinal branches: both
+    /// install a no-op filter and the put/get round-trip continues to
+    /// succeed.
+    #[test]
+    fn test_frs_cf_set_compaction_filter_ttl() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Install Value-state TTL filter (state_type=1, ttl=60_000ms,
+            // timestamp at offset 0). Must succeed.
+            assert_eq!(
+                frs_cf_set_compaction_filter_ttl(db, cf, 60_000, 1, 0),
+                FRS_STATUS_OK
+            );
+
+            // Round-trip a put/get to confirm the install didn't break the
+            // hot path. The "value" payload here doesn't carry a real
+            // timestamp prefix, but in the in-memory backend nothing is
+            // compacted so the filter is never invoked — what we're
+            // verifying is that registering the filter is non-destructive.
+            let key = b"ttl-key";
+            let value = b"ttl-value";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+                FRS_STATUS_OK
+            );
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            assert_eq!(slice::from_raw_parts(out.data, out.len), value);
+            frs_bytes_free(&mut out);
+
+            // Replace with a Disabled-state filter — this should also
+            // succeed and leave the engine functional.
+            assert_eq!(
+                frs_cf_set_compaction_filter_ttl(db, cf, 0, 0, 0),
+                FRS_STATUS_OK
+            );
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+                FRS_STATUS_OK
+            );
+
+            // Unknown ordinal (99) must NOT panic / error — it falls back
+            // to Disabled so a future Flink upgrade adding a state type
+            // can never silently turn the filter into a destructive no-op.
+            assert_eq!(
+                frs_cf_set_compaction_filter_ttl(db, cf, 1_000, 99, 0),
+                FRS_STATUS_OK
+            );
+
+            // Null DB / CF arguments are rejected.
+            assert_eq!(
+                frs_cf_set_compaction_filter_ttl(ptr::null_mut(), cf, 0, 1, 0),
+                FRS_STATUS_NULL_ARG
+            );
+            assert_eq!(
+                frs_cf_set_compaction_filter_ttl(db, ptr::null_mut(), 0, 1, 0),
+                FRS_STATUS_NULL_ARG
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Live-file enumeration (frs_db_get_live_files / *_metadata / *_free)
+    // -----------------------------------------------------------------
+
+    /// On a fresh, never-written DB the live-file list must be empty —
+    /// no SSTs have been produced and the enumerated count is 0.
+    #[test]
+    fn test_frs_db_get_live_files_empty_db() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            let mut list = FrsLiveFileList {
+                files: ptr::null_mut(),
+                count: 0,
+                manifest_size: 0,
+            };
+            // flush_memtable=false: no rows have been written so flush
+            // would be a no-op anyway. Verifies the no-flush path works.
+            assert_eq!(frs_db_get_live_files(db, false, &mut list), FRS_STATUS_OK);
+            assert_eq!(list.count, 0);
+            assert!(list.files.is_null());
+
+            // free is safe-and-idempotent on an empty list.
+            assert_eq!(frs_db_live_file_list_free(&mut list), FRS_STATUS_OK);
+            assert_eq!(frs_db_live_file_list_free(&mut list), FRS_STATUS_OK);
+
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// After writing rows and flushing, at least one L0 SST must appear in
+    /// the live-file list with non-zero size and a recorded sequence.
+    #[test]
+    fn test_frs_db_get_live_files_after_flush() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Write enough rows that the flushed memtable produces a
+            // non-trivial SST.
+            for i in 0..100u32 {
+                let k = format!("k{:06}", i);
+                let v = format!("value-payload-{:06}", i);
+                assert_eq!(
+                    frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                    FRS_STATUS_OK
+                );
+            }
+
+            // flush_memtable=true makes get_live_files run flush_all itself.
+            let mut list = FrsLiveFileList {
+                files: ptr::null_mut(),
+                count: 0,
+                manifest_size: 0,
+            };
+            assert_eq!(frs_db_get_live_files(db, true, &mut list), FRS_STATUS_OK);
+            assert!(
+                list.count >= 1,
+                "expected at least one live SST after flush, got {}",
+                list.count
+            );
+            assert!(!list.files.is_null());
+
+            // Inspect the first entry.
+            let entries = slice::from_raw_parts(list.files, list.count);
+            let mut total_size = 0u64;
+            for entry in entries {
+                assert!(!entry.path.is_null());
+                assert!(!entry.cf_name.is_null());
+                let path = std::ffi::CStr::from_ptr(entry.path).to_str().unwrap();
+                let cf = std::ffi::CStr::from_ptr(entry.cf_name).to_str().unwrap();
+                assert!(path.ends_with(".sst"), "path missing .sst suffix: {path}");
+                assert_eq!(cf, "default");
+                // Level should be valid (0..MAX_LEVELS).
+                assert!(entry.level < 64);
+                total_size = total_size.saturating_add(entry.size);
+            }
+            assert!(
+                total_size > 0,
+                "every flushed SST must have non-zero size; got total {total_size}"
+            );
+
+            // Sequence number should advance past the writes.
+            let mut seq: u64 = 0;
+            assert_eq!(frs_sequence_number(db, &mut seq), FRS_STATUS_OK);
+            assert!(seq >= 100, "sequence must reflect 100 puts; got {seq}");
+
+            // Verify metadata-only path returns the same shape.
+            let mut list2 = FrsLiveFileList {
+                files: ptr::null_mut(),
+                count: 0,
+                manifest_size: 0,
+            };
+            assert_eq!(
+                frs_db_get_live_files_metadata(db, &mut list2),
+                FRS_STATUS_OK
+            );
+            assert_eq!(list2.count, list.count);
+
+            assert_eq!(frs_db_live_file_list_free(&mut list), FRS_STATUS_OK);
+            assert_eq!(frs_db_live_file_list_free(&mut list2), FRS_STATUS_OK);
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// `frs_db_live_file_list_free` must be idempotent: calling it twice on
+    /// the same list (or on a NULL list) must not double-free or panic.
+    #[test]
+    fn test_frs_db_live_file_list_free_idempotent() {
+        unsafe {
+            // 1. NULL pointer is a no-op.
+            assert_eq!(frs_db_live_file_list_free(ptr::null_mut()), FRS_STATUS_OK);
+
+            // 2. Empty struct is a no-op.
+            let mut empty = FrsLiveFileList {
+                files: ptr::null_mut(),
+                count: 0,
+                manifest_size: 0,
+            };
+            assert_eq!(frs_db_live_file_list_free(&mut empty), FRS_STATUS_OK);
+            assert_eq!(frs_db_live_file_list_free(&mut empty), FRS_STATUS_OK);
+
+            // 3. Populated list — produce one then free twice.
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+            for i in 0..20u32 {
+                let k = format!("k{:04}", i);
+                frs_put(db, cf, k.as_ptr(), k.len(), b"v".as_ptr(), 1);
+            }
+            assert_eq!(frs_flush(db), FRS_STATUS_OK);
+
+            let mut list = FrsLiveFileList {
+                files: ptr::null_mut(),
+                count: 0,
+                manifest_size: 0,
+            };
+            assert_eq!(frs_db_get_live_files(db, false, &mut list), FRS_STATUS_OK);
+            // First free reclaims the buffer.
+            assert_eq!(frs_db_live_file_list_free(&mut list), FRS_STATUS_OK);
+            assert!(list.files.is_null());
+            assert_eq!(list.count, 0);
+            // Second free is a no-op (idempotent).
+            assert_eq!(frs_db_live_file_list_free(&mut list), FRS_STATUS_OK);
+            assert!(list.files.is_null());
+            assert_eq!(list.count, 0);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// NULL-pointer and bad-handle inputs to the live-file FFI surface
+    /// must return clean error codes rather than panicking.
+    #[test]
+    fn test_frs_db_get_live_files_null_args() {
+        unsafe {
+            // out=null → NULL_ARG.
+            assert_eq!(
+                frs_db_get_live_files(ptr::null_mut(), false, ptr::null_mut()),
+                FRS_STATUS_NULL_ARG
+            );
+            // db=null but out non-null → NULL_ARG (after zeroing out).
+            let mut list = FrsLiveFileList {
+                files: ptr::null_mut(),
+                count: 0,
+                manifest_size: 0,
+            };
+            assert_eq!(
+                frs_db_get_live_files(ptr::null_mut(), false, &mut list),
+                FRS_STATUS_NULL_ARG
+            );
+            assert!(list.files.is_null());
+            assert_eq!(list.count, 0);
         }
     }
 }

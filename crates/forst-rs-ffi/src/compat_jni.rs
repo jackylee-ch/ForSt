@@ -4586,12 +4586,17 @@ pub extern "system" fn Java_org_forstdb_RocksDB_releaseSnapshot<'local>(
 /// Java signature: `(JZ)Lorg/forstdb/RocksDB$LiveFiles;`
 ///
 /// Community ForSt returns a `LiveFiles` POJO bundling `files` (List<String>),
-/// `manifestFileSize` (long), and `currentSequenceNumber` (long). forst-rs
-/// has no per-file enumeration today — we emit a `LiveFiles` whose files
-/// list is empty (callers fall back to full-checkpoint restore) and whose
-/// sequence number reflects the live engine. If `flushMemtable` is true we
-/// honour it via [`frs_flush`] so the returned sequence number includes
-/// any pending writes.
+/// `manifestFileSize` (long), and `currentSequenceNumber` (long). We delegate
+/// per-file enumeration to [`crate::frs_db_get_live_files`], which walks the
+/// engine's current Version and returns one entry per live SST, then we
+/// adapt the result into the Java POJO Flink expects:
+///
+/// 1. allocate an `ArrayList<String>` and append every SST's absolute path,
+/// 2. construct `RocksDB$LiveFiles(files, manifestFileSize, currentSeq)`.
+///
+/// Memory: the underlying `FrsLiveFileList` is freed via
+/// [`crate::frs_db_live_file_list_free`] before we return — the JVM has
+/// already copied each path into a Java `String`.
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
     mut env: JNIEnv<'local>,
@@ -4604,25 +4609,41 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
             throw_rocksdb(env, "RocksDB.getLiveFiles: null DB handle");
             return ptr::null_mut();
         }
-        if flush_memtable != JNI_FALSE {
-            // SAFETY: handle came from a prior open.
-            let st = unsafe { crate::frs_flush(handle as FrsDb) };
-            if check_status(env, st, "RocksDB.getLiveFiles.flush") {
-                return ptr::null_mut();
-            }
+
+        // Step 1: enumerate live files (engine flushes if requested).
+        let mut list = crate::FrsLiveFileList {
+            files: ptr::null_mut(),
+            count: 0,
+            manifest_size: 0,
+        };
+        // SAFETY: handle came from a prior open; `&mut list` is stack-local.
+        let st = unsafe {
+            crate::frs_db_get_live_files(handle as FrsDb, flush_memtable != JNI_FALSE, &mut list)
+        };
+        if check_status(env, st, "RocksDB.getLiveFiles.enumerate") {
+            return ptr::null_mut();
         }
+
+        // Step 2: read the (possibly post-flush) sequence number.
         let mut seq: u64 = 0;
         // SAFETY: handle valid; out_seq stack-local.
         let st = unsafe { frs_sequence_number(handle as FrsDb, &mut seq) };
         if check_status(env, st, "RocksDB.getLiveFiles.seq") {
+            // SAFETY: list was filled by frs_db_get_live_files above.
+            unsafe {
+                let _ = crate::frs_db_live_file_list_free(&mut list);
+            }
             return ptr::null_mut();
         }
+
+        let count = list.count;
+        let manifest_size = list.manifest_size;
         tracing::debug!(
             target: "compat_jni::livefiles",
-            "RocksDB.getLiveFiles: forst-rs has no per-file enumeration; returning empty file list (seq_no={seq})"
+            "RocksDB.getLiveFiles: enumerated {count} SST file(s) (manifest={manifest_size}B, seq={seq})"
         );
 
-        // Build an empty ArrayList<String> for `files`.
+        // Step 3: build ArrayList<String> with every SST's absolute path.
         let arraylist_class = match env.find_class("java/util/ArrayList") {
             Ok(c) => c,
             Err(e) => {
@@ -4630,19 +4651,60 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
                     env,
                     &format!("getLiveFiles: find_class(ArrayList) failed: {e}"),
                 );
+                // SAFETY: list owned by us.
+                unsafe {
+                    let _ = crate::frs_db_live_file_list_free(&mut list);
+                }
                 return ptr::null_mut();
             }
         };
-        let files = match env.new_object(&arraylist_class, "()V", &[]) {
+        let files_obj = match env.new_object(&arraylist_class, "()V", &[]) {
             Ok(o) => o,
             Err(e) => {
                 throw_rocksdb(env, &format!("getLiveFiles: new ArrayList failed: {e}"));
+                // SAFETY: list owned by us.
+                unsafe {
+                    let _ = crate::frs_db_live_file_list_free(&mut list);
+                }
                 return ptr::null_mut();
             }
         };
 
-        // Construct LiveFiles via its public ctor.
-        // Most community shims expose `LiveFiles(List<String>, long, long)`.
+        // Walk every entry and add its path to the ArrayList.
+        if count > 0 && !list.files.is_null() {
+            // SAFETY: `list.files` is a valid pointer to `count` initialised
+            // entries produced by `into_ffi_list`.
+            let entries = unsafe { std::slice::from_raw_parts(list.files, count) };
+            for entry in entries {
+                if entry.path.is_null() {
+                    continue;
+                }
+                // SAFETY: path is a Rust-owned NUL-terminated CString.
+                let path_str = match unsafe { std::ffi::CStr::from_ptr(entry.path) }.to_str() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let jstr = match env.new_string(path_str) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let _ = env.call_method(
+                    &files_obj,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[jni::objects::JValue::Object(jstr.as_ref())],
+                );
+            }
+        }
+
+        // Step 4: free the FFI list — Java now owns the Strings.
+        // SAFETY: list was filled by frs_db_get_live_files above; freeing
+        // here is the documented one-and-only release.
+        unsafe {
+            let _ = crate::frs_db_live_file_list_free(&mut list);
+        }
+
+        // Step 5: construct LiveFiles via its `(List<String>, long, long)` ctor.
         let live_files_class = match env.find_class("org/forstdb/RocksDB$LiveFiles") {
             Ok(c) => c,
             Err(e) => {
@@ -4657,8 +4719,8 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
             &live_files_class,
             "(Ljava/util/List;JJ)V",
             &[
-                jni::objects::JValue::Object(files.as_ref()),
-                jni::objects::JValue::Long(0), // manifestFileSize
+                jni::objects::JValue::Object(files_obj.as_ref()),
+                jni::objects::JValue::Long(manifest_size as jlong),
                 jni::objects::JValue::Long(seq as jlong),
             ],
         ) {
@@ -4686,19 +4748,50 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
 ///
 /// Java signature: `(J)Ljava/util/List;`
 ///
-/// Always returns an empty `ArrayList` — forst-rs has no per-SST metadata
-/// surface. See module-level divergence note.
+/// We enumerate every live SST via [`crate::frs_db_get_live_files_metadata`],
+/// then attempt to construct one `LiveFileMetaData` per entry using its
+/// `(String columnFamilyName, int level, String fileName, String path,
+/// long size, long smallestSeqno, long largestSeqno, byte[] smallestKey,
+/// byte[] largestKey, long numReadsSampled, boolean beingCompacted,
+/// long numEntries, long numDeletions)` ctor (the standard
+/// community-RocksJava shape). Fields forst-rs does not currently track
+/// (smallest/largest keys, numReadsSampled, beingCompacted) are filled
+/// with documented placeholder values — Flink's incremental-restore code
+/// path only consumes `level`, `path` (or `fileName`), and `size`.
+///
+/// If the ctor's class is unavailable on the classpath we degrade to
+/// returning an empty list (preserving the previous behaviour) and log
+/// a debug-level note rather than throwing.
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesMetaData<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
+    handle: jlong,
 ) -> jni::sys::jobject {
     jni_guard(&mut env, ptr::null_mut, |env| -> jni::sys::jobject {
+        if handle == 0 {
+            throw_rocksdb(env, "RocksDB.getLiveFilesMetaData: null DB handle");
+            return ptr::null_mut();
+        }
+
+        // Step 1: enumerate.
+        let mut list = crate::FrsLiveFileList {
+            files: ptr::null_mut(),
+            count: 0,
+            manifest_size: 0,
+        };
+        // SAFETY: handle valid; out stack-local.
+        let st = unsafe { crate::frs_db_get_live_files_metadata(handle as FrsDb, &mut list) };
+        if check_status(env, st, "RocksDB.getLiveFilesMetaData.enumerate") {
+            return ptr::null_mut();
+        }
+        let count = list.count;
         tracing::debug!(
             target: "compat_jni::livefiles",
-            "RocksDB.getLiveFilesMetaData: returning empty list (forst-rs has no per-SST metadata)"
+            "RocksDB.getLiveFilesMetaData: enumerated {count} SST file(s)"
         );
+
+        // Step 2: build the ArrayList we'll return.
         let arraylist_class = match env.find_class("java/util/ArrayList") {
             Ok(c) => c,
             Err(e) => {
@@ -4706,19 +4799,135 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFilesMetaData<'local>(
                     env,
                     &format!("getLiveFilesMetaData: find_class(ArrayList) failed: {e}"),
                 );
+                // SAFETY: list owned by us.
+                unsafe {
+                    let _ = crate::frs_db_live_file_list_free(&mut list);
+                }
                 return ptr::null_mut();
             }
         };
-        match env.new_object(&arraylist_class, "()V", &[]) {
-            Ok(o) => o.into_raw(),
+        let result = match env.new_object(&arraylist_class, "()V", &[]) {
+            Ok(o) => o,
             Err(e) => {
                 throw_rocksdb(
                     env,
                     &format!("getLiveFilesMetaData: new ArrayList failed: {e}"),
                 );
-                ptr::null_mut()
+                // SAFETY: list owned by us.
+                unsafe {
+                    let _ = crate::frs_db_live_file_list_free(&mut list);
+                }
+                return ptr::null_mut();
+            }
+        };
+
+        // Step 3: per-entry — try to construct LiveFileMetaData. If the
+        // class is missing we still return the (possibly empty) list.
+        let lfm_class = env.find_class("org/forstdb/LiveFileMetaData").ok();
+        if lfm_class.is_none() {
+            tracing::debug!(
+                target: "compat_jni::livefiles",
+                "getLiveFilesMetaData: org.forstdb.LiveFileMetaData unavailable; returning empty list (Flink incremental-restore degrades to full copy)"
+            );
+            // SAFETY: list owned by us.
+            unsafe {
+                let _ = crate::frs_db_live_file_list_free(&mut list);
+            }
+            return result.into_raw();
+        }
+        let lfm_class = lfm_class.unwrap();
+
+        if count > 0 && !list.files.is_null() {
+            // SAFETY: `list.files` valid for `count` initialised entries.
+            let entries = unsafe { std::slice::from_raw_parts(list.files, count) };
+            for entry in entries {
+                if entry.path.is_null() || entry.cf_name.is_null() {
+                    continue;
+                }
+                // SAFETY: Rust-owned NUL-terminated CStrings.
+                let path_str = match unsafe { std::ffi::CStr::from_ptr(entry.path) }.to_str() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+                let cf_str = match unsafe { std::ffi::CStr::from_ptr(entry.cf_name) }.to_str() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => continue,
+                };
+                let file_basename = std::path::Path::new(&path_str)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(path_str.as_str())
+                    .to_string();
+
+                let cf_jstr = match env.new_string(&cf_str) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let path_jstr = match env.new_string(&path_str) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let file_jstr = match env.new_string(&file_basename) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                // Empty byte[] for smallest/largest key — engine does not
+                // expose them on the live-file FFI primitive today.
+                let empty_bytes = match env.new_byte_array(0) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+                let empty_bytes2 = match env.new_byte_array(0) {
+                    Ok(a) => a,
+                    Err(_) => continue,
+                };
+
+                let ctor_sig =
+                    "(Ljava/lang/String;ILjava/lang/String;Ljava/lang/String;JJJ[B[BJZJJ)V";
+                let args = [
+                    jni::objects::JValue::Object(cf_jstr.as_ref()),
+                    jni::objects::JValue::Int(entry.level as jint),
+                    jni::objects::JValue::Object(file_jstr.as_ref()),
+                    jni::objects::JValue::Object(path_jstr.as_ref()),
+                    jni::objects::JValue::Long(entry.size as jlong),
+                    jni::objects::JValue::Long(0), // smallestSeqno (not tracked separately)
+                    jni::objects::JValue::Long(entry.sequence as jlong),
+                    jni::objects::JValue::Object(empty_bytes.as_ref()),
+                    jni::objects::JValue::Object(empty_bytes2.as_ref()),
+                    jni::objects::JValue::Long(0), // numReadsSampled
+                    jni::objects::JValue::Bool(JNI_FALSE), // beingCompacted
+                    jni::objects::JValue::Long(0), // numEntries (not surfaced today)
+                    jni::objects::JValue::Long(0), // numDeletions
+                ];
+                let lfm = match env.new_object(&lfm_class, ctor_sig, &args) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "compat_jni::livefiles",
+                            "getLiveFilesMetaData: LiveFileMetaData ctor failed ({e}); skipping entry"
+                        );
+                        // Clear the pending Java exception so subsequent
+                        // calls don't trip on it.
+                        let _ = env.exception_clear();
+                        continue;
+                    }
+                };
+                let _ = env.call_method(
+                    &result,
+                    "add",
+                    "(Ljava/lang/Object;)Z",
+                    &[jni::objects::JValue::Object(lfm.as_ref())],
+                );
             }
         }
+
+        // Step 4: free FFI list now that Java owns the data.
+        // SAFETY: list was filled by frs_db_get_live_files_metadata.
+        unsafe {
+            let _ = crate::frs_db_live_file_list_free(&mut list);
+        }
+
+        result.into_raw()
     })
 }
 

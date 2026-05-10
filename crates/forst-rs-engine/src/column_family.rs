@@ -172,7 +172,18 @@ pub struct ColumnFamilyData {
     handle: ColumnFamilyHandle,
     options: CfOptions,
     merge_operator: Option<Arc<dyn MergeOperator>>,
-    compaction_filter: Option<Arc<dyn CompactionFilter>>,
+    /// Optional compaction filter, swappable so consumers can install /
+    /// replace it after the CF has been created (e.g. via the new
+    /// `frs_cf_set_compaction_filter_ttl` FFI export, which mirrors the
+    /// post-`open` configuration model that Flink's
+    /// `FlinkCompactionFilterFactory` ultimately needs to drive).
+    ///
+    /// Reads happen once per compaction-job assembly (NOT per emitted
+    /// key — the job captures a snapshot `Arc` and dispatches against it
+    /// for the entire job lifetime), so the `RwLock` cost is irrelevant.
+    /// `dyn CompactionFilter` is unsized so `ArcSwapOption` (which needs
+    /// `Sized` inner) is not an option here.
+    compaction_filter: RwLock<Option<Arc<dyn CompactionFilter>>>,
     active_memtable: RwLock<SharedMemTable>,
     imm_list: RwLock<Vec<SharedMemTable>>,
     cached_snapshot_view: ArcSwap<SnapshotView>,
@@ -234,7 +245,7 @@ impl ColumnFamilyData {
             handle,
             options,
             merge_operator,
-            compaction_filter,
+            compaction_filter: RwLock::new(compaction_filter),
             active_memtable: RwLock::new(memtable),
             imm_list: RwLock::new(Vec::new()),
             cached_snapshot_view: ArcSwap::new(initial_snapshot),
@@ -258,9 +269,31 @@ impl ColumnFamilyData {
         self.merge_operator.as_ref()
     }
 
-    /// Returns the configured compaction filter, if any.
-    pub fn compaction_filter(&self) -> Option<&Arc<dyn CompactionFilter>> {
-        self.compaction_filter.as_ref()
+    /// Returns a snapshot of the currently installed compaction filter.
+    ///
+    /// Compaction job assembly calls this every time it builds a job; the
+    /// returned `Arc` is then handed to the job and is the snapshot used
+    /// for that entire job's lifetime — racing
+    /// [`Self::set_compaction_filter`] against an in-flight compaction
+    /// will affect subsequent jobs but never the one already running.
+    pub fn compaction_filter(&self) -> Option<Arc<dyn CompactionFilter>> {
+        self.compaction_filter
+            .read()
+            .expect("compaction_filter lock poisoned")
+            .clone()
+    }
+
+    /// Installs (or replaces) the compaction filter on this CF.
+    ///
+    /// `filter = None` clears the slot back to "no filter" (every entry is
+    /// emitted unchanged). The next compaction job built for this CF will
+    /// observe the new value; in-flight jobs run to completion against
+    /// whatever snapshot they captured.
+    pub fn set_compaction_filter(&self, filter: Option<Arc<dyn CompactionFilter>>) {
+        *self
+            .compaction_filter
+            .write()
+            .expect("compaction_filter lock poisoned") = filter;
     }
 
     /// Returns a clone of the active memtable `Arc`. Callers can then acquire
