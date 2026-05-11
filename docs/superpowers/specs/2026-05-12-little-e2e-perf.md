@@ -85,9 +85,51 @@ env.fromSequence(1, N).keyBy(x -> x % 100).flatMap(SumState).discard()
 
 ## Results
 
-[populated post-run from the `little-e2e-results` GHA artifact +
-`little-e2e.log` — appended once the workflow has been triggered with a
-non-zero events budget]
+Run `25693835571` on `1b6f95002c2` (forst-rs-jdk25, 2026-05-12):
+
+| Backend variant | Events | elapsed_ms | throughput (eps) | status |
+|---|---:|---:|---:|---|
+| `rocksdb` (EmbeddedRocksDBStateBackend) | 100,000 | 769.86 | **129,893** | ✅ |
+| `forst` (community libforstjni) | — | — | — | ❌ `NoSuchMethodError: org.forstdb.RocksDB.loadLibrary()` — see below |
+| `forst (libforstjni → libforst_rs_ffi)` | — | — | — | ❌ same root cause as variant 2 (uses same SPI factory) |
+| `forst-rs` (ForStRsStateBackendFactory, FFM) | 100,000 | 1111.73 | **89,950** | ✅ |
+
+### Reading the numbers
+
+- **rocksdb vs forst-rs ratio**: rocksdb is **1.44× faster** on this
+  workload (or equivalently, forst-rs is **0.69×** rocksdb's throughput).
+- This is a small workload (100k events, parallelism=2, no checkpointing,
+  no async state API) — the per-event state-access path dominates wall
+  time. The forst-rs gap vs rocksdb comes primarily from the FFM hop
+  overhead (vs rocksdb's bundled JNI lib) at this workload size.
+- The bench's per-event amortised cost works out to:
+  - rocksdb: 7.7 µs/event
+  - forst-rs: 11.1 µs/event
+- The earlier P5 JMH engine-side bench showed forst-rs at **~4× faster
+  than RocksDB** on engine-only point lookups (0.125 µs P99 dbSnapshot
+  + 5.96 µs P95 sync-phase). The gap between engine-level wins and
+  through-Flink wall-time is the Flink runtime overhead (key context
+  setup, key-group encoding, namespace serialisation, scheduler
+  interaction). Reducing that gap is the focus of follow-up work
+  (B-Prod-followup-L7 incremental checkpoint via SPI surfaces some of
+  this overhead).
+
+### Variant 2 + 3 failure cause
+
+Both variants use the `org.apache.flink.state.forst.ForStStateBackendFactory`
+SPI factory. Its initialization path calls `org.forstdb.RocksDB.loadLibrary()`
+which fails with `NoSuchMethodError` because the transitive
+`com.ververica:forstjni:0.1.8` dep doesn't expose that method signature on
+its `RocksDB` class. This is an **upstream API mismatch** within
+`flink-statebackend-forst` + the `com.ververica:forstjni` artifact it pulls
+in — NOT caused by anything in this branch's forst-rs work.
+
+Tracking: `B-Prod-followup-CommunityForstJni` — pin or replace
+`com.ververica:forstjni:0.1.8` with a version compatible with
+`flink-statebackend-forst.ForStStateBackend.ensureForStIsLoaded()`. Variant
+3 (libswap) is gated on variant 2 working — once variant 2 produces
+numbers, the libswap variant will too (same factory, just with
+`-Djava.library.path` pointing at libforst_rs_ffi-renamed-libforstjni).
 
 ## Notes
 
