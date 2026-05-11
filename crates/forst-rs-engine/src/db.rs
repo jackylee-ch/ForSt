@@ -65,6 +65,16 @@ static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
 /// stalls writers when imm count >= the configured cap.
 const FLUSH_QUEUE_CAPACITY: usize = 64;
 
+/// Cadence at which the snapshot-age ticker polls
+/// [`SnapshotRegistry::check_long_lived`] (spec §6a.3). One second is
+/// far below the 5-minute default warn threshold, so the worst-case
+/// detection latency after a snapshot first crosses the line is ~1 s —
+/// well inside any operator-actionable timeframe. Bounded to avoid
+/// log spam: the warn is RATE-LIMITED INSIDE the ticker by only emitting
+/// when `check_long_lived` returns `Some(...)`, which already requires
+/// a snapshot to be live past the threshold.
+const SNAPSHOT_AGE_TICK_MS: u64 = 1_000;
+
 /// Name of the default column family (always id 0).
 pub const DEFAULT_CF_NAME: &str = "default";
 
@@ -185,6 +195,19 @@ pub struct DbImpl {
     /// rather than blocking, matching RocksDB's `allow_stall=false`
     /// default.
     write_buffer_manager: Arc<WriteBufferManager>,
+    /// Background ticker that periodically calls
+    /// [`SnapshotRegistry::check_long_lived`] and emits a `tracing::warn!`
+    /// when a snapshot has exceeded its `max_age_ms` warn-line
+    /// (spec §6a.3). Per spec the engine NEVER auto-releases the
+    /// snapshot — this is a WARN-only path; the operator runbook is the
+    /// remediation surface. `Some` while the engine is alive; taken and
+    /// joined in [`Drop`] for clean shutdown.
+    snapshot_age_worker: Mutex<Option<JoinHandle<()>>>,
+    /// Signal that tells the snapshot-age ticker to stop and exit. The
+    /// ticker checks this between sleeps; setting it to `true` and
+    /// then joining drains the thread within the configured tick
+    /// interval (currently 1 second, see `SNAPSHOT_AGE_TICK_MS`).
+    snapshot_age_shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DbImpl {
@@ -257,11 +280,14 @@ impl DbImpl {
             db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
             block_cache,
             write_buffer_manager,
+            snapshot_age_worker: Mutex::new(None),
+            snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
         Self::spawn_flush_worker(&db);
+        Self::spawn_snapshot_age_worker(&db);
         Ok(db)
     }
 
@@ -514,6 +540,28 @@ impl DbImpl {
     /// See spec §6a.2.
     pub fn snapshot_registry(&self) -> &Arc<SnapshotRegistry> {
         &self.snapshot_registry
+    }
+
+    /// Sets the snapshot warn-line threshold in milliseconds (spec §6a.3).
+    ///
+    /// Effects the next tick of the background snapshot-age worker; the
+    /// worker emits a `tracing::warn!` for every period in which a
+    /// pinned snapshot has been alive longer than this threshold.
+    /// Defaults to [`crate::mvcc::DEFAULT_MAX_AGE_MS`] (5 minutes).
+    /// Per spec the engine NEVER auto-releases — this is WARN-only.
+    pub fn set_snapshot_max_age_ms(&self, ms: u64) {
+        self.snapshot_registry.set_max_age_ms(ms);
+    }
+
+    /// One-shot read of the snapshot-age warn condition (spec §6a.3).
+    /// Returns `Some(...)` when at least one pinned snapshot has been
+    /// alive longer than the configured `max_age_ms`. Intended for
+    /// FFI / test drivers that want to poll the registry on their own
+    /// cadence; the engine's own background ticker calls this method
+    /// every `SNAPSHOT_AGE_TICK_MS` (~1 s, private constant) and emits
+    /// a warn line on each non-`None` return.
+    pub fn check_long_lived_snapshots(&self) -> Option<crate::mvcc::SnapshotAgeWarning> {
+        self.snapshot_registry.check_long_lived()
     }
 
     /// Returns the process-monotonic `DbId` stamped onto every snapshot
@@ -1492,11 +1540,14 @@ impl DbImpl {
             db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
             block_cache,
             write_buffer_manager,
+            snapshot_age_worker: Mutex::new(None),
+            snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
         Self::spawn_flush_worker(&db);
+        Self::spawn_snapshot_age_worker(&db);
         Ok(db)
     }
 
@@ -2178,6 +2229,60 @@ impl DbImpl {
             })
             .expect("failed to spawn flush worker thread");
         *db.flush_worker.lock().expect("lock poisoned") = Some(handle);
+    }
+
+    /// Spawns the background snapshot-age ticker (spec §6a.3).
+    ///
+    /// The ticker runs at [`SNAPSHOT_AGE_TICK_MS`] cadence and emits a
+    /// `tracing::warn!` line for every period in which the snapshot
+    /// registry reports at least one snapshot past its `max_age_ms`
+    /// warn-line. Per spec the worker NEVER auto-releases the offending
+    /// snapshot — doing so would silently break the reader's correctness
+    /// contract (a `Snapshot` pinned at seq S guarantees its versions
+    /// remain readable for as long as the handle is alive; auto-releasing
+    /// would let compaction reclaim those versions while a Java-side
+    /// reader still references them). The remediation surface is the
+    /// operator runbook, which is exactly what the warn line points at.
+    ///
+    /// Exit path: the worker checks `snapshot_age_shutdown` between
+    /// sleeps; [`Drop`] sets the flag and joins, draining within one
+    /// tick (~1 s) of shutdown.
+    fn spawn_snapshot_age_worker(db: &Arc<Self>) {
+        let weak: Weak<DbImpl> = Arc::downgrade(db);
+        let shutdown = Arc::clone(&db.snapshot_age_shutdown);
+        let handle = std::thread::Builder::new()
+            .name("forst-rs-snap-age".to_string())
+            .spawn(move || {
+                loop {
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    // Sleep first so a fresh-open engine doesn't fire a
+                    // spurious warn on the first tick before any
+                    // snapshot has had time to age.
+                    std::thread::sleep(std::time::Duration::from_millis(SNAPSHOT_AGE_TICK_MS));
+                    let Some(db) = weak.upgrade() else {
+                        return;
+                    };
+                    if let Some(w) = db.snapshot_registry.check_long_lived() {
+                        // Emit structured fields so a log aggregator can
+                        // index by seq / db_id. The Display impl gives a
+                        // human-readable summary; we include both so the
+                        // operator gets the runbook hint inline.
+                        tracing::warn!(
+                            seq = w.seq.value(),
+                            db_id = w.db_id.0,
+                            age_ms = w.age_ms,
+                            max_age_ms = w.max_age_ms,
+                            hint = w.hint,
+                            "{}",
+                            w
+                        );
+                    }
+                }
+            })
+            .expect("failed to spawn snapshot-age worker thread");
+        *db.snapshot_age_worker.lock().expect("lock poisoned") = Some(handle);
     }
 
     /// Pushes a flush request onto the background queue. The writer never
@@ -2867,6 +2972,27 @@ impl Drop for DbImpl {
         if let Some(h) = handle {
             if let Err(e) = h.join() {
                 eprintln!("forst-rs: flush worker panicked during shutdown: {:?}", e);
+            }
+        }
+
+        // 4. Signal the snapshot-age ticker to stop. The worker checks
+        //    this flag between sleeps so the join below resolves within
+        //    one tick (~1 s by default). Same panic-on-thread-poison
+        //    discipline as the flush worker: log instead of abort so
+        //    one bad thread doesn't tear down the whole runtime.
+        self.snapshot_age_shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        let snap_handle = self
+            .snapshot_age_worker
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        if let Some(h) = snap_handle {
+            if let Err(e) = h.join() {
+                eprintln!(
+                    "forst-rs: snapshot-age worker panicked during shutdown: {:?}",
+                    e
+                );
             }
         }
     }
@@ -4527,4 +4653,5 @@ mod tests {
             "expected InvalidArgument for cross-DB snapshot, got Ok"
         );
     }
+
 }

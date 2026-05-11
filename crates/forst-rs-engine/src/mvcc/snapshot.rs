@@ -31,11 +31,71 @@
 //! `captured_at.elapsed().as_millis()` (B-Prod-P0 Task 0.5; spec §6a.3).
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use forst_rs_common::types::SequenceNumber;
+
+/// Default warn-line for long-lived snapshots, in milliseconds. Per spec
+/// §6a.3 — 5 minutes balances "alert before the operator falls asleep"
+/// against "don't spam logs for a normal-length checkpoint".
+pub const DEFAULT_MAX_AGE_MS: u64 = 5 * 60 * 1_000;
+
+/// Operator runbook hint embedded in [`SnapshotAgeWarning`]'s `Display`
+/// impl so a log line is self-contained. Centralized as a constant so
+/// any docs that reference the hint string can stay in lock-step.
+pub const SNAPSHOT_AGE_HINT: &str = "long-lived snapshot is pinning versions \
+    — check the operator runbook (spec §6a.3) for safe-release procedure; \
+    auto-release is intentionally disabled because dropping a live snapshot \
+    silently breaks the reader's correctness contract";
+
+/// Diagnostic returned by [`SnapshotRegistry::check_long_lived`] when any
+/// pinned snapshot has been alive longer than the configured `max_age_ms`.
+///
+/// Carrying the seq + DB id makes the warning actionable — an operator
+/// reading the log line can grep their own audit trail for the same `seq`
+/// to find the call site that captured the snapshot but never released
+/// it. The `Display` impl produces the exact text emitted by the engine's
+/// periodic check; consumers SHOULD NOT format it themselves so the wire
+/// format stays stable across releases.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotAgeWarning {
+    /// Sequence number of the offending snapshot.
+    pub seq: SequenceNumber,
+    /// DB id the snapshot was captured against (spec §15 "Same-DB").
+    pub db_id: DbId,
+    /// Wall-clock milliseconds since the snapshot was captured. Always
+    /// `> max_age_ms` when this struct is constructed; we surface it
+    /// rather than letting callers re-derive it so the warn line reports
+    /// the same value the threshold check used.
+    pub age_ms: u64,
+    /// The threshold that was exceeded. Included so a log aggregator
+    /// can correlate the warn against any subsequent `set_max_age_ms`
+    /// reconfiguration without having to query the engine.
+    pub max_age_ms: u64,
+    /// Static hint pointing operators at the runbook. Stored as `&'static
+    /// str` because [`SNAPSHOT_AGE_HINT`] is the only producer today and
+    /// callers should never customize it (the message is a stable docs
+    /// landmark).
+    pub hint: &'static str,
+}
+
+impl fmt::Display for SnapshotAgeWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "snapshot age exceeds max_age_ms: seq={}, db_id={}, \
+             age_ms={}, max_age_ms={}; hint: {}",
+            self.seq.value(),
+            self.db_id.0,
+            self.age_ms,
+            self.max_age_ms,
+            self.hint
+        )
+    }
+}
 
 /// Opaque DB instance identifier.
 ///
@@ -56,6 +116,13 @@ struct RegistryEntry {
     /// captures at the same seq do NOT refresh this — the oldest pin
     /// is what matters for `oldest_age_ms` accounting.
     captured_at: Instant,
+    /// DB id of the *first* capture at this seq. In practice every
+    /// capture against a given registry uses the same `DbId` (the
+    /// registry is owned by one [`crate::DbImpl`]), so this is always
+    /// the issuing DB's id; storing it here lets
+    /// [`SnapshotRegistry::check_long_lived`] surface it without
+    /// needing a backref from the entry to the caller.
+    db_id: DbId,
 }
 
 /// RAII snapshot handle. `Drop` releases the ref-count back to the issuing
@@ -113,6 +180,13 @@ pub struct SnapshotRegistry {
     /// `active` lock on every capture/release transition that changes
     /// the minimum. Stale reads are SAFER than truth — see module docs.
     cached_min: AtomicU64,
+    /// Warn-line threshold (ms) consulted by [`Self::check_long_lived`].
+    /// Defaults to [`DEFAULT_MAX_AGE_MS`] (5 minutes per spec §6a.3).
+    /// `Relaxed` ordering is fine — the threshold is read on a slow
+    /// operator-facing path; transient staleness after a `set_max_age_ms`
+    /// call is acceptable (the next periodic tick picks up the new
+    /// value).
+    max_age_ms: AtomicU64,
 }
 
 impl SnapshotRegistry {
@@ -123,6 +197,7 @@ impl SnapshotRegistry {
         Arc::new(Self {
             active: Mutex::new(BTreeMap::new()),
             cached_min: AtomicU64::new(u64::MAX),
+            max_age_ms: AtomicU64::new(DEFAULT_MAX_AGE_MS),
         })
     }
 
@@ -149,6 +224,7 @@ impl SnapshotRegistry {
                         RegistryEntry {
                             ref_count: AtomicUsize::new(1),
                             captured_at: now,
+                            db_id,
                         },
                     );
                 }
@@ -256,6 +332,68 @@ impl SnapshotRegistry {
             return 0;
         }
         walker(min)
+    }
+
+    /// Sets the warn-line threshold (ms) consulted by
+    /// [`Self::check_long_lived`]. Pass `0` to effectively disable the
+    /// warn-line (every check returns `Some(...)` immediately because
+    /// any positive age exceeds `0`); callers that want to disable the
+    /// check should simply stop calling `check_long_lived` instead.
+    ///
+    /// Threshold updates are not retroactive: a snapshot that has
+    /// already aged past the OLD threshold and been warned once will
+    /// only re-warn after a subsequent check at the new threshold;
+    /// emission cadence is owned by the caller (the registry stays
+    /// stateless wrt. warn-rate-limiting).
+    pub fn set_max_age_ms(&self, ms: u64) {
+        // `Relaxed`: see field-level doc on `max_age_ms`.
+        self.max_age_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Returns the current warn-line threshold in milliseconds.
+    pub fn max_age_ms(&self) -> u64 {
+        self.max_age_ms.load(Ordering::Relaxed)
+    }
+
+    /// Returns `Some(warning)` when at least one pinned snapshot has been
+    /// alive longer than the configured `max_age_ms`. The returned
+    /// warning references the OLDEST offending snapshot (BTreeMap order
+    /// is by seq, which is the order snapshots were captured under
+    /// monotonic-seq writes; the first hit at the lowest seq is the
+    /// most-aged in practice). Returns `None` when the registry is
+    /// empty OR no snapshot has exceeded the threshold.
+    ///
+    /// Behavior: WARN-ONLY. Per spec §6a.3 the registry NEVER auto-
+    /// releases a snapshot — doing so would silently break the reader's
+    /// correctness contract (a `Snapshot` pinned at seq S guarantees
+    /// every version visible at S remains readable for the snapshot's
+    /// lifetime; auto-releasing would let compaction reclaim those
+    /// versions while a Java-side reader still holds the handle). The
+    /// fix is operator action (find the leaker, release it) — this
+    /// method just surfaces enough context to drive that action.
+    ///
+    /// Cost: O(n) walk over live distinct seqs under the `active` lock.
+    /// Operator-facing path — not on the compaction hot path. Callers
+    /// should rate-limit invocations (e.g. once per second on a
+    /// background tick), NOT call this from every read or write.
+    pub fn check_long_lived(&self) -> Option<SnapshotAgeWarning> {
+        let max = self.max_age_ms.load(Ordering::Relaxed);
+        let guard = self.active.lock().expect("SnapshotRegistry mutex poisoned");
+        // Walk in BTreeMap (seq-ascending) order so we return the first
+        // (oldest) hit deterministically.
+        for (seq, entry) in guard.iter() {
+            let age = u64::try_from(entry.captured_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if age > max {
+                return Some(SnapshotAgeWarning {
+                    seq: *seq,
+                    db_id: entry.db_id,
+                    age_ms: age,
+                    max_age_ms: max,
+                    hint: SNAPSHOT_AGE_HINT,
+                });
+            }
+        }
+        None
     }
 
     /// Recomputes `cached_min` from the current `active` map. Called
@@ -385,6 +523,87 @@ mod tests {
         let reg = SnapshotRegistry::new();
         let estimate = reg.pinned_bytes_estimate(|_min_seq| 0);
         assert_eq!(estimate, 0);
+    }
+
+    /// Followup 1 (spec §6a.3): under-threshold returns None.
+    #[test]
+    fn check_long_lived_under_threshold_returns_none() {
+        let reg = SnapshotRegistry::new();
+        // Default warn-line is 5 minutes; a freshly-captured snapshot
+        // is well under that — even a slow CI runner won't burn 5
+        // minutes between the capture and this call.
+        let _snap = reg.capture(DbId(7), seq(1));
+        assert_eq!(reg.check_long_lived(), None);
+    }
+
+    /// Followup 1 (spec §6a.3): over-threshold returns Some with the
+    /// right fields, and Display contains the operator-runbook hint.
+    #[test]
+    fn check_long_lived_over_threshold_returns_warning() {
+        let reg = SnapshotRegistry::new();
+        // Set a small threshold so the test doesn't have to sleep
+        // minutes — 5 ms is comfortably above timer noise on every
+        // supported platform.
+        reg.set_max_age_ms(5);
+        let _snap = reg.capture(DbId(42), seq(99));
+        thread::sleep(Duration::from_millis(20));
+        let warn = reg.check_long_lived().expect("should warn after sleep");
+        assert_eq!(warn.seq, seq(99));
+        assert_eq!(warn.db_id, DbId(42));
+        assert!(
+            warn.age_ms >= 20,
+            "age_ms should be at least the sleep duration, got {}",
+            warn.age_ms
+        );
+        assert_eq!(warn.max_age_ms, 5);
+        assert_eq!(warn.hint, SNAPSHOT_AGE_HINT);
+        // Sanity-check the Display impl includes the seq, db_id, and
+        // hint so a log scraper finds the expected landmarks.
+        let rendered = warn.to_string();
+        assert!(
+            rendered.contains("seq=99"),
+            "Display missing seq: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("db_id=42"),
+            "Display missing db_id: {}",
+            rendered
+        );
+        assert!(
+            rendered.contains("hint:"),
+            "Display missing hint label: {}",
+            rendered
+        );
+    }
+
+    /// Followup 1 (spec §6a.3): the setter changes the threshold
+    /// dynamically and subsequent checks honor the new value.
+    #[test]
+    fn check_long_lived_threshold_is_dynamic() {
+        let reg = SnapshotRegistry::new();
+        // Start with the warn-line WAY above the test's sleep budget;
+        // a 1-hour threshold means check_long_lived returns None even
+        // after a substantial sleep.
+        reg.set_max_age_ms(60 * 60 * 1_000);
+        assert_eq!(reg.max_age_ms(), 60 * 60 * 1_000);
+        let _snap = reg.capture(DbId(0), seq(123));
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            reg.check_long_lived(),
+            None,
+            "should NOT warn under 1h threshold"
+        );
+
+        // Dial the threshold down — the same snapshot is now over
+        // the limit.
+        reg.set_max_age_ms(1);
+        assert_eq!(reg.max_age_ms(), 1);
+        let warn = reg
+            .check_long_lived()
+            .expect("should warn after lowering threshold");
+        assert_eq!(warn.seq, seq(123));
+        assert_eq!(warn.max_age_ms, 1);
     }
 
     #[test]
