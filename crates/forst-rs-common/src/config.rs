@@ -235,6 +235,20 @@ pub struct EngineOptions {
     /// values fall back to modulus. Clamped to `[1, 256]` by the
     /// `ShardedMemTable` constructor (0 → default).
     pub memtable_shards: usize,
+
+    /// Total capacity of the shared LRU block cache in bytes (B-Prod-P7,
+    /// spec §6d). When non-zero this overrides [`Self::block_cache_size`]
+    /// (the legacy field name) when constructing the engine's shared block
+    /// cache. Default: 256 MiB. Set to 0 to fall back to
+    /// `block_cache_size`.
+    pub block_cache_capacity_bytes: u64,
+
+    /// Total memtable budget across all CFs in bytes (WriteBufferManager —
+    /// B-Prod-P7, spec §6d). When non-zero, the engine tracks the running
+    /// sum of per-CF memtable bytes and triggers flush of the largest CF
+    /// once the budget is exceeded. Default: 512 MiB. Set to 0 to disable
+    /// (per-CF `write_buffer_size` is the only ceiling).
+    pub write_buffer_manager_capacity_bytes: u64,
 }
 
 impl Default for EngineOptions {
@@ -255,6 +269,9 @@ impl Default for EngineOptions {
             enable_statistics: true,
             db_path: String::new(),
             memtable_shards: 16,
+            // B-Prod-P7 §6d defaults: 256 MiB block cache, 512 MiB WBM.
+            block_cache_capacity_bytes: 256 * 1024 * 1024,
+            write_buffer_manager_capacity_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -537,6 +554,27 @@ impl EngineOptions {
                 MAX_BACKGROUND_THREADS, self.max_background_flushes
             )));
         }
+        // B-Prod-P7 §6d: cap the new u64 cache + WBM knobs at the same
+        // 1 PiB ceiling that bounds the legacy `block_cache_size` axis so
+        // the FFI / RPC surface that fills `FrsEngineOptions` cannot
+        // request a multi-EiB allocation that would saturate `usize` on a
+        // 64-bit host. 0 = "use engine default / disabled" and is allowed.
+        if self.block_cache_capacity_bytes != 0
+            && self.block_cache_capacity_bytes > MAX_BLOCK_CACHE_SIZE as u64
+        {
+            return Err(ForstError::invalid_argument(format!(
+                "block_cache_capacity_bytes must be ≤ {} bytes (1 PiB), got {}",
+                MAX_BLOCK_CACHE_SIZE, self.block_cache_capacity_bytes
+            )));
+        }
+        if self.write_buffer_manager_capacity_bytes != 0
+            && self.write_buffer_manager_capacity_bytes > MAX_BLOCK_CACHE_SIZE as u64
+        {
+            return Err(ForstError::invalid_argument(format!(
+                "write_buffer_manager_capacity_bytes must be ≤ {} bytes (1 PiB), got {}",
+                MAX_BLOCK_CACHE_SIZE, self.write_buffer_manager_capacity_bytes
+            )));
+        }
         Ok(())
     }
 }
@@ -648,6 +686,22 @@ impl EngineOptionsBuilder {
     /// Sets the number of shards in the active memtable (E1).
     pub fn memtable_shards(mut self, n: usize) -> Self {
         self.inner.memtable_shards = n;
+        self
+    }
+
+    /// Sets the shared LRU block cache capacity in bytes (B-Prod-P7,
+    /// spec §6d). Overrides the legacy [`Self::block_cache_size`] when
+    /// non-zero. Pass 0 to fall back to the legacy field.
+    pub fn block_cache_capacity_bytes(mut self, bytes: u64) -> Self {
+        self.inner.block_cache_capacity_bytes = bytes;
+        self
+    }
+
+    /// Sets the cross-CF memtable budget (WriteBufferManager) in bytes
+    /// (B-Prod-P7, spec §6d). Pass 0 to disable the cross-CF cap (each
+    /// CF still respects its own `write_buffer_size`).
+    pub fn write_buffer_manager_capacity_bytes(mut self, bytes: u64) -> Self {
+        self.inner.write_buffer_manager_capacity_bytes = bytes;
         self
     }
 
@@ -968,6 +1022,46 @@ mod tests {
         let opts = EngineOptions::default();
         assert_eq!(opts.block_cache_size, 256 * 1024 * 1024);
         assert_eq!(opts.block_size, 64 * 1024);
+    }
+
+    #[test]
+    fn test_engine_options_default_bprod_p7_runtime_tuning_knobs() {
+        // B-Prod-P7 spec §6d: cache + WBM defaults exposed for FFI tuning.
+        let opts = EngineOptions::default();
+        assert_eq!(opts.block_cache_capacity_bytes, 256 * 1024 * 1024);
+        assert_eq!(opts.write_buffer_manager_capacity_bytes, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_builder_sets_bprod_p7_runtime_tuning_knobs() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/test-db")
+            .block_cache_capacity_bytes(1024 * 1024 * 1024)
+            .write_buffer_manager_capacity_bytes(2 * 1024 * 1024 * 1024)
+            .build();
+        assert_eq!(opts.block_cache_capacity_bytes, 1024 * 1024 * 1024);
+        assert_eq!(
+            opts.write_buffer_manager_capacity_bytes,
+            2 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_oversize_bprod_p7_block_cache_capacity() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/test-db")
+            .block_cache_capacity_bytes((MAX_BLOCK_CACHE_SIZE as u64) + 1)
+            .build();
+        assert!(opts.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_oversize_bprod_p7_wbm_capacity() {
+        let opts = EngineOptions::builder()
+            .db_path("/tmp/test-db")
+            .write_buffer_manager_capacity_bytes((MAX_BLOCK_CACHE_SIZE as u64) + 1)
+            .build();
+        assert!(opts.validate().is_err());
     }
 
     #[test]

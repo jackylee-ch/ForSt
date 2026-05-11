@@ -569,6 +569,163 @@ fn uri_str_hash(uri: &str) -> u64 {
 #[allow(dead_code)]
 const _PATH_USAGE: fn(&Path) = |_| {};
 
+// ---------------------------------------------------------------------------
+// 1b. Structured open (B-Prod-P7, spec §6d)
+// ---------------------------------------------------------------------------
+
+/// Opaque structured config passed to [`frs_db_open_with_options`].
+///
+/// **ABI stability**: this struct is `repr(C)` and **append-only** — future
+/// fields will be added at the end so that consumers built against an older
+/// header continue to work after a forst-rs upgrade. Existing fields will
+/// never be removed, reordered, or have their semantics changed; the
+/// `cdylib` versioning policy treats any incompatible edit to this struct
+/// as a breaking change.
+///
+/// Field semantics:
+///
+/// | Field | `0` means | Non-zero means |
+/// |---|---|---|
+/// | `db_path` (`*const c_char`, NUL-terminated UTF-8) | open in-memory under `/db` | open at the given filesystem path with `LocalFileSystem` |
+/// | `write_buffer_size` | use engine default (64 MiB) | use this value (clamped by `EngineOptions::validate`) |
+/// | `max_write_buffer_number` | use engine default (3) | use this value |
+/// | `max_background_compactions` | use engine default (4) | use this value |
+/// | `max_background_flushes` | use engine default (2) | use this value |
+/// | `block_cache_capacity_bytes` | use engine default (256 MiB) | size the shared LRU at this many bytes |
+/// | `write_buffer_manager_capacity_bytes` | use engine default (512 MiB) | cap cross-CF memtable bytes at this many bytes |
+///
+/// All `0` is therefore "open with all defaults" — equivalent to
+/// [`frs_db_open_memory`] when `db_path` is also null.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FrsEngineOptions {
+    /// Filesystem path for the database directory (NUL-terminated UTF-8).
+    /// `null` opens an in-memory engine at `/db`.
+    pub db_path: *const c_char,
+    /// Per-CF memtable size in bytes. `0` = engine default.
+    pub write_buffer_size: u64,
+    /// Per-CF max memtable count (active + sealed). `0` = engine default.
+    pub max_write_buffer_number: u32,
+    /// Background compaction threads. `0` = engine default.
+    pub max_background_compactions: u32,
+    /// Background flush threads. `0` = engine default.
+    pub max_background_flushes: u32,
+    /// Shared LRU block cache capacity in bytes. `0` = engine default
+    /// (256 MiB; spec §6d).
+    pub block_cache_capacity_bytes: u64,
+    /// Cross-CF memtable budget in bytes (WriteBufferManager).
+    /// `0` = engine default (512 MiB; spec §6d).
+    pub write_buffer_manager_capacity_bytes: u64,
+}
+
+/// Opens a new engine using a structured options blob. Backwards-compatible
+/// way to extend the FFI tuning surface without breaking the
+/// [`frs_db_open_memory_tuned`] positional ABI (B-Prod-P7, spec §6d).
+///
+/// The `opts` pointer is read but not retained — the caller may free the
+/// struct (and any `db_path` it points to) as soon as this function
+/// returns. On success, writes the new `FrsDb` handle into `*out_handle`
+/// and returns `FRS_STATUS_OK`.
+///
+/// # SAFETY
+/// - `opts` must be either null OR point to a valid, fully-initialised
+///   `FrsEngineOptions` for the duration of this call.
+/// - When `opts.db_path` is non-null, it must be a NUL-terminated UTF-8
+///   string valid for the duration of this call.
+/// - `out_handle` must be a valid pointer to a `FrsDb` slot.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_with_options(
+    opts: *const FrsEngineOptions,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if out_handle.is_null() || opts.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let cfg = &*opts;
+
+        let mut builder = forst_rs_common::EngineOptions::builder();
+
+        // db_path: null → in-memory at /db; non-null → on-disk path.
+        let path_ref = cfg.db_path;
+        let (db_path, in_memory) = match cstr_to_str(&path_ref) {
+            Some(p) if !p.is_empty() => (p.to_string(), false),
+            _ => ("/db".to_string(), true),
+        };
+        builder = builder.db_path(db_path);
+
+        if cfg.write_buffer_size != 0 {
+            builder = builder.write_buffer_size(cfg.write_buffer_size as usize);
+        }
+        if cfg.max_write_buffer_number != 0 {
+            builder = builder.max_write_buffer_number(cfg.max_write_buffer_number as usize);
+        }
+        if cfg.max_background_compactions != 0 {
+            builder = builder.max_background_compactions(cfg.max_background_compactions as usize);
+        }
+        if cfg.max_background_flushes != 0 {
+            builder = builder.max_background_flushes(cfg.max_background_flushes as usize);
+        }
+        if cfg.block_cache_capacity_bytes != 0 {
+            builder = builder.block_cache_capacity_bytes(cfg.block_cache_capacity_bytes);
+        }
+        if cfg.write_buffer_manager_capacity_bytes != 0 {
+            builder = builder
+                .write_buffer_manager_capacity_bytes(cfg.write_buffer_manager_capacity_bytes);
+        }
+
+        let engine_opts = match builder.try_build() {
+            Ok(o) => o,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+
+        let fs: Arc<dyn FileSystem> = if in_memory {
+            Arc::new(MemoryFileSystem::new())
+        } else {
+            Arc::new(LocalFileSystem::new())
+        };
+
+        match DbImpl::open_with_fs(engine_opts, fs) {
+            Ok(db) => {
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Returns the configured WriteBufferManager capacity for the engine, or
+/// `0` when the manager is unbounded. Diagnostic accessor wired to the
+/// Java FFM tuning surface (B-Prod-P7, spec §6d). Returns `0` for a null
+/// or already-closed handle.
+///
+/// # SAFETY
+/// - `handle` must be either null OR a valid `FrsDb` returned by
+///   `frs_db_open*` and not yet closed.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_write_buffer_manager_capacity(handle: FrsDb) -> u64 {
+    let Some(db) = db_from_handle(handle) else {
+        return 0;
+    };
+    db.write_buffer_manager().capacity_bytes()
+}
+
+/// Returns the running cross-CF memtable bytes tracked by the
+/// WriteBufferManager (B-Prod-P7, spec §6d). Useful for IT bench
+/// assertions that want to verify the cap is actually firing.
+///
+/// # SAFETY
+/// - `handle` must be a valid `FrsDb` returned by `frs_db_open*`.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_write_buffer_manager_current_bytes(handle: FrsDb) -> u64 {
+    let Some(db) = db_from_handle(handle) else {
+        return 0;
+    };
+    db.write_buffer_manager().current_bytes()
+}
+
 /// Closes an engine previously returned by [`frs_db_open`]. After this
 /// call the handle must not be used again. Always returns `FRS_STATUS_OK`.
 #[no_mangle]
@@ -2499,6 +2656,104 @@ mod tests {
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
+    }
+
+    #[test]
+    fn test_open_with_options_all_zero_uses_defaults() {
+        // B-Prod-P7 §6d: all-zero opts → in-memory engine at /db with
+        // engine defaults (256 MiB cache, 512 MiB WBM).
+        unsafe {
+            let opts = FrsEngineOptions {
+                db_path: ptr::null(),
+                write_buffer_size: 0,
+                max_write_buffer_number: 0,
+                max_background_compactions: 0,
+                max_background_flushes: 0,
+                block_cache_capacity_bytes: 0,
+                write_buffer_manager_capacity_bytes: 0,
+            };
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(
+                frs_db_open_with_options(&opts, &mut db),
+                FRS_STATUS_OK
+            );
+            assert!(!db.is_null());
+            assert_eq!(
+                frs_db_write_buffer_manager_capacity(db),
+                512u64 * 1024 * 1024
+            );
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_open_with_options_custom_cache_and_wbm() {
+        // B-Prod-P7 §6d: caller-supplied 1 GiB cache + 256 MiB WBM round-trips.
+        unsafe {
+            let opts = FrsEngineOptions {
+                db_path: ptr::null(),
+                write_buffer_size: 0,
+                max_write_buffer_number: 0,
+                max_background_compactions: 0,
+                max_background_flushes: 0,
+                block_cache_capacity_bytes: 1024 * 1024 * 1024,
+                write_buffer_manager_capacity_bytes: 256 * 1024 * 1024,
+            };
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(
+                frs_db_open_with_options(&opts, &mut db),
+                FRS_STATUS_OK
+            );
+            assert_eq!(
+                frs_db_write_buffer_manager_capacity(db),
+                256u64 * 1024 * 1024
+            );
+            // Initially no bytes reserved.
+            assert_eq!(frs_db_write_buffer_manager_current_bytes(db), 0);
+            // After a put the WBM should track non-zero bytes.
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            frs_db_default_cf(db, &mut cf);
+            let key = b"k";
+            let val = b"v";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), val.as_ptr(), val.len()),
+                FRS_STATUS_OK
+            );
+            assert!(frs_db_write_buffer_manager_current_bytes(db) > 0);
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_open_with_options_null_opts_returns_null_arg() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(
+                frs_db_open_with_options(ptr::null(), &mut db),
+                FRS_STATUS_NULL_ARG
+            );
+        }
+    }
+
+    #[test]
+    fn test_open_with_options_struct_layout_appears_repr_c() {
+        // Sanity-check the field offsets so an accidental reorder would
+        // be caught locally instead of surfacing as a Java FFM ABI break.
+        // Field ordering and types must match the docstring table on
+        // FrsEngineOptions and the `MemoryLayout.structLayout(...)`
+        // mirror in ForStRsLinker.java.
+        use std::mem::{align_of, size_of};
+        // *const c_char is 8B on 64-bit; padded out to alignment by the
+        // following u64 fields. The total size is the sum of:
+        //   8 (db_path ptr) + 8 (write_buffer_size u64) + 4 (u32) + 4 (u32)
+        // + 4 (u32) + 4 (pad) + 8 (u64) + 8 (u64) = 48 bytes.
+        // (32-bit hosts will have a smaller pointer; the bridge is built
+        // 64-bit only today, so we encode the 64-bit layout here.)
+        if size_of::<*const c_char>() == 8 {
+            assert_eq!(size_of::<FrsEngineOptions>(), 48);
+        }
+        assert!(align_of::<FrsEngineOptions>() >= 8);
     }
 
     #[test]

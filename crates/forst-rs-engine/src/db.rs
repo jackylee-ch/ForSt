@@ -32,6 +32,7 @@ use forst_rs_common::{
     SequenceNumber, DEFAULT_CF_ID,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSystem};
+use forst_rs_storage::cache::clock::ShardedClockCache;
 use forst_rs_storage::cached_fs::CachedFileSystem;
 use forst_rs_storage::local_cache::LocalCache;
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
@@ -46,6 +47,7 @@ use crate::compaction_filter::CompactionFilter;
 use crate::file_deletion_guard::FileDeletionGuard;
 use crate::flush::{sst_file_path, FlushExecutor, FlushJob, FlushQueue, FlushRequest};
 use crate::mvcc::{self, DbId, Snapshot, SnapshotRegistry};
+use crate::runtime_tuning::WriteBufferManager;
 use crate::snapshot_view::SnapshotView;
 use crate::write_batch::WriteBatch;
 use crate::write_controller::WriteController;
@@ -167,6 +169,22 @@ pub struct DbImpl {
     /// engine. The FFI release path checks this against the calling
     /// `DbImpl` to enforce the spec §15 "Same-DB" invariant.
     db_id: DbId,
+    /// Shared LRU block cache (B-Prod-P7, spec §6d). Sized at open by
+    /// `EngineOptions::block_cache_capacity_bytes` (falling back to the
+    /// legacy `block_cache_size` when the new field is `0`). Held here so
+    /// (a) every CF read path can sample the same cache instance and
+    /// (b) the FFI tuning surface can read its current bytes / hit-rate
+    /// for diagnostics. The SST-reader-side wiring lands incrementally as
+    /// readers migrate to the shared cache.
+    block_cache: Arc<ShardedClockCache>,
+    /// Cross-CF memtable budget (B-Prod-P7, spec §6d). Sized at open by
+    /// `EngineOptions::write_buffer_manager_capacity_bytes` (`0` =
+    /// unbounded). Per-write paths reserve / release bytes via
+    /// `WriteBufferManager::{reserve, release}`; once `over_budget()`
+    /// trips, the writer hot path triggers a flush of the largest CF
+    /// rather than blocking, matching RocksDB's `allow_stall=false`
+    /// default.
+    write_buffer_manager: Arc<WriteBufferManager>,
 }
 
 impl DbImpl {
@@ -199,6 +217,24 @@ impl DbImpl {
             fs.create_dir_all(&db_path)?;
         }
 
+        // B-Prod-P7 §6d runtime tuning hooks. The new
+        // `block_cache_capacity_bytes` field takes precedence; when it is
+        // `0` we fall back to the legacy `usize` `block_cache_size` so
+        // pre-P7 callers building EngineOptions through `..default()`
+        // keep their cache sizing.
+        let cache_bytes = if options.block_cache_capacity_bytes != 0 {
+            // Truncate to usize on 32-bit hosts (the validator already
+            // capped at 1 PiB, well under 4 GiB only on impossibly small
+            // targets — the truncation is always lossless on 64-bit, and
+            // a 32-bit host cannot meaningfully address 1 PiB anyway).
+            options.block_cache_capacity_bytes.min(usize::MAX as u64) as usize
+        } else {
+            options.block_cache_size
+        };
+        let block_cache = Arc::new(ShardedClockCache::with_capacity(cache_bytes));
+        let write_buffer_manager =
+            WriteBufferManager::new(options.write_buffer_manager_capacity_bytes);
+
         let db = Arc::new(Self {
             options,
             db_path,
@@ -219,6 +255,8 @@ impl DbImpl {
             pending_flush_count: AtomicU32::new(0),
             snapshot_registry: SnapshotRegistry::new(),
             db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
+            block_cache,
+            write_buffer_manager,
         });
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
@@ -483,6 +521,23 @@ impl DbImpl {
     /// reject cross-DB releases (spec §15 "Same-DB" invariant).
     pub fn db_id(&self) -> DbId {
         self.db_id
+    }
+
+    /// Returns the shared LRU block cache held by this engine. Sized at
+    /// open time by `EngineOptions::block_cache_capacity_bytes`
+    /// (B-Prod-P7, spec §6d). Exposed so the FFI tuning surface can
+    /// sample its current bytes / hit-rate, and so SST readers can wire
+    /// onto the same cache instance as they migrate to the shared cache.
+    pub fn block_cache(&self) -> &Arc<ShardedClockCache> {
+        &self.block_cache
+    }
+
+    /// Returns the cross-CF [`WriteBufferManager`] (B-Prod-P7, spec §6d).
+    /// The writer hot path consults this to decide whether to trigger a
+    /// flush after a reservation pushes the running sum past the
+    /// configured cap.
+    pub fn write_buffer_manager(&self) -> &Arc<WriteBufferManager> {
+        &self.write_buffer_manager
     }
 
     // ---------------------------------------------------------------
@@ -789,6 +844,21 @@ impl DbImpl {
                 }
             }
         }
+        // B-Prod-P7 §6d: charge the cross-CF WriteBufferManager for the
+        // reservation this write contributed to the active memtable. The
+        // released amount comes back on a successful flush via
+        // `wbm_release_on_flush`. Approximation matches what
+        // `VectorizedMemTable::put` charges internally
+        // (key + value + 8 + 1 + 48); WBM precision needs are coarse
+        // (cap is 512 MiB by default) so the constant 57-byte overhead
+        // approximation is fine.
+        let charge = key.len() as u64
+            + value.map(|v| v.len() as u64).unwrap_or(0)
+            + 8 // seq
+            + 1 // op-type
+            + 48; // record header
+        self.write_buffer_manager.reserve(charge);
+
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
             self.maybe_switch_memtable_in_lock(&cf_data)?
@@ -799,7 +869,10 @@ impl DbImpl {
         // WriteController stall above — when imm count >= cap the next
         // writer's `may_throttle()` call blocks until the worker drains
         // an imm and calls `set_imm_count(new_lower)`.
-        if needs_flush {
+        // B-Prod-P7 §6d: when WBM is over budget, force a flush so the
+        // background worker can drain bytes back below the cap.
+        let wbm_over = self.write_buffer_manager.over_budget();
+        if needs_flush || wbm_over {
             self.enqueue_flush(cf_data.clone())?;
         }
 
@@ -1388,6 +1461,15 @@ impl DbImpl {
             snapshot.last_sequence,
         ));
 
+        let cache_bytes = if options.block_cache_capacity_bytes != 0 {
+            options.block_cache_capacity_bytes.min(usize::MAX as u64) as usize
+        } else {
+            options.block_cache_size
+        };
+        let block_cache = Arc::new(ShardedClockCache::with_capacity(cache_bytes));
+        let write_buffer_manager =
+            WriteBufferManager::new(options.write_buffer_manager_capacity_bytes);
+
         let db = Arc::new(Self {
             options,
             db_path,
@@ -1408,6 +1490,8 @@ impl DbImpl {
             pending_flush_count: AtomicU32::new(0),
             snapshot_registry: SnapshotRegistry::new(),
             db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
+            block_cache,
+            write_buffer_manager,
         });
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
@@ -1811,11 +1895,18 @@ impl DbImpl {
             .expect("lock poisoned")
             .insert(meta.file_number, reader);
 
+        // B-Prod-P7 §6d: release the bytes this memtable held back to
+        // the cross-CF WriteBufferManager. We sample memory_usage()
+        // BEFORE the pop so the byte count we release is the same one
+        // that contributed to `over_budget()` earlier.
+        let released_bytes = oldest.memory_usage() as u64;
+
         // Pop the memtable now that its data is durably in the SST and the
         // Version has been updated. Readers that acquired a snapshot before
         // the pop still see the in-memory imm; readers after see only the
         // SST — both return the same values.
         cf_data.pop_oldest_imm();
+        self.write_buffer_manager.release(released_bytes);
         self.refresh_snapshot_view(cf_data);
         self.write_controller
             .set_imm_count(cf_data.imm_count() as u32);
