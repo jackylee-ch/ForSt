@@ -285,7 +285,7 @@ jobs:
           # is intentionally minimal — we only want to fail fast on a totally broken
           # cdylib, not gate the surface evolution.
           MISSING=0
-          for sym in frs_db_open frs_db_close frs_put frs_get frs_cf_open frs_iterator_open; do
+          for sym in frs_db_open frs_db_close frs_put frs_get frs_db_open_cf frs_iterator_open; do
             if ! nm -D target/release/libforst_rs_ffi.so 2>/dev/null | grep -q "\b${sym}\b"; then
               echo "MISSING symbol: ${sym}"
               MISSING=1
