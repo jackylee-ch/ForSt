@@ -41,9 +41,10 @@
 #[cfg(feature = "compat-jni")]
 pub mod compat_jni;
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::Arc;
 
@@ -398,6 +399,175 @@ pub unsafe extern "C" fn frs_db_open_memory_tuned(
         }
     })
 }
+
+/// Opens a remote-storage-backed engine with a local SST cache (B-Prod-P6).
+///
+/// `uri` selects the OpenDAL backend (`memory://`, `file:///abs/path`, or
+/// `s3://bucket/`). `opendal_config_json` is a flat JSON object (e.g.
+/// `{"region":"us-east-1","endpoint":"https://minio.example.com"}`) holding
+/// scheme-specific config; pass `{}` or `null` if none are required (the
+/// `memory` and `file` schemes ignore the map). `cache_dir` is the local
+/// directory used for the LRU SST cache; `cache_capacity_bytes` bounds its
+/// total on-disk size.
+///
+/// On success, writes the new `FrsDb` handle into `*out_handle` and
+/// returns `FRS_STATUS_OK`. On failure returns one of the standard
+/// status codes (NULL_ARG, INVALID_ARGUMENT, IO, …).
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_remote(
+    uri: *const c_char,
+    opendal_config_json: *const c_char,
+    cache_dir: *const c_char,
+    cache_capacity_bytes: u64,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if out_handle.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let uri_str = match cstr_to_str(&uri) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let cache_dir_str = match cstr_to_str(&cache_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        // JSON config is optional: a NULL pointer (or empty / "null" /
+        // "{}" string) means "no extra config".
+        let json_str = if opendal_config_json.is_null() {
+            String::new()
+        } else {
+            match cstr_to_str(&opendal_config_json) {
+                Some(s) => s.to_string(),
+                None => return FRS_STATUS_NULL_ARG,
+            }
+        };
+        let config = match parse_flat_json_object(&json_str) {
+            Ok(m) => m,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+
+        let opts = EngineOptions {
+            db_path: format!("/db-remote-{}", uri_str_hash(&uri_str)),
+            ..EngineOptions::default()
+        };
+        let cache_path = PathBuf::from(&cache_dir_str);
+        match DbImpl::open_remote(opts, &uri_str, config, &cache_path, cache_capacity_bytes) {
+            Ok(db) => {
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Parses a flat JSON object (string-to-string only) into a `HashMap`.
+/// Accepts the empty string, `"null"`, and `"{}"` as "no config".
+///
+/// We intentionally keep this parser tiny rather than pulling in `serde_json`:
+/// the FFI surface only ever passes a handful of well-known string knobs
+/// (`region`, `endpoint`, `access_key_id`, `secret_access_key`) and a
+/// strict-but-small parser is far less of a foot-gun than carrying the
+/// full serde stack across the FFI boundary.
+///
+/// Returns `Err(())` on any malformed input. Quoted strings are recognised
+/// with no escape support beyond `\"` and `\\` — sufficient for the values
+/// the bridge actually carries today.
+fn parse_flat_json_object(s: &str) -> Result<HashMap<String, String>, ()> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() || trimmed == "null" || trimmed == "{}" {
+        return Ok(HashMap::new());
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.first() != Some(&b'{') || bytes.last() != Some(&b'}') {
+        return Err(());
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut out = HashMap::new();
+    if inner.trim().is_empty() {
+        return Ok(out);
+    }
+
+    // Split on top-level commas. Strings can contain commas, so we only
+    // honour commas outside double quotes.
+    let mut parts = Vec::new();
+    let mut buf = String::new();
+    let mut in_str = false;
+    let mut escape = false;
+    for ch in inner.chars() {
+        if escape {
+            buf.push(ch);
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_str => {
+                buf.push(ch);
+                escape = true;
+            }
+            '"' => {
+                buf.push(ch);
+                in_str = !in_str;
+            }
+            ',' if !in_str => {
+                parts.push(std::mem::take(&mut buf));
+            }
+            _ => buf.push(ch),
+        }
+    }
+    if !buf.trim().is_empty() {
+        parts.push(buf);
+    }
+
+    for part in parts {
+        let (k, v) = part.split_once(':').ok_or(())?;
+        let key = unquote_json_string(k.trim())?;
+        let value = unquote_json_string(v.trim())?;
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
+fn unquote_json_string(s: &str) -> Result<String, ()> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return Err(());
+    }
+    let inner = &s[1..s.len() - 1];
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                _ => return Err(()),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
+/// Stable, URL-safe hash of `uri` to disambiguate the `db_path` reported
+/// to the engine (the engine uses it as a logical root only — the actual
+/// FS root is the OpenDAL operator). Keeps logs/metrics readable.
+fn uri_str_hash(uri: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut h);
+    h.finish()
+}
+
+// Suppress dead_code for the imported Path alias; we use PathBuf above.
+#[allow(dead_code)]
+const _PATH_USAGE: fn(&Path) = |_| {};
 
 /// Closes an engine previously returned by [`frs_db_open`]. After this
 /// call the handle must not be used again. Always returns `FRS_STATUS_OK`.
@@ -3880,6 +4050,111 @@ mod tests {
             assert_eq!(frs_iterator_close(iter), FRS_STATUS_OK);
             assert_eq!(frs_db_release_snapshot(db, snap), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // B-Prod-P6: frs_db_open_remote
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_flat_json_object_supports_empty_and_null() {
+        assert_eq!(parse_flat_json_object("").unwrap().len(), 0);
+        assert_eq!(parse_flat_json_object("null").unwrap().len(), 0);
+        assert_eq!(parse_flat_json_object("{}").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_parse_flat_json_object_simple_pair() {
+        let m = parse_flat_json_object("{\"region\":\"us-east-1\"}").unwrap();
+        assert_eq!(m.get("region").map(String::as_str), Some("us-east-1"));
+    }
+
+    #[test]
+    fn test_parse_flat_json_object_multiple_pairs_with_spaces() {
+        let m = parse_flat_json_object(
+            "{ \"region\": \"us-west-2\" , \"endpoint\": \"https://example.com\" }",
+        )
+        .unwrap();
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("region").map(String::as_str), Some("us-west-2"));
+        assert_eq!(
+            m.get("endpoint").map(String::as_str),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn test_parse_flat_json_object_rejects_missing_braces() {
+        assert!(parse_flat_json_object("region:us-east-1").is_err());
+    }
+
+    #[test]
+    fn test_frs_db_open_remote_memory_uri_round_trip() {
+        let cache_dir = tempfile::TempDir::new().expect("cache tempdir");
+        let cache_dir_str = cache_dir.path().to_string_lossy().into_owned();
+        unsafe {
+            let uri = CString::new("memory://").unwrap();
+            let cfg = CString::new("{}").unwrap();
+            let cdir = CString::new(cache_dir_str).unwrap();
+
+            let mut db: FrsDb = ptr::null_mut();
+            let rc = frs_db_open_remote(
+                uri.as_ptr(),
+                cfg.as_ptr(),
+                cdir.as_ptr(),
+                64 * 1024 * 1024,
+                &mut db,
+            );
+            assert_eq!(rc, FRS_STATUS_OK, "open_remote failed");
+            assert!(!db.is_null());
+
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"hello-remote";
+            let value = b"world-remote";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+                FRS_STATUS_OK
+            );
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            let slice = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(slice, value);
+            frs_bytes_free(&mut out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_db_open_remote_null_uri_returns_null_arg() {
+        let cache_dir = tempfile::TempDir::new().expect("cache tempdir");
+        let cdir = CString::new(cache_dir.path().to_string_lossy().into_owned()).unwrap();
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            let rc = frs_db_open_remote(ptr::null(), ptr::null(), cdir.as_ptr(), 1024, &mut db);
+            assert_eq!(rc, FRS_STATUS_NULL_ARG);
+            assert!(db.is_null());
+        }
+    }
+
+    #[test]
+    fn test_frs_db_open_remote_invalid_scheme_returns_invalid_argument() {
+        let cache_dir = tempfile::TempDir::new().expect("cache tempdir");
+        let cdir = CString::new(cache_dir.path().to_string_lossy().into_owned()).unwrap();
+        unsafe {
+            let uri = CString::new("ftp://nope/").unwrap();
+            let cfg = CString::new("{}").unwrap();
+            let mut db: FrsDb = ptr::null_mut();
+            let rc = frs_db_open_remote(uri.as_ptr(), cfg.as_ptr(), cdir.as_ptr(), 1024, &mut db);
+            assert_eq!(rc, FRS_STATUS_INVALID_ARGUMENT);
+            assert!(db.is_null());
         }
     }
 }
