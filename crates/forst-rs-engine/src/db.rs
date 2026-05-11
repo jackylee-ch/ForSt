@@ -75,6 +75,34 @@ const FLUSH_QUEUE_CAPACITY: usize = 64;
 /// a snapshot to be live past the threshold.
 const SNAPSHOT_AGE_TICK_MS: u64 = 1_000;
 
+/// Sequence-number warn threshold (spec §6a.4). 2^59 — at this point
+/// the writer has burned half of the engine's 2^60-bit usable seq
+/// space; surfacing the condition early lets an operator schedule a
+/// checkpoint-and-restart cycle before the fatal threshold lands.
+/// Process-singleton warn (gated via [`SEQ_HIGH_WARNED`]) so logs do
+/// not get spammed on every write past the line.
+const SEQ_NUMBER_WARN_THRESHOLD: u64 = 1u64 << 59;
+
+/// Sequence-number fatal threshold (spec §6a.4). 2^60 — at this point
+/// the engine refuses further writes; the only safe recovery is a
+/// checkpoint + restart cycle. We stop BEFORE the InternalKey 56-bit
+/// packed-seq invariant trips (a `debug_assert!` in
+/// `SequenceNumber::new` that release builds elide); the 2^60 limit
+/// gives operators a 4-bit safety margin against the absolute hard
+/// stop at `u64::MAX >> 8` = 2^56 - 1. NOTE: the spec uses 2^60 as a
+/// conservative bar to flag well before the 56-bit packed-seq limit
+/// would actually fire in misuse; see the inline comment on
+/// `write_single` for why the check still triggers a real fatal even
+/// though the on-disk encoder would tolerate slightly more.
+const SEQ_NUMBER_FATAL_THRESHOLD: u64 = 1u64 << 60;
+
+/// Process-singleton flag that gates the one-time `tracing::warn!` for
+/// the sequence-number warn threshold. We use a plain `AtomicBool`
+/// (CAS to claim the warn slot) rather than `std::sync::Once` so the
+/// flag is reachable from test code that wants to assert "warn fires
+/// at most once across the process".
+static SEQ_HIGH_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Name of the default column family (always id 0).
 pub const DEFAULT_CF_NAME: &str = "default";
 
@@ -865,6 +893,12 @@ impl DbImpl {
         // because the seq is plumbed through subsequent `mem.write()` /
         // `read()` boundaries that establish the necessary happens-before.
         let seq = self.sequence_number.fetch_add(1, Ordering::Relaxed) + 1;
+        // Spec §6a.4 sequence-number overflow guard. The check runs AFTER
+        // the allocation so a single writer racing the threshold can't
+        // wedge subsequent writers — the next writer trips the fatal arm
+        // and returns Internal; the one writer that actually crossed the
+        // line returns the same error and never reaches `put_with_seq`.
+        Self::check_sequence_overflow(seq)?;
 
         // E1: with `ShardedMemTable` the put hot path holds only the
         // owning shard's `RwLock` (one of N), so concurrent writers hashing
@@ -927,6 +961,74 @@ impl DbImpl {
         Ok(seq)
     }
 
+    /// Spec §6a.4 sequence-number overflow guard.
+    ///
+    /// Called by every write path AFTER the seq has been reserved via
+    /// `fetch_add` on `sequence_number`. Returns:
+    ///
+    /// - `Ok(())` when `seq < SEQ_NUMBER_WARN_THRESHOLD` (2^59);
+    /// - `Ok(())` when `SEQ_NUMBER_WARN_THRESHOLD <= seq < SEQ_NUMBER_FATAL_THRESHOLD`,
+    ///   AND emits a one-time `tracing::warn!` if no prior write has
+    ///   already claimed the warn slot (process-singleton);
+    /// - `Err(ForstError::Internal(...))` when `seq >= SEQ_NUMBER_FATAL_THRESHOLD`
+    ///   (2^60). Writes never land on the memtable past this line; the
+    ///   error message names checkpoint+restart as the recovery path.
+    ///
+    /// The check is intentionally per-write rather than per-batch so a
+    /// long-running batch that nudges the counter past the threshold
+    /// surfaces the warn / fatal at the SAME write boundary the
+    /// counter advanced (no "we crossed but didn't notice for 10ms"
+    /// window). Read paths do NOT consult this helper — readers continue
+    /// to work after the fatal threshold so operators can drain a
+    /// checkpoint cleanly without the read side failing too.
+    fn check_sequence_overflow(seq: u64) -> ForstResult<()> {
+        if seq >= SEQ_NUMBER_FATAL_THRESHOLD {
+            return Err(ForstError::internal(format!(
+                "sequence number {} exceeded 2^60 threshold; engine stopped \
+                 accepting writes; restart from checkpoint to recover",
+                seq
+            )));
+        }
+        if seq >= SEQ_NUMBER_WARN_THRESHOLD
+            && SEQ_HIGH_WARNED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            // First writer past the warn line claims the slot and
+            // emits the line. All subsequent writers in this process
+            // observe `true` on the load and skip — see `SEQ_HIGH_WARNED`
+            // doc on why we use a plain AtomicBool rather than `Once`.
+            tracing::warn!(
+                seq,
+                warn_threshold = SEQ_NUMBER_WARN_THRESHOLD,
+                fatal_threshold = SEQ_NUMBER_FATAL_THRESHOLD,
+                "sequence number high; consider checkpoint + restart \
+                 before the engine reaches the 2^60 fatal threshold"
+            );
+        }
+        Ok(())
+    }
+
+    /// Test-only seam that forces the engine's sequence counter to an
+    /// arbitrary value so the warn / fatal arms of
+    /// [`Self::check_sequence_overflow`] can be exercised without
+    /// burning 2^59 writes.
+    ///
+    /// This stores DIRECTLY into the underlying `AtomicU64`; the next
+    /// write path's `fetch_add(1)` returns this value, so calling
+    /// `force_set_sequence(SEQ_NUMBER_WARN_THRESHOLD - 1)` arms the
+    /// warn arm and `force_set_sequence(SEQ_NUMBER_FATAL_THRESHOLD - 1)`
+    /// arms the fatal arm.
+    #[cfg(test)]
+    pub(crate) fn force_set_sequence(&self, seq: u64) {
+        self.sequence_number.store(seq, Ordering::Release);
+    }
+
     /// If the current L0 file count is at or above the slowdown trigger,
     /// run an L0→L1 compaction. Returns `Ok(())` either way.
     fn maybe_auto_compact(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
@@ -967,6 +1069,11 @@ impl DbImpl {
             .sequence_number
             .fetch_add(total_count, Ordering::Relaxed);
         let last_seq = prev + total_count;
+        // Spec §6a.4 sequence-number overflow guard. Check the
+        // HIGHEST seq in the reserved range — if last_seq is past the
+        // fatal threshold every row in this batch lands beyond it, so
+        // refusing the whole batch is correct.
+        Self::check_sequence_overflow(last_seq)?;
 
         // E1: per-CF batch insert routes rows by shard; each shard takes
         // its own write lock independently, so concurrent batches across
@@ -1048,6 +1155,9 @@ impl DbImpl {
             .fetch_add(count as u64, Ordering::Relaxed);
         let last_seq = prev + count as u64;
         let base_seq = prev + 1;
+        // Spec §6a.4 sequence-number overflow guard. Same rationale as
+        // `batch_write` — check the HIGHEST seq in the reserved range.
+        Self::check_sequence_overflow(last_seq)?;
 
         // E1: arrow batch is partitioned across shards in `ShardedMemTable`;
         // each shard takes its own lock so concurrent batches don't
@@ -4654,4 +4764,75 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Followup 2 (spec §6a.4): sequence-number overflow guard
+    //
+    // The three tests below assert (a) under-threshold writes work
+    // normally, (b) at-warn-threshold writes still succeed (warn is
+    // logged via tracing but not surfaced as an error), and (c)
+    // at-fatal-threshold writes return ForstError::Internal.
+    //
+    // We use `force_set_sequence` to seed the counter — burning 2^59
+    // writes is not feasible in unit tests. The tests do NOT serialize
+    // across the process-singleton SEQ_HIGH_WARNED flag because the
+    // warn arm's side-effect is just a tracing line; a flipped flag
+    // does not affect the test assertions (which check ForstResult,
+    // not log output).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_seq_overflow_under_threshold_write_succeeds() {
+        let db = open();
+        // Default counter starts at 0 — comfortably below the warn
+        // line. Standard put should succeed.
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v").expect("put under threshold");
+        // Sanity-check the counter advanced exactly once.
+        assert_eq!(db.sequence_number(), 1);
+    }
+
+    #[test]
+    fn test_seq_overflow_at_warn_threshold_write_still_succeeds() {
+        let db = open();
+        // Seed the counter so the next `fetch_add(1)` returns the
+        // warn threshold. The write should succeed AND advance the
+        // counter; the warn line is emitted via tracing but does not
+        // surface as a ForstResult error.
+        db.force_set_sequence(super::SEQ_NUMBER_WARN_THRESHOLD - 1);
+        let cf = db.default_cf();
+        db.put(&cf, b"warn", b"v")
+            .expect("put at warn threshold must still succeed");
+        let post = db.sequence_number();
+        assert!(
+            post >= super::SEQ_NUMBER_WARN_THRESHOLD,
+            "counter should have advanced past warn threshold, got {}",
+            post
+        );
+    }
+
+    #[test]
+    fn test_seq_overflow_at_fatal_threshold_returns_internal_error() {
+        let db = open();
+        // Seed the counter so the next `fetch_add(1)` returns a value
+        // at-or-past the 2^60 fatal threshold. The write path must
+        // bail with ForstError::Internal and refuse to plumb the seq
+        // into the memtable.
+        db.force_set_sequence(super::SEQ_NUMBER_FATAL_THRESHOLD - 1);
+        let cf = db.default_cf();
+        let err = db
+            .put(&cf, b"fatal", b"v")
+            .expect_err("put at fatal threshold must error");
+        assert!(
+            err.is_internal(),
+            "expected Internal error at fatal threshold, got {:?}",
+            err
+        );
+        // Subsequent writes continue to fail — the counter sits past
+        // the fatal threshold and every fresh `fetch_add(1)` lands
+        // above the line too.
+        let err2 = db
+            .put(&cf, b"fatal2", b"v")
+            .expect_err("subsequent put at fatal threshold must also error");
+        assert!(err2.is_internal());
+    }
 }

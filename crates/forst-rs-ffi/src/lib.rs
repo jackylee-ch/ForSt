@@ -111,6 +111,12 @@ pub const FRS_STATUS_EXPIRED: i32 = 13;
 /// APIs (partial scans, chunked reads); no call site emits this status
 /// today.
 pub const FRS_STATUS_INCOMPLETE: i32 = 14;
+/// Engine-internal invariant violated; caller cannot make forward progress
+/// without operator intervention (e.g. process restart from a checkpoint).
+/// Emitted when the engine's sequence-number space is exhausted past the
+/// 2^60 fatal threshold (spec §6a.4) — write paths return this code and
+/// stop accepting work until the engine is restarted.
+pub const FRS_STATUS_INTERNAL: i32 = 15;
 
 // ---------------------------------------------------------------------------
 // Opaque handle types
@@ -280,6 +286,8 @@ fn error_to_status(err: &forst_rs_common::ForstError) -> i32 {
         FRS_STATUS_EXPIRED
     } else if err.is_incomplete() {
         FRS_STATUS_INCOMPLETE
+    } else if err.is_internal() {
+        FRS_STATUS_INTERNAL
     } else {
         FRS_STATUS_ERROR
     }

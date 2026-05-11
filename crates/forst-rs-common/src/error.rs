@@ -70,6 +70,14 @@ pub enum ForstError {
     /// has expired.
     #[error("Expired: {0}")]
     Expired(String),
+
+    /// An internal invariant inside the engine has been violated and the
+    /// caller cannot make forward progress without operator intervention
+    /// (e.g. process restart from a checkpoint). Reserved for "engine
+    /// stopped accepting work" conditions — sequence-number space
+    /// exhaustion, structural-state mismatch detected at runtime, etc.
+    #[error("Internal: {0}")]
+    Internal(String),
 }
 
 /// A convenience type alias for `Result<T, ForstError>`.
@@ -123,6 +131,17 @@ impl ForstError {
     /// Creates a [`ForstError::Expired`] with the given message.
     pub fn expired(msg: impl Into<String>) -> Self {
         ForstError::Expired(msg.into())
+    }
+
+    /// Creates a [`ForstError::Internal`] with the given message.
+    ///
+    /// Reserved for "engine cannot make forward progress without operator
+    /// intervention" — sequence-number space exhaustion (spec §6a.4),
+    /// structural invariant violation, etc. Distinct from
+    /// [`ForstError::Corruption`] (on-disk integrity failure) and
+    /// [`ForstError::Aborted`] (transient operation-level abort).
+    pub fn internal(msg: impl Into<String>) -> Self {
+        ForstError::Internal(msg.into())
     }
 }
 
@@ -179,6 +198,11 @@ impl ForstError {
     /// Returns `true` if this is an [`ForstError::Expired`] variant.
     pub fn is_expired(&self) -> bool {
         matches!(self, ForstError::Expired(_))
+    }
+
+    /// Returns `true` if this is an [`ForstError::Internal`] variant.
+    pub fn is_internal(&self) -> bool {
+        matches!(self, ForstError::Internal(_))
     }
 }
 
@@ -254,6 +278,12 @@ mod tests {
         assert_eq!(err.to_string(), "Expired: ttl exceeded");
     }
 
+    #[test]
+    fn test_display_internal() {
+        let err = ForstError::internal("engine stopped accepting writes");
+        assert_eq!(err.to_string(), "Internal: engine stopped accepting writes");
+    }
+
     // -- From<io::Error> conversion -----------------------------------------
 
     #[test]
@@ -292,6 +322,7 @@ mod tests {
         assert!(ForstError::busy("x").is_busy());
         assert!(ForstError::timed_out("x").is_timed_out());
         assert!(ForstError::expired("x").is_expired());
+        assert!(ForstError::internal("x").is_internal());
     }
 
     #[test]
