@@ -479,7 +479,12 @@ mod tests {
 
     #[test]
     fn concurrent_put_and_get_smoke_16_threads() {
-        let (_tmp, cache) = fresh_cache(64 * 1024);
+        // Working set: 16 threads × 32 entries × 256 B = 128 KiB. Provision the
+        // cache to fit it all so this is a pure concurrency smoke (not also an
+        // eviction race — that's a separate test). Under llvm-cov instrumentation
+        // the original 64 KiB sizing caused LRU to evict each put before its
+        // own get could observe it (CI run 25653863209).
+        let (_tmp, cache) = fresh_cache(1024 * 1024);
         let cache = Arc::new(cache);
 
         let mut handles = Vec::new();
