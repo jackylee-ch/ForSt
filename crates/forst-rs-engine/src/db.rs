@@ -1942,10 +1942,7 @@ impl DbImpl {
         // Pre-size the buffer: header + per-entry 8 bytes of length
         // prefixes + payload. Cheap upper-bound, avoids reallocations on
         // large CFs.
-        let payload_bytes: usize = entries
-            .iter()
-            .map(|(k, v)| 4 + k.len() + 4 + v.len())
-            .sum();
+        let payload_bytes: usize = entries.iter().map(|(k, v)| 4 + k.len() + 4 + v.len()).sum();
         let mut buf = Vec::with_capacity(8 + 8 + cf_name_bytes.len() + payload_bytes);
         buf.extend_from_slice(Self::EXPORT_MAGIC);
         buf.extend_from_slice(&(cf_name_bytes.len() as u64).to_le_bytes());
@@ -1966,10 +1963,7 @@ impl DbImpl {
         std::fs::write(&blob_path, &buf).map_err(|e| {
             ForstError::Io(std::io::Error::new(
                 e.kind(),
-                format!(
-                    "cf_export: write '{}' failed: {e}",
-                    blob_path.display()
-                ),
+                format!("cf_export: write '{}' failed: {e}", blob_path.display()),
             ))
         })?;
         Ok(())
@@ -2041,9 +2035,8 @@ impl DbImpl {
                     "create_cf_from_import: truncated key length",
                 ));
             }
-            let key_len = u32::from_le_bytes(
-                blob[cursor..cursor + 4].try_into().expect("4 bytes"),
-            ) as usize;
+            let key_len =
+                u32::from_le_bytes(blob[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
             cursor += 4;
             if cursor + key_len > blob.len() {
                 return Err(ForstError::corruption(
@@ -2059,9 +2052,8 @@ impl DbImpl {
                     "create_cf_from_import: truncated value length",
                 ));
             }
-            let value_len = u32::from_le_bytes(
-                blob[cursor..cursor + 4].try_into().expect("4 bytes"),
-            ) as usize;
+            let value_len =
+                u32::from_le_bytes(blob[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
             cursor += 4;
             if cursor + value_len > blob.len() {
                 return Err(ForstError::corruption(

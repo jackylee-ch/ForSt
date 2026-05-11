@@ -17,9 +17,9 @@
 //! Production knobs that operators tune without recompiling the engine:
 //!
 //! - **Block cache** — single shared LRU sized by
-//!   `EngineOptions::block_cache_capacity_bytes`. Held by [`DbImpl`] and
+//!   `EngineOptions::block_cache_capacity_bytes`. Held by `DbImpl` and
 //!   handed to SST readers as those wire it on the read path. The handle
-//!   is exposed via [`DbImpl::block_cache`] so future readers (or the
+//!   is exposed via `DbImpl::block_cache` so future readers (or the
 //!   FFI tuning surface) can sample its hit-rate / current bytes.
 //!
 //! - **WriteBufferManager** — cross-CF memtable budget. The engine adds

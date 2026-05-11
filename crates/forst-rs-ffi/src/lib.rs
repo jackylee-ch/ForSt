@@ -2779,10 +2779,7 @@ mod tests {
                 write_buffer_manager_capacity_bytes: 0,
             };
             let mut db: FrsDb = ptr::null_mut();
-            assert_eq!(
-                frs_db_open_with_options(&opts, &mut db),
-                FRS_STATUS_OK
-            );
+            assert_eq!(frs_db_open_with_options(&opts, &mut db), FRS_STATUS_OK);
             assert!(!db.is_null());
             assert_eq!(
                 frs_db_write_buffer_manager_capacity(db),
@@ -2806,10 +2803,7 @@ mod tests {
                 write_buffer_manager_capacity_bytes: 256 * 1024 * 1024,
             };
             let mut db: FrsDb = ptr::null_mut();
-            assert_eq!(
-                frs_db_open_with_options(&opts, &mut db),
-                FRS_STATUS_OK
-            );
+            assert_eq!(frs_db_open_with_options(&opts, &mut db), FRS_STATUS_OK);
             assert_eq!(
                 frs_db_write_buffer_manager_capacity(db),
                 256u64 * 1024 * 1024
@@ -4546,14 +4540,7 @@ mod tests {
                 let k = format!("k{:02}", i);
                 let v = format!("v{:02}", i);
                 assert_eq!(
-                    frs_put(
-                        db,
-                        src_cf,
-                        k.as_ptr(),
-                        k.len(),
-                        v.as_ptr(),
-                        v.len()
-                    ),
+                    frs_put(db, src_cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
                     FRS_STATUS_OK
                 );
             }
@@ -4571,7 +4558,10 @@ mod tests {
                 export_dir_c.as_ptr(),
                 &mut imp_cf,
             );
-            assert_eq!(rc, FRS_STATUS_OK, "frs_db_create_cf_from_import failed: {rc}");
+            assert_eq!(
+                rc, FRS_STATUS_OK,
+                "frs_db_create_cf_from_import failed: {rc}"
+            );
             assert!(!imp_cf.is_null());
 
             // Read back from the imported CF.
@@ -4616,12 +4606,8 @@ mod tests {
             let mut db: FrsDb = ptr::null_mut();
             assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
             // out_cf == null
-            let rc = frs_db_create_cf_from_import(
-                db,
-                name.as_ptr(),
-                dir_c.as_ptr(),
-                ptr::null_mut(),
-            );
+            let rc =
+                frs_db_create_cf_from_import(db, name.as_ptr(), dir_c.as_ptr(), ptr::null_mut());
             assert_eq!(rc, FRS_STATUS_NULL_ARG);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }

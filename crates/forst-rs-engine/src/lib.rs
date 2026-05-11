@@ -26,7 +26,7 @@
 //! - [`write_batch`] — WriteBatch / WriteBatchEntry for grouped writes.
 //! - [`write_controller`] — back-pressure (stall / slowdown / L0 triggers).
 //! - [`snapshot_view`] — Immutable snapshot view over a column family.
-//! - [`db`] — [`DbImpl`], the top-level engine struct.
+//! - [`db`] — `DbImpl`, the top-level engine struct.
 //!
 //! # Storage backends
 //!
