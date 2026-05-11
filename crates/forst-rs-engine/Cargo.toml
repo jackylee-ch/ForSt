@@ -36,3 +36,18 @@ tracing = { workspace = true }
 forst-rs-test-utils = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+# S3 integration test (gated by feature `s3-it`; requires Docker). MinIO
+# is launched via `testcontainers` GenericImage so we can validate
+# `DbImpl::open_remote` against a real S3-compatible backend per spec §6c.
+# We only pull `testcontainers` (not `testcontainers-modules`) because we
+# override the entrypoint to pre-create the bucket as a `/data/<bucket>`
+# directory before `minio server` starts — the module's default image
+# doesn't bake in `mc` or `curl`, so the GenericImage path is simpler.
+testcontainers = { version = "0.27", features = ["blocking"] }
+
+[features]
+default = []
+# Integration test that requires Docker (MinIO container). Skipped by
+# default so `cargo test --workspace` stays self-contained; CI gates it
+# behind a dedicated `s3-integration` job on `ubuntu-latest`.
+s3-it = []

@@ -181,6 +181,31 @@ jobs:
       - name: Enforce coverage gate (≥80%)
         run: cargo llvm-cov report --fail-under-lines 80
 
+  s3-integration:
+    # B-Prod-followup-3 (§6c): validates `frs_db_open_remote` end-to-end
+    # against a real S3-compatible backend (MinIO via testcontainers).
+    # `ubuntu-latest` ships with Docker pre-installed, so no extra
+    # `services:` block is needed — the test creates and tears down its
+    # own MinIO container.
+    name: S3 Integration Test (MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-s3-it-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-s3-it-
+      - name: Verify Docker is available
+        run: docker info
+      - name: Run S3 integration test
+        run: cargo test --test s3_remote_storage_it --features s3-it -p forst-rs-engine -- --nocapture
+
   doc:
     name: Rustdoc (strict; -D warnings)
     runs-on: ubuntu-latest
