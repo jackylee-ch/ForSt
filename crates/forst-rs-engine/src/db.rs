@@ -22,7 +22,7 @@
 //! Compaction (W15) and the C ABI bridge (W16) are not yet implemented.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
@@ -1847,6 +1847,234 @@ impl DbImpl {
     ) -> ForstResult<Vec<(Vec<u8>, Vec<u8>)>> {
         let upper = prefix_upper_bound(prefix);
         self.scan(cf, prefix, upper.as_deref())
+    }
+
+    // ---------------------------------------------------------------
+    // Import / Export (B-Prod-P10, spec §6g)
+    //
+    // The community RocksDB / ForSt path uses an
+    // `ExportImportFilesMetaData` structure that hardlinks a CF's live SST
+    // files into an "export dir", then reopens them as a new CF in the
+    // destination DB. forst-rs cannot follow that path verbatim today —
+    // the engine's `VersionSet` does not partition SSTs by CF, so a single
+    // SST may contain rows for multiple CFs and "extract these N SSTs as
+    // CF X" has no well-defined meaning here. The implementer guidance
+    // attached to PR B-Prod-P10 explicitly allows the "less efficient but
+    // correct" path: scan the source CF, write every (key, value) pair to
+    // a self-describing export blob, and replay the blob into a fresh CF
+    // on import. Rows visible at the time of `cf_export` are exactly the
+    // rows visible after `create_cf_from_import` — which is the §6g
+    // acceptance criterion.
+    //
+    // On-disk format (single file `EXPORT.frsblob` under the export dir):
+    //
+    //   magic           : 8 bytes  = b"FRSEXP01"
+    //   cf_name_len     : 8 bytes  = u64 little-endian
+    //   cf_name         : N bytes  UTF-8
+    //   repeated entries until EOF:
+    //     key_len       : 4 bytes  u32 little-endian
+    //     key           : K bytes
+    //     value_len     : 4 bytes  u32 little-endian
+    //     value         : V bytes
+    //
+    // The file is "self-describing": the magic + cf-name header lets the
+    // import side validate it before replaying. No checksum today (the
+    // export dir is expected to live on a durable filesystem; future work
+    // can add a trailing CRC32 if required). Empty CFs produce a valid
+    // header-only blob (zero entries).
+    // ---------------------------------------------------------------
+
+    /// Magic bytes prefixing an `EXPORT.frsblob` file. Bumping the suffix
+    /// is the migration story if the format ever changes.
+    const EXPORT_MAGIC: &'static [u8; 8] = b"FRSEXP01";
+
+    /// Filename written under `export_dir` by [`Self::cf_export`]. The
+    /// import side ([`Self::create_cf_from_import`]) reads the same name
+    /// from `import_dir`.
+    const EXPORT_BLOB_NAME: &'static str = "EXPORT.frsblob";
+
+    /// Exports every live (key, value) pair in `cf` to a single
+    /// self-describing blob under `export_dir` (`EXPORT.frsblob`). The
+    /// directory is created if it does not exist. Per spec §6g, this is
+    /// the producer side of cross-job state transfer: the resulting
+    /// directory can be shipped to another job and consumed via
+    /// [`Self::create_cf_from_import`] to seed a new CF with the exact
+    /// same rows.
+    ///
+    /// The export reads through the engine's normal scan path
+    /// ([`Self::scan`]), which already resolves tombstones, merges and
+    /// MVCC visibility — so the export captures the latest visible row
+    /// for every user key in the CF. Tombstones are intentionally not
+    /// preserved (the import side is creating a brand-new CF; a "deleted"
+    /// row would be re-inserted as a tombstone with no prior version, a
+    /// no-op).
+    ///
+    /// Atomicity: the blob is fully written before this method returns;
+    /// concurrent writers to `cf` are not blocked, but only writes
+    /// committed before this call took the underlying scan are guaranteed
+    /// to appear in the export. This matches RocksDB's
+    /// `ExportColumnFamily` snapshot-at-call-time semantics.
+    pub fn cf_export(&self, cf: &ColumnFamilyHandle, export_dir: &Path) -> ForstResult<()> {
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        // Make sure on-disk SSTs reflect the latest writes — pure
+        // hygiene; the scan path also reads memtables, but flushing keeps
+        // the export deterministic and minimizes the scan's working set.
+        // Failure to flush is non-fatal here: the scan still sees rows
+        // that are still in memtables.
+        let _ = self.force_switch_memtable(cf);
+        let _ = self.flush_cf_data(&cf_data);
+
+        std::fs::create_dir_all(export_dir).map_err(|e| {
+            ForstError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cf_export: create export dir '{}' failed: {e}",
+                    export_dir.display()
+                ),
+            ))
+        })?;
+
+        let cf_name = cf_data.handle().name().to_string();
+        let cf_name_bytes = cf_name.as_bytes();
+        let entries = self.scan(cf, b"", None)?;
+
+        // Pre-size the buffer: header + per-entry 8 bytes of length
+        // prefixes + payload. Cheap upper-bound, avoids reallocations on
+        // large CFs.
+        let payload_bytes: usize = entries
+            .iter()
+            .map(|(k, v)| 4 + k.len() + 4 + v.len())
+            .sum();
+        let mut buf = Vec::with_capacity(8 + 8 + cf_name_bytes.len() + payload_bytes);
+        buf.extend_from_slice(Self::EXPORT_MAGIC);
+        buf.extend_from_slice(&(cf_name_bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(cf_name_bytes);
+        for (k, v) in &entries {
+            if k.len() > u32::MAX as usize || v.len() > u32::MAX as usize {
+                return Err(ForstError::invalid_argument(
+                    "cf_export: per-entry key/value must fit in u32 (4 GiB)",
+                ));
+            }
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+
+        let blob_path = export_dir.join(Self::EXPORT_BLOB_NAME);
+        std::fs::write(&blob_path, &buf).map_err(|e| {
+            ForstError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cf_export: write '{}' failed: {e}",
+                    blob_path.display()
+                ),
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Creates a new column family `name` and seeds it with every entry
+    /// from `import_dir/EXPORT.frsblob`. Returns the new CF's handle.
+    /// Per spec §6g, this is the consumer side of cross-job state
+    /// transfer.
+    ///
+    /// `name` is an explicit caller choice — the manifest's original CF
+    /// name is intentionally ignored so the consumer can re-namespace the
+    /// imported state (mirrors RocksDB's `ImportColumnFamily(new_name,
+    /// metadata)` ergonomics). If a CF with that name already exists the
+    /// call returns [`ForstError::InvalidArgument`] and no state is
+    /// imported.
+    ///
+    /// Errors: [`ForstError::InvalidArgument`] for a missing or
+    /// magic-mismatched blob; [`ForstError::Corruption`] for a truncated
+    /// blob or invalid length prefix; otherwise propagates errors from
+    /// the underlying CF creation / put paths.
+    pub fn create_cf_from_import(
+        &self,
+        name: &str,
+        import_dir: &Path,
+    ) -> ForstResult<ColumnFamilyHandle> {
+        let blob_path = import_dir.join(Self::EXPORT_BLOB_NAME);
+        let blob = std::fs::read(&blob_path).map_err(|e| {
+            ForstError::invalid_argument(format!(
+                "create_cf_from_import: read '{}' failed: {e}",
+                blob_path.display()
+            ))
+        })?;
+
+        // ---- Header ----
+        if blob.len() < 16 {
+            return Err(ForstError::corruption(format!(
+                "create_cf_from_import: blob too short ({} bytes)",
+                blob.len()
+            )));
+        }
+        if &blob[..8] != Self::EXPORT_MAGIC {
+            return Err(ForstError::invalid_argument(
+                "create_cf_from_import: magic mismatch (not an EXPORT.frsblob)",
+            ));
+        }
+        let cf_name_len = u64::from_le_bytes(blob[8..16].try_into().expect("8 bytes")) as usize;
+        let header_end = 16usize
+            .checked_add(cf_name_len)
+            .ok_or_else(|| ForstError::corruption("cf_name_len overflows usize"))?;
+        if blob.len() < header_end {
+            return Err(ForstError::corruption(
+                "create_cf_from_import: header truncated",
+            ));
+        }
+        // We do not validate or use the embedded cf_name — the caller
+        // re-names by passing `name`. Reading it would just be a debug
+        // courtesy.
+
+        // ---- Create the destination CF ----
+        let cf = self.create_column_family(ColumnFamilyDescriptor::new(name))?;
+
+        // ---- Replay entries ----
+        let mut cursor = header_end;
+        while cursor < blob.len() {
+            // key
+            if cursor + 4 > blob.len() {
+                return Err(ForstError::corruption(
+                    "create_cf_from_import: truncated key length",
+                ));
+            }
+            let key_len = u32::from_le_bytes(
+                blob[cursor..cursor + 4].try_into().expect("4 bytes"),
+            ) as usize;
+            cursor += 4;
+            if cursor + key_len > blob.len() {
+                return Err(ForstError::corruption(
+                    "create_cf_from_import: truncated key payload",
+                ));
+            }
+            let key = &blob[cursor..cursor + key_len];
+            cursor += key_len;
+
+            // value
+            if cursor + 4 > blob.len() {
+                return Err(ForstError::corruption(
+                    "create_cf_from_import: truncated value length",
+                ));
+            }
+            let value_len = u32::from_le_bytes(
+                blob[cursor..cursor + 4].try_into().expect("4 bytes"),
+            ) as usize;
+            cursor += 4;
+            if cursor + value_len > blob.len() {
+                return Err(ForstError::corruption(
+                    "create_cf_from_import: truncated value payload",
+                ));
+            }
+            let value = &blob[cursor..cursor + value_len];
+            cursor += value_len;
+
+            self.put(&cf, key, value)?;
+        }
+
+        Ok(cf)
     }
 
     fn flush_cf_data(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<Option<SstFileMeta>> {

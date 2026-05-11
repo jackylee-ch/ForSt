@@ -2612,6 +2612,112 @@ pub unsafe extern "C" fn frs_db_open_from_incremental(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 9. State import / export migration (B-Prod-P10, spec §6g)
+//
+// `frs_cf_export` writes every (key, value) row in `cf` to a single
+// self-describing blob (`EXPORT.frsblob`) under `export_dir`.
+// `frs_db_create_cf_from_import` creates a new CF named `name` and
+// replays the blob's entries into it. Both call straight through to the
+// engine-side [`forst_rs_engine::DbImpl::cf_export`] /
+// [`forst_rs_engine::DbImpl::create_cf_from_import`] (see
+// `crates/forst-rs-engine/src/db.rs` for the wire format and atomicity
+// notes). The Java side wraps these via
+// `org.apache.flink.state.forstrs.migration.ForStRsStateMigration`.
+// ---------------------------------------------------------------------------
+
+/// Exports every live (key, value) pair from `cf` to a self-describing
+/// blob (`EXPORT.frsblob`) under `export_dir`. The directory is created
+/// if it does not exist.
+///
+/// Returns:
+/// - `FRS_STATUS_OK` on success.
+/// - `FRS_STATUS_NULL_ARG` if `db`, `cf`, or `export_dir` is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` if `export_dir` is not valid UTF-8 or
+///   the engine rejects the CF handle.
+/// - `FRS_STATUS_IO` if the blob cannot be written.
+///
+/// # SAFETY
+/// - `db` must be a handle returned by `frs_db_open*` and not yet closed.
+/// - `cf` must be a handle returned by `frs_db_create_cf*` /
+///   `frs_db_open_cf` for the same database.
+/// - `export_dir` must be a NUL-terminated UTF-8 string for the duration
+///   of the call.
+#[no_mangle]
+pub unsafe extern "C" fn frs_cf_export(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    export_dir: *const c_char,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(dir_str) = cstr_to_str(&export_dir) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let dir = std::path::Path::new(dir_str);
+        match db.cf_export(cf, dir) {
+            Ok(()) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Creates a new column family with name `name` and seeds it with every
+/// entry from `import_dir/EXPORT.frsblob`. The new CF handle is written
+/// to `out_cf`; the caller MUST release it via `frs_cf_close`.
+///
+/// Returns:
+/// - `FRS_STATUS_OK` on success.
+/// - `FRS_STATUS_NULL_ARG` if `db`, `name`, `import_dir`, or `out_cf`
+///   is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` if the blob is missing, the magic
+///   header doesn't match, or a CF named `name` already exists.
+/// - `FRS_STATUS_CORRUPTION` if the blob is truncated mid-entry.
+/// - `FRS_STATUS_IO` if a backing put fails.
+///
+/// # SAFETY
+/// - `db` must be a handle returned by `frs_db_open*` and not yet closed.
+/// - `name` and `import_dir` must be NUL-terminated UTF-8 strings for
+///   the duration of the call.
+/// - `out_cf` must point to a writable `FrsCfHandle` (typically a stack
+///   slot allocated as `FrsCfHandle`).
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_create_cf_from_import(
+    db: FrsDb,
+    name: *const c_char,
+    import_dir: *const c_char,
+    out_cf: *mut FrsCfHandle,
+) -> i32 {
+    guarded(|| {
+        if out_cf.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(name_str) = cstr_to_str(&name) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(dir_str) = cstr_to_str(&import_dir) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let dir = std::path::Path::new(dir_str);
+        match db.create_cf_from_import(name_str, dir) {
+            Ok(cf_handle) => {
+                let boxed = Box::new(cf_handle);
+                *out_cf = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
 fn put_batch_schema() -> std::sync::Arc<Schema> {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("key", DataType::Binary, false),
@@ -4410,6 +4516,114 @@ mod tests {
             let rc = frs_db_open_remote(uri.as_ptr(), cfg.as_ptr(), cdir.as_ptr(), 1024, &mut db);
             assert_eq!(rc, FRS_STATUS_INVALID_ARGUMENT);
             assert!(db.is_null());
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 9. State import / export migration (B-Prod-P10, spec §6g)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_frs_cf_export_then_import_roundtrip() {
+        let export_dir = tempfile::TempDir::new().expect("export tempdir");
+        let export_dir_c =
+            CString::new(export_dir.path().to_string_lossy().into_owned()).expect("cstring");
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            // Source CF.
+            let src_name = CString::new("src").unwrap();
+            let mut src_cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(
+                frs_db_create_cf(db, src_name.as_ptr(), &mut src_cf),
+                FRS_STATUS_OK
+            );
+
+            // Write a few keys via the FFI put surface.
+            for i in 0u32..32 {
+                let k = format!("k{:02}", i);
+                let v = format!("v{:02}", i);
+                assert_eq!(
+                    frs_put(
+                        db,
+                        src_cf,
+                        k.as_ptr(),
+                        k.len(),
+                        v.as_ptr(),
+                        v.len()
+                    ),
+                    FRS_STATUS_OK
+                );
+            }
+
+            // Export.
+            let rc = frs_cf_export(db, src_cf, export_dir_c.as_ptr());
+            assert_eq!(rc, FRS_STATUS_OK, "frs_cf_export failed: {rc}");
+
+            // Import as a NEW CF with a different name.
+            let imp_name = CString::new("imported").unwrap();
+            let mut imp_cf: FrsCfHandle = ptr::null_mut();
+            let rc = frs_db_create_cf_from_import(
+                db,
+                imp_name.as_ptr(),
+                export_dir_c.as_ptr(),
+                &mut imp_cf,
+            );
+            assert_eq!(rc, FRS_STATUS_OK, "frs_db_create_cf_from_import failed: {rc}");
+            assert!(!imp_cf.is_null());
+
+            // Read back from the imported CF.
+            for i in 0u32..32 {
+                let k = format!("k{:02}", i);
+                let expected = format!("v{:02}", i);
+                let mut out = FrsBytes::NULL;
+                assert_eq!(
+                    frs_get(db, imp_cf, k.as_ptr(), k.len(), &mut out),
+                    FRS_STATUS_OK,
+                    "imported get for {k}"
+                );
+                let slice = slice::from_raw_parts(out.data, out.len);
+                assert_eq!(slice, expected.as_bytes());
+                frs_bytes_free(&mut out);
+            }
+
+            assert_eq!(frs_cf_close(imp_cf), FRS_STATUS_OK);
+            assert_eq!(frs_cf_close(src_cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_cf_export_null_args_return_null_arg() {
+        unsafe {
+            // null db
+            let dir = CString::new("/tmp/nope").unwrap();
+            assert_eq!(
+                frs_cf_export(ptr::null_mut(), ptr::null_mut(), dir.as_ptr()),
+                FRS_STATUS_NULL_ARG
+            );
+        }
+    }
+
+    #[test]
+    fn test_frs_db_create_cf_from_import_null_out_returns_null_arg() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let dir_c = CString::new(dir.path().to_string_lossy().into_owned()).unwrap();
+        let name = CString::new("x").unwrap();
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            // out_cf == null
+            let rc = frs_db_create_cf_from_import(
+                db,
+                name.as_ptr(),
+                dir_c.as_ptr(),
+                ptr::null_mut(),
+            );
+            assert_eq!(rc, FRS_STATUS_NULL_ARG);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
     }
 }
