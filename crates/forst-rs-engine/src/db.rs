@@ -32,6 +32,8 @@ use forst_rs_common::{
     SequenceNumber, DEFAULT_CF_ID,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSystem};
+use forst_rs_storage::cached_fs::CachedFileSystem;
+use forst_rs_storage::local_cache::LocalCache;
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
 use forst_rs_storage::version::{SstFileMeta, Version, VersionEdit, VersionSetImpl};
 
@@ -310,6 +312,47 @@ impl DbImpl {
             secret_access_key,
         )?);
         Self::open_with_fs(options, fs)
+    }
+
+    /// Opens a remote-storage-backed engine with a local SST cache (B-Prod-P6).
+    ///
+    /// State files are persisted via OpenDAL on the URI's scheme (e.g.
+    /// `memory://`, `file:///abs/path`, `s3://bucket/`), and a local LRU
+    /// cache rooted at `cache_dir` fronts every read with `cache_capacity_bytes`
+    /// of byte budget. Service-specific configuration (S3 region, endpoint,
+    /// credentials, …) is passed via `opendal_config` whose keys match the
+    /// OpenDAL builder field names for the URI's scheme.
+    ///
+    /// On URI scheme `memory://` the `opendal_config` map is ignored; the
+    /// in-memory backend has no configurable knobs. For `file://` the
+    /// `path` portion of the URI is used as the FS root (the map is also
+    /// ignored). For `s3://`, the host portion is the bucket, and the map
+    /// MUST contain at minimum `region`; optional keys include `endpoint`,
+    /// `access_key_id`, `secret_access_key`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ForstError::InvalidArgument`] for an unsupported URI scheme,
+    ///   malformed URI, or non-UTF-8 `cache_dir`.
+    /// - [`ForstError::Io`] for any underlying OpenDAL builder failure or
+    ///   cache directory creation failure.
+    pub fn open_remote(
+        options: EngineOptions,
+        uri: &str,
+        opendal_config: HashMap<String, String>,
+        cache_dir: &std::path::Path,
+        cache_capacity_bytes: u64,
+    ) -> ForstResult<Arc<Self>> {
+        let remote_fs = build_opendal_fs_from_uri(uri, &opendal_config)?;
+        let cache = LocalCache::open(cache_dir, cache_capacity_bytes).map_err(|e| {
+            ForstError::Io(std::io::Error::other(format!(
+                "open_remote: failed to open local cache at {:?}: {e}",
+                cache_dir
+            )))
+        })?;
+        let cached_fs: Arc<dyn FileSystem> =
+            Arc::new(CachedFileSystem::new(remote_fs, Arc::new(cache)));
+        Self::open_with_fs(options, cached_fs)
     }
 
     /// Returns a handle to the default column family.
@@ -2373,6 +2416,79 @@ impl DbImpl {
         }
         *pending = still_pending;
     }
+}
+
+// ---------------------------------------------------------------------
+// Remote-storage URI -> OpendalFileSystem
+// ---------------------------------------------------------------------
+
+/// Parses an OpenDAL URI of the form `<scheme>://<authority>[/path]` and
+/// returns a configured [`OpendalFileSystem`]. Used by
+/// [`DbImpl::open_remote`] (B-Prod-P6) to bridge Java-supplied URI strings
+/// onto the strongly-typed OpenDAL builder.
+///
+/// Supported schemes today: `memory://`, `file://`, `s3://`. Service-
+/// specific knobs (region, endpoint, credentials, …) come from
+/// `extra_config` whose keys MUST match the OpenDAL builder field names
+/// for that scheme. Keys that don't apply to the scheme are ignored.
+fn build_opendal_fs_from_uri(
+    uri: &str,
+    extra_config: &HashMap<String, String>,
+) -> ForstResult<Arc<dyn FileSystem>> {
+    // Parse "scheme://rest" without depending on the `url` crate (already
+    // pulled in transitively via opendal but not exposed in our deps).
+    let (scheme, rest) = uri.split_once("://").ok_or_else(|| {
+        ForstError::invalid_argument(format!(
+            "open_remote: URI '{uri}' must be of the form '<scheme>://<rest>'"
+        ))
+    })?;
+
+    let fs: Arc<dyn FileSystem> = match scheme {
+        "memory" => Arc::new(OpendalFileSystem::memory()?),
+        "file" => {
+            // `file:///abs/path` → root = `/abs/path`. Tolerate bare
+            // `file://relative/path` too, treating it as relative.
+            let root = if rest.starts_with('/') {
+                rest.to_string()
+            } else {
+                format!("/{}", rest)
+            };
+            Arc::new(OpendalFileSystem::local(std::path::Path::new(&root))?)
+        }
+        "s3" => {
+            // `s3://bucket` or `s3://bucket/`. The path portion (if any)
+            // is treated as the bucket prefix; OpenDAL's `bucket` field
+            // is just the name, so we use the host portion.
+            let bucket = rest.split('/').next().unwrap_or(rest).to_string();
+            if bucket.is_empty() {
+                return Err(ForstError::invalid_argument(format!(
+                    "open_remote: s3 URI '{uri}' missing bucket name"
+                )));
+            }
+            let region = extra_config.get("region").cloned().ok_or_else(|| {
+                ForstError::invalid_argument(
+                    "open_remote: s3 scheme requires 'region' in opendal_config",
+                )
+            })?;
+            let endpoint = extra_config.get("endpoint").map(String::as_str);
+            let access_key_id = extra_config.get("access_key_id").map(String::as_str);
+            let secret_access_key = extra_config.get("secret_access_key").map(String::as_str);
+            Arc::new(OpendalFileSystem::s3(
+                &bucket,
+                &region,
+                endpoint,
+                access_key_id,
+                secret_access_key,
+            )?)
+        }
+        other => {
+            return Err(ForstError::invalid_argument(format!(
+                "open_remote: unsupported URI scheme '{other}' (supported: memory, file, s3)"
+            )));
+        }
+    };
+
+    Ok(fs)
 }
 
 // ---------------------------------------------------------------------

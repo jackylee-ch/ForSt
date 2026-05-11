@@ -20,6 +20,8 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod cached_fs;
+pub mod local_cache;
 pub mod memtable;
 pub mod merge_operator;
 pub mod sst;
