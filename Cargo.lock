@@ -1092,6 +1092,7 @@ dependencies = [
  "forst-rs-storage",
  "rocksdb",
  "tempfile",
+ "testcontainers",
 ]
 
 [[package]]

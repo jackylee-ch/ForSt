@@ -42,12 +42,20 @@ rocksdb = { version = "0.22", optional = true }
 arrow = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+# S3 vs local-FS comparison bench (gated by feature `s3-it`; needs Docker).
+# Same MinIO image / version pin as the engine S3 integration test.
+testcontainers = { version = "0.27", features = ["blocking"] }
 
 [features]
 default = []
 # Enable side-by-side RocksDB v8.x comparison benches. Long build time
 # (~15 min on first cargo build for the bundled C++ rocksdb sources).
 rocksdb-baseline = ["dep:rocksdb"]
+# S3 vs local-FS perf comparison bench (B-Prod-followup-S3-perf, VP Q6).
+# Requires a Docker daemon at run time. Skipped by default so
+# `cargo bench --workspace` stays self-contained; CI gates it behind a
+# dedicated `s3-perf-bench` workflow on `ubuntu-latest`.
+s3-it = []
 
 [[bench]]
 name = "point_lookup"
@@ -73,3 +81,8 @@ harness = false
 name = "rocksdb_compare"
 harness = false
 required-features = ["rocksdb-baseline"]
+
+[[bench]]
+name = "s3_vs_local"
+harness = false
+required-features = ["s3-it"]

@@ -1,0 +1,229 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# B-Prod-followup-S3-perf — disaggregated-storage perf cost measurement.
+#
+# Runs the `s3_vs_local` criterion bench (forst-rs-bench crate) which directly
+# compares `DbImpl::open_remote(s3://...)` against a MinIO testcontainer with
+# `DbImpl::open_with_fs(LocalFileSystem)` on a tempdir. Answers VP question 6
+# ("what's the perf cost of disaggregated storage?") quantitatively.
+#
+# Triggers:
+#   - workflow_dispatch — manual (analogous to nexmark-baseline.yml)
+#   - push to forst-rs when the bench file or this workflow changes
+#
+# Cost-of-running: ~10-20 min per run (MinIO image pull + bench compile + 3
+# workloads × ~30 s each). Not on every push — only when the bench surface
+# changes.
+
+name: s3-perf-bench
+
+on:
+  push:
+    branches: [forst-rs]
+    paths:
+      - 'crates/forst-rs-bench/benches/s3_vs_local.rs'
+      - 'crates/forst-rs-bench/Cargo.toml'
+      - '.github/workflows/s3-perf-bench.yml'
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: 'Criterion sample size (default 30; reduce for faster runs)'
+        required: false
+        default: '30'
+        type: string
+      measurement_time:
+        description: 'Criterion measurement_time seconds (default 3)'
+        required: false
+        default: '3'
+        type: string
+
+permissions: read-all
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_TIMEOUT: '600'
+  CARGO_NET_RETRY: '10'
+  SAMPLE_SIZE: ${{ github.event.inputs.sample_size || '30' }}
+  MEASUREMENT_TIME: ${{ github.event.inputs.measurement_time || '3' }}
+
+jobs:
+  s3-perf:
+    name: "S3 vs local-FS perf (DbImpl::open_remote MinIO vs open_with_fs LocalFileSystem)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-s3-perf-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-s3-perf-
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-s3-perf-${{ hashFiles('Cargo.lock', 'crates/forst-rs-bench/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-target-s3-perf-
+
+      # Same MinIO tag as crates/forst-rs-engine/tests/s3_remote_storage_it.rs
+      # so CI and local repro use the same image bits.
+      - name: Pre-pull MinIO image
+        run: docker pull minio/minio:RELEASE.2025-02-28T09-55-16Z
+
+      - name: Prepare results dir
+        run: mkdir -p /tmp/s3-bench
+
+      - name: Build bench (no-run)
+        run: |
+          cargo bench --no-run -p forst-rs-bench --bench s3_vs_local --features s3-it
+
+      - name: Run s3_vs_local bench
+        run: |
+          cargo bench -p forst-rs-bench --bench s3_vs_local --features s3-it -- \
+            --warm-up-time 1 \
+            --measurement-time "${MEASUREMENT_TIME}" \
+            --sample-size "${SAMPLE_SIZE}" \
+            2>&1 | tee /tmp/s3-bench/results.txt
+
+      - name: Compute local-FS vs S3 ratio
+        if: always()
+        run: |
+          set +e
+          python3 - <<'PY' | tee /tmp/s3-bench/RATIO_SUMMARY.txt
+          import re
+          try:
+              text = open('/tmp/s3-bench/results.txt').read()
+          except FileNotFoundError:
+              print("(results.txt missing — bench did not run)")
+              raise SystemExit(0)
+
+          # Criterion line shapes we look for:
+          #   s3_vs_local__point_lookup_warm_cache/local-fs/1000
+          #                          time:   [X us Y us Z us]
+          #   s3_vs_local__point_lookup_warm_cache/s3-minio-warm/1000
+          #                          time:   [...]
+          # We pair the median (middle value) of each variant inside the
+          # same group and report the S3/local ratio.
+          rows = {}  # (group, params) -> {variant: median_seconds}
+          lines = text.splitlines()
+          i = 0
+          UNIT = {'ns': 1e-9, 'us': 1e-6, 'µs': 1e-6, 'ms': 1e-3, 's': 1.0}
+          # match the bench ID header line, e.g.
+          # `s3_vs_local__sequential_write_then_flush/s3-minio/1k-writes-then-flush`
+          # Note variant names may contain '-' and '/'.
+          hdr_re = re.compile(r'^(s3_vs_local__\w+)/([\w\-]+)(?:/([\w\-]+))?\s*$')
+          time_re = re.compile(r'time:\s*\[\s*[\d.]+\s*\w+\s+([\d.]+)\s*(\w+)\s+[\d.]+\s*\w+\s*\]')
+          while i < len(lines):
+              m = hdr_re.match(lines[i].strip())
+              if m:
+                  group, variant, params = m.group(1), m.group(2), m.group(3) or ''
+                  for j in range(i + 1, min(i + 8, len(lines))):
+                      t = time_re.search(lines[j])
+                      if t:
+                          val = float(t.group(1)) * UNIT.get(t.group(2), 1.0)
+                          rows.setdefault((group, params), {})[variant] = val
+                          break
+              i += 1
+
+          print('=' * 78)
+          print(f"{'Workload':<55}{'local-fs':>12}{'s3':>12}{'ratio':>8}")
+          print('=' * 78)
+          for (group, params), pair in sorted(rows.items()):
+              # heuristic: any variant with "s3" in its name is the S3 side
+              s3_v = None
+              local_v = None
+              for v, t in pair.items():
+                  if 's3' in v:
+                      s3_v = (v, t)
+                  else:
+                      local_v = (v, t)
+              g = group.replace('s3_vs_local__', '')
+              if s3_v and local_v:
+                  ratio = s3_v[1] / local_v[1] if local_v[1] > 0 else float('inf')
+                  label = f"{g}/{params}" if params else g
+                  print(f"{label:<55}{local_v[1]*1e3:>10.3f}ms{s3_v[1]*1e3:>10.3f}ms{ratio:>7.2f}x")
+              elif s3_v:
+                  label = f"{g}/{params}" if params else g
+                  print(f"{label:<55}{'(no local)':>12}{s3_v[1]*1e3:>10.3f}ms{'':>8}")
+              elif local_v:
+                  label = f"{g}/{params}" if params else g
+                  print(f"{label:<55}{local_v[1]*1e3:>10.3f}ms{'(no s3)':>12}{'':>8}")
+          print('=' * 78)
+          print("# ratio = s3_time / local_time  (>1 → S3 slower; <1 → S3 faster)")
+          PY
+          true
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-perf-bench-results
+          path: /tmp/s3-bench/
+          retention-days: 30
+
+      - name: Upload criterion HTML reports (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-perf-criterion-html
+          path: target/criterion/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Write GitHub job summary
+        if: always()
+        run: |
+          {
+            echo "## S3 vs local-FS perf comparison"
+            echo ""
+            echo "**Commit:** \`${{ github.sha }}\`"
+            echo "**Trigger:** \`${{ github.event_name }}\`"
+            echo "**Sample size:** \`${{ env.SAMPLE_SIZE }}\`"
+            echo "**Criterion measurement_time:** \`${{ env.MEASUREMENT_TIME }}s\`"
+            echo ""
+            echo "Local: \`DbImpl::open_with_fs(LocalFileSystem)\` on a tempdir."
+            echo "S3:    \`DbImpl::open_remote(\"s3://forst-rs-bench/\", ..., cache_capacity_bytes=64 MiB)\` against a MinIO testcontainer."
+            echo ""
+            echo "### Ratio summary"
+            echo ""
+            if [ -f /tmp/s3-bench/RATIO_SUMMARY.txt ]; then
+              echo '```'
+              cat /tmp/s3-bench/RATIO_SUMMARY.txt
+              echo '```'
+            else
+              echo "_(no RATIO_SUMMARY.txt produced — bench may have failed; see artifact \`s3-perf-bench-results\`)_"
+            fi
+            echo ""
+            echo "### Raw criterion output (last 80 lines)"
+            echo ""
+            if [ -f /tmp/s3-bench/results.txt ]; then
+              echo '```'
+              tail -80 /tmp/s3-bench/results.txt
+              echo '```'
+            else
+              echo "_(no results.txt)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
