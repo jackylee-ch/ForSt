@@ -171,6 +171,12 @@ impl FrsBytes {
     };
 }
 
+impl Default for FrsBytes {
+    fn default() -> Self {
+        Self::NULL
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1879,6 +1885,406 @@ pub unsafe extern "C" fn frs_prefix_lookup_next(
     frs_iterator_next(iter, out_key, out_value, out_valid)
 }
 
+// ---------------------------------------------------------------------------
+// 10. MVCC: snapshots + versioned reads (B-Prod-P2)
+// ---------------------------------------------------------------------------
+//
+// These exports give Flink's snapshot strategy a stable C ABI for the MVCC
+// API documented in spec §10a / §10.0:
+//
+//   * `frs_db_snapshot` mints a snapshot pinned at the current sequence;
+//   * `frs_db_release_snapshot` releases it (RAII drop on the Rust side
+//     decrements the registry ref-count so compaction's `min_active`
+//     advances);
+//   * `frs_get_at` / `frs_iterator_open_at` perform versioned reads that
+//     ignore writes with sequence > snapshot.seq.
+//
+// ABI contract (spec §10.0): a snapshot is bound to its issuing DbImpl
+// (via `db_id`); cross-DB use returns `FRS_STATUS_INVALID_ARGUMENT` rather
+// than `panic` or undefined behavior, and the cross-DB release path
+// re-leaks the box so the caller cannot accidentally double-free it.
+
+mod ffi_mvcc_internal {
+    //! Box wrapper for `forst_rs_engine::Snapshot`. Keeping this `pub(crate)`
+    //! ensures external callers cannot reach inside `FrsSnapshot` and
+    //! observe the wrapped `Snapshot`'s Drop side-effects.
+    pub struct SnapshotBox {
+        pub inner: forst_rs_engine::Snapshot,
+    }
+}
+
+/// Opaque snapshot handle. Created by [`frs_db_snapshot`], released by
+/// [`frs_db_release_snapshot`]. Per spec §10.0 ABI lifetime contract:
+/// the handle is bound to its issuing [`FrsDb`] and any cross-DB use
+/// (release or read) returns `FRS_STATUS_INVALID_ARGUMENT` without
+/// freeing the underlying allocation.
+pub type FrsSnapshot = *mut ffi_mvcc_internal::SnapshotBox;
+
+/// Captures a snapshot at the engine's current sequence number.
+///
+/// On success, `*out_snapshot` receives a non-null handle that the caller
+/// MUST eventually pass to [`frs_db_release_snapshot`] (or accept the
+/// pinned-bytes liability until DB close). The handle implements MVCC
+/// isolation: subsequent writes do not affect [`frs_get_at`] reads against
+/// this snapshot.
+///
+/// # Returns
+/// - `FRS_STATUS_OK` on success.
+/// - `FRS_STATUS_NULL_ARG` if `db` or `out_snapshot` is null.
+/// - `FRS_STATUS_PANIC` if the engine path panics (caught at the boundary).
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_snapshot(db: FrsDb, out_snapshot: *mut FrsSnapshot) -> i32 {
+    guarded(|| {
+        if out_snapshot.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let snap = db.snapshot();
+        let boxed = Box::new(ffi_mvcc_internal::SnapshotBox { inner: snap });
+        *out_snapshot = Box::into_raw(boxed);
+        FRS_STATUS_OK
+    })
+}
+
+/// Releases a snapshot previously returned by [`frs_db_snapshot`].
+///
+/// # Returns
+/// - `FRS_STATUS_OK` on success — the underlying `Snapshot` is dropped
+///   and its registry ref-count decremented.
+/// - `FRS_STATUS_NULL_ARG` if `db` or `snapshot` is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` if `snapshot` was issued by a different
+///   `FrsDb`. In this case the box is intentionally re-leaked (via
+///   `mem::forget`) so the caller does not accidentally double-free
+///   when they retry the call against the correct DB.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_release_snapshot(db: FrsDb, snapshot: FrsSnapshot) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if snapshot.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let boxed = Box::from_raw(snapshot);
+        if boxed.inner.db_id() != db.db_id() {
+            // Re-leak so the caller does not double-free if they retry
+            // against the correct DB. The pinned ref stays in the issuing
+            // DB's registry until that DB is dropped.
+            std::mem::forget(boxed);
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        // Drop the box: the inner Snapshot's Drop fires here and the
+        // registry ref-count is decremented.
+        FRS_STATUS_OK
+    })
+}
+
+/// Reads the value visible at `snapshot.seq` for `key` in `cf`.
+///
+/// On success (key exists at snapshot time and is not a tombstone), the
+/// status is `FRS_STATUS_OK` and `*out_value` is populated with a Rust-
+/// owned `FrsBytes` that the caller MUST release via [`frs_bytes_free`].
+///
+/// # Returns
+/// - `FRS_STATUS_OK` with `*out_value` populated on hit.
+/// - `FRS_STATUS_NOT_FOUND` if no version is visible at snapshot time
+///   (or the latest visible version is a deletion tombstone). `*out_value`
+///   is left in its caller-provided state.
+/// - `FRS_STATUS_NULL_ARG` if any of `db`, `cf`, `snapshot`, `key`, or
+///   `out_value` is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` if `snapshot` was issued by a different
+///   `FrsDb` (per spec §15 same-DB invariant).
+/// - I/O / corruption codes propagated from the engine on failure.
+#[no_mangle]
+pub unsafe extern "C" fn frs_get_at(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    snapshot: FrsSnapshot,
+    key: *const u8,
+    key_len: usize,
+    out_value: *mut FrsBytes,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if snapshot.is_null() || key.is_null() || out_value.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        if key_len > MAX_KEY_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let snap_ref = &(*snapshot).inner;
+        if snap_ref.db_id() != db.db_id() {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let key_slice = slice::from_raw_parts(key, key_len);
+        match db.get_at_cf(cf, snap_ref, key_slice) {
+            Ok(Some(value)) => {
+                *out_value = FrsBytes::from_vec(value);
+                FRS_STATUS_OK
+            }
+            Ok(None) => FRS_STATUS_NOT_FOUND,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Opens a forward iterator that yields the latest version of each
+/// user-key with `seq <= snapshot.seq`, skipping tombstones.
+///
+/// Behaves like [`frs_iterator_open`] in every other respect: callers
+/// drive it with [`frs_iterator_next`] / [`frs_iterator_seek`] and
+/// release it via [`frs_iterator_close`]. The iterator is materialized
+/// at open time (snapshot-and-collect, see the §9 module comment) so
+/// holding the [`FrsSnapshot`] open is not strictly required after this
+/// call returns — but releasing the snapshot before all writes that
+/// followed it have been compacted away will still let compaction
+/// reclaim those versions, so the canonical pattern is to keep the
+/// snapshot alive for the iterator's lifetime.
+///
+/// # Returns
+/// - `FRS_STATUS_OK` and `*out_iter` populated on success.
+/// - `FRS_STATUS_NULL_ARG` if any pointer arg is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` if `snapshot` is from a different `FrsDb`.
+#[no_mangle]
+pub unsafe extern "C" fn frs_iterator_open_at(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    snapshot: FrsSnapshot,
+    out_iter: *mut FrsIterator,
+) -> i32 {
+    guarded(|| {
+        if out_iter.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if snapshot.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let snap_ref = &(*snapshot).inner;
+        if snap_ref.db_id() != db.db_id() {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let rows = match db.scan_at(cf, snap_ref) {
+            Ok(r) => r,
+            Err(e) => return error_to_status(&e),
+        };
+        let boxed = Box::new(IteratorState::new(rows));
+        *out_iter = Box::into_raw(boxed) as *mut c_void;
+        FRS_STATUS_OK
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 11. Incremental checkpoints at snapshot (B-Prod-P2)
+// ---------------------------------------------------------------------------
+//
+// `frs_create_incremental_checkpoint_at` records the engine state at a
+// snapshot into a manifest blob and returns the SST file lists Flink needs
+// to upload (new SSTs vs. SSTs that the previous checkpoint already
+// shipped). `frs_db_open_from_incremental` is the restore-side counterpart:
+// open a fresh DB whose state is reconstructed from the persisted manifest
+// + the SST file list.
+//
+// Memory ownership for [`FrsIncrementalCheckpointResult`]:
+//
+//   * `manifest_path` — Rust-owned C string; release with
+//     `CString::from_raw` (or via the convenience helper in P3).
+//   * `new_ssts` / `shared_ssts` — Rust-owned [`FrsLiveFileList`] boxes;
+//     release each via [`frs_db_live_file_list_free`] then `Box::from_raw`
+//     to reclaim the outer box.
+//   * `flush_done_eventfd` — `-1` for v1 (flush is synchronous before this
+//     call returns); reserved for the async-flush story documented in P5.
+
+/// Result of an incremental checkpoint capture; see module comment for
+/// memory-ownership rules.
+#[repr(C)]
+pub struct FrsIncrementalCheckpointResult {
+    /// Path to the persisted manifest blob, NUL-terminated UTF-8.
+    /// Rust-owned; release via `CString::from_raw`.
+    pub manifest_path: *mut c_char,
+    /// SSTs newly created by this checkpoint (must be uploaded to remote
+    /// storage). Outer box and inner array are both Rust-owned; release
+    /// the inner via [`frs_db_live_file_list_free`] then drop the box via
+    /// [`frs_db_incremental_checkpoint_result_free`].
+    pub new_ssts: *mut FrsLiveFileList,
+    /// SSTs shared with `base_checkpoint_id` (already on remote storage —
+    /// caller can reference them by handle without re-uploading). Same
+    /// ownership rules as `new_ssts`.
+    pub shared_ssts: *mut FrsLiveFileList,
+    /// Reserved for async-flush story. Always `-1` in v1 (flush is
+    /// synchronous before this call returns).
+    pub flush_done_eventfd: std::os::raw::c_int,
+}
+
+/// Captures an incremental checkpoint pinned at `snapshot`.
+///
+/// `checkpoint_id` is the new checkpoint's identifier; `base_checkpoint_id`
+/// is the previous checkpoint that this incremental checkpoint is taken
+/// against (any SSTs present in `base_checkpoint_id` and still live at
+/// `snapshot.seq` are returned in `shared_ssts` rather than `new_ssts`).
+/// Pass `0` for `base_checkpoint_id` for a full / first checkpoint.
+///
+/// On success, the engine has flushed and persisted the checkpoint manifest
+/// to its checkpoint directory; the caller is responsible for uploading any
+/// `new_ssts` and the manifest blob to remote storage. See module comment
+/// for memory-ownership rules of the populated [`FrsIncrementalCheckpointResult`].
+#[no_mangle]
+pub unsafe extern "C" fn frs_create_incremental_checkpoint_at(
+    db: FrsDb,
+    snapshot: FrsSnapshot,
+    checkpoint_id: u64,
+    base_checkpoint_id: u64,
+    out: *mut FrsIncrementalCheckpointResult,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if snapshot.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let snap_ref = &(*snapshot).inner;
+        if snap_ref.db_id() != db.db_id() {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        match db.create_incremental_checkpoint(snap_ref, checkpoint_id, base_checkpoint_id) {
+            Ok(result) => {
+                let manifest_path_c =
+                    std::ffi::CString::new(result.manifest_path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| {
+                            std::ffi::CString::new("<invalid-path>").expect("static literal")
+                        });
+                let new_list_box = Box::new(into_ffi_list(result.new_ssts, 0));
+                let shared_list_box = Box::new(into_ffi_list(result.shared_ssts, 0));
+                std::ptr::write(
+                    out,
+                    FrsIncrementalCheckpointResult {
+                        manifest_path: manifest_path_c.into_raw(),
+                        new_ssts: Box::into_raw(new_list_box),
+                        shared_ssts: Box::into_raw(shared_list_box),
+                        flush_done_eventfd: -1,
+                    },
+                );
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Releases the inner allocations of an [`FrsIncrementalCheckpointResult`].
+///
+/// Walks both `new_ssts` and `shared_ssts` (calling
+/// [`frs_db_live_file_list_free`] on the inner array, then reclaiming the
+/// outer Box), then reclaims `manifest_path` via `CString::from_raw`.
+/// Idempotent: calling twice (or on a NULL pointer) is a no-op.
+///
+/// The outer `*out` struct itself is caller-allocated (typical
+/// stack-or-Java-heap pattern) so we do NOT free it.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_incremental_checkpoint_result_free(
+    out: *mut FrsIncrementalCheckpointResult,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_OK;
+        }
+        let r = &mut *out;
+        if !r.new_ssts.is_null() {
+            frs_db_live_file_list_free(r.new_ssts);
+            drop(Box::from_raw(r.new_ssts));
+            r.new_ssts = std::ptr::null_mut();
+        }
+        if !r.shared_ssts.is_null() {
+            frs_db_live_file_list_free(r.shared_ssts);
+            drop(Box::from_raw(r.shared_ssts));
+            r.shared_ssts = std::ptr::null_mut();
+        }
+        if !r.manifest_path.is_null() {
+            drop(std::ffi::CString::from_raw(r.manifest_path));
+            r.manifest_path = std::ptr::null_mut();
+        }
+        FRS_STATUS_OK
+    })
+}
+
+/// Opens a fresh DB whose state is reconstructed from a manifest blob and
+/// an SST file list previously produced by
+/// [`frs_create_incremental_checkpoint_at`].
+///
+/// The function hardlinks (or copies) each `sst_files` entry into
+/// `target_dir` and then opens the DB from the persisted manifest. The
+/// returned handle behaves identically to one returned by [`frs_db_open`];
+/// release it with [`frs_db_close`].
+///
+/// # Returns
+/// - `FRS_STATUS_OK` and `*out_handle` populated on success.
+/// - `FRS_STATUS_NULL_ARG` if any required pointer is null. Per-entry NULL
+///   check on `sst_files` array entries.
+/// - I/O / corruption codes propagated from the engine on failure.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_incremental(
+    target_dir: *const c_char,
+    base_manifest: *const c_char,
+    sst_files: *const *const c_char,
+    sst_file_count: usize,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if target_dir.is_null() || base_manifest.is_null() || out_handle.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        if sst_file_count > 0 && sst_files.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let target = match CStr::from_ptr(target_dir).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        let manifest = match CStr::from_ptr(base_manifest).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        let mut paths: Vec<String> = Vec::with_capacity(sst_file_count);
+        for i in 0..sst_file_count {
+            let p = *sst_files.add(i);
+            if p.is_null() {
+                return FRS_STATUS_NULL_ARG;
+            }
+            match CStr::from_ptr(p).to_str() {
+                Ok(s) => paths.push(s.to_string()),
+                Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+            }
+        }
+        match DbImpl::open_from_incremental(&target, &manifest, &paths) {
+            Ok(db) => {
+                // Same handle layout as `frs_db_open` / `frs_db_open_memory`:
+                // a Box-allocated Arc that `frs_db_close` reclaims via
+                // `Box::from_raw`.
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
 fn put_batch_schema() -> std::sync::Arc<Schema> {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("key", DataType::Binary, false),
@@ -3332,6 +3738,148 @@ mod tests {
             );
             assert!(list.files.is_null());
             assert_eq!(list.count, 0);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // §10. MVCC FFI exports — snapshot, release, get_at, iterator_open_at
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_frs_db_snapshot_release_round_trip() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut snap: FrsSnapshot = ptr::null_mut();
+            assert_eq!(frs_db_snapshot(db, &mut snap), FRS_STATUS_OK);
+            assert!(!snap.is_null());
+            assert_eq!(frs_db_release_snapshot(db, snap), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_db_snapshot_null_db_returns_null_arg() {
+        unsafe {
+            let mut snap: FrsSnapshot = ptr::null_mut();
+            assert_eq!(
+                frs_db_snapshot(ptr::null_mut(), &mut snap),
+                FRS_STATUS_NULL_ARG
+            );
+        }
+    }
+
+    #[test]
+    fn test_frs_db_release_snapshot_null_arg_returns_null_arg() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            // NULL snapshot.
+            assert_eq!(
+                frs_db_release_snapshot(db, ptr::null_mut()),
+                FRS_STATUS_NULL_ARG
+            );
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_get_at_isolation() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"k";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), b"v1".as_ptr(), 2),
+                FRS_STATUS_OK
+            );
+
+            let mut snap: FrsSnapshot = ptr::null_mut();
+            assert_eq!(frs_db_snapshot(db, &mut snap), FRS_STATUS_OK);
+
+            // Write v2 AFTER snapshot.
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), b"v2".as_ptr(), 2),
+                FRS_STATUS_OK
+            );
+
+            // get_at sees v1.
+            let mut out = FrsBytes::default();
+            assert_eq!(
+                frs_get_at(db, cf, snap, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            let val = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(val, b"v1");
+            frs_bytes_free(&mut out);
+
+            // Current get sees v2.
+            let mut out2 = FrsBytes::default();
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out2),
+                FRS_STATUS_OK
+            );
+            let val2 = slice::from_raw_parts(out2.data, out2.len);
+            assert_eq!(val2, b"v2");
+            frs_bytes_free(&mut out2);
+
+            assert_eq!(frs_db_release_snapshot(db, snap), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_iterator_open_at_filters_by_snapshot_seq() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Write 3 keys.
+            for &k in &[b"a", b"b", b"c"] {
+                assert_eq!(
+                    frs_put(db, cf, k.as_ptr(), 1, b"v1".as_ptr(), 2),
+                    FRS_STATUS_OK
+                );
+            }
+
+            let mut snap: FrsSnapshot = ptr::null_mut();
+            assert_eq!(frs_db_snapshot(db, &mut snap), FRS_STATUS_OK);
+
+            // Add d AFTER snapshot — must NOT appear in iter_at.
+            assert_eq!(
+                frs_put(db, cf, b"d".as_ptr(), 1, b"v1".as_ptr(), 2),
+                FRS_STATUS_OK
+            );
+
+            let mut iter: FrsIterator = ptr::null_mut();
+            assert_eq!(frs_iterator_open_at(db, cf, snap, &mut iter), FRS_STATUS_OK);
+
+            let mut count = 0;
+            loop {
+                let mut k = FrsBytes::default();
+                let mut v = FrsBytes::default();
+                let mut valid: bool = false;
+                assert_eq!(
+                    frs_iterator_next(iter, &mut k, &mut v, &mut valid),
+                    FRS_STATUS_OK
+                );
+                if !valid {
+                    break;
+                }
+                count += 1;
+                frs_bytes_free(&mut k);
+                frs_bytes_free(&mut v);
+            }
+            assert_eq!(count, 3, "'d' should be filtered out by snapshot.seq");
+
+            assert_eq!(frs_iterator_close(iter), FRS_STATUS_OK);
+            assert_eq!(frs_db_release_snapshot(db, snap), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
     }
 }

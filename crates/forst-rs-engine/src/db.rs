@@ -35,7 +35,9 @@ use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSyst
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
 use forst_rs_storage::version::{SstFileMeta, Version, VersionEdit, VersionSetImpl};
 
-use crate::checkpoint::{copy_live_ssts, serialize_snapshot, write_blob, CheckpointManifest};
+use crate::checkpoint::{
+    copy_live_ssts, serialize_snapshot, write_blob, CheckpointManifest, CHECKPOINT_BLOB_NAME,
+};
 use crate::column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
 use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::compaction_filter::CompactionFilter;
@@ -85,6 +87,23 @@ pub struct LiveFileInfo {
     /// always [`DEFAULT_CF_NAME`] today, but is exposed so the FFI surface
     /// is forward-compatible with a future per-CF VersionSet.
     pub cf_name: String,
+}
+
+/// Result of [`DbImpl::create_incremental_checkpoint`]. See spec §10b.
+///
+/// `new_ssts` lists the SSTs the caller must upload to durable storage
+/// (those not already shared with `base_checkpoint_id`). `shared_ssts`
+/// lists the SSTs the caller can reference by handle from the previous
+/// checkpoint without re-uploading. `manifest_path` points at the
+/// engine-persisted checkpoint manifest blob.
+#[derive(Debug, Clone)]
+pub struct IncrementalCheckpointResult {
+    /// On-disk path to the manifest blob persisted by the engine.
+    pub manifest_path: PathBuf,
+    /// SSTs created since `base_checkpoint_id` — caller must upload.
+    pub new_ssts: Vec<LiveFileInfo>,
+    /// SSTs shared with `base_checkpoint_id` — caller can reuse handles.
+    pub shared_ssts: Vec<LiveFileInfo>,
 }
 
 /// The top-level engine struct.
@@ -501,6 +520,79 @@ impl DbImpl {
         )
         .map(|s| s.to_vec());
         Ok(result)
+    }
+
+    /// Snapshot-aware variant of [`Self::scan`]: returns (key, value) pairs
+    /// reflecting the engine state visible at `snapshot.seq`. Filters out
+    /// keys whose latest version at snapshot time is a deletion tombstone.
+    ///
+    /// Memory cost is O(scanned bytes), same as [`Self::scan`] (the FFI
+    /// iterator surface materializes the full set up front today — see
+    /// spec §6a.5 / `forst_rs_ffi`'s §9 module comment).
+    pub fn scan_at(
+        &self,
+        cf: &ColumnFamilyHandle,
+        snapshot: &Snapshot,
+    ) -> ForstResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        use std::collections::BTreeSet;
+
+        if snapshot.db_id() != self.db_id {
+            return Err(ForstError::invalid_argument(
+                "Snapshot was issued by a different DbImpl instance",
+            ));
+        }
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let read_seq = snapshot.seq().value();
+        let lower: &[u8] = &[];
+        let upper: Option<&[u8]> = None;
+        let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+
+        // Active memtable.
+        {
+            let mem_arc = cf_data.active_memtable();
+            for (k, _, _, _) in mem_arc.collect_range_entries(lower, upper, read_seq) {
+                keys.insert(k);
+            }
+        }
+        // Immutable memtables.
+        for imm in cf_data.imm_memtables() {
+            for (k, _, _, _) in imm.collect_range_entries(lower, upper, read_seq) {
+                keys.insert(k);
+            }
+        }
+        // SST layer — bound files whose key range overlaps the (empty)
+        // bound. Any file with `largest_seqno > snapshot.seq` is still
+        // worth scanning because individual entries inside the file may
+        // be older than snapshot.seq (per spec §6a.5, snapshot filtering
+        // happens at the per-entry seq level, not at the file level).
+        let version = self.version_set.current();
+        for sst in version.live_sst_files() {
+            let reader = self.get_or_open_sst_reader(&sst)?;
+            for (k, _, _, _) in reader.scan(lower, upper)? {
+                keys.insert(k);
+            }
+        }
+
+        // Resolve each candidate key through the versioned read path so
+        // that tombstones and stale versions are filtered correctly.
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = self.get_at_cf(cf, snapshot, &key)? {
+                out.push((key, value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Engine-side alias for [`Self::scan_at`] used by the FFI
+    /// `frs_iterator_open_at` export. Same contract, separate name so the
+    /// FFI binding documentation reads cleanly.
+    pub fn iter_at(
+        &self,
+        snapshot: &Snapshot,
+        cf: &ColumnFamilyHandle,
+    ) -> ForstResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_at(cf, snapshot)
     }
 
     /// Collects every version of `user_key` from memtable + L0 + lower
@@ -1279,6 +1371,194 @@ impl DbImpl {
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
         Self::spawn_flush_worker(&db);
         Ok(db)
+    }
+
+    /// Captures an incremental checkpoint pinned at `snapshot`.
+    ///
+    /// Per spec §10b: the returned [`IncrementalCheckpointResult`] describes
+    /// the SSTs that the caller must upload (`new_ssts`) and the SSTs
+    /// already present in `base_checkpoint_id` that can be referenced by
+    /// handle without re-uploading (`shared_ssts`). For `base_checkpoint_id
+    /// == 0` (full / first checkpoint) every live SST is reported as new.
+    ///
+    /// The manifest is persisted under
+    /// `<db_path>/checkpoints/<checkpoint_id>/CHECKPOINT.blob`. Callers
+    /// upload the manifest plus the `new_ssts` to durable storage; restore
+    /// uses [`Self::open_from_incremental`] to reconstruct a DB from the
+    /// uploaded files.
+    pub fn create_incremental_checkpoint(
+        &self,
+        snapshot: &Snapshot,
+        checkpoint_id: u64,
+        base_checkpoint_id: u64,
+    ) -> ForstResult<IncrementalCheckpointResult> {
+        if snapshot.db_id() != self.db_id {
+            return Err(ForstError::invalid_argument(
+                "Snapshot was issued by a different DbImpl instance",
+            ));
+        }
+
+        // Flush so every write that preceded the snapshot is on disk. This
+        // matches `create_checkpoint` semantics — versioned reads against
+        // the snapshot still work even if newer writes have come in
+        // afterwards (compaction would not drop them while the snapshot
+        // pins them).
+        self.flush_all()?;
+        let cfs: Vec<Arc<ColumnFamilyData>> = {
+            let guard = self.cfs.read().expect("lock poisoned");
+            guard.values().cloned().collect()
+        };
+        for cf_data in &cfs {
+            let has_data = {
+                let mem_arc = cf_data.active_memtable();
+                mem_arc.num_entries() > 0
+            };
+            if has_data {
+                let _writer = self.write_mutex.lock().expect("lock poisoned");
+                cf_data.swap_active_memtable();
+                self.refresh_snapshot_view(cf_data);
+                drop(_writer);
+                self.flush_cf_data(cf_data)?;
+            }
+        }
+
+        // Capture the VersionSet snapshot AFTER flushes so the manifest
+        // contains every L0 file the snapshot pins.
+        let version_snapshot = self.version_set.snapshot();
+        let blob = serialize_snapshot(&version_snapshot)?;
+
+        // Compute new vs. shared SSTs against the base checkpoint's
+        // manifest. base_checkpoint_id == 0 means "no base" — every live
+        // file is new.
+        let live = self.version_set.live_sst_files();
+        let file_numbers: Vec<FileNumber> = live.iter().map(|f| f.file_number).collect();
+        let _pin = self.deletion_guard.pin_batch(&file_numbers);
+
+        let base_dir = self.incremental_checkpoint_dir(base_checkpoint_id);
+        let base_live: std::collections::HashSet<FileNumber> = if base_checkpoint_id != 0
+            && self.fs.file_exists(&base_dir.join(CHECKPOINT_BLOB_NAME))?
+        {
+            use crate::checkpoint::{deserialize_snapshot, read_blob};
+            let base_blob = read_blob(self.fs.as_ref(), &base_dir)?;
+            let base_snap = deserialize_snapshot(&base_blob)?;
+            base_snap
+                .version
+                .live_sst_files()
+                .iter()
+                .map(|f| f.file_number)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        let mut new_ssts: Vec<LiveFileInfo> = Vec::new();
+        let mut shared_ssts: Vec<LiveFileInfo> = Vec::new();
+        for (level_idx, level_meta) in version_snapshot.version.levels.iter().enumerate() {
+            for file in &level_meta.files {
+                let info = LiveFileInfo {
+                    path: sst_file_path(&self.db_path, file.file_number),
+                    size: file.file_size,
+                    sequence: file.max_sequence.value(),
+                    level: level_idx as u8,
+                    cf_name: DEFAULT_CF_NAME.to_string(),
+                };
+                if base_live.contains(&file.file_number) {
+                    shared_ssts.push(info);
+                } else {
+                    new_ssts.push(info);
+                }
+            }
+        }
+
+        // Persist the manifest blob into the per-checkpoint subdir so
+        // `open_from_incremental` can pick it up by checkpoint id.
+        let target_dir = self.incremental_checkpoint_dir(checkpoint_id);
+        self.fs.create_dir_all(&target_dir)?;
+        let manifest_path = write_blob(self.fs.as_ref(), &target_dir, &blob)?;
+
+        drop(_pin);
+
+        Ok(IncrementalCheckpointResult {
+            manifest_path,
+            new_ssts,
+            shared_ssts,
+        })
+    }
+
+    /// Returns the canonical on-disk directory for an incremental
+    /// checkpoint with the given `checkpoint_id`. `0` is reserved by
+    /// [`Self::create_incremental_checkpoint`] to mean "no base"; passing
+    /// `0` here returns the directory the engine would use IF such an id
+    /// existed, but no caller should rely on that path.
+    fn incremental_checkpoint_dir(&self, checkpoint_id: u64) -> PathBuf {
+        self.db_path
+            .join("checkpoints")
+            .join(format!("{:020}", checkpoint_id))
+    }
+
+    /// Opens a fresh engine reconstructed from the manifest blob at
+    /// `base_manifest` plus the SST file list `sst_files`.
+    ///
+    /// Per spec §10b restore path: each `sst_files` entry is hardlinked
+    /// (or copied, on filesystems without hardlink support) into
+    /// `target_dir` under its source basename, then the engine is opened
+    /// against `target_dir` via the same blob-restore path used by
+    /// [`Self::open_from_checkpoint`]. The returned engine is fully
+    /// writable; callers that want to preserve the original checkpoint
+    /// should pass a copy of `sst_files`.
+    pub fn open_from_incremental(
+        target_dir: &str,
+        base_manifest: &str,
+        sst_files: &[String],
+    ) -> ForstResult<Arc<Self>> {
+        let target = PathBuf::from(target_dir);
+        let manifest = PathBuf::from(base_manifest);
+
+        // Ensure the target dir exists; native LocalFileSystem will fail
+        // gracefully if creation is denied.
+        let fs: Arc<dyn FileSystem> = Arc::new(forst_rs_io::LocalFileSystem::new());
+        fs.create_dir_all(&target)?;
+
+        // Copy the manifest into target_dir/CHECKPOINT.blob if it lives
+        // elsewhere; otherwise reuse in place.
+        let target_manifest = target.join(CHECKPOINT_BLOB_NAME);
+        if manifest != target_manifest {
+            // Read source blob + write into the target.
+            use crate::checkpoint::{read_blob, write_blob};
+            let manifest_dir = manifest
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            let blob = read_blob(fs.as_ref(), &manifest_dir)?;
+            write_blob(fs.as_ref(), &target, &blob)?;
+        }
+
+        // Hardlink (or copy) every SST file into the target directory.
+        for src in sst_files {
+            let src_path = PathBuf::from(src);
+            let basename = src_path
+                .file_name()
+                .ok_or_else(|| ForstError::invalid_argument(format!("bad SST path: {src}")))?;
+            let dst = target.join(basename);
+            if dst != src_path && !fs.file_exists(&dst)? {
+                // Try hardlink first (cheap, no copy); fall back to copy
+                // if hardlink fails (cross-device, FS doesn't support, etc.)
+                #[cfg(unix)]
+                let linked = std::fs::hard_link(&src_path, &dst).is_ok();
+                #[cfg(not(unix))]
+                let linked = false;
+                if !linked {
+                    crate::checkpoint::copy_file(fs.as_ref(), &src_path, &dst)?;
+                }
+            }
+        }
+
+        // Now open the engine from the materialized checkpoint dir.
+        let options = EngineOptions {
+            db_path: target.to_string_lossy().into_owned(),
+            ..EngineOptions::default()
+        };
+        Self::open_from_checkpoint(options, fs)
     }
 
     fn compact_l0_for_cf(
