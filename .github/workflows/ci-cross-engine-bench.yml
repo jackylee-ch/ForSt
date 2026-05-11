@@ -1,0 +1,492 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Cross-engine performance dashboard. Runs on every push to forst-rs/main so
+# that engine-level (Rust criterion) and JVM-side (FFM + JNI shim + canonical
+# rocksdb-jni) perf can be compared head-to-head without manual triggering.
+#
+# This is intentionally separate from:
+#   - ci-bench.yml          — nightly trend dashboard (GH Pages)
+#   - ci-bench-compare.yml  — weekly ForSt-RS-vs-RocksDB long-form measurement
+#   - nexmark-baseline.yml  — Nexmark harness smoke build (NOT real measurement)
+#
+# Bench inventory exercised here:
+#   Rust engine layer (criterion, harness=false):
+#     - rocksdb_compare.rs       (forst_rs vs rocksdb point-lookup + write, 3 group sizes)
+#     - point_lookup.rs          (ForSt-RS-only point get throughput)
+#     - write_throughput.rs      (sustained-put 25s+ window)
+#     - batch_ops.rs             (batch put + batch get)
+#   JVM bench layer (driven via flink/.../run-jmh-3way.sh):
+#     - forst-rs-ffm             -> ForStRsFfmBenchmark            (FFM bridge, perf path)
+#     - rocksdb-jni              -> RocksDbJniBenchmark            (canonical RocksDB JNI baseline)
+#     - forst-rs (JNI shim)      -> ForStCompareBenchmark          (libforst_rs_ffi loaded as JNI lib)
+#     - forst (community JNI)    -> ForStCommunityBenchmark        (REQUIRES external libforstjni; opt-in only)
+#
+# We do NOT exercise:
+#   - batch_put_arrow_vs_write_batch.rs (internal arrow-vs-batch ablation, not a cross-engine compare)
+#   - checkpoint.rs (long-running checkpoint create+open; runs in ci-bench.yml nightly)
+#   - ForStRsBProdBenchmark @Tag("bench") JUnit tests — these are long-running
+#     production parity checks, not micro-benchmarks; covered by ci-java.yml on demand.
+
+name: ci-cross-engine-bench
+
+on:
+  push:
+    branches: [forst-rs, main]
+    paths:
+      - 'crates/**'
+      - '.github/workflows/ci-cross-engine-bench.yml'
+  pull_request:
+    branches: [forst-rs, main]
+    paths:
+      - 'crates/**'
+      - '.github/workflows/ci-cross-engine-bench.yml'
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: 'Criterion sample size (default 30)'
+        required: false
+        default: '30'
+        type: string
+      measurement_time:
+        description: 'Criterion measurement_time seconds (default 3)'
+        required: false
+        default: '3'
+        type: string
+      jvm_warmup_s:
+        description: 'JVM bench warmup seconds (default 4)'
+        required: false
+        default: '4'
+        type: string
+      jvm_measure_s:
+        description: 'JVM bench measurement seconds (default 15)'
+        required: false
+        default: '15'
+        type: string
+
+permissions: read-all
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_HTTP_TIMEOUT: '600'
+  CARGO_NET_RETRY: '10'
+  # Bench tunables (resolved here so both jobs see the same default).
+  SAMPLE_SIZE: ${{ github.event.inputs.sample_size || '30' }}
+  MEASUREMENT_TIME: ${{ github.event.inputs.measurement_time || '3' }}
+  JVM_WARMUP_S: ${{ github.event.inputs.jvm_warmup_s || '4' }}
+  JVM_MEASURE_S: ${{ github.event.inputs.jvm_measure_s || '15' }}
+
+jobs:
+  rust-engine-bench:
+    name: "Rust engine bench (rocksdb vs forst-rs)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install RocksDB build deps (for rocksdb-baseline feature)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libclang-dev \
+            clang \
+            cmake \
+            libsnappy-dev \
+            liblz4-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            libbz2-dev
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-cross-engine-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-cross-engine-
+
+      - name: Cache target dir (long-lived; vendored librocksdb-sys build is ~15 min cold)
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-cross-engine-${{ hashFiles('Cargo.lock', 'crates/forst-rs-bench/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-target-cross-engine-
+
+      - name: Prepare results dir
+        run: mkdir -p /tmp/bench-results
+
+      - name: Build benches (cold-build of vendored RocksDB may take ~15 min)
+        run: |
+          # Non-rocksdb benches first (point_lookup, write_throughput, batch_ops) so a
+          # rocksdb-baseline build failure does not mask the always-on signal.
+          cargo bench --no-run -p forst-rs-bench --bench point_lookup
+          cargo bench --no-run -p forst-rs-bench --bench write_throughput
+          cargo bench --no-run -p forst-rs-bench --bench batch_ops
+          # Then the rocksdb_compare bench under the rocksdb-baseline feature.
+          cargo bench --no-run -p forst-rs-bench --features rocksdb-baseline --bench rocksdb_compare
+
+      - name: Run rocksdb_compare (forst-rs vs rocksdb, point-lookup + write)
+        run: |
+          cargo bench -p forst-rs-bench --features rocksdb-baseline --bench rocksdb_compare -- \
+            --warm-up-time 1 \
+            --measurement-time "${MEASUREMENT_TIME}" \
+            --sample-size "${SAMPLE_SIZE}" \
+            2>&1 | tee /tmp/bench-results/rocksdb_compare.txt
+
+      - name: Run point_lookup
+        run: |
+          cargo bench -p forst-rs-bench --bench point_lookup -- \
+            --warm-up-time 1 \
+            --measurement-time "${MEASUREMENT_TIME}" \
+            --sample-size "${SAMPLE_SIZE}" \
+            2>&1 | tee /tmp/bench-results/point_lookup.txt
+
+      - name: Run write_throughput (sustained-put window)
+        run: |
+          cargo bench -p forst-rs-bench --bench write_throughput -- \
+            --warm-up-time 1 \
+            --measurement-time 5 \
+            --sample-size 20 \
+            2>&1 | tee /tmp/bench-results/write_throughput.txt
+
+      - name: Run batch_ops
+        run: |
+          cargo bench -p forst-rs-bench --bench batch_ops -- \
+            --warm-up-time 1 \
+            --measurement-time "${MEASUREMENT_TIME}" \
+            --sample-size "${SAMPLE_SIZE}" \
+            2>&1 | tee /tmp/bench-results/batch_ops.txt
+
+      - name: Compute forst-rs vs rocksdb speedup (rocksdb_compare only)
+        if: always()
+        run: |
+          set +e
+          python3 - <<'PY' | tee /tmp/bench-results/SPEEDUP_SUMMARY.txt
+          import re
+          try:
+              text = open('/tmp/bench-results/rocksdb_compare.txt').read()
+          except FileNotFoundError:
+              print("(rocksdb_compare.txt missing — bench did not run)")
+              raise SystemExit(0)
+          # Pattern (criterion default fmt):
+          #   point_lookup/forst_rs/100000
+          #                          thrpt:  [11.232 12.044 12.913 Melem/s]
+          groups = {}
+          # Pair benchmark id with the next thrpt: line below it.
+          lines = text.splitlines()
+          i = 0
+          while i < len(lines):
+              m = re.match(r'^(\w+)/(forst_rs|rocksdb)/(\d+)\s*$', lines[i].strip())
+              if m:
+                  gname, impl, n = m.groups()
+                  # find next thrpt line within a window
+                  for j in range(i + 1, min(i + 8, len(lines))):
+                      t = re.search(r'thrpt:\s*\[\S+\s+([\d.]+)\s+(\w+)', lines[j])
+                      if t:
+                          val, unit = float(t.group(1)), t.group(2)
+                          groups.setdefault((gname, n), {})[impl] = (val, unit)
+                          break
+              i += 1
+          print('=' * 78)
+          print(f"{'Bench / size':<35}{'forst-rs':>16}{'rocksdb':>16}{'speedup':>10}")
+          print('=' * 78)
+          gate_met_any = False
+          for (gname, n), pair in sorted(groups.items()):
+              if 'forst_rs' in pair and 'rocksdb' in pair:
+                  fr_v, fr_u = pair['forst_rs']
+                  rb_v, rb_u = pair['rocksdb']
+                  if fr_u != rb_u:
+                      print(f"{gname}/{n:<25}  unit mismatch: {fr_u} vs {rb_u}")
+                      continue
+                  ratio = fr_v / rb_v if rb_v else float('inf')
+                  marker = '  3x-KPI' if ratio >= 3.0 else ''
+                  gate_met_any = gate_met_any or ratio >= 3.0
+                  print(f"{gname}/{n:<25}{fr_v:>10.2f} {fr_u:<4}{rb_v:>10.2f} {rb_u:<4}{ratio:>8.2f}x{marker}")
+          print('=' * 78)
+          print(f"# Rows meeting 3x KPI: {'YES' if gate_met_any else 'no'}  (informational; gate enforced in cargo test perf-gate, not here)")
+          PY
+          true  # never fail the step on parse mismatch
+
+      - name: Upload Rust bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-engine-bench-results
+          path: /tmp/bench-results/
+          retention-days: 30
+
+      - name: Upload criterion HTML reports (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-engine-criterion-html
+          path: target/criterion/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # Builds the cdylib once and uploads it as a workflow artifact so the JVM
+  # bench job can consume it without rebuilding the entire ForSt-RS tree
+  # inside the Flink checkout.
+  build-cdylib:
+    name: "Build libforst_rs_ffi.so (release cdylib)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-cdylib-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-cdylib-
+
+      - name: Cache target dir
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-cdylib-${{ hashFiles('Cargo.lock', 'crates/forst-rs-ffi/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-target-cdylib-
+
+      - name: Build cdylib
+        run: cargo build --release -p forst-rs-ffi
+
+      - name: Verify cdylib exports are present
+        run: |
+          set -e
+          test -f target/release/libforst_rs_ffi.so
+          # Spot-check the surface that JVM benches will dlopen at runtime. The list
+          # is intentionally minimal — we only want to fail fast on a totally broken
+          # cdylib, not gate the surface evolution.
+          MISSING=0
+          for sym in frs_db_open frs_db_close frs_put frs_get frs_cf_open frs_iterator_open; do
+            if ! nm -D target/release/libforst_rs_ffi.so 2>/dev/null | grep -q "\b${sym}\b"; then
+              echo "MISSING symbol: ${sym}"
+              MISSING=1
+            fi
+          done
+          [ $MISSING -eq 0 ] || exit 1
+
+      - name: Upload cdylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: libforst_rs_ffi-linux-x86_64
+          path: target/release/libforst_rs_ffi.so
+          retention-days: 30
+
+  flink-jvm-bench:
+    name: "Flink JVM bench (rocksdb-jni vs forst-rs-ffm vs forst-rs-jni-shim)"
+    runs-on: ubuntu-latest
+    needs: build-cdylib
+    timeout-minutes: 60
+    steps:
+      - name: Checkout ForSt (this repo) — for nothing yet, but keeps artifact paths predictable
+        uses: actions/checkout@v4
+        with:
+          path: forst-rs
+
+      - name: Checkout Flink companion repo (forst-rs-jdk25 branch)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/flink
+          ref: forst-rs-jdk25
+          path: flink
+
+      - name: Setup JDK 25 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      - name: Download cdylib artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: libforst_rs_ffi-linux-x86_64
+          path: /tmp/native-libs
+
+      - name: Verify cdylib downloaded
+        run: |
+          ls -la /tmp/native-libs/
+          test -f /tmp/native-libs/libforst_rs_ffi.so
+
+      - name: Cache Maven repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-mvn-cross-engine-${{ hashFiles('flink/flink-state-backends/flink-statebackend-forst-rs/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-mvn-cross-engine-
+
+      - name: Pre-fetch rocksdbjni 8.11.4 (needed by rocksdb-jni JVM variant)
+        run: |
+          cd flink
+          mvn -B -q dependency:get -Dartifact=org.rocksdb:rocksdbjni:8.11.4 || true
+
+      - name: Prepare results dir
+        run: mkdir -p /tmp/jvm-bench-results
+
+      # The run-jmh-3way.sh script lives in the Flink module and drives all four
+      # JVM bench variants via direct javac + java invocation (no surefire). We
+      # invoke it per variant and capture each /tmp/jmh-results-* file separately.
+      - name: "JVM bench: forst-rs-ffm (production FFM path, ForStRsFfmBenchmark)"
+        env:
+          FORST_RS_LIB: /tmp/native-libs/libforst_rs_ffi.so
+          BENCH_WARMUP_S: ${{ env.JVM_WARMUP_S }}
+          BENCH_MEASURE_S: ${{ env.JVM_MEASURE_S }}
+        run: |
+          cd flink/flink-state-backends/flink-statebackend-forst-rs
+          chmod +x run-jmh-3way.sh
+          ./run-jmh-3way.sh forst-rs-ffm 2>&1 | tee /tmp/jvm-bench-results/forst-rs-ffm.log
+          # Capture the well-known per-variant result file too if it landed.
+          cp -v /tmp/jmh-results-forst-rs-ffm-*.txt /tmp/jvm-bench-results/ 2>/dev/null || true
+
+      - name: "JVM bench: rocksdb-jni (canonical RocksDB JNI baseline, RocksDbJniBenchmark)"
+        env:
+          BENCH_WARMUP_S: ${{ env.JVM_WARMUP_S }}
+          BENCH_MEASURE_S: ${{ env.JVM_MEASURE_S }}
+        run: |
+          cd flink/flink-state-backends/flink-statebackend-forst-rs
+          ./run-jmh-3way.sh rocksdb-jni 2>&1 | tee /tmp/jvm-bench-results/rocksdb-jni.log
+          cp -v /tmp/jmh-results-rocksdb-jni-*.txt /tmp/jvm-bench-results/ 2>/dev/null || true
+
+      - name: "JVM bench: forst-rs (libforst_rs_ffi via JNI compat shim, ForStCompareBenchmark)"
+        env:
+          FORST_RS_LIB: /tmp/native-libs/libforst_rs_ffi.so
+          BENCH_WARMUP_S: ${{ env.JVM_WARMUP_S }}
+          BENCH_MEASURE_S: ${{ env.JVM_MEASURE_S }}
+        run: |
+          cd flink/flink-state-backends/flink-statebackend-forst-rs
+          ./run-jmh-3way.sh forst-rs 2>&1 | tee /tmp/jvm-bench-results/forst-rs-jni.log
+          cp -v /tmp/jmh-results-forst-rs-*.txt /tmp/jvm-bench-results/ 2>/dev/null || true
+
+      # The community ForSt (libforstjni) variant requires a separately-built
+      # native library that is NOT produced by this repo. We expose it as an
+      # opt-in informational step that auto-skips when the lib isn't present.
+      - name: "JVM bench: forst (community ForSt JNI — opt-in only)"
+        if: env.FORST_COMMUNITY_LIB_URL != ''
+        continue-on-error: true
+        env:
+          FORST_COMMUNITY_LIB_URL: ${{ vars.FORST_COMMUNITY_LIB_URL }}
+          BENCH_WARMUP_S: ${{ env.JVM_WARMUP_S }}
+          BENCH_MEASURE_S: ${{ env.JVM_MEASURE_S }}
+        run: |
+          curl -fSL "$FORST_COMMUNITY_LIB_URL" -o /tmp/forstjni-community.so
+          cd flink/flink-state-backends/flink-statebackend-forst-rs
+          FORST_LIB=/tmp/forstjni-community.so ./run-jmh-3way.sh forst 2>&1 | tee /tmp/jvm-bench-results/forst-community.log
+          cp -v /tmp/jmh-results-forst-*.txt /tmp/jvm-bench-results/ 2>/dev/null || true
+
+      - name: Upload JVM bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jvm-bench-results
+          path: /tmp/jvm-bench-results/
+          retention-days: 30
+
+  bench-summary:
+    name: "Cross-engine bench summary"
+    runs-on: ubuntu-latest
+    needs: [rust-engine-bench, flink-jvm-bench]
+    if: always()
+    steps:
+      - name: Download Rust bench results
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-engine-bench-results
+          path: /tmp/rust-results
+        continue-on-error: true
+
+      - name: Download JVM bench results
+        uses: actions/download-artifact@v4
+        with:
+          name: jvm-bench-results
+          path: /tmp/jvm-results
+        continue-on-error: true
+
+      - name: Write GitHub job summary
+        run: |
+          {
+            echo "## Cross-engine benchmark summary"
+            echo ""
+            echo "**Commit:** \`${{ github.sha }}\`  "
+            echo "**Trigger:** \`${{ github.event_name }}\`  "
+            echo "**Sample size:** \`${{ env.SAMPLE_SIZE }}\`  "
+            echo "**Criterion measurement_time:** \`${{ env.MEASUREMENT_TIME }}s\`  "
+            echo "**JVM warmup / measure:** \`${{ env.JVM_WARMUP_S }}s / ${{ env.JVM_MEASURE_S }}s\`  "
+            echo ""
+            echo "---"
+            echo ""
+            echo "### Engine layer — Rust criterion (rocksdb vs forst-rs)"
+            echo ""
+            if [ -f /tmp/rust-results/SPEEDUP_SUMMARY.txt ]; then
+              echo '```'
+              cat /tmp/rust-results/SPEEDUP_SUMMARY.txt
+              echo '```'
+            else
+              echo "_(no SPEEDUP_SUMMARY.txt produced — rocksdb_compare bench may have failed; see artifact \`rust-engine-bench-results\`)_"
+            fi
+            echo ""
+            for f in /tmp/rust-results/point_lookup.txt /tmp/rust-results/write_throughput.txt /tmp/rust-results/batch_ops.txt; do
+              if [ -f "$f" ]; then
+                name="$(basename "$f" .txt)"
+                echo "<details><summary><code>${name}</code> (last 25 thrpt lines)</summary>"
+                echo ""
+                echo '```'
+                grep -E '^(test|.*thrpt:|.*change:)' "$f" 2>/dev/null | tail -25 || true
+                echo '```'
+                echo "</details>"
+                echo ""
+              fi
+            done
+            echo "---"
+            echo ""
+            echo "### JVM layer — driven by \`flink/.../run-jmh-3way.sh\`"
+            echo ""
+            echo "Variants exercised (Linux x86_64 runner):"
+            echo ""
+            echo "| Variant | Bench class | Native dependency |"
+            echo "|---|---|---|"
+            echo "| \`forst-rs-ffm\`     | \`ForStRsFfmBenchmark\`    | libforst_rs_ffi.so (this repo) |"
+            echo "| \`rocksdb-jni\`      | \`RocksDbJniBenchmark\`    | bundled in rocksdbjni 8.11.4 jar |"
+            echo "| \`forst-rs\` (shim) | \`ForStCompareBenchmark\`  | libforst_rs_ffi.so loaded via JNI compat shim |"
+            echo "| \`forst\` (community)| \`ForStCommunityBenchmark\`| external libforstjni — opt-in via \`FORST_COMMUNITY_LIB_URL\` repo variable |"
+            echo ""
+            for f in /tmp/jvm-results/*.log; do
+              if [ -f "$f" ]; then
+                name="$(basename "$f" .log)"
+                echo "<details><summary><code>${name}</code> (last 40 lines)</summary>"
+                echo ""
+                echo '```'
+                tail -40 "$f" 2>/dev/null || echo "(empty)"
+                echo '```'
+                echo "</details>"
+                echo ""
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

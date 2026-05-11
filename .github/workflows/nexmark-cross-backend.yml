@@ -1,0 +1,93 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Nexmark cross-backend E2E throughput dashboard — PLACEHOLDER.
+#
+# Hard perf target (memory.md):  30–40% Nexmark E2E improvement
+#                                vs the rocksdb / community-forst baselines.
+#
+# Why this is workflow_dispatch only:
+#   - A single full Nexmark sweep (~10 queries x 3 backends x stable measurement
+#     window) takes multi-hour wall clock on ubuntu-latest-large.
+#   - The Nexmark generator + Flink job submission tooling is not yet wired in
+#     this repo; see .planning/refactor-review/N2_nexmark_plan.md.
+#   - Running on every push would burn the runner budget for the entire org.
+#
+# When ready, implement the steps under each matrix cell per the TODO block.
+
+name: nexmark-cross-backend
+
+on:
+  workflow_dispatch:
+    inputs:
+      backends:
+        description: "Comma-separated backends to bench (default: rocksdb,forst,forst-rs)"
+        required: false
+        default: "rocksdb,forst,forst-rs"
+      queries:
+        description: "Nexmark query IDs (comma-separated, e.g. q3,q7,q11)"
+        required: false
+        default: "q3,q7,q11"
+      events_per_sec:
+        description: "Source generation rate (default 1_000_000)"
+        required: false
+        default: "1000000"
+      duration_minutes:
+        description: "Per-query measurement window in minutes (default 10)"
+        required: false
+        default: "10"
+
+permissions: read-all
+
+jobs:
+  nexmark:
+    name: "Nexmark ${{ matrix.backend }} ${{ matrix.query }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [rocksdb, forst, forst-rs]
+        query: [q3, q7, q11]
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "TODO — Nexmark cross-backend execution not yet wired"
+        run: |
+          cat <<'EOF'
+          Nexmark cross-backend E2E bench is not wired in this branch.
+
+          Required components (B-Prod-followup-Nexmark workstream):
+            1. Nexmark-Flink harness checkout (already vendored as a
+               submodule; see .gitmodules + nexmark-baseline-smoke workflow)
+            2. Flink job submission with state.backend = ${{ matrix.backend }}
+            3. Source generator pinned at ${{ github.event.inputs.events_per_sec || '1000000' }} events/sec
+            4. Query ${{ matrix.query }} sustained for ${{ github.event.inputs.duration_minutes || '10' }} min
+            5. Throughput + p99 latency + backpressure metric capture
+            6. Result upload to bench-results artifact
+            7. Cross-backend speedup ratio computation
+               (3x KPI gate is per .planning/refactor-review/A1 §5;
+                NEVER silently relax even if a newer prompt softens it)
+
+          References:
+            - Plan:     .planning/refactor-review/N2_nexmark_plan.md
+            - Runbook:  .planning/nexmark/USER_RUNBOOK.md
+            - Smoke CI: .github/workflows/nexmark-baseline.yml
+
+          This matrix cell is intentionally a no-op pass so the workflow
+          dispatches cleanly until the harness lands.
+          EOF
+          echo "matrix: backend=${{ matrix.backend }} query=${{ matrix.query }}"
+          exit 0
