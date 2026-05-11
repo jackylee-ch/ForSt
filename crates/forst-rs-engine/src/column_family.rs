@@ -20,6 +20,7 @@
 //! creating/opening a column family. [`ColumnFamilyData`] holds the per-CF
 //! mutable state (active memtable, immutable list, cached snapshot view).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
@@ -34,18 +35,27 @@ use crate::snapshot_view::SnapshotView;
 ///
 /// Contains the numeric id and a shared pointer to the name. Clone is O(1)
 /// because `Arc` pointer bumps are cheap. Equality is defined by id only.
+///
+/// Holds a shared `dropped` flag (cloned from the `ColumnFamilyData` it
+/// was minted against) so callers can ask `is_dropped()` without going
+/// back through the engine. The handle's flag and the data's flag are the
+/// same `Arc<AtomicBool>` — a `drop_cf` on the engine flips both at once.
 #[derive(Clone, Debug)]
 pub struct ColumnFamilyHandle {
     id: ColumnFamilyId,
     name: Arc<String>,
+    dropped: Arc<AtomicBool>,
 }
 
 impl ColumnFamilyHandle {
-    /// Creates a new handle.
+    /// Creates a new handle. The `dropped` flag is fresh (`false`); the
+    /// engine [`super::DbImpl::drop_cf`] path flips it via the shared
+    /// `Arc<AtomicBool>` cloned into [`ColumnFamilyData`].
     pub fn new(id: ColumnFamilyId, name: impl Into<String>) -> Self {
         Self {
             id,
             name: Arc::new(name.into()),
+            dropped: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -57,6 +67,22 @@ impl ColumnFamilyHandle {
     /// Returns the column family name.
     pub fn name(&self) -> &str {
         self.name.as_str()
+    }
+
+    /// Returns `true` if [`super::DbImpl::drop_cf`] has been called on
+    /// this CF (or an equivalent handle sharing the same id). Cheap
+    /// (single relaxed atomic load); intended for callers that want to
+    /// short-circuit work on a dropped CF without paying the engine's
+    /// `lookup_cf_by_id` cost.
+    pub fn is_dropped(&self) -> bool {
+        self.dropped.load(Ordering::Acquire)
+    }
+
+    /// Marks the handle as dropped. Used by the engine; external callers
+    /// should not call this directly — they should call
+    /// [`super::DbImpl::drop_cf`].
+    pub(crate) fn mark_dropped(&self) {
+        self.dropped.store(true, Ordering::Release);
     }
 }
 
@@ -259,6 +285,22 @@ impl ColumnFamilyData {
         &self.handle
     }
 
+    /// Returns `true` once [`super::DbImpl::drop_cf`] has flipped this
+    /// CF's `dropped` flag. The flag is shared (single
+    /// `Arc<AtomicBool>`) between the data and every cloned
+    /// [`ColumnFamilyHandle`], so callers either side observe the same
+    /// state.
+    pub fn is_dropped(&self) -> bool {
+        self.handle.is_dropped()
+    }
+
+    /// Marks this CF as dropped (and, by extension, every
+    /// [`ColumnFamilyHandle`] cloned off it). Engine-internal; callers
+    /// invoke [`super::DbImpl::drop_cf`] instead.
+    pub(crate) fn mark_dropped(&self) {
+        self.handle.mark_dropped();
+    }
+
     /// Returns the column family options.
     pub fn options(&self) -> &CfOptions {
         &self.options
@@ -399,6 +441,12 @@ mod tests {
     }
 
     #[test]
+    // Clippy flags interior-mutability on `Arc<AtomicBool>` inside the
+    // handle, but the handle's `Hash` / `Eq` are defined over `id` only
+    // — the `dropped` flag never participates in hashing. Suppress the
+    // lint with an inline allow so the test exercises the real-world
+    // usage (Flink stores handles in maps keyed by id).
+    #[allow(clippy::mutable_key_type)]
     fn test_handle_hashable() {
         use std::collections::HashMap;
         let h = ColumnFamilyHandle::new(ColumnFamilyId(5), "x");

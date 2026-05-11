@@ -2726,6 +2726,130 @@ pub unsafe extern "C" fn frs_db_create_cf_from_import(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 9b. drop_cf + ingest_external_sst (B-Prod-followup-5, spec §6g)
+//
+// The community RocksDB-style import path hardlinks SST files in
+// O(file-count) instead of replaying scan + put in O(key-count). These
+// two FFI exports let Flink's `ForStRsStateMigration` swap its
+// scan/replay path for the engine's hardlink+ingest path, dropping
+// per-row migration cost in the process.
+// ---------------------------------------------------------------------------
+
+/// Drops a column family.
+///
+/// Removes the CF from the engine's CF maps and flips its shared
+/// `dropped` flag so subsequent operations on cloned handles return
+/// `FRS_STATUS_INVALID_ARGUMENT`. Idempotent on an already-dropped CF
+/// (returns `FRS_STATUS_OK`); rejects the default CF.
+///
+/// SSTs are NOT physically deleted — see
+/// [`forst_rs_engine::DbImpl::drop_cf`] for the rationale (the
+/// `VersionSet` is currently CF-agnostic).
+///
+/// Returns:
+/// - `FRS_STATUS_OK` on success (including idempotent re-drop).
+/// - `FRS_STATUS_NULL_ARG` if `db` or `cf` is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` if `cf` is the default CF or the
+///   engine rejects the handle.
+///
+/// # SAFETY
+/// - `db` must be a handle returned by `frs_db_open*` and not yet closed.
+/// - `cf` must be a handle returned by `frs_db_create_cf*` /
+///   `frs_db_open_cf`. The handle remains valid (callers MUST still
+///   call `frs_cf_close`); calling `frs_db_drop_cf` only marks it
+///   unusable for future engine operations.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_drop_cf(db: FrsDb, cf: FrsCfHandle) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        match db.drop_cf(cf) {
+            Ok(()) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Ingests pre-built SST files into the engine's L0.
+///
+/// Each path in `sst_paths` (an array of `count` NUL-terminated UTF-8 C
+/// strings) is hardlinked (or copied cross-FS) into the engine's SST
+/// directory, then registered at L0 via a single atomic version edit.
+/// See [`forst_rs_engine::DbImpl::ingest_external_sst`] for the caller
+/// contract (key-range overlap rules, source-SST compatibility, CF
+/// visibility).
+///
+/// Returns:
+/// - `FRS_STATUS_OK` on successful ingest.
+/// - `FRS_STATUS_NULL_ARG` if `db`, `cf`, or `sst_paths` is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` if `count > MAX_BATCH_COUNT`, or any
+///   path entry is null / not valid UTF-8, or the engine rejects the
+///   CF handle.
+/// - `FRS_STATUS_IO` if hardlink+copy fails for any source file.
+/// - `FRS_STATUS_CORRUPTION` if a source SST cannot be parsed.
+///
+/// # SAFETY
+/// - `db`, `cf` must be valid (see [`frs_db_drop_cf`]).
+/// - `sst_paths` must point to a contiguous array of `count` NUL-
+///   terminated C strings, each readable for the duration of the call.
+/// - The engine takes no ownership of `sst_paths`; the caller is free
+///   to delete (or keep) the source files after the call returns.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_ingest_external_sst(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    sst_paths: *const *const c_char,
+    count: usize,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if sst_paths.is_null() && count != 0 {
+            return FRS_STATUS_NULL_ARG;
+        }
+        if count > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        if count == 0 {
+            // Engine treats empty input as a no-op; mirror that here so
+            // a Java caller can pass an empty array without special-
+            // casing on the JNI side.
+            return match db.ingest_external_sst(cf, &[]) {
+                Ok(_) => FRS_STATUS_OK,
+                Err(e) => error_to_status(&e),
+            };
+        }
+        // Collect the C-string array into owned PathBufs first so the
+        // borrow checker is happy with the &[&Path] the engine expects.
+        let raw_slice = slice::from_raw_parts(sst_paths, count);
+        let mut owned: Vec<PathBuf> = Vec::with_capacity(count);
+        for raw in raw_slice {
+            if raw.is_null() {
+                return FRS_STATUS_NULL_ARG;
+            }
+            let cstr = CStr::from_ptr(*raw);
+            let Ok(s) = cstr.to_str() else {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            };
+            owned.push(PathBuf::from(s));
+        }
+        let path_refs: Vec<&Path> = owned.iter().map(|p| p.as_path()).collect();
+        match db.ingest_external_sst(cf, &path_refs) {
+            Ok(_) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
 fn put_batch_schema() -> std::sync::Arc<Schema> {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("key", DataType::Binary, false),
@@ -4617,6 +4741,95 @@ mod tests {
             let rc =
                 frs_db_create_cf_from_import(db, name.as_ptr(), dir_c.as_ptr(), ptr::null_mut());
             assert_eq!(rc, FRS_STATUS_NULL_ARG);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    // ---- B-Prod-followup-5: frs_db_drop_cf + frs_db_ingest_external_sst ----
+
+    #[test]
+    fn test_frs_db_drop_cf_round_trip() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let name = CString::new("to_drop").unwrap();
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_create_cf(db, name.as_ptr(), &mut cf), FRS_STATUS_OK);
+            // First drop succeeds.
+            assert_eq!(frs_db_drop_cf(db, cf), FRS_STATUS_OK);
+            // Second drop is idempotent.
+            assert_eq!(frs_db_drop_cf(db, cf), FRS_STATUS_OK);
+            // A subsequent put on the dropped handle must fail.
+            let k = b"x";
+            let v = b"y";
+            let rc = frs_put(db, cf, k.as_ptr(), 1, v.as_ptr(), 1);
+            assert_eq!(rc, FRS_STATUS_INVALID_ARGUMENT);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_db_drop_cf_rejects_default() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+            let rc = frs_db_drop_cf(db, cf);
+            assert_eq!(rc, FRS_STATUS_INVALID_ARGUMENT);
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_db_drop_cf_null_args() {
+        unsafe {
+            assert_eq!(
+                frs_db_drop_cf(ptr::null_mut(), ptr::null_mut()),
+                FRS_STATUS_NULL_ARG
+            );
+        }
+    }
+
+    #[test]
+    fn test_frs_db_ingest_external_sst_empty_input() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+            // count = 0 with null sst_paths: engine no-op.
+            assert_eq!(
+                frs_db_ingest_external_sst(db, cf, ptr::null(), 0),
+                FRS_STATUS_OK
+            );
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_db_ingest_external_sst_null_args() {
+        unsafe {
+            // null db
+            assert_eq!(
+                frs_db_ingest_external_sst(ptr::null_mut(), ptr::null_mut(), ptr::null(), 0),
+                FRS_STATUS_NULL_ARG
+            );
+            // count > MAX_BATCH_COUNT
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+            let dummy: *const c_char = ptr::null();
+            assert_eq!(
+                frs_db_ingest_external_sst(db, cf, &dummy, MAX_BATCH_COUNT + 1),
+                FRS_STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
     }

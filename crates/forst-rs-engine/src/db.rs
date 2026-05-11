@@ -540,6 +540,296 @@ impl DbImpl {
         Ok(())
     }
 
+    /// Drops a column family (B-Prod-followup-5, spec §6g).
+    ///
+    /// Removes `cf` from the engine's CF maps, flips its shared `dropped`
+    /// flag (visible from every cloned [`ColumnFamilyHandle`]), and
+    /// releases the memtable buffers back to the
+    /// [`WriteBufferManager`]. Subsequent operations on the dropped CF
+    /// return [`ForstError::InvalidArgument`].
+    ///
+    /// SST FILES ARE NOT DELETED. forst-rs's `VersionSet` is currently
+    /// CF-agnostic — a single SST may contain rows for multiple CFs
+    /// (the engine relies on the Flink-side `CfRouter` to disambiguate
+    /// via cf-id key prefixes). Walking the version set to remove "this
+    /// CF's files" would corrupt sibling CFs. The correct reclamation
+    /// story is: drop the CF, let compaction's `should_drop` MVCC logic
+    /// retire the orphaned rows as they age out. This matches the spec
+    /// §6g acceptance criterion ("dropped CF is invisible to subsequent
+    /// reads"; physical storage reclamation is allowed to be lazy).
+    ///
+    /// Idempotent:
+    /// - Dropping an already-dropped CF returns `Ok(())` (no-op).
+    /// - Dropping the default CF returns
+    ///   [`ForstError::InvalidArgument`] (the default CF cannot be
+    ///   dropped; an attempt is a programming error, not a no-op).
+    pub fn drop_cf(&self, cf: &ColumnFamilyHandle) -> ForstResult<()> {
+        // Reject the default CF up-front. The check is by id (not name)
+        // so renames in the future can't slip past — id 0 is the
+        // process-wide default-CF contract.
+        if cf.id() == DEFAULT_CF_ID {
+            return Err(ForstError::invalid_argument(
+                "default column family cannot be dropped",
+            ));
+        }
+
+        // Idempotent: already-dropped → no-op. We check the handle's
+        // shared flag first so callers that re-drop with a stale handle
+        // get Ok without us needing to find the CF in the maps.
+        if cf.is_dropped() {
+            return Ok(());
+        }
+
+        // Resolve the CF data while it's still in the maps. We bypass
+        // `lookup_cf_by_id` here because that path returns
+        // InvalidArgument once the flag is flipped — and we're the one
+        // about to flip it.
+        let cf_data = {
+            let cfs = self.cfs.read().expect("lock poisoned");
+            cfs.get(&cf.id()).cloned()
+        };
+        let Some(cf_data) = cf_data else {
+            // Not in the maps and not flagged dropped — caller passed a
+            // bogus handle. Surface as InvalidArgument for parity with
+            // every other CF-resolving entry point.
+            return Err(ForstError::invalid_argument(format!(
+                "column family id {} not found",
+                cf.id()
+            )));
+        };
+
+        // Flip the dropped flag BEFORE removing from the maps so a
+        // concurrent `lookup_cf_by_id` race observes either:
+        //   (a) the CF still in the map but flagged → InvalidArgument
+        //   (b) the CF gone from the map → InvalidArgument (not found)
+        // Either way the caller sees consistent "CF unusable" rejection.
+        cf_data.mark_dropped();
+
+        // Release memtable bytes back to the WriteBufferManager. We
+        // approximate by sampling both the active and immutable memtable
+        // usage; the per-shard accounting is precise enough for the
+        // cross-CF budget cap which is itself coarse (~512 MiB default).
+        let mut released_bytes: u64 = cf_data.active_memtable().memory_usage() as u64;
+        for imm in cf_data.imm_memtables() {
+            released_bytes = released_bytes.saturating_add(imm.memory_usage() as u64);
+        }
+        self.write_buffer_manager.release(released_bytes);
+
+        // Remove from both maps. The (cfs map, name map) ordering doesn't
+        // matter for correctness — the dropped flag is the source of
+        // truth once flipped — but removing from `cf_name_to_id` first
+        // lets a same-name `create_column_family` immediately succeed.
+        let cf_name = cf_data.handle().name().to_string();
+        {
+            let mut names = self.cf_name_to_id.write().expect("lock poisoned");
+            names.remove(&cf_name);
+        }
+        {
+            let mut cfs = self.cfs.write().expect("lock poisoned");
+            cfs.remove(&cf.id());
+        }
+
+        // The `Arc<ColumnFamilyData>` may still have outstanding refs
+        // (compaction job snapshots, in-flight write batches). Those
+        // refs will observe `is_dropped() == true` on their next CF
+        // access and bail out cleanly. Once the last ref drops, the
+        // memtable and snapshot view are reclaimed.
+        Ok(())
+    }
+
+    /// Ingests pre-built SST files into the engine's L0 layer
+    /// (B-Prod-followup-5, spec §6g).
+    ///
+    /// Each `src_path` is hardlinked (or copied if cross-filesystem)
+    /// into the engine's SST directory under a freshly allocated file
+    /// number, its footer is read to extract `min_key` / `max_key` /
+    /// `min_sequence` / `max_sequence` / `num_entries` / `file_size`,
+    /// and the resulting `SstFileMeta` is installed at L0 via a single
+    /// atomic `VersionSetImpl::apply` call.
+    ///
+    /// CONTRACT — caller responsibilities:
+    ///
+    /// - The source SSTs MUST be readable by [`SstReaderImpl::open`]
+    ///   (i.e. produced by another forst-rs instance or a compatible
+    ///   builder). RocksDB-compat ingestion is not supported on this
+    ///   path today.
+    /// - Key ranges in the ingested SSTs SHOULD NOT overlap with keys
+    ///   already present at non-zero levels. The engine installs at L0
+    ///   where overlap is permitted; deeper levels would require
+    ///   compaction-level overlap analysis the caller cannot easily do.
+    /// - The `cf` argument is currently informational — forst-rs's
+    ///   `VersionSet` is global (not partitioned by CF), so the
+    ///   ingested files become visible to ALL live CFs. Callers route
+    ///   CF visibility via the key encoding (Flink's `CfRouter` prefix
+    ///   scheme); the `cf` parameter exists so a future per-CF
+    ///   VersionSet can drop in without breaking callers.
+    ///
+    /// Returns the list of newly allocated SST file numbers (one per
+    /// `src_path`) in the same order. On any per-file failure the
+    /// already-linked dest files are best-effort cleaned up and the
+    /// error is propagated — the version set is never partially
+    /// updated.
+    pub fn ingest_external_sst(
+        &self,
+        cf: &ColumnFamilyHandle,
+        sst_paths: &[&Path],
+    ) -> ForstResult<Vec<u64>> {
+        let _cf_data = self.lookup_cf_by_id(cf.id())?;
+        if sst_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 1: allocate file numbers, hardlink/copy source SSTs into
+        // the engine's SST dir, and read their footers to build
+        // SstFileMeta entries. We accumulate (file_number, dest_path,
+        // meta) so the version edit and the readers cache can both be
+        // populated atomically below.
+        let mut new_files: Vec<(FileNumber, PathBuf, SstFileMeta)> =
+            Vec::with_capacity(sst_paths.len());
+        let mut new_ids: Vec<u64> = Vec::with_capacity(sst_paths.len());
+
+        for src in sst_paths {
+            let file_number = self.version_set.allocate_file_number();
+            let dest = sst_file_path(&self.db_path, file_number);
+
+            // Try hardlink first (fastest, zero-copy on same FS); fall
+            // back to a byte copy on cross-FS / unsupported FS.
+            if let Err(_link_err) = std::fs::hard_link(src, &dest) {
+                std::fs::copy(src, &dest).map_err(|e| {
+                    // Best-effort cleanup of any already-linked dest
+                    // files so a failed ingest doesn't leak SSTs into
+                    // the engine's directory.
+                    Self::cleanup_ingested(&new_files);
+                    ForstError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "ingest_external_sst: hardlink+copy '{}' -> '{}' failed: {e}",
+                            src.display(),
+                            dest.display()
+                        ),
+                    ))
+                })?;
+            }
+
+            // Open the dest file and read the footer to extract the
+            // metadata fields VersionEdit needs. We open via the engine's
+            // FileSystem (so the OpenDAL / cached-fs paths get exercised
+            // uniformly), not std::fs.
+            let rac = self.fs.open_random_access_file(&dest).inspect_err(|_| {
+                Self::cleanup_ingested(&new_files);
+            })?;
+            // Re-open the dest via a *fresh* RAC so we can sample its
+            // file_size BEFORE consuming the handle into SstReaderImpl
+            // (the reader takes Box<dyn RandomAccessFile> by value).
+            // The second `open_random_access_file` is cheap on every
+            // FileSystem impl we ship.
+            let file_size = match self.fs.open_random_access_file(&dest) {
+                Ok(probe) => match probe.file_size() {
+                    Ok(sz) => sz,
+                    Err(e) => {
+                        Self::cleanup_ingested(&new_files);
+                        return Err(e);
+                    }
+                },
+                Err(e) => {
+                    Self::cleanup_ingested(&new_files);
+                    return Err(e);
+                }
+            };
+            let reader = SstReaderImpl::open(rac).inspect_err(|_| {
+                Self::cleanup_ingested(&new_files);
+            })?;
+            let footer = reader.footer().clone();
+
+            let meta = SstFileMeta {
+                file_number,
+                file_size,
+                smallest_key: footer.min_key.clone(),
+                largest_key: footer.max_key.clone(),
+                min_sequence: SequenceNumber(footer.min_sequence),
+                max_sequence: SequenceNumber(footer.max_sequence),
+                num_entries: footer.total_entries,
+            };
+
+            new_ids.push(file_number.value());
+            new_files.push((file_number, dest, meta));
+
+            // Drop the temp reader; we'll re-open into the engine's
+            // sst_readers cache below after the version edit lands.
+            drop(reader);
+        }
+
+        // Phase 2: install all new SSTs at L0 in a single VersionEdit.
+        // The edit also bumps `last_sequence` to cover the highest seq
+        // we just ingested so subsequent reads at u64::MAX still see
+        // these keys without the read path having to specially handle
+        // "ingested seq > engine seq".
+        let mut max_seq_ingested: u64 = 0;
+        let mut new_files_for_edit: Vec<(u32, SstFileMeta)> = Vec::with_capacity(new_files.len());
+        for (_, _, meta) in &new_files {
+            if meta.max_sequence.value() > max_seq_ingested {
+                max_seq_ingested = meta.max_sequence.value();
+            }
+            new_files_for_edit.push((0u32, meta.clone()));
+        }
+
+        let edit = VersionEdit {
+            new_files: new_files_for_edit,
+            last_sequence: if max_seq_ingested > 0 {
+                Some(SequenceNumber(max_seq_ingested))
+            } else {
+                None
+            },
+            ..Default::default()
+        };
+        if let Err(e) = self.version_set.apply(&edit) {
+            Self::cleanup_ingested(&new_files);
+            return Err(e);
+        }
+
+        // Phase 3: pre-populate the sst_readers cache so the first
+        // point lookup doesn't pay the open-file cost. We rebuild
+        // readers because the temp readers from phase 1 were dropped
+        // above; this also ensures the cache holds readers opened
+        // through the engine's FileSystem (cf. CachedFileSystem
+        // bookkeeping).
+        let mut readers_map = self.sst_readers.write().expect("lock poisoned");
+        for (file_number, dest, _meta) in &new_files {
+            let rac = self.fs.open_random_access_file(dest)?;
+            let reader = Arc::new(SstReaderImpl::open(rac)?);
+            readers_map.insert(*file_number, reader);
+        }
+        drop(readers_map);
+
+        // Bump the engine sequence counter so writes following the
+        // ingest don't reuse a seq < the ingested max. Matches the
+        // VersionEdit's `last_sequence` update above; we set both
+        // because external readers consult `engine.sequence_number()`
+        // (e.g. `snapshot()`) while the read path consults
+        // `version_set.last_sequence()`.
+        if max_seq_ingested > self.sequence_number.load(Ordering::Acquire) {
+            self.sequence_number
+                .store(max_seq_ingested, Ordering::Release);
+        }
+
+        // L0 file count for back-pressure.
+        self.write_controller
+            .set_l0_file_count(self.version_set.current().l0_files().len() as u32);
+
+        Ok(new_ids)
+    }
+
+    /// Best-effort cleanup helper for [`Self::ingest_external_sst`].
+    /// Deletes any dest files we already linked/copied before the call
+    /// failed. Errors are intentionally swallowed (the surfaced error is
+    /// the original failure that triggered cleanup; cleanup failures
+    /// would only obscure it).
+    fn cleanup_ingested(new_files: &[(FileNumber, PathBuf, SstFileMeta)]) {
+        for (_, dest, _) in new_files {
+            let _ = std::fs::remove_file(dest);
+        }
+    }
+
     /// Returns a reference to the engine options.
     pub fn options(&self) -> &EngineOptions {
         &self.options
@@ -2900,9 +3190,25 @@ impl DbImpl {
 
     fn lookup_cf_by_id(&self, id: ColumnFamilyId) -> ForstResult<Arc<ColumnFamilyData>> {
         let cfs = self.cfs.read().expect("lock poisoned");
-        cfs.get(&id).cloned().ok_or_else(|| {
+        let cf_data = cfs.get(&id).cloned().ok_or_else(|| {
             ForstError::invalid_argument(format!("column family id {} not found", id))
-        })
+        })?;
+        // Spec §6g / B-Prod-followup-5: dropped CFs are removed from the
+        // `cfs` map atomically with the `dropped` flag flip, so a hit here
+        // means the CF is still live. The flag check is a belt-and-braces
+        // race guard for the brief window where a caller may have stashed
+        // an Arc<ColumnFamilyData> across a `drop_cf` boundary (compaction
+        // workers, write batches in-flight, etc.). Returning
+        // InvalidArgument from this central choke point ensures every
+        // engine entry point that resolves a handle gets the consistent
+        // "CF dropped" rejection without each call site re-checking.
+        if cf_data.is_dropped() {
+            return Err(ForstError::invalid_argument(format!(
+                "column family id {} has been dropped",
+                id
+            )));
+        }
+        Ok(cf_data)
     }
 
     /// Access the shared [`FileDeletionGuard`] — used by checkpoints to pin
