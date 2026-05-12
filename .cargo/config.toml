@@ -3,3 +3,18 @@ registry = "https://github.com/rust-lang/crates.io-index"
 
 [net]
 git-fetch-with-cli = true
+
+# Enable target-cpu=native for release builds: unlocks AVX2 on x86_64 and
+# NEON on aarch64. The hash-index probe, memcpy, and comparison operations
+# in the memtable hot path auto-vectorize with these instruction sets.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
