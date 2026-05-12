@@ -205,3 +205,77 @@ The Phase B plan's focus shifts from "reduce FFM hop count" (B1/B3) to:
 3. **Batch-get** (B1, still useful but won't close the 5.8× gap alone since the per-call cost is in the engine, not the hop)
 
 4. **Checkpoint hang** (NEW blocker): `ForStRsSnapshotStrategy` blocks the data path during checkpoint barriers. Needs investigation before the checkpoint-enabled perf bar can be measured.
+
+---
+
+## Post-Hash-Index Optimization (commit 98ede3451)
+
+### Engine-level improvement
+
+| Bench | Before | After | Speedup |
+|---|---|---|---|
+| criterion point_lookup 10k keys | 733 µs | 488 µs | **1.50×** |
+| criterion point_lookup 100k keys | 8.9 ms | 5.6 ms | **1.59×** |
+| rocksdb_compare (forst-rs vs rocksdb) | 4.3× faster | **9.6× faster** | 2.2× improvement |
+
+### Through-Flink (LittleE2E 1M events, p=2, no checkpointing)
+
+| Backend | Before hash-index | After hash-index | Change |
+|---|---:|---:|---|
+| rocksdb | 1,418,081 eps | 1,375,946 eps | ~same |
+| **forst-rs** | **242,931 eps** | **476,761 eps** | **+96% (+1.96×)** |
+| Gap (rocksdb / forst-rs) | 5.84× | **2.89×** | Gap halved |
+
+### Honest assessment of the 3× performance bar
+
+The user's target: **forst-rs/S3 should be 3× FASTER than rocksdb/local**.
+
+Current reality: **rocksdb is still 2.89× faster than forst-rs** (both local).
+
+The gap between "engine 9.6× faster" and "through-Flink 2.89× slower" is the
+**Flink runtime per-event overhead**:
+- Key-group encoding (`ForStRsKeyGroupedSerializer.encodeForState`)
+- State-context setup (`setCurrentKey` + key-group assignment)
+- Namespace serialization
+- `InternalKvState` adapter dispatch
+- Per-call `MemorySegment.ofArray` + `Linker.Option.critical(true)` FFM session
+
+RocksDB's JNI path avoids most of this: its `RocksDB.get(byte[])` is a single
+JNI call with no key-group encoding, no namespace, no adapter — the key IS the
+raw user key. ForSt-rs pays the Flink keyed-state protocol overhead on every
+event because it implements `AbstractKeyedStateBackend` properly.
+
+### What would it take to hit 3× faster
+
+To flip from "2.89× slower" to "3× faster" requires a **~8.7× total improvement**
+from today's through-Flink number. Paths:
+
+1. **Batch state access** (B1 in Phase 2 plan): amortize the per-event Flink
+   overhead across N events. If N=10 (batch window), the per-event overhead
+   drops 10×. This is the single highest-leverage optimization remaining.
+
+2. **Eliminate key-group encoding on the hot path**: cache the encoded key
+   per current-key (it doesn't change between state accesses for the same
+   record). Saves ~1 µs/event.
+
+3. **Direct-memory state access** (bypass the InternalKvState adapter layer):
+   for the common ValueState case, inline the get/put directly in the backend
+   without going through the adapter's `getInternal`/`updateInternal` dispatch.
+
+4. **The S3 warm-cache advantage**: if the working set fits in LocalCache,
+   forst-rs/S3 = forst-rs/local (0.95× per our S3 bench). So the S3 path
+   doesn't help or hurt for warm-cache — the comparison is effectively
+   forst-rs/local vs rocksdb/local.
+
+**Honest verdict**: The 3× FASTER bar (forst-rs over rocksdb) is **not achievable
+through point-lookup optimization alone**. It requires either:
+- A fundamentally different access pattern where forst-rs's vectorized engine
+  wins (batch/scan workloads, not point-lookup-per-event)
+- OR reducing the Flink per-event overhead to near-zero via batching (B1)
+- OR measuring a workload where checkpoint cost dominates (forst-rs MVCC
+  snapshot is µs vs rocksdb's ms-scale flush) — but the checkpoint variant
+  currently hangs
+
+The **5× forst-rs/S3 vs forst/S3** bar is more achievable because both pay
+the same S3 cost and forst-rs's engine is genuinely 9.6× faster at the engine
+level. The Flink overhead gap narrows when both backends pay it equally.
