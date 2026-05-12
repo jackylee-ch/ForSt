@@ -122,8 +122,8 @@ pub struct VectorizedMemTable {
     ///
     /// Memory overhead: ~56 bytes per unique key (Box<[u8]> + HashEntry header)
     /// + 16 bytes per version (RowIndex) + up to 64 bytes inline value.
-    /// For 1M keys with avg 32-byte keys and 1 version each: ~112 MB worst
-    /// case (all values ≤64B inlined) — still within a 128 MiB memtable budget.
+    ///   For 1M keys with avg 32-byte keys and 1 version each: ~112 MB worst
+    ///   case (all values ≤64B inlined) — still within a 128 MiB memtable budget.
     hash_index: HashMap<Box<[u8]>, HashEntry>,
 
     // -- State --
@@ -295,7 +295,7 @@ impl VectorizedMemTable {
             entry.latest_seq = seq;
             entry.latest_op = op_type_byte;
             if op_type_byte == OpType::Put as u8
-                && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
             {
                 entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
             } else {
@@ -303,7 +303,7 @@ impl VectorizedMemTable {
             }
         } else {
             let inline_value = if op_type_byte == OpType::Put as u8
-                && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
             {
                 value.map(|v| v.to_vec().into_boxed_slice())
             } else {
@@ -614,8 +614,8 @@ impl VectorizedMemTable {
     /// The returned pointer is valid as long as:
     /// - The `VectorizedMemTable` is not dropped
     /// - No write to the same key occurs (which would reallocate the Box)
-    /// In Flink's single-threaded-per-slot model, both conditions hold for
-    /// the duration of a single record processing.
+    ///   In Flink's single-threaded-per-slot model, both conditions hold for
+    ///   the duration of a single record processing.
     pub fn get_pinned_ptr(&self, key: &[u8]) -> Option<(*const u8, usize)> {
         let entry = self.hash_index.get(key)?;
         // Only serve from inline cache for Put ops (not Delete/Merge).
@@ -750,7 +750,7 @@ impl VectorizedMemTable {
                 entry.latest_seq = seq;
                 entry.latest_op = op_types[i];
                 if op_types[i] == OpType::Put as u8
-                    && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
                 {
                     entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
                 } else {
@@ -758,7 +758,7 @@ impl VectorizedMemTable {
                 }
             } else {
                 let inline_value = if op_types[i] == OpType::Put as u8
-                    && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
                 {
                     value.map(|v| v.to_vec().into_boxed_slice())
                 } else {
@@ -888,7 +888,7 @@ impl VectorizedMemTable {
                 entry.latest_seq = seq;
                 entry.latest_op = op_types[i];
                 if op_types[i] == OpType::Put as u8
-                    && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
                 {
                     entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
                 } else {
@@ -896,7 +896,7 @@ impl VectorizedMemTable {
                 }
             } else {
                 let inline_value = if op_types[i] == OpType::Put as u8
-                    && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
                 {
                     value.map(|v| v.to_vec().into_boxed_slice())
                 } else {
@@ -1148,7 +1148,7 @@ impl VectorizedMemTable {
                 entry.latest_seq = seq;
                 entry.latest_op = op_values[i];
                 if op_values[i] == OpType::Put as u8
-                    && val_bytes.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                    && val_bytes.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
                 {
                     entry.inline_value = val_bytes.map(|v| v.to_vec().into_boxed_slice());
                 } else {
@@ -1156,7 +1156,7 @@ impl VectorizedMemTable {
                 }
             } else {
                 let inline_value = if op_values[i] == OpType::Put as u8
-                    && val_bytes.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                    && val_bytes.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
                 {
                     val_bytes.map(|v| v.to_vec().into_boxed_slice())
                 } else {
@@ -2372,7 +2372,10 @@ mod tests {
         let over = vec![42u8; INLINE_THRESHOLD + 1]; // 65 bytes
         mt.put(b"over", Some(&over), 1).unwrap();
         let entry = mt.hash_index.get(b"over".as_slice()).unwrap();
-        assert!(entry.inline_value.is_none(), "65 bytes should NOT be inlined");
+        assert!(
+            entry.inline_value.is_none(),
+            "65 bytes should NOT be inlined"
+        );
     }
 
     /// Overwriting a key updates the inline cache to the new value.
@@ -2396,7 +2399,12 @@ mod tests {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"k", Some(b"val"), 1).unwrap();
         // Verify inline is set.
-        assert!(mt.hash_index.get(b"k".as_slice()).unwrap().inline_value.is_some());
+        assert!(mt
+            .hash_index
+            .get(b"k".as_slice())
+            .unwrap()
+            .inline_value
+            .is_some());
 
         // Delete clears inline.
         mt.put(b"k", None, 0).unwrap(); // OpType::Delete = 0
@@ -2410,7 +2418,12 @@ mod tests {
     fn test_inline_value_small_to_large_clears_cache() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"k", Some(b"small"), 1).unwrap();
-        assert!(mt.hash_index.get(b"k".as_slice()).unwrap().inline_value.is_some());
+        assert!(mt
+            .hash_index
+            .get(b"k".as_slice())
+            .unwrap()
+            .inline_value
+            .is_some());
 
         let large = vec![0u8; 128];
         mt.put(b"k", Some(&large), 1).unwrap();

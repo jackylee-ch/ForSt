@@ -2972,11 +2972,7 @@ impl DbImpl {
     /// Best-effort: errors are silently ignored (the subsequent
     /// `get_or_open_sst_reader` will retry and surface the error if it
     /// persists).
-    fn prefetch_sst_files_for_batch(
-        &self,
-        _cf_data: &Arc<ColumnFamilyData>,
-        _keys: &[&[u8]],
-    ) {
+    fn prefetch_sst_files_for_batch(&self, _cf_data: &Arc<ColumnFamilyData>, _keys: &[&[u8]]) {
         let version = self.version_set.current();
         let readers = self.sst_readers.read().expect("lock poisoned");
 

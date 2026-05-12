@@ -367,14 +367,7 @@ fn m5_get_pinned_small_value_returns_ok() {
 
         let mut out_ptr: *const u8 = ptr::null();
         let mut out_len: usize = 0;
-        let rc = frs_get_pinned(
-            db,
-            cf,
-            key.as_ptr(),
-            key.len(),
-            &mut out_ptr,
-            &mut out_len,
-        );
+        let rc = frs_get_pinned(db, cf, key.as_ptr(), key.len(), &mut out_ptr, &mut out_len);
         assert_eq!(rc, FRS_STATUS_OK);
         assert!(!out_ptr.is_null());
         assert_eq!(out_len, value.len());
@@ -399,14 +392,7 @@ fn m5_get_pinned_large_value_returns_fallback() {
 
         let mut out_ptr: *const u8 = ptr::null();
         let mut out_len: usize = 0;
-        let rc = frs_get_pinned(
-            db,
-            cf,
-            key.as_ptr(),
-            key.len(),
-            &mut out_ptr,
-            &mut out_len,
-        );
+        let rc = frs_get_pinned(db, cf, key.as_ptr(), key.len(), &mut out_ptr, &mut out_len);
         assert_eq!(rc, FRS_STATUS_FALLBACK);
         assert!(out_ptr.is_null());
         assert_eq!(out_len, 0);
@@ -457,14 +443,7 @@ fn m5_get_pinned_deleted_key_returns_fallback() {
 
         let mut out_ptr: *const u8 = ptr::null();
         let mut out_len: usize = 0;
-        let rc = frs_get_pinned(
-            db,
-            cf,
-            key.as_ptr(),
-            key.len(),
-            &mut out_ptr,
-            &mut out_len,
-        );
+        let rc = frs_get_pinned(db, cf, key.as_ptr(), key.len(), &mut out_ptr, &mut out_len);
         assert_eq!(rc, FRS_STATUS_FALLBACK);
         assert!(out_ptr.is_null());
 
@@ -483,25 +462,11 @@ fn m5_get_pinned_null_args_returns_null_arg() {
         let mut out_len: usize = 0;
 
         // null out_ptr
-        let rc = frs_get_pinned(
-            db,
-            cf,
-            b"k".as_ptr(),
-            1,
-            ptr::null_mut(),
-            &mut out_len,
-        );
+        let rc = frs_get_pinned(db, cf, b"k".as_ptr(), 1, ptr::null_mut(), &mut out_len);
         assert_eq!(rc, FRS_STATUS_NULL_ARG);
 
         // null out_len
-        let rc = frs_get_pinned(
-            db,
-            cf,
-            b"k".as_ptr(),
-            1,
-            &mut out_ptr,
-            ptr::null_mut(),
-        );
+        let rc = frs_get_pinned(db, cf, b"k".as_ptr(), 1, &mut out_ptr, ptr::null_mut());
         assert_eq!(rc, FRS_STATUS_NULL_ARG);
 
         frs_cf_close(cf);
