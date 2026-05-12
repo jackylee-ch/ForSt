@@ -99,6 +99,59 @@ impl CachedFileSystem {
         &self.remote
     }
 
+    /// Ensures the file at `path` is present in the local cache.
+    ///
+    /// On a cache hit this is a no-op (just a hash-map lookup). On a miss
+    /// the entire file is fetched from the remote backend in one GetObject
+    /// call and persisted to the local cache directory.
+    ///
+    /// # Use case — S3 vector I/O prefetch
+    ///
+    /// Call `ensure_cached` for each SST file that a batch of lookups will
+    /// touch *before* opening the readers. This amortizes S3 RTT: one
+    /// large GetObject per SST instead of many small range reads, and
+    /// allows the caller to issue multiple prefetches in parallel (e.g.
+    /// via `rayon` or `tokio::spawn`).
+    ///
+    /// ```text
+    /// // Prefetch all SSTs a batch_get will touch:
+    /// for path in sst_paths {
+    ///     cached_fs.ensure_cached(&path)?;
+    /// }
+    /// // Now open_random_access_file is a local-only operation.
+    /// ```
+    pub fn ensure_cached(&self, path: &Path) -> ForstResult<()> {
+        let key = self.cache_key(path)?;
+        if self.cache.contains(key) {
+            return Ok(());
+        }
+        // Miss: fetch the entire file and populate the cache.
+        self.fetch_through_cache(path)?;
+        Ok(())
+    }
+
+    /// Batch-prefetch multiple files into the local cache.
+    ///
+    /// Iterates `paths` and calls [`ensure_cached`](Self::ensure_cached) for
+    /// each. Files already in the cache are skipped (cheap hash-map check).
+    /// Returns the number of cache misses that triggered a remote fetch.
+    ///
+    /// For maximum throughput on S3, callers should parallelize across
+    /// paths at a higher layer (e.g. `rayon::par_iter` or async tasks).
+    /// This sequential helper is provided for convenience when the caller
+    /// does not have a parallel runtime available.
+    pub fn prefetch_files(&self, paths: &[&Path]) -> ForstResult<usize> {
+        let mut misses = 0usize;
+        for path in paths {
+            let key = self.cache_key(path)?;
+            if !self.cache.contains(key) {
+                self.fetch_through_cache(path)?;
+                misses += 1;
+            }
+        }
+        Ok(misses)
+    }
+
     /// Resolves a `&Path` to its cache-key string (UTF-8). The same key
     /// shape is used on remote reads, local writes, and invalidations.
     fn cache_key<'a>(&self, path: &'a Path) -> ForstResult<&'a str> {
@@ -227,6 +280,15 @@ impl FileSystem for CachedFileSystem {
     fn name(&self) -> &str {
         &self.name
     }
+
+    fn ensure_cached(&self, path: &Path) -> ForstResult<()> {
+        let key = self.cache_key(path)?;
+        if self.cache.contains(key) {
+            return Ok(());
+        }
+        self.fetch_through_cache(path)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +400,92 @@ mod tests {
         let mut chunk = [0u8; 5];
         let n = r2.read_at(6, &mut chunk).unwrap();
         assert_eq!(&chunk[..n], b"from-");
+    }
+
+    #[test]
+    fn ensure_cached_fetches_entire_file_on_first_access() {
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(LocalCache::open(tmp.path(), 1 << 20).unwrap());
+        let fs = CachedFileSystem::new(remote.clone(), cache.clone());
+
+        // Seed the remote with a file.
+        let path = PathBuf::from("/db/test.sst");
+        let mut w = remote
+            .open_writable_file(&path, WriteMode::CreateOrTruncate)
+            .unwrap();
+        w.append(b"hello world data").unwrap();
+        w.sync().unwrap();
+        drop(w);
+
+        // First access: cache miss, fetches entire file.
+        assert!(!cache.contains("/db/test.sst"));
+        fs.ensure_cached(&path).unwrap();
+        assert!(cache.contains("/db/test.sst"));
+
+        // Subsequent reads are cache hits (delete remote to prove it).
+        remote.delete_file(&path).unwrap();
+        let r = fs.open_random_access_file(&path).unwrap();
+        let mut buf = [0u8; 5];
+        let n = r.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn ensure_cached_is_noop_on_hit() {
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(LocalCache::open(tmp.path(), 1 << 20).unwrap());
+        let fs = CachedFileSystem::new(remote.clone(), cache.clone());
+
+        let path = PathBuf::from("/db/hit.sst");
+        let mut w = remote
+            .open_writable_file(&path, WriteMode::CreateOrTruncate)
+            .unwrap();
+        w.append(b"cached-data").unwrap();
+        w.sync().unwrap();
+        drop(w);
+
+        // Populate cache.
+        fs.ensure_cached(&path).unwrap();
+        assert!(cache.contains("/db/hit.sst"));
+
+        // Delete remote — ensure_cached should not fail because it's a hit.
+        remote.delete_file(&path).unwrap();
+        fs.ensure_cached(&path).unwrap(); // no-op, no remote access
+    }
+
+    #[test]
+    fn prefetch_files_returns_miss_count() {
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(LocalCache::open(tmp.path(), 1 << 20).unwrap());
+        let fs = CachedFileSystem::new(remote.clone(), cache.clone());
+
+        let path_a = PathBuf::from("/db/a.sst");
+        let path_b = PathBuf::from("/db/b.sst");
+        for (p, data) in [(&path_a, b"aaa" as &[u8]), (&path_b, b"bbb" as &[u8])] {
+            let mut w = remote
+                .open_writable_file(p, WriteMode::CreateOrTruncate)
+                .unwrap();
+            w.append(data).unwrap();
+            w.sync().unwrap();
+        }
+
+        // Both are misses on first prefetch.
+        let misses = fs
+            .prefetch_files(&[path_a.as_path(), path_b.as_path()])
+            .unwrap();
+        assert_eq!(misses, 2);
+
+        // Second call: both are hits.
+        let misses = fs
+            .prefetch_files(&[path_a.as_path(), path_b.as_path()])
+            .unwrap();
+        assert_eq!(misses, 0);
     }
 
     #[test]

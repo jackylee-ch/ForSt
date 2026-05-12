@@ -162,6 +162,21 @@ pub trait FileSystem: Send + Sync {
 
     /// Returns a human-readable name for this filesystem implementation.
     fn name(&self) -> &str;
+
+    /// Hint: ensure the file at `path` is locally available for fast reads.
+    ///
+    /// For caching filesystem implementations (e.g. `CachedFileSystem`),
+    /// this fetches the entire file from the remote backend into the local
+    /// cache on a miss. For local or in-memory filesystems this is a no-op.
+    ///
+    /// Callers use this to prefetch SST files before opening readers,
+    /// amortizing S3 round-trip latency across multiple files (vector I/O
+    /// prefetch pattern).
+    ///
+    /// The default implementation is a no-op that always succeeds.
+    fn ensure_cached(&self, _path: &Path) -> ForstResult<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

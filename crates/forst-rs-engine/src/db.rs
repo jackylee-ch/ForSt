@@ -2799,18 +2799,67 @@ impl DbImpl {
     }
 
     /// Batch point-lookup.
+    ///
+    /// Before performing the lookups, prefetches any SST files that are not
+    /// already in the reader cache into the local file cache (S3 vector I/O
+    /// prefetch). This amortizes S3 round-trip latency: one GetObject per
+    /// SST file instead of paying the RTT on the first `get_internal` that
+    /// happens to miss the reader cache.
     pub fn batch_get(
         &self,
         cf: &ColumnFamilyHandle,
         keys: &[&[u8]],
     ) -> ForstResult<Vec<Option<Vec<u8>>>> {
         let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        // S3 vector I/O prefetch: warm the file cache for SSTs not yet in
+        // the reader cache. This is a no-op on LocalFileSystem/MemoryFileSystem
+        // (the trait default returns Ok(())).
+        self.prefetch_sst_files_for_batch(&cf_data, keys);
+
         let read_seq = u64::MAX;
         let mut out = Vec::with_capacity(keys.len());
         for k in keys {
             out.push(self.get_internal(&cf_data, k, read_seq)?);
         }
         Ok(out)
+    }
+
+    /// Prefetch SST files that a batch of keys might touch.
+    ///
+    /// Collects all SST file numbers from the current version that are NOT
+    /// already open in `sst_readers`, then calls `fs.ensure_cached(path)`
+    /// for each. On a CachedFileSystem backed by S3, this fetches the
+    /// entire SST in one GetObject call and populates the local cache.
+    /// On local/memory filesystems this is a no-op.
+    ///
+    /// Best-effort: errors are silently ignored (the subsequent
+    /// `get_or_open_sst_reader` will retry and surface the error if it
+    /// persists).
+    fn prefetch_sst_files_for_batch(
+        &self,
+        _cf_data: &Arc<ColumnFamilyData>,
+        _keys: &[&[u8]],
+    ) {
+        let version = self.version_set.current();
+        let readers = self.sst_readers.read().expect("lock poisoned");
+
+        // Collect file numbers not yet in the reader cache.
+        let mut to_prefetch: Vec<PathBuf> = Vec::new();
+        for level in &version.levels {
+            for sst in &level.files {
+                if !readers.contains_key(&sst.file_number) {
+                    to_prefetch.push(sst_file_path(&self.db_path, sst.file_number));
+                }
+            }
+        }
+        drop(readers);
+
+        // Prefetch each file. Errors are best-effort — the read path will
+        // retry on the actual lookup and surface the error there.
+        for path in &to_prefetch {
+            let _ = self.fs.ensure_cached(path);
+        }
     }
 
     fn get_internal(
