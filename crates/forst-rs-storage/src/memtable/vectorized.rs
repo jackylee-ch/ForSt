@@ -15,8 +15,9 @@
 //! [`VectorizedMemTable`] — hybrid Sorted Run Array + BTreeMap implementation.
 //!
 //! Columnar storage (key, value, sequence, op_type) mirrors the SST Arrow
-//! schema. A BTreeMap sorted index enables O(log N) point lookups over
-//! already-merged data, while a HashMap buffers recent unsorted writes.
+//! schema. A persistent HashMap (`hash_index`) provides O(1) point lookups.
+//! A BTreeMap sorted index enables ordered iteration for range scans and
+//! flush, while a HashMap buffers recent unsorted writes before merge.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
@@ -46,8 +47,10 @@ struct RowIndex {
 /// the unsorted HashMap. When the unsorted zone grows beyond the configured
 /// ratio, entries are merged into the sorted BTreeMap.
 ///
-/// **Read path:** `get()` checks the unsorted HashMap first (newer data),
-/// then the sorted BTreeMap, returning the entry with the highest sequence.
+/// **Read path:** `get()` uses the persistent `hash_index` for O(1) point
+/// lookups. The hash index is maintained on every write and never drained by
+/// the merge step — it is the single source of truth for point lookups.
+/// Range scans still use the sorted BTreeMap + unsorted zone.
 pub struct VectorizedMemTable {
     // -- Columnar storage (append-only) --
     /// Key bytes, concatenated.
@@ -87,6 +90,18 @@ pub struct VectorizedMemTable {
     /// Pool of recycled `Vec<RowIndex>` allocations released by the merge step.
     /// PERF (B2): avoids re-allocating the per-key index list on every put.
     rowindex_vec_pool: Vec<Vec<RowIndex>>,
+
+    /// Persistent hash index for O(1) point lookups. Maps user_key to ALL
+    /// RowIndex entries for that key (across both sorted and unsorted zones).
+    /// Unlike `unsorted_lookup` (which is drained on merge), this index is
+    /// append-only and survives `merge_unsorted_to_sorted()`. Entries are in
+    /// insertion order (oldest first); `get()` walks backwards to find the
+    /// latest visible version.
+    ///
+    /// Memory overhead: ~40 bytes per unique key (Box<[u8]> + Vec header) +
+    /// 16 bytes per version (RowIndex). For 1M keys with avg 32-byte keys
+    /// and 1 version each: ~56 MB — acceptable for a 64 MiB memtable.
+    hash_index: HashMap<Box<[u8]>, Vec<RowIndex>>,
 
     // -- State --
     /// Current sequence counter (incremented on each insert).
@@ -132,6 +147,7 @@ impl VectorizedMemTable {
             unsorted_entries: Vec::with_capacity(INIT_ROWS_HINT),
             unsorted_lookup: HashMap::with_capacity(INIT_ROWS_HINT),
             rowindex_vec_pool: Vec::new(),
+            hash_index: HashMap::with_capacity(INIT_ROWS_HINT),
             next_sequence: 1,
             memory_used: 0,
             frozen: false,
@@ -247,6 +263,13 @@ impl VectorizedMemTable {
             let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
             slot.push(row_index);
             self.unsorted_lookup.insert(Box::from(key), slot);
+        }
+
+        // Persistent hash index: always append so get() is O(1).
+        if let Some(slot) = self.hash_index.get_mut(key) {
+            slot.push(row_index);
+        } else {
+            self.hash_index.insert(Box::from(key), vec![row_index]);
         }
 
         // Update memory tracking (approximate).
@@ -493,35 +516,15 @@ impl VectorizedMemTable {
 
     /// Point lookup: returns the latest entry for `key` with sequence <= `read_sequence`.
     ///
-    /// Checks the unsorted zone first (newer data), then the sorted index.
-    /// Returns the entry with the highest sequence number.
+    /// Uses the persistent `hash_index` for O(1) access. The hash index
+    /// contains ALL versions of every key (across both sorted and unsorted
+    /// zones) in insertion order. We walk backwards to find the latest
+    /// visible version.
     pub fn get(&self, key: &[u8], read_sequence: u64) -> ForstResult<Option<GetResult>> {
-        // Check unsorted zone first (potentially newer).
-        let unsorted_result = self
-            .unsorted_lookup
+        let result = self
+            .hash_index
             .get(key)
             .and_then(|indices| self.find_latest(indices, read_sequence));
-
-        // Check sorted index.
-        let sorted_result = self
-            .sorted_index
-            .get(key)
-            .and_then(|indices| self.find_latest(indices, read_sequence));
-
-        // Return the one with the higher sequence.
-        let result = match (unsorted_result, sorted_result) {
-            (Some(u), Some(s)) => {
-                if u.sequence >= s.sequence {
-                    Some(u)
-                } else {
-                    Some(s)
-                }
-            }
-            (Some(u), None) => Some(u),
-            (None, Some(s)) => Some(s),
-            (None, None) => None,
-        };
-
         Ok(result)
     }
 
@@ -642,6 +645,13 @@ impl VectorizedMemTable {
                 self.unsorted_lookup.insert(Box::from(key), slot);
             }
 
+            // Persistent hash index: always append so get() is O(1).
+            if let Some(slot) = self.hash_index.get_mut(key) {
+                slot.push(row_index);
+            } else {
+                self.hash_index.insert(Box::from(key), vec![row_index]);
+            }
+
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
 
@@ -746,6 +756,13 @@ impl VectorizedMemTable {
                 let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
                 slot.push(row_index);
                 self.unsorted_lookup.insert(Box::from(key), slot);
+            }
+
+            // Persistent hash index: always append so get() is O(1).
+            if let Some(slot) = self.hash_index.get_mut(key) {
+                slot.push(row_index);
+            } else {
+                self.hash_index.insert(Box::from(key), vec![row_index]);
             }
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
@@ -969,6 +986,13 @@ impl VectorizedMemTable {
                 let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
                 slot.push(row_index);
                 self.unsorted_lookup.insert(Box::from(key), slot);
+            }
+
+            // Persistent hash index: always append so get() is O(1).
+            if let Some(slot) = self.hash_index.get_mut(key) {
+                slot.push(row_index);
+            } else {
+                self.hash_index.insert(Box::from(key), vec![row_index]);
             }
 
             // Approximate memory accounting matching put()/batch_insert().
@@ -2009,5 +2033,120 @@ mod tests {
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         // 200 + 500 = 700 raw rows.
         assert_eq!(total_rows, 700);
+    }
+
+    // === Hash index O(1) point lookup tests ===
+
+    /// Validates that the hash_index gives correct results after
+    /// merge_unsorted_to_sorted — the key property that makes this an
+    /// improvement over the old get() which fell back to BTreeMap.
+    #[test]
+    fn test_hash_index_point_lookup_survives_merge() {
+        let mut mt = VectorizedMemTable::new(MemTableConfig {
+            max_size: 64 * 1024 * 1024,
+            unsorted_merge_ratio: 1024.0, // suppress auto-merge
+        });
+        // Insert 10k keys.
+        for i in 0..10_000u32 {
+            let k = format!("hk_{:06}", i);
+            let v = format!("hv_{:06}", i);
+            mt.put(k.as_bytes(), Some(v.as_bytes()), 1).unwrap();
+        }
+        // Force merge — moves everything from unsorted_lookup to sorted_index.
+        mt.merge_unsorted_to_sorted();
+        assert!(mt.unsorted_lookup.is_empty());
+        assert_eq!(mt.sorted_count, 10_000);
+
+        // hash_index must still serve all 10k keys at O(1).
+        for i in 0..10_000u32 {
+            let k = format!("hk_{:06}", i);
+            let v = format!("hv_{:06}", i);
+            let r = mt.get(k.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(r.value, Some(v.into_bytes()), "mismatch at {}", i);
+        }
+    }
+
+    /// Multi-version: hash_index correctly returns the latest version
+    /// even after multiple merges.
+    #[test]
+    fn test_hash_index_multi_version_across_merges() {
+        let mut mt = VectorizedMemTable::new(MemTableConfig {
+            max_size: 64 * 1024 * 1024,
+            unsorted_merge_ratio: 1024.0,
+        });
+        mt.put(b"key", Some(b"v1"), 1).unwrap(); // seq=1
+        mt.merge_unsorted_to_sorted();
+        mt.put(b"key", Some(b"v2"), 1).unwrap(); // seq=2
+        mt.merge_unsorted_to_sorted();
+        mt.put(b"key", Some(b"v3"), 1).unwrap(); // seq=3
+
+        // Latest version.
+        let r = mt.get(b"key", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"v3".to_vec()));
+        assert_eq!(r.sequence, 3);
+
+        // Snapshot reads at each seq boundary.
+        let r = mt.get(b"key", 1).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"v1".to_vec()));
+        let r = mt.get(b"key", 2).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"v2".to_vec()));
+    }
+
+    /// Hash index handles delete tombstones correctly.
+    #[test]
+    fn test_hash_index_delete_tombstone() {
+        let mut mt = VectorizedMemTable::new(MemTableConfig {
+            max_size: 64 * 1024 * 1024,
+            unsorted_merge_ratio: 1024.0,
+        });
+        mt.put(b"key", Some(b"alive"), 1).unwrap();
+        mt.merge_unsorted_to_sorted();
+        mt.put(b"key", None, 0).unwrap(); // Delete
+
+        let r = mt.get(b"key", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.op_type, OpType::Delete);
+        assert_eq!(r.value, None);
+
+        // Snapshot before delete sees the value.
+        let r = mt.get(b"key", 1).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"alive".to_vec()));
+    }
+
+    /// 10k keys: hash-index get matches what a full scan would return.
+    #[test]
+    fn hash_index_point_lookup_matches_scan() {
+        let mut mt = VectorizedMemTable::new(MemTableConfig {
+            max_size: 64 * 1024 * 1024,
+            unsorted_merge_ratio: 0.25, // allow natural merges
+        });
+        // Insert 10k keys with some overwrites.
+        for i in 0..10_000u32 {
+            let k = format!("sk_{:06}", i);
+            let v = format!("sv_{:06}", i);
+            mt.put(k.as_bytes(), Some(v.as_bytes()), 1).unwrap();
+        }
+        // Overwrite first 1000 keys.
+        for i in 0..1_000u32 {
+            let k = format!("sk_{:06}", i);
+            let v = format!("sv2_{:06}", i);
+            mt.put(k.as_bytes(), Some(v.as_bytes()), 1).unwrap();
+        }
+
+        // Verify hash-index get matches expected for every key.
+        for i in 0..10_000u32 {
+            let k = format!("sk_{:06}", i);
+            let expected_v = if i < 1000 {
+                format!("sv2_{:06}", i)
+            } else {
+                format!("sv_{:06}", i)
+            };
+            let r = mt.get(k.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(
+                r.value,
+                Some(expected_v.into_bytes()),
+                "mismatch at key {}",
+                i
+            );
+        }
     }
 }
