@@ -1141,6 +1141,63 @@ impl DbImpl {
         self.write_single(cf, key, Some(value), OpType::Put)
     }
 
+    /// Combined get + put in one call. Returns the OLD value (before the put).
+    ///
+    /// Equivalent to `let old = self.get(cf, key)?; self.put(cf, key, new_value)?; Ok(old)`
+    /// but performs both operations in a single engine call, saving one FFM
+    /// boundary crossing for the dominant ValueState read-modify-write pattern.
+    /// The read uses the latest sequence (u64::MAX visibility) and the put
+    /// allocates a fresh sequence number — same semantics as separate calls.
+    pub fn get_and_put(
+        &self,
+        cf: &ColumnFamilyHandle,
+        key: &[u8],
+        new_value: &[u8],
+    ) -> ForstResult<Option<Vec<u8>>> {
+        // Pre-write checks (same as write_single).
+        self.consume_flush_error()?;
+        self.write_controller.may_throttle()?;
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        // Read the old value (latest view, same as get()).
+        let read_seq = u64::MAX;
+        let old_value = self.get_internal(&cf_data, key, read_seq)?;
+
+        // Write the new value (same logic as write_single for Put).
+        let seq = self.sequence_number.fetch_add(1, Ordering::Relaxed) + 1;
+        Self::check_sequence_overflow(seq)?;
+
+        {
+            let mut attempt = 0;
+            loop {
+                let mem_arc = cf_data.active_memtable();
+                match mem_arc.put_with_seq(key, Some(new_value), OpType::Put as u8, seq) {
+                    Ok(_) => break,
+                    Err(e) if attempt < 8 && e.to_string().contains("frozen MemTable") => {
+                        attempt += 1;
+                        std::thread::yield_now();
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // WBM charge (same formula as write_single).
+        let charge = key.len() as u64 + new_value.len() as u64 + 8 + 1 + 48;
+        self.write_buffer_manager.reserve(charge);
+
+        let needs_flush = {
+            let _writer = self.write_mutex.lock().expect("lock poisoned");
+            self.maybe_switch_memtable_in_lock(&cf_data)?
+        };
+        let wbm_over = self.write_buffer_manager.over_budget();
+        if needs_flush || wbm_over {
+            self.enqueue_flush(cf_data.clone())?;
+        }
+
+        Ok(old_value)
+    }
+
     /// Deletes the key.
     pub fn delete(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> ForstResult<u64> {
         self.write_single(cf, key, None, OpType::Delete)
@@ -3781,6 +3838,43 @@ mod tests {
         assert_eq!(out[0].as_deref(), Some(b"1".as_ref()));
         assert_eq!(out[1], None);
         assert_eq!(out[2].as_deref(), Some(b"2".as_ref()));
+    }
+
+    #[test]
+    fn test_get_and_put_returns_old_value() {
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"old").unwrap();
+        let old = db.get_and_put(&cf, b"k", b"new").unwrap();
+        assert_eq!(old.as_deref(), Some(b"old".as_ref()));
+        // Verify the new value is now stored.
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"new".as_ref()));
+    }
+
+    #[test]
+    fn test_get_and_put_missing_key_returns_none() {
+        let db = open();
+        let cf = db.default_cf();
+        let old = db.get_and_put(&cf, b"absent", b"val").unwrap();
+        assert_eq!(old, None);
+        // The put still succeeds.
+        assert_eq!(
+            db.get(&cf, b"absent").unwrap().as_deref(),
+            Some(b"val".as_ref())
+        );
+    }
+
+    #[test]
+    fn test_get_and_put_overwrites_multiple_times() {
+        let db = open();
+        let cf = db.default_cf();
+        let old1 = db.get_and_put(&cf, b"k", b"v1").unwrap();
+        assert_eq!(old1, None);
+        let old2 = db.get_and_put(&cf, b"k", b"v2").unwrap();
+        assert_eq!(old2.as_deref(), Some(b"v1".as_ref()));
+        let old3 = db.get_and_put(&cf, b"k", b"v3").unwrap();
+        assert_eq!(old3.as_deref(), Some(b"v2".as_ref()));
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(b"v3".as_ref()));
     }
 
     #[test]

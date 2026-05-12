@@ -1059,6 +1059,50 @@ pub unsafe extern "C" fn frs_get(
     })
 }
 
+/// Combined get + put: reads the current value of `key`, writes `new_value`,
+/// returns the old value via `out_old_value`. Single FFM boundary crossing
+/// for the read-modify-write pattern. Returns `FRS_STATUS_OK` when the key
+/// existed (old value written to `out_old_value`), `FRS_STATUS_NOT_FOUND`
+/// when the key did not exist (put still succeeds, `out_old_value` is NULL).
+#[no_mangle]
+pub unsafe extern "C" fn frs_get_and_put(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    key: *const u8,
+    key_len: usize,
+    new_value: *const u8,
+    new_value_len: usize,
+    out_old_value: *mut FrsBytes,
+) -> i32 {
+    guarded(|| {
+        if out_old_value.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if key.is_null() || new_value.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let k = slice::from_raw_parts(key, key_len);
+        let v = slice::from_raw_parts(new_value, new_value_len);
+        match db.get_and_put(cf, k, v) {
+            Ok(Some(old)) => {
+                *out_old_value = FrsBytes::from_vec(old);
+                FRS_STATUS_OK
+            }
+            Ok(None) => {
+                *out_old_value = FrsBytes::NULL;
+                FRS_STATUS_NOT_FOUND
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 4. Batch operations
 // ---------------------------------------------------------------------------
@@ -4831,6 +4875,118 @@ mod tests {
             );
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_get_and_put_returns_old_value() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Put initial value.
+            let key = b"k1";
+            let val1 = b"old_value";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), val1.as_ptr(), val1.len()),
+                FRS_STATUS_OK
+            );
+
+            // get_and_put: should return old value and write new.
+            let val2 = b"new_value";
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get_and_put(
+                    db,
+                    cf,
+                    key.as_ptr(),
+                    key.len(),
+                    val2.as_ptr(),
+                    val2.len(),
+                    &mut out
+                ),
+                FRS_STATUS_OK
+            );
+            assert!(!out.data.is_null());
+            let old_slice = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(old_slice, val1);
+            frs_bytes_free(&mut out);
+
+            // Verify new value is stored.
+            let mut get_out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut get_out),
+                FRS_STATUS_OK
+            );
+            let new_slice = slice::from_raw_parts(get_out.data, get_out.len);
+            assert_eq!(new_slice, val2);
+            frs_bytes_free(&mut get_out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_get_and_put_missing_key_returns_not_found() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"missing";
+            let val = b"value";
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get_and_put(
+                    db,
+                    cf,
+                    key.as_ptr(),
+                    key.len(),
+                    val.as_ptr(),
+                    val.len(),
+                    &mut out
+                ),
+                FRS_STATUS_NOT_FOUND
+            );
+            // out should be NULL (no old value).
+            assert!(out.data.is_null());
+
+            // But the put still succeeded.
+            let mut get_out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut get_out),
+                FRS_STATUS_OK
+            );
+            let slice = slice::from_raw_parts(get_out.data, get_out.len);
+            assert_eq!(slice, val);
+            frs_bytes_free(&mut get_out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_get_and_put_null_args() {
+        unsafe {
+            let mut out = FrsBytes::NULL;
+            // null db
+            assert_eq!(
+                frs_get_and_put(
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    0,
+                    &mut out
+                ),
+                FRS_STATUS_NULL_ARG
+            );
         }
     }
 }
