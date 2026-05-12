@@ -2904,6 +2904,63 @@ impl DbImpl {
         Ok(out)
     }
 
+    /// Batch point-lookup returning results as an Arrow RecordBatch.
+    ///
+    /// Input: a `BinaryArray` of keys.
+    /// Output: a `RecordBatch` with columns:
+    /// - `value: Binary` (nullable) — the value bytes for each key (null if not found)
+    /// - `found: Boolean` — true if found, false if not found
+    ///
+    /// This method builds the Arrow output directly during the lookup loop,
+    /// avoiding the intermediate `Vec<Option<Vec<u8>>>` allocation that
+    /// `batch_get` incurs. Combined with the Arrow C Data Interface at the
+    /// FFI layer, this eliminates all per-value memcpy on the return path.
+    pub fn batch_get_arrow(
+        &self,
+        cf: &ColumnFamilyHandle,
+        keys: &arrow::array::BinaryArray,
+    ) -> ForstResult<arrow::array::RecordBatch> {
+        use arrow::array::{Array, BinaryBuilder, BooleanBuilder, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let n = keys.len();
+
+        // Pre-allocate builders with estimated capacity. 32 bytes/value is a
+        // reasonable heuristic for Flink state values.
+        let mut value_builder = BinaryBuilder::with_capacity(n, n * 32);
+        let mut found_builder = BooleanBuilder::with_capacity(n);
+
+        let read_seq = u64::MAX;
+        for i in 0..n {
+            let key = keys.value(i);
+            match self.get_internal(&cf_data, key, read_seq)? {
+                Some(value) => {
+                    value_builder.append_value(&value);
+                    found_builder.append_value(true);
+                }
+                None => {
+                    value_builder.append_null();
+                    found_builder.append_value(false);
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Binary, true),
+            Field::new("found", DataType::Boolean, false),
+        ]));
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(value_builder.finish()),
+                Arc::new(found_builder.finish()),
+            ],
+        )
+        .map_err(|e| ForstError::invalid_argument(e.to_string()))
+    }
+
     /// Prefetch SST files that a batch of keys might touch.
     ///
     /// Collects all SST file numbers from the current version that are NOT
@@ -3860,6 +3917,61 @@ mod tests {
         assert_eq!(out[0].as_deref(), Some(b"1".as_ref()));
         assert_eq!(out[1], None);
         assert_eq!(out[2].as_deref(), Some(b"2".as_ref()));
+    }
+
+    #[test]
+    fn test_batch_get_arrow_returns_correct_results() {
+        use arrow::array::{Array, BinaryArray, BooleanArray};
+
+        let db = open();
+        let cf = db.default_cf();
+
+        // Write some keys.
+        db.put(&cf, b"k1", b"v1").unwrap();
+        db.put(&cf, b"k2", b"v2").unwrap();
+        db.put(&cf, b"k3", b"v3").unwrap();
+
+        // Build keys array including a missing key.
+        let keys = BinaryArray::from(vec![
+            b"k1".as_slice(),
+            b"k2".as_slice(),
+            b"missing".as_slice(),
+            b"k3".as_slice(),
+        ]);
+
+        let result = db.batch_get_arrow(&cf, &keys).unwrap();
+        assert_eq!(result.num_rows(), 4);
+
+        let values = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let found = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+
+        assert_eq!(values.value(0), b"v1");
+        assert_eq!(values.value(1), b"v2");
+        assert!(values.is_null(2));
+        assert_eq!(values.value(3), b"v3");
+        assert!(found.value(0));
+        assert!(found.value(1));
+        assert!(!found.value(2));
+        assert!(found.value(3));
+    }
+
+    #[test]
+    fn test_batch_get_arrow_empty_keys() {
+        use arrow::array::BinaryArray;
+
+        let db = open();
+        let cf = db.default_cf();
+        let keys = BinaryArray::from(Vec::<&[u8]>::new());
+        let result = db.batch_get_arrow(&cf, &keys).unwrap();
+        assert_eq!(result.num_rows(), 0);
     }
 
     #[test]

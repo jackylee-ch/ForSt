@@ -1909,49 +1909,18 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
         // SECURITY: same MAX_BATCH_COUNT cap as the non-Arrow path
         // and as frs_batch_put_arrow. keys.len() comes from the C-side
         // Arrow array; cap defends against a crafted batch driving
-        // unbounded allocations via Vec<&[u8]> and batch_get's internal
-        // result Vec. (Sweep R10 H by Reviewer 3; parallel finding to
-        // R5 H#2 which fixed the put-side.)
+        // unbounded allocations via the internal builders.
+        // (Sweep R10 H by Reviewer 3; parallel finding to R5 H#2 which
+        // fixed the put-side.)
         if keys.len() > MAX_BATCH_COUNT {
             return FRS_STATUS_INVALID_ARGUMENT;
         }
-        let key_slices: Vec<&[u8]> = (0..keys.len()).map(|i| keys.value(i)).collect();
-        let values = match db.batch_get(cf, &key_slices) {
-            Ok(v) => v,
-            Err(e) => return error_to_status(&e),
-        };
 
-        // Build the output RecordBatch.
-        let mut value_builder = arrow::array::BinaryBuilder::new();
-        let mut found_builder = arrow::array::BooleanBuilder::new();
-        for v in &values {
-            match v {
-                Some(bytes) => {
-                    value_builder.append_value(bytes);
-                    found_builder.append_value(true);
-                }
-                None => {
-                    value_builder.append_null();
-                    found_builder.append_value(false);
-                }
-            }
-        }
-        let value_array = value_builder.finish();
-        let found_array = found_builder.finish();
-
-        let schema = std::sync::Arc::new(Schema::new(vec![
-            Field::new("value", DataType::Binary, true),
-            Field::new("found", DataType::Boolean, false),
-        ]));
-        let batch = match RecordBatch::try_new(
-            schema,
-            vec![
-                std::sync::Arc::new(value_array),
-                std::sync::Arc::new(found_array),
-            ],
-        ) {
+        // Zero-copy path: build Arrow output directly during lookup,
+        // avoiding the intermediate Vec<Option<Vec<u8>>> allocation.
+        let batch = match db.batch_get_arrow(cf, keys) {
             Ok(b) => b,
-            Err(_) => return FRS_STATUS_ERROR,
+            Err(e) => return error_to_status(&e),
         };
 
         // Export the batch as a struct FFI_ArrowArray.

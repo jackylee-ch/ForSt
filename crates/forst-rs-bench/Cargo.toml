@@ -70,6 +70,10 @@ name = "batch_put_arrow_vs_write_batch"
 harness = false
 
 [[bench]]
+name = "batch_get_arrow_vs_batch_get"
+harness = false
+
+[[bench]]
 name = "write_throughput"
 harness = false
 
