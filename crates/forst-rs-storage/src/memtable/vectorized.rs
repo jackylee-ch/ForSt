@@ -41,6 +41,26 @@ struct RowIndex {
     op_type: OpType,
 }
 
+/// Maximum value size (bytes) that will be stored inline in the hash entry.
+/// Covers most Flink ValueState<Long/String/etc> payloads (≤64 bytes).
+const INLINE_THRESHOLD: usize = 64;
+
+/// Per-key entry in the hash index. For small values (≤ INLINE_THRESHOLD bytes),
+/// the latest version's value is stored inline to avoid dereferencing through
+/// the columnar value storage on point lookups.
+#[derive(Clone)]
+struct HashEntry {
+    /// Row indices of all versions of this key (oldest first).
+    row_indices: Vec<RowIndex>,
+    /// Latest version's value inlined if ≤ INLINE_THRESHOLD bytes.
+    /// None if the latest value exceeds the threshold or is a deletion tombstone.
+    inline_value: Option<Box<[u8]>>,
+    /// Latest version's sequence number (for fast-path eligibility check).
+    latest_seq: u64,
+    /// Latest version's op_type byte (for tombstone detection on fast path).
+    latest_op: u8,
+}
+
 /// A vectorized MemTable using columnar storage + BTreeMap sorted index.
 ///
 /// **Write path:** `put()` appends data to columnar arrays and inserts into
@@ -91,17 +111,20 @@ pub struct VectorizedMemTable {
     /// PERF (B2): avoids re-allocating the per-key index list on every put.
     rowindex_vec_pool: Vec<Vec<RowIndex>>,
 
-    /// Persistent hash index for O(1) point lookups. Maps user_key to ALL
-    /// RowIndex entries for that key (across both sorted and unsorted zones).
-    /// Unlike `unsorted_lookup` (which is drained on merge), this index is
-    /// append-only and survives `merge_unsorted_to_sorted()`. Entries are in
-    /// insertion order (oldest first); `get()` walks backwards to find the
-    /// latest visible version.
+    /// Persistent hash index for O(1) point lookups. Maps user_key to a
+    /// [`HashEntry`] containing ALL RowIndex entries for that key (across both
+    /// sorted and unsorted zones) plus an inline cache of the latest version's
+    /// value (when ≤ INLINE_THRESHOLD bytes). Unlike `unsorted_lookup` (which
+    /// is drained on merge), this index is append-only and survives
+    /// `merge_unsorted_to_sorted()`. Entries are in insertion order (oldest
+    /// first); `get()` uses the inline cache for current-version reads and
+    /// falls through to the columnar path for MVCC snapshot reads.
     ///
-    /// Memory overhead: ~40 bytes per unique key (Box<[u8]> + Vec header) +
-    /// 16 bytes per version (RowIndex). For 1M keys with avg 32-byte keys
-    /// and 1 version each: ~56 MB — acceptable for a 64 MiB memtable.
-    hash_index: HashMap<Box<[u8]>, Vec<RowIndex>>,
+    /// Memory overhead: ~56 bytes per unique key (Box<[u8]> + HashEntry header)
+    /// + 16 bytes per version (RowIndex) + up to 64 bytes inline value.
+    /// For 1M keys with avg 32-byte keys and 1 version each: ~112 MB worst
+    /// case (all values ≤64B inlined) — still within a 128 MiB memtable budget.
+    hash_index: HashMap<Box<[u8]>, HashEntry>,
 
     // -- State --
     /// Current sequence counter (incremented on each insert).
@@ -266,10 +289,35 @@ impl VectorizedMemTable {
         }
 
         // Persistent hash index: always append so get() is O(1).
-        if let Some(slot) = self.hash_index.get_mut(key) {
-            slot.push(row_index);
+        // Also maintain the inline value cache for the latest version.
+        if let Some(entry) = self.hash_index.get_mut(key) {
+            entry.row_indices.push(row_index);
+            entry.latest_seq = seq;
+            entry.latest_op = op_type_byte;
+            if op_type_byte == OpType::Put as u8
+                && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+            {
+                entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
+            } else {
+                entry.inline_value = None; // tombstone or oversized
+            }
         } else {
-            self.hash_index.insert(Box::from(key), vec![row_index]);
+            let inline_value = if op_type_byte == OpType::Put as u8
+                && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+            {
+                value.map(|v| v.to_vec().into_boxed_slice())
+            } else {
+                None
+            };
+            self.hash_index.insert(
+                Box::from(key),
+                HashEntry {
+                    row_indices: vec![row_index],
+                    inline_value,
+                    latest_seq: seq,
+                    latest_op: op_type_byte,
+                },
+            );
         }
 
         // Update memory tracking (approximate).
@@ -520,11 +568,35 @@ impl VectorizedMemTable {
     /// contains ALL versions of every key (across both sorted and unsorted
     /// zones) in insertion order. We walk backwards to find the latest
     /// visible version.
+    ///
+    /// PERF: For current-version reads (read_sequence >= latest_seq), uses the
+    /// inline value cache when available — eliminates one pointer chase through
+    /// the columnar value storage for small values (≤ INLINE_THRESHOLD bytes).
+    /// MVCC snapshot reads fall through to the row_indices + columnar path.
     pub fn get(&self, key: &[u8], read_sequence: u64) -> ForstResult<Option<GetResult>> {
-        let result = self
-            .hash_index
-            .get(key)
-            .and_then(|indices| self.find_latest(indices, read_sequence));
+        let entry = match self.hash_index.get(key) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        // Fast path: caller wants the latest version (read_sequence >= latest_seq)
+        // and we have the inline cache populated (small Put value).
+        if entry.latest_seq <= read_sequence {
+            if let Some(ref inlined) = entry.inline_value {
+                // inline_value is only set for Put ops with value ≤ INLINE_THRESHOLD.
+                let op_type = OpType::from_u8(entry.latest_op).unwrap_or(OpType::Put);
+                return Ok(Some(GetResult {
+                    value: Some(inlined.to_vec()),
+                    sequence: entry.latest_seq,
+                    op_type,
+                }));
+            }
+            // No inline cache — fall through to columnar path.
+            // (tombstone, oversized value, or Merge op)
+        }
+
+        // Slow path: MVCC snapshot read or no inline cache available.
+        let result = self.find_latest(&entry.row_indices, read_sequence);
         Ok(result)
     }
 
@@ -646,10 +718,35 @@ impl VectorizedMemTable {
             }
 
             // Persistent hash index: always append so get() is O(1).
-            if let Some(slot) = self.hash_index.get_mut(key) {
-                slot.push(row_index);
+            // Maintain inline value cache for the latest version.
+            if let Some(entry) = self.hash_index.get_mut(key) {
+                entry.row_indices.push(row_index);
+                entry.latest_seq = seq;
+                entry.latest_op = op_types[i];
+                if op_types[i] == OpType::Put as u8
+                    && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                {
+                    entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
+                } else {
+                    entry.inline_value = None;
+                }
             } else {
-                self.hash_index.insert(Box::from(key), vec![row_index]);
+                let inline_value = if op_types[i] == OpType::Put as u8
+                    && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                {
+                    value.map(|v| v.to_vec().into_boxed_slice())
+                } else {
+                    None
+                };
+                self.hash_index.insert(
+                    Box::from(key),
+                    HashEntry {
+                        row_indices: vec![row_index],
+                        inline_value,
+                        latest_seq: seq,
+                        latest_op: op_types[i],
+                    },
+                );
             }
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
@@ -759,10 +856,35 @@ impl VectorizedMemTable {
             }
 
             // Persistent hash index: always append so get() is O(1).
-            if let Some(slot) = self.hash_index.get_mut(key) {
-                slot.push(row_index);
+            // Maintain inline value cache for the latest version.
+            if let Some(entry) = self.hash_index.get_mut(key) {
+                entry.row_indices.push(row_index);
+                entry.latest_seq = seq;
+                entry.latest_op = op_types[i];
+                if op_types[i] == OpType::Put as u8
+                    && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                {
+                    entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
+                } else {
+                    entry.inline_value = None;
+                }
             } else {
-                self.hash_index.insert(Box::from(key), vec![row_index]);
+                let inline_value = if op_types[i] == OpType::Put as u8
+                    && value.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                {
+                    value.map(|v| v.to_vec().into_boxed_slice())
+                } else {
+                    None
+                };
+                self.hash_index.insert(
+                    Box::from(key),
+                    HashEntry {
+                        row_indices: vec![row_index],
+                        inline_value,
+                        latest_seq: seq,
+                        latest_op: op_types[i],
+                    },
+                );
             }
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
@@ -989,10 +1111,40 @@ impl VectorizedMemTable {
             }
 
             // Persistent hash index: always append so get() is O(1).
-            if let Some(slot) = self.hash_index.get_mut(key) {
-                slot.push(row_index);
+            // Maintain inline value cache for the latest version.
+            let val_bytes: Option<&[u8]> = if values.is_null(i) {
+                None
             } else {
-                self.hash_index.insert(Box::from(key), vec![row_index]);
+                Some(values.value(i))
+            };
+            if let Some(entry) = self.hash_index.get_mut(key) {
+                entry.row_indices.push(row_index);
+                entry.latest_seq = seq;
+                entry.latest_op = op_values[i];
+                if op_values[i] == OpType::Put as u8
+                    && val_bytes.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                {
+                    entry.inline_value = val_bytes.map(|v| v.to_vec().into_boxed_slice());
+                } else {
+                    entry.inline_value = None;
+                }
+            } else {
+                let inline_value = if op_values[i] == OpType::Put as u8
+                    && val_bytes.map_or(false, |v| v.len() <= INLINE_THRESHOLD)
+                {
+                    val_bytes.map(|v| v.to_vec().into_boxed_slice())
+                } else {
+                    None
+                };
+                self.hash_index.insert(
+                    Box::from(key),
+                    HashEntry {
+                        row_indices: vec![row_index],
+                        inline_value,
+                        latest_seq: seq,
+                        latest_op: op_values[i],
+                    },
+                );
             }
 
             // Approximate memory accounting matching put()/batch_insert().
@@ -2148,5 +2300,116 @@ mod tests {
                 i
             );
         }
+    }
+
+    // === Inline value storage tests ===
+
+    /// Small values (≤ INLINE_THRESHOLD) are served from the hash entry's
+    /// inline cache without touching the columnar value storage.
+    #[test]
+    fn test_inline_value_small_values_served_from_hash() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"k", Some(b"small"), 1).unwrap(); // OpType::Put = 1
+        let r = mt.get(b"k", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"small".to_vec()));
+        assert_eq!(r.op_type, OpType::Put);
+
+        // Verify the inline_value is populated in the hash entry.
+        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
+        assert!(entry.inline_value.is_some());
+        assert_eq!(entry.inline_value.as_deref(), Some(b"small".as_slice()));
+    }
+
+    /// Large values (> INLINE_THRESHOLD) fall through to the columnar path.
+    #[test]
+    fn test_inline_value_large_values_fall_through() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let large = vec![0u8; 128]; // > INLINE_THRESHOLD (64)
+        mt.put(b"k2", Some(&large), 1).unwrap();
+        let r = mt.get(b"k2", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(large.clone()));
+
+        // Verify inline_value is NOT populated.
+        let entry = mt.hash_index.get(b"k2".as_slice()).unwrap();
+        assert!(entry.inline_value.is_none());
+    }
+
+    /// Exactly INLINE_THRESHOLD bytes should be inlined.
+    #[test]
+    fn test_inline_value_boundary_64_bytes() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let exact = vec![42u8; INLINE_THRESHOLD]; // exactly 64 bytes
+        mt.put(b"exact", Some(&exact), 1).unwrap();
+        let entry = mt.hash_index.get(b"exact".as_slice()).unwrap();
+        assert!(entry.inline_value.is_some(), "64 bytes should be inlined");
+
+        let over = vec![42u8; INLINE_THRESHOLD + 1]; // 65 bytes
+        mt.put(b"over", Some(&over), 1).unwrap();
+        let entry = mt.hash_index.get(b"over".as_slice()).unwrap();
+        assert!(entry.inline_value.is_none(), "65 bytes should NOT be inlined");
+    }
+
+    /// Overwriting a key updates the inline cache to the new value.
+    #[test]
+    fn test_inline_value_overwrite_updates_cache() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"k", Some(b"v1"), 1).unwrap();
+        mt.put(b"k", Some(b"v2"), 1).unwrap();
+
+        let r = mt.get(b"k", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"v2".to_vec()));
+
+        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
+        assert_eq!(entry.inline_value.as_deref(), Some(b"v2".as_slice()));
+        assert_eq!(entry.latest_seq, 2);
+    }
+
+    /// Deleting a key clears the inline cache (tombstone).
+    #[test]
+    fn test_inline_value_delete_clears_cache() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"k", Some(b"val"), 1).unwrap();
+        // Verify inline is set.
+        assert!(mt.hash_index.get(b"k".as_slice()).unwrap().inline_value.is_some());
+
+        // Delete clears inline.
+        mt.put(b"k", None, 0).unwrap(); // OpType::Delete = 0
+        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
+        assert!(entry.inline_value.is_none());
+        assert_eq!(entry.latest_op, 0);
+    }
+
+    /// Overwriting a small value with a large value clears the inline cache.
+    #[test]
+    fn test_inline_value_small_to_large_clears_cache() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"k", Some(b"small"), 1).unwrap();
+        assert!(mt.hash_index.get(b"k".as_slice()).unwrap().inline_value.is_some());
+
+        let large = vec![0u8; 128];
+        mt.put(b"k", Some(&large), 1).unwrap();
+        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
+        assert!(entry.inline_value.is_none());
+
+        // But get() still returns the correct value via columnar path.
+        let r = mt.get(b"k", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, Some(large));
+    }
+
+    /// MVCC snapshot reads bypass the inline cache and use the columnar path.
+    #[test]
+    fn test_inline_value_mvcc_snapshot_bypasses_cache() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"k", Some(b"v1"), 1).unwrap(); // seq=1
+        mt.put(b"k", Some(b"v2"), 1).unwrap(); // seq=2
+
+        // Inline cache has v2 (latest).
+        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
+        assert_eq!(entry.inline_value.as_deref(), Some(b"v2".as_slice()));
+
+        // Snapshot read at seq=1 must return v1 (not the cached v2).
+        let r = mt.get(b"k", 1).unwrap().unwrap();
+        assert_eq!(r.value, Some(b"v1".to_vec()));
+        assert_eq!(r.sequence, 1);
     }
 }
