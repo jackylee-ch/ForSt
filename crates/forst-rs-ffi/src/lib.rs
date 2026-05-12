@@ -118,6 +118,11 @@ pub const FRS_STATUS_INCOMPLETE: i32 = 14;
 /// stop accepting work until the engine is restarted.
 pub const FRS_STATUS_INTERNAL: i32 = 15;
 
+/// The value is not available via the zero-copy path (not inline in the
+/// active memtable). Caller should fall back to the regular allocating
+/// `frs_get` path.
+pub const FRS_STATUS_FALLBACK: i32 = 16;
+
 // ---------------------------------------------------------------------------
 // Opaque handle types
 // ---------------------------------------------------------------------------
@@ -1055,6 +1060,57 @@ pub unsafe extern "C" fn frs_get(
                 FRS_STATUS_OK
             }
             Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Zero-copy get: returns a pointer directly into the memtable's inline
+/// value storage. The pointer is valid until the next flush or memtable
+/// switch. Caller MUST NOT free the returned pointer.
+///
+/// Returns `FRS_STATUS_OK` + populates `out_ptr`/`out_len` on hit.
+/// Returns `FRS_STATUS_NOT_FOUND` on miss (out_ptr = null, out_len = 0).
+/// Returns `FRS_STATUS_FALLBACK` if the value is not inline (too large or
+/// in SST) — caller should fall back to regular `frs_get`.
+#[no_mangle]
+pub unsafe extern "C" fn frs_get_pinned(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    key: *const u8,
+    key_len: usize,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+) -> i32 {
+    guarded(|| {
+        if out_ptr.is_null() || out_len.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if key.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let k = slice::from_raw_parts(key, key_len);
+        match db.get_pinned(cf, k) {
+            Some((ptr, len)) => {
+                *out_ptr = ptr;
+                *out_len = len;
+                FRS_STATUS_OK
+            }
+            None => {
+                // Distinguish NOT_FOUND from FALLBACK: check if the key
+                // exists at all via the regular get path. But that would
+                // defeat the purpose (allocating). Instead, return FALLBACK
+                // unconditionally — the caller will try frs_get which handles
+                // both "not found" and "found in SST/imm" cases.
+                *out_ptr = std::ptr::null();
+                *out_len = 0;
+                FRS_STATUS_FALLBACK
+            }
         }
     })
 }

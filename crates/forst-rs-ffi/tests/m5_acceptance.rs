@@ -349,3 +349,162 @@ fn m5_delete_then_put_cycle() {
         frs_db_close(db);
     }
 }
+
+// ---------------------------------------------------------------------------
+// frs_get_pinned tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn m5_get_pinned_small_value_returns_ok() {
+    unsafe {
+        let db = open();
+        let cf = default_cf(db);
+
+        // Write a small value (< 64 bytes) — should be inlined.
+        let key = b"pinned_key";
+        let value = b"hello_pinned";
+        put(db, cf, key, value);
+
+        let mut out_ptr: *const u8 = ptr::null();
+        let mut out_len: usize = 0;
+        let rc = frs_get_pinned(
+            db,
+            cf,
+            key.as_ptr(),
+            key.len(),
+            &mut out_ptr,
+            &mut out_len,
+        );
+        assert_eq!(rc, FRS_STATUS_OK);
+        assert!(!out_ptr.is_null());
+        assert_eq!(out_len, value.len());
+        let got = slice::from_raw_parts(out_ptr, out_len);
+        assert_eq!(got, value);
+
+        frs_cf_close(cf);
+        frs_db_close(db);
+    }
+}
+
+#[test]
+fn m5_get_pinned_large_value_returns_fallback() {
+    unsafe {
+        let db = open();
+        let cf = default_cf(db);
+
+        // Write a value > 64 bytes — should NOT be inlined.
+        let key = b"big_key";
+        let value = vec![0xABu8; 128]; // 128 bytes > INLINE_THRESHOLD (64)
+        put(db, cf, key, &value);
+
+        let mut out_ptr: *const u8 = ptr::null();
+        let mut out_len: usize = 0;
+        let rc = frs_get_pinned(
+            db,
+            cf,
+            key.as_ptr(),
+            key.len(),
+            &mut out_ptr,
+            &mut out_len,
+        );
+        assert_eq!(rc, FRS_STATUS_FALLBACK);
+        assert!(out_ptr.is_null());
+        assert_eq!(out_len, 0);
+
+        // Regular get should still work.
+        let got = get_copy(db, cf, key);
+        assert_eq!(got.as_deref(), Some(value.as_slice()));
+
+        frs_cf_close(cf);
+        frs_db_close(db);
+    }
+}
+
+#[test]
+fn m5_get_pinned_missing_key_returns_fallback() {
+    unsafe {
+        let db = open();
+        let cf = default_cf(db);
+
+        let mut out_ptr: *const u8 = ptr::null();
+        let mut out_len: usize = 0;
+        let rc = frs_get_pinned(
+            db,
+            cf,
+            b"nonexistent".as_ptr(),
+            11,
+            &mut out_ptr,
+            &mut out_len,
+        );
+        assert_eq!(rc, FRS_STATUS_FALLBACK);
+        assert!(out_ptr.is_null());
+        assert_eq!(out_len, 0);
+
+        frs_cf_close(cf);
+        frs_db_close(db);
+    }
+}
+
+#[test]
+fn m5_get_pinned_deleted_key_returns_fallback() {
+    unsafe {
+        let db = open();
+        let cf = default_cf(db);
+
+        let key = b"del_key";
+        put(db, cf, key, b"val");
+        assert_eq!(frs_delete(db, cf, key.as_ptr(), key.len()), FRS_STATUS_OK);
+
+        let mut out_ptr: *const u8 = ptr::null();
+        let mut out_len: usize = 0;
+        let rc = frs_get_pinned(
+            db,
+            cf,
+            key.as_ptr(),
+            key.len(),
+            &mut out_ptr,
+            &mut out_len,
+        );
+        assert_eq!(rc, FRS_STATUS_FALLBACK);
+        assert!(out_ptr.is_null());
+
+        frs_cf_close(cf);
+        frs_db_close(db);
+    }
+}
+
+#[test]
+fn m5_get_pinned_null_args_returns_null_arg() {
+    unsafe {
+        let db = open();
+        let cf = default_cf(db);
+
+        let mut out_ptr: *const u8 = ptr::null();
+        let mut out_len: usize = 0;
+
+        // null out_ptr
+        let rc = frs_get_pinned(
+            db,
+            cf,
+            b"k".as_ptr(),
+            1,
+            ptr::null_mut(),
+            &mut out_len,
+        );
+        assert_eq!(rc, FRS_STATUS_NULL_ARG);
+
+        // null out_len
+        let rc = frs_get_pinned(
+            db,
+            cf,
+            b"k".as_ptr(),
+            1,
+            &mut out_ptr,
+            ptr::null_mut(),
+        );
+        assert_eq!(rc, FRS_STATUS_NULL_ARG);
+
+        frs_cf_close(cf);
+        frs_db_close(db);
+    }
+}

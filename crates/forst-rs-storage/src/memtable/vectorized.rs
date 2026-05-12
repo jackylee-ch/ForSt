@@ -600,6 +600,32 @@ impl VectorizedMemTable {
         Ok(result)
     }
 
+    /// Zero-copy point lookup: returns a raw pointer + length to the inline
+    /// value in the hash index, without cloning into a `Vec<u8>`.
+    ///
+    /// Returns `Some((ptr, len))` when the latest version is a Put with an
+    /// inline value (≤ INLINE_THRESHOLD bytes). Returns `None` if:
+    /// - Key not found
+    /// - Latest version is a tombstone (Delete/SingleDelete)
+    /// - Value exceeds INLINE_THRESHOLD (not inlined)
+    /// - Latest version is a Merge op
+    ///
+    /// # Safety
+    /// The returned pointer is valid as long as:
+    /// - The `VectorizedMemTable` is not dropped
+    /// - No write to the same key occurs (which would reallocate the Box)
+    /// In Flink's single-threaded-per-slot model, both conditions hold for
+    /// the duration of a single record processing.
+    pub fn get_pinned_ptr(&self, key: &[u8]) -> Option<(*const u8, usize)> {
+        let entry = self.hash_index.get(key)?;
+        // Only serve from inline cache for Put ops (not Delete/Merge).
+        if entry.latest_op != OpType::Put as u8 {
+            return None;
+        }
+        let inlined = entry.inline_value.as_ref()?;
+        Some((inlined.as_ptr(), inlined.len()))
+    }
+
     /// Batch-inserts multiple entries at once.
     ///
     /// All arrays must have the same length. `values[i]` is `None` for deletes.

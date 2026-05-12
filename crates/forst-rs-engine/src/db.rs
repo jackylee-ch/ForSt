@@ -2855,6 +2855,28 @@ impl DbImpl {
         self.get_internal(&cf_data, key, read_seq)
     }
 
+    /// Zero-copy point lookup: returns a raw pointer + length to the value
+    /// stored inline in the active memtable's hash index.
+    ///
+    /// Returns `Some((ptr, len))` when the key's latest version is a small
+    /// Put (≤ 64 bytes) in the active memtable. Returns `None` if:
+    /// - Key not found in active memtable
+    /// - Value exceeds inline threshold (stored in columnar storage)
+    /// - Latest version is a tombstone or Merge
+    /// - Key is only in immutable memtables or SSTs
+    ///
+    /// The caller should fall back to `get()` when this returns `None`.
+    ///
+    /// # Safety
+    /// The returned pointer is valid as long as the active memtable is not
+    /// flushed and no write to the same key occurs. In Flink's single-threaded
+    /// per-slot model, both conditions hold during record processing.
+    pub fn get_pinned(&self, cf: &ColumnFamilyHandle, key: &[u8]) -> Option<(*const u8, usize)> {
+        let cf_data = self.lookup_cf_by_id(cf.id()).ok()?;
+        let mem = cf_data.active_memtable();
+        mem.get_pinned_ptr(key)
+    }
+
     /// Batch point-lookup.
     ///
     /// Before performing the lookups, prefetches any SST files that are not

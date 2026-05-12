@@ -397,6 +397,20 @@ impl ShardedMemTable {
         shard.get(key, read_sequence)
     }
 
+    /// Zero-copy point lookup: returns a raw pointer + length to the inline
+    /// value without allocating. Returns `None` if the key is not found, is
+    /// a tombstone, or the value is not inlined (exceeds INLINE_THRESHOLD).
+    ///
+    /// # Safety
+    /// The returned pointer is valid as long as no write to the same key
+    /// occurs and the memtable is not dropped. In Flink's single-threaded
+    /// per-slot model, both hold during a single record processing cycle.
+    pub fn get_pinned_ptr(&self, key: &[u8]) -> Option<(*const u8, usize)> {
+        let idx = self.shard_for_key(key);
+        let shard = self.shards[idx].read().expect("lock poisoned");
+        shard.get_pinned_ptr(key)
+    }
+
     /// Range scan: visits every shard and merges results into a single
     /// `Vec<ScanRow>` sorted by (key ASC, sequence DESC). Each shard's
     /// own `collect_range_entries` already merges its sorted + unsorted
