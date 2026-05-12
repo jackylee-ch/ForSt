@@ -153,3 +153,55 @@ numbers, the libswap variant will too (same factory, just with
   community / FFM / RocksDB-JNI)
 - `2026-05-12-s3-vs-local-bench.md` — disaggregated storage perf
 - `2026-05-12-bprod-vp-status-v2.md` — overall VP status
+
+---
+
+## Phase 2 Profiling Results (2026-05-12, commit 9214ba00129)
+
+### Scale-up at 1M events
+
+| Backend | parallelism | events | elapsed_ms | throughput (eps) | µs/event |
+|---|---:|---:|---:|---:|---:|
+| rocksdb | 2 | 1M | 705.18 | **1,418,081** | 0.71 |
+| forst-rs | 2 | 1M | 4,116.40 | **242,931** | 4.12 |
+| forst-rs | 4 | 1M | 3,350.73 | **298,443** | 3.35 |
+| rocksdb (ckpt=5s) | 4 | 1M | 1,508.21 | **663,037** | 1.51 |
+| forst-rs (ckpt=5s) | 4 | 1M | HUNG | — | — |
+
+**Gap at 1M/p=2: rocksdb is 5.8× faster** (vs 1.44× at 100k events).
+
+### JFR Profiling — where the 3.4 µs/event gap lives
+
+| Rank | Method | CPU samples | % |
+|---|---|---:|---:|
+| 1 | `ForStRsLinker.getInternal` → `frs_get` native downcall (Rust memtable skiplist lookup) | 292 | **95%** |
+| 2 | `ForStRsLinker.put` → `frs_put` native downcall | 7 | 2.3% |
+| 3 | `ForStRsLinker.copyAndFreeRaw` (copy native bytes + frs_bytes_free) | 2 | 0.6% |
+| 4 | `SharedSession.acquire0` (FFM session overhead) | 2 | 0.6% |
+| 5 | Other (HashMap, AbstractMemorySegmentImpl) | 5 | 1.5% |
+
+### Key insight
+
+**The bottleneck is NOT FFM hop overhead.** It is 95% inside the native `frs_get` call — the Rust engine's point-lookup path through the Arrow-columnar memtable + MVCC version resolution.
+
+The engine's memtable uses an Arrow RecordBatch (4-column: key/value/seq/op_type) which is optimized for vectorized scans, NOT for point lookups. Each `get` must:
+1. Linear-scan or binary-search the key column for the target key
+2. Among matches, find the latest version with seq ≤ current (MVCC)
+3. Check op_type for tombstones
+
+This is O(log N) at best (binary search on sorted key column) but with poor cache locality compared to a hash-based or B-tree memtable optimized for point access.
+
+### Revised optimization strategy
+
+The Phase B plan's focus shifts from "reduce FFM hop count" (B1/B3) to:
+
+1. **Engine memtable point-lookup optimization** (NEW, highest priority):
+   - Add a hash index over the Arrow key column for O(1) point lookups
+   - Or: maintain a parallel `HashMap<key, row_index>` alongside the Arrow batch
+   - Or: switch memtable to a hybrid structure (hash for point lookups, Arrow for scans/flushes)
+
+2. **S3 vector I/O** (B2, still relevant for cold-cache bar)
+
+3. **Batch-get** (B1, still useful but won't close the 5.8× gap alone since the per-call cost is in the engine, not the hop)
+
+4. **Checkpoint hang** (NEW blocker): `ForStRsSnapshotStrategy` blocks the data path during checkpoint barriers. Needs investigation before the checkpoint-enabled perf bar can be measured.
