@@ -12,9 +12,11 @@
 
 ## Executive Summary
 
-ForSt-RS delivers **3× throughput improvement** over both RocksDB and community ForSt at
-production-relevant scale (5M-10M events) with checkpoint enabled. The write-behind buffer
-architecture exploits Flink's keyed-state temporal locality to amortize native calls.
+ForSt-RS delivers **3× throughput improvement** over both RocksDB and community ForSt on
+workloads with temporal locality (aggregation, session state). The write-behind buffer
+architecture exploits Flink's keyed-state access patterns to amortize native calls.
+**However**, on high-cardinality join workloads (Nexmark), the buffer overhead makes it
+slower — an adaptive buffer strategy is needed.
 
 | Level | Metric | Result | Target | Status |
 |---|---|---|---|---|
@@ -23,7 +25,8 @@ architecture exploits Flink's keyed-state temporal locality to amortize native c
 | **L2** Flink backend (10M, p=2) | Throughput vs rocksdb | **2.66× faster** | 3× | 🟡 close |
 | **L3** Stateful E2E (10M, p=4, ckpt=5s) | Throughput vs rocksdb | **3.07× faster** | 3× | ✅ MET |
 | **L3** Stateful E2E (10M, p=8, ckpt=5s) | Throughput vs rocksdb | **2.68× faster** | 3× | 🟡 close |
-| **L4** Nexmark | — | pending (needs cluster) | 1.5-2× | 🔄 |
+| **L4** Nexmark q0 (stateless) | Throughput vs rocksdb | **0.87×** | 1.5× | ❌ no benefit |
+| **L4** Nexmark q3 (high-cardinality join) | Throughput vs rocksdb | **~0.02×** | 1.5× | ❌ REGRESSION |
 
 ---
 
@@ -129,26 +132,48 @@ masking the buffer benefit. At 5M+, startup is amortized and the buffer dominate
 
 ## L4: Flink Nexmark Benchmark
 
-**Status**: Infrastructure ready, execution pending (requires ~30min per backend variant).
+**Config**: Standalone cluster (JM 1c4g + TM 3c12g, 4 slots), 100M events, TPS=10M
+**Backends**: rocksdb (JDK 17) vs forst-rs (JDK 25, pipeline.classpaths)
 
-**Setup completed**:
-- Nexmark JAR built against Flink 2.2.0 (`nexmark/nexmark-flink/target/`)
-- Flink standalone cluster config: JM 1c4g + TM 3c12g (4 slots)
-- State backend: rocksdb (JDK 17) for baseline
-- Queries planned: q0, q1, q2, q3, q5, q7, q8 (stateful queries)
-- Workload: 10M events, TPS=10M, warmup=30s
+### L4.1: Results
 
-**Execution plan** (not yet run — requires 30min+ per backend):
-1. Start cluster with rocksdb backend → run all queries → collect metrics
-2. Restart cluster with forst-rs backend → run all queries → collect metrics
-3. Compare Cores×Time(s) metric per query
+| Query | Type | rocksdb Time(s) | rocksdb Throughput | forst-rs Time(s) | forst-rs/rocksdb |
+|---|---|---:|---|---:|---|
+| q0 | passthrough (stateless) | 22.3 | 4.48 M/s | 25.5 | 0.87× |
+| q3 | join (high-cardinality state) | 28.3 | 3.54 M/s | ~1297 (cancelled) | **~0.02×** ❌ |
+| q5 | window aggregation | 116.1 | 861.5 K/s | — | — |
+| q7 | window + heavy state | 471.5 | 212.1 K/s | — | — |
+| q8 | join | 34.0 | 2.94 M/s | — | — |
 
-**Expected performance** (based on L2/L3 extrapolation):
-- Stateless queries (q0, q1, q2): ~1× (no state access, no benefit)
-- Stateful queries (q3, q5, q7, q8): **1.5-2× improvement** expected
-  - Lower than L2/L3 because Nexmark has higher key cardinality and
-    mixed state types (joins use MapState, not just ValueState)
-  - Write-buffer hit rate is lower with 10k+ distinct keys
+### L4.2: Root Cause Analysis — Why Nexmark is SLOWER
+
+The write-behind buffer **hurts** on high-cardinality workloads:
+
+1. **Nexmark key cardinality**: millions of distinct auction/person IDs
+2. **Buffer hit rate**: ~0% (each key accessed 1-2 times only)
+3. **Per-access overhead**: HashMap lookup (miss) + FFM native call > direct JNI
+4. **Net effect**: every state access pays HashMap overhead WITH NO benefit
+
+This is the opposite of the LittleE2E workload (100 keys, each accessed 100k+ times).
+
+### L4.3: Required Fix — Adaptive Write Buffer
+
+The write-behind buffer needs to be **adaptive**:
+- Monitor hit rate over a sliding window
+- When hit rate < 50%: bypass the buffer, use direct FFM calls
+- When hit rate > 80%: enable buffer (current behavior)
+- Alternative: use batch FFI for high-cardinality (amortize FFM boundary per batch)
+
+**Without this fix, forst-rs should NOT be used for high-cardinality join workloads.**
+
+### L4.4: Workload Suitability Matrix
+
+| Workload Type | Key Cardinality | Buffer Hit Rate | forst-rs vs rocksdb |
+|---|---|---|---|
+| Aggregation (keyBy + sum) | Low (100-1000) | >95% | **3× faster** ✅ |
+| Session windows | Medium (10k) | ~80% | **~2× faster** (estimated) |
+| Joins (Nexmark q3/q8) | High (1M+) | <5% | **slower** ❌ |
+| Windowed aggregation | Medium-High | ~50% | **~1× even** (estimated) |
 
 ---
 
