@@ -46,6 +46,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::slice;
+use std::ptr;
 use std::sync::Arc;
 
 use forst_rs_common::EngineOptions;
@@ -122,6 +123,9 @@ pub const FRS_STATUS_INTERNAL: i32 = 15;
 /// active memtable). Caller should fall back to the regular allocating
 /// `frs_get` path.
 pub const FRS_STATUS_FALLBACK: i32 = 16;
+
+/// Caller-provided output buffer is too small for the value.
+pub const FRS_STATUS_BUFFER_TOO_SMALL: i32 = 17;
 
 // ---------------------------------------------------------------------------
 // Opaque handle types
@@ -2105,6 +2109,55 @@ pub unsafe extern "C" fn frs_lookup_kv(
             }
             Ok(None) => {
                 *out_value = FrsBytes::NULL;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Zero-allocation get: writes the value directly into a caller-provided buffer.
+/// Returns the value length via `out_val_len`. If the buffer is too small,
+/// returns FRS_STATUS_BUFFER_TOO_SMALL and sets `out_val_len` to the required size.
+/// If the key is not found, returns FRS_STATUS_OK with `out_val_len` = 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn frs_get_into_buf(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    key: *const u8,
+    key_len: usize,
+    out_buf: *mut u8,
+    out_buf_cap: usize,
+    out_val_len: *mut usize,
+) -> i32 {
+    guarded(|| {
+        if out_val_len.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if key.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        if key_len > MAX_KEY_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let k = slice::from_raw_parts(key, key_len);
+        match db.get(cf, k) {
+            Ok(Some(v)) => {
+                *out_val_len = v.len();
+                if v.len() > out_buf_cap || out_buf.is_null() {
+                    return FRS_STATUS_BUFFER_TOO_SMALL;
+                }
+                ptr::copy_nonoverlapping(v.as_ptr(), out_buf, v.len());
+                FRS_STATUS_OK
+            }
+            Ok(None) => {
+                *out_val_len = 0;
                 FRS_STATUS_OK
             }
             Err(e) => error_to_status(&e),
