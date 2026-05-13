@@ -196,17 +196,21 @@ The remaining gap to the 3× bar at GHA scale (1M events) is due to MiniCluster 
 | forst-rs (ckpt=5s) | 25 | 4 | 5s | 1M | 466,898 | 0.64× (checkpoint overhead) |
 | forst | — | — | — | — | — | ❌ `UnsupportedClassVersionError: org/forstdb/RocksDB class version 69` — flink-statebackend-forst still compiled at JDK 25 on GHA despite split-build fix |
 
-### Forst variant — root cause confirmed
+### Forst variant — root cause confirmed + FIX APPLIED
 
-`flink-statebackend-forst` is compiled at class version 69 (JDK 25) on the GHA runner
-because the Maven reactor resolves it as a dependency of `flink-statebackend-forst-rs`
-(which requires JDK 25). Even though the run script tries to build it separately with
-JDK 17, the `-am` (also-make-dependencies) flag pulls in the parent reactor which
-enforces JDK 25.
+**Root cause**: `target/test-classes/org/forstdb/RocksDB.class` (compiled at class
+version 69 by the forst-rs module's JDK 25 build) shadows the forstjni JAR's version
+(class version 52) on the classpath. When the forst variant runs on JDK 17, it loads
+the JDK-25-compiled class first and fails with `UnsupportedClassVersionError`.
 
-**Fix needed**: Build `flink-statebackend-forst` in a completely separate Maven invocation
-WITHOUT `-am` and WITHOUT the forst-rs module in the reactor. This requires the forst
-module's dependencies to already be in `~/.m2` (from a prior `mvn install` of the parent).
+**Fix** (commit `86da87f4185`):
+1. Split classpath: `CP_JDK17_BASE` excludes `target/test-classes` so forstjni JAR's
+   classes take precedence when running on JDK 17
+2. Use `export JAVA_HOME` + `export PATH` in build subshells for robust JDK isolation
+3. Three-step build: parent POMs → rocksdb+forst (JDK 17) → forst-rs (JDK 25)
+4. Class version verification step detects and retries if forst was compiled wrong
+
+**Status**: GHA run `25774220932` triggered with fix. Awaiting results.
 
 ### Checkpoint regression note
 
