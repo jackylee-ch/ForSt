@@ -290,7 +290,21 @@ impl VectorizedMemTable {
 
         // Persistent hash index: always append so get() is O(1).
         // Also maintain the inline value cache for the latest version.
+        //
+        // PERF: For Put operations on existing keys where the value fits inline,
+        // skip the columnar append entirely — just update the hash_index entry.
+        // This makes memory usage proportional to DISTINCT keys, not total updates.
         if let Some(entry) = self.hash_index.get_mut(key) {
+            if op_type_byte == OpType::Put as u8
+                && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                && entry.latest_op == OpType::Put as u8
+            {
+                // Fast path: update inline value in-place, skip columnar append
+                entry.latest_seq = seq;
+                entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
+                self.memory_used += 8; // approximate: seq update
+                return Ok(seq);
+            }
             entry.row_indices.push(row_index);
             entry.latest_seq = seq;
             entry.latest_op = op_type_byte;
