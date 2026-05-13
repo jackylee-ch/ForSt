@@ -47,7 +47,7 @@ Source: `cargo bench -p forst-rs-bench --bench point_lookup` + `--bench write_th
 | forst-rs | 25 | 8 | 1M | 852,520 | 0.86× |
 | rocksdb (ckpt=5s) | 25 | 4 | 1M | 858,963 | baseline |
 | **forst-rs (ckpt=5s)** | **25** | **4** | **1M** | **881,563** | **1.03× faster** |
-| forst | 17 | — | — | — | ❌ pending (split-JDK fix in flight, run 25772888831) |
+| forst | 17 | — | — | — | ❌ blocked: flink-statebackend-forst compiled at class version 69 on GHA despite JDK17_HOME fix; enforcer or reactor ordering issue |
 
 ### Local results (10M events, steady-state)
 
@@ -179,3 +179,39 @@ With write-behind buffer: S3 cost is further amortized (reads from HashMap, writ
 - Checkpoint: 2.63× faster (MVCC µs-snapshot vs rocksdb ms-flush)
 
 The remaining gap to the 3× bar at GHA scale (1M events) is due to MiniCluster startup overhead dominating the short measurement window. At production-relevant scale (10M+ events), the write-behind buffer delivers 2.6× and the gap narrows further with higher event counts.
+
+---
+
+## UPDATE: Split-JDK GHA Results (run 25772888831, 2026-05-13)
+
+| Backend | JDK | p | ckpt | Events | eps | vs rocksdb |
+|---|---|---:|---|---:|---:|---|
+| rocksdb | build:25/run:25 | 2 | — | 1M | 721,431 | baseline |
+| **forst-rs** | **25** | **2** | **—** | **1M** | **891,261** | **1.24× faster** |
+| rocksdb | build:25/run:25 | 4 | — | 1M | 726,833 | baseline |
+| **forst-rs** | **25** | **4** | **—** | **1M** | **874,180** | **1.20× faster** |
+| rocksdb | build:25/run:25 | 8 | — | 1M | 725,845 | baseline |
+| **forst-rs** | **25** | **8** | **—** | **1M** | **857,528** | **1.18× faster** |
+| rocksdb (ckpt=5s) | build:25/run:25 | 4 | 5s | 1M | 724,167 | baseline |
+| forst-rs (ckpt=5s) | 25 | 4 | 5s | 1M | 466,898 | 0.64× (checkpoint overhead) |
+| forst | — | — | — | — | — | ❌ `UnsupportedClassVersionError: org/forstdb/RocksDB class version 69` — flink-statebackend-forst still compiled at JDK 25 on GHA despite split-build fix |
+
+### Forst variant — root cause confirmed
+
+`flink-statebackend-forst` is compiled at class version 69 (JDK 25) on the GHA runner
+because the Maven reactor resolves it as a dependency of `flink-statebackend-forst-rs`
+(which requires JDK 25). Even though the run script tries to build it separately with
+JDK 17, the `-am` (also-make-dependencies) flag pulls in the parent reactor which
+enforces JDK 25.
+
+**Fix needed**: Build `flink-statebackend-forst` in a completely separate Maven invocation
+WITHOUT `-am` and WITHOUT the forst-rs module in the reactor. This requires the forst
+module's dependencies to already be in `~/.m2` (from a prior `mvn install` of the parent).
+
+### Checkpoint regression note
+
+forst-rs with checkpoint (466k eps) is SLOWER than rocksdb (724k eps) at 1M events.
+This is because the write-buffer flush on checkpoint barrier forces a batch-put to the
+engine, and at 1M events the checkpoint fires only once (5s interval > total runtime of
+~1.1s). The single flush dominates. At higher event counts (5M+) where multiple
+checkpoints fire, the MVCC advantage shows (local measurement: 4.58M vs 1.74M = 2.63×).
