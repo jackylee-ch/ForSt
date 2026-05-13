@@ -43,7 +43,7 @@ struct RowIndex {
 
 /// Maximum value size (bytes) that will be stored inline in the hash entry.
 /// Covers most Flink ValueState<Long/String/etc> payloads (≤64 bytes).
-const INLINE_THRESHOLD: usize = 64;
+const INLINE_THRESHOLD: usize = 256;
 
 /// Per-key entry in the hash index. For small values (≤ INLINE_THRESHOLD bytes),
 /// the latest version's value is stored inline to avoid dereferencing through
