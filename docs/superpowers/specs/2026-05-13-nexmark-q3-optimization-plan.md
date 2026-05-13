@@ -282,3 +282,48 @@ The key insight: **FFM is NOT inherently slower than JNI** — the overhead come
 per-call Arena allocation and byte[] copying. Eliminating these (via heap-segment
 direct pass + batch FFI) makes FFM competitive with JNI while keeping the 8.78×
 engine advantage.
+
+---
+
+## UPDATE (2026-05-14): Root Cause Identified
+
+### The Real Bottleneck: Append-Only Memtable at Scale
+
+The 3.65µs per FFI call is NOT from FFM boundary crossing. It's from the
+**vectorized memtable's append-only design**:
+
+1. Each `put()` APPENDS a new row (key + value + seq + op_type) to growing Vecs
+2. With 1M keys × 10 updates each = 10M rows in the memtable
+3. `key_data` Vec grows to ~1GB, causing frequent reallocations
+4. `unsorted_lookup` HashMap with 10M entries has severe cache pressure
+5. Each `get()` must search through the unsorted zone + hash_index
+
+### Why RocksDB Doesn't Have This Problem
+
+RocksDB's SkipList memtable:
+- Updates in-place (same key → same node, value pointer updated)
+- O(log N) lookup with good cache locality (skip list levels)
+- No Vec reallocation (node-based allocation)
+- Memory usage proportional to DISTINCT keys (1M), not total updates (10M)
+
+### Fix Required: In-Place Update for Hash-Index
+
+When a `put()` targets a key that already exists in the hash_index:
+- If new value size ≤ old value size: overwrite in-place (zero allocation)
+- If new value size > old value size: append new row, update hash_index pointer
+- This makes the memtable's memory usage proportional to distinct keys
+
+**Estimated impact**: Reduces memtable from 10M rows to 1M rows for the
+1M-key workload. Memory drops from ~1GB to ~100MB. Lookup speed improves
+from O(N) unsorted scan to O(1) hash-index hit.
+
+**Estimated effort**: 2-3 days (modify `put_with_seq` + hash_index update logic)
+
+### Verification Test
+
+```
+LittleE2E with 1M keys, 10M events:
+- rocksdb: 5.5s (1.81M eps)
+- forst-rs (current): 73s (137K eps) — 13× slower
+- forst-rs (with in-place update): target ~5s (parity)
+```
