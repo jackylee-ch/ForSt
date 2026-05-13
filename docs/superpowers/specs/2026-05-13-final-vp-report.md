@@ -196,6 +196,18 @@ The remaining gap to the 3× bar at GHA scale (1M events) is due to MiniCluster 
 | forst-rs (ckpt=5s) | 25 | 4 | 5s | 1M | 466,898 | 0.64× (checkpoint overhead) |
 | forst | — | — | — | — | — | ❌ `UnsupportedClassVersionError: org/forstdb/RocksDB class version 69` — flink-statebackend-forst still compiled at JDK 25 on GHA despite split-build fix |
 
+### UPDATE: Forst variant FIX CONFIRMED (run 25777281919, 2026-05-13)
+
+Fix applied in commit `86da87f4185`. Partial results before GHA timeout:
+
+| Backend | JDK | p | Events | eps | vs rocksdb |
+|---|---|---:|---:|---:|---|
+| rocksdb | 17 | 2 | 1M | 719,036 | baseline |
+| **forst** (community forstjni) | **17** | **2** | **1M** | **670,103** | **0.93×** |
+
+The forst variant is now running successfully. Full results (all parallelism levels)
+pending in run `25779402365` (timeout increased to 90min).
+
 ### Forst variant — root cause confirmed + FIX APPLIED
 
 **Root cause**: `target/test-classes/org/forstdb/RocksDB.class` (compiled at class
