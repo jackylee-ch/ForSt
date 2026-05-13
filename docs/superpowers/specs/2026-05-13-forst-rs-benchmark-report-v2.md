@@ -129,13 +129,26 @@ masking the buffer benefit. At 5M+, startup is amortized and the buffer dominate
 
 ## L4: Flink Nexmark Benchmark
 
-**Status**: Requires dedicated cluster setup (~1 week). Scaffold exists at
-`/nexmark/nexmark-flink/` with configuration at `/nexmark-config/`.
+**Status**: Infrastructure ready, execution pending (requires ~30min per backend variant).
+
+**Setup completed**:
+- Nexmark JAR built against Flink 2.2.0 (`nexmark/nexmark-flink/target/`)
+- Flink standalone cluster config: JM 1c4g + TM 3c12g (4 slots)
+- State backend: rocksdb (JDK 17) for baseline
+- Queries planned: q0, q1, q2, q3, q5, q7, q8 (stateful queries)
+- Workload: 10M events, TPS=10M, warmup=30s
+
+**Execution plan** (not yet run — requires 30min+ per backend):
+1. Start cluster with rocksdb backend → run all queries → collect metrics
+2. Restart cluster with forst-rs backend → run all queries → collect metrics
+3. Compare Cores×Time(s) metric per query
 
 **Expected performance** (based on L2/L3 extrapolation):
-- Nexmark queries are more complex (joins, windows, aggregations)
-- Write-buffer benefit is lower for high-cardinality queries (Q5, Q8)
-- Expected: **1.5-2× improvement** on stateful queries (Q3, Q5, Q7, Q8)
+- Stateless queries (q0, q1, q2): ~1× (no state access, no benefit)
+- Stateful queries (q3, q5, q7, q8): **1.5-2× improvement** expected
+  - Lower than L2/L3 because Nexmark has higher key cardinality and
+    mixed state types (joins use MapState, not just ValueState)
+  - Write-buffer hit rate is lower with 10k+ distinct keys
 
 ---
 
