@@ -2165,6 +2165,44 @@ pub unsafe extern "C" fn frs_get_into_buf(
     })
 }
 
+/// Fast-path get: skips `catch_unwind` and `Arc::clone` for maximum throughput.
+/// The caller guarantees that `handle` is a valid, non-null FrsDb that will not
+/// be closed during this call. This is safe when the Java backend holds the db
+/// open for the entire processing lifetime (which it does — close only on dispose).
+///
+/// Returns FRS_STATUS_OK with value copied into `out_buf` (length in `out_val_len`).
+/// Returns FRS_STATUS_BUFFER_TOO_SMALL if buffer is too small.
+/// Returns FRS_STATUS_OK with `out_val_len` = 0 if key not found.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn frs_get_fast(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    key: *const u8,
+    key_len: usize,
+    out_buf: *mut u8,
+    out_buf_cap: usize,
+    out_val_len: *mut usize,
+) -> i32 {
+    let db = &*(handle as *const Arc<DbImpl>);
+    let cf_h = &*(cf as *const ColumnFamilyHandle);
+    let k = slice::from_raw_parts(key, key_len);
+    match db.get(cf_h, k) {
+        Ok(Some(v)) => {
+            *out_val_len = v.len();
+            if v.len() > out_buf_cap {
+                return FRS_STATUS_BUFFER_TOO_SMALL;
+            }
+            ptr::copy_nonoverlapping(v.as_ptr(), out_buf, v.len());
+            FRS_STATUS_OK
+        }
+        Ok(None) => {
+            *out_val_len = 0;
+            FRS_STATUS_OK
+        }
+        Err(_) => FRS_STATUS_ERROR,
+    }
+}
+
 /// Opens a forward iterator over the entire column family.
 ///
 /// Implementation: snapshot the CF via `db.scan` (empty lower bound, no
