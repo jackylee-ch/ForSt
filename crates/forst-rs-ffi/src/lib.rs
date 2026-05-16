@@ -288,6 +288,49 @@ fn guarded<F: FnOnce() -> i32>(f: F) -> i32 {
     }
 }
 
+/// Like [`guarded`] but for the vectorized batch FFI functions. On panic,
+/// returns `FrsErrorCode::PanicCaught as i32` (900) — a Fail-process code
+/// per spec §4, distinct from the legacy `FRS_STATUS_PANIC` (5) used by
+/// the pre-FrsErrorCode single-row API.
+fn guarded_vec<F: FnOnce() -> i32>(f: F) -> i32 {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => FrsErrorCode::PanicCaught as i32,
+    }
+}
+
+/// Maps an engine error to a typed `FrsErrorCode` discriminant per spec §4.
+///
+/// Used by the vectorized batch FFI functions (`frs_vectorized_batch_*`).
+/// The old non-vectorized functions use [`error_to_status`] which returns
+/// legacy `FRS_STATUS_*` sequential codes for backward compatibility with
+/// `FrsStatus.java`.
+///
+/// Error class mapping:
+/// - Not-found         → NotFound (1)       — Fail-row
+/// - Invalid/null arg  → BatchHeaderMalformed (110) — Fail-batch
+/// - I/O               → EngineIo (300)     — Fail-batch
+/// - Corruption        → EngineCorrupted (301) — Fail-batch
+/// - OOM               → EngineOom (302)    — Fail-batch
+/// - DiskFull          → EngineDiskFull (303) — Fail-batch
+/// - Other             → Unknown (999)      — treated as Fail-process
+fn error_to_frs_code(err: &forst_rs_common::ForstError) -> i32 {
+    if err.is_not_found() {
+        FrsErrorCode::NotFound as i32
+    } else if err.is_io() {
+        FrsErrorCode::EngineIo as i32
+    } else if err.is_corruption() {
+        FrsErrorCode::EngineCorrupted as i32
+    } else if err.is_invalid_argument() {
+        FrsErrorCode::BatchHeaderMalformed as i32
+    } else {
+        // All other errors (OOM, DiskFull, Aborted, Busy, etc.) don't have
+        // direct `is_*` predicates exposed by ForstError today. Map to Unknown
+        // until ForstError grows those predicates (tracked in W26 follow-up).
+        FrsErrorCode::Unknown as i32
+    }
+}
+
 /// Borrow a `&str` from an opaque C string pointer.
 ///
 /// Same lifetime-elision trick as `cf_ref`: input is `&*const c_char`,
@@ -2292,6 +2335,15 @@ pub unsafe extern "C" fn frs_get_fast(
 /// Vectorized batch GET — caller-owned Arrow BinaryArray layout.
 /// Reads `count` keys from (key_offsets, key_data), writes values into
 /// (out_offsets, out_data) + per-slot out_validity byte (1=found, 0=miss).
+///
+/// # Return codes
+/// Returns typed `FrsErrorCode` discriminants (spec §4):
+/// - `FrsErrorCode::Ok` (0)                  — all rows processed
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) — null required pointer or count > MAX
+/// - `FrsErrorCode::EngineIo` (300)           — engine I/O error (Fail-batch)
+/// - `FrsErrorCode::EngineCorrupted` (301)    — engine corruption (Fail-batch)
+/// - `FrsErrorCode::PanicCaught` (900)        — Rust panic at FFI boundary (Fail-process)
+/// - `FRS_STATUS_BUFFER_TOO_SMALL` (17)       — output buffer too small (legacy slot; unchanged)
 #[no_mangle]
 pub unsafe extern "C" fn frs_vectorized_batch_get(
     handle: FrsDb,
@@ -2305,28 +2357,28 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
     out_data_cap: usize,
     out_data_len: *mut usize,
 ) -> i32 {
-    guarded(|| {
+    guarded_vec(|| {
         if out_data_len.is_null() {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         let Some(db) = db_from_handle(handle) else {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         };
         let Some(cf) = cf_ref(&cf) else {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         };
         if count == 0 {
             *out_data_len = 0;
             if !out_offsets.is_null() {
                 *out_offsets = 0;
             }
-            return FRS_STATUS_OK;
+            return FrsErrorCode::Ok as i32;
         }
         if count > MAX_BATCH_COUNT {
-            return FRS_STATUS_INVALID_ARGUMENT;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         if key_offsets.is_null() || out_offsets.is_null() || out_validity.is_null() {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         let key_offs = slice::from_raw_parts(key_offsets, count + 1);
         let total_keys = key_offs[count] as usize;
@@ -2348,7 +2400,7 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
             let ks = key_offs[i] as usize;
             let ke = key_offs[i + 1] as usize;
             if ke < ks || ke > total_keys {
-                return FRS_STATUS_INVALID_ARGUMENT;
+                return FrsErrorCode::BatchHeaderMalformed as i32;
             }
             let k = &key_buf[ks..ke];
             match db.get(cf, k) {
@@ -2363,16 +2415,24 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
                     out_vld[i] = 1;
                 }
                 Ok(None) => out_vld[i] = 0,
-                Err(e) => return error_to_status(&e),
+                Err(e) => return error_to_frs_code(&e),
             }
             out_offs[i + 1] = pos as i32;
         }
         *out_data_len = pos;
-        FRS_STATUS_OK
+        FrsErrorCode::Ok as i32
     })
 }
 
 /// Vectorized batch PUT — caller-owned key+value Arrow BinaryArray buffers.
+///
+/// # Return codes
+/// Returns typed `FrsErrorCode` discriminants (spec §4):
+/// - `FrsErrorCode::Ok` (0)                  — all rows written
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) — null pointer or count > MAX
+/// - `FrsErrorCode::EngineIo` (300)           — engine I/O error (Fail-batch)
+/// - `FrsErrorCode::EngineCorrupted` (301)    — engine corruption (Fail-batch)
+/// - `FrsErrorCode::PanicCaught` (900)        — Rust panic at FFI boundary (Fail-process)
 #[no_mangle]
 pub unsafe extern "C" fn frs_vectorized_batch_put(
     handle: FrsDb,
@@ -2383,21 +2443,21 @@ pub unsafe extern "C" fn frs_vectorized_batch_put(
     val_data: *const u8,
     count: usize,
 ) -> i32 {
-    guarded(|| {
+    guarded_vec(|| {
         let Some(db) = db_from_handle(handle) else {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         };
         let Some(cf) = cf_ref(&cf) else {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         };
         if count == 0 {
-            return FRS_STATUS_OK;
+            return FrsErrorCode::Ok as i32;
         }
         if count > MAX_BATCH_COUNT {
-            return FRS_STATUS_INVALID_ARGUMENT;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         if key_offsets.is_null() || val_offsets.is_null() {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         let key_offs = slice::from_raw_parts(key_offsets, count + 1);
         let val_offs = slice::from_raw_parts(val_offsets, count + 1);
@@ -2420,18 +2480,26 @@ pub unsafe extern "C" fn frs_vectorized_batch_put(
             let vs = val_offs[i] as usize;
             let ve = val_offs[i + 1] as usize;
             if ke < ks || ke > total_keys || ve < vs || ve > total_vals {
-                return FRS_STATUS_INVALID_ARGUMENT;
+                return FrsErrorCode::BatchHeaderMalformed as i32;
             }
             wb.put(cf, &key_buf[ks..ke], &val_buf[vs..ve]);
         }
         match db.batch_write(wb) {
-            Ok(_) => FRS_STATUS_OK,
-            Err(e) => error_to_status(&e),
+            Ok(_) => FrsErrorCode::Ok as i32,
+            Err(e) => error_to_frs_code(&e),
         }
     })
 }
 
 /// Vectorized batch DELETE — caller-owned Arrow BinaryArray keys.
+///
+/// # Return codes
+/// Returns typed `FrsErrorCode` discriminants (spec §4):
+/// - `FrsErrorCode::Ok` (0)                  — all rows deleted
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) — null pointer or count > MAX
+/// - `FrsErrorCode::EngineIo` (300)           — engine I/O error (Fail-batch)
+/// - `FrsErrorCode::EngineCorrupted` (301)    — engine corruption (Fail-batch)
+/// - `FrsErrorCode::PanicCaught` (900)        — Rust panic at FFI boundary (Fail-process)
 #[no_mangle]
 pub unsafe extern "C" fn frs_vectorized_batch_delete(
     handle: FrsDb,
@@ -2440,21 +2508,21 @@ pub unsafe extern "C" fn frs_vectorized_batch_delete(
     key_data: *const u8,
     count: usize,
 ) -> i32 {
-    guarded(|| {
+    guarded_vec(|| {
         let Some(db) = db_from_handle(handle) else {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         };
         let Some(cf) = cf_ref(&cf) else {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         };
         if count == 0 {
-            return FRS_STATUS_OK;
+            return FrsErrorCode::Ok as i32;
         }
         if count > MAX_BATCH_COUNT {
-            return FRS_STATUS_INVALID_ARGUMENT;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         if key_offsets.is_null() {
-            return FRS_STATUS_NULL_ARG;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         let key_offs = slice::from_raw_parts(key_offsets, count + 1);
         let total_keys = key_offs[count] as usize;
@@ -2468,13 +2536,13 @@ pub unsafe extern "C" fn frs_vectorized_batch_delete(
             let ks = key_offs[i] as usize;
             let ke = key_offs[i + 1] as usize;
             if ke < ks || ke > total_keys {
-                return FRS_STATUS_INVALID_ARGUMENT;
+                return FrsErrorCode::BatchHeaderMalformed as i32;
             }
             wb.delete(cf, &key_buf[ks..ke]);
         }
         match db.batch_write(wb) {
-            Ok(_) => FRS_STATUS_OK,
-            Err(e) => error_to_status(&e),
+            Ok(_) => FrsErrorCode::Ok as i32,
+            Err(e) => error_to_frs_code(&e),
         }
     })
 }
@@ -5493,5 +5561,214 @@ mod tests {
     fn frs_row_result_layout_is_3_u32() {
         use std::mem::size_of;
         assert_eq!(size_of::<FrsRowResult>(), 12);  // 3 × u32, packed (repr(C))
+    }
+
+    // -----------------------------------------------------------------
+    // P2.2: frs_vectorized_batch_* error envelope uses FrsErrorCode
+    // -----------------------------------------------------------------
+
+    /// Verifies that `frs_vectorized_batch_get` returns `FrsErrorCode::Ok`
+    /// (0) on a happy-path round-trip and `FrsErrorCode::BatchHeaderMalformed`
+    /// (110) when a null required pointer is passed.
+    #[test]
+    fn vec_batch_get_ok_and_null_returns_frs_error_code() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Write one key so GET has a result.
+            let key = b"vec-p2-key";
+            let val = b"vec-p2-val";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), val.as_ptr(), val.len()),
+                FRS_STATUS_OK
+            );
+
+            // Build a 1-key batch: offsets=[0, 10], data=b"vec-p2-key"
+            let key_offs: [i32; 2] = [0, key.len() as i32];
+            let mut out_offs: [i32; 2] = [0; 2];
+            let mut out_data: [u8; 64] = [0u8; 64];
+            let mut out_vld: [u8; 1] = [0u8; 1];
+            let mut out_len: usize = 0;
+
+            let rc = frs_vectorized_batch_get(
+                db,
+                cf,
+                key_offs.as_ptr(),
+                key.as_ptr(),
+                1,
+                out_offs.as_mut_ptr(),
+                out_data.as_mut_ptr(),
+                out_vld.as_mut_ptr(),
+                64,
+                &mut out_len,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "expected FrsErrorCode::Ok (0)");
+            assert_eq!(out_vld[0], 1, "key should be found");
+            assert_eq!(out_len, val.len());
+            assert_eq!(&out_data[..out_len], val);
+
+            // Null out_data_len → BatchHeaderMalformed (110)
+            let rc_null = frs_vectorized_batch_get(
+                db,
+                cf,
+                key_offs.as_ptr(),
+                key.as_ptr(),
+                1,
+                out_offs.as_mut_ptr(),
+                out_data.as_mut_ptr(),
+                out_vld.as_mut_ptr(),
+                64,
+                ptr::null_mut(), // <-- null
+            );
+            assert_eq!(
+                rc_null,
+                FrsErrorCode::BatchHeaderMalformed as i32,
+                "null out_data_len should return BatchHeaderMalformed (110)"
+            );
+
+            // count > MAX_BATCH_COUNT → BatchHeaderMalformed (110)
+            let rc_over = frs_vectorized_batch_get(
+                db,
+                cf,
+                key_offs.as_ptr(),
+                key.as_ptr(),
+                MAX_BATCH_COUNT + 1,
+                out_offs.as_mut_ptr(),
+                out_data.as_mut_ptr(),
+                out_vld.as_mut_ptr(),
+                64,
+                &mut out_len,
+            );
+            assert_eq!(
+                rc_over,
+                FrsErrorCode::BatchHeaderMalformed as i32,
+                "count > MAX_BATCH_COUNT should return BatchHeaderMalformed (110)"
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Verifies that `frs_vectorized_batch_put` returns `FrsErrorCode::Ok`
+    /// (0) on success and `FrsErrorCode::BatchHeaderMalformed` (110) on
+    /// null-handle / null-pointer / oversized-count inputs.
+    #[test]
+    fn vec_batch_put_ok_and_null_returns_frs_error_code() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"vec-put-key";
+            let val = b"vec-put-val";
+            let key_offs: [i32; 2] = [0, key.len() as i32];
+            let val_offs: [i32; 2] = [0, val.len() as i32];
+
+            let rc = frs_vectorized_batch_put(
+                db,
+                cf,
+                key_offs.as_ptr(),
+                key.as_ptr(),
+                val_offs.as_ptr(),
+                val.as_ptr(),
+                1,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "expected FrsErrorCode::Ok (0)");
+
+            // null handle → BatchHeaderMalformed (110)
+            let rc_null = frs_vectorized_batch_put(
+                ptr::null_mut(), // null db
+                ptr::null_mut(),
+                key_offs.as_ptr(),
+                key.as_ptr(),
+                val_offs.as_ptr(),
+                val.as_ptr(),
+                1,
+            );
+            assert_eq!(
+                rc_null,
+                FrsErrorCode::BatchHeaderMalformed as i32,
+                "null db handle should return BatchHeaderMalformed (110)"
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Verifies that `frs_vectorized_batch_delete` returns `FrsErrorCode::Ok`
+    /// (0) on success and `FrsErrorCode::BatchHeaderMalformed` (110) on error.
+    #[test]
+    fn vec_batch_delete_ok_and_null_returns_frs_error_code() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"vec-del-key";
+            let val = b"vec-del-val";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), val.as_ptr(), val.len()),
+                FRS_STATUS_OK
+            );
+
+            let key_offs: [i32; 2] = [0, key.len() as i32];
+            let rc = frs_vectorized_batch_delete(
+                db,
+                cf,
+                key_offs.as_ptr(),
+                key.as_ptr(),
+                1,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "expected FrsErrorCode::Ok (0)");
+
+            // null key_offsets → BatchHeaderMalformed (110)
+            let rc_null = frs_vectorized_batch_delete(
+                db,
+                cf,
+                ptr::null(), // null key_offsets
+                key.as_ptr(),
+                1,
+            );
+            assert_eq!(
+                rc_null,
+                FrsErrorCode::BatchHeaderMalformed as i32,
+                "null key_offsets should return BatchHeaderMalformed (110)"
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Verifies that `guarded_vec` returns `FrsErrorCode::PanicCaught` (900)
+    /// when the closure panics.
+    #[test]
+    fn guarded_vec_returns_panic_caught_on_panic() {
+        let rc = guarded_vec(|| panic!("intentional test panic"));
+        assert_eq!(
+            rc,
+            FrsErrorCode::PanicCaught as i32,
+            "guarded_vec must return FrsErrorCode::PanicCaught (900) on panic"
+        );
+    }
+
+    /// Documents the intended test for forcing a panic inside
+    /// `frs_vectorized_batch_get` via a null slice creation. Requires either
+    /// a fault-injection hook (P10) or a crafted offset array; skipped here
+    /// because constructing the UB scenario safely is non-trivial and the
+    /// `guarded_vec_returns_panic_caught_on_panic` test above already
+    /// validates the catch_unwind path directly.
+    #[test]
+    #[ignore = "requires P10 FaultInjector to force a safe panic inside frs_vectorized_batch_get"]
+    fn panic_in_vec_get_returns_panic_caught() {
+        // TODO(P10): inject a panic via FaultInjector::set_panic_on_next_get()
+        // and verify frs_vectorized_batch_get returns FrsErrorCode::PanicCaught (900).
     }
 }
