@@ -90,3 +90,7 @@ required-features = ["rocksdb-baseline"]
 name = "s3_vs_local"
 harness = false
 required-features = ["s3-it"]
+
+[[bench]]
+name = "component_microbench"
+harness = false
