@@ -3692,6 +3692,150 @@ pub extern "C" fn frs_vec_iter_prefix_abort(handle: u64) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// 13. Vectorized chunked range iterator — frs_vec_iter_range_* (P9)
+//
+// Mirrors the prefix-iterator symbols (section 12) but bounds the scan by a
+// half-open interval [lo, hi) instead of a single prefix.  The engine's
+// `scan(cf, lo, Some(hi))` API provides proper range semantics at V1.
+//
+// Handle lifecycle is shared with the prefix iterator: both kinds use the same
+// ITER_HANDLES registry and NEXT_ITER_ID counter, so close/abort are
+// functionally identical to the prefix variants.
+// ---------------------------------------------------------------------------
+
+/// Open a range-scoped iterator over [lo, hi).
+///
+/// Semantics mirror `frs_vec_iter_prefix_open` but with explicit lower and
+/// upper bounds.  The engine materialises the full [lo, hi) result set at open
+/// time (V1 snapshot semantics).
+///
+/// # Parameters
+/// - `db`            — engine handle.
+/// - `cf`            — column-family handle.
+/// - `lo_ptr/lo_len` — lower-bound key (inclusive); may be empty for start-of-keyspace.
+/// - `hi_ptr/hi_len` — upper-bound key (exclusive); may be empty for end-of-keyspace.
+/// - `chunk_buf_ptr/chunk_buf_cap` — caller-owned output buffer.
+/// - `out_handle`    — receives the opaque iterator handle on success.
+/// - `out_row_count` — receives the number of rows in the first chunk.
+/// - `out_bytes_used`— receives the bytes written into `chunk_buf`.
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) on success.
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) on null out-pointers or bad handles.
+/// - `FrsErrorCode::EngineIo` (300) on engine errors.
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_iter_range_open(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    lo_ptr: *const u8,
+    lo_len: u32,
+    hi_ptr: *const u8,
+    hi_len: u32,
+    chunk_buf_ptr: *mut u8,
+    chunk_buf_cap: u32,
+    out_handle: *mut u64,
+    out_row_count: *mut u32,
+    out_bytes_used: *mut u32,
+) -> i32 {
+    guarded_vec(|| {
+        if out_handle.is_null() || out_row_count.is_null() || out_bytes_used.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if chunk_buf_ptr.is_null() && chunk_buf_cap > 0 {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let Some(db_ref) = db_from_handle(db) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(cf_ref_) = cf_ref(&cf) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if (lo_len as usize) > MAX_KEY_LEN || (hi_len as usize) > MAX_KEY_LEN {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+
+        let lo = if lo_ptr.is_null() || lo_len == 0 {
+            &[][..]
+        } else {
+            slice::from_raw_parts(lo_ptr, lo_len as usize)
+        };
+        let hi_opt: Option<&[u8]> = if hi_ptr.is_null() || hi_len == 0 {
+            None
+        } else {
+            Some(slice::from_raw_parts(hi_ptr, hi_len as usize))
+        };
+
+        // V1: materialize the [lo, hi) result set via the engine's range scan.
+        let rows = match db_ref.scan(cf_ref_, lo, hi_opt) {
+            Ok(r) => r,
+            Err(_) => return FrsErrorCode::EngineIo as i32,
+        };
+
+        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
+            Box::new(rows.into_iter());
+        let mut native_iter = NativeIter::new(inner);
+
+        // Fill the first chunk into the caller's buffer.
+        let chunk = native_iter.next_chunk(chunk_buf_cap as usize);
+        let (bytes_used, row_count) =
+            write_chunk_into_buf(&chunk.rows, chunk_buf_ptr, chunk_buf_cap as usize);
+
+        // Register — shares the same global registry as prefix iterators.
+        let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        iter_handles().lock().unwrap().insert(handle_id, native_iter);
+
+        *out_handle = handle_id;
+        *out_row_count = row_count;
+        *out_bytes_used = bytes_used;
+        FrsErrorCode::Ok as i32
+    })
+}
+
+/// Fetch the next chunk from a range iterator opened by `frs_vec_iter_range_open`.
+///
+/// Identical in shape and behaviour to `frs_vec_iter_prefix_next`; delegates
+/// to the shared handle registry.
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) always on success (even exhaustion).
+/// - `FrsErrorCode::IterCursorInvalid` (201) if `handle` is unknown.
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) on null out-pointers.
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_iter_range_next(
+    handle: u64,
+    chunk_buf_ptr: *mut u8,
+    chunk_buf_cap: u32,
+    out_row_count: *mut u32,
+    out_bytes_used: *mut u32,
+) -> i32 {
+    // Semantically identical to frs_vec_iter_prefix_next — the registry is shared.
+    frs_vec_iter_prefix_next(handle, chunk_buf_ptr, chunk_buf_cap, out_row_count, out_bytes_used)
+}
+
+/// Release a range iterator handle.  Delegates to `frs_vec_iter_prefix_close`.
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) always.
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+#[no_mangle]
+pub extern "C" fn frs_vec_iter_range_close(handle: u64) -> i32 {
+    frs_vec_iter_prefix_close(handle)
+}
+
+/// Watchdog hook: abort a range iterator.  Delegates to `frs_vec_iter_prefix_abort`.
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) on success.
+/// - `FrsErrorCode::IterCursorInvalid` (201) if `handle` is unknown.
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+#[no_mangle]
+pub extern "C" fn frs_vec_iter_range_abort(handle: u64) -> i32 {
+    frs_vec_iter_prefix_abort(handle)
+}
+
+// ---------------------------------------------------------------------------
 // List-append merge (P6-A)
 // ---------------------------------------------------------------------------
 
@@ -6522,5 +6666,179 @@ mod tests {
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // frs_vec_iter_range_* tests (P9, spec §2 component D)
+    // -----------------------------------------------------------------------
+
+    /// Open/close round trip: 3 keys in [b, d) are returned; "a" and "d" are
+    /// excluded by the bounds.
+    #[test]
+    fn vec_iter_range_open_close_round_trip() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            for (k, v) in &[
+                (&b"a"[..], &b"va"[..]),
+                (b"b", b"vb"),
+                (b"bb", b"vbb"),
+                (b"bc", b"vbc"),
+                (b"d", b"vd"),
+            ] {
+                assert_eq!(
+                    frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                    FRS_STATUS_OK
+                );
+            }
+
+            let mut chunk_buf = vec![0u8; 4096];
+            let mut handle: u64 = 0;
+            let mut row_count: u32 = 0;
+            let mut bytes_used: u32 = 0;
+
+            let lo = b"b";
+            let hi = b"d";
+            let rc = frs_vec_iter_range_open(
+                db, cf,
+                lo.as_ptr(), lo.len() as u32,
+                hi.as_ptr(), hi.len() as u32,
+                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
+                &mut handle, &mut row_count, &mut bytes_used,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "open should return Ok");
+            assert_ne!(handle, 0, "handle must be non-zero");
+            assert_eq!(row_count, 3, "expect 3 keys in [b, d)");
+
+            let rows = decode_chunk_buf(&chunk_buf, bytes_used, row_count);
+            assert_eq!(rows.len(), 3);
+            for (k, _) in &rows {
+                assert!(k.as_slice() >= b"b".as_slice(), "key {:?} below lo", k);
+                assert!(k.as_slice() < b"d".as_slice(), "key {:?} at/above hi", k);
+            }
+
+            // Second chunk is empty.
+            let rc2 = frs_vec_iter_range_next(
+                handle,
+                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
+                &mut row_count, &mut bytes_used,
+            );
+            assert_eq!(rc2, FrsErrorCode::Ok as i32);
+            assert_eq!(row_count, 0);
+
+            assert_eq!(frs_vec_iter_range_close(handle), FrsErrorCode::Ok as i32);
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// next on an unknown range handle returns IterCursorInvalid.
+    #[test]
+    fn vec_iter_range_next_unknown_handle_returns_cursor_invalid() {
+        let mut chunk_buf = vec![0u8; 64];
+        let mut row_count: u32 = 0;
+        let mut bytes_used: u32 = 0;
+        let rc = unsafe {
+            frs_vec_iter_range_next(
+                u64::MAX,
+                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
+                &mut row_count, &mut bytes_used,
+            )
+        };
+        assert_eq!(rc, FrsErrorCode::IterCursorInvalid as i32);
+    }
+
+    /// Abort a range iterator: subsequent next returns empty chunk.
+    #[test]
+    fn vec_iter_range_abort_stops_iteration() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            for i in 0u8..4 {
+                let k = format!("rng/{}", i);
+                let v = format!("v{}", i);
+                assert_eq!(
+                    frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                    FRS_STATUS_OK
+                );
+            }
+
+            let mut chunk_buf = vec![0u8; 4096];
+            let mut handle: u64 = 0;
+            let mut row_count: u32 = 0;
+            let mut bytes_used: u32 = 0;
+
+            // Use a range that only covers part of the keys written.
+            let lo = b"rng/0";
+            let hi = b"rng/z";
+            let rc = frs_vec_iter_range_open(
+                db, cf,
+                lo.as_ptr(), lo.len() as u32,
+                hi.as_ptr(), hi.len() as u32,
+                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
+                &mut handle, &mut row_count, &mut bytes_used,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+            assert_ne!(handle, 0);
+
+            assert_eq!(frs_vec_iter_range_abort(handle), FrsErrorCode::Ok as i32);
+
+            // After abort, next returns empty.
+            let rc2 = frs_vec_iter_range_next(
+                handle,
+                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
+                &mut row_count, &mut bytes_used,
+            );
+            assert_eq!(rc2, FrsErrorCode::Ok as i32);
+            assert_eq!(row_count, 0, "aborted range iter must yield empty chunk");
+
+            // Abort on unknown handle → IterCursorInvalid.
+            assert_eq!(
+                frs_vec_iter_range_abort(u64::MAX),
+                FrsErrorCode::IterCursorInvalid as i32
+            );
+
+            assert_eq!(frs_vec_iter_range_close(handle), FrsErrorCode::Ok as i32);
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Null out-pointers return BatchHeaderMalformed.
+    #[test]
+    fn vec_iter_range_open_null_out_pointers_return_malformed() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let mut chunk_buf = vec![0u8; 64];
+            let lo = b"a";
+            let hi = b"z";
+            let rc = frs_vec_iter_range_open(
+                db, cf,
+                lo.as_ptr(), lo.len() as u32,
+                hi.as_ptr(), hi.len() as u32,
+                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
+                ptr::null_mut(), &mut 0u32, &mut 0u32,
+            );
+            assert_eq!(rc, FrsErrorCode::BatchHeaderMalformed as i32);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// close(0) is a no-op.
+    #[test]
+    fn vec_iter_range_close_zero_handle_is_noop() {
+        assert_eq!(frs_vec_iter_range_close(0), FrsErrorCode::Ok as i32);
     }
 }
