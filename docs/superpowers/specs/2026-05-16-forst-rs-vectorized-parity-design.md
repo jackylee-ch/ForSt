@@ -513,6 +513,14 @@ Post-panic invariants asserted: no FD leak; memtable indices consistent; snapsho
 
 Q3's 1.25× already met; locked as floor for that query.
 
+**Gates are commitments after measurement, not pre-measurement aspirations.** The ≥ 1.20× state-heavy gate is the design's expected outcome based on Q3's validated 1.25×, but it is not a deduced lower bound for Q4/Q5/Q8 — they touch state differently. **On the first daily L6 miss for any state-heavy query, the response is:**
+1. Open an investigation issue (`perf-gate-miss` label) within 24 h.
+2. Identify the responsible delta (profile, bisect, attribute to a component or workload property).
+3. **Either** fix the regression and re-validate, **or** re-tier the query with a documented rationale (e.g. "Q5's ListState concatenation cost is workload-bounded; re-tier to state-medium with ≥ 1.05× gate").
+4. Update this spec's tier table in the same PR.
+
+What is **not** acceptable: silently lowering the gate without investigation. The discipline is "measure, then commit" — gate changes go through review like any spec change.
+
 ### Cadence
 
 | Cadence | Scope | Trigger |
@@ -586,13 +594,25 @@ Post-deploy verification:
 
 ### 6.2 Canary plan (short-window observables only)
 
-L7 24–72 h soak runs **pre-deploy on a separate test cluster**, not inside canary. Canary stages use only what can be measured in their hold window.
+**Preconditions — must all hold before any canary TM accepts production traffic:**
+
+```
+[ ] Pre-deploy L7 24 h soak passed on a separate test cluster (RSS stable, no leak, no silent state loss)
+[ ] All L5 fault injection tests (F1-F12) pass deterministically and probabilistically
+[ ] frs_abi_version match verified on every candidate TM
+[ ] Pre-deploy L6 daily-cadence baseline established (rolling 7-day median per query)
+[ ] §6.13 release readiness checklist signed off
+```
+
+If any precondition fails, **do not enter canary** — fix the failing gate first. Stability validation is not run in parallel with production traffic.
+
+After preconditions are met, canary stages use only what can be measured in their hold window:
 
 | Stage | Hold | Promotion criteria |
 |---|---|---|
 | **Canary 1 TM** | 1 h | (a) `engine.panic_caught == 0`; (b) zero `FrsException`; (c) `dispatch.<kind>.latency_ns_p99` within 1.5× pre-cut baseline; (d) ≥ 2 successful checkpoints; (e) RSS within +10 % of warm-up |
 | **10 %** | 4 h | All + (f) `iter.handles_open` slot-mean linear-fit slope ≈ 0 over 4 h; (g) `arena.region_overflows/h` < 10; (h) checkpoint failure rate < 0.5 % |
-| **50 %** | 24 h | All + (i) checkpoint failure trend stable; (j) no canary-tier metric fires on the broader fleet; **(k) pre-deploy L7 24 h passed (gate observed before canary)** |
+| **50 %** | 24 h | All + (i) checkpoint failure trend stable; (j) no canary-tier metric fires on the broader fleet |
 | **100 %** | — | — |
 
 ### 6.3 In-band rollback (drain succeeds)
@@ -726,7 +746,48 @@ This runbook is versioned alongside the Forst-RS codebase.
 - Cross-reference from every minor-version release-note entry.
 - If observed behavior contradicts this runbook, file an issue with `runbook-stale`.
 
-### 6.13 Documented trade-off: `frs_get_fast` panic = TM death
+### 6.13 V1 release readiness checklist
+
+"V1 is ready to ship" is a verifiable claim, not a judgment. All of the following must hold before tagging V1:
+
+**Code completeness:**
+```
+[ ] All 17 Java components (§2 1-17) implemented; PR-merged; no `TODO`/`FIXME`/`unimplemented!` in V1 code paths
+[ ] All 7 Rust components (§2 A-G) implemented; cargo build clean; no `panic!()` outside intentional sites
+[ ] FRS_ABI_VERSION = 1 locked; bumped on every layout change during development; matches Java EXPECTED_ABI_VERSION
+```
+
+**Test coverage:**
+```
+[ ] L1 Rust unit: all panic-safety proptests passing
+[ ] L2 Java unit: every component in §2 has a unit test, ≥ 80 % line coverage
+[ ] L3 FFI round-trip: byte-level parity for every frs_vec_* symbol
+[ ] L4 state-class integration: each state primitive's coverage matrix row green
+[ ] L5 fault injection: F1-F12 each pass deterministically (_AT mode) and probabilistically (_PROB mode)
+[ ] L6 daily cadence: rolling 7-day median per query within published tier gate
+[ ] L7 24 h PR-gate soak: passed at least once on a release candidate
+[ ] L7 72 h release-gate soak: passed on this candidate (RSS stable ± 5 %, no silent state loss)
+```
+
+**Operational readiness:**
+```
+[ ] Runbook (§6) reviewed against current code; quarterly review most recent within 30 days
+[ ] Metrics published and visible on dashboard
+[ ] Escalation matrix (§6.8) populated for the target deployment
+[ ] Release notes drafted with "no in-place upgrade from ForSt" callout
+[ ] Migration validation: at least one production-shape job successfully drained-and-restored Forst-RS → Forst-RS
+```
+
+**Documentation:**
+```
+[ ] This spec's V1.x deferred-items list (§6.10) up to date
+[ ] Non-goals list (§6.11) reviewed against current product positioning
+[ ] SP1-SP6 cross-references (Appendix) version-locked to V1 (see "Documentation maintenance discipline" in Appendix)
+```
+
+Sign-off: state-backend team lead + PMC representative. The checklist is the artifact, not the meeting.
+
+### 6.14 Documented trade-off: `frs_get_fast` panic = TM death
 
 `frs_get_fast` deliberately omits `catch_unwind`:
 - Saves ~15 ns per call on the per-key lookup hot path (Q3 critical).
@@ -752,9 +813,49 @@ Published as expected behavior, not a bug.
 
 ---
 
+## Appendix — Pre-implementation validation gate
+
+Before writing V1 implementation code, run a **component-boundary microbench** to validate the design's performance claims. The 17 Java components on the hot path are tightly coupled by the dispatch and Arena lifecycle; the published "sub-µs per `put()`" envelope (§3 Trace A) is a design target, not a measurement. **Microbench it before the design is locked into implementation.**
+
+**Schedule:** 6 weeks before V1 implementation start.
+
+**Microbench targets (per-component, isolated, JMH-style):**
+
+| Component / boundary | Measured op | Target envelope | If unmet |
+|---|---|---|---|
+| `SlotArenaScope.enter()/exit()` | empty turn round-trip | ≤ 200 ns | Consolidate enter/exit into a single MemoryHandle savepoint, drop iterator-registry copy |
+| `turnRegion.allocate()` (bump alloc, in-region) | one allocation, 256 B aligned | ≤ 50 ns | Drop align step for power-of-2 default; verify with `AlignmentFinder` |
+| `encodeKeyInto(turnRegion)` (Trace A step 2) | full composite key encode | ≤ 100 ns | Inline `serializeK` writeback; cache key prefix per slot |
+| `encodeValueInto` for ≤ 256 B value | full encode | ≤ 150 ns | Bypass `MemorySegmentDataOutputView` for small fixed-size types |
+| `VectorizedClassifier.submit()` (in-batch) | append one request, no flush | ≤ 100 ns | Pre-size batch buffer per-state to avoid resize-and-copy |
+| `VectorizedExecutor.dispatch()` (Java→FFI→Java) | one batch of 64 rows | ≤ 5 µs ÷ 64 = ~80 ns/row | Reduce per-batch FFI overhead (header copy, return-column parse) |
+| `ColumnarBatchBuffer` flush serialization | 64-row PUT batch into FFI-ready layout | ≤ 2 µs total | Consider direct off-heap layout (no separate serialization step) |
+| `pendingMisses.computeIfAbsent()` | cache-miss path lookup | ≤ 50 ns hit / ≤ 200 ns miss | Replace ConcurrentHashMap with open-addressed slot-local table |
+
+**Acceptance:** sum of measured per-row costs along Trace A ≤ **1 µs** at p99 for 256 B values in 32-row batches. If the sum exceeds the target, **consolidate components during V1 implementation, not after release.** Candidate consolidations:
+
+1. **Merge** `VectorizedStateRequest` envelope into `ColumnarBatchBuffer` directly — skip the per-request object allocation, write straight into the batch buffer.
+2. **Inline** `encodeKeyInto` + `encodeValueInto` at the call site for primitive-typed state.
+3. **Single-pass classifier** that writes batch + dispatches inline when buffer fills (no separate flush step).
+
+**Deliverable:** `docs/superpowers/specs/2026-04-04-forst-rs-component-microbench-report.md` (or equivalent dated path), with raw JMH numbers and recommended consolidations (if any).
+
+**Block on failure:** if the microbench shows the sum-of-components exceeds 2× target, the design enters revision before V1 implementation begins. The current 17-component decomposition is not load-bearing — clarity-vs-perf can rebalance if the data demands.
+
 ## Appendix — Cross-references to companion specs
 
 - **SP1** (state types V2): per-state-type V2 contracts referenced from §2 components 9–13.
 - **SP2** (iterator vectorization): foundation for §1 ITER_PREFIX/ITER_RANGE; this spec adds lifetime bound + per-iter Arena.
 - **SP5** (snapshot/restore + data transfer): underpins §3 Trace E + §5 migration strategy.
 - **SP6** (V1 sync vectorization): `MemorySegmentDataOutputView`/`InputView` primitives reused for §2 off-heap value staging.
+
+### Cross-reference maintenance discipline (version-locked)
+
+This umbrella spec is **load-bearing** for SP1–SP6 — those specs depend on contracts defined here. To prevent silent drift:
+
+1. **Bidirectional citation:** every section of SP1–SP6 that touches a contract defined here cites this spec's section number (e.g. "per umbrella §1 §a — APPEND_MERGE non-goal for Reducing/Aggregating"). Conversely, this spec's components (§2 9–13) cite the SP that owns the implementation.
+2. **PR-level sync gate:** any PR that reorganizes a section, renames a constant, or changes a contract semantic in SP1–SP6 **must** update the corresponding citation here in the same PR. The reviewer of the SP change is responsible for verifying.
+3. **Quarterly review:** state-backend team performs a quarterly cross-reference walk — every citation in this spec resolves to an existing section in SP1–SP6 with the cited semantics; every back-citation from SP1–SP6 resolves to an existing section here. Stale references file `runbook-stale`-labelled issues.
+4. **Version lock:** this spec is tagged at V1 release. Subsequent material changes bump to V1.1, V1.2, etc. SP1–SP6 cite the version they were validated against; cross-version drift triggers re-validation.
+
+Without this discipline, future reviewers will repeatedly raise "doesn't this contradict SP-X?" against statements here that have silently fallen out of sync. The discipline is cheap (PR-time check) and prevents an expensive cleanup later.
