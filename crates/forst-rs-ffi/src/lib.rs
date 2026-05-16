@@ -50,7 +50,7 @@ use std::ptr;
 use std::sync::Arc;
 
 use forst_rs_common::EngineOptions;
-use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, WriteBatch};
+use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, ListMergeCombiner, WriteBatch};
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
 use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
 
@@ -3691,6 +3691,121 @@ pub extern "C" fn frs_vec_iter_prefix_abort(handle: u64) -> i32 {
     })
 }
 
+// ---------------------------------------------------------------------------
+// List-append merge (P6-A)
+// ---------------------------------------------------------------------------
+
+/// Append N operands to an existing value at `key` in a ListState column family.
+///
+/// The function reads the existing value (or treats it as empty when absent),
+/// concatenates `num_operands` operands in arrival order, and writes the result
+/// back with a single `put`. This is the V1 read-modify-write implementation;
+/// a true merge-op accumulation path is deferred to V1.x.
+///
+/// Per umbrella spec §1 §a, this path is **ListState-only**. Reducing and
+/// Aggregating states use the RMW cache (P7), not append-merge.
+///
+/// # Single-row API
+///
+/// Java callers loop: one FFI call per row. Lower throughput than a true
+/// batch variant, but acceptable because ListState.add() is far less hot
+/// than get/put. A multi-row variant is deferred to V1.x.
+///
+/// # Parameters
+/// - `db`           — engine handle from `frs_db_open*`.
+/// - `cf`           — column-family handle (must be a ListState CF).
+/// - `key_ptr`      — pointer to key bytes (non-null).
+/// - `key_len`      — length of key in bytes.
+/// - `operand_ptrs` — pointer to array of `num_operands` byte pointers.
+/// - `operand_lens` — pointer to array of `num_operands` u32 lengths.
+/// - `num_operands` — number of operands to append (may be 0, which is a
+///                    no-op and returns `Ok`).
+///
+/// # Returns (typed `FrsErrorCode` discriminants — spec §4)
+/// - `FrsErrorCode::Ok` (0)                       — success
+/// - `FrsErrorCode::BatchHeaderMalformed` (110)   — null pointer argument or
+///                                                   invalid handle
+/// - `FrsErrorCode::EngineIo` (300)               — engine I/O failure
+/// - `FrsErrorCode::PanicCaught` (900)            — Rust panic at FFI boundary
+///
+/// # Safety
+/// - `key_ptr` must point to at least `key_len` valid bytes for the
+///   duration of this call.
+/// - `operand_ptrs` must point to at least `num_operands` valid pointers,
+///   each pointing to at least the corresponding `operand_lens[i]` bytes.
+/// - `operand_lens` must point to at least `num_operands` valid `u32` values.
+/// - No pointer may alias writable memory in a way that would cause UB
+///   under Rust's memory model for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_merge_append(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    key_ptr: *const u8,
+    key_len: u32,
+    operand_ptrs: *const *const u8,
+    operand_lens: *const u32,
+    num_operands: u32,
+) -> i32 {
+    guarded_vec(|| {
+        // Validate handle and null-checks.
+        if key_ptr.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if num_operands > 0 && (operand_ptrs.is_null() || operand_lens.is_null()) {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let Some(db_ref) = db_from_handle(db) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(cf_ref) = cf_ref(&cf) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+
+        let key = slice::from_raw_parts(key_ptr, key_len as usize);
+
+        // No-op fast path.
+        if num_operands == 0 {
+            return FrsErrorCode::Ok as i32;
+        }
+
+        // Collect operands.
+        let mut operands: Vec<Vec<u8>> = Vec::with_capacity(num_operands as usize);
+        for i in 0..num_operands as usize {
+            let p = *operand_ptrs.add(i);
+            let n = *operand_lens.add(i) as usize;
+            if p.is_null() && n > 0 {
+                return FrsErrorCode::BatchHeaderMalformed as i32;
+            }
+            let bytes = if n == 0 {
+                Vec::new()
+            } else {
+                slice::from_raw_parts(p, n).to_vec()
+            };
+            operands.push(bytes);
+        }
+
+        // Read existing value (empty Vec when key absent).
+        let existing: Vec<u8> = match db_ref.get(cf_ref, key) {
+            Ok(opt) => opt.unwrap_or_default(),
+            Err(e) => return error_to_frs_code(&e),
+        };
+
+        // Concatenate using the fixed list-append combiner.
+        let combiner = ListMergeCombiner::new();
+        let merged = if existing.is_empty() {
+            combiner.combine(&operands)
+        } else {
+            combiner.combine_with_base(&existing, &operands)
+        };
+
+        // Write back.
+        match db_ref.put(cf_ref, key, &merged) {
+            Ok(_) => FrsErrorCode::Ok as i32,
+            Err(e) => error_to_frs_code(&e),
+        }
+    })
+}
+
 fn put_batch_schema() -> std::sync::Arc<Schema> {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("key", DataType::Binary, false),
@@ -6271,5 +6386,141 @@ mod tests {
             frs_vec_iter_prefix_close(0),
             FrsErrorCode::Ok as i32
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // P6-A: frs_vec_merge_append smoke tests
+    // -----------------------------------------------------------------------
+
+    /// Appending to an absent key: result equals the concatenated operands.
+    #[test]
+    fn merge_append_absent_key_concatenates_operands() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"list_key";
+            let v1 = b"A";
+            let v2 = b"B";
+            let v3 = b"C";
+            let operand_ptrs: [*const u8; 3] = [v1.as_ptr(), v2.as_ptr(), v3.as_ptr()];
+            let operand_lens: [u32; 3] = [v1.len() as u32, v2.len() as u32, v3.len() as u32];
+
+            let rc = frs_vec_merge_append(
+                db, cf,
+                key.as_ptr(), key.len() as u32,
+                operand_ptrs.as_ptr(), operand_lens.as_ptr(), 3,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+
+            // Verify via frs_get.
+            let mut out = FrsBytes::NULL;
+            assert_eq!(frs_get(db, cf, key.as_ptr(), key.len(), &mut out), FRS_STATUS_OK);
+            assert!(!out.data.is_null());
+            let got = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(got, b"ABC");
+            frs_bytes_free(&mut out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Appending to an existing value: new operands are suffixed to the base.
+    #[test]
+    fn merge_append_existing_key_suffixes_operands() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"list2";
+            // Prime the key with "BASE".
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), b"BASE".as_ptr(), 4),
+                FRS_STATUS_OK
+            );
+
+            // Append "X", "Y".
+            let v1 = b"X";
+            let v2 = b"Y";
+            let operand_ptrs: [*const u8; 2] = [v1.as_ptr(), v2.as_ptr()];
+            let operand_lens: [u32; 2] = [1, 1];
+            let rc = frs_vec_merge_append(
+                db, cf,
+                key.as_ptr(), key.len() as u32,
+                operand_ptrs.as_ptr(), operand_lens.as_ptr(), 2,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+
+            let mut out = FrsBytes::NULL;
+            assert_eq!(frs_get(db, cf, key.as_ptr(), key.len(), &mut out), FRS_STATUS_OK);
+            let got = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(got, b"BASEXY");
+            frs_bytes_free(&mut out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Zero-operand call is a no-op (does not write an empty value).
+    ///
+    /// `frs_get` returns `FRS_STATUS_OK` with a NULL `FrsBytes` when the key
+    /// is absent (not `FRS_STATUS_NOT_FOUND`), so we assert `out.data.is_null()`.
+    #[test]
+    fn merge_append_zero_operands_is_noop() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"noop_key";
+            let rc = frs_vec_merge_append(
+                db, cf,
+                key.as_ptr(), key.len() as u32,
+                ptr::null(), ptr::null(), 0,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+
+            // Key should be absent: frs_get returns OK with NULL data pointer.
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            assert!(out.data.is_null(), "absent key should have null data pointer");
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Null key pointer returns BatchHeaderMalformed.
+    #[test]
+    fn merge_append_null_key_returns_malformed() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let v = b"X";
+            let ptrs: [*const u8; 1] = [v.as_ptr()];
+            let lens: [u32; 1] = [1];
+            let rc = frs_vec_merge_append(
+                db, cf,
+                ptr::null(), 0,          // null key
+                ptrs.as_ptr(), lens.as_ptr(), 1,
+            );
+            assert_eq!(rc, FrsErrorCode::BatchHeaderMalformed as i32);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
     }
 }

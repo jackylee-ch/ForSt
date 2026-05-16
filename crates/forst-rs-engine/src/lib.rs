@@ -80,6 +80,7 @@ pub mod compaction_filter;
 pub mod db;
 pub mod file_deletion_guard;
 pub mod flush;
+pub mod list_merge;
 pub mod mvcc;
 pub mod runtime_tuning;
 pub mod snapshot_view;
@@ -88,6 +89,7 @@ pub mod write_controller;
 
 pub use checkpoint::{CheckpointManifest, CHECKPOINT_BLOB_NAME};
 pub use column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
+pub use list_merge::ListMergeCombiner;
 pub use compaction::{compaction_output_path, CompactionJob};
 pub use compaction_filter::{
     decode_ttl_payload, encode_ttl_value, CompactionDecision, CompactionFilter,
