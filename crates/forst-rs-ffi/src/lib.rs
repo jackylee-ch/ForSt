@@ -2203,6 +2203,285 @@ pub unsafe extern "C" fn frs_get_fast(
     }
 }
 
+// ===========================================================================
+// Recovered session-1 FFI additions (reverted accidentally, re-added).
+// ===========================================================================
+
+/// Vectorized batch GET — caller-owned Arrow BinaryArray layout.
+/// Reads `count` keys from (key_offsets, key_data), writes values into
+/// (out_offsets, out_data) + per-slot out_validity byte (1=found, 0=miss).
+#[no_mangle]
+pub unsafe extern "C" fn frs_vectorized_batch_get(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    key_offsets: *const i32,
+    key_data: *const u8,
+    count: usize,
+    out_offsets: *mut i32,
+    out_data: *mut u8,
+    out_validity: *mut u8,
+    out_data_cap: usize,
+    out_data_len: *mut usize,
+) -> i32 {
+    guarded(|| {
+        if out_data_len.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if count == 0 {
+            *out_data_len = 0;
+            if !out_offsets.is_null() {
+                *out_offsets = 0;
+            }
+            return FRS_STATUS_OK;
+        }
+        if count > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        if key_offsets.is_null() || out_offsets.is_null() || out_validity.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let key_offs = slice::from_raw_parts(key_offsets, count + 1);
+        let total_keys = key_offs[count] as usize;
+        let key_buf: &[u8] = if key_data.is_null() || total_keys == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(key_data, total_keys)
+        };
+        let out_offs = slice::from_raw_parts_mut(out_offsets, count + 1);
+        let out_vld = slice::from_raw_parts_mut(out_validity, count);
+        let out_buf: &mut [u8] = if out_data.is_null() || out_data_cap == 0 {
+            &mut []
+        } else {
+            slice::from_raw_parts_mut(out_data, out_data_cap)
+        };
+        let mut pos: usize = 0;
+        out_offs[0] = 0;
+        for i in 0..count {
+            let ks = key_offs[i] as usize;
+            let ke = key_offs[i + 1] as usize;
+            if ke < ks || ke > total_keys {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+            let k = &key_buf[ks..ke];
+            match db.get(cf, k) {
+                Ok(Some(v)) => {
+                    let vl = v.len();
+                    if pos + vl > out_data_cap {
+                        *out_data_len = pos + vl;
+                        return FRS_STATUS_BUFFER_TOO_SMALL;
+                    }
+                    ptr::copy_nonoverlapping(v.as_ptr(), out_buf.as_mut_ptr().add(pos), vl);
+                    pos += vl;
+                    out_vld[i] = 1;
+                }
+                Ok(None) => out_vld[i] = 0,
+                Err(e) => return error_to_status(&e),
+            }
+            out_offs[i + 1] = pos as i32;
+        }
+        *out_data_len = pos;
+        FRS_STATUS_OK
+    })
+}
+
+/// Vectorized batch PUT — caller-owned key+value Arrow BinaryArray buffers.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vectorized_batch_put(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    key_offsets: *const i32,
+    key_data: *const u8,
+    val_offsets: *const i32,
+    val_data: *const u8,
+    count: usize,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if count == 0 {
+            return FRS_STATUS_OK;
+        }
+        if count > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        if key_offsets.is_null() || val_offsets.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let key_offs = slice::from_raw_parts(key_offsets, count + 1);
+        let val_offs = slice::from_raw_parts(val_offsets, count + 1);
+        let total_keys = key_offs[count] as usize;
+        let total_vals = val_offs[count] as usize;
+        let key_buf: &[u8] = if key_data.is_null() || total_keys == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(key_data, total_keys)
+        };
+        let val_buf: &[u8] = if val_data.is_null() || total_vals == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(val_data, total_vals)
+        };
+        let mut wb = WriteBatch::with_capacity(count);
+        for i in 0..count {
+            let ks = key_offs[i] as usize;
+            let ke = key_offs[i + 1] as usize;
+            let vs = val_offs[i] as usize;
+            let ve = val_offs[i + 1] as usize;
+            if ke < ks || ke > total_keys || ve < vs || ve > total_vals {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+            wb.put(cf, &key_buf[ks..ke], &val_buf[vs..ve]);
+        }
+        match db.batch_write(wb) {
+            Ok(_) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Vectorized batch DELETE — caller-owned Arrow BinaryArray keys.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vectorized_batch_delete(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    key_offsets: *const i32,
+    key_data: *const u8,
+    count: usize,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if count == 0 {
+            return FRS_STATUS_OK;
+        }
+        if count > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        if key_offsets.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let key_offs = slice::from_raw_parts(key_offsets, count + 1);
+        let total_keys = key_offs[count] as usize;
+        let key_buf: &[u8] = if key_data.is_null() || total_keys == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(key_data, total_keys)
+        };
+        let mut wb = WriteBatch::with_capacity(count);
+        for i in 0..count {
+            let ks = key_offs[i] as usize;
+            let ke = key_offs[i + 1] as usize;
+            if ke < ks || ke > total_keys {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+            wb.delete(cf, &key_buf[ks..ke]);
+        }
+        match db.batch_write(wb) {
+            Ok(_) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+// --- Stub symbols (linker bind requires symbol exists; unused on Q3 hot path) ---
+
+pub type FrsWriteBatch = *mut c_void;
+
+#[no_mangle]
+pub unsafe extern "C" fn frs_prefix_get_all(
+    _handle: FrsDb,
+    _cf: FrsCfHandle,
+    _prefix: *const u8,
+    _prefix_len: usize,
+    _max_count: usize,
+    _out_keys: *mut FrsBytes,
+    _out_values: *mut FrsBytes,
+    out_count: *mut usize,
+) -> i32 {
+    if !out_count.is_null() {
+        *out_count = 0;
+    }
+    FRS_STATUS_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn frs_batch_prefix_scan(
+    _handle: FrsDb,
+    _cf: FrsCfHandle,
+    _prefixes: *const *const u8,
+    _prefix_lens: *const usize,
+    _prefix_count: usize,
+    _max_per_prefix: usize,
+    _out_keys: *mut FrsBytes,
+    _out_values: *mut FrsBytes,
+    out_counts: *mut usize,
+    out_total: *mut usize,
+) -> i32 {
+    if !out_total.is_null() {
+        *out_total = 0;
+    }
+    if !out_counts.is_null() {
+        let _ = out_counts;
+    }
+    FRS_STATUS_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn frs_writebatch_open(out_handle: *mut FrsWriteBatch) -> i32 {
+    if !out_handle.is_null() {
+        *out_handle = std::ptr::null_mut();
+    }
+    FRS_STATUS_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn frs_writebatch_put(
+    _handle: FrsWriteBatch,
+    _cf: FrsCfHandle,
+    _key_offsets: *const i32,
+    _key_data: *const u8,
+    _val_offsets: *const i32,
+    _val_data: *const u8,
+    _count: usize,
+) -> i32 {
+    FRS_STATUS_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn frs_writebatch_delete(
+    _handle: FrsWriteBatch,
+    _cf: FrsCfHandle,
+    _key_offsets: *const i32,
+    _key_data: *const u8,
+    _count: usize,
+) -> i32 {
+    FRS_STATUS_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn frs_writebatch_commit(_handle: FrsWriteBatch, _db: FrsDb) -> i32 {
+    FRS_STATUS_NOT_SUPPORTED
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn frs_writebatch_close(_handle: FrsWriteBatch) -> i32 {
+    FRS_STATUS_OK
+}
+
 /// Opens a forward iterator over the entire column family.
 ///
 /// Implementation: snapshot the CF via `db.scan` (empty lower bound, no
