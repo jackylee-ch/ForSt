@@ -128,6 +128,22 @@ pub const FRS_STATUS_FALLBACK: i32 = 16;
 pub const FRS_STATUS_BUFFER_TOO_SMALL: i32 = 17;
 
 // ---------------------------------------------------------------------------
+// ABI version negotiation
+// ---------------------------------------------------------------------------
+
+/// V1 ABI version. Bump on any FFI layout change (struct field add/remove,
+/// enum variant add/remove, function signature change). Java side maintains
+/// EXPECTED_ABI_VERSION; init-time mismatch throws FrsAbiMismatchException.
+pub const FRS_ABI_VERSION: u32 = 1;
+
+/// Returns the V1 ABI version. Called once at Java backend init to detect
+/// dylib/jar version skew before any state op runs.
+#[no_mangle]
+pub extern "C" fn frs_abi_version() -> u32 {
+    FRS_ABI_VERSION
+}
+
+// ---------------------------------------------------------------------------
 // Opaque handle types
 // ---------------------------------------------------------------------------
 
@@ -5383,5 +5399,10 @@ mod tests {
                 FRS_STATUS_NULL_ARG
             );
         }
+    }
+
+    #[test]
+    fn abi_version_is_one() {
+        assert_eq!(frs_abi_version(), 1);
     }
 }
