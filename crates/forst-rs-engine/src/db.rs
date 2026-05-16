@@ -2348,13 +2348,52 @@ impl DbImpl {
     }
 
     /// Prefix scan: all key-value pairs whose keys start with `prefix`.
+    #[inline]
     pub fn prefix_scan(
         &self,
         cf: &ColumnFamilyHandle,
         prefix: &[u8],
     ) -> ForstResult<Vec<(Vec<u8>, Vec<u8>)>> {
         let upper = prefix_upper_bound(prefix);
-        self.scan(cf, prefix, upper.as_deref())
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        // Fast path: use prefix_scan_keys on memtable (O(1) prefix index lookup)
+        let mem_arc = cf_data.active_memtable();
+        let keys = mem_arc.prefix_scan_keys(prefix, upper.as_deref());
+
+        // Resolve each key — try active memtable directly (inline cache)
+        let read_seq = u64::MAX;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let active_hit = mem_arc.get(&key, read_seq)?;
+            match active_hit {
+                Some(entry) if entry.op_type == OpType::Put => {
+                    if let Some(value) = entry.value {
+                        out.push((key, value));
+                    }
+                }
+                Some(_) => {} // Delete — skip
+                None => {
+                    // Fall back to full path
+                    if let Some(value) = self.get(cf, &key)? {
+                        out.push((key, value));
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn batch_prefix_scan(
+        &self,
+        cf: &ColumnFamilyHandle,
+        prefixes: &[&[u8]],
+    ) -> ForstResult<Vec<Vec<(Vec<u8>, Vec<u8>)>>> {
+        let mut results = Vec::with_capacity(prefixes.len());
+        for prefix in prefixes {
+            results.push(self.prefix_scan(cf, prefix)?);
+        }
+        Ok(results)
     }
 
     // ---------------------------------------------------------------
@@ -2884,6 +2923,7 @@ impl DbImpl {
     /// prefetch). This amortizes S3 round-trip latency: one GetObject per
     /// SST file instead of paying the RTT on the first `get_internal` that
     /// happens to miss the reader cache.
+    #[inline]
     pub fn batch_get(
         &self,
         cf: &ColumnFamilyHandle,
@@ -2896,10 +2936,25 @@ impl DbImpl {
         // (the trait default returns Ok(())).
         self.prefetch_sst_files_for_batch(&cf_data, keys);
 
+        let mem = cf_data.active_memtable();
         let read_seq = u64::MAX;
         let mut out = Vec::with_capacity(keys.len());
         for k in keys {
-            out.push(self.get_internal(&cf_data, k, read_seq)?);
+            // Fast path: try active memtable directly (inline cache + hash index)
+            let active_hit = mem.get(k, read_seq)?;
+            match active_hit {
+                Some(entry) if entry.op_type == OpType::Put => {
+                    out.push(entry.value);
+                }
+                Some(_) => {
+                    // Delete/Merge in active memtable
+                    out.push(None);
+                }
+                None => {
+                    // Not in active memtable — fall back to full path
+                    out.push(self.get_internal(&cf_data, k, read_seq)?);
+                }
+            }
         }
         Ok(out)
     }
@@ -2994,6 +3049,7 @@ impl DbImpl {
         }
     }
 
+    #[inline]
     fn get_internal(
         &self,
         cf_data: &Arc<ColumnFamilyData>,

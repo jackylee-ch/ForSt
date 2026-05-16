@@ -445,6 +445,17 @@ impl ShardedMemTable {
         out
     }
 
+    pub fn prefix_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Vec<u8>> {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for shard in &self.shards {
+            let guard = shard.read().expect("lock poisoned");
+            keys.extend(guard.prefix_scan_keys(lower, upper));
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
     // ------------------------------------------------------------------
     // Lifecycle / flush helpers
     // ------------------------------------------------------------------

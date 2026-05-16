@@ -126,6 +126,11 @@ pub struct VectorizedMemTable {
     ///   case (all values ≤64B inlined) — still within a 128 MiB memtable budget.
     hash_index: HashMap<Box<[u8]>, HashEntry>,
 
+    /// Prefix index for O(1) prefix scan. Maps prefix bytes → set of full keys
+    /// that share that prefix. The prefix is extracted as everything up to and
+    /// including the last '/' byte in the key. Keys without '/' are not indexed.
+    prefix_index: HashMap<Box<[u8]>, Vec<Box<[u8]>>>,
+
     // -- State --
     /// Current sequence counter (incremented on each insert).
     next_sequence: u64,
@@ -171,6 +176,7 @@ impl VectorizedMemTable {
             unsorted_lookup: HashMap::with_capacity(INIT_ROWS_HINT),
             rowindex_vec_pool: Vec::new(),
             hash_index: HashMap::with_capacity(INIT_ROWS_HINT),
+            prefix_index: HashMap::with_capacity(INIT_ROWS_HINT),
             next_sequence: 1,
             memory_used: 0,
             frozen: false,
@@ -332,6 +338,27 @@ impl VectorizedMemTable {
                     latest_op: op_type_byte,
                 },
             );
+        }
+
+        // Prefix index: maintain mapping from prefix → full keys.
+        // Skip if key already existed (update to existing key — already indexed).
+        if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
+            let prefix = &key[..=last_slash];
+            if op_type == OpType::Delete || op_type == OpType::SingleDelete {
+                if let Some(keys) = self.prefix_index.get_mut(prefix) {
+                    keys.retain(|k| &**k != key);
+                }
+            } else if op_type == OpType::Put {
+                // Only add if this is a NEW key (not an update to existing)
+                let is_new_key = self.hash_index.get(key)
+                    .map_or(true, |e| e.row_indices.len() <= 1);
+                if is_new_key {
+                    self.prefix_index
+                        .entry(Box::from(prefix))
+                        .or_insert_with(Vec::new)
+                        .push(Box::from(key));
+                }
+            }
         }
 
         // Update memory tracking (approximate).
@@ -527,6 +554,45 @@ impl VectorizedMemTable {
     /// `(key, value, sequence, op_type)` tuples in sorted order
     /// (key ASC, sequence DESC).
     ///
+    /// Fast prefix scan: returns all live keys matching the prefix range [lower, upper).
+    /// Uses sorted_index (BTreeMap range) + unsorted_lookup (prefix filter) without
+    /// rebuilding a merged BTreeMap. Much faster than collect_range_entries for prefix scans.
+    #[inline]
+    pub fn prefix_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Vec<u8>> {
+        // Fast path: if lower ends with '/' and upper is the prefix_upper_bound,
+        // use the prefix_index for O(1) lookup.
+        if lower.last() == Some(&b'/') {
+            if let Some(keys) = self.prefix_index.get(lower) {
+                return keys.iter().map(|k| k.to_vec()).collect();
+            }
+            return Vec::new();
+        }
+        // Fallback: merge sorted_index range + unsorted_lookup filter (no temp BTreeMap)
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        // sorted_index is already sorted — range query is O(log N + K)
+        let range_iter = match upper {
+            Some(hi) => self.sorted_index.range::<Vec<u8>, _>(lower.to_vec()..hi.to_vec()),
+            None => self.sorted_index.range::<Vec<u8>, _>(lower.to_vec()..),
+        };
+        for (key, _) in range_iter {
+            keys.push(key.clone());
+        }
+        // Merge unsorted entries (already checked for prefix match)
+        let prev_len = keys.len();
+        for key in self.unsorted_lookup.keys() {
+            let k: &[u8] = key;
+            if k >= lower && upper.map_or(true, |hi| k < hi) {
+                keys.push(k.to_vec());
+            }
+        }
+        // Only sort+dedup if we added unsorted entries
+        if keys.len() > prev_len {
+            keys.sort();
+            keys.dedup();
+        }
+        keys
+    }
+
     /// Only entries with `sequence <= read_sequence` are included.
     /// Passing `lower=&[]` and `upper=None` yields every visible entry.
     ///
@@ -587,6 +653,7 @@ impl VectorizedMemTable {
     /// inline value cache when available — eliminates one pointer chase through
     /// the columnar value storage for small values (≤ INLINE_THRESHOLD bytes).
     /// MVCC snapshot reads fall through to the row_indices + columnar path.
+    #[inline]
     pub fn get(&self, key: &[u8], read_sequence: u64) -> ForstResult<Option<GetResult>> {
         let entry = match self.hash_index.get(key) {
             Some(e) => e,
