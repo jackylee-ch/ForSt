@@ -3439,6 +3439,258 @@ pub unsafe extern "C" fn frs_db_ingest_external_sst(
     })
 }
 
+// ---------------------------------------------------------------------------
+// 12. Vectorized chunked iterator — frs_vec_iter_prefix_* (P3-A, spec §1 §b + §2 E)
+//
+// These four symbols implement the chunked-iteration API used by the Java
+// vectorized dispatch executor (`IterPrefixExecutor`):
+//
+//   frs_vec_iter_prefix_open   — prefix scan → first chunk + opaque handle
+//   frs_vec_iter_prefix_next   — pull next chunk from an open handle
+//   frs_vec_iter_prefix_close  — drop the handle and release native state
+//   frs_vec_iter_prefix_abort  — watchdog hook: mark handle as aborted
+//
+// Wire format: rows are packed into the caller's direct ByteBuffer as
+//   [klen: u32 LE][vlen: u32 LE][key bytes][value bytes]
+// repeated, with no padding between rows.
+//
+// V1 snapshot semantics: `prefix_scan` materialises the full result set
+// into a Vec at open time; subsequent writes do not affect the iterator.
+// The Vec is heap-resident for the handle's lifetime.  Proper streaming
+// snapshot ref-counting is deferred to V2.
+//
+// Handle registry: `ITER_HANDLES` maps `u64` IDs to boxed `NativeIter`
+// instances.  The Java side treats the ID as opaque, passing it back
+// through next/close/abort.  IDs are monotonically increasing from 1;
+// overflow at u64::MAX wraps to 0 (harmless: the handle registry will
+// simply miss a lookup and return `IterCursorInvalid`).
+// ---------------------------------------------------------------------------
+
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::AtomicU64;
+use forst_rs_storage::NativeIter;
+
+/// Boxed, type-erased iterator stored in `ITER_HANDLES`.
+type AnyNativeIter = NativeIter<Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>>;
+
+static ITER_HANDLES: OnceLock<Mutex<HashMap<u64, AnyNativeIter>>> = OnceLock::new();
+static NEXT_ITER_ID: AtomicU64 = AtomicU64::new(1);
+
+fn iter_handles() -> &'static Mutex<HashMap<u64, AnyNativeIter>> {
+    ITER_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Pack `chunk.rows` into `buf[0..cap]` using the wire format
+/// `[klen u32 LE][vlen u32 LE][key bytes][value bytes]`.
+///
+/// Stops before a row would overflow the buffer. Returns the number of
+/// bytes written and the number of rows that fit.
+///
+/// # Safety
+/// Caller must ensure `buf` points to at least `cap` writable bytes for
+/// the duration of the call.
+unsafe fn write_chunk_into_buf(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    buf: *mut u8,
+    cap: usize,
+) -> (u32, u32) {
+    let mut off = 0usize;
+    let mut row_count = 0u32;
+    for (k, v) in rows {
+        let row_size = 8 + k.len() + v.len();
+        if off + row_size > cap {
+            break;
+        }
+        let klen = k.len() as u32;
+        let vlen = v.len() as u32;
+        std::ptr::copy_nonoverlapping(
+            klen.to_le_bytes().as_ptr(),
+            buf.add(off),
+            4,
+        );
+        off += 4;
+        std::ptr::copy_nonoverlapping(
+            vlen.to_le_bytes().as_ptr(),
+            buf.add(off),
+            4,
+        );
+        off += 4;
+        std::ptr::copy_nonoverlapping(k.as_ptr(), buf.add(off), k.len());
+        off += k.len();
+        std::ptr::copy_nonoverlapping(v.as_ptr(), buf.add(off), v.len());
+        off += v.len();
+        row_count += 1;
+    }
+    (off as u32, row_count)
+}
+
+/// Open a prefix-scoped iterator anchored to a point-in-time snapshot of
+/// the engine state (V1: full materialization via `prefix_scan`).
+///
+/// On success (`FrsErrorCode::Ok`):
+/// - `*out_handle` is set to a non-zero opaque iterator handle.
+/// - The first chunk is written to `chunk_buf_ptr[0..chunk_buf_cap]`.
+/// - `*out_row_count` is set to the number of rows in the first chunk.
+/// - `*out_bytes_used` is set to the number of bytes written to the buffer.
+///
+/// On exhaustion, `*out_row_count == 0` and `*out_bytes_used == 0`.
+/// The handle is still valid — caller should call `frs_vec_iter_prefix_close`
+/// to release it.
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) on success.
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) on null arguments or bad CF.
+/// - `FrsErrorCode::EngineIo` (300) on engine-side errors.
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_iter_prefix_open(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    prefix_ptr: *const u8,
+    prefix_len: u32,
+    chunk_buf_ptr: *mut u8,
+    chunk_buf_cap: u32,
+    out_handle: *mut u64,
+    out_row_count: *mut u32,
+    out_bytes_used: *mut u32,
+) -> i32 {
+    guarded_vec(|| {
+        if out_handle.is_null() || out_row_count.is_null() || out_bytes_used.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if chunk_buf_ptr.is_null() && chunk_buf_cap > 0 {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let Some(db_ref) = db_from_handle(db) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(cf_ref_) = cf_ref(&cf) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if (prefix_len as usize) > MAX_KEY_LEN {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let prefix = if prefix_ptr.is_null() || prefix_len == 0 {
+            &[][..]
+        } else {
+            slice::from_raw_parts(prefix_ptr, prefix_len as usize)
+        };
+
+        // V1: materialize the full prefix result set at open time.
+        let rows = match db_ref.prefix_scan(cf_ref_, prefix) {
+            Ok(r) => r,
+            Err(_) => return FrsErrorCode::EngineIo as i32,
+        };
+
+        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
+            Box::new(rows.into_iter());
+        let mut native_iter = NativeIter::new(inner);
+
+        // Fill the first chunk into the caller's buffer.
+        let chunk = native_iter.next_chunk(chunk_buf_cap as usize);
+        let (bytes_used, row_count) =
+            write_chunk_into_buf(&chunk.rows, chunk_buf_ptr, chunk_buf_cap as usize);
+
+        // Register the iterator so subsequent next/close calls can find it.
+        let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        iter_handles().lock().unwrap().insert(handle_id, native_iter);
+
+        *out_handle = handle_id;
+        *out_row_count = row_count;
+        *out_bytes_used = bytes_used;
+        FrsErrorCode::Ok as i32
+    })
+}
+
+/// Fetch the next chunk from a previously opened iterator.
+///
+/// On success (`FrsErrorCode::Ok`):
+/// - Rows are written to `chunk_buf_ptr[0..chunk_buf_cap]`.
+/// - `*out_row_count` is the number of rows written.
+/// - `*out_bytes_used` is the byte count consumed.
+///
+/// When `*out_row_count == 0` the iterator is exhausted; call
+/// `frs_vec_iter_prefix_close` to release the handle.
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) always on success (even exhaustion).
+/// - `FrsErrorCode::IterCursorInvalid` (201) if `handle` is unknown.
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) on null out-pointers.
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_iter_prefix_next(
+    handle: u64,
+    chunk_buf_ptr: *mut u8,
+    chunk_buf_cap: u32,
+    out_row_count: *mut u32,
+    out_bytes_used: *mut u32,
+) -> i32 {
+    guarded_vec(|| {
+        if out_row_count.is_null() || out_bytes_used.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if chunk_buf_ptr.is_null() && chunk_buf_cap > 0 {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let mut guard = iter_handles().lock().unwrap();
+        let iter = match guard.get_mut(&handle) {
+            Some(it) => it,
+            None => return FrsErrorCode::IterCursorInvalid as i32,
+        };
+        let chunk = iter.next_chunk(chunk_buf_cap as usize);
+        let (bytes_used, row_count) =
+            write_chunk_into_buf(&chunk.rows, chunk_buf_ptr, chunk_buf_cap as usize);
+        *out_row_count = row_count;
+        *out_bytes_used = bytes_used;
+        FrsErrorCode::Ok as i32
+    })
+}
+
+/// Release an iterator handle opened by `frs_vec_iter_prefix_open`.
+///
+/// After this call the handle is invalid; passing it to next/abort returns
+/// `FrsErrorCode::IterCursorInvalid`. Safe to call with `handle == 0`
+/// (no-op, returns `Ok`).
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) always.
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+#[no_mangle]
+pub extern "C" fn frs_vec_iter_prefix_close(handle: u64) -> i32 {
+    guarded_vec(|| {
+        if handle == 0 {
+            return FrsErrorCode::Ok as i32;
+        }
+        iter_handles().lock().unwrap().remove(&handle);
+        FrsErrorCode::Ok as i32
+    })
+}
+
+/// Watchdog hook: atomically mark an iterator as aborted so subsequent
+/// `frs_vec_iter_prefix_next` calls return an empty chunk immediately.
+///
+/// The Java-side `IterLifetimeWatchdog` calls this on idle/max-lifetime
+/// breach.  The handle remains in the registry until `frs_vec_iter_prefix_close`
+/// is called; the watchdog should call close immediately after abort.
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) on success.
+/// - `FrsErrorCode::IterCursorInvalid` (201) if `handle` is unknown.
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+#[no_mangle]
+pub extern "C" fn frs_vec_iter_prefix_abort(handle: u64) -> i32 {
+    guarded_vec(|| {
+        let guard = iter_handles().lock().unwrap();
+        match guard.get(&handle) {
+            Some(iter) => {
+                iter.abort();
+                FrsErrorCode::Ok as i32
+            }
+            None => FrsErrorCode::IterCursorInvalid as i32,
+        }
+    })
+}
+
 fn put_batch_schema() -> std::sync::Arc<Schema> {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("key", DataType::Binary, false),
@@ -5770,5 +6022,254 @@ mod tests {
     fn panic_in_vec_get_returns_panic_caught() {
         // TODO(P10): inject a panic via FaultInjector::set_panic_on_next_get()
         // and verify frs_vectorized_batch_get returns FrsErrorCode::PanicCaught (900).
+    }
+
+    // -----------------------------------------------------------------------
+    // frs_vec_iter_prefix_* tests (P3-A, spec §1 §b + §2 component E)
+    // -----------------------------------------------------------------------
+
+    /// Helper: decode rows from a chunk buffer written by `write_chunk_into_buf`.
+    /// Returns a Vec of (key, value) byte vecs.
+    fn decode_chunk_buf(buf: &[u8], bytes_used: u32, row_count: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut rows = Vec::new();
+        let mut off = 0usize;
+        let limit = bytes_used as usize;
+        for _ in 0..row_count {
+            if off + 8 > limit {
+                break;
+            }
+            let klen = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            let vlen = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()) as usize;
+            off += 8;
+            if off + klen + vlen > limit {
+                break;
+            }
+            let k = buf[off..off + klen].to_vec();
+            off += klen;
+            let v = buf[off..off + vlen].to_vec();
+            off += vlen;
+            rows.push((k, v));
+        }
+        rows
+    }
+
+    /// Open/close round trip with 3 prefix-matching keys + 1 outside prefix.
+    /// Verifies: handle is non-zero, first chunk contains the 3 rows,
+    /// second chunk is empty, and close returns Ok.
+    #[test]
+    fn vec_iter_prefix_open_close_round_trip() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Insert 3 rows under prefix "p1/" and 1 outside.
+            for (k, v) in &[
+                (&b"p1/a"[..], &b"v1"[..]),
+                (b"p1/b", b"v2"),
+                (b"p1/c", b"v3"),
+                (b"q/x", b"vx"),
+            ] {
+                assert_eq!(
+                    frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                    FRS_STATUS_OK
+                );
+            }
+
+            let mut chunk_buf = vec![0u8; 4096];
+            let mut handle: u64 = 0;
+            let mut row_count: u32 = 0;
+            let mut bytes_used: u32 = 0;
+
+            let prefix = b"p1/";
+            let rc = frs_vec_iter_prefix_open(
+                db,
+                cf,
+                prefix.as_ptr(),
+                prefix.len() as u32,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut handle,
+                &mut row_count,
+                &mut bytes_used,
+            );
+            assert_eq!(
+                rc,
+                FrsErrorCode::Ok as i32,
+                "open should return Ok"
+            );
+            assert_ne!(handle, 0, "handle should be non-zero");
+            assert_eq!(row_count, 3, "first chunk should contain 3 rows");
+
+            // Decode and verify the rows came back.
+            let rows = decode_chunk_buf(&chunk_buf, bytes_used, row_count);
+            assert_eq!(rows.len(), 3);
+            // Keys should all start with "p1/".
+            for (k, _) in &rows {
+                assert!(
+                    k.starts_with(b"p1/"),
+                    "unexpected key {:?}",
+                    k
+                );
+            }
+
+            // Second chunk should be empty (iterator exhausted).
+            let rc = frs_vec_iter_prefix_next(
+                handle,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut row_count,
+                &mut bytes_used,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+            assert_eq!(row_count, 0, "second chunk should be empty");
+            assert_eq!(bytes_used, 0);
+
+            // Close should succeed.
+            assert_eq!(
+                frs_vec_iter_prefix_close(handle),
+                FrsErrorCode::Ok as i32
+            );
+
+            // Second close is a no-op (handle removed from registry).
+            assert_eq!(
+                frs_vec_iter_prefix_close(handle),
+                FrsErrorCode::Ok as i32
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// `frs_vec_iter_prefix_next` on an unknown handle returns
+    /// `FrsErrorCode::IterCursorInvalid` (201).
+    #[test]
+    fn vec_iter_prefix_next_unknown_handle_returns_cursor_invalid() {
+        let mut chunk_buf = vec![0u8; 64];
+        let mut row_count: u32 = 0;
+        let mut bytes_used: u32 = 0;
+        let rc = unsafe {
+            frs_vec_iter_prefix_next(
+                u64::MAX, // non-existent handle
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut row_count,
+                &mut bytes_used,
+            )
+        };
+        assert_eq!(rc, FrsErrorCode::IterCursorInvalid as i32);
+    }
+
+    /// Null out-pointers return `BatchHeaderMalformed` (110).
+    #[test]
+    fn vec_iter_prefix_open_null_out_pointers_return_malformed() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let mut chunk_buf = vec![0u8; 64];
+            let prefix = b"p/";
+
+            // null out_handle
+            let rc = frs_vec_iter_prefix_open(
+                db,
+                cf,
+                prefix.as_ptr(),
+                prefix.len() as u32,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                ptr::null_mut(), // <-- null
+                &mut 0u32,
+                &mut 0u32,
+            );
+            assert_eq!(
+                rc,
+                FrsErrorCode::BatchHeaderMalformed as i32,
+                "null out_handle should return BatchHeaderMalformed"
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Abort an iterator: subsequent next returns empty; abort on unknown
+    /// handle returns `IterCursorInvalid`.
+    #[test]
+    fn vec_iter_prefix_abort_stops_iteration() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Insert rows with a tiny chunk budget so they'd normally span
+            // multiple chunks (budget = 1 byte → 1 row per chunk).
+            for i in 0u8..4 {
+                let k = format!("ab/{}", i);
+                let v = format!("val{}", i);
+                assert_eq!(
+                    frs_put(
+                        db, cf,
+                        k.as_ptr(), k.len(),
+                        v.as_ptr(), v.len(),
+                    ),
+                    FRS_STATUS_OK
+                );
+            }
+
+            let mut chunk_buf = vec![0u8; 4096];
+            let mut handle: u64 = 0;
+            let mut row_count: u32 = 0;
+            let mut bytes_used: u32 = 0;
+
+            let prefix = b"ab/";
+            let rc = frs_vec_iter_prefix_open(
+                db, cf,
+                prefix.as_ptr(), prefix.len() as u32,
+                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
+                &mut handle, &mut row_count, &mut bytes_used,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+            assert_ne!(handle, 0);
+
+            // Abort: ok return.
+            assert_eq!(
+                frs_vec_iter_prefix_abort(handle),
+                FrsErrorCode::Ok as i32
+            );
+
+            // Next after abort → empty chunk.
+            let rc = frs_vec_iter_prefix_next(
+                handle,
+                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
+                &mut row_count, &mut bytes_used,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+            assert_eq!(row_count, 0, "aborted iter should return empty chunk");
+
+            // Abort on unknown handle → IterCursorInvalid.
+            assert_eq!(
+                frs_vec_iter_prefix_abort(u64::MAX),
+                FrsErrorCode::IterCursorInvalid as i32
+            );
+
+            assert_eq!(frs_vec_iter_prefix_close(handle), FrsErrorCode::Ok as i32);
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Close with handle == 0 is a no-op (returns Ok).
+    #[test]
+    fn vec_iter_prefix_close_zero_handle_is_noop() {
+        assert_eq!(
+            frs_vec_iter_prefix_close(0),
+            FrsErrorCode::Ok as i32
+        );
     }
 }

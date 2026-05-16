@@ -21,8 +21,11 @@
 
 pub mod cache;
 pub mod cached_fs;
+pub mod iter;
 pub mod local_cache;
 pub mod memtable;
 pub mod merge_operator;
 pub mod sst;
 pub mod version;
+
+pub use iter::{IterChunk, NativeIter};
