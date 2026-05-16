@@ -144,6 +144,72 @@ pub extern "C" fn frs_abi_version() -> u32 {
 }
 
 // ---------------------------------------------------------------------------
+// Error codes and row result envelope
+// ---------------------------------------------------------------------------
+
+/// Per-row result envelope returned by every batch FFI call.
+///
+/// Layout is `#[repr(C)]` for stable ABI. `code` is a discriminator
+/// from `FrsErrorCode`; on `Ok`, `payload_off`/`payload_len` describe a
+/// slice in the caller's output buffer. On error, they MAY carry
+/// optional detail bytes (caller need not consume).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FrsRowResult {
+    pub code: u32,
+    pub payload_off: u32,
+    pub payload_len: u32,
+}
+
+/// Typed error code set returned per row by every batch FFI call.
+///
+/// Three classes (per umbrella spec §4):
+///   - Fail-row (codes 1..300): one row affected; other rows in the batch
+///     resolve normally. State remains consistent.
+///   - Fail-batch (codes 300..900): whole batch failed; treat as if nothing
+///     happened. Recovery via Flink checkpoint replay.
+///   - Fail-process (codes 900+): engine state suspect; FatalErrorHandler
+///     escalates to TM-level restart.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrsErrorCode {
+    Ok                       = 0,
+    NotFound                 = 1,
+    KeyTooLarge              = 100,
+    ValueTooLarge            = 101,
+    BatchHeaderMalformed     = 110,
+    IterExpired              = 200,
+    IterCursorInvalid        = 201,
+    EngineIo                 = 300,
+    EngineCorrupted          = 301,
+    EngineOom                = 302,
+    EngineDiskFull           = 303,
+    PanicCaught              = 900,
+    Unknown                  = 999,
+}
+
+impl FrsErrorCode {
+    /// Convert from u32; unknown values map to `Unknown`.
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0   => FrsErrorCode::Ok,
+            1   => FrsErrorCode::NotFound,
+            100 => FrsErrorCode::KeyTooLarge,
+            101 => FrsErrorCode::ValueTooLarge,
+            110 => FrsErrorCode::BatchHeaderMalformed,
+            200 => FrsErrorCode::IterExpired,
+            201 => FrsErrorCode::IterCursorInvalid,
+            300 => FrsErrorCode::EngineIo,
+            301 => FrsErrorCode::EngineCorrupted,
+            302 => FrsErrorCode::EngineOom,
+            303 => FrsErrorCode::EngineDiskFull,
+            900 => FrsErrorCode::PanicCaught,
+            _   => FrsErrorCode::Unknown,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Opaque handle types
 // ---------------------------------------------------------------------------
 
@@ -5404,5 +5470,28 @@ mod tests {
     #[test]
     fn abi_version_is_one() {
         assert_eq!(frs_abi_version(), 1);
+    }
+
+    #[test]
+    fn error_codes_match_spec_section_4() {
+        assert_eq!(FrsErrorCode::Ok as u32, 0);
+        assert_eq!(FrsErrorCode::NotFound as u32, 1);
+        assert_eq!(FrsErrorCode::KeyTooLarge as u32, 100);
+        assert_eq!(FrsErrorCode::ValueTooLarge as u32, 101);
+        assert_eq!(FrsErrorCode::BatchHeaderMalformed as u32, 110);
+        assert_eq!(FrsErrorCode::IterExpired as u32, 200);
+        assert_eq!(FrsErrorCode::IterCursorInvalid as u32, 201);
+        assert_eq!(FrsErrorCode::EngineIo as u32, 300);
+        assert_eq!(FrsErrorCode::EngineCorrupted as u32, 301);
+        assert_eq!(FrsErrorCode::EngineOom as u32, 302);
+        assert_eq!(FrsErrorCode::EngineDiskFull as u32, 303);
+        assert_eq!(FrsErrorCode::PanicCaught as u32, 900);
+        assert_eq!(FrsErrorCode::Unknown as u32, 999);
+    }
+
+    #[test]
+    fn frs_row_result_layout_is_3_u32() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<FrsRowResult>(), 12);  // 3 × u32, packed (repr(C))
     }
 }
