@@ -33,6 +33,10 @@ forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
 arrow = { workspace = true }
 
+# Fault injection harness (L5, umbrella spec §5). Optional behind
+# `fault-injection` feature so production cdylib builds pay zero cost.
+forst-rs-test-harness = { workspace = true, optional = true }
+
 # Optional JNI shim for G-A drop-in replacement of community ForSt's
 # `libforstjni.so`. Pulled in only when the `compat-jni` feature is enabled
 # so non-Java consumers (and the bulk of CI) don't pay the dependency cost.
@@ -48,6 +52,8 @@ tracing = { workspace = true, optional = true }
 # Used by P2 compat-jni tests to materialise on-disk checkpoint dirs that
 # the engine writes into; never linked into the production cdylib.
 tempfile = { workspace = true }
+# Fault-injection tests need the harness even without the feature flag.
+forst-rs-test-harness = { workspace = true }
 
 [features]
 default = []
@@ -56,3 +62,7 @@ default = []
 # place of `com.ververica:forstjni:0.1.8` for an existing Flink
 # `flink-statebackend-forst` deployment (G-A acceptance, design doc 2.5).
 compat-jni = ["dep:jni", "dep:tracing"]
+# Enable fault injection hooks in FFI entry points. Never enabled in release
+# builds. Activate for L5 soak / fuzz testing:
+#   cargo test -p forst-rs-ffi --features fault-injection
+fault-injection = ["dep:forst-rs-test-harness"]

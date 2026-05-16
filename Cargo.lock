@@ -1131,6 +1131,7 @@ dependencies = [
  "forst-rs-engine",
  "forst-rs-io",
  "forst-rs-storage",
+ "forst-rs-test-harness",
  "jni",
  "tempfile",
  "tracing",
@@ -1161,6 +1162,13 @@ dependencies = [
  "tempfile",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "forst-rs-test-harness"
+version = "0.1.0"
+dependencies = [
+ "once_cell",
 ]
 
 [[package]]

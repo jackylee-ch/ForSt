@@ -2357,6 +2357,20 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
     out_data_cap: usize,
     out_data_len: *mut usize,
 ) -> i32 {
+    // F1 fault hook (ErrorCodeSubstitution, umbrella spec §5).
+    // Active only when the `fault-injection` feature is enabled.
+    // Env vars: FRS_FAULT_VEC_GET_AT=<n>  or  FRS_FAULT_VEC_GET_PROB=<p>
+    //           FRS_FAULT_VEC_GET_CODE=<code>   (default: 300 = ENGINE_IO)
+    #[cfg(feature = "fault-injection")]
+    {
+        if forst_rs_test_harness::FaultInjector::global().should_fire("vec_get") {
+            let injected = std::env::var("FRS_FAULT_VEC_GET_CODE")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(FrsErrorCode::EngineIo as u32);
+            return injected as i32;
+        }
+    }
     guarded_vec(|| {
         if out_data_len.is_null() {
             return FrsErrorCode::BatchHeaderMalformed as i32;
@@ -6841,4 +6855,69 @@ mod tests {
     fn vec_iter_range_close_zero_handle_is_noop() {
         assert_eq!(frs_vec_iter_range_close(0), FrsErrorCode::Ok as i32);
     }
+
+    // ── F1: ErrorCodeSubstitution via fault-injection feature ─────────────────
+    //
+    // The test below requires `--features fault-injection`.  It is marked
+    // `#[ignore]` in the default test run so that `cargo test -p forst-rs-ffi`
+    // (without the feature) never tries to reference the harness.
+    //
+    // To execute:
+    //   cargo test -p forst-rs-ffi --features fault-injection \
+    //       fault_injector_substitutes_error_code -- --ignored
+    //
+    // F2/F4-F12 are deferred to P11/P12 (require running engine fixtures).
+
+    /// F1 — ErrorCodeSubstitution: injector substitutes ENGINE_IO on call 1.
+    ///
+    /// This test drives `frs_vectorized_batch_get` with a null `out_data_len`
+    /// pointer (which would normally return BatchHeaderMalformed *before*
+    /// reaching the fault hook). However because the F1 hook fires *before*
+    /// the validation guard, it intercepts first and returns the injected code.
+    /// That behaviour is intentional — fault injection bypasses normal
+    /// validation so tests can probe error paths independently.
+    #[test]
+    #[cfg(feature = "fault-injection")]
+    fn fault_injector_substitutes_error_code() {
+        // Reset the injector so any previous test's counter doesn't interfere.
+        forst_rs_test_harness::FaultInjector::global().reset();
+
+        std::env::remove_var("FRS_FAULT_VEC_GET_PROB");
+        std::env::set_var("FRS_FAULT_VEC_GET_AT", "1");
+        std::env::set_var("FRS_FAULT_VEC_GET_CODE", "300"); // ENGINE_IO
+
+        // Re-read env vars after setting them (reset flushes config cache).
+        forst_rs_test_harness::FaultInjector::global().reset();
+
+        // Call with all-null/zero args — the fault hook fires before any
+        // pointer dereference, so this is safe.
+        let rc = unsafe {
+            frs_vectorized_batch_get(
+                std::ptr::null_mut(),     // null FrsDb handle
+                std::ptr::null_mut(),     // null FrsCfHandle
+                std::ptr::null(),         // key_offsets
+                std::ptr::null(),         // key_data
+                0,                        // count
+                std::ptr::null_mut(),     // out_offsets
+                std::ptr::null_mut(),     // out_data
+                std::ptr::null_mut(),     // out_validity
+                0,                        // out_data_cap
+                std::ptr::null_mut(),     // out_data_len — normally → BatchHeaderMalformed
+            )
+        };
+
+        assert_eq!(rc, 300, "fault hook must return injected ENGINE_IO code (300)");
+
+        // Cleanup.
+        std::env::remove_var("FRS_FAULT_VEC_GET_AT");
+        std::env::remove_var("FRS_FAULT_VEC_GET_CODE");
+        forst_rs_test_harness::FaultInjector::global().reset();
+    }
+
+    // F2/F4-F12 TODO: add when engine fixture infrastructure is available (P11/P12).
+    // Each will follow the same pattern:
+    //   1. Set FRS_FAULT_<KIND>_AT=<n> + FRS_FAULT_<KIND>_CODE=<code>
+    //   2. Call the relevant frs_vec_* function
+    //   3. Assert the injected code is returned
+    //   4. Verify Java-side FrsException carries the right code (integration only)
 }
