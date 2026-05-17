@@ -15,7 +15,11 @@
 
 ## Executive summary
 
-**forst-rs hits its design goal on heavy windowed aggregation + multi-way joins (10 of 22 queries, up to 67× faster), but regresses on per-record-RMW workloads (9 of 22).** Q5/Q8 task-restart bug fixed via async-V2 state types (commit `c81654b3345`); Q5 now passes at 3.08×, Q8 reached 0.99× parity.
+**2026-05-18 update: with per-job GC routing (ZGC default + G1 opt-in), 16 of 22 queries hit ≥ 1.00× rocksdb** (up from 10 with ZGC-only). 6 remain below: Q0 0.92× / Q1 0.88× / Q2 0.86× / Q11 0.67× / Q12 0.28× / Q13 0.84×. Each remaining gap has a documented V1.1 path (AppCDS / cache extensions / async-lookup buffering).
+
+The G1 variant was tested empirically across all 22 queries. Q4 (23.14×) and Q7 (66.71×) HARD-FAIL on G1 (regress to 1.62× and 2.49×) — keep ZGC default for these. Q11 also regresses on G1 (0.67× → 0.56× — same unbounded-state pattern as Q4). For the other 19 queries, G1 ties or beats ZGC; 9 of them cross 1.x on G1 that were below 1.x on ZGC.
+
+**Original V1 result:** forst-rs hit its design goal on heavy windowed aggregation + multi-way joins (10 of 22 queries, up to 67× faster), but regressed on per-record-RMW workloads (9 of 22). Q5/Q8 task-restart bug fixed via async-V2 state types (commit `c81654b3345`); Q5 now passes at 3.08×, Q8 reached 0.99× parity.
 
 | Dimension | Result |
 |---|---|
@@ -139,14 +143,68 @@ Q5 + Q8 fixes: commit `c81654b3345` added async-V2 `ForStRsAsyncListStateV2 / Re
 
 ### Aggregate verdict (forst-rs vs rocksdb across 22 queries)
 
-| Outcome | Count | Queries |
-|---|---|---|
-| ✓✓ Massive win (≥ 5×) | 3 | Q4 (23×), Q7 (67×), Q23 (2.87×)… actually Q23 is just-above-large. Q4+Q7 alone. |
-| ✓ Tier-gate PASS | 7 more | Q3, Q5, Q15, Q16, Q18, Q19, Q20 |
-| ≈ Parity (0.85-1.05×) | 3 | Q8, Q14, Q22 |
-| ❌ Regression (< 0.85×) | 9 | Q0, Q1, Q2, Q9, Q10, Q11, Q12, Q13, Q17, Q21 (Q12 worst at 0.24×) |
+**2026-05-18 update:** added G1 variant config (`-XX:+UseG1GC`) as a per-job opt-in. Full 22-query results on both GC configurations follow.
 
-**10 of 22 queries hit the user's "1.x speedup" goal** (Q3/Q4/Q5/Q7/Q15/Q16/Q18/Q19/Q20/Q23). 9 still regress.
+| Q | rocksdb | forst-rs ZGC (default) | forst-rs G1 (opt-in) | ZGC ratio | G1 ratio | best-of-routing |
+|---|---:|---:|---:|---:|---:|---:|
+| Q0  | 20.56  | 27.39  | 22.26  | 0.75× | 0.92× | G1 0.92× |
+| Q1  | 19.56  | 28.02  | 22.26  | 0.70× | 0.88× | G1 0.88× |
+| Q2  | 20.58  | 30.93  | 23.87  | 0.67× | 0.86× | G1 0.86× |
+| Q3  | 27.35  | 21.45  | 23.28  | **1.28×** | 1.18× | ZGC **1.28×** |
+| Q4  | 262.63 | 11.35  | 162.67 | **23.14×** | 1.62× | ZGC **23.14×** |
+| Q5  | 124.92 | 40.51  | 30.54  | 3.08× | **4.09×** | G1 **4.09×** |
+| Q7  | 470.78 | 7.06   | 188.75 | **66.71×** | 2.49× | ZGC **66.71×** |
+| Q8  | 32.87  | 33.34  | 26.35  | 0.99× | **1.25×** | G1 **1.25×** |
+| Q9  | 564.82 | 882.72 | 317.31 | 0.64× | **1.78×** | G1 **1.78×** |
+| Q10 | 17.47  | 32.21  | 7.49   | 0.54× | **2.33×** | G1 **2.33×** |
+| Q11 | 108.70 | 162.68 | 193.80 | 0.67× | 0.56× | ZGC 0.67× |
+| Q12 | 35.75  | 151.26 | 126.62 | 0.24× | 0.28× | G1 0.28× |
+| Q13 | 37.92  | 48.42  | 44.99  | 0.78× | 0.84× | G1 0.84× |
+| Q14 | 28.28  | 33.19  | 27.70  | 0.85× | **1.02×** | G1 **1.02×** |
+| Q15 | 274.23 | 120.89 | 116.15 | 2.27× | **2.36×** | G1 **2.36×** |
+| Q16 | 387.66 | 296.11 | 253.33 | 1.31× | **1.53×** | G1 **1.53×** |
+| Q17 | 57.24  | 77.50  | 48.20  | 0.74× | **1.19×** | G1 **1.19×** |
+| Q18 | 189.17 | 82.53  | 73.54  | 2.29× | **2.57×** | G1 **2.57×** |
+| Q19 | 148.61 | 106.57 | 79.40  | 1.39× | **1.87×** | G1 **1.87×** |
+| Q20 | 417.46 | 303.78 | 282.71 | 1.37× | **1.48×** | G1 **1.48×** |
+| Q21 | 56.60  | 64.03  | 51.83  | 0.88× | **1.09×** | G1 **1.09×** |
+| Q22 | 45.70  | 47.65  | 45.90  | 0.96× | **1.00×** | G1 **1.00×** |
+| Q23 | 1045.51| 364.57 | 328.28 | 2.87× | **3.18×** | G1 **3.18×** |
+
+| Outcome (best-of-routing) | Count | Queries |
+|---|---|---|
+| ✓✓ Massive win (≥ 5×) | 2 | Q4 (23.14×, ZGC), Q7 (66.71×, ZGC) |
+| ✓ Tier-gate PASS (1.20×+) | 11 | Q3 ZGC, Q5 G1, Q8 G1, Q9 G1, Q10 G1, Q15 G1, Q16 G1, Q17 G1, Q18 G1, Q19 G1, Q20 G1, Q23 G1 |
+| ≈ Gate-met (1.00-1.20×) | 3 | Q14 G1, Q21 G1, Q22 G1 |
+| ❌ Below 1.x even with routing | 6 | Q0 (0.92×), Q1 (0.88×), Q2 (0.86×), Q11 (0.67×), Q12 (0.28×), Q13 (0.84×) |
+
+**16 of 22 queries at ≥ 1.00× rocksdb with per-job GC routing** (up from 10 with ZGC-only). The remaining 6 break down into 4 categories needing distinct V1.1 follow-up work:
+
+| Query | Best-of ratio | Residual gap | V1.1 path |
+|---|---:|---:|---|
+| Q0  | 0.92× | -8 %  | AppCDS (A-2) + JIT warm-up |
+| Q1  | 0.88× | -12 % | AppCDS + JIT warm-up |
+| Q2  | 0.86× | -14 % | AppCDS + JIT warm-up |
+| Q11 | 0.67× | -33 % | unbounded session-window state — cache (B-2) + state-shape cleanup |
+| Q12 | 0.28× | -72 % | per-record RMW + 100 K-window working set — cache (B-4c adaptive sizing) |
+| Q13 | 0.84× | -16 % | LookupJoin async I/O — buffering / hot-tier cache |
+
+### Path to "all 22 at ≥ 1.x" (status update)
+
+- **A-1 (G1 opt-in config):** ✓ delivered — 6 queries newly cross 1.x (Q8/Q9/Q14/Q17/Q21/Q22), 5 more get faster while staying above 1.x. Empirical preflight outcome was PARTIAL-FAIL on Q4/Q7 (and now Q11 too) → ship behind opt-in flag per the V1.1 decision tree.
+- **A-2 (AppCDS):** still V1.1 P0 — closes Q0/Q1/Q2 8-14 % gap.
+- **B-2 (MapStateCache + race fix):** still V1.1 P0 — addresses Q11 session-window state.
+- **B-4c (adaptive cache sizing):** still V1.1 P0 — addresses Q12 working-set vs cap mismatch.
+- **B-5 (barrier-flush sharding):** still V1.1 P0 — precondition for B-1/B-2/B-4c to not block checkpoints on BOS PUT rate cap.
+- **Q13 LookupJoin buffering:** new V1.1 work item — async-I/O cache for repeated lookup-table reads.
+
+### Critical operational note: GC routing
+
+Per-job GC selection isn't directly supported in Flink today (one GC per TM). The current architecture options are:
+
+1. **Default the global cluster to G1** — gains 11 queries, loses Q4 + Q7 (HARD-FAIL); not viable for production.
+2. **Default to ZGC + provide G1 as opt-in config template** — applies to TM startup; jobs landing on the TM all share the same GC. Operators stand up parallel TM pools tagged by workload (`forst-rs-zgc-pool` / `forst-rs-g1-pool`), route jobs by tag. This is the recommended V1.1 deployment posture.
+3. **Per-job TaskExecutor request** — Flink 2.x supports `taskmanager.memory.process.size` per slot pool but not per-slot GC. V1.x: contribute a Flink improvement to route jobs to TM pools by GC tag.
 
 ### Pattern analysis of the 9 remaining regressions
 
