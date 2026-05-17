@@ -178,9 +178,7 @@ impl FaultInjector {
 /// fault injection. Seeded with `(n, seed)` so each call site has a unique
 /// output even when `seed=0`.
 fn splitmix64(n: u64, seed: u64) -> u64 {
-    let mut z = n
-        .wrapping_add(seed)
-        .wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = n.wrapping_add(seed).wrapping_add(0x9E3779B97F4A7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
@@ -214,10 +212,12 @@ mod tests {
         std::env::remove_var("FRS_FAULT_DETAT_PROB");
         std::env::set_var("FRS_FAULT_DETAT_AT", "5");
         let inj = fresh();
-        let fires: Vec<u64> = (1..=10)
-            .filter(|_| inj.should_fire("detat"))
-            .collect();
-        assert_eq!(fires, vec![5], "deterministic mode must fire exactly at call 5");
+        let fires: Vec<u64> = (1..=10).filter(|_| inj.should_fire("detat")).collect();
+        assert_eq!(
+            fires,
+            vec![5],
+            "deterministic mode must fire exactly at call 5"
+        );
         std::env::remove_var("FRS_FAULT_DETAT_AT");
     }
 

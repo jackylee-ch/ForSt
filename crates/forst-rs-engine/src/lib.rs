@@ -89,7 +89,6 @@ pub mod write_controller;
 
 pub use checkpoint::{CheckpointManifest, CHECKPOINT_BLOB_NAME};
 pub use column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
-pub use list_merge::ListMergeCombiner;
 pub use compaction::{compaction_output_path, CompactionJob};
 pub use compaction_filter::{
     decode_ttl_payload, encode_ttl_value, CompactionDecision, CompactionFilter,
@@ -98,6 +97,7 @@ pub use compaction_filter::{
 pub use db::{DbImpl, IncrementalCheckpointResult, LiveFileInfo, DEFAULT_CF_NAME};
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};
+pub use list_merge::ListMergeCombiner;
 pub use mvcc::{DbId, Snapshot, SnapshotRegistry};
 pub use runtime_tuning::WriteBufferManager;
 pub use snapshot_view::SnapshotView;

@@ -45,12 +45,14 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::slice;
 use std::ptr;
+use std::slice;
 use std::sync::Arc;
 
 use forst_rs_common::EngineOptions;
-use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, ListMergeCombiner, WriteBatch};
+use forst_rs_engine::{
+    ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, ListMergeCombiner, WriteBatch,
+};
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
 use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
 
@@ -173,27 +175,27 @@ pub struct FrsRowResult {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrsErrorCode {
-    Ok                       = 0,
-    NotFound                 = 1,
-    KeyTooLarge              = 100,
-    ValueTooLarge            = 101,
-    BatchHeaderMalformed     = 110,
-    IterExpired              = 200,
-    IterCursorInvalid        = 201,
-    EngineIo                 = 300,
-    EngineCorrupted          = 301,
-    EngineOom                = 302,
-    EngineDiskFull           = 303,
-    PanicCaught              = 900,
-    Unknown                  = 999,
+    Ok = 0,
+    NotFound = 1,
+    KeyTooLarge = 100,
+    ValueTooLarge = 101,
+    BatchHeaderMalformed = 110,
+    IterExpired = 200,
+    IterCursorInvalid = 201,
+    EngineIo = 300,
+    EngineCorrupted = 301,
+    EngineOom = 302,
+    EngineDiskFull = 303,
+    PanicCaught = 900,
+    Unknown = 999,
 }
 
 impl FrsErrorCode {
     /// Convert from u32; unknown values map to `Unknown`.
     pub fn from_u32(v: u32) -> Self {
         match v {
-            0   => FrsErrorCode::Ok,
-            1   => FrsErrorCode::NotFound,
+            0 => FrsErrorCode::Ok,
+            1 => FrsErrorCode::NotFound,
             100 => FrsErrorCode::KeyTooLarge,
             101 => FrsErrorCode::ValueTooLarge,
             110 => FrsErrorCode::BatchHeaderMalformed,
@@ -204,7 +206,7 @@ impl FrsErrorCode {
             302 => FrsErrorCode::EngineOom,
             303 => FrsErrorCode::EngineDiskFull,
             900 => FrsErrorCode::PanicCaught,
-            _   => FrsErrorCode::Unknown,
+            _ => FrsErrorCode::Unknown,
         }
     }
 }
@@ -3480,9 +3482,9 @@ pub unsafe extern "C" fn frs_db_ingest_external_sst(
 // simply miss a lookup and return `IterCursorInvalid`).
 // ---------------------------------------------------------------------------
 
-use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::AtomicU64;
 use forst_rs_storage::NativeIter;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Mutex, OnceLock};
 
 /// Boxed, type-erased iterator stored in `ITER_HANDLES`.
 type AnyNativeIter = NativeIter<Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>>;
@@ -3517,17 +3519,9 @@ unsafe fn write_chunk_into_buf(
         }
         let klen = k.len() as u32;
         let vlen = v.len() as u32;
-        std::ptr::copy_nonoverlapping(
-            klen.to_le_bytes().as_ptr(),
-            buf.add(off),
-            4,
-        );
+        std::ptr::copy_nonoverlapping(klen.to_le_bytes().as_ptr(), buf.add(off), 4);
         off += 4;
-        std::ptr::copy_nonoverlapping(
-            vlen.to_le_bytes().as_ptr(),
-            buf.add(off),
-            4,
-        );
+        std::ptr::copy_nonoverlapping(vlen.to_le_bytes().as_ptr(), buf.add(off), 4);
         off += 4;
         std::ptr::copy_nonoverlapping(k.as_ptr(), buf.add(off), k.len());
         off += k.len();
@@ -3596,8 +3590,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
 
-        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
-            Box::new(rows.into_iter());
+        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> = Box::new(rows.into_iter());
         let mut native_iter = NativeIter::new(inner);
 
         // Fill the first chunk into the caller's buffer.
@@ -3607,7 +3600,10 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
 
         // Register the iterator so subsequent next/close calls can find it.
         let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        iter_handles().lock().unwrap().insert(handle_id, native_iter);
+        iter_handles()
+            .lock()
+            .unwrap()
+            .insert(handle_id, native_iter);
 
         *out_handle = handle_id;
         *out_row_count = row_count;
@@ -3786,8 +3782,7 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
 
-        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
-            Box::new(rows.into_iter());
+        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> = Box::new(rows.into_iter());
         let mut native_iter = NativeIter::new(inner);
 
         // Fill the first chunk into the caller's buffer.
@@ -3797,7 +3792,10 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
 
         // Register — shares the same global registry as prefix iterators.
         let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        iter_handles().lock().unwrap().insert(handle_id, native_iter);
+        iter_handles()
+            .lock()
+            .unwrap()
+            .insert(handle_id, native_iter);
 
         *out_handle = handle_id;
         *out_row_count = row_count;
@@ -3825,7 +3823,13 @@ pub unsafe extern "C" fn frs_vec_iter_range_next(
     out_bytes_used: *mut u32,
 ) -> i32 {
     // Semantically identical to frs_vec_iter_prefix_next — the registry is shared.
-    frs_vec_iter_prefix_next(handle, chunk_buf_ptr, chunk_buf_cap, out_row_count, out_bytes_used)
+    frs_vec_iter_prefix_next(
+        handle,
+        chunk_buf_ptr,
+        chunk_buf_cap,
+        out_row_count,
+        out_bytes_used,
+    )
 }
 
 /// Release a range iterator handle.  Delegates to `frs_vec_iter_prefix_close`.
@@ -3877,12 +3881,12 @@ pub extern "C" fn frs_vec_iter_range_abort(handle: u64) -> i32 {
 /// - `operand_ptrs` — pointer to array of `num_operands` byte pointers.
 /// - `operand_lens` — pointer to array of `num_operands` u32 lengths.
 /// - `num_operands` — number of operands to append (may be 0, which is a
-///                    no-op and returns `Ok`).
+///   no-op and returns `Ok`).
 ///
 /// # Returns (typed `FrsErrorCode` discriminants — spec §4)
 /// - `FrsErrorCode::Ok` (0)                       — success
 /// - `FrsErrorCode::BatchHeaderMalformed` (110)   — null pointer argument or
-///                                                   invalid handle
+///   invalid handle
 /// - `FrsErrorCode::EngineIo` (300)               — engine I/O failure
 /// - `FrsErrorCode::PanicCaught` (900)            — Rust panic at FFI boundary
 ///
@@ -6085,7 +6089,7 @@ mod tests {
     #[test]
     fn frs_row_result_layout_is_3_u32() {
         use std::mem::size_of;
-        assert_eq!(size_of::<FrsRowResult>(), 12);  // 3 × u32, packed (repr(C))
+        assert_eq!(size_of::<FrsRowResult>(), 12); // 3 × u32, packed (repr(C))
     }
 
     // -----------------------------------------------------------------
@@ -6244,13 +6248,7 @@ mod tests {
             );
 
             let key_offs: [i32; 2] = [0, key.len() as i32];
-            let rc = frs_vectorized_batch_delete(
-                db,
-                cf,
-                key_offs.as_ptr(),
-                key.as_ptr(),
-                1,
-            );
+            let rc = frs_vectorized_batch_delete(db, cf, key_offs.as_ptr(), key.as_ptr(), 1);
             assert_eq!(rc, FrsErrorCode::Ok as i32, "expected FrsErrorCode::Ok (0)");
 
             // null key_offsets → BatchHeaderMalformed (110)
@@ -6367,11 +6365,7 @@ mod tests {
                 &mut row_count,
                 &mut bytes_used,
             );
-            assert_eq!(
-                rc,
-                FrsErrorCode::Ok as i32,
-                "open should return Ok"
-            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "open should return Ok");
             assert_ne!(handle, 0, "handle should be non-zero");
             assert_eq!(row_count, 3, "first chunk should contain 3 rows");
 
@@ -6380,11 +6374,7 @@ mod tests {
             assert_eq!(rows.len(), 3);
             // Keys should all start with "p1/".
             for (k, _) in &rows {
-                assert!(
-                    k.starts_with(b"p1/"),
-                    "unexpected key {:?}",
-                    k
-                );
+                assert!(k.starts_with(b"p1/"), "unexpected key {:?}", k);
             }
 
             // Second chunk should be empty (iterator exhausted).
@@ -6400,16 +6390,10 @@ mod tests {
             assert_eq!(bytes_used, 0);
 
             // Close should succeed.
-            assert_eq!(
-                frs_vec_iter_prefix_close(handle),
-                FrsErrorCode::Ok as i32
-            );
+            assert_eq!(frs_vec_iter_prefix_close(handle), FrsErrorCode::Ok as i32);
 
             // Second close is a no-op (handle removed from registry).
-            assert_eq!(
-                frs_vec_iter_prefix_close(handle),
-                FrsErrorCode::Ok as i32
-            );
+            assert_eq!(frs_vec_iter_prefix_close(handle), FrsErrorCode::Ok as i32);
 
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
@@ -6486,11 +6470,7 @@ mod tests {
                 let k = format!("ab/{}", i);
                 let v = format!("val{}", i);
                 assert_eq!(
-                    frs_put(
-                        db, cf,
-                        k.as_ptr(), k.len(),
-                        v.as_ptr(), v.len(),
-                    ),
+                    frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len(),),
                     FRS_STATUS_OK
                 );
             }
@@ -6502,25 +6482,29 @@ mod tests {
 
             let prefix = b"ab/";
             let rc = frs_vec_iter_prefix_open(
-                db, cf,
-                prefix.as_ptr(), prefix.len() as u32,
-                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
-                &mut handle, &mut row_count, &mut bytes_used,
+                db,
+                cf,
+                prefix.as_ptr(),
+                prefix.len() as u32,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut handle,
+                &mut row_count,
+                &mut bytes_used,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
             assert_ne!(handle, 0);
 
             // Abort: ok return.
-            assert_eq!(
-                frs_vec_iter_prefix_abort(handle),
-                FrsErrorCode::Ok as i32
-            );
+            assert_eq!(frs_vec_iter_prefix_abort(handle), FrsErrorCode::Ok as i32);
 
             // Next after abort → empty chunk.
             let rc = frs_vec_iter_prefix_next(
                 handle,
-                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
-                &mut row_count, &mut bytes_used,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut row_count,
+                &mut bytes_used,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
             assert_eq!(row_count, 0, "aborted iter should return empty chunk");
@@ -6540,10 +6524,7 @@ mod tests {
     /// Close with handle == 0 is a no-op (returns Ok).
     #[test]
     fn vec_iter_prefix_close_zero_handle_is_noop() {
-        assert_eq!(
-            frs_vec_iter_prefix_close(0),
-            FrsErrorCode::Ok as i32
-        );
+        assert_eq!(frs_vec_iter_prefix_close(0), FrsErrorCode::Ok as i32);
     }
 
     // -----------------------------------------------------------------------
@@ -6567,15 +6548,22 @@ mod tests {
             let operand_lens: [u32; 3] = [v1.len() as u32, v2.len() as u32, v3.len() as u32];
 
             let rc = frs_vec_merge_append(
-                db, cf,
-                key.as_ptr(), key.len() as u32,
-                operand_ptrs.as_ptr(), operand_lens.as_ptr(), 3,
+                db,
+                cf,
+                key.as_ptr(),
+                key.len() as u32,
+                operand_ptrs.as_ptr(),
+                operand_lens.as_ptr(),
+                3,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
 
             // Verify via frs_get.
             let mut out = FrsBytes::NULL;
-            assert_eq!(frs_get(db, cf, key.as_ptr(), key.len(), &mut out), FRS_STATUS_OK);
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
             assert!(!out.data.is_null());
             let got = slice::from_raw_parts(out.data, out.len);
             assert_eq!(got, b"ABC");
@@ -6608,14 +6596,21 @@ mod tests {
             let operand_ptrs: [*const u8; 2] = [v1.as_ptr(), v2.as_ptr()];
             let operand_lens: [u32; 2] = [1, 1];
             let rc = frs_vec_merge_append(
-                db, cf,
-                key.as_ptr(), key.len() as u32,
-                operand_ptrs.as_ptr(), operand_lens.as_ptr(), 2,
+                db,
+                cf,
+                key.as_ptr(),
+                key.len() as u32,
+                operand_ptrs.as_ptr(),
+                operand_lens.as_ptr(),
+                2,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
 
             let mut out = FrsBytes::NULL;
-            assert_eq!(frs_get(db, cf, key.as_ptr(), key.len(), &mut out), FRS_STATUS_OK);
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
             let got = slice::from_raw_parts(out.data, out.len);
             assert_eq!(got, b"BASEXY");
             frs_bytes_free(&mut out);
@@ -6639,9 +6634,13 @@ mod tests {
 
             let key = b"noop_key";
             let rc = frs_vec_merge_append(
-                db, cf,
-                key.as_ptr(), key.len() as u32,
-                ptr::null(), ptr::null(), 0,
+                db,
+                cf,
+                key.as_ptr(),
+                key.len() as u32,
+                ptr::null(),
+                ptr::null(),
+                0,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
 
@@ -6651,7 +6650,10 @@ mod tests {
                 frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
                 FRS_STATUS_OK
             );
-            assert!(out.data.is_null(), "absent key should have null data pointer");
+            assert!(
+                out.data.is_null(),
+                "absent key should have null data pointer"
+            );
 
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
@@ -6671,9 +6673,13 @@ mod tests {
             let ptrs: [*const u8; 1] = [v.as_ptr()];
             let lens: [u32; 1] = [1];
             let rc = frs_vec_merge_append(
-                db, cf,
-                ptr::null(), 0,          // null key
-                ptrs.as_ptr(), lens.as_ptr(), 1,
+                db,
+                cf,
+                ptr::null(),
+                0, // null key
+                ptrs.as_ptr(),
+                lens.as_ptr(),
+                1,
             );
             assert_eq!(rc, FrsErrorCode::BatchHeaderMalformed as i32);
 
@@ -6717,11 +6723,17 @@ mod tests {
             let lo = b"b";
             let hi = b"d";
             let rc = frs_vec_iter_range_open(
-                db, cf,
-                lo.as_ptr(), lo.len() as u32,
-                hi.as_ptr(), hi.len() as u32,
-                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
-                &mut handle, &mut row_count, &mut bytes_used,
+                db,
+                cf,
+                lo.as_ptr(),
+                lo.len() as u32,
+                hi.as_ptr(),
+                hi.len() as u32,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut handle,
+                &mut row_count,
+                &mut bytes_used,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32, "open should return Ok");
             assert_ne!(handle, 0, "handle must be non-zero");
@@ -6737,8 +6749,10 @@ mod tests {
             // Second chunk is empty.
             let rc2 = frs_vec_iter_range_next(
                 handle,
-                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
-                &mut row_count, &mut bytes_used,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut row_count,
+                &mut bytes_used,
             );
             assert_eq!(rc2, FrsErrorCode::Ok as i32);
             assert_eq!(row_count, 0);
@@ -6758,8 +6772,10 @@ mod tests {
         let rc = unsafe {
             frs_vec_iter_range_next(
                 u64::MAX,
-                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
-                &mut row_count, &mut bytes_used,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut row_count,
+                &mut bytes_used,
             )
         };
         assert_eq!(rc, FrsErrorCode::IterCursorInvalid as i32);
@@ -6792,11 +6808,17 @@ mod tests {
             let lo = b"rng/0";
             let hi = b"rng/z";
             let rc = frs_vec_iter_range_open(
-                db, cf,
-                lo.as_ptr(), lo.len() as u32,
-                hi.as_ptr(), hi.len() as u32,
-                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
-                &mut handle, &mut row_count, &mut bytes_used,
+                db,
+                cf,
+                lo.as_ptr(),
+                lo.len() as u32,
+                hi.as_ptr(),
+                hi.len() as u32,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut handle,
+                &mut row_count,
+                &mut bytes_used,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
             assert_ne!(handle, 0);
@@ -6806,8 +6828,10 @@ mod tests {
             // After abort, next returns empty.
             let rc2 = frs_vec_iter_range_next(
                 handle,
-                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
-                &mut row_count, &mut bytes_used,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                &mut row_count,
+                &mut bytes_used,
             );
             assert_eq!(rc2, FrsErrorCode::Ok as i32);
             assert_eq!(row_count, 0, "aborted range iter must yield empty chunk");
@@ -6837,11 +6861,17 @@ mod tests {
             let lo = b"a";
             let hi = b"z";
             let rc = frs_vec_iter_range_open(
-                db, cf,
-                lo.as_ptr(), lo.len() as u32,
-                hi.as_ptr(), hi.len() as u32,
-                chunk_buf.as_mut_ptr(), chunk_buf.len() as u32,
-                ptr::null_mut(), &mut 0u32, &mut 0u32,
+                db,
+                cf,
+                lo.as_ptr(),
+                lo.len() as u32,
+                hi.as_ptr(),
+                hi.len() as u32,
+                chunk_buf.as_mut_ptr(),
+                chunk_buf.len() as u32,
+                ptr::null_mut(),
+                &mut 0u32,
+                &mut 0u32,
             );
             assert_eq!(rc, FrsErrorCode::BatchHeaderMalformed as i32);
 
@@ -6893,20 +6923,23 @@ mod tests {
         // pointer dereference, so this is safe.
         let rc = unsafe {
             frs_vectorized_batch_get(
-                std::ptr::null_mut(),     // null FrsDb handle
-                std::ptr::null_mut(),     // null FrsCfHandle
-                std::ptr::null(),         // key_offsets
-                std::ptr::null(),         // key_data
-                0,                        // count
-                std::ptr::null_mut(),     // out_offsets
-                std::ptr::null_mut(),     // out_data
-                std::ptr::null_mut(),     // out_validity
-                0,                        // out_data_cap
-                std::ptr::null_mut(),     // out_data_len — normally → BatchHeaderMalformed
+                std::ptr::null_mut(), // null FrsDb handle
+                std::ptr::null_mut(), // null FrsCfHandle
+                std::ptr::null(),     // key_offsets
+                std::ptr::null(),     // key_data
+                0,                    // count
+                std::ptr::null_mut(), // out_offsets
+                std::ptr::null_mut(), // out_data
+                std::ptr::null_mut(), // out_validity
+                0,                    // out_data_cap
+                std::ptr::null_mut(), // out_data_len — normally → BatchHeaderMalformed
             )
         };
 
-        assert_eq!(rc, 300, "fault hook must return injected ENGINE_IO code (300)");
+        assert_eq!(
+            rc, 300,
+            "fault hook must return injected ENGINE_IO code (300)"
+        );
 
         // Cleanup.
         std::env::remove_var("FRS_FAULT_VEC_GET_AT");

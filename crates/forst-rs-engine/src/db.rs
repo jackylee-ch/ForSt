@@ -2384,6 +2384,7 @@ impl DbImpl {
         Ok(out)
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn batch_prefix_scan(
         &self,
         cf: &ColumnFamilyHandle,

@@ -350,12 +350,14 @@ impl VectorizedMemTable {
                 }
             } else if op_type == OpType::Put {
                 // Only add if this is a NEW key (not an update to existing)
-                let is_new_key = self.hash_index.get(key)
-                    .map_or(true, |e| e.row_indices.len() <= 1);
+                let is_new_key = self
+                    .hash_index
+                    .get(key)
+                    .is_none_or(|e| e.row_indices.len() <= 1);
                 if is_new_key {
                     self.prefix_index
                         .entry(Box::from(prefix))
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(Box::from(key));
                 }
             }
@@ -571,7 +573,9 @@ impl VectorizedMemTable {
         let mut keys: Vec<Vec<u8>> = Vec::new();
         // sorted_index is already sorted — range query is O(log N + K)
         let range_iter = match upper {
-            Some(hi) => self.sorted_index.range::<Vec<u8>, _>(lower.to_vec()..hi.to_vec()),
+            Some(hi) => self
+                .sorted_index
+                .range::<Vec<u8>, _>(lower.to_vec()..hi.to_vec()),
             None => self.sorted_index.range::<Vec<u8>, _>(lower.to_vec()..),
         };
         for (key, _) in range_iter {
@@ -581,7 +585,7 @@ impl VectorizedMemTable {
         let prev_len = keys.len();
         for key in self.unsorted_lookup.keys() {
             let k: &[u8] = key;
-            if k >= lower && upper.map_or(true, |hi| k < hi) {
+            if k >= lower && upper.is_none_or(|hi| k < hi) {
                 keys.push(k.to_vec());
             }
         }

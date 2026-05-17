@@ -118,7 +118,8 @@ fn bench_engine_single_put_256b(c: &mut Criterion) {
         b.iter(|| {
             let k = &keys[counter % keys.len()];
             let v = &vals[counter % vals.len()];
-            let _ = db.put(&cf, black_box(k.as_slice()), black_box(v.as_slice()))
+            let _ = db
+                .put(&cf, black_box(k.as_slice()), black_box(v.as_slice()))
                 .expect("put");
             counter = counter.wrapping_add(1);
         });

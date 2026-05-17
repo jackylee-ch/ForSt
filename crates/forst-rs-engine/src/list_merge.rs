@@ -19,7 +19,9 @@
 pub struct ListMergeCombiner;
 
 impl ListMergeCombiner {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 
     pub fn combine(&self, operands: &[Vec<u8>]) -> Vec<u8> {
         let total: usize = operands.iter().map(|o| o.len()).sum();
@@ -44,7 +46,9 @@ impl ListMergeCombiner {
 }
 
 impl Default for ListMergeCombiner {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -82,12 +86,7 @@ mod tests {
     #[test]
     fn preserves_arbitrary_bytes() {
         let c = ListMergeCombiner::new();
-        let result = c.combine(&[
-            vec![0u8, 1, 2, 3],
-            vec![0xFFu8, 0xFE],
-            vec![],
-            vec![0x55u8],
-        ]);
+        let result = c.combine(&[vec![0u8, 1, 2, 3], vec![0xFFu8, 0xFE], vec![], vec![0x55u8]]);
         assert_eq!(result, vec![0, 1, 2, 3, 0xFF, 0xFE, 0x55]);
     }
 }
