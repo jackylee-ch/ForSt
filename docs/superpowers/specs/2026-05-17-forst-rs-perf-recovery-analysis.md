@@ -507,6 +507,48 @@ Per-fix effort + sequencing constraints (B-5 → B-2 → B-1 → B-4c → A-1):
 
 ---
 
+## 10a. In-session empirical sweep (2026-05-18) — what config-tuning alone achieves
+
+After landing A-1 (G1 opt-in), additional in-session experiments isolated the cost contributors per query. Variants tested:
+
+- **ZGC + S3** (default V1)
+- **G1 + S3** (A-1)
+- **G1 + local checkpoint dir** (A-1 + A-6)
+- **G1 + S3 + 8 GiB local SST cache** (A-1 + cache pump)
+
+| Query | rocksdb | ZGC+S3 | G1+S3 | G1+local | G1+8GiB-cache | Best ratio reachable via config |
+|---|---:|---:|---:|---:|---:|---:|
+| Q0  | 20.56  | 0.75× | 0.92× | 0.90× | — | **0.92×** (G1+S3) |
+| Q1  | 19.56  | 0.70× | 0.88× | **0.92×** | — | **0.92×** (G1+local) |
+| Q2  | 20.58  | 0.67× | 0.86× | **0.89×** | — | **0.89×** (G1+local) |
+| Q11 | 108.70 | 0.67× | 0.56× | — | **0.69×** | **0.69×** (G1+8GiB) |
+| Q12 | 35.75  | 0.24× | 0.28× | **0.35×** | 0.28× | **0.35×** (G1+local) |
+
+**Findings on the user-named optimization axes (end-to-end vectorization, zero-copy, cache, vector-I/O for S3):**
+
+1. **End-to-end vectorization is already in place** — `VectorizedClassifier` accumulates state requests by op-type; `VectorizedExecutor` dispatches one FFM call per batch. Wins on Q4 23×, Q7 67× prove this works when there's batch opportunity.
+
+2. **Zero-copy is partial.** `VectorizedExecutor.executeGets:321-322` still allocates a Java `byte[]` and copies from the FFM `MemorySegment` to JVM heap per result. **V1.1.x improvement:** change `ForStRsInnerTable.deserializeValue(byte[])` to take a `MemorySegment` slice + offset/length, eliminating the copy. Estimated impact: 1-3 s saved on Q12-class workloads (46 M reads × ~30 ns/copy).
+
+3. **Engine block cache size doesn't help per-record-RMW.** Pumping `state.backend.forst-rs.storage.cache-capacity-mb` from 1024 → 8192 on Q12 gave **0.28× → 0.28×** (no change). The bottleneck is FFM call **frequency**, not engine read cost. Each FFM call has ~500 ns boundary overhead regardless of what the engine returns. **The in-Java cache (B-1 / B-2 / B-4c) is the only fix** — it eliminates FFM calls entirely for cache-hit reads.
+
+4. **Vector-I/O for S3 prefetch infrastructure exists but is not wired to Java.** `crates/forst-rs-storage/src/cached_fs.rs::prefetch_files()` does batched OpenDAL `range_read` calls and stages results into the local cache. **V1.1 work item:** expose as `frs_prefetch_files` FFI symbol + call it from `ForStRsAsyncKeyedStateBackend` at recovery / iterator-open time. Estimated impact: 200-500 ms saved on iterator-heavy queries (Q7-class), not relevant for the 6 remaining sub-1.x queries.
+
+5. **Per-job GC + storage routing (shipped in-session):** delivers 16/22 queries at ≥ 1.x. Q11 (session-window unbounded state) and Q12 (per-record RMW) cannot reach 1.x via config alone; they require the in-Java cache work.
+
+**Honest summary:** config alone cannot close the remaining 6 queries past 1.x.
+
+| Query | Best via config | Residual gap | Required architectural work |
+|---|---:|---:|---|
+| Q0  | 0.92× | 8 %  | A-2 AppCDS + JIT warm-up |
+| Q1  | 0.92× | 8 %  | A-2 AppCDS + JIT warm-up |
+| Q2  | 0.89× | 11 % | A-2 AppCDS + JIT warm-up |
+| Q11 | 0.69× | 31 % | B-2 MapStateCache (session-window state) + adaptive size for unbounded |
+| Q12 | 0.35× | 65 % | B-1 ValueStateCache + B-4c adaptive sizing (per-record RMW) |
+| Q13 | 0.84× | 16 % | new V1.1 item: async LookupJoin buffering + hot-tier cache |
+
+These map to the V1.1 P0 work items already documented in §3.4 + §4.3. The session's empirical sweep validates the analysis structure: no config knob exists that bypasses the documented architectural work.
+
 ## 11. Recommendation
 
 Promote **A-1 (gated by A-1-preflight) + B-1 + B-2 (with race fix) + B-4c (adaptive sizing) + B-5 (barrier-flush sharding)** to **V1.1 P0**. They are the minimum change to deliver "every forst-supported Nexmark query at ≥ 1.00× rocksdb." Without them, the V1 release notes must read "use forst-rs for windowed/joined workloads; use forst (community) for per-record-RMW workloads" — which is not the user's product position.
