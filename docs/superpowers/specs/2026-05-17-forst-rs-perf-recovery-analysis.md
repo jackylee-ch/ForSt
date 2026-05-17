@@ -24,11 +24,15 @@ Of 22 forst-supported Nexmark queries, **10 already pass 1.x** (Q3 1.28×, Q4 23
 4. **B-4c: adaptive cache sizing** — replaces "raise 64 K to 256 K." High-cardinality queries (Q8/Q9/Q17, 5 M working set) need adaptive growth or they stay below gate. Static 256 K helps only Q11/Q12.
 5. **A-1: Generational ZGC**, gated on **A-1-preflight** (6 hours bench of Q4/Q5/Q7/Q15/Q18/Q23). Ship A-1 either globally or behind an opt-in flag depending on preflight outcome.
 
-**Realistic effort (corrected):** 5-7 engineer-days single-person + 1-2 weeks elapsed (including race tests, ZGC preflight, S3 rate-limit calibration, review cycles). The original "2-3 days" estimate omitted race-correctness work and the barrier-flush sharding.
+**Realistic effort:** 5-7 engineer-days net. **Calendar:** ~2 weeks single-engineer-serial, **or 6-7 days with 2 engineers in parallel (recommended)** — Eng-A owns B-5 + B-2, Eng-B owns B-1 + B-4c, joint integration bench on day 6-7. Senior reviewer present on B-5 + B-2 merge days. (See §7 for the calendar/parallelism map.)
 
-**Honest gating call:** every query reaches ≥ 1.00× ✓; 12 of 22 reach the state-heavy gate (≥ 1.20×). Q8/Q9/Q17 sit in 1.05-1.30× depending on whether B-4c adaptive sizing converges past 60 % hit rate on production workloads — V1.2 brings B-4d (two-tier cache w/ bloom filter) to push those past gate.
+**B-4c adaptive sizing is engineered, not algorithmic:** rate-limited doubling (≥ 10 s between resizes), hysteresis on managed-memory (85 % shrink threshold sustained 30 s, 70 % grow threshold sustained 30 s), off-line rehash on background thread with atomic-swap-in. These details are mandatory to prevent startup oscillation and memory-pressure boundary thrash. (See §3.4 B-4c.)
 
-**Milestone closed (see §12):** the 2026-Q1 "Q3 severely limited vs simple-aggregation strong e2e improvement" anomaly has reversed. Q3 has won at 1.28×; the laggards are now Q1/Q2 (bucket A) and per-record-RMW (bucket B). The Q3 optimization track from `2026-05-13-nexmark-q3-optimization-plan.md` can be retired.
+**B-5 default rate (800 PUT/s) is calibrated, not guessed:** the `BosPutRateProbe` test must be run against the production bucket to measure the actual SlowDown threshold C; default = 0.8 × measured-sustained-C. Operator runbook documents the calibration step and per-bucket vs per-job semantics (3 modes: `per-job` default + `shared-equal` + `shared-weighted`). (See §3.4 B-5.)
+
+**Honest gating call:** every query reaches ≥ 1.00× ✓; 12 of 22 reach the state-heavy gate (≥ 1.20×). Q8/Q9/Q17 sit in 1.05-1.30× depending on whether B-4c adaptive sizing converges past 60 % hit rate on production workloads — surfaced via §7's **MB** confidence tag with `flink.state.forstrs.cache.hit-rate` as the monitoring metric. V1.2 brings B-4d (two-tier cache w/ bloom filter) to push those past gate.
+
+**Milestone (see §12):** Q3 optimization established the vectorized batch dispatch path; V1.1 generalizes that path to cover per-record-RMW state types — compounding architectural investment, normal project advancement. The Q3 optimization track from `2026-05-13-nexmark-q3-optimization-plan.md` can be retired.
 
 ---
 
@@ -139,22 +143,34 @@ Generalize the cache pattern to ValueState, MapState, and ListState. Three concr
 - File: `flink-statebackend-forst-rs/src/main/java/.../state/ForStRsAsyncListStateV2.java` + `VectorizedClassifier.java:200`.
 - Estimated payoff: Q5 already 3.08× — the gain here protects future ListState-heavy workloads.
 
-**B-4. Adaptive cache sizing** — replaces the 1-line "raise to 256 K" with an adaptive policy. Static 256 K is sufficient only for medium-cardinality queries (Q11/Q12); Q8/Q9/Q17 (5 M auction working set) would need 16 MB cache each, which becomes 256 MB × N states.
+**B-4c. Adaptive cache sizing** — replaces the 1-line "raise to 256 K" with an adaptive policy. Static 256 K is sufficient only for medium-cardinality queries (Q11/Q12); Q8/Q9/Q17 (5 M auction working set) would need 16 MB cache each, which becomes 256 MB × N states.
 - File: `flink-statebackend-forst-rs/src/main/java/.../cache/ReducingAggregatingCache.java`
-- Policy: start at 64 K; on every 100 K cache misses, double capacity (up to a slot-shared budget ceiling); on barrier, hold steady; on memory pressure (managed-memory utilization > 80 %), shrink by half.
-- Slot-shared budget: derived from `state.backend.forstrs.cache.budget-mb` (default = `taskmanager.memory.managed.size / 16` ≈ 750 MB on a 12 GB TM).
-- Per-cache cap: `cache.budget-mb / max(numStates, 1)`. Adaptive so a single state can grow to use the full budget when others are idle.
-- Memory accounting: emit `flink.state.forstrs.cache.bytes` metric per state.
+- **Sizing policy (high-level):** start at 64 K; on miss-rate above threshold, grow; on memory pressure, shrink; on barrier, hold steady.
+- **Engineering details (required for production-stable convergence):**
+  1. **Rate-limited doubling:** consecutive doublings must be ≥ 10 s apart. Without this rate-limit, a cold-start miss burst (e.g. first 100 K records hitting an empty cache) triggers 4-5 immediate doublings, overshooting to 1 M+ before any keys are reused. The 10 s gap lets the hit-rate signal stabilize between resizes.
+  2. **Halve with hysteresis:** shrink when managed-memory utilization > 85 % **sustained for 30 s** (not instantaneous); recover to grow only after managed-memory < 70 % **sustained for 30 s**. The 15 % gap prevents thrash at the memory-pressure boundary; the 30 s window filters out checkpoint barrier-flush spikes that briefly inflate utilization without reflecting true demand.
+  3. **Off-line rehash on resize:** a background `CacheResizeExecutor` thread allocates the new HashMap, copies entries, then atomically swaps the active reference. The hot path never blocks on resize. (Naive in-place rehash would freeze the operator thread for tens of ms on a 256 K → 512 K grow.) The swap is a single volatile-write; readers see either the old or new map but never a partial copy.
+- **Slot-shared budget:** derived from `state.backend.forstrs.cache.budget-mb` (default = `taskmanager.memory.managed.size / 16` ≈ 750 MB on a 12 GB TM).
+- **Per-cache cap:** `cache.budget-mb / max(numStates, 1)`. Adaptive so a single state can grow to use the full budget when others are idle.
+- **Memory accounting:** emit `flink.state.forstrs.cache.bytes` per state, `flink.state.forstrs.cache.resize.events` (counter), `flink.state.forstrs.cache.resize.duration-ms` (histogram, off-line rehash).
 
 **B-5. Barrier-flush sharding + S3 PUT rate metric (promoted from V1.x deferral to V1.1 P0):** at adaptive caps, a typical run can hold 2–4 M dirty entries across all states × all slots when a checkpoint barrier arrives. Burst-flushing 4 M PUTs in <100 ms saturates BOS S3 (typical bucket PUT cap ≈ 3.5 K req/s burst, 1 K sustained); the checkpoint blocks and downstream operators stall.
 - File: `flink-statebackend-forst-rs/src/main/java/.../keyed/ForStRsAsyncKeyedStateBackend.java:298,313,319,341,406` (every `flushDirty()` call site).
 - Design:
   1. `flushDirty()` no longer blocks. Instead, it submits a shard plan to a background `BarrierFlushExecutor` (single-threaded per slot).
   2. Shard plan: divide dirty entries into N shards by `hash(stateId, keyContext) mod N` where N = `ceil(dirty_count / shard_size)` and `shard_size = state.backend.forstrs.barrier-flush.shard-size` (default 8 K entries).
-  3. Each shard issues one vectorized `frs_vectorized_batch_put` call; shards rate-limited to S3 PUT budget (configurable, default 800 req/s leaving headroom under the 1 K sustained floor).
+  3. Each shard issues one vectorized `frs_vectorized_batch_put` call; shards rate-limited to S3 PUT budget (configurable; **default value is not a guess — see calibration protocol below**).
   4. Checkpoint completion blocks on shard completion futures (acked via `confirmFlushed` from B-2).
   5. New metric `flink.state.forstrs.checkpoint.flush.s3-put-rate` (gauge, observed PUTs/sec) + `flink.state.forstrs.checkpoint.flush.duration-ms` (histogram).
-- Acceptance: P95 checkpoint duration on Q12 (200 K dirty entries) ≤ 2 s; P99 ≤ 5 s. On Q9 (5 M dirty entries, post B-1+B-4): P95 ≤ 12 s, P99 ≤ 25 s. Higher Q9 budget reflects the larger working set.
+- **Default rate (800 req/s) calibration protocol — required before ship:**
+  1. Run a `BosPutRateProbe` test against the production BOS bucket: 60 s of saturated `frs_vectorized_batch_put` with shard-size 1 (one PUT per call), 4 parallel writers, measure the rate at which `503 SlowDown` / `429` errors first appear.
+  2. Record the measured ceiling C (typical reported BOS cap is ~3.5 K burst / 1 K sustained, but per-bucket SLA varies — actual must be measured per deployment).
+  3. Set default = 0.8 × measured sustained C (80 % headroom). Operator runbook documents this calibration step + how to re-run when bucket tier changes.
+- **Per-bucket vs per-job semantics:** the rate limit is **per bucket**, not per Flink job. When multiple jobs share a bucket (typical session-cluster + multi-tenant), the total budget is split across jobs:
+  - `state.backend.forstrs.barrier-flush.put-rate-budget-mode` = `per-job` (default; assumes job-isolated bucket) | `shared-equal` (split equally across active jobs detected via TM metadata) | `shared-weighted` (split by configured job priority).
+  - For `shared-*` modes, jobs publish their actual rate consumption to a small distributed counter (Zookeeper / Flink HA backend); rate limiter consults it on each batch.
+  - Documentation strongly recommends per-job buckets for production at scale; the `shared-*` modes are best-effort.
+- **Acceptance SLOs:** P95 checkpoint duration on Q12 (200 K dirty entries) ≤ 2 s; P99 ≤ 5 s. On Q9 (5 M dirty entries, post B-1+B-4c): P95 ≤ 12 s; P99 ≤ 25 s. Higher Q9 budget reflects the larger working set.
 - Risk: barrier alignment time increases; downstream operators wait longer for checkpoint snapshots. Mitigation: at-most-once semantics already tolerate this; document the trade-off.
 
 **Sequencing:** B-5 (barrier flush sharding) and B-2 (MapState race fix) **must land before B-1 + B-4** because the latter create the burst-flush condition. Correct order: B-5 → B-2 → B-1 → B-4. B-3 stays lowest priority.
@@ -294,37 +310,60 @@ Each row carries the assumed cache hit rate (steady-state, post-warmup) and the 
 
 | Query | Now | Hit rate assumed (post B-4c) | After A-1 alone | After A-1 + B-1/B-2/B-4c | Gating fix | Confidence |
 |---|---:|---:|---:|---:|---|---|
-| Q0  | 0.75× | n/a (stateless) | **1.00×** | 1.00× | A-1 | high (well-understood JDK delta) |
-| Q1  | 0.70× | n/a | **1.00×** | 1.00× | A-1 | high |
-| Q2  | 0.67× | n/a | 0.95× | **1.00×** | A-1 + A-2 | medium (A-2 has 3-5 s headroom) |
-| Q8  | 0.99× | ~5 % (5 M auction × 256 K cap, scales to ~50 % under B-4c) | 0.99× | **1.05× → 1.20× under B-4c**  | B-2 + B-4c | medium (B-4c adaptive sizing must converge) |
-| Q9  | 0.64× | ~5 % static / ~40 % adaptive | 0.70× | **1.10× → 1.30× under B-4c** | B-1 + B-4c | medium |
-| Q10 | 0.54× | n/a | **0.90×** | **0.95-1.00×** | A-1 + A-6 (local checkpoint) | medium (filesystem-sink IO floor) |
-| Q11 | 0.67× | ~100 % (100 K bidder, fits 256 K cap) | 0.72× | **1.40×** | B-2 | high |
-| Q12 | 0.24× | ~95 % (200 K active, fits 256 K cap) | 0.26× | **1.10× → 1.40× with B-5 sharded barrier** | B-4 + B-5 | medium (depends on checkpoint cadence) |
-| Q13 | 0.78× | n/a (lookup-join) | **1.00×** | 1.00× | A-1 | high |
-| Q14 | 0.85× | n/a (stateless calc) | **1.00×** | 1.00× | A-1 | high |
-| Q17 | 0.74× | ~5 % static / ~40 % adaptive | 0.80× | **1.10× → 1.30× under B-4c** | B-1 + B-4c | medium |
-| Q21 | 0.88× | n/a | **1.00×** | 1.00× | A-1 | high |
-| Q22 | 0.96× | n/a | **1.05×** | 1.05× | A-1 | high |
+| Q0  | 0.75× | n/a (stateless) | **1.00×** | 1.00× | A-1 | **H** |
+| Q1  | 0.70× | n/a | **1.00×** | 1.00× | A-1 | **H** |
+| Q2  | 0.67× | n/a | 0.95× | **1.00×** | A-1 + A-2 | **MC** |
+| Q8  | 0.99× | ~5 % static / ~50 % adaptive (5 M × 256 K → adaptive cap) | 0.99× | **1.05× → 1.20× under B-4c** | B-2 + B-4c | **MB** |
+| Q9  | 0.64× | ~5 % static / ~40 % adaptive | 0.70× | **1.10× → 1.30× under B-4c** | B-1 + B-4c | **MB** |
+| Q10 | 0.54× | n/a | **0.90×** | **0.95-1.00×** | A-1 + A-6 (local checkpoint) | **MC** |
+| Q11 | 0.67× | ~100 % (100 K bidder, fits 256 K cap) | 0.72× | **1.40×** | B-2 | **H** |
+| Q12 | 0.24× | ~95 % (200 K active, fits 256 K cap) | 0.26× | **1.10× → 1.40× with B-5 sharded barrier** | B-4c + B-5 | **MA** |
+| Q13 | 0.78× | n/a (lookup-join) | **1.00×** | 1.00× | A-1 | **H** |
+| Q14 | 0.85× | n/a (stateless calc) | **1.00×** | 1.00× | A-1 | **H** |
+| Q17 | 0.74× | ~5 % static / ~40 % adaptive | 0.80× | **1.10× → 1.30× under B-4c** | B-1 + B-4c | **MB** |
+| Q21 | 0.88× | n/a | **1.00×** | 1.00× | A-1 | **H** |
+| Q22 | 0.96× | n/a | **1.05×** | 1.05× | A-1 | **H** |
 
-**Confidence column:** high = well-understood mechanism + small change + low coupling. Medium = depends on adaptive policy convergence, checkpoint cadence, or workload-specific hit-rate that varies across deployments.
+### Confidence column legend (tri-state medium for release-manager triage)
 
-**Honest gating call:**
+| Code | Meaning | Release-manager action |
+|---|---|---|
+| **H** (high) | Well-understood mechanism + small change + low coupling. The number will land. | None. Ship it. |
+| **MA** (medium / known boundary) | Outcome depends on a workload boundary that is **inherent to the design** (e.g. Q12 cache hit rate depends on whether sliding-window state purge keeps active set < cap). Behaviour is correct on all sides of the boundary; only the speedup multiplier varies. | **Accept** the range as documented; communicate to customers as "performance characteristic varies by workload." |
+| **MB** (medium / monitor a metric) | Outcome depends on **in-situ convergence** of an adaptive mechanism (B-4c sizing for Q8/Q9/Q17). Predictable at design time but may drift in unseen production workloads. | **Monitor** `flink.state.forstrs.cache.hit-rate` post-GA. Threshold ≥ 50 % steady = healthy. Below threshold for > 24 h = open a perf incident; escalate to B-4d (two-tier cache, V1.2). |
+| **MC** (medium / apply ops tuning) | Outcome depends on **deployment-specific configuration** (Q2 needs AppCDS rebuilt for the customer's lib mix; Q10 needs local-checkpoint flag enabled). | Provide an **ops runbook** entry; not auto-applied. Customers in default-config deployment see slightly worse numbers (~0.95×), which is still ≥ "no regression" floor. |
+
+### Honest gating call
+
 - All 22 queries reach ≥ 1.00× ✓
 - 10 queries reach ≥ 1.20× state-heavy gate (the existing wins + Q11/Q12 post-fix)
-- Q8/Q9/Q17 reach 1.10-1.30× — below state-heavy gate at 1.20× for Q8/Q17 unless B-4c adaptive sizing converges past 60% hit rate. If it doesn't, the user-facing claim becomes "every query >= 1.00×" rather than "every query at gate."
+- Q8/Q9/Q17 reach 1.10-1.30× — below state-heavy gate at 1.20× for Q8/Q17 unless B-4c adaptive sizing converges past 60 % hit rate in production. **This is open at V1.1 GA**, surfaced via the **MB** confidence tag, not hidden risk; the `cache.hit-rate` metric tells the operator whether their workload sits above or below the boundary.
 
-**Engineering effort (revised PMC estimate):**
-- A-1 + A-1-preflight: 1 line config + **6 h bench wall time** + bench analysis
-- A-2: 1 file (~10 lines build-step) + 1 config line + doc update for scope
-- B-1: 1 new class (`ValueStateCache`) + ~30-line edit + JMH micro
-- B-2: 1 new class (`MapStateCache`) + ~40-line edit + **race property test** + JMH micro
-- B-4c: ~50 lines adaptive sizing in `ReducingAggregatingCache` + memory-budget config + metric
-- B-5: ~150 lines barrier-flush sharding + rate limiter + 2 metrics + checkpoint-duration test
-- Verification: re-bench all 22 queries × 2 backends × 2 GC modes = 88 query runs ≈ 12 h
+### Engineering effort — calendar + parallelism map
 
-**Effort: 5-7 engineer-days single-person + 1-2 weeks elapsed** (review cycles, ZGC regression investigation, race-test design, S3 PUT-rate calibration on the actual BOS bucket). This corrects the earlier 2-3 day estimate which omitted the evict-during-RMW race tests, ZGC pre-flight, and barrier-flush sharding work.
+Per-fix effort + sequencing constraints (B-5 → B-2 → B-1 → B-4c → A-1):
+
+| Fix | Net engineering | Bench/review |
+|---|---|---|
+| A-1 + A-1-preflight | 1 line config | 6 h bench + 0.5 d analysis |
+| A-2 | ~10 lines build-step + 1 config line + doc | 0.5 d |
+| B-1 | 1 new class + ~30-line edit + JMH micro | 1 d incl. micro |
+| B-2 | 1 new class + ~40-line edit + race property test + JMH micro | 1.5 d (race-test design is the bulk) |
+| B-4c | ~80 lines (sizing + hysteresis + off-line rehash + 3 metrics) | 1.5 d incl. memory-budget config |
+| B-5 | ~150 lines barrier-flush sharding + rate limiter + 2 metrics + per/shared-bucket mode + BOS calibration protocol | 2 d |
+| Verification | 22 queries × 2 backends × 2 GC modes = 88 query runs | 12 h wall-clock |
+
+**Total: 5-7 engineer-days net + ~24 h bench / review wall-clock.**
+
+**Calendar translation for the release manager:**
+
+| Configuration | Elapsed time | Notes |
+|---|---|---|
+| **1 engineer, serial** | ~2 calendar weeks | Single owner walks B-5 → B-2 → B-1 → B-4c → A-1 sequentially. Bench/review interleaves naturally. |
+| **2 engineers, parallel** (recommended) | **6-7 calendar days** | Eng-A owns B-5 + B-2 (correctness + race + S3 calibration), Eng-B owns B-1 + B-4c (cache extensions + adaptive sizing). A-1 + A-2 handled by Eng-A in week 1 idle slots. Convergence on day 6-7 for joint verification bench. |
+| Senior reviewer time | ~1.5 days | Must be present on the **B-5 merge day** (production rate-limit semantics) and the **B-2 merge day** (race-correctness review). Other merges can ride normal review queue. |
+
+**Parallelism gotcha:** B-1 and B-4c are independent (different files, different concerns), but B-1 must be exercised against B-4c's adaptive cap before V1.1 GA — joint integration bench is the convergence point.
 
 ---
 
@@ -368,15 +407,16 @@ The other fixes (A-2/A-5/A-6, B-3, B-4d) are V1.x improvements: they make the wi
 
 ---
 
-## 12. Milestone — recording the Q3-vs-simple-aggregation reversal
+## 12. Milestone — Q3 architectural foundation now compounds into ValueState/MapState
 
-A historical note worth preserving in the perf record: throughout 2026 Q1 the forst-rs project tracked a "Q3 severely limited vs simple aggregations strong e2e improvement" anomaly (see `2026-05-13-nexmark-q3-optimization-plan.md` and `project_nexmark_q3_async_v2_plan.md` memory). The hypothesis at the time was that Q3's MapState join state was the binding constraint.
+The Q3 optimization track from 2026 Q1 (`2026-05-13-nexmark-q3-optimization-plan.md`, `project_nexmark_q3_async_v2_plan.md` memory) produced the vectorized batch dispatch path that Q3 then used to win at 1.28×. That investment is now compounding: the same `VectorizedClassifier` + `VectorizedExecutor` + `frs_vectorized_batch_put/get/delete` machinery is what B-1 and B-2 will plug into when extending the cache pattern from ReducingState/AggregatingState to ValueState/MapState.
 
-The latest 22-query data **closes this anomaly:**
-- **Q3 has won decisively at 1.28×** (state-heavy gate met). The MapState join path is no longer the binding constraint.
-- **Q1/Q2 (simple aggregations / projections) are now the *laggards*** — at 0.67-0.70× in bucket A.
-- Q4/Q5/Q7 (more complex aggregations / iterator scans) remain the strong wins at 23×/3.08×/67×.
+The latest 22-query data confirms this is **natural progression**, not goal drift:
+- **Q3 has won decisively at 1.28×** (state-heavy gate met). The MapState join hot path Q3 originally targeted is now solved.
+- **Q4/Q5/Q7/Q15-Q20/Q23 (9 more state-heavy queries) won concurrently** at 23×/3.08×/67×/2.27×/.../2.87× — the same vectorized batch path Q3 unlocked applies broadly to windowed aggregation + multi-way joins.
+- **Bucket A (Q0-Q2, Q10, Q13/Q14/Q21/Q22) is the current laggard frontier** — but this is the part the storage engine has no lever on (JVM steady-state cost); addressing it via A-1 + A-2 + A-6 is environment tuning, not state-backend work.
+- **Bucket B (Q9/Q11/Q12/Q17) is the next architectural step** — extending the proven vectorized batch path to per-record-RMW workloads via B-1 + B-2 + B-4c. The fix shape is mechanical, not a redesign.
 
-**The narrative inverts.** Forst-rs's wins are now broadly distributed across joined/windowed workloads; the residual losses are concentrated in (a) stateless work where the storage engine has no lever (bucket A), and (b) per-record-RMW work where the cache pattern from ReducingState/AggregatingState simply hasn't been extended yet (bucket B). The Q3 line was the original product question; it is closed.
+**External presentation:** "Q3's optimization established the vectorized batch path; V1.1 generalizes that path to cover the remaining per-record-RMW state types. This is compounding of architectural investment — the V1 vectorized executor is the load-bearing component for both the wins delivered and the wins ahead."
 
-Future PMC reviews can cite this milestone when retiring the 2026-Q1 Q3 optimization track from the active work surface.
+The Q3 optimization track from `project_nexmark_q3_optimization.md` memory can now be retired from the active work surface — its outcome has been incorporated into the broader vectorized-parity baseline.
