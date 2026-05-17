@@ -652,6 +652,7 @@ mod tests {
     /// that the sequence is within the 56-bit limit. Release builds elide
     /// this check; debug builds (where `cargo test` runs) catch the misuse.
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "exceeds 56-bit MAX_SEQUENCE_NUMBER")]
     fn test_internal_key_new_panics_on_oversize_sequence_in_debug() {
         // Release builds will NOT panic — this test only fires in debug.

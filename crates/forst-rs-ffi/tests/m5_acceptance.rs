@@ -385,9 +385,10 @@ fn m5_get_pinned_large_value_returns_fallback() {
         let db = open();
         let cf = default_cf(db);
 
-        // Write a value > 64 bytes — should NOT be inlined.
+        // Write a value > INLINE_THRESHOLD bytes — should NOT be inlined.
+        // INLINE_THRESHOLD was bumped to 256 B in 836b9a367; pick clearly above.
         let key = b"big_key";
-        let value = vec![0xABu8; 128]; // 128 bytes > INLINE_THRESHOLD (64)
+        let value = vec![0xABu8; 512]; // 512 bytes > INLINE_THRESHOLD (256)
         put(db, cf, key, &value);
 
         let mut out_ptr: *const u8 = ptr::null();
