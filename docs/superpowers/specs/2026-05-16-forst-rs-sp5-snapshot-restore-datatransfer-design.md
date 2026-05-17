@@ -4,6 +4,8 @@
 **Status:** Design — implementation pending
 **Parent:** `2026-05-15-forst-rs-whole-program-vectorization-design.md` §SP5
 
+> **Umbrella spec:** [2026-05-16-forst-rs-vectorized-parity-design.md](2026-05-16-forst-rs-vectorized-parity-design.md). This SP implements checkpoint barrier semantics and Trace E (state snapshot lifecycle) defined in the umbrella's §1 (semantic guarantees) and checkpoint integration sections. Any change to this SP that touches a contract defined by the umbrella must update the cross-reference in the same PR.
+
 ## Goal
 
 Bring forst-rs to parity with forst on snapshot / restore strategies and on

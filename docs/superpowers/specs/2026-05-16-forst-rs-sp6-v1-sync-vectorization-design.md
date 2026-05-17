@@ -5,6 +5,8 @@
 **Parent:** `2026-05-15-forst-rs-whole-program-vectorization-design.md` (extends; not replaced by)
 **Constraint:** Backend-only changes (no Flink core / no Flink Table runtime changes).
 
+> **Umbrella spec:** [2026-05-16-forst-rs-vectorized-parity-design.md](2026-05-16-forst-rs-vectorized-parity-design.md). This SP extends the umbrella's dispatch table (§1) to cover the V1 sync path in addition to async-v2, bringing components 1–4, 7–17 (Java runtime + all state types) and A–G (Rust FFI + engine ops) to the synchronous API surface. Any change to this SP that touches a dispatch contract or metrics namespace defined by the umbrella must update the cross-reference in the same PR.
+
 ## Why this sub-project exists
 
 The prior four spec docs (whole-program, SP1, SP2, SP5) all targeted the **async-v2 state path**. Real-world benchmarks (Nexmark Q3 100M, this session) showed that **Flink Table runtime in Flink 2.2.1 does not use async-v2 for joins/aggregations** — it calls `createKeyedStateBackend` (the synchronous V1 path). Forst-rs's V1 sync path was prematurely deleted earlier in the project and then restored; with `frs_get_fast` added it now runs Q3 in **74.8 s vs rocksdb 33.5 s** — still 2.2× slower than rocksdb-local and 1.8× slower than community forst.
