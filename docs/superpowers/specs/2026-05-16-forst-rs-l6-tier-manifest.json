@@ -1,0 +1,35 @@
+{
+  "$comment": "Forst-RS V1 L6 Nexmark perf-gate tier manifest. Per umbrella spec §5.",
+  "$comment2": "Gates compare forst-rs JDK 25 vs RocksDB local JDK 17.",
+  "$comment3": "On miss: open investigation issue, do NOT silently lower gate.",
+  "version": 1,
+  "comparator_backend": "rocksdb",
+  "comparator_jdk": "jdk17",
+  "candidate_backend": "forst-rs",
+  "candidate_jdk": "jdk25",
+  "tiers": {
+    "state-heavy": {
+      "gate_speedup": 1.20,
+      "queries": ["q3", "q4", "q5", "q8"],
+      "rationale": "Vectorization payoff direct; failure means rework not delivering"
+    },
+    "state-medium": {
+      "gate_speedup": 1.05,
+      "queries": ["q6", "q7"],
+      "rationale": "Modest improvement; mostly proves we don't regress"
+    },
+    "state-light": {
+      "gate_speedup": 0.95,
+      "queries": ["q0", "q1", "q2"],
+      "rationale": "State path incidental; regression guard for JDK 25/ZGC tuning"
+    }
+  },
+  "q3_floor_locked_at_seconds": 21.3,
+  "miss_response": {
+    "step_1": "Open investigation issue with `perf-gate-miss` label within 24h",
+    "step_2": "Identify responsible delta (profile, bisect, attribute)",
+    "step_3": "Either fix and re-validate OR re-tier with documented rationale",
+    "step_4": "Update this manifest in the same PR as the re-tier",
+    "not_acceptable": "Silently lowering the gate without investigation"
+  }
+}
