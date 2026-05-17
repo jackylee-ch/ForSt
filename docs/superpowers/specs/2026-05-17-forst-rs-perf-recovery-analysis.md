@@ -9,7 +9,13 @@
 
 ## 1. Executive summary
 
-Of 22 forst-supported Nexmark queries, **10 already pass 1.x** (Q3 1.28×, Q4 23×, Q5 3.08×, Q7 67×, Q15 2.27×, Q16 1.31×, Q18 2.29×, Q19 1.39×, Q20 1.37×, Q23 2.87×). The remaining 12 fall into three diagnostic buckets:
+**2026-05-18 in-session update:** A-1 implemented (G1 variant config tested across all 22 queries). With **per-job GC routing (ZGC default + G1 opt-in), 16 of 22 queries now reach ≥ 1.00× rocksdb** (up from 10 with ZGC-only); 11 of those reach the ≥ 1.20× state-heavy gate. Remaining 6: Q0 0.92× / Q1 0.88× / Q2 0.86× / Q11 0.67× / Q12 0.28× / Q13 0.84× — each with a documented V1.1 path (AppCDS for Q0-Q2, cache extensions for Q11-Q12, async-lookup buffering for Q13). See §4 for the full empirical G1-vs-ZGC table.
+
+**A-1 empirical findings (correct the original plan):**
+1. `-XX:+ZGenerational` was removed in JDK 24; JDK 25 already runs Generational ZGC by default. The original A-1 wording was a no-op.
+2. Actual A-1 change: switch to G1 (`-XX:+UseG1GC`). PARTIAL-FAIL on the preflight per the decision tree: Q4 (23.14×→1.62×) and Q7 (66.71×→2.49×) HARD-FAIL because their unbounded-state / iterator-scan workload shape depends on ZGC's low-pause incremental collection. **Ship G1 as opt-in flag, not default.** Per-workload recommendation table updated in §4.
+
+**Original V1 state (preserved for context):** Of 22 forst-supported Nexmark queries, **10 already pass 1.x** (Q3 1.28×, Q4 23×, Q5 3.08×, Q7 67×, Q15 2.27×, Q16 1.31×, Q18 2.29×, Q19 1.39×, Q20 1.37×, Q23 2.87×). The remaining 12 fall into three diagnostic buckets:
 
 | Bucket | Queries | Worst | Root cause | Fix tier | Realistic post-fix range |
 |---|---|---|---|---|---|
