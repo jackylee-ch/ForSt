@@ -24,13 +24,13 @@ Of 22 forst-supported Nexmark queries, **10 already pass 1.x** (Q3 1.28×, Q4 23
 4. **B-4c: adaptive cache sizing** — replaces "raise 64 K to 256 K." High-cardinality queries (Q8/Q9/Q17, 5 M working set) need adaptive growth or they stay below gate. Static 256 K helps only Q11/Q12.
 5. **A-1: Generational ZGC**, gated on **A-1-preflight** (6 hours bench of Q4/Q5/Q7/Q15/Q18/Q23). Ship A-1 either globally or behind an opt-in flag depending on preflight outcome.
 
-**Realistic effort:** 5-7 engineer-days net. **Calendar:** ~2 weeks single-engineer-serial, **or 6-7 days with 2 engineers in parallel (recommended)** — Eng-A owns B-5 + B-2, Eng-B owns B-1 + B-4c, joint integration bench on day 6-7. Senior reviewer present on B-5 + B-2 merge days. (See §7 for the calendar/parallelism map.)
+**Realistic effort:** 5-7 engineer-days net. **Calendar:** ~2 weeks single-engineer-serial, **or 6-7 days with 2 engineers in parallel (recommended)** — Eng-A owns B-5 + B-2, Eng-B owns B-1 + B-4c, joint integration bench on day 6-7. **Senior reviewer (1.5 days) must be booked at sprint planning, not requested at PR-merge time** — this is a hard resource constraint; last-minute scheduling has caused 3-5 day delays on this project. (See §7 for the calendar/parallelism map.)
 
 **B-4c adaptive sizing is engineered, not algorithmic:** rate-limited doubling (≥ 10 s between resizes), hysteresis on managed-memory (85 % shrink threshold sustained 30 s, 70 % grow threshold sustained 30 s), off-line rehash on background thread with atomic-swap-in. These details are mandatory to prevent startup oscillation and memory-pressure boundary thrash. (See §3.4 B-4c.)
 
-**B-5 default rate (800 PUT/s) is calibrated, not guessed:** the `BosPutRateProbe` test must be run against the production bucket to measure the actual SlowDown threshold C; default = 0.8 × measured-sustained-C. Operator runbook documents the calibration step and per-bucket vs per-job semantics (3 modes: `per-job` default + `shared-equal` + `shared-weighted`). (See §3.4 B-5.)
+**B-5 default rate (800 PUT/s) is calibrated, not guessed:** the `BosPutRateProbe` test (with **execution-safety guardrails — isolated prefix, mandatory cleanup, region/tier non-portability, maintenance-window gate, cluster-wide HA lock**) must be run against the production bucket to measure the actual SlowDown threshold C; default = 0.8 × measured-sustained-C. Operator runbook documents the calibration step and per-bucket vs per-job semantics — 3 modes (`per-job` default + `shared-equal` + `shared-weighted`) with explicit **applicability boundaries** (Flink HA backend required; per-job 50 % ceiling; sync-latency gauge auto-falls-back if > 500 ms sustained). Production at scale should use bucket-per-job isolation + `per-job` mode. (See §3.4 B-5.)
 
-**Honest gating call:** every query reaches ≥ 1.00× ✓; 12 of 22 reach the state-heavy gate (≥ 1.20×). Q8/Q9/Q17 sit in 1.05-1.30× depending on whether B-4c adaptive sizing converges past 60 % hit rate on production workloads — surfaced via §7's **MB** confidence tag with `flink.state.forstrs.cache.hit-rate` as the monitoring metric. V1.2 brings B-4d (two-tier cache w/ bloom filter) to push those past gate.
+**Honest gating call:** every query reaches ≥ 1.00× ✓; 12 of 22 reach the state-heavy gate (≥ 1.20×). Q8/Q9/Q17 sit in 1.05-1.30× depending on whether B-4c adaptive sizing converges past 60 % hit rate on production workloads — surfaced via §7's **MB** confidence tag with `flink.state.forstrs.cache.hit-rate` as the monitoring metric. **Prometheus alert rule:** `quantile_over_time(0.90, ...{cache.hit-rate}[24h]) < 0.50` sustained ≥ 6 h = `ForstRsCacheHitRateLow` warning; ≥ 24 h = `ForstRsCacheHitRateCritical` incident → escalate to V1.2 B-4d (two-tier bloom-filter cache). The 6 h / 24 h windows align with Flink's 60 s metric-reporter cadence (statistically meaningful P90).
 
 **Milestone (see §12):** Q3 optimization established the vectorized batch dispatch path; V1.1 generalizes that path to cover per-record-RMW state types — compounding architectural investment, normal project advancement. The Q3 optimization track from `2026-05-13-nexmark-q3-optimization-plan.md` can be retired.
 
@@ -166,10 +166,21 @@ Generalize the cache pattern to ValueState, MapState, and ListState. Three concr
   1. Run a `BosPutRateProbe` test against the production BOS bucket: 60 s of saturated `frs_vectorized_batch_put` with shard-size 1 (one PUT per call), 4 parallel writers, measure the rate at which `503 SlowDown` / `429` errors first appear.
   2. Record the measured ceiling C (typical reported BOS cap is ~3.5 K burst / 1 K sustained, but per-bucket SLA varies — actual must be measured per deployment).
   3. Set default = 0.8 × measured sustained C (80 % headroom). Operator runbook documents this calibration step + how to re-run when bucket tier changes.
+- **Probe execution safety (mandatory operator-runbook content):** the probe **will** degrade the target bucket during its 60 s saturated window; running it carelessly will SLO-burn a production bucket and page on-call. Hard requirements:
+  1. **Isolated prefix:** the probe writes to `s3://<bucket>/<prefix>/_forstrs_probe/<run-id>/` only — never to a state/checkpoint prefix. The probe enforces this via path-prefix assertion at start and refuses to run if `BOS_PROBE_PREFIX` env var is unset.
+  2. **Cleanup:** on success and on failure, the probe MUST issue a bulk-delete of its written objects before exiting (idempotent retry on 503). Surface a `probe.cleanup-incomplete` warning if any objects remain after 3 deletion attempts.
+  3. **Non-portability across regions:** measured C is per-region and per-bucket-tier (Standard vs Infrequent-Access vs Archive). Probe records `bucket-region + bucket-tier + run-timestamp` and refuses to apply prior measurements to a different region/tier; re-run is required on bucket migration.
+  4. **Maintenance window requirement:** probe must run inside a documented maintenance window (no live customer traffic to the bucket). The runbook entry includes a pre-flight question "is this bucket currently serving live state I/O?" and a `--force` flag that requires an explicit ticket reference in CI/CD. Refuse to run on a bucket with > 100 PUT/s observed in the prior 5 min unless `--force` is supplied.
+  5. **Concurrency lock:** runbook reserves cluster-wide lock via the Flink HA backend (Zookeeper / Kubernetes ConfigMap) — only one probe runs against a bucket at a time, even from different operators. Stale locks expire after 10 min.
 - **Per-bucket vs per-job semantics:** the rate limit is **per bucket**, not per Flink job. When multiple jobs share a bucket (typical session-cluster + multi-tenant), the total budget is split across jobs:
   - `state.backend.forstrs.barrier-flush.put-rate-budget-mode` = `per-job` (default; assumes job-isolated bucket) | `shared-equal` (split equally across active jobs detected via TM metadata) | `shared-weighted` (split by configured job priority).
   - For `shared-*` modes, jobs publish their actual rate consumption to a small distributed counter (Zookeeper / Flink HA backend); rate limiter consults it on each batch.
-  - Documentation strongly recommends per-job buckets for production at scale; the `shared-*` modes are best-effort.
+- **shared-\* mode applicability boundaries** — these modes are best-effort and break down outside their applicability envelope. Each `shared-*` mode is **gated at startup**; if conditions are not met the backend falls back to `per-job` with a `WARN` log entry naming the missing prerequisite:
+  1. **Flink HA backend required:** `shared-*` depends on the distributed counter for cross-job consumption visibility. Without `high-availability.type` = `zookeeper` | `kubernetes`, fall back to `per-job`. (Local file HA = single-JM = no cross-job sync — degenerates to `per-job` anyway.)
+  2. **Per-job rate ceiling:** even in `shared-equal`, a single job is capped at `0.5 × bucket-budget` (no single tenant starves the cluster). Configurable via `state.backend.forstrs.barrier-flush.per-job-ceiling-fraction` (default 0.5; min 0.1, max 1.0).
+  3. **Cross-job sync-latency metric:** new gauge `flink.state.forstrs.checkpoint.shared-budget.sync-latency-ms` (time from counter-write to counter-visible-cluster-wide). If the gauge sustains > 500 ms for 5 min → emit `WARN` + auto-fallback the affected job to `per-job` for the duration. Restored to `shared-*` on next checkpoint if latency recovers.
+  4. **Recommended deployment posture:** production at scale should use **bucket-per-job isolation** (one BOS bucket per Flink job) and stay on `per-job` mode. The `shared-*` modes are intended for development / multi-tenant lab clusters where bucket allocation is hand-managed. The runbook calls this out under "production deployment guidance."
+- Documentation strongly recommends per-job buckets for production at scale; the `shared-*` modes are best-effort under the applicability gates above.
 - **Acceptance SLOs:** P95 checkpoint duration on Q12 (200 K dirty entries) ≤ 2 s; P99 ≤ 5 s. On Q9 (5 M dirty entries, post B-1+B-4c): P95 ≤ 12 s; P99 ≤ 25 s. Higher Q9 budget reflects the larger working set.
 - Risk: barrier alignment time increases; downstream operators wait longer for checkpoint snapshots. Mitigation: at-most-once semantics already tolerate this; document the trade-off.
 
@@ -236,8 +247,38 @@ JDK 17 G1 vs JDK 25 ZGC measured throughput delta on stateless streaming work: t
 **A-1-preflight. Pre-flight regression test on existing wins (must run before A-1 ships):** JDK does not support per-operator GC. Switching all forst-rs jobs to Generational ZGC is irreversible at config level. Q4 (23×) and Q7 (67×) depend on current single-generation ZGC's heap-reclaim cadence; changing the young-gen cadence may regress.
 - Reproduce Q4 + Q7 + Q5 + Q15 + Q18 + Q23 (6 representative wins) on `-XX:+UseZGC -XX:+ZGenerational` config, full 100 M events each.
 - Gate: each query must remain within 90 % of its current speedup (e.g., Q4 ≥ 20.8× rocksdb; Q7 ≥ 60×; Q5 ≥ 2.77×).
-- If any query regresses below gate: revert A-1, accept the bucket-A 0.7× floor, and document; alternatively, ship A-1 behind an opt-in flag `state.backend.forstrs.zgc.generational` (default off; bucket-A regressions remain).
 - Bench wall time: ~6 hours (6 queries × 60 min average + cluster restarts).
+- **Expected-output decision tree (preflight reviewer playbook):**
+
+  | Outcome | Per-query speedup vs current | Decision | Next action |
+  |---|---|---|---|
+  | **PASS** | All 6 queries ≥ 90 % of current speedup | Ship A-1 globally | Commit config change to `conf/templates/config-forst-rs.yaml.tpl`; update Flink docs to call out the GC choice; close A-1 |
+  | **PARTIAL-FAIL** | 1-2 queries between 80 % and 90 % | Ship A-1 behind an opt-in flag | Set `state.backend.forstrs.zgc.generational` default to off; document the partially-regressed queries in release notes; bucket-A queries stay at current 0.7× floor unless customer opts in |
+  | **HARD-FAIL** | Any query < 80 % of current speedup, OR 3+ queries in the 80-90 % band | Do not ship A-1 in V1.1 | Open `ZGC-Regression-V1.1` tracking ticket; bucket-A queries stay at floor; revisit in V1.2 with the JEP 522 + 523 Generational ZGC follow-ups; consider per-query GC tuning (e.g., region size, soft-max-heap) |
+
+- **Raw-data archive path:** `docs/superpowers/bench-archive/2026-05-<date>-a1-preflight/` with one subdir per run, each containing:
+  - `nexmark-forst-rs-zgcgen-<query>.log` (full Nexmark run output)
+  - `flink-taskexecutor.log` (TM log, for GC pause analysis)
+  - `gc-log-<query>.log` (`-Xlog:gc*=info,gc+heap=debug:file=...`)
+  - `summary.json` (speedup vs current, gate verdict per query)
+- **Commit-doc template:** the preflight commit message MUST include:
+
+  ```
+  perf(jvm): A-1-preflight — Generational ZGC regression test on 6 representative wins
+
+  Result: PASS | PARTIAL-FAIL | HARD-FAIL
+  Per-query speedups (current → ZGCgen):
+    Q4: 23.14× → <new>× (<delta>%)
+    Q5:  3.08× → <new>× (<delta>%)
+    Q7: 66.71× → <new>× (<delta>%)
+    Q15: 2.27× → <new>× (<delta>%)
+    Q18: 2.29× → <new>× (<delta>%)
+    Q23: 2.87× → <new>× (<delta>%)
+
+  Decision: <ship globally | opt-in flag | do not ship>
+  Raw bench data: docs/superpowers/bench-archive/2026-05-<date>-a1-preflight/
+  ```
+- **Reviewer expectation:** the preflight commit's tree-diff is exactly one config line, but the commit message must contain the table and the decision; the bench archive is the evidence trail. PR reviewer reads the commit message + scans the summary.json before approving.
 
 **A-2. AppCDS warm-up — scope: standalone per-job mode + new TM startup only.** Application Class Data Sharing pre-compiles + caches the Flink + state-backend class hierarchy at JVM launch.
 - **Scope:** AppCDS helps every fresh JVM invocation. In **session-cluster mode**, this means the one-time TM startup but **not** subsequent job launches (the TM stays warm; only the JobMaster runs jobs, which is already in-cluster). Documentation must call this out — Nexmark (per-job standalone) benefits; production session-cluster users see only first-TM-startup savings.
@@ -330,7 +371,7 @@ Each row carries the assumed cache hit rate (steady-state, post-warmup) and the 
 |---|---|---|
 | **H** (high) | Well-understood mechanism + small change + low coupling. The number will land. | None. Ship it. |
 | **MA** (medium / known boundary) | Outcome depends on a workload boundary that is **inherent to the design** (e.g. Q12 cache hit rate depends on whether sliding-window state purge keeps active set < cap). Behaviour is correct on all sides of the boundary; only the speedup multiplier varies. | **Accept** the range as documented; communicate to customers as "performance characteristic varies by workload." |
-| **MB** (medium / monitor a metric) | Outcome depends on **in-situ convergence** of an adaptive mechanism (B-4c sizing for Q8/Q9/Q17). Predictable at design time but may drift in unseen production workloads. | **Monitor** `flink.state.forstrs.cache.hit-rate` post-GA. Threshold ≥ 50 % steady = healthy. Below threshold for > 24 h = open a perf incident; escalate to B-4d (two-tier cache, V1.2). |
+| **MB** (medium / monitor a metric) | Outcome depends on **in-situ convergence** of an adaptive mechanism (B-4c sizing for Q8/Q9/Q17). Predictable at design time but may drift in unseen production workloads. | **Monitor** `flink.state.forstrs.cache.hit-rate` post-GA. **Prometheus alert rule:** `quantile_over_time(0.90, flink_state_forstrs_cache_hit_rate{}[24h]) < 0.50` sustained for ≥ 6 consecutive hours → fires `ForstRsCacheHitRateLow` warning; ≥ 24 h sustained → escalate to `ForstRsCacheHitRateCritical` perf incident, route to V1.2 B-4d (two-tier bloom-filter cache). The 6 h / 24 h aligns with Flink's default 60 s metric reporter cadence (~360 / 1440 data points; P90 is statistically meaningful at both windows). |
 | **MC** (medium / apply ops tuning) | Outcome depends on **deployment-specific configuration** (Q2 needs AppCDS rebuilt for the customer's lib mix; Q10 needs local-checkpoint flag enabled). | Provide an **ops runbook** entry; not auto-applied. Customers in default-config deployment see slightly worse numbers (~0.95×), which is still ≥ "no regression" floor. |
 
 ### Honest gating call
@@ -361,7 +402,13 @@ Per-fix effort + sequencing constraints (B-5 → B-2 → B-1 → B-4c → A-1):
 |---|---|---|
 | **1 engineer, serial** | ~2 calendar weeks | Single owner walks B-5 → B-2 → B-1 → B-4c → A-1 sequentially. Bench/review interleaves naturally. |
 | **2 engineers, parallel** (recommended) | **6-7 calendar days** | Eng-A owns B-5 + B-2 (correctness + race + S3 calibration), Eng-B owns B-1 + B-4c (cache extensions + adaptive sizing). A-1 + A-2 handled by Eng-A in week 1 idle slots. Convergence on day 6-7 for joint verification bench. |
-| Senior reviewer time | ~1.5 days | Must be present on the **B-5 merge day** (production rate-limit semantics) and the **B-2 merge day** (race-correctness review). Other merges can ride normal review queue. |
+| Senior reviewer time | ~1.5 days — **hard resource constraint, book at sprint planning** | Must be present on the **B-5 merge day** (production rate-limit semantics) and the **B-2 merge day** (race-correctness review). Other merges can ride normal review queue. |
+
+**Senior reviewer booking — sprint planning action:** the 1.5 reviewer-days are *not* a flexible "request when ready" — they are a **resource constraint** to be booked at sprint planning, **before** the implementation sprint starts. Last-minute review scheduling has historically caused 3-5 day landing delays at PR merge time on this project (cross-team senior reviewers are 60-80 % loaded). Sprint-planning checklist must include:
+- Identify senior reviewer for **B-5 merge** (production rate-limit semantics, S3 calibration, multi-tenant correctness) — typically the Flink-state-backend tech lead or a PMC member familiar with checkpoint semantics.
+- Identify senior reviewer for **B-2 merge** (race-correctness review) — typically the concurrency / memory-model owner. May be the same person as B-5 reviewer; in that case **double-book consecutive days** to allow context to remain warm.
+- **Calendar holds:** book a 4 h block per merge day, +1 h follow-up next day for any review-cycle requests. Reviewer marks the slots as `BLOCKED FOR forst-rs V1.1 P0 review` so other teams don't poach.
+- Implementation kicks off only after reviewer confirmations land on the sprint plan.
 
 **Parallelism gotcha:** B-1 and B-4c are independent (different files, different concerns), but B-1 must be exercised against B-4c's adaptive cap before V1.1 GA — joint integration bench is the convergence point.
 
