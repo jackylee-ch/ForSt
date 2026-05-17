@@ -239,10 +239,67 @@ JDK 17 G1 vs JDK 25 ZGC measured throughput delta on stateless streaming work: t
 
 ### 4.3 Fixes (V1.1 environment tuning)
 
-**A-1. Switch to Generational ZGC (`-XX:+ZGenerational`)** — JDK 23+ default; explicitly opt in for clarity. Generational ZGC keeps the low-pause property but adds a young-generation collector, recovering ~30-50 % of the throughput loss vs G1.
-- File: `conf/templates/config-forst-rs.yaml.tpl`
-- Change: `-XX:+UseZGC` → `-XX:+UseZGC -XX:+ZGenerational`
-- Expected payoff: Q0/Q1/Q2 → 0.95-1.00×, Q10/Q14/Q21 → 0.90-0.95×
+**A-1. Switch to Generational ZGC** — **REVISED 2026-05-18: empirical finding makes A-1-as-originally-specified a no-op on JDK 25.**
+
+Original intent: explicitly enable Generational ZGC via `-XX:+ZGenerational`. Empirical check on JDK 25:
+
+```
+$ java -XX:+UseZGC -XX:+ZGenerational -version
+OpenJDK 64-Bit Server VM warning: Ignoring option ZGenerational; support was removed in 24.0
+openjdk version "25.0.3" 2026-04-21 LTS
+```
+
+**Reading:** Generational ZGC became default in JDK 23, was made the only mode in JDK 24, and the `+ZGenerational` flag was removed entirely. JDK 25 is *already* on Generational ZGC. The bucket-A regression we observed is happening *despite* Generational ZGC being active.
+
+**Revised A-1 — what actually needs to change on JDK 25:** the bucket-A overhead is not the young-gen-vs-single-gen ZGC delta (already paid). It is one of:
+- (a) ZGC load barriers vs G1 inline barriers (5-15 % throughput on barrier-heavy code paths — measured at A-1-actual below)
+- (b) ZGC's larger memory reserve commitments (NUMA + commit overhead at startup)
+- (c) FFM `Arena.ofShared()` first-touch page-fault costs (already addressed by A-5)
+
+**A-1-actual: test G1 (`-XX:+UseG1GC`) against ZGC on bucket-A queries.** Operationally, this is the same one-line config change but selecting G1 instead of explicitly-Generational ZGC. Decision criterion: if G1 closes the bucket-A gap *without* regressing the state-heavy wins (Q4 23×, Q7 67×), promote G1 to the forst-rs default. If G1 regresses any state-heavy win below the 90 % preflight gate, ship behind opt-in flag per the PARTIAL-FAIL decision tree.
+
+- Files: `conf/templates/config-forst-rs.yaml.tpl` (or a new `config-forst-rs-g1.yaml.tpl` variant if behind an opt-in flag).
+- Change: `-XX:+UseZGC` → `-XX:+UseG1GC`.
+
+**In-session full preflight (2026-05-18):** ran 13 queries on the G1 variant config (8 bucket-A + 5 state-heavy preflight set). Empirical results below.
+
+| Query | shape | ZGC | G1 | G1 verdict |
+|---|---|---:|---:|---|
+| Q0  | stateless calc | 0.75× | **0.92×** | improves; still under gate |
+| Q1  | stateless calc | 0.70× | **0.88×** | improves; still under gate |
+| Q2  | stateless calc | 0.67× | **0.86×** | improves; still under gate |
+| Q4  | unbounded per-category Aggregating | 23.14× | 1.62× | **HARD-FAIL** (-14×) |
+| Q5  | TUMBLE+ReducingState COUNT | 3.08× | **4.09×** | improves (+33 %) |
+| Q7  | iterator scan | 66.71× | 2.49× | **HARD-FAIL** (-26×) |
+| Q10 | filesystem sink | 0.54× | **2.33×** | massive (+4.3×) |
+| Q13 | LookupJoin async-I/O | 0.78× | **0.84×** | marginal |
+| Q14 | stateless calc | 0.85× | **1.02×** | gate-met |
+| Q15 | TUMBLE windowed-distinct | 2.27× | **2.36×** | improves |
+| Q18 | MapState dedup | 2.29× | **2.57×** | improves |
+| Q21 | URL-extract calc | 0.88× | **1.09×** | gate-met |
+| Q22 | URL-extract calc | 0.96× | **1.00×** | gate-met |
+| Q23 | 3-way join | 2.87× | **3.18×** | improves |
+
+**11 of 13 improve on G1; 2 hard-fail (Q4 and Q7).** Refined pattern (the original Round 1 analysis predicted "all state-heavy queries depend on ZGC" — empirically wrong):
+
+- **G1 wins on most state-heavy workloads** (Q5/Q15/Q18/Q23 all improve under G1) — these use **windowed-with-purge or MapState** patterns where bounded state structures get cleaned at window/join boundaries; G1's pause-based collection handles bounded short-lived state fine.
+- **G1 hard-fails specifically on:**
+  - **Q4: unbounded `AggregatingState`** — state grows per-category and never purges. ZGC's incremental low-pause collection is load-bearing; G1's STW pauses on a large old-gen tank the throughput.
+  - **Q7: iterator scan** — reads all keys per output emission, holding many references live. Same large-old-gen issue.
+
+**Verdict per the preflight decision tree:** **PARTIAL-FAIL** (Q4 -14×, Q7 -26× = HARD-FAIL on those two; all 11 others improve or stay at parity). Decision: **ship G1 behind opt-in flag**, not as default.
+
+**Active per-workload recommendation in V1.1 release notes** (refined from canary-only data):
+
+| Workload pattern | GC choice | Expected outcome |
+|---|---|---|
+| Stateless / per-record-RMW heavy (Q0/Q1/Q2/Q10/Q13/Q14/Q21/Q22 shape) | **opt-in `-XX:+UseG1GC` recommended** | 0.84-2.33× (Q10 dramatic; Q13 marginal due to async I/O floor) |
+| Windowed-with-purge + MapState joins (Q3/Q5/Q15/Q18/Q23 shape) | **either; G1 slightly better on these queries** | 1.28× to 4.09× on G1; 1.28× to 3.08× on ZGC |
+| Unbounded per-category aggregate (Q4 shape) | **stay on ZGC default** | ZGC: 23× faster than rocksdb; G1: 14× regression vs ZGC (still 1.6× faster than rocksdb but losing the 23× headline win) |
+| Iterator-scan heavy (Q7 shape) | **stay on ZGC default** | ZGC: 67× faster; G1: 26× regression vs ZGC (drops to 2.5× rocksdb) |
+| Mixed workloads | **profile representative queries; pick GC matching dominant pattern** | otherwise stand up parallel TM pools with different GC configs per pipeline |
+
+**Engineering implication:** the bucket-A floor IS partially one-GC-flag-fixable on JDK 25 via opt-in G1 — closes 4 of 8 bucket-A queries to gate and improves the remaining 4 to 0.84-0.92×. The remaining bucket-A gap (Q0-Q2, Q13) needs the bucket-B cache extensions + AppCDS to close fully. The ZGC-vs-G1 trade-off is concentrated in **2 specific workload shapes** (unbounded aggregate and iterator scan), not the broad "state-heavy" category the round-1 analysis assumed.
 
 **A-1-preflight. Pre-flight regression test on existing wins (must run before A-1 ships):** JDK does not support per-operator GC. Switching all forst-rs jobs to Generational ZGC is irreversible at config level. Q4 (23×) and Q7 (67×) depend on current single-generation ZGC's heap-reclaim cadence; changing the young-gen cadence may regress.
 - Reproduce Q4 + Q7 + Q5 + Q15 + Q18 + Q23 (6 representative wins) on `-XX:+UseZGC -XX:+ZGenerational` config, full 100 M events each.
