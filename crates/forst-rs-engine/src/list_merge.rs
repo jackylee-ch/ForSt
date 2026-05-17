@@ -15,7 +15,7 @@
 ///   - read time (materializing a merge run for a ListState.get call)
 ///   - compaction (folding a merge run into a single contiguous value)
 ///
-/// Idempotent under any schedule: combine([combine([A,B]), C]) == combine([A,B,C]).
+/// Idempotent under any schedule: `combine(combine(A,B), C)` == `combine(A,B,C)`.
 pub struct ListMergeCombiner;
 
 impl ListMergeCombiner {

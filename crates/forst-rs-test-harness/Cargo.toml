@@ -17,6 +17,7 @@ name = "forst-rs-test-harness"
 version = "0.1.0"
 edition = "2021"
 publish = false
+license = "Apache-2.0"
 description = "Fault injection harness for L5 tests (umbrella spec §5)"
 
 [dependencies]
