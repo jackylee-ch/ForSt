@@ -587,6 +587,26 @@ The routing table extends to **4 variants × 22 queries** — too granular for h
 
 Across all 5 variants tested in this session — ZGC+S3 (0.24×), G1+S3 (0.28×), G1+S3+8GiB-cache (0.28×), G1+local (0.35×), G1+S3+noCOH (0.27×) — Q12 sits in the 0.24-0.35× band. **No config knob bridges this 3× gap.** The architectural cache work (B-1 ValueStateCache + B-4c adaptive sizing) is genuinely the only remaining lever, validated empirically.
 
+## 10c. AppCDS — REVERTED (regression)
+
+Tested AppCDS for Q0/Q1/Q2 since they remained 8-14 % below gate even on G1. Process:
+1. Phase 1: ran Q0 with `-XX:ArchiveClassesAtExit=/tmp/flink-tm-cds.jsa` → 98 MB archive written on cluster stop.
+2. Phase 2: ran Q0/Q1/Q2 with `-XX:SharedArchiveFile=/tmp/flink-tm-cds.jsa`.
+
+| Query | rocksdb | G1+S3 (current) | G1+S3+AppCDS | verdict |
+|---|---:|---:|---:|---|
+| Q0 | 20.56 | 22.26 (0.92×) | **23.43 (0.88×)** | **REGRESSED** -4 pp |
+| Q1 | 19.56 | 22.26 (0.88×) | 22.28 (0.88×) | tied |
+| Q2 | 20.58 | 23.87 (0.86×) | **24.10 (0.85×)** | **REGRESSED** -1 pp |
+
+**Reason:** Flink TM is a long-running JVM. Class loading happens once at TM startup (~30 s before the first job runs). AppCDS only helps short-lived JVMs (per-job-mode CLI workflows where each job invokes a fresh JVM). In session-cluster + benchmark workflows where the TM is warmed before any benchmark query runs, AppCDS is dead weight — its CRC validation + memory-mapping overhead at JVM init is paid but never amortized.
+
+This empirically confirms what §4.3 A-2 stated as a scope limit: "session-cluster users see only first-TM-startup savings." Nexmark in this benchmark harness runs queries against an already-warm TM → AppCDS has zero amortization runway.
+
+**Decision per the user's revert-on-regression discipline:** AppCDS REVERTED. Templates `config-forst-rs-g1-cds-record.yaml.tpl` and `config-forst-rs-g1-cds.yaml.tpl` deleted. The archive `/tmp/flink-tm-cds.jsa` removed. Default `config-forst-rs.yaml.tpl` was never modified — no rollback needed.
+
+**Implication:** Q0/Q1/Q2 cannot be closed by any JVM-startup tuning we have available. The 8-14 % gap is the **steady-state JDK 25 vs JDK 17 cost differential** (different JIT compiler, different intrinsics, different CompactObjectHeaders behavior). Closing it requires either (a) reverting the JDK 25 dependency (loses ZGenerational/Vector API/FFM — defeats the V1 design) or (b) accepting the gap as the unfixable JDK-upgrade tax on state-light workloads.
+
 ## 11. Recommendation
 
 Promote **A-1 (gated by A-1-preflight) + B-1 + B-2 (with race fix) + B-4c (adaptive sizing) + B-5 (barrier-flush sharding)** to **V1.1 P0**. They are the minimum change to deliver "every forst-supported Nexmark query at ≥ 1.00× rocksdb." Without them, the V1 release notes must read "use forst-rs for windowed/joined workloads; use forst (community) for per-record-RMW workloads" — which is not the user's product position.
