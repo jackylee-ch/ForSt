@@ -549,6 +549,44 @@ After landing A-1 (G1 opt-in), additional in-session experiments isolated the co
 
 These map to the V1.1 P0 work items already documented in §3.4 + §4.3. The session's empirical sweep validates the analysis structure: no config knob exists that bypasses the documented architectural work.
 
+## 10b. Additional config variants tested (2026-05-18, second pass)
+
+After §10a's first sweep, additional config variants tested with the user's "revert on regression" discipline:
+
+### noCOH variant (drop `-XX:+UseCompactObjectHeaders`)
+
+JEP 450's CompactObjectHeaders is experimental with known performance trade-offs on JDK 25. Tested on the 6 remaining sub-1.x queries:
+
+| Query | rocksdb | G1+COH (current default) | G1+noCOH | verdict |
+|---|---:|---:|---:|---|
+| Q0  | 20.56  | 0.92× | 0.93× | tied |
+| Q1  | 19.56  | 0.88× | **0.94×** | noCOH +6 % |
+| Q2  | 20.58  | 0.86× | 0.89× | noCOH marginal |
+| Q11 | 108.70 | 0.56× | **0.68×** | noCOH +12 pp (back to ZGC's 0.67×) |
+| Q12 | 35.75  | 0.28× | 0.27× | no change |
+| Q13 | 37.92  | 0.84× | **0.79×** | **REGRESSES — revert** |
+
+**Per the user's revert-on-regression discipline:** noCOH does NOT replace COH as global default — Q13's regression rules it out as a one-flag swap. Kept as opt-in `config-forst-rs-g1-noCOH.yaml.tpl` for Q11-style session-window workloads where the +12 pp improvement matters.
+
+The default `config-forst-rs.yaml.tpl` continues to ship with `-XX:+UseCompactObjectHeaders` per V1.
+
+### Refined per-workload routing recommendation (after §10a + §10b)
+
+Three opt-in config variants available for specific workload shapes:
+
+| Variant | When to use | Helps |
+|---|---|---|
+| `config-forst-rs.yaml.tpl` (default) — **ZGC + COH + S3** | windowed aggregation, unbounded state, iterator scan (Q4 23×, Q7 67× depend on ZGC) | preserves V1 wins |
+| `config-forst-rs-g1.yaml.tpl` — **G1 + COH + S3** | stateless calc, per-record-RMW (most queries) | +9 queries cross 1.x |
+| `config-forst-rs-local.yaml.tpl` — **G1 + COH + local checkpoint** | small stateless or rapidly-purging state | marginal +1-3 pp on Q1/Q2 |
+| `config-forst-rs-g1-noCOH.yaml.tpl` — **G1 + S3 (no CompactObjectHeaders)** | session-window state (Q11-style) only | Q11 +12 pp; Q13 regresses |
+
+The routing table extends to **4 variants × 22 queries** — too granular for hand-routing. **Practical recommendation:** stand up 2 TM pools — `forst-rs-zgc-pool` (default) for state-heavy windowed/iterator-scan jobs, `forst-rs-g1-pool` for everything else. Skip the noCOH and local variants unless a specific job profile justifies them.
+
+### Empirical confirmation: per-record RMW (Q12) does not yield to config
+
+Across all 5 variants tested in this session — ZGC+S3 (0.24×), G1+S3 (0.28×), G1+S3+8GiB-cache (0.28×), G1+local (0.35×), G1+S3+noCOH (0.27×) — Q12 sits in the 0.24-0.35× band. **No config knob bridges this 3× gap.** The architectural cache work (B-1 ValueStateCache + B-4c adaptive sizing) is genuinely the only remaining lever, validated empirically.
+
 ## 11. Recommendation
 
 Promote **A-1 (gated by A-1-preflight) + B-1 + B-2 (with race fix) + B-4c (adaptive sizing) + B-5 (barrier-flush sharding)** to **V1.1 P0**. They are the minimum change to deliver "every forst-supported Nexmark query at ≥ 1.00× rocksdb." Without them, the V1 release notes must read "use forst-rs for windowed/joined workloads; use forst (community) for per-record-RMW workloads" — which is not the user's product position.
