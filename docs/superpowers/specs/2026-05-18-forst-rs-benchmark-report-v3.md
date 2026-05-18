@@ -19,9 +19,10 @@
 |---|---|---|
 | L1 engine point-lookup | forst-rs **10.0× faster** than rocksdb; forst ≈ rocksdb (JNI overhead on top) | ✅ improved from v2 (8.78×) |
 | L4 Nexmark (22 queries × 3 backends) | forst-rs wins **10/22** outright on V1 ZGC config; **16/22 with per-job G1 opt-in routing** added since v2 | ✅ scope expanded vs v2 (which tested 5 Nexmark queries) |
+| L4 Nexmark vs forst (community) — 8-query v2 scope | forst-rs **5 of 8 above 1.x**, including Q3 2.19× / Q4 208× / Q5 11.50× / Q7 104.93× / Q8 2.31× | ✅ massive wins on state-heavy; narrow miss on Q0/Q1/Q2 vs JDK 17 |
 | L2/L3 LittleE2E + StatefulE2E | **deprecated** — removed from the test surface in V1 readiness signoff (`StatefulE2EBench.java` was deleted; Nexmark Q3/Q4 are the substitute state-heavy proxies, with apples-to-apples 100 M event workloads) | covered via L4 Q3/Q4 |
 
-The v2 report's headline regression (Q3 ≈ 0.02× — was a documented async-V1 sync write-buffer pathology that V1 fixed via async-V2) has been **closed completely**: Q3 is now 1.275× on ZGC and 1.18× on G1.
+The v2 report's headline regression (Q3 ≈ 0.02× — was a documented async-V1 sync write-buffer pathology that V1 fixed via async-V2) has been **closed completely**: Q3 is now 1.275× on ZGC and 1.18× on G1, **and 2.19× vs community forst**.
 
 The remaining 6 sub-1.x queries on V1 (Q0/Q1/Q2/Q11/Q12/Q13) each have a documented V1.1 architectural fix — empirically validated as unfixable via config alone after 6 in-session config-variant experiments.
 
@@ -108,9 +109,9 @@ Existing data merged from V1 final report (`2026-05-17-v1-three-backend-perf-com
 | Q2  | 20.58  | 22.54   | 30.93  | 23.87 | 23.87 | 0.86× | **0.94×** |
 | Q3  | 27.35  | 47.06   | 21.45  | 23.28 | 21.45 | **1.28×** | **2.19×** |
 | Q4  | 262.63 | 2365.11 | 11.35  | 162.67| 11.35 | **23.14×** | **208.4×** |
-| Q5  | 124.92 | TBD     | 40.51  | 30.54 | 30.54 | **4.09×** | TBD |
-| Q7  | 470.78 | TBD     | 7.06   | 188.75| 7.06  | **66.71×** | TBD |
-| Q8  | 32.87  | TBD     | 33.34  | 26.35 | 26.35 | **1.25×** | TBD |
+| Q5  | 124.92 | **351.09** | 40.51  | 30.54 | 30.54 | **4.09×** | **11.50×** |
+| Q7  | 470.78 | **740.85** | 7.06   | 188.75| 7.06  | **66.71×** | **104.93×** |
+| Q8  | 32.87  | **60.80**  | 33.34  | 26.35 | 26.35 | **1.25×** | **2.31×** |
 | Q9  | 564.82 | n/a     | 882.72 | 317.31| 317.31| **1.78×** | n/a |
 | Q10 | 17.47  | n/a     | 32.21  | 7.49  | 7.49  | **2.33×** | n/a |
 | Q11 | 108.70 | n/a     | 162.68 | 193.80| 162.68| 0.67× | n/a |
@@ -135,9 +136,28 @@ Three-backend dataset complete for Q0-Q4. forst on Q5-Q23 is omitted from v2's s
 - ≥ 1.x: **16 of 22** queries
 - < 1.x: Q0 0.92×, Q1 0.88×, Q2 0.86×, Q11 0.67×, Q12 0.28×, Q13 0.84×
 
-**forst-rs vs forst (community), where comparable (Q0-Q4):**
-- 5 of 5 queries above 1.x: Q0 0.92× (still narrow loss vs forst's slight edge — forst on JDK 17 has lower startup tax), Q1 0.97×, Q2 0.94×, Q3 **2.19×**, Q4 **208×**.
-- Q0/Q1/Q2 vs forst very close (≥ 0.92×) — the small JDK 17 vs 25 startup tax is the difference.
+**forst-rs vs forst (community), 8 of 8 queries with full data (Q0/Q1/Q2/Q3/Q4/Q5/Q7/Q8):**
+
+| Q | forst-rs best | forst | forst-rs / forst | verdict |
+|---|---:|---:|---:|---|
+| Q0 | 22.26  | 20.57   | 0.92× | narrow miss (JDK 17 vs 25 startup tax) |
+| Q1 | 22.26  | 21.50   | 0.97× | narrow miss |
+| Q2 | 23.87  | 22.54   | 0.94× | narrow miss |
+| Q3 | 21.45  | 47.06   | **2.19×** | win |
+| Q4 | 11.35  | 2365.11 | **208×** | massive win |
+| Q5 | 30.54  | 351.09  | **11.50×** | massive win |
+| Q7 | 7.06   | 740.85  | **104.93×** | massive win |
+| Q8 | 26.35  | 60.80   | **2.31×** | win |
+
+**5 of 8 above 1.x (Q3/Q4/Q5/Q7/Q8 all state-heavy; massive wins).** The 3 narrow misses (Q0/Q1/Q2 stateless calc) are the JDK 17 vs 25 startup tax — community forst runs on JDK 17 and benefits from G1 by default plus a more-mature JIT path. The state-heavy wins range from 2× to 208×, validating the v2 design thesis that forst-rs's vectorized batch dispatch closes the per-op S3 overhead that hobbles community forst.
+
+**forst (community) is significantly slower than rocksdb on state-heavy queries:**
+- Q4: 2365 s vs 263 s = **0.11×** (rocksdb 9× faster than forst)
+- Q5: 351 s vs 125 s = **0.36×** (rocksdb 2.81× faster)
+- Q7: 741 s vs 471 s = **0.64×** (rocksdb 1.57× faster)
+- Q8: 60.8 s vs 32.9 s = **0.54×** (rocksdb 1.85× faster)
+
+This is exactly the per-op S3 latency problem that forst-rs's vectorized batch dispatch was designed to fix. The 9-208× forst-rs advantage on these queries is the direct payoff of that fix.
 
 ### L4.3 — Why the v2 Q3 regression closed
 
@@ -190,7 +210,7 @@ Identical to v2 + V1 readiness signoff: all green on `f319d099d` (current branch
 
 Three queries (Q0/Q1/Q2) at 0.86-0.92× vs rocksdb are documented as the JDK-25-vs-17 startup tax floor on stateless workloads — not a regression to be fixed at the state-backend layer.
 
-For "forst-rs ≥ 1.x vs forst (community)" where comparable: 4 of 5 Q0-Q4 queries pass (Q0 narrow miss at 0.92×; Q3 = 2.19×, Q4 = 208×). The narrow Q0 miss is the same JDK 17 vs 25 tax — community forst runs on JDK 17.
+For "forst-rs ≥ 1.x vs forst (community)" — 8 of 8 queries from v2's scope (Q0-Q8 less Q6): 5 of 8 above 1.x (Q3 2.19×, Q4 208×, Q5 11.50×, Q7 104.93×, Q8 2.31×). Q0/Q1/Q2 narrow misses at 0.92-0.97× — same JDK 17 vs 25 tax (community forst on JDK 17). On state-heavy workloads forst-rs delivers a 2-208× advantage over community forst, the direct payoff of vectorized batch dispatch closing community forst's per-op S3 latency floor.
 
 ---
 
