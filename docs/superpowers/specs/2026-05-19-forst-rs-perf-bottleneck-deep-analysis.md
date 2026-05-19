@@ -207,7 +207,32 @@ With **#4 cache** added (assuming 90% hit rate from window-local key reuse): ano
 
 ## 5. What can be done in this session vs requires V1.1 sprint
 
-### Empirical attempt: Fix #1 with `db.batch_get()` — REVERTED
+### Empirical attempts: both Fix #1 and Fix #1b — REVERTED
+
+Two iterations on the same hypothesis (substitute the per-key loop with `db.batch_get`):
+
+**Attempt 1 (Fix #1, unconditional):** replace the per-key loop unconditionally. Results:
+
+| Query | Prior (v3.2) | Fix #1 | Delta | Verdict |
+|---|---:|---:|---:|---|
+| Q11 (SESSION window) | 176.64 s | 159.62 s | **-9.6%** | improvement |
+| Q12 (PROCTIME tumble) | 116.56 s | 128.99 s | **+10.7%** | REGRESSION |
+
+Reverted.
+
+**Attempt 2 (Fix #1b, threshold-gated at count ≥ 16):** assumption was that Q12 has small batches (1-4) that should fall to the per-key path. Results:
+
+| Query | Prior (v3.2) | Fix #1b | Delta | Verdict |
+|---|---:|---:|---:|---|
+| Q11 | 176.64 s | 160.16 s | **-9.3%** | improvement (replicates Fix #1) |
+| Q12 | 116.56 s | 128.00 s | **+9.8%** | **STILL REGRESSES** |
+| Q5  | 32.45 s  | 34.23 s  | **+5.5%** | regression |
+
+Reverted.
+
+**Empirical lesson sharpened:** Q12's batches **are actually ≥ 16** under per-record-RMW (async-state batches more aggressively than the analysis assumed). The threshold of 16 routed Q12 to the `batch_get` path where the `Vec<Option<Vec<u8>>>` allocation regresses. Threshold gating doesn't rescue this. **Only a true zero-allocation engine API can win on both regimes simultaneously.**
+
+This is a high-value negative result: it bounds the next API design.
 
 I implemented Fix #1 in-session (replaced the per-key `db.get()` loop with a single `db.batch_get(cf, &key_refs)` call in `crates/forst-rs-ffi/src/lib.rs:2413-2440`), rebuilt the dylib, and benched:
 
@@ -232,13 +257,58 @@ All three require more work than this session allows; documented as V1.1.
 
 **This session (immediately implementable, low-risk):**
 
-- Reverted Fix #1 because Q12 regressed > 10% (failed user's gate)
-- Validated that the FFI per-key loop IS the bottleneck, but `db.batch_get` as-is isn't the right substitute. The engine needs a zero-intermediate-alloc batch path.
+- Reverted Fix #1 and Fix #1b — both caused Q12 regression > 5 %
+- Validated that the FFI per-key loop IS the bottleneck (Q11 -9.6 % proves it), but `db.batch_get` as-is isn't the right substitute because the `Vec<Option<Vec<u8>>>` outer allocation re-introduces overhead on Q12-style workloads. Threshold gating doesn't help (Q12 batches ≥ 16 → routes through the same regressing path).
 
-**Requires V1.1 sprint (multi-day, risk-managed):**
-- Fix #1c/#1d: zero-alloc batch_get on engine side
-- Fix #2: MemorySegment-slice deserialize contract change across state classes
-- Fix #4: cache + property test + bench acceptance gates (full plan in `2026-05-19-mapstate-cache-implementation-plan.md`)
+**Requires V1.1 sprint (multi-day, risk-managed) — REVISED priority order:**
+
+1. **Fix #1d (P0, first deliverable) — zero-alloc `batch_get_into` engine API.** New engine signature:
+
+   ```rust
+   /// Fill caller-provided out buffers directly, no intermediate Vec allocations.
+   pub fn batch_get_into(
+       &self,
+       cf: &ColumnFamilyHandle,
+       keys: &[&[u8]],
+       out_validity: &mut [u8],
+       out_offsets: &mut [i32],
+       out_data: &mut [u8],
+   ) -> ForstResult<usize>;  // returns total bytes written to out_data
+   ```
+
+   This is the most general zero-allocation abstraction. It closes Bottleneck #1 (per-key loop overhead) and Bottleneck #2 (Java-side `byte[]` could be eliminated by passing the off-heap slice through deserializers — see Fix #2) in **a single API change**, with #1c (`batch_get_arrow`) becoming an Arrow specialization layered on top rather than a parallel path.
+
+2. **Fix #1c — Arrow specialization on top of #1d.** Once #1d lands, `batch_get_arrow` can be implemented as a thin Arrow-output wrapper that calls #1d internally. No standalone engine path needed.
+
+3. **Async-Profiler / `perf` flamegraph before committing Fix #1d.** Decompose the 853 ns Q12 gap into its components:
+   - FFM boundary crossing (estimated ~150 ns × 2 calls/event = ~300 ns)
+   - Per-key engine call overhead (estimated ~50-100 ns/key × N)
+   - Java-side `byte[]` allocation + copy (estimated ~30 ns/event)
+   - Result decoding + deserialization (estimated ~50 ns/event)
+   - Remaining unaccounted (likely small-batch dispatch fixed costs)
+
+   Tooling:
+   - **JVM side:** `async-profiler -d 60 -f /tmp/q12-jvm.html <tm-pid>` captures FFM crossings + Java allocation hotspots
+   - **Rust side:** `perf record -F 99 -g -- <bench>; perf script | flamegraph.pl > /tmp/q12-rust.svg`
+
+   Without these numbers we are guessing weights; with them we can put numbers on each Fix's expected payoff.
+
+4. **Fix #4 (ValueStateCache) — CONDITIONAL P0.** Launch only if **Q12 remains < 0.7× rocksdb after Fix #1d ships.** If #1d closes Q12 to ≥ 0.7×, defer the cache to V1.2 — its complexity (race tests, per-key tracking, barrier flush sync) only justifies itself when the cheaper engine-API fix is insufficient. The conditional gate prevents over-investing in a complex feature when a simpler one would suffice.
+
+5. **Fix #2 — MemorySegment-slice deserialize.** Implementable independently of #1d but should land in the same sprint to compound. Touches the `ForStRsInnerTable` interface across 5 state classes.
+
+### Sequencing
+
+```
+day 1-2: flamegraphs + Fix #1d design + engine API stub
+day 3-4: Fix #1d implementation + FFI rewire + bench
+day 5:   bench acceptance gates (full 23-query sweep)
+day 6:   if Q12 still < 0.7×, start Fix #4 cache work; else mark cache as V1.2
+day 7-9: Fix #4 implementation + race test (if needed)
+day 10:  Fix #2 + final 23-query sweep + release notes
+```
+
+5-7 engineer-days, 2 engineers parallel reduces to 6-7 calendar days per the perf-recovery analysis §7.
 
 ---
 
