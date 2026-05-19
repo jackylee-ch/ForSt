@@ -358,19 +358,35 @@ pub enum BatchGetResult {
 
    Without these numbers we are guessing weights; with them we can put numbers on each Fix's expected payoff.
 
-4. **Fix #4 (ValueStateCache) — CONDITIONAL P0, three-band trigger.** Decision after #1d ships and Q12 is re-benched:
+4. **Fix #4 (ValueStateCache / MapStateCache) — CONDITIONAL P0, per-query-shape tri-state trigger.** Decision after #1d ships and the suite is re-benched. **The trigger is differentiated by query shape** because session-window patterns (Q11) have intrinsically higher cache hit rates than tumble-window patterns (Q12), so MapStateCache ROI is structurally higher for Q11 — same threshold for both would over- or under-invest.
 
-   | Band | Q12 vs rocksdb post-#1d | Decision |
-   |---|---:|---|
-   | **Red** | < 0.7× | **Launch ValueStateCache in V1.1.** Engine fix wasn't enough; cache is the next architectural lever. |
-   | **Yellow** | 0.7× to 0.85× | **Retrospect-first, don't commit yet.** The middle band is where missed bottlenecks hide. Re-run Async-Profiler with #1d's code paths visible, look for a 3rd contributor (e.g., GC pressure that #1d revealed by removing the alloc, or a deserialize hotspot that became proportionally larger after FFM cost dropped). Only commit to cache if the retrospective confirms no cheaper fix exists. |
-   | **Green** | ≥ 0.85× | **Defer to V1.2.** Cache complexity (race tests, per-key tracking, barrier flush sync) is unjustified at this delta; close the V1.1 gap with bench-only verification. |
+   | Query | Red (launch in V1.1) | Yellow (retrospect-first) | Green (defer V1.2) |
+   |---|---|---|---|
+   | **Q12** (TUMBLE / PROCTIME) | < 0.7× | 0.7× – 0.85× | ≥ 0.85× |
+   | **Q11** (SESSION window) | < 0.7× | 0.7× – 0.85× | **≥ 0.85× still launch** |
+   | **Q9** (ROW_NUMBER) | < 0.7× | 0.7× – 0.85× | ≥ 0.85× |
+   | **Q20** (streaming join) | < 0.7× | 0.7× – 0.85× | ≥ 0.85× |
 
-   The three-band gate prevents the binary-decision pathology where 0.71× and 0.85× get the same treatment despite the former having clearly more headroom for a complex fix than the latter.
+   **Q11 special-case rationale:** Q11's `(bidder, session_id)` key has a session that spans many bid records before window-close. The same key is RMW'd many times during the session lifetime — cache hit rate is intrinsically ~99 % once the session opens. **Even at 0.85× rocksdb post-#1d, the marginal cost of MapStateCache for Q11 is small (key tracking) while the marginal benefit is large (eliminate all but the first RMW's FFM call). Launch the cache for Q11 if it's anywhere below parity.**
+
+   **General rationale for the three bands** (applies to other queries):
+   - **Red:** engine fix wasn't enough; cache is the next architectural lever.
+   - **Yellow:** the middle band is where missed bottlenecks hide. Re-run Async-Profiler with #1d's code paths visible; look for a 3rd contributor (e.g., GC pressure that #1d revealed by removing the alloc, or a deserialize hotspot that became proportionally larger after FFM cost dropped). Only commit to cache if the retrospective confirms no cheaper fix exists.
+   - **Green:** cache complexity (race tests, per-key tracking, barrier flush sync) is unjustified at this delta; close the V1.1 gap with bench-only verification.
 
    **Why retrospect-first matters:** if #1d closes Q12 from 0.27× to 0.80× and we just launched the cache, the cache might over-attribute the next 10 % to itself when the real cause was a different unaddressed hotspot. Retrospection re-validates the model before adding complexity.
 
 5. **Fix #2 — MemorySegment-slice deserialize.** Implementable independently of #1d but should land in the same sprint to compound. Touches the `ForStRsInnerTable` interface across 5 state classes.
+
+### Next-audit scope (V1.1 sprint planning)
+
+In addition to fixing the 5 violations identified in `2026-05-19-vectorization-violation-audit-q8q9q11q12q20.md`, **the next audit MUST include Q3** (stream-stream join `auction JOIN bid ON A.id = B.auction`). Rationale:
+
+- Q3 is the closest-to-unaudited state shape — it uses MapState-based stream-stream join with multi-set semantics + watermark-driven cleanup, a code path none of Q8/Q9/Q11/Q12/Q20 fully exercises.
+- v3.2 measured Q3 at 1.09× rocksdb (above gate) but with thin headroom; the join-state-cleanup path is heavily exercised and may contain a separate "per-record-tombstone-write" or "watermark-driven prefix-delete" violation class.
+- If a join-specific violation exists, finding it before #1d ships saves a sprint cycle.
+
+Q3 audit focus areas: per-record-tombstone-write patterns; watermark-driven prefix-delete paths; any per-row state cleanup bypassing `frs_vectorized_batch_delete`.
 
 ### Sequencing
 

@@ -136,6 +136,38 @@ Implements Fix #1b per docs/superpowers/specs/2026-05-19-forst-rs-perf-bottlenec
 
 ---
 
+## Query characterization template (perf work)
+
+Before benching any new Nexmark / SQL workload against forst-rs, fill in the SQL-to-state-shape table for the query. This forces explicit reasoning about the state operations the query exercises before drawing conclusions from wall-clock numbers.
+
+| Field | What to fill in |
+|---|---|
+| **Q number / name** | e.g. `Q12 — PROCTIME tumble per bidder count` |
+| **SQL shape** | One-line summary of the SQL — windowing pattern, join type, aggregation kind |
+| **GROUP BY / partition keys** | Per-row operator key (the keyContext driving state) |
+| **Dominant state operation** | windowed agg / per-record RMW / streaming join / iterator scan / TopN rank |
+| **State class hit** | `ForStRsValueStateV2` / `ForStRsMapStateV2` / `ForStRsAsyncReducingStateV2` / etc. |
+| **Cache-hit-rate expectation** | rough estimate ("high — same key hit many times per window" / "low — keys distributed uniformly") |
+| **Iterator usage** | none / yes — prefix scan on `<column>` |
+
+Example (Q12):
+
+| Field | Value |
+|---|---|
+| Q number / name | Q12 — PROCTIME tumble per bidder count |
+| SQL shape | `TUMBLE(B, PROCTIME(), INTERVAL '10' SECOND) GROUP BY bidder, window_start, window_end` |
+| GROUP BY / partition keys | bidder |
+| Dominant state operation | windowed COUNT — per-bid GET-modify-PUT on `MapState<(window_start, window_end), Long>` |
+| State class hit | `ForStRsMapStateV2` |
+| Cache-hit-rate expectation | ~95 % steady-state (each bidder in 1 active window; consecutive bids hit same key) |
+| Iterator usage | none |
+
+**Long-term goal:** auto-generate this table from `EXPLAIN PLAN_WITH_STATE_RESOURCES` output, then contribute the tooling upstream to Flink master so all state backends use the same characterization framework.
+
+The template was extracted from the 2026-05-19 vectorization-violation audit (`docs/superpowers/specs/2026-05-19-vectorization-violation-audit-q8q9q11q12q20.md`) where filling it in for 5 queries explicitly revealed that all 5 hit `ForStRsMapStateV2` — pinning the bottleneck before the perf data confirmed it.
+
+---
+
 ## Testing
 
 Pre-existing project conventions for tests (TDD, race-test gates for concurrent state classes, integration tests via `cargo test -p forst-rs-test-harness`) remain in force. See `docs/superpowers/specs/2026-05-16-forst-rs-vectorized-parity-design.md` §5 for the test taxonomy.

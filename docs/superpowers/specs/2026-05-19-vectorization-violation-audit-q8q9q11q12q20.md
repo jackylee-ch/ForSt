@@ -199,3 +199,96 @@ Per the user's "audit-only" answer to the brainstorming question, this audit doe
 Violations #2, #3 are V1.1 P0 work per the locked Fix #1d / Fix #2 plan in `2026-05-19-forst-rs-perf-bottleneck-deep-analysis.md`.
 
 Violation #5 is conditional on the tri-state trigger after #1d ships.
+
+---
+
+## §A — Built-but-unwired sweep (next-step #2)
+
+**Method:** grep all `pub extern fn frs_vec*` and `frs_vectorized*` exports in `crates/forst-rs-ffi/src/lib.rs`; cross-reference against the `downcallHandle("frs_*")` registrations in `ForStRsLinker.java`; for each match, check if a non-Linker caller in production code paths invokes it (vs only test code or unreachable code paths).
+
+**Sweep result:**
+
+| Rust export | Java linker method exists | Caller from production hot path | Status |
+|---|---|---|---|
+| `frs_vectorized_batch_get` | ✓ | `VectorizedExecutor.executeGets` | wired and used (carries violation #2 internally) |
+| `frs_vectorized_batch_put` | ✓ | `VectorizedExecutor.executePuts` | wired and used (already uses WriteBatch — optimal) |
+| `frs_vectorized_batch_delete` | ✓ | `VectorizedExecutor.executeDeletes` | wired and used |
+| `frs_vec_iter_prefix_open` | ✓ | `VectorizedExecutor.dispatchIterPrefix` (Path B only) | wired but Flink-framework iteration uses Path A instead |
+| `frs_vec_iter_prefix_next` | ✓ | `FrsIterHandle.next` (Path B only) | **CRITICAL — wired but unreachable from Flink-framework MAP_ITER requests** |
+| `frs_vec_iter_prefix_close` | ✓ | `FrsIterHandle.close` (Path B only) | same Path B confinement |
+| `frs_vec_iter_prefix_abort` | ✓ | `IterLifetimeWatchdog` | wired and used by watchdog |
+| `frs_vec_iter_range_open/next/close/abort` | ✓ | `IterRangeRequest` (Path B only) | same Path B confinement |
+| `frs_vec_merge_append` | ✓ | `AppendMergeBatchBuffer` | wired |
+| `frs_abi_version` | ✓ | called at backend init | wired |
+
+**Discovery — architectural "two iteration paths":**
+
+The code maintains **two parallel iteration paths** that diverged during V1 development:
+
+- **Path A (legacy):** `ForStRsDBIterRequest.process()` → `linker.prefixLookupOpen` → `linker.iteratorNext(iter)` loop. Used for all Flink-async-V2-framework-originated `MAP_ITER`/`MAP_ITER_KEY`/`MAP_ITER_VALUE` requests (the only iteration entry points Flink itself constructs).
+- **Path B (vectorized):** `IterPrefixRequest extends VectorizedStateRequest` → `VectorizedExecutor.submitVectorized` → `linker.frsVecIterPrefixOpen` + `linker.frsVecIterPrefixNext` chunked. Only reachable from forst-rs code that explicitly builds an `IterPrefixRequest` (e.g., `submitVectorized()` call sites). **No state class currently does this — they all rely on Flink's framework, which routes through Path A.**
+
+**Conclusion:** the vectorized iterator infrastructure was fully built and tested, but it is **unreachable from the Flink hot path** because state classes (`ForStRsMapStateV2.asyncEntries/asyncKeys/asyncValues`) inherit `AbstractMapState` defaults that construct `StateRequest(MAP_ITER)` objects, which the classifier routes to Path A. **Path B is dead code for production workloads** until either (a) `ForStRsDBIterRequest.process()` is rewritten to call `frsVecIterPrefixNext` directly (the fix proposed in violation #1), or (b) the state classes override `asyncEntries` etc. to construct `IterPrefixRequest` directly.
+
+Option (a) — wire the chunked API into Path A — is the right fix because it preserves the existing Flink-framework integration contract while eliminating the per-entry FFM call.
+
+**Proposed CI lint** (zero-runtime-cost preventive measure):
+
+A small Python/bash script in `.github/workflows/`:
+
+```bash
+# scripts/check-built-but-unwired.sh
+set -e
+RUST_EXPORTS=$(grep -E 'pub.*extern.*fn frs_(vec|vectorized)' crates/forst-rs-ffi/src/lib.rs \
+               | sed -E 's/.*fn (frs_[a-z_]+).*/\1/' | sort -u)
+JAVA_REFS=$(grep -roE 'frs_(vec|vectorized)[a-z_]+' \
+              flink-state-backends/flink-statebackend-forst-rs/src/main/java/ \
+              | sort -u | cut -d: -f2)
+# Compare and fail if any Rust export has no Java caller.
+diff <(echo "$RUST_EXPORTS") <(echo "$JAVA_REFS") || exit 1
+```
+
+This wouldn't catch the Path A/Path B reachability issue (since `frsVecIterPrefixNext` IS called from `FrsIterHandle`), but it would catch the broader category of "added Rust FFI without wiring Java side."
+
+**Stronger lint (catches the Path A/B case):** add an annotation marker comment in `ForStRsLinker.java` like `// @ProductionHotPath` next to wrappers expected to be called from hot paths, plus a script that asserts each such wrapper is invoked from at least one non-test, non-Linker class in `org.apache.flink.state.forstrs.*`. V1.1 follow-up.
+
+---
+
+## §B — Violation #5 trigger split by query shape (next-step #3)
+
+The deep-analysis doc's tri-state trigger (Red/Yellow/Green at 0.7×/0.85×/up) treats Q11 and Q12 identically. They aren't:
+
+- **Q12 (PROCTIME tumble per bidder count):** key = `(bidder, window_start, window_end)`. Window changes every 10 s of proc-time. **Each bidder typically appears in 1 active window at a time;** consecutive bids by the same bidder within 10s hit the same key. Cache hit rate ≈ 95 % if working set fits.
+
+- **Q11 (SESSION window per bidder, 10s gap):** key = `(bidder, session_id)`. Session merges as new bids arrive within the gap; **state for a single bidder spans many records before a window closes** (sessions can be much longer than 10s on a hot bidder). Cache hit rate **structurally higher** than Q12 — same `(bidder, session)` is hit many times before the session closes.
+
+**Revised tri-state trigger (split by query shape):**
+
+| Query | Red (launch cache) | Yellow (retrospect-first) | Green (defer V1.2) |
+|---|---|---|---|
+| Q12 (TUMBLE/PROCTIME) | < 0.7× | 0.7× – 0.85× | ≥ 0.85× |
+| Q11 (SESSION) | < 0.7× | 0.7× – 0.85× | **≥ 0.85× still launch — see note** |
+| Q9 (ROW_NUMBER) | < 0.7× | 0.7× – 0.85× | ≥ 0.85× |
+| Q20 (streaming join) | < 0.7× | 0.7× – 0.85× | ≥ 0.85× |
+
+**Q11 note:** Q11's session-window state has intrinsically higher cache hit rate; MapStateCache ROI is structurally larger. **Q11's effective trigger threshold is `< 0.85×`** (i.e., yellow band shifts to green only if Q11 is at parity or above). Rationale: even at 0.80× rocksdb, Q11 has cheap headroom from cache that other queries don't.
+
+This is recorded as a refinement to `2026-05-19-forst-rs-perf-bottleneck-deep-analysis.md` §5.
+
+---
+
+## §C — Q3 added to next audit's scope (next-step #5)
+
+Q3 (stream-stream join: `auction JOIN bid ON A.id = B.auction`) has state shape **closest to the unaudited surface** in the V1 design — it uses MapState-based stream-stream join with multi-set semantics + watermark-driven cleanup. v3.2 measured Q3 at **1.09× rocksdb** (above gate) and **1.81× forst** — but the head-room above the gate is thin, and the join-state-cleanup path is exercised heavily.
+
+**Hypothesis: Q3 may expose a "join-multiset-cleanup" violation class** that this audit didn't see because Q8/Q11/Q12 use windowed-aggregate (different state-cleanup contract) and Q9/Q20 use streaming-join (Q9 with TopN-style cleanup, Q20 with category-filter probe but no time-windowed cleanup).
+
+**Q3 in scope for next audit:** look for per-record-tombstone-write patterns, watermark-driven prefix-delete paths, and any per-row state cleanup that bypasses `frs_vectorized_batch_delete`.
+
+---
+
+## §D — SQL-to-state-shape mapping template (next-step #4)
+
+The audit's §"SQL → state-shape map" table is being lifted into `CONTRIBUTING.md` as the standard template for query characterization in any future perf work. Long-term goal: auto-generate from Flink logical plans via `EXPLAIN PLAN_WITH_STATE_RESOURCES`, then contribute the tooling upstream to Flink master so other state backends can use the same characterization framework.
+
+See `CONTRIBUTING.md` §"Query characterization template" for the standard form.
