@@ -262,6 +262,71 @@ All three require more work than this session allows; documented as V1.1.
 
 **Requires V1.1 sprint (multi-day, risk-managed) — REVISED priority order:**
 
+### Pre-flight diagnostics (REQUIRED before writing #1d code)
+
+These run on day 1 of the sprint, before any code is touched. They surface cognitive blind spots before commitment to an implementation:
+
+**Diag-A: Batch-size distribution histogram.** Instrument `frs_vectorized_batch_get` to log a histogram of `count` values per call across a full Q11 + Q12 + Q5 run. The Fix #1b failure was rooted in the assumption that Q12 had small batches (1-4); the empirical data contradicted this. **Before designing #1d, get the actual distribution.** If Q12's mode batch size is 32+, the API design needs to optimize for medium-large batches; if it's bimodal, the API needs a small-batch fast-path that doesn't allocate.
+
+Histogram delivery: append-only file `/tmp/batch-size-histogram-{query}.tsv` with one line per call (`<count>\t<elapsed_ns>`), processed with `awk` to bucket. Cost: ~20 lines of Rust, minimal runtime overhead with feature-flag gate.
+
+**Diag-B: Predicted-vs-measured cost table for the 853 ns gap.** Before implementing #1d, build this table from flamegraph data:
+
+| Component | Predicted (analysis §2) | Async-Profiler / perf measured | Delta | Notes |
+|---|---:|---:|---:|---|
+| FFM boundary cross (2× per RMW) | 300 ns | TBD | TBD | Async-Profiler `Java_*` / `org.openjdk.foreign.NativeMemorySegment` frames |
+| Per-key engine call (db.get loop) | 50-100 ns × N | TBD | TBD | `perf record` on Rust side |
+| Java `byte[]` alloc + copy (executeGets:315) | 30 ns | TBD | TBD | Async-Profiler `_new_array_Java` frame |
+| Deserialize + completeGet | 100 ns | TBD | TBD | TypeSerializer frames |
+| Small-batch dispatch fixed cost | residual | TBD | TBD | sum minus above |
+
+**The total measured column must sum to within ±15% of the empirical 853 ns gap.** If it doesn't, the model is wrong and we're missing a bottleneck — pause the sprint and re-investigate before writing #1d. This catches the "missed weight" failure mode where engineering effort goes into the wrong fix.
+
+**Diag-C: Re-confirm Q11 batch size ≠ Q12 batch size.** Fix #1's Q11 win and Q12 regression were attributed to different batch sizes. Diag-A's histogram either confirms or falsifies this. If batch sizes are similar, the regression cause is elsewhere (e.g., different value-size distribution, different hit-rate of memtable vs SST) and the next fix needs to target that instead of just batch size.
+
+These three diagnostics are the gate. **No #1d code is committed before they're complete and the cost table sums correctly.**
+
+### Fix #1d API signature — LOCKED (Option A)
+
+After the diagnostics, the API signature is fixed before implementation begins. **Option A (caller-provides + optimistic sizing + rare retry) is locked in; the two-step size-probe alternative is explicitly rejected.**
+
+```rust
+/// Fill caller-provided out buffers directly. Zero engine-side allocations.
+///
+/// Returns `Ok(total_bytes)` if all values fit; `Err(BufferTooSmall { needed })` if
+/// `out_data.len() < total_bytes_needed`. Caller grows the buffer and retries.
+///
+/// Buffer sizing convention (Option A — optimistic + rare retry):
+///   - Caller allocates `out_data` based on a sticky high-water-mark (initially
+///     `count * avg_value_size_observed`, defaulting to `count * 256` on first call).
+///   - On `BufferTooSmall`, caller grows to `max(needed, 2 * current)` and retries.
+///   - Engine fills `out_offsets[0..=count]`, `out_validity[0..count]`, and
+///     `out_data[0..total_bytes]`. Engine does NOT allocate any Vec.
+pub fn batch_get_into(
+    &self,
+    cf: &ColumnFamilyHandle,
+    keys: &[&[u8]],
+    out_validity: &mut [u8],   // len == keys.len()
+    out_offsets: &mut [i32],   // len == keys.len() + 1
+    out_data: &mut [u8],       // caller-sized
+) -> ForstResult<BatchGetResult>;
+
+pub enum BatchGetResult {
+    Ok { total_bytes: usize },
+    BufferTooSmall { needed: usize },
+}
+```
+
+**Why Option A and not the alternative:**
+
+- *Rejected alternative (two-step size-probe):* "first pass counts total value bytes, second pass copies." This pays per-key engine cost twice on the hot path. Empirically this is the same failure mode Fix #1 hit — small batches don't amortize the doubled engine work. The Q12 regression was a Vec alloc; doubling per-key work would be worse.
+- *Option A* pays the engine cost once. The retry is rare in practice (high-water-mark grows monotonically; once sized correctly for a workload, it never retries). On a cache-miss-cold start, retry adds one extra `batch_get_into` call but no engine work duplication.
+- The `BatchGetResult::BufferTooSmall { needed }` carries the exact required size so the caller grows once, not exponentially.
+
+**API signature locked here means: no further API design loop during implementation; only internal Rust code can change.**
+
+### Original V1.1 priority list
+
 1. **Fix #1d (P0, first deliverable) — zero-alloc `batch_get_into` engine API.** New engine signature:
 
    ```rust
@@ -293,7 +358,17 @@ All three require more work than this session allows; documented as V1.1.
 
    Without these numbers we are guessing weights; with them we can put numbers on each Fix's expected payoff.
 
-4. **Fix #4 (ValueStateCache) — CONDITIONAL P0.** Launch only if **Q12 remains < 0.7× rocksdb after Fix #1d ships.** If #1d closes Q12 to ≥ 0.7×, defer the cache to V1.2 — its complexity (race tests, per-key tracking, barrier flush sync) only justifies itself when the cheaper engine-API fix is insufficient. The conditional gate prevents over-investing in a complex feature when a simpler one would suffice.
+4. **Fix #4 (ValueStateCache) — CONDITIONAL P0, three-band trigger.** Decision after #1d ships and Q12 is re-benched:
+
+   | Band | Q12 vs rocksdb post-#1d | Decision |
+   |---|---:|---|
+   | **Red** | < 0.7× | **Launch ValueStateCache in V1.1.** Engine fix wasn't enough; cache is the next architectural lever. |
+   | **Yellow** | 0.7× to 0.85× | **Retrospect-first, don't commit yet.** The middle band is where missed bottlenecks hide. Re-run Async-Profiler with #1d's code paths visible, look for a 3rd contributor (e.g., GC pressure that #1d revealed by removing the alloc, or a deserialize hotspot that became proportionally larger after FFM cost dropped). Only commit to cache if the retrospective confirms no cheaper fix exists. |
+   | **Green** | ≥ 0.85× | **Defer to V1.2.** Cache complexity (race tests, per-key tracking, barrier flush sync) is unjustified at this delta; close the V1.1 gap with bench-only verification. |
+
+   The three-band gate prevents the binary-decision pathology where 0.71× and 0.85× get the same treatment despite the former having clearly more headroom for a complex fix than the latter.
+
+   **Why retrospect-first matters:** if #1d closes Q12 from 0.27× to 0.80× and we just launched the cache, the cache might over-attribute the next 10 % to itself when the real cause was a different unaddressed hotspot. Retrospection re-validates the model before adding complexity.
 
 5. **Fix #2 — MemorySegment-slice deserialize.** Implementable independently of #1d but should land in the same sprint to compound. Touches the `ForStRsInnerTable` interface across 5 state classes.
 

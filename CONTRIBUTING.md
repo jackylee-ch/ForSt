@@ -81,6 +81,51 @@ Per revert-on-regression discipline: REVERTED.
 
 This makes the commit log itself the audit trail.
 
+### MUST: Rust-side changes reference dylib rebuild command + SHA-256 checksum
+
+Performance commits that change Rust code in `crates/forst-rs-*/` must include in the commit message:
+
+1. The exact rebuild command used to produce the dylib that was benched:
+
+   ```
+   Rebuild: cargo build -p forst-rs-ffi --release
+   Deploy: cp target/release/libforst_rs_ffi.dylib \
+           /Users/lijunqing/Downloads/workenv/flink-2.2.1/lib/libforst_rs_ffi.dylib
+   ```
+
+2. The SHA-256 checksum of the deployed dylib (proves the binary the bench measured matches the source the commit reflects):
+
+   ```
+   Dylib SHA-256: shasum -a 256 .../libforst_rs_ffi.dylib
+                  <64-hex-char>  libforst_rs_ffi.dylib
+   ```
+
+**Why:** during the 2026-05-19 Fix #1 iteration, the difference between "Rust source committed" and "Rust dylib actually deployed for the bench" caused at least one false start where a stale dylib was producing prior-version numbers. Checksum the deployed artifact and put the value in the commit message — that lets any reviewer reproduce the exact bench.
+
+### MUST: Benchmark reports include criterion repeat counts + variance
+
+Every benchmark number in a commit message or perf-recovery report must come from a measurement that documents:
+
+- **N (number of samples or iterations):** criterion default is 100 samples × 5 s collection. State the value if non-default. For Nexmark wall-clock, state the number of repeats (default: 1 per bench-suite run, so report explicitly).
+- **Variance / confidence interval:** criterion auto-reports `[lower median upper]`; include the median + bounds, not just the point estimate. For Nexmark, report the wall-clock + a noise estimate (typically ±5-10 % on this hardware).
+
+Example (good):
+
+```
+L1 point_lookup/100K: 29.01 ns [28.90 ns, 29.13 ns] (criterion, 100 samples, p < 0.05 vs prior 32.35 ns)
+Q12 Nexmark: 116.56 s (single run, ±~10 % thermal/criterion variance estimate)
+```
+
+Example (bad — caused several false-positive deltas in this project's history):
+
+```
+Q12: 116s -> 128s slower
+```
+
+Without N and variance, "+10 %" might be noise. With them, reviewers can decide.
+
+**Why:** the 2026-05-19 Fix #1b experiment showed Q5 at +5.5 % which is right on the noise boundary. With variance bounds reported, "+5.5 % ± 8 %" reads as inconclusive; without them, "+5.5 %" reads as a regression. The discipline forces honesty about measurement quality.
+
 ### SHOULD: Cross-reference the spec document
 
 Performance specs live in `docs/superpowers/specs/`. Reference them in the commit message:
