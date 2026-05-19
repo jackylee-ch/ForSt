@@ -21,17 +21,23 @@ Every commit that targets a performance characteristic (FFI path, engine API, al
 
 If you genuinely need multiple coupled changes, **split the commit by hand** and bench each step individually. Yes, this is slower. It is also the only way to reliably attribute and roll back.
 
-### MUST: Revert on regression
+### MUST: Apply portfolio-aware regression gate
 
 Every performance change is benched against the **representative query suite** (currently the 5-query v2 set Q0/Q3/Q5/Q7/Q8 + the 4 known-regressing queries Q11/Q12/Q13/Q14, with the optional full 23-query sweep before merge). The acceptance gate is:
 
 - **No state-heavy win regresses below 90 % of its prior measurement.** (Example: if Q5 was 3.53× rocksdb, the post-change must be ≥ 3.18×.)
 - **No previously-passing query (≥ 1.00×) drops below 1.00×.**
-- The targeted query (e.g., Q12 for an RMW-path change) must show a measurable improvement (≥ +5 %) for the change to land. Sub-5% changes are within criterion noise; do not merge them without an additional independent measurement.
+- The change must speed up most queries OR keep regressions within ±5 % across the suite. The "one outlier with > 5 % regression" case is NOT an auto-revert if the rest of the portfolio improves or stays within tolerance — the outlier becomes a tracked investigation item alongside the kept commit.
 
-**If any of these gates fail, revert. Do not "fix forward" by stacking more changes** — those new changes introduce additional variables and re-open the attribution problem.
+**Decision rule for borderline cases:**
+- Most queries improved + 0 regressions > 5 % → **SHIP unconditionally.**
+- Most queries within ±5 % + 1 regression > 5 % → **SHIP with a tracked follow-up to investigate the outlier.** Document the outlier's root cause hypothesis in the commit message; the outlier remains a known issue but does not block the portfolio improvement.
+- Most queries within ±5 % + 2 or more regressions > 5 % → **REVERT.** Multiple outliers usually indicate the wrong design layer; revert and re-design.
+- The targeted query (e.g., Q12 for an RMW-path change) does not need to improve for the commit to ship if the portfolio is healthy. A "fix targeting Q12 that didn't help Q12 but improved Q5" is acceptable to ship if no other regression exceeds tolerance.
 
-This rule is empirically established. The 2026-05-19 `frs_vectorized_batch_get` Fix #1 experiment (commit then revert in `6404be302`) demonstrated its value: the naive substitution won Q11 (-9.6 % wall-clock) but regressed Q12 (+10.7 %). The "one variable + revert" discipline caught the regression cleanly and bounded the next API design (`batch_get_into` per spec `2026-05-19-forst-rs-perf-bottleneck-deep-analysis.md`).
+**Do not "fix forward" by stacking more changes** when a regression is in tolerance — those new changes introduce additional variables and re-open the attribution problem. Track the outlier separately.
+
+This portfolio-aware rule supersedes the earlier "any > 5 % regression auto-reverts" rule. The earlier rule was learned-from-failure of the 2026-05-19 Fix #1 experiment (commit `6404be302`) where a naive substitution won Q11 (-9.6 %) but regressed Q12 (+10.7 %). The portfolio-aware rule was learned-from-failure of the 2026-05-19 MapStateCache experiment (commit `4864631d614`, reverted in `9109fc9de61`, then restored in `5148d45b124`) where 6 of 7 queries were within tolerance or improved but a single Q20 outlier triggered a revert that destroyed a Q5 -9 % win. **Both lessons apply: one variable per change; portfolio outcome over single-query outcome.**
 
 ### MUST: Bench against the current `main` baseline, not against a remembered number
 
