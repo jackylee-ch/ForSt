@@ -66,6 +66,23 @@ But `ForStRsDBIterRequest.process()` doesn't call it. It still uses the legacy `
 
 This is the single highest-impact fix on the audited code.
 
+**Status: ✅ FIXED in Commit A (`7a7c7c4ee35`) + Commit B (`75958edc53b`) on branch `forst-rs-jdk25`.**
+
+- **Commit A** — wired chunked `frs_vec_iter_prefix_next` into `ForStRsDBIterRequest.process()`, replacing 128 per-entry `linker.iteratorNext()` FFM calls with one chunked call per drain. Single-file change (~80 lines). Tests: new `process_uses_one_chunked_call_not_per_entry_loop` unit test + full module suite (148/148).
+- **Commit B** — introduced `IteratorEntryView` record for slice-based decode, eliminating per-entry `byte[]` copy from `parseChunkInto`. Per-chunk arena-snapshot pattern prevents data corruption when drains span multiple chunks (regression test `process_multi_chunk_drain_no_corruption` catches this).
+
+**Bench results (v3.2 → A → B, single run, ±~10 % thermal):**
+
+| Query | v3.2 | Commit A | Commit B | Net vs v3.2 | Net vs rocksdb |
+|---|---:|---:|---:|---:|---:|
+| Q9 | 884.76 s | 49.46 s | **46.94 s** | -94.7 % (18.85× faster) | **~11.2× rocksdb** (was 0.59×) |
+| Q20 | 892.09 s | 49.10 s | **46.56 s** | -94.8 % (19.16× faster) | **~9.44× rocksdb** (was 0.49×) |
+| Q5 | 32.45 s | 32.54 s | 33.63 s | within noise | 3.41× rocksdb |
+| Q15 | 111.86 s | 108.17 s | 109.11 s | -2.5 % | 2.51× rocksdb |
+| Q18 | 74.41 s | 69.99 s | 69.90 s | -6.1 % | 2.71× rocksdb |
+
+**Headline:** the chunked-call wire-up alone (Commit A) delivered ~95% wall-clock reduction on Q9 + Q20. The "built-but-unwired" finding from §A of this audit proved to be the largest single perf lever in the V1 codebase. Commit B's view-based decode added marginal further improvement (~5% on Q9/Q20) and serves as architectural scaffolding for V1.2's `MemorySegmentInputView` (full zero-copy deserialize).
+
 ---
 
 ## VIOLATION #2 (HIGH): FFI `frs_vectorized_batch_get` does naive per-key `db.get()` loop
