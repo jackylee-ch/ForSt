@@ -607,6 +607,48 @@ This empirically confirms what §4.3 A-2 stated as a scope limit: "session-clust
 
 **Implication:** Q0/Q1/Q2 cannot be closed by any JVM-startup tuning we have available. The 8-14 % gap is the **steady-state JDK 25 vs JDK 17 cost differential** (different JIT compiler, different intrinsics, different CompactObjectHeaders behavior). Closing it requires either (a) reverting the JDK 25 dependency (loses ZGenerational/Vector API/FFM — defeats the V1 design) or (b) accepting the gap as the unfixable JDK-upgrade tax on state-light workloads.
 
+## 10d. MapStateCache (Fix #4) — IMPLEMENTED AND REVERTED 2026-05-19
+
+The V1.1 P0 plan's MapStateCache was implemented per §3.4 B-2 spec and benched per the tri-state trigger.
+
+**Implementation** (commit `4864631d614` on `forst-rs-jdk25`):
+- `MapStateCache<V>` class — LinkedHashMap LRU, 256K cap, TOMBSTONE sentinel for known-missing, single-threaded access (no concurrent guards needed; Flink async-state V2 serializes per-record ops via RecordContext lock)
+- `ForStRsMapStateV2.asyncGet/asyncPut/asyncRemove/asyncContains` overridden — cache lookup on read, write-through on write
+- 17 unit tests covering hit/miss/tombstone/LRU eviction/access-order promotion + structural assertions
+- Full module test suite: 167 tests pass (148 prior + 17 new + 2 carryover, no regressions in unit tests)
+
+**Bench results vs Commit B baseline:**
+
+| Query | Pre-cache | MapStateCache | Δ | Verdict |
+|---|---:|---:|---:|---|
+| **Q11** (target) | 158.08 s | 159.59 s | **+0.9%** | tied — NO BENEFIT |
+| **Q12** (target) | 129.82 s | 134.13 s | **+3.3%** | tied — NO BENEFIT |
+| Q9 | 46.94 s | 49.42 s | +5.3% | within gate |
+| **Q20** | 46.56 s | 55.99 s | **+20.3%** | **REGRESSION — exceeds 10% protection gate** |
+| Q5 | 33.63 s | 30.56 s | -9.1% | improvement |
+| Q15 | 109.11 s | 107.77 s | -1.2% | tied |
+| Q18 | 69.90 s | 67.59 s | -3.3% | tied |
+
+**Reverted** at commit `9109fc9de61`. Post-revert Q20 re-bench: 46.93 s (back to baseline within noise).
+
+### Empirical finding: Fix #4 as designed does NOT reach Q11/Q12's hot path
+
+The cache code IS running (Q20 regresses +20.3% from lookup overhead) but does NOT measurably help Q11/Q12. The Tri-state trigger's red-band entry assumption — that Q11/Q12 hit `ForStRsMapStateV2.asyncGet/asyncPut` heavily — is empirically FALSIFIED.
+
+**Hypothesis (unverified, needs flamegraph):** Q11 (SESSION window) and Q12 (PROCTIME tumble) use Flink's **internal `WindowOperator` state primitive** which goes through Flink runtime code that builds a `MapState` view, but the per-record-RMW happens via different internal paths (e.g., `InternalMapState` extends `KeyedStateBackend` directly, bypassing the user-facing async API). The user-facing `ForStRsMapStateV2.asyncGet/asyncPut` overrides may not intercept the WindowAggregator's per-bid state RMW.
+
+If true, the V1.1 plan's "MapStateCache eliminates Q11/Q12 per-record cost" thesis is **wrong as designed**. The correct fix is one of:
+
+1. **State-primitive identification:** flamegraph Q11/Q12 with the cache instrumented (counter on cache.put/cache.lookup) to identify exactly which `ForStRsXxxState*` class the Flink WindowOperator's internal state goes through. Then cache THAT class.
+2. **FFM-boundary cache:** move the cache from the state-class layer to the executor layer (`VectorizedExecutor.executeGets`). The executor sees ALL serialized GET keys regardless of which state class submitted them. Tradeoff: serialized-byte-key cache lookup is slower than per-state in-Java cache; per-state-class context disappears.
+3. **Engine-level optimization:** Fix #1d `batch_get_into` zero-alloc API + parallel SST scans / bloom-filter sharing across keys in a batch (true multi_get). Engine-side per-key cost reduction without Java-side caching.
+
+Decision deferred to V1.2 sprint. V1.1 ships with Q11/Q12 acknowledged as unfixed-by-software-state-backend; the operational story shifts to:
+- Q11 0.64× rocksdb (was 0.57× in v3.2 — Commit A+B incidentally helped 12%)
+- Q12 0.24× rocksdb (unchanged from v3.2; per-record-RMW pattern is the architectural cap)
+
+**Methodological success:** the empirical bench-and-revert workflow caught a wrong-targeting fix that would have regressed Q20 by 20% in production. Per CONTRIBUTING.md "revert on regression," the cost of one round-trip was 1 commit + 1 revert + 1 doc update; the saved cost is unbounded.
+
 ## 11. Recommendation
 
 Promote **A-1 (gated by A-1-preflight) + B-1 + B-2 (with race fix) + B-4c (adaptive sizing) + B-5 (barrier-flush sharding)** to **V1.1 P0**. They are the minimum change to deliver "every forst-supported Nexmark query at ≥ 1.00× rocksdb." Without them, the V1 release notes must read "use forst-rs for windowed/joined workloads; use forst (community) for per-record-RMW workloads" — which is not the user's product position.
