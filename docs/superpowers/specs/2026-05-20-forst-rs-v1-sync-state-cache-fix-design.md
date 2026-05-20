@@ -158,27 +158,84 @@ No new error modes. Existing FFM error propagation (FRS_STATUS_OK / FALLBACK / E
 3. **Key-group correctness across boundaries** — setCurrentKey in keyGroup A, write; setCurrentKey in keyGroup B with the same logical user-key value, write distinct value; reading back from both key-groups returns correct distinct values.
 4. **State-name pre-cache parity** — encoder produces byte-identical output via both `encodeForState(kg, k, stateName)` and `encodeForState(kg, k, preEncodedStateNameBytes)` overloads.
 
-### Bench acceptance gates
+### Bench acceptance gates — tiered, portfolio-aware
 
-| Query | Gate | Source baseline |
+Replaces the previous flat ±5 % gate. The flat gate would have blocked a Q5-class net portfolio win because a single high-multiple win wobbled by 7 %. The tiered scheme protects strategic position without conflating signal with noise.
+
+| Tier | Trigger | Action |
 |---|---|---|
-| Q5  | < 113.98 s  | rocksdb v3.2 |
-| Q8  | < 32.81 s   | rocksdb v3.2 |
-| Q13 | < 33.75 s   | rocksdb v3.2 |
-| Q0-Q4, Q7, Q9-Q12, Q14-Q23 | within 5 % of v3.3 numbers | v3.3 (this report's prior section) |
+| **T0 — strategic-threshold breach** | Any query that was ≥ 1.0× rocksdb in v3.3 drops below 1.0× | **Mandatory revert** |
+| **T1 — large drift on strong win** | Any current ≥ 1.5× win regresses > 10 % | **Review-triggered** (not auto-revert) — PMC decision based on net portfolio delta |
+| **T2 — catastrophic** | Any query regresses > 20 % regardless of position | **Mandatory revert** |
+| **Target wins** | Q5 < 113.98 s, Q8 < 32.81 s, Q13 < 33.75 s | KPI met → PR-A lands; missed → re-bench / Approach-C spec |
 
-If **any one** of Q5/Q8/Q13 misses, roll back the PR and open a follow-up Approach-C spec (Rust engine work). If any of the 16 wins regresses > 5 %, roll back the offending sub-change (we land per-state-type, one commit per type, so attribution is clean).
+Rationale: a 1.5× win dropping to 1.35× (10 % drift) is still a win and should not gate-block a 5× Q5 fix; but a win dropping below rocksdb (1.0×) is a regime change and forces revert.
 
-### Implementation order (one commit per step, bench between)
+### PR sequencing — split by risk profile
 
-1. `ForStRsValueState` — add kg-prefixed-with-buffer-hooks ctor; cache `stateNameBytes`; keep legacy ctor for tests.
-2. `ForStRsKeyedStateBackend.getValueState` — switch to new ctor; **remove `stateCache.clear()` line 288**. Bench Q5/Q8/Q13 + Q11/Q12 sanity.
-3. `ForStRsListState`, `ForStRsMapState`, `ForStRsReducingState`, `ForStRsAggregatingState` — same pattern. Bench again.
-4. `ForStRsKeyGroupedSerializer` — pre-encoded-stateName overload. Bench again.
-5. `getFromWriteBuffer` thread-local mutable wrapper. Bench again.
+The original linear "one commit per step, bench between" sequencing is preserved at the technical level, but **PR boundaries** are drawn along risk-curve discontinuities:
 
-This sequencing means each step ships an isolated, attributable delta — and if step 2 already meets KPI, we can ship there without the remaining cuts.
+#### PR-A (Headline): "Fix V1-Sync stateCache per-event clear regression"
+
+Steps that share the same risk profile (single-key-update-hub change, no concurrent/reentrancy concerns):
+
+- **Step A0** — Q11 / Q12 V2-async-path **instrumented verification** (≈ 0.5 engineer-day). Add temporary counters at `ForStRsValueStateV2.value/update` entry points, run Q11 / Q12 once, confirm the V2 path is the one taken AND the call counts match expected per-event work. Remove counters before commit. Closes the prior audit's "Q11/Q12 use ForStRsValueStateV2" claim which rested on grep + memory-recall, not instrumentation — and the prior audit already mis-identified the state class once (see CONTRIBUTING.md case studies). Do this BEFORE touching `setCurrentKey`.
+- **Step A1** — `ForStRsValueState` adds kg-prefixed-with-buffer-hooks ctor; caches `stateNameBytes`; legacy ctor retained for tests.
+- **Step A2** — `ForStRsKeyedStateBackend.getValueState` switches to new ctor; **remove `stateCache.clear()` line 288**. Bench Q5/Q8/Q13 + Q11/Q12 sanity.
+
+PR-A is the maximum-visibility ship target — one-line removal + constructor switch carries the potential 5× win and benefits from concentrated PMC review.
+
+#### PR-B chain (Follow-up): "Extend V1-sync alloc cuts to remaining state types"
+
+Same risk profile as PR-A, but each sub-PR is independently reviewable:
+
+- **PR-B1** — `ForStRsListState`, `ForStRsReducingState`, `ForStRsAggregatingState` switch to kg-prefixed ctor (+ MapState audit per its row above).
+- **PR-B2** — `ForStRsKeyGroupedSerializer.encodeForState` overload accepting pre-encoded `stateNameBytes`.
+
+Reuse the spike-then-design pattern: PR-A validates the approach; PR-B propagates it.
+
+#### PR-C (Hardening sprint): "Thread-local mutable ByteArrayWrapper for V1 buffer lookups"
+
+This step has a **different risk curve** from PR-A and PR-B because it introduces a thread-local mutable shared piece of state held under the buffer's HashMap lookup contract. Concurrency / reentrancy bugs here can be silent corruption (wrong cache hits across threads, recursive calls returning a stale wrapper view). Decoupling protects PR-A's headline win from being held up by a hardening question.
+
+PR-C requires:
+- Concurrent stress test: N threads × M setCurrentKey iterations × per-state read/write — assert HashMap returns correct value or null, no cross-thread contamination.
+- Reentrancy assertion guard: the mutable wrapper holds an `inUse` flag asserted-set on borrow and asserted-unset on return; reentrant access fails-fast in dev builds.
+- Bench-confirmed isolated win (alloc-rate JFR before/after).
+
+Land PR-C only after PR-A and PR-B are merged and their wins are confirmed in production-equivalent benches.
+
+#### PR-D (Process): "CONTRIBUTING.md — perf-audit hypothesis-falsification rule"
+
+Independent of code. Adds a **MUST** rule grounded in the two empirical case studies (this Q5 cognitive failure + the prior 4.6 µs regime correction). See "CONTRIBUTING.md update" section below.
+
+### CONTRIBUTING.md update
+
+Add a new section under perf-work guidelines:
+
+> **MUST: Search memory for falsifying evidence before locking a root cause.**
+>
+> Before forming the final root-cause hypothesis in any performance audit, run an explicit memory search ( `conversation_search` over `~/.claude/projects/.../memory/`, plus a grep of `docs/superpowers/specs/` for related audits ) for evidence that *falsifies* your working hypothesis. Examples of falsifying queries: "FFM vs JNI cost," "per-call overhead measurement," "engine micro-bench."
+>
+> If a memory entry contradicts the current hypothesis, the hypothesis MUST be revised before any fix is proposed.
+>
+> **Case studies — what this rule prevents:**
+> 1. **Q5 / Q8 / Q13 cache-clear (2026-05-20)** — initial audit framed the 5× slowdown as an "FFM-per-call vs JNI-per-call structural gap" and proposed accepting the loss. Memory `project_nexmark_q3_jni_experiment` (saved earlier) had already measured FFM at 200 s vs JNI at 232 s on the same engine, directly falsifying the structural-gap framing. Not retrieving that memory delayed the real fix ( `stateCache.clear()` per-event reallocation) by one full review cycle.
+> 2. **Q3 4.6 µs engine per-call cost (earlier session)** — initial audit framed the bottleneck as the FFM boundary; engine-level micro-benchmarks (already in memory) showed the per-call cost was 4.6 µs *inside* the engine, not at the boundary. Same failure mode.
+>
+> Both cases share the same cognitive pathology: the auditor formed a structural hypothesis and stopped looking. The mitigation is procedural — make "retrieve contradicting evidence" precede "form new hypothesis."
+
+PR-D ships as a single commit on `forst-rs` branch with no code changes.
+
+### Implementation summary
+
+| PR | Contains | Bench acceptance | Order |
+|---|---|---|---|
+| PR-A | Step A0 (Q11/Q12 verification) + A1 + A2 | Tiered gates above + Q5 < 114 s target | Lands first |
+| PR-B | B1 (List/Map/Reducing/Aggregating ctors) + B2 (serializer overload) | Same tiered gates + Q8 / Q13 KPI confirmation | After PR-A merged |
+| PR-C | Mutable wrapper + concurrent stress test + reentrancy guard | Tiered gates + JFR alloc-rate confirmation | After PR-B merged |
+| PR-D | CONTRIBUTING.md MUST rule + case studies | (docs-only) | Any time; can land in parallel with PR-A |
 
 ## Open Questions
 
-None at design time. If steps 2-5 land and Q5 still misses 113.98 s, the follow-up Approach-C spec for engine-level work will be authored and reviewed separately.
+None at design time. If PR-A + PR-B land and Q5 still misses 113.98 s, the follow-up Approach-C spec for engine-level work will be authored and reviewed separately.
