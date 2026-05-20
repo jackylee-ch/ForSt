@@ -165,11 +165,23 @@ Replaces the previous flat ±5 % gate. The flat gate would have blocked a Q5-cla
 | Tier | Trigger | Action |
 |---|---|---|
 | **T0 — strategic-threshold breach** | Any query that was ≥ 1.0× rocksdb in v3.3 drops below 1.0× | **Mandatory revert** |
-| **T1 — large drift on strong win** | Any current ≥ 1.5× win regresses > 10 % | **Review-triggered** (not auto-revert) — PMC decision based on net portfolio delta |
+| **T1 — large drift on strong win** | Any current ≥ 1.5× win regresses > 10 % | **Review-triggered** — PMC decision based on **net portfolio delta** (formula below) |
 | **T2 — catastrophic** | Any query regresses > 20 % regardless of position | **Mandatory revert** |
 | **Target wins** | Q5 < 113.98 s, Q8 < 32.81 s, Q13 < 33.75 s | KPI met → PR-A lands; missed → re-bench / Approach-C spec |
 
 Rationale: a 1.5× win dropping to 1.35× (10 % drift) is still a win and should not gate-block a 5× Q5 fix; but a win dropping below rocksdb (1.0×) is a regime change and forces revert.
+
+#### Net portfolio delta formula (T1 review default)
+
+To prevent recurring subjective debate over "which metric to use" in T1 review, compute a single scalar from the bench results and use it as the default starting data for the review meeting:
+
+```
+net_delta = Σ_query  log10(new_time / old_time)
+```
+
+where the sum runs over every query that ran on both v3.3 and the candidate PR. **Smaller (more negative) = better.** Each query contributes a log-ratio so a 2× speedup on one query exactly cancels a 2× regression on another. Reviewers retain the right to override the formula, but the conversation starts from a fixed number.
+
+This formula belongs in CONTRIBUTING.md alongside the tiered gates (PR-D below).
 
 ### PR sequencing — split by risk profile
 
@@ -177,13 +189,29 @@ The original linear "one commit per step, bench between" sequencing is preserved
 
 #### PR-A (Headline): "Fix V1-Sync stateCache per-event clear regression"
 
-Steps that share the same risk profile (single-key-update-hub change, no concurrent/reentrancy concerns):
+Sequenced internally as commits A0 → A1 → A2 following the RocksDB/LevelDB "new-code commit / behavior-switch commit separation" pattern. Each commit's role:
 
-- **Step A0** — Q11 / Q12 V2-async-path **instrumented verification** (≈ 0.5 engineer-day). Add temporary counters at `ForStRsValueStateV2.value/update` entry points, run Q11 / Q12 once, confirm the V2 path is the one taken AND the call counts match expected per-event work. Remove counters before commit. Closes the prior audit's "Q11/Q12 use ForStRsValueStateV2" claim which rested on grep + memory-recall, not instrumentation — and the prior audit already mis-identified the state class once (see CONTRIBUTING.md case studies). Do this BEFORE touching `setCurrentKey`.
-- **Step A1** — `ForStRsValueState` adds kg-prefixed-with-buffer-hooks ctor; caches `stateNameBytes`; legacy ctor retained for tests.
-- **Step A2** — `ForStRsKeyedStateBackend.getValueState` switches to new ctor; **remove `stateCache.clear()` line 288**. Bench Q5/Q8/Q13 + Q11/Q12 sanity.
+- **Commit A0** — Q11 / Q12 V2-async-path **instrumented verification** (≈ 0.5 engineer-day; temporary counters, removed before commit).
 
-PR-A is the maximum-visibility ship target — one-line removal + constructor switch carries the potential 5× win and benefits from concentrated PMC review.
+   Add `AtomicLong` counters at four call-site classes: `ForStRsValueStateV2.value`, `ForStRsValueStateV2.update`, `ForStRsValueState.value` (V1), `ForStRsValueState.update` (V1). Run Q11 + Q12 each for one normal duration, then evaluate **three falsifiable yes/no gates**:
+
+   | # | Assertion | Pass condition | If fails |
+   |---|---|---|---|
+   | 1 | **Path identity** | `V2.value + V2.update > 0` AND `V1.value + V1.update == 0` | Q11/Q12 do not actually use V2 — design's "Q11/Q12 unaffected" claim is falsified; HALT before A2 |
+   | 2 | **Cardinality sanity** | `V2.value + V2.update` is within 2× of `(input_records × expected_ops_per_record)` for the query | Counter wiring is wrong or per-record op assumption is wrong; investigate before proceeding |
+   | 3 | **setCurrentKey cross-check** | `backend.setCurrentKey` invocation count is within 1× of `input_records`, AND `V2.value/update` count is within 1× of `setCurrentKey × expected_ops` | V2 ops aren't following setCurrentKey 1:1; the cache-clear change might affect V2 in unexpected ways; HALT |
+
+   All three must pass for A2 to proceed. Counters are removed before A0 is committed (no permanent observability cost). A0 itself is verification-only and produces NO code change at the production paths — its commit contains only the temporary counter scaffold + a markdown attestation of the three pass/fail outcomes captured during the verification run.
+
+- **Commit A1** — **Additive only**: `ForStRsValueState` adds the new kg-prefixed-with-buffer-hooks constructor; caches `stateNameBytes`; **legacy ctor retained, no call sites changed**.
+
+   Why: the new constructor is dead code at commit time. Running the full Nexmark sweep against A1 must confirm **zero drift** on every query (within bench noise). Any drift here indicates a latent side effect from the new constructor (e.g., static initializer, class loader hit) that we'd otherwise blame on A2. Confirmed-zero-drift becomes the audit baseline for A2.
+
+- **Commit A2** — **Behavior switch**: `ForStRsKeyedStateBackend.getValueState` switches to the new ctor; **`stateCache.clear()` line 288 removed**. This is the smallest possible commit that flips behavior — call-site rewire + one-line deletion + the cache-survival semantics.
+
+   Bench post-A2 measures the **main-fix gain**. Because A1 already confirmed zero-drift, any A2 delta is attributable to the cache-survival + per-call composite-key encoding switch — no side-effects commingled.
+
+PR-A is the maximum-visibility ship target — A2's one-line removal + call-site switch carries the potential 5× win and benefits from concentrated PMC review. The A0/A1/A2 separation makes the bench data tell a clean story: A0 confirms scope, A1 confirms zero-cost-of-additive-code, A2 confirms gain-from-behavior-flip.
 
 #### PR-B chain (Follow-up): "Extend V1-sync alloc cuts to remaining state types"
 
@@ -209,32 +237,55 @@ Land PR-C only after PR-A and PR-B are merged and their wins are confirmed in pr
 
 Independent of code. Adds a **MUST** rule grounded in the two empirical case studies (this Q5 cognitive failure + the prior 4.6 µs regime correction). See "CONTRIBUTING.md update" section below.
 
-### CONTRIBUTING.md update
+### CONTRIBUTING.md update (PR-D)
 
-Add a new section under perf-work guidelines:
+Add a new section under perf-work guidelines. Two pieces: the MUST rule with a structured 5-item checklist, and the portfolio-aware bench gate + net-delta formula.
 
 > **MUST: Search memory for falsifying evidence before locking a root cause.**
 >
-> Before forming the final root-cause hypothesis in any performance audit, run an explicit memory search ( `conversation_search` over `~/.claude/projects/.../memory/`, plus a grep of `docs/superpowers/specs/` for related audits ) for evidence that *falsifies* your working hypothesis. Examples of falsifying queries: "FFM vs JNI cost," "per-call overhead measurement," "engine micro-bench."
+> Before forming the final root-cause hypothesis in any performance audit, execute the following 5-item checklist. Each item maps to a specific failure mode observed in the case studies below:
 >
-> If a memory entry contradicts the current hypothesis, the hypothesis MUST be revised before any fix is proposed.
+> 1. **Antonym search of the current hypothesis.** Phrase the inverse claim and search memory for it. *Example: hypothesis = "FFM-per-call is the bottleneck" → search "FFM faster than JNI", "boundary cost not bottleneck", "engine per-call dominates".*
+> 2. **Recent micro-benches of the involved components.** Grep memory + `docs/superpowers/specs/` for the latest micro-benchmark numbers on each component named in your hypothesis. *Example: hypothesis names `getPinned` → find the most recent `getPinned` micro-bench result.*
+> 3. **Regime correction for any earlier numerical floor.** Search for prior session notes containing "regime", "floor", "actually X ns/µs/s not Y" on the relevant ops. *Example: "engine per-call 4.6 µs" was a regime correction missed in a prior audit.*
+> 4. **Earlier audits on the same query class.** Search for prior audits naming the affected queries OR the same access-pattern shape (HOP / sliding-shared / JOIN / per-key high-throughput). Read the conclusion before re-auditing.
+> 5. **Grep last-6-month perf-related specs.** Run `git log --since=6.months docs/superpowers/specs/` and skim the titles for related audits. The cost is one minute and prevents re-walking solved ground.
 >
-> **Case studies — what this rule prevents:**
-> 1. **Q5 / Q8 / Q13 cache-clear (2026-05-20)** — initial audit framed the 5× slowdown as an "FFM-per-call vs JNI-per-call structural gap" and proposed accepting the loss. Memory `project_nexmark_q3_jni_experiment` (saved earlier) had already measured FFM at 200 s vs JNI at 232 s on the same engine, directly falsifying the structural-gap framing. Not retrieving that memory delayed the real fix ( `stateCache.clear()` per-event reallocation) by one full review cycle.
-> 2. **Q3 4.6 µs engine per-call cost (earlier session)** — initial audit framed the bottleneck as the FFM boundary; engine-level micro-benchmarks (already in memory) showed the per-call cost was 4.6 µs *inside* the engine, not at the boundary. Same failure mode.
+> If any checklist item surfaces evidence that contradicts the current hypothesis, the hypothesis MUST be revised before any fix is proposed.
+>
+> **Case studies — failure modes this checklist prevents:**
+>
+> | Case | What was missed | Which checklist item would have caught it |
+> |---|---|---|
+> | Q5/Q8/Q13 cache-clear (2026-05-20) | `project_nexmark_q3_jni_experiment` showed FFM 200 s < JNI 232 s, falsifying the "FFM-per-call structural gap" framing | #1 (antonym search) — searching "FFM faster than JNI" would have hit it; #2 (recent micro-benches) — searching for the most recent FFM-vs-JNI measurement |
+> | Q3 4.6 µs engine per-call (earlier session) | Engine-level micro-benchmark showed the cost was *inside* the engine, not at the boundary | #2 (recent micro-benches) — searching for "engine per-call cost" or "engine per-op cost" would have surfaced it; #3 (regime correction) — searching "actually 4.6 µs" or "regime" |
 >
 > Both cases share the same cognitive pathology: the auditor formed a structural hypothesis and stopped looking. The mitigation is procedural — make "retrieve contradicting evidence" precede "form new hypothesis."
+
+> **MUST: Portfolio-aware bench gate.** Use the tiered T0/T1/T2 thresholds (see [tiered bench gates section](#bench-acceptance-gates--tiered-portfolio-aware) of the related design spec) for accepting / rejecting any PR claiming a perf win. Compute the **net portfolio delta** as the default starting number for any T1 review:
+>
+> ```
+> net_delta = Σ_query  log10(new_time / old_time)
+> ```
+>
+> Smaller is better. The formula is not a final arbiter — PMC review retains override — but it eliminates "which metric do we use" as an open question at review time.
 
 PR-D ships as a single commit on `forst-rs` branch with no code changes.
 
 ### Implementation summary
 
-| PR | Contains | Bench acceptance | Order |
+| PR | Commits | Bench acceptance | Order |
 |---|---|---|---|
-| PR-A | Step A0 (Q11/Q12 verification) + A1 + A2 | Tiered gates above + Q5 < 114 s target | Lands first |
-| PR-B | B1 (List/Map/Reducing/Aggregating ctors) + B2 (serializer overload) | Same tiered gates + Q8 / Q13 KPI confirmation | After PR-A merged |
+| PR-A | A0 (Q11/Q12 verification, 3 falsifiable gates) + A1 (additive ctor, zero-drift bench) + A2 (call-site switch + cache-clear removal, main-fix bench) | Tiered T0/T1/T2 + Q5 < 114 s target + net_delta < 0 | Lands first |
+| PR-B | B1 (List/Reducing/Aggregating ctors + MapState audit) + B2 (serializer overload) | Same tiered gates + Q8 / Q13 KPI confirmation + net_delta < 0 | After PR-A merged |
 | PR-C | Mutable wrapper + concurrent stress test + reentrancy guard | Tiered gates + JFR alloc-rate confirmation | After PR-B merged |
-| PR-D | CONTRIBUTING.md MUST rule + case studies | (docs-only) | Any time; can land in parallel with PR-A |
+| PR-D | CONTRIBUTING.md MUST rule (5-item checklist + case-study table) + portfolio gate + net_delta formula | (docs-only) | Any time; can land in parallel with PR-A |
+
+### Spec template extraction
+
+This design's structural sequence — Problem → Root Cause → Goal/Non-Goals → Architecture → Components → Data Flow → Invariants → Error Handling → Testing (tiered gates + net_delta) → PR sequencing by risk curve → CONTRIBUTING.md-coupled PR — is generalizable to any forst-rs performance fix.
+
+After PR-A lands, archive this document's section structure as `docs/superpowers/templates/perf-fix-spec-template.md` so future perf-fix authors get the procedural reminders for free via empty template fields. This upgrades the workflow from discipline-based ("remember to consider tiered gates") to tool-based ("the template has a tiered-gate section; you fill it in or explicitly mark N/A"). The template extraction is tracked as a follow-on after PR-A so we don't bikeshed the template before the original spec ships.
 
 ## Open Questions
 
