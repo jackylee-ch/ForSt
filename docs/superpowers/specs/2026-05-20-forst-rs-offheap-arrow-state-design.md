@@ -1,4 +1,4 @@
-# Forst-RS Off-Heap Arrow ValueState — End-to-End Zero-Copy + Auto-Tuned Buffer
+# Forst-RS Off-Heap Arrow State — End-to-End Zero-Copy + All-Batch (no per-key, no byte[])
 
 **Author:** jackylee (PMC) + Claude
 **Date:** 2026-05-20
@@ -37,12 +37,55 @@ Strict KPI:
 - All other queries: tiered T0/T1/T2 gates from prior spec.
 - Net portfolio delta `Σ log10(new/v3.3) ≤ -2.0`.
 
+## Scope expansion (2026-05-20)
+
+Audit of the current code found **18 per-key linker call sites** across 7 production state classes + timer queue, and **20+ byte[] allocation sites per-call** on hot paths (including V2 async classes which still allocate byte[] for per-call encode/decode despite using vectorized dispatch). Per the user's "no per-key, no byte[], all batch" criterion, this spec covers **the full end-to-end refactor**, organized as sequenced sub-PRs sharing one design:
+
+- **Tier 1a** — `ArrowBinaryBuffer` + auto-tuner + Linker FFM signatures (foundation)
+- **Tier 1b** — `ForStRsValueState` (V1 sync) zero-copy + batch
+- **Tier 1c** — `ForStRsMapState` (V1 sync) — per-mapKey ops + iterators
+- **Tier 1d** — `ForStRsListState` + `ForStRsReducingState` + `ForStRsAggregatingState` (V1 sync)
+- **Tier 1e** — V2 state classes (Value/Map/List/Reducing/Aggregating V2) — eliminate `getCopyOfBuffer()` per call by writing into shared scratch MemorySegment + wrap iterator chunks in MemorySegmentDataInputView
+- **Tier 1f** — Timer queue (`ForStRsKeyGroupedInternalPriorityQueue`) — batch put/delete for `advance()`; group timer ops by key-group via `frsBatchPrefixScan` + `frsVectorizedBatchDelete`
+
+Each sub-PR ships independently with its own bench validation. **Tier 1a+1b lands first** to unlock Q5/Q11 wins; 1c-1f follow.
+
+## Per-key call sites to eliminate (audit 2026-05-20)
+
+| State | Call site (file:line) | Op | Target replacement |
+|---|---|---|---|
+| ValueState | `value:178` | getPinned | Arrow buffer hit OR batch_get cold-prefetch heuristic |
+| ValueState | `value:181` | getFast (fallback) | eliminated — explicit `NOT_FOUND` from `getPinnedSegment` |
+| ValueState | `update:205` | put | `buffer.insert` + batched flush via `frsBatchPutArrow` |
+| ValueState | `clear:216` | delete | `buffer.remove` + batched delete via `frsVectorizedBatchDelete` |
+| ValueState | `getAndUpdate:233` | getAndPut | `buffer.insertAndGet` (RMW serves from buffer; cold path uses native `getAndPut`) |
+| MapState | `value:217` | getFast | `buffer.find(compositeMapKey)` + `frsBatchGetArrow` cold path |
+| MapState | `remove:286` | delete | `buffer.remove` + batched delete |
+| MapState | `clear:362` | delete (per-entry loop) | `frsBatchPrefixScan` + `frsVectorizedBatchDelete` (one FFM for whole map clear) |
+| ListState | `clear:154` | delete | `buffer.remove` + batched delete |
+| ListState | `update:181` | put | `buffer.insert` + batched flush |
+| ReducingState | `clear:113`, `add:129` | delete/put | `buffer.remove/insert` + batched flush |
+| AggregatingState | `clear:123`, `add:139` | delete/put | `buffer.remove/insert` + batched flush |
+| `Backend.deleteFromWriteBuffer:707` | delete (bypasses buffer) | route through buffer; flush via `frsVectorizedBatchDelete` |
+| `StateExecutor:114` | delete | batched per executor cycle |
+| Timer queue `:297/307/308/321/409/411` | put/get/delete | `frsBatchPutArrow` for inserts; `frsBatchPrefixScan` + batch delete for `advance()` |
+
+## byte[] allocation sites to eliminate (hot path)
+
+| State class | Call site | Replacement |
+|---|---|---|
+| All V1 sync states | `keyPrefix.clone()` in ctor | one-time, not hot — keep |
+| ValueState/Reducing/Aggregating (V1) | `outputBuffer.getCopyOfBuffer()` per `update/add` | serialize directly into `statebuf.valueData` (off-heap) |
+| MapStateV2, ValueStateV2, AsyncListStateV2, AsyncReducingStateV2, AsyncAggregatingStateV2, AggregatingStateV2, ReducingStateV2 | `keyOut/valueOut.getCopyOfBuffer()` per call | serialize into per-thread scratch Arena; pass `(segment, offset, length)` onward |
+| MapStateV2 iterator | `new byte[rangeLen]`, `new byte[len]` per entry | iterator already exposes off-heap chunk via `frsVecIterPrefixNext` — wrap with `MemorySegmentDataInputView`, don't copy |
+| ValueStateV2 | `new byte[len]` | wrap returned chunk in `MemorySegmentDataInputView` |
+| All async state V2 | `KEY_PREFIX = "k/".getBytes(UTF_8)` static finals | one-time at class-load; keep |
+
 ## Non-Goals
 
-- V2 async path refactor — V2 already vectorized via VectorizedExecutor; no work here.
-- Iterator path — already uses chunked vec iter; out of scope.
-- Rust engine internals — only new FFM signatures (companion changes to `forst-rs` engine repo).
+- Rust engine internals — only the new Linker FFM signatures need Rust companions; existing batch ops (`frsBatchPutArrow` / `frsBatchGetArrow` / `frsVectorizedBatch*`) are reused as-is.
 - Flink table-runtime / planner — unchanged.
+- Iterator chunked decode (already uses chunked vec iter + slice-decode; just stop wrapping in byte[] inside `MapStateV2` iter — covered in Tier 1e).
 
 ## Architecture
 
@@ -223,22 +266,52 @@ ForStRsValueState.clear():
 | **Target wins** | Q5 < 114 s, Q8 < 33 s, Q11 ≤ 76.5 s, Q12 ≤ 35.5 s, Q13 < 34 s | KPI met → ship; missed → re-bench or escalate to Tier 2 |
 | **Net portfolio delta** | `Σ log10(new/v3.3)` ≤ -2.0 | required overall improvement |
 
-### Implementation order (one commit per logical unit, bench at end)
+### Implementation order — sequenced sub-PRs (1a–1f)
 
-0. **PREP — restore HEAP timer factory.** Recover the lost perf-recovery work from earlier session. Standalone commit. Bench Q11 / Q12 to confirm they're back to v3.3 numbers before Tier-1 begins (so attribution of subsequent gains is clean).
-1. **`ArrowBinaryBuffer` + `ArrowBinaryBufferAutoTuner` + unit tests.** Pure Java, no FFM dependency. Self-contained.
-2. **`linker.getPinnedSegment` + Rust companion.** Java FFM binding + Rust FFI stub. May initially route through existing `frs_get_pinned` + memcpy if Rust-side native zero-copy isn't ready.
-3. **`KeyGroupedSerializer.encodeForStateOffheap` + parity test.** Confirms byte-identical encoding before any state-class changes land.
-4. **`ForStRsValueState` off-heap value()/update()/clear() + unit tests.** New constructor; legacy ctors retained.
-5. **`ForStRsKeyedStateBackend` wiring** — `getValueState` constructs per-instance ArrowBinaryBuffer + scratchArena; passes them to the new ForStRsValueState ctor.
-6. **`linker.putSegment` + `linker.batchPutSegments` + Rust companion** — wire the write-path zero-copy. Initially can stub to copy if Rust isn't ready (still eliminates byte[] alloc on Java side).
-7. **Bench Q5/Q11/Q12/Q13 first (fast feedback), then full Q0-Q23 sweep** with fresh-cluster strategy.
+0. **PREP — restore HEAP timer factory.** Recover lost perf-recovery work. Standalone commit. Confirm Q11/Q12 return to v3.3 numbers BEFORE Tier-1 begins (clean attribution).
 
-## Out of Scope (Tier 2/3)
+**Sub-PR 1a — Foundation** (one PR, ~1 day):
+1a.1. `ArrowBinaryBuffer` + `ArrowBinaryBufferAutoTuner` + unit tests (pure Java, no FFM).
+1a.2. `linker.getPinnedSegment` Java binding + Rust companion (may route through existing `frs_get_pinned` + memcpy if Rust zero-copy not ready).
+1a.3. `linker.putSegment` + `linker.batchPutSegments` (zero-copy native put taking caller-owned MemorySegment + offsets).
+1a.4. `KeyGroupedSerializer.encodeForStateOffheap` + parity test.
 
-- **Tier 2 — Map/List/Reducing/Aggregating off-heap** — same pattern as ValueState; landed as a sibling spec after Tier 1 proves the approach.
-- **Tier 3 — V2 async path off-heap** — V2 is already vectorized via VectorizedExecutor; off-heap migration there is incremental cleanup, not a perf win.
-- **Engine-level optimizations** — Approach-C, separate spec.
+**Sub-PR 1b — ValueState (V1 sync)** (one PR, ~0.5 day):
+1b.1. `ForStRsValueState` off-heap value()/update()/clear()/getAndUpdate() using foundation pieces.
+1b.2. `ForStRsKeyedStateBackend.getValueState` constructs per-instance ArrowBinaryBuffer + scratchArena.
+1b.3. Bench Q5/Q11/Q13 (V1 sync hot queries). **KPI gate: Q5 < 114 s, Q11 ≤ 76.5 s** before PR-1c is allowed.
+
+**Sub-PR 1c — MapState (V1 sync)** (one PR, ~1 day):
+1c.1. `ForStRsMapState` off-heap value/put/remove using per-MapKey ArrowBinaryBuffer per state instance.
+1c.2. Iterator: wrap `frsVecIterPrefixNext` chunk output in `MemorySegmentDataInputView`; eliminate `new byte[]` allocations.
+1c.3. `clear()` switches from per-entry delete loop to `frsBatchPrefixScan` + `frsVectorizedBatchDelete` (one FFM round trip).
+1c.4. Bench Q15/Q18/Q19 (MapState-heavy queries).
+
+**Sub-PR 1d — ListState + ReducingState + AggregatingState (V1 sync)** (one PR, ~0.5 day):
+1d.1. Identical pattern to ValueState: per-instance ArrowBinaryBuffer + scratchArena + off-heap update/clear.
+1d.2. Bench Q17/Q21/Q22.
+
+**Sub-PR 1e — V2 state classes** (one PR, ~1 day):
+1e.1. Replace `keyOut/valueOut.getCopyOfBuffer()` with serialize-into-thread-local-Arena pattern across ForStRsValueStateV2, MapStateV2, AsyncListStateV2, AsyncReducingStateV2, AsyncAggregatingStateV2, AggregatingStateV2, ReducingStateV2.
+1e.2. MapStateV2 iterator: replace `new byte[rangeLen]` and `new byte[len]` with MemorySegmentDataInputView wrapping the iterator chunk.
+1e.3. Bench Q12/Q9/Q14/Q20 (V2 hot queries) — should see latency drop from reduced GC.
+
+**Sub-PR 1f — Timer queue** (one PR, ~0.5 day):
+1f.1. `ForStRsKeyGroupedInternalPriorityQueue` — convert per-timer linker.put/get/delete to batched Arrow ops.
+1f.2. `advance()` uses `frsBatchPrefixScan` + `frsVectorizedBatchDelete` instead of per-timer delete loop.
+1f.3. Bench Q11/Q12 with timer-heavy load.
+
+**Final integration**: full Q0-Q23 sweep, tiered T0/T1/T2 + net_delta evaluation. Update v3 report with v3.5 section.
+
+## Sub-PR landing protocol
+
+Each sub-PR independently:
+- Lands its own commits on `forst-rs-jdk25` (Java) and `forst-rs` (engine, if FFI changes).
+- Has its own bench validation against tiered T0/T1/T2 gates.
+- Surfaces per-sub-PR attribution: `net_delta` for the queries it affects must be ≤ 0.
+- Can be reverted independently if its tier's gates fail.
+
+Sub-PRs 1a is gating (1b through 1f depend on its FFM signatures + ArrowBinaryBuffer). Sub-PRs 1c/1d/1e/1f can land in parallel once 1a+1b prove the approach.
 
 ## CONTRIBUTING.md hand-off
 
