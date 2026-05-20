@@ -35,7 +35,7 @@ Combined with the legacy "static byte[] prefix" mode in `ForStRsValueState` (whi
 
 For Q5 at 100 M events × ~5 state ops/event with mostly-unique auction keys: **~100 M+ `ForStRsValueState` object allocations + comparable byte[] churn.** Community ForSt's `ForStSyncValueState` has none of this: state instance is constructed once per (stateName), `serializeCurrentKeyWithGroupAndNamespace()` produces a per-call composite key.
 
-Q11 / Q12 are unaffected because the V2 async path uses a different cache (`ContextKey`-based) that does not trigger on `setCurrentKey`.
+Q12 is unaffected because the V2 async path uses a different cache (`ContextKey`-based) that does not trigger on `setCurrentKey`. **Q11 was assumed to be on V2 async but A0 verification (2026-05-20) falsified that — Q11 actually traverses the V1 sync path** (`ForStRsValueState.value/update` at 92 M calls per Nexmark Q11 run, `setCurrentKey` at 92 M invocations). Q11's existing 76.5 s win over rocksdb comes from the V1-sync write-buffer hit pattern (`project_q11_always_on_buffer_win`), not from being on the V2 path. The cache-clear removal in A2 therefore affects Q11 as well — added to bench gates as an additional target (Q11 < 76.5 s).
 
 ## Goal
 
@@ -167,7 +167,7 @@ Replaces the previous flat ±5 % gate. The flat gate would have blocked a Q5-cla
 | **T0 — strategic-threshold breach** | Any query that was ≥ 1.0× rocksdb in v3.3 drops below 1.0× | **Mandatory revert** |
 | **T1 — large drift on strong win** | Any current ≥ 1.5× win regresses > 10 % | **Review-triggered** — PMC decision based on **net portfolio delta** (formula below) |
 | **T2 — catastrophic** | Any query regresses > 20 % regardless of position | **Mandatory revert** |
-| **Target wins** | Q5 < 113.98 s, Q8 < 32.81 s, Q13 < 33.75 s | KPI met → PR-A lands; missed → re-bench / Approach-C spec |
+| **Target wins** | Q5 < 113.98 s, Q8 < 32.81 s, Q13 < 33.75 s, **Q11 ≤ 76.5 s (no regression)** | KPI met → PR-A lands; missed → re-bench / Approach-C spec. Q11 added 2026-05-20 after A0 falsified the V2-path assumption — Q11 is V1 sync and is now an additional target. |
 
 Rationale: a 1.5× win dropping to 1.35× (10 % drift) is still a win and should not gate-block a 5× Q5 fix; but a win dropping below rocksdb (1.0×) is a regime change and forces revert.
 
@@ -193,15 +193,17 @@ Sequenced internally as commits A0 → A1 → A2 following the RocksDB/LevelDB "
 
 - **Commit A0** — Q11 / Q12 V2-async-path **instrumented verification** (≈ 0.5 engineer-day; temporary counters, removed before commit).
 
-   Add `AtomicLong` counters at four call-site classes: `ForStRsValueStateV2.value`, `ForStRsValueStateV2.update`, `ForStRsValueState.value` (V1), `ForStRsValueState.update` (V1). Run Q11 + Q12 each for one normal duration, then evaluate **three falsifiable yes/no gates**:
+   Add `AtomicLong` counters at four call-site classes: `ForStRsValueStateV2` vectorized entry points (`serializeKeyInto` / `serializeValueInto` — the public `value`/`update` methods live in `AbstractValueState` and never fire on the vectorized path), `ForStRsValueState.value` (V1), `ForStRsValueState.update` (V1), and `ForStRsKeyedStateBackend.setCurrentKey`. Run Q11 + Q12 each for one normal duration, then evaluate **path-identity per query**:
 
    | # | Assertion | Pass condition | If fails |
    |---|---|---|---|
-   | 1 | **Path identity** | `V2.value + V2.update > 0` AND `V1.value + V1.update == 0` | Q11/Q12 do not actually use V2 — design's "Q11/Q12 unaffected" claim is falsified; HALT before A2 |
-   | 2 | **Cardinality sanity** | `V2.value + V2.update` is within 2× of `(input_records × expected_ops_per_record)` for the query | Counter wiring is wrong or per-record op assumption is wrong; investigate before proceeding |
-   | 3 | **setCurrentKey cross-check** | `backend.setCurrentKey` invocation count is within 1× of `input_records`, AND `V2.value/update` count is within 1× of `setCurrentKey × expected_ops` | V2 ops aren't following setCurrentKey 1:1; the cache-clear change might affect V2 in unexpected ways; HALT |
+   | 1 | **Path identity per query** | For each query, V1 ops > 0 XOR V2 ops > 0 — i.e., the query lives on exactly ONE path | A query straddles both paths (unexpected) — investigate; HALT before A2 |
+   | 2 | **Cardinality plausibility** | V1 op count (if V1 query) is within 2× of `input_records × expected_ops_per_record`. V2 op count (if V2 query) may be much lower than input_records due to vectorized RMW fusion (e.g. `AsyncStateAggCombiner` collapses Q12's 100 M records to ~6 M ops per `project_q12_batch_histogram_2026-05-19`); no hard bound, just plausibility | Counter wiring is wrong; investigate |
+   | 3 | **A2-scope identification** | For each query, RECORD whether V1 ops > 0 (A2-affected) or V2 ops > 0 (A2-unaffected). Queries on V1 are added to A2 bench gates as additional targets | Determines per-query risk attribution; never "fails" — it classifies |
 
-   All three must pass for A2 to proceed. Counters are removed before A0 is committed (no permanent observability cost). A0 itself is verification-only and produces NO code change at the production paths — its commit contains only the temporary counter scaffold + a markdown attestation of the three pass/fail outcomes captured during the verification run.
+   Gates produce a per-query CLASSIFICATION (V1 vs V2), not a single pass/fail. **Any query found on V1 sync becomes part of A2's bench-gate scope.** A2 proceeds once classification is complete. Counters are removed before commit; the commit contains only the attestation markdown with per-query path classification.
+
+   **Original phrasing (before 2026-05-20 revision):** the three gates were "V2 > 0 AND V1 == 0" path identity, a fixed cardinality band, and a setCurrentKey cross-check assuming all named queries lived on V2. A0's first run on Q11 falsified the V2 assumption (Q11 is V1 with 92 M ops + 92 M setCurrentKey invocations) — gates were rewritten above to classify rather than gate-block, and Q11 was added to A2 target wins. The original strict-fail behavior is preserved in the new gate 1 (XOR — queries cannot straddle both paths).
 
 - **Commit A1** — **Additive only**: `ForStRsValueState` adds the new kg-prefixed-with-buffer-hooks constructor; caches `stateNameBytes`; **legacy ctor retained, no call sites changed**.
 

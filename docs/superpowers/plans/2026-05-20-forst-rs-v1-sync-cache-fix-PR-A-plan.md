@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Eliminate `ForStRsKeyedStateBackend.stateCache.clear()` per-event invalidation by switching `getValueState` to the keyComputer-mode constructor, recovering the V1-sync allocation pattern community ForSt achieves. Target: Q5 < 113.98 s, Q8 < 32.81 s, Q13 < 33.75 s.
+**Goal:** Eliminate `ForStRsKeyedStateBackend.stateCache.clear()` per-event invalidation by switching `getValueState` to the keyComputer-mode constructor, recovering the V1-sync allocation pattern community ForSt achieves. Target: Q5 < 113.98 s, Q8 < 32.81 s, Q13 < 33.75 s, **Q11 ≤ 76.5 s (no regression — Q11 is V1 sync, per A0 attestation 2026-05-20)**.
 
 **Architecture:** PR-A internal sequence A0 → A1 → A2, following RocksDB/LevelDB "new-code-commit / behavior-switch-commit" separation. A0 is verification-only (no production code change); A1 adds the new constructor additively (zero drift required); A2 flips the call site and removes the one-line `stateCache.clear()`. All three commits land together as PR-A.
 
@@ -887,7 +887,7 @@ For each query, compute `ratio = A2_time / v3.3_time`. Then evaluate:
 - **T0 (mandatory revert):** any query whose v3.3 ratio vs rocksdb was ≥ 1.0× and whose A2 ratio drops below 1.0×.
 - **T1 (review-triggered):** any query that was ≥ 1.5× win in v3.3 regressing > 10 % (ratio > 1.10).
 - **T2 (mandatory revert):** any query with ratio > 1.20.
-- **Target wins:** Q5 < 113.98 s AND Q8 < 32.81 s AND Q13 < 33.75 s.
+- **Target wins:** Q5 < 113.98 s AND Q8 < 32.81 s AND Q13 < 33.75 s AND Q11 ≤ 76.5 s (no regression — Q11 is V1 sync per A0).
 - **Net portfolio delta:** `net_delta = Σ_query log10(A2_time / v3.3_time)`. Smaller (more negative) is better.
 
 ```bash
