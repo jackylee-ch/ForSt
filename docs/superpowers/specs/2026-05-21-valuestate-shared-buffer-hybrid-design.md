@@ -1,175 +1,189 @@
-# Hybrid V1-ValueState Shared-HashMap Buffer + Current MapState Off-Heap
+# Backend-Shared Off-Heap ArrowBinaryBuffer for V1-Sync ValueState
 
 **Author:** jackylee (PMC) + Claude
 **Date:** 2026-05-21
 **Branches:** `~/Code/stczwd/flink` `forst-rs-jdk25` (HEAD `e0809571483`), `~/Code/stczwd/ForSt` `forst-rs`
 **Related:**
 - v3.2 canonical baseline: [`docs/superpowers/specs/2026-05-18-forst-rs-benchmark-report-v3.2.md`](2026-05-18-forst-rs-benchmark-report-v3.2.md)
-- 1a-1c.1 committed work supersedes parts of 1b which this spec partially reverts.
+- 1a-1c.1 committed work supersedes parts of 1b which this spec partially redirects.
+- **Supersedes** the prior draft that proposed reverting to byte[]-HashMap — that violated the zero-copy goal. This draft preserves zero-copy AND recovers Q5 perf.
 
 ## Problem
 
-The 1b.1/1b.2/1b.3 work refactored V1-sync `ForStRsValueState` from the shared-backend-HashMap write buffer (v3.2 mechanism) to a per-instance `ArrowBinaryBuffer`. This decision was made under the misconception that v3.2 Q5 = 32.45 s was a silent-data-loss artifact. **Re-reading the canonical v3.2 report confirms Q5 = 32.45 s was real** — at commit `c81654b3345`, V1 ValueState used the shared backend `Map<ByteArrayWrapper, byte[]>` with `MAX_BUFFER_ENTRIES = 524288`. Q5's 5-pane HOP working set fit comfortably in the single shared buffer; FFM crossings were rare; Q5 finished in 32 s. Q11/Q12 were bad at v3.2 (Q11 = 176 s, Q12 = 116 s) because the engine-backed timer queue was the default — NOT because of the buffer mechanism.
+Two failure modes have been observed empirically this session:
 
-After 1b.1, each ValueState owns its own per-instance `ArrowBinaryBuffer`. For Q5's 5 panes per event, this means 5 separate buffers competing for grow events independently. Per-pane effective buffer is smaller; eviction churn hits; FFM crossings climb; Q5 regressed to 561 s.
+1. **1b.1 per-instance off-heap (current state, HEAD `e0809571483`)** — Q5 = 561 s, regression 17× over v3.2. Per-pane ValueState gets its OWN `ArrowBinaryBuffer`; Q5's 5-pane HOP working set is fragmented across 5 buffers each managing independent grow/evict cycles → buffer churn dominates → FFM crossings dominate wall-clock.
 
-The cost of recovering Q5 to ~32 s is **not** abandoning all of this session's work — only the V1-ValueState piece. The 1a foundation (`ArrowBinaryBuffer`, `AutoTuner`, `getPinnedSegment`, `encodeForStateOffheap`) remains as MapState's storage backend (1c.1 wins are independent: Q15 6×, Q9 16×, Q20 18×). The PREP HEAP timer factory remains (Q11/Q12 are now timer-bound, not buffer-bound — buffer mechanism choice is invariant for them).
+2. **v3.2 shared on-heap HashMap (`Map<ByteArrayWrapper, byte[]>`)** — Q5 = 32.45 s. ONE big buffer absorbs Q5's working set efficiently. But the mechanism uses byte[] everywhere — composite keys, value payloads, HashMap wrappers, `linker.put(byte[], byte[])`. Violates the stated architectural goal of end-to-end zero-copy + vectorization.
+
+**The lever is shared-vs-per-instance, NOT off-heap-vs-on-heap.** v3.2 was fast because the buffer was shared. 1b.1 was slow because the buffer was per-instance. Off-heap zero-copy is orthogonal to that lever.
 
 ## Goal
 
-**Recover Q5 ≈ 32 s and Q8 ≈ 28 s simultaneously with current Q11/Q12/Q15/Q9/Q20 wins** by reverting V1-sync ValueState to v3.2's shared-backend-HashMap write-buffer mechanism while keeping every other 2026-05-20-21 session improvement intact.
+**Recover Q5 ≈ 32 s** by giving V1 ValueState a **shared off-heap `ArrowBinaryBuffer`** owned by the backend (replacing v3.2's on-heap HashMap and 1b.1's per-instance off-heap). One big shared off-heap buffer absorbs Q5's working set AND keeps the hot path zero-copy: MemorySegment views all the way through `value()/update()/clear()`.
 
 Strict KPI:
 - Q5  ≤ 50 s   (vs current 561 s; v3.2 was 32.45 s)
 - Q8  ≤ 40 s   (vs current 55.6 s; v3.2 was 27.3 s)
-- Q11 ≤ 80 s  (current 73.6 s — no regression)
-- Q12 ≤ 35 s  (current 33.3 s — no regression)
-- Q13 ≤ 45 s  (current 40.6 s — no regression; should improve)
-- Q15 ≤ 25 s  (current 18.3 s — preserve win)
-- Q9  ≤ 70 s  (current 56.9 s — preserve win)
-- Q18 ≤ 75 s  (current 68.4 s — preserve win)
-- Q20 ≤ 60 s  (current 48.8 s — preserve win)
-- Q19 stays at its 1c.1 known-regression level (~117 s; separate spec)
+- Q11 ≤ 80 s   (current 73.6 s — no regression)
+- Q12 ≤ 35 s   (current 33.3 s — no regression)
+- Q13 ≤ 45 s   (current 40.6 s — should improve)
+- Q15 ≤ 25 s   (current 18.3 s — preserve 1c.1 win)
+- Q9  ≤ 70 s   (current 56.9 s — preserve 1c.1 win)
+- Q18 ≤ 75 s   (current 68.4 s)
+- Q20 ≤ 60 s   (current 48.8 s — preserve 1c.1 win)
 
 ## Non-Goals
 
-- Removing 1a/1c.1 code — keep the foundation as MapState's storage.
-- Touching V2 async path — unchanged.
-- Rust engine — no FFM changes.
+- Removing 1a/1c.1 code — keep foundation; MapState's per-instance buffer pattern stays as 1c.1's choice.
+- V2 async path — unchanged; doesn't use this buffer.
+- Rust engine — no FFM changes (existing `frsBatchPutArrow` reused).
 - Flink runtime — unchanged.
 
 ## Architecture
 
 ```
-ForStRsKeyedStateBackend (HEAD e0809571483):
-├── stateCache: Map<String, Object>            (per-stateName cache)
-├── shared writeBuffer: Map<ByteArrayWrapper, byte[]>   (REINSTATED for V1 ValueState)
-│     MAX_BUFFER_ENTRIES = 524288   (or current 4096 — see Section 2)
-│     WRITE_BUFFER_FLUSH_THRESHOLD = 64  (current)
-│     adaptive disable already in place
-├── mapStateRegistry: Map<String, ForStRsMapState>  (per-MapState off-heap; unchanged)
-├── ownedBuffers: List<ArrowBinaryBuffer>  (still owned for MapStates; ValueState is no longer wired)
+ForStRsKeyedStateBackend:
+├── stateCache: Map<String, ForStRsValueState> (per-stateName cache; survives setCurrentKey)
+├── sharedValueStateBuf: ArrowBinaryBuffer  (NEW — single off-heap buffer for ALL V1 ValueState)
+│     initialCapacity = 1024
+│     maxCapacity = 524288  (matches v3.2's MAX_BUFFER_ENTRIES)
+│     auto-tuner attached (existing AutoTuner; growth gated by size + hit-rate)
+├── mapStateRegistry: Map<String, ForStRsMapState> (per-MapState off-heap; 1c.1 unchanged)
+├── ownedBuffers: List<ArrowBinaryBuffer>  (now also includes sharedValueStateBuf)
+├── scratchArenaTL: ThreadLocal<MemorySegment>  (unchanged)
 ├── setCurrentKey(K newKey):
-│     - serialize newKey to currentKeyBytes
+│     - currentKeyBytes = serialize(newKey)
 │     - keyGeneration++
-│     - stateCache.clear()        (REINSTATED — V1 ValueState's keyPrefix embeds currentKey)
+│     - NO cache clear (ValueState instances are buffer-agnostic; they encode the current
+│       composite key per call via their kgSerializer reference)
 ├── getValueState(stateName, valueSerializer):
-│     ┌─────────────────────────────────────────────────────────┐
-│     │  REVERT TO v3.2 PATTERN                                  │
-│     │  byte[] prefix = buildPrefix(stateName);                 │
-│     │  return new ForStRsValueState<>(                         │
-│     │      linker, db, defaultCf, prefix, valueSerializer,     │
-│     │      this::getFromWriteBuffer,                           │
-│     │      this::putToWriteBuffer,                             │
-│     │      this::deleteFromWriteBuffer);                       │
-│     └─────────────────────────────────────────────────────────┘
-└── getMapState(stateName, keySer, valSer):  (UNCHANGED — uses 1c.1 ArrowBinaryBuffer + tuner)
+│     - cache hit → return cached instance
+│     - cache miss → new ForStRsValueState<>(
+│         linker, db, defaultCf, valueSerializer,
+│         scratchArenaTL::get,
+│         kgSerializer,
+│         stateName,
+│         this::getCurrentKeyGroupIndex,
+│         () -> getCurrentKey(),
+│         sharedValueStateBuf,        // ← KEY: shared backend buffer, not per-instance
+│         sharedValueStateTuner);
+└── getMapState(...): UNCHANGED, uses per-instance ArrowBinaryBuffer per 1c.1.
+
+ForStRsValueState (using existing 1b.1 off-heap ctor):
+├── value()/update()/clear() unchanged from 1b.1 — they already operate on the
+│   passed-in statebuf via MemorySegment APIs. They don't care whether the buffer
+│   is per-instance or shared.
+└── flushStateBuffer(): drains the buffer. Since the buffer is now shared across
+    all V1 ValueState instances, EACH ValueState's flushStateBuffer drains the
+    SAME backend buffer. Idempotent: if already empty, no-op.
+
+Data flow on Q5 event:
+  setCurrentKey(auctionId)               (no clear)
+  for each of 5 panes:
+    state = backend.getValueState("acc")  (cache hit after first call)
+    state.value():
+      encodeForStateOffheap(...) → (off, len) in scratch (different per pane via namespace)
+      sharedValueStateBuf.find(scratch, off, len) → row or -1
+      hit → MemorySegmentDataInputView on shared buffer (zero-copy, zero byte[])
+      miss → linker.getPinnedSegment(...) into scratch (zero byte[] per Java side)
+    state.update(newAcc):
+      serialize into scratch via MemorySegmentDataOutputView (zero byte[])
+      sharedValueStateBuf.insert(scratch, keyOff, keyLen, scratch, valOff, valLen)
+      if buffer fills: flushTo → linker.batchPut (single FFM for N entries)
 ```
 
-ValueState (legacy byte[]-prefix-with-hooks ctor — class lines 112-132) consumes the backend's shared write-buffer hooks. `keyComputer`-mode ctor (1b.1) remains in the file as dead code (kept for future revisitation / tests).
-
-ArrowBinaryBuffer + AutoTuner remain in tree — used exclusively by MapState (and any future state class that opts in).
+All 5 panes' state lives in ONE shared off-heap buffer. Working set ~50K-250K entries fits within 524K cap. Buffer hit rate stays high. FFM crossings rare. Q5 absorption mechanism = v3.2's shared mechanism, off-heap.
 
 ## Components Touched
 
 | Component | File | Change |
 |---|---|---|
-| `getValueState` wiring | `ForStRsKeyedStateBackend.java` (around current line 327) | Switch from keyComputer-mode ctor (`new ForStRsValueState<>(linker, db, defaultCf, valueSerializer, () -> ..., kgSer, stateName, ..., buf, tuner)`) to byte[]-prefix-with-hooks ctor (`new ForStRsValueState<>(linker, db, defaultCf, buildPrefix(stateName), valueSerializer, this::getFromWriteBuffer, this::putToWriteBuffer, this::deleteFromWriteBuffer)`). Remove the per-instance `new ArrowBinaryBuffer(...)` + `ownedBuffers.add(buf)` lines for ValueState. |
-| `setCurrentKey` | `ForStRsKeyedStateBackend.java` (around line 268) | Re-add `this.stateCache.clear();` at the end of setCurrentKey (it was removed in 1b.2). The legacy byte[]-prefix ValueState ctor bakes `currentKeyBytes` into the prefix at construction time, so each setCurrentKey must invalidate cached ValueStates. MapState is in `mapStateRegistry` (separate from `stateCache`) so it's unaffected. |
-| `MAX_BUFFER_ENTRIES` | `ForStRsKeyedStateBackend.java` | Lift the existing constant from current 4096 → 524288 (matches v3.2). The shared HashMap can absorb Q5's working set comfortably at this size. The adaptive-disable mechanism keeps high-cardinality unhelpful-buffer workloads from paying HashMap-grow cost when hit rate is < 10%. |
-| `WRITE_BUFFER_FLUSH_THRESHOLD` | `ForStRsKeyedStateBackend.java` | Lift from current 64 → 8192 (between v3.2's 524288 cap-flush and a flushable batch size; smaller than v3.2's effective batch so we don't stall on giant batchPut calls). |
-| ValueState off-heap code | `ForStRsValueState.java` (lines 158-210 approx — the keyComputer-mode ctor + the off-heap branches in value/update/clear) | Keep as dead code. The byte[]-prefix ctors + their value/update/clear bodies (lines 89-156 approx) handle V1 again. |
-| ArrowBinaryBuffer + AutoTuner | unchanged | Used by MapState only. |
+| Shared buffer field | `ForStRsKeyedStateBackend.java` | Add `private final ArrowBinaryBuffer sharedValueStateBuf;` + `sharedValueStateTuner;` initialized in constructor at `(initial=1024, max=524288, tuner)`. |
+| Shared buffer lifecycle | `ForStRsKeyedStateBackend.close()` | Already iterates ownedBuffers and closes each; add sharedValueStateBuf to ownedBuffers so it's freed on close. |
+| `getValueState` | `ForStRsKeyedStateBackend.java` (around line 327) | Switch ctor call to pass `sharedValueStateBuf, sharedValueStateTuner` instead of constructing a per-instance one. Remove `ownedBuffers.add(buf)` (the shared one is already registered). |
+| `setCurrentKey` | `ForStRsKeyedStateBackend.java` | Keep current (no clear) — works correctly because ValueState instances now lazily encode composite key per call from currentKeyBytes (the kgSerializer + keySupplier closure handles this). |
+| Snapshot/close flush | `ForStRsKeyedStateBackend.java` | Existing iteration over stateCache + flushStateBuffer is correct. Each ValueState's flushStateBuffer drains the shared buffer; the first call empties it, subsequent calls are no-ops (size==0). |
+| `MAX_BUFFER_ENTRIES` on legacy backend HashMap | `ForStRsKeyedStateBackend.java` | Legacy `Map<ByteArrayWrapper, byte[]> writeBuffer` becomes UNUSED for ValueState (was already unused after 1b.1). Existing code paths that call `getFromWriteBuffer/putToWriteBuffer/deleteFromWriteBuffer` are kept for any future legacy-mode callers (e.g., List/Reducing/Aggregating still use legacy ctor pathways), but ValueState no longer touches them. |
 
-## Data Flow (post-fix, Q5 example)
+ValueState itself: unchanged. Its off-heap value/update/clear (committed in 1b.1) operates on whatever buffer it's given. The fix is purely at the wiring layer.
 
-```
-event:
-  backend.setCurrentKey(auctionId)
-    - serialize currentKey → currentKeyBytes
-    - stateCache.clear()  (V1 ValueState instances reaped)
+## Data Flow Comparison
 
-  for each of 5 panes (window-namespace):
-    state = backend.getValueState("acc", LongSerializer.INSTANCE)
-      - cache miss → new ForStRsValueState<>(linker, db, defaultCf, buildPrefix("acc"), ..., hooks)
-      - cached in stateCache
-    state.value():
-      - lastValueKey = keyPrefix (already includes currentKeyBytes from ctor)
-      - writeBufferGet.apply(lastValueKey) → HashMap lookup
-        - HIT → return cached payload (zero FFM)
-        - MISS → linker.getPinned(...) → byte[] (1 FFM)
-    state.update(newAcc):
-      - serialize → byte[] payload
-      - writeBufferPut.accept(lastValueKey, payload)
-        - HashMap.put — accumulates in shared buffer
-        - flushes via frsBatchPut at WRITE_BUFFER_FLUSH_THRESHOLD or MAX_BUFFER_ENTRIES
-```
-
-For Q5: 5 panes × 100 M events × ~5 effective pane keys per event with high read-write locality (sliding-shared) → buffer hit rate ~95%+ → ~25 M FFM crossings instead of 1 B → wall-clock drops from 561 s to ~32 s.
+| Path | 1b.1 (current, Q5 = 561 s) | v3.2 (Q5 = 32 s, byte[] everywhere) | **This design (Q5 ≈ 32 s, zero-copy)** |
+|---|---|---|---|
+| Composite key | off-heap in scratch | byte[] alloc | off-heap in scratch ✓ |
+| Buffer storage | per-instance ArrowBinaryBuffer | shared HashMap<wrapper, byte[]> | **shared ArrowBinaryBuffer** ✓ |
+| Read path | MemorySegmentDataInputView on instance buf | byte[] from HashMap → DataInputDeserializer | **MemorySegmentDataInputView on shared buf** ✓ |
+| Write path | MemorySegmentDataOutputView into scratch → instance buf | DataOutputSerializer → getCopyOfBuffer → HashMap.put | **MemorySegmentDataOutputView into scratch → shared buf** ✓ |
+| Cold-miss native call | linker.getPinnedSegment | linker.getPinned (byte[]) | **linker.getPinnedSegment** ✓ |
+| Flush | per-instance batchPut | shared batchPut | **shared batchPut** ✓ |
+| **byte[] on hot path** | none | many | **none** ✓ |
+| **Q5 working set absorption** | fragmented across 5 per-pane buffers | one buffer | **one shared buffer** ✓ |
 
 ## Correctness Invariants
 
-- **stateCache.clear() on setCurrentKey** — restored. V1 ValueState's `keyPrefix` field is captured at construction with the current key embedded; subsequent setCurrentKey must invalidate the cached instance. Matches v3.2 semantics. Per-event ValueState allocation cost is dominated by buffer hit rate not allocation churn (per JFR analysis early in this session).
-- **MapState cache survival** — `mapStateRegistry` (separate from `stateCache`) survives setCurrentKey. 1c.1's MapState instances use `compositeKeyComputer: Function<UK, byte[]>` which lazily reads `currentKeyBytes`, so survival is correct. Unchanged.
-- **Shared write-buffer correctness** — exists in v3.2 and current code (line 165 of ForStRsKeyedStateBackend.java). The `writeBufferPut/Get/Delete` hooks route through this HashMap. Concurrency: single-threaded per Flink slot — same as today. Flush on checkpoint: existing `flushWriteBuffer()` method.
-- **Read-after-write consistency** — `getFromWriteBuffer` is called before `linker.getPinned` in value(); writes go through `putToWriteBuffer` first. Reads see the latest write. Unchanged.
-- **Snapshot/restore** — checkpoint flushes the write buffer (existing path); restore reads from engine state. Unchanged.
+- **Shared buffer concurrency** — Flink keyed-state backend is single-threaded per slot; the shared buffer is single-threaded by construction. No locking needed.
+- **stateCache survival across setCurrentKey** — ValueState instances are buffer-agnostic; they compute composite keys per call from the backend's `currentKeyBytes` via the kgSerializer + keySupplier closure. Survives setCurrentKey safely. (Same property as 1b.2's design.)
+- **State-name disambiguation in the shared buffer** — composite keys include `[kg | userKey | / | stateName | /]`, so two different ValueStates with different stateNames have different composite keys. No collision in the shared buffer.
+- **Flush correctness** — backend's `close()` iterates `stateCache` and calls `flushStateBuffer()` on each ValueState. The first call drains the shared buffer; subsequent are no-ops. Each ValueState's `flushStateBuffer` is idempotent (already checks `if (size == 0) return`).
+- **Snapshot/checkpoint correctness** — existing path calls `flushStateBuffer()` on each cached ValueState before snapshot. Same drains-shared-buffer behavior. Data is durable in engine post-snapshot.
+- **Auto-tuner sharing** — one auto-tuner observes reads from ALL ValueState instances. The aggregate hit rate + occupancy across all panes drives growth decisions. This is desired — the cap grows when the WHOLE workload's working set grows, not when one pane's does.
 
 ## Error Handling
 
-No new error modes. All shared write-buffer paths are existing code reinstated, not new.
+No new error modes. All existing failure paths (`linker.getPinnedSegment` returns -1 on miss, `flushTo` propagates native errors, etc.) inherited from 1a/1b/1c.1.
 
 ## Testing
 
-### Existing tests that must still pass
+### Existing tests that must pass
 
-- `ArrowBinaryBufferTest`, `ArrowBinaryBufferAutoTunerTest` — pure-Java, unaffected.
-- `ForStRsValueStateOffheapTest` — exercises the off-heap ctor directly, still passes (the ctor lives, just is no longer called from `getValueState`).
-- `ForStRsMapStateOffheapTest` — unaffected.
-- `KeyGroupedSerializerOffheapParityTest` — unaffected.
+- All current tests (33+ unit tests in the forst-rs backend) must still pass.
+- `ForStRsValueStateOffheapTest` continues to exercise the off-heap ctor — still passes since the ctor signature is unchanged.
 
-### New / restored tests
+### New tests
 
-1. **`ValueStateUsesSharedBufferTest`** — after `getValueState`, two consecutive `value()` reads on the same key should produce exactly ONE `linker.getPinned` call (the second hits the shared buffer). Use a mockable linker that counts calls.
-2. **`ValueStateInstanceCachePerName`** — calling `getValueState("foo", ...)` twice between two `setCurrentKey` calls returns the SAME instance (cache hit). Calling it after a `setCurrentKey` produces a different instance (cache cleared).
+1. **`SharedValueStateBufferTest`** — create two `ForStRsValueState` instances with different stateNames sharing the SAME `ArrowBinaryBuffer`. Verify writes to one don't collide with reads from the other. (Tests composite-key disambiguation.)
+2. **`SharedBufferSurvivesSetCurrentKey`** — backend creates V1 ValueState, puts a value, calls `setCurrentKey(k2)`, then reads back with the original key — should still find the buffered write (since the shared buffer holds it indexed by composite-key that includes the original key).
+3. **`SharedBufferFlushOnceFromAnyValueState`** — fill the shared buffer via ValueState A, call flushStateBuffer via ValueState B. Buffer drains correctly. Reads from ValueState A after flush still work (read goes through linker.getPinnedSegment to engine).
 
-### Bench acceptance gates (tiered, per existing T0/T1/T2)
+### Bench acceptance gates (tiered, fresh-cluster)
 
 | Q | Target | Notes |
 |---|---|---|
-| Q5  | ≤ 50 s   | recover v3.2's 32 s (with HEAP timer plus shared buffer ⇒ should hit) |
-| Q8  | ≤ 40 s   | v3.2 was 27 s |
+| Q5  | ≤ 50 s   | Q5 = recovery target |
+| Q8  | ≤ 40 s   | v3.2 was 27 s; should be close |
 | Q11 | ≤ 80 s   | no regression vs current 73 s |
-| Q12 | ≤ 35 s   | V2 path, invariant |
+| Q12 | ≤ 35 s   | V2 path invariant |
 | Q13 | ≤ 45 s   | should improve |
-| Q15 | ≤ 25 s   | preserve 1c.1 win (current 18 s) |
-| Q9  | ≤ 70 s   | preserve 1c.1 win (current 57 s) |
-| Q18 | ≤ 75 s   | preserve current 68 s |
-| Q20 | ≤ 60 s   | preserve 1c.1 win (current 49 s) |
-| Q22 | ≤ 35 s   | preserve current 32 s |
-| Q19 | ≤ 130 s  | 1c.1 known regression; separate fix |
+| Q15 | ≤ 25 s   | preserve 1c.1 win |
+| Q9  | ≤ 70 s   | preserve 1c.1 win |
+| Q18 | ≤ 75 s   | preserve current |
+| Q20 | ≤ 60 s   | preserve 1c.1 win |
+| Q22 | ≤ 35 s   | preserve current |
+| Q19 | ≤ 130 s  | known 1c.1 regression; separate spec |
 
-If any of Q5/Q8/Q13/Q11/Q12 misses target by > 20%, the design's premise is wrong — rollback and re-investigate. Q9/Q15/Q18/Q20 should be invariant (their wins come from MapState off-heap, not ValueState).
+If Q5 misses target, the design's "shared absorption" hypothesis is wrong — investigate (likely the working set is bigger than 524K) and consider lifting max OR adding LRU eviction.
 
-## Implementation Order — single PR
+## Implementation Order (single PR)
 
-1. **Lift `MAX_BUFFER_ENTRIES`** (current `ForStRsKeyedStateBackend.java`) — 4096 → 524288.
-2. **Lift `WRITE_BUFFER_FLUSH_THRESHOLD`** — 64 → 8192.
-3. **`getValueState` switch** — use the byte[]-prefix-with-hooks ctor; remove the per-instance ArrowBinaryBuffer construction for ValueState. ValueState's off-heap code remains as dead code on the legacy path.
-4. **Restore `stateCache.clear()` in `setCurrentKey`** — bring back the line 288 deletion (1b.2 removed it).
-5. **Add the 2 new unit tests.**
-6. **Bench Q5, Q8, Q11, Q12, Q13, Q15, Q9, Q18, Q20, Q22, Q19 with fresh-cluster strategy.**
-7. **Commit + update v3 report (v3.8 section) with the recovered portfolio.**
+1. **Add `sharedValueStateBuf` field + tuner** to `ForStRsKeyedStateBackend`. Initialize in constructor. Add to `ownedBuffers` for lifecycle.
+2. **Modify `getValueState`** — pass the shared buffer + tuner to ValueState's existing off-heap ctor.
+3. **Verify `setCurrentKey`** stays without `stateCache.clear()` (it already does post-1b.2).
+4. **Add 3 unit tests** described above.
+5. **Build, deploy, bench Q5/Q8/Q9/Q11/Q12/Q13/Q15/Q18/Q19/Q20/Q22.**
+6. **Commit + update v3 report with v3.8 section** if gates pass.
 
-## Why this is safe to ship
+## Why this is the right design
 
-- **Reverts only the ValueState wiring** — touches one method in one file (`getValueState`) plus 3 constants + restore one line in `setCurrentKey`. ≤ 20 lines of code change.
-- **Preserves all the architectural infrastructure** — 1a foundation, 1c.1 MapState off-heap, PREP HEAP timer factory, size-aware AutoTuner.
-- **Empirical evidence** — v3.2 ran exactly this V1-ValueState mechanism and achieved Q5 = 32.45 s. The mechanism is proven.
-- **Q11/Q12 robustness** — these are timer-bound, not buffer-bound. They didn't regress when we removed the per-instance buffer in 1b.1's design; they won't regress when we put back the v3.2 shared-buffer.
+- **Preserves the architectural goal**: zero-copy + vectorization end-to-end on V1 sync. No byte[] on hot path.
+- **Empirically grounded**: v3.2 proved a shared 524K-entry buffer absorbs Q5's working set. We're using the same SHAPE, off-heap.
+- **Surgical**: ≤ 30 lines of code change in `ForStRsKeyedStateBackend.java`. No changes to ValueState itself (1b.1 off-heap path stays).
+- **Preserves all current wins**: HEAP timer factory (Q11/Q12), MapState off-heap (Q15/Q9/Q20), 1a foundation.
+- **Future-friendly**: if a workload needs per-instance isolation (e.g., disjoint working sets), a future opt-in could wire per-instance buffer. The shared buffer is the default; per-instance is the future optimization.
 
 ## Out of Scope (follow-on)
 
-- Q19's 1c.1 regression (MapState off-heap write memcpy) — separate spec.
-- Engine-level Q5 optimization (Approach-C) — if even with this fix Q5 stays ≥ 40 s, deeper engine work.
-- Removing the dead 1b.1 off-heap ValueState code — keep for potential future use; YAGNI says don't delete working code that might be wanted later.
+- Q19's 1c.1 known regression — separate spec.
+- Engine-level optimizations — Approach-C, separate spec.
+- Migrating MapState to use the same shared-buffer pattern — could give Q19 recovery; experimental, not in this PR.
