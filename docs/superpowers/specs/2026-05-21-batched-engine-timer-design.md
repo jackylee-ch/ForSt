@@ -37,63 +37,82 @@ Net effect: HEAP timer factory becomes unnecessary; FORSTRS becomes the universa
 - Rust engine — no FFM signature changes; existing `frsBatchPut` / `frsVectorizedBatchDelete` / `frsBatchPrefixScan` are reused.
 - Flink runtime — no changes to timer-service contract.
 
-## Architecture — "Option 1' (watermark-aware buffered min-heap)"
+## Architecture — "Option 1' + Variant B (off-heap zero-copy)"
+
+End-to-end goals: **batch execution + vectorization + zero-copy** all preserved. The pending buffer is an **off-heap binary min-heap** (not a Java `PriorityQueue`) so no Java objects are allocated per timer event.
 
 ```
-ForStRsKeyGroupedInternalPriorityQueue:
+ArrowTimerBuffer (NEW component — analog of ArrowBinaryBuffer for timer entries):
+├── heapArray: MemorySegment of fixed-size entries (24 bytes each)
+│     entry layout: { ts: long, op: int (ADD=1, REMOVE=2), keyOffset: int, keyLen: int }
+│     min-heap by ts, indexed by array position (parent=(i-1)/2, children=2i+1/2i+2)
+├── keyData: MemorySegment of variable-length composite key bytes (kg+ts+serialize(T))
+├── hashIndex: open-addressed long → int (key-hash → heapArray row) for O(1) cancellation lookup
+├── size / capacity (resize like ArrowBinaryBuffer; growth is rare)
+└── all operations operate on MemorySegments — ZERO Java alloc on hot path
+
+ForStRsKeyGroupedInternalPriorityQueue (refactored):
 ├── engine (current, unchanged):
 │     Composite key layout: "q/" || stateName || "/" || kg(2B BE) || ts(8B BE) || serialize(T)
 │     Engine accessed via linker.batchPut / linker.frsBatchPrefixScan / linker.frsVectorizedBatchDelete
-├── pendingBuffer (NEW): Java-side min-heap (PriorityQueue<TimerEntry>) ordered by timestamp
-│     Each entry: { op: ADD|REMOVE, key (off-heap MemorySegment ref OR byte[] view), ts }
-│     Two semantic states per (kg, ts, T) tuple:
-│       — pending ADD: timer to be inserted to engine
-│       — pending REMOVE: timer to be removed from engine
-│     INVARIANT: at most ONE pending entry per (kg, ts, T) at any time
-└── flush triggers (3 moments only):
-      1. advance() entry — before processing due timers (read boundary)
-      2. threshold reached — pendingBuffer.size ≥ 1024
-      3. checkpoint barrier — snapshot must see consistent state
+├── pendingBuffer: ArrowTimerBuffer (above)
+├── flush triggers (3 moments only):
+│     1. advance() entry — before processing due timers (read boundary)
+│     2. threshold reached — pendingBuffer.size ≥ 1024
+│     3. checkpoint barrier — snapshot must see consistent state
+└── scratchArena (thread-local): for composing the composite key per call (reused across calls)
 
 External operations:
   add(T element):
-    1. compose key = ts + serialize(T)
-    2. pendingBuffer.lookup(key):
+    1. Compose key into scratchArena → (keyOffset, keyLen) view (off-heap, no byte[])
+    2. hash = hash(scratchArena, keyOffset, keyLen)
+    3. pendingBuffer.lookup(hash, scratchArena, keyOffset, keyLen):
        — found ADD → no-op (idempotent)
-       — found REMOVE → CANCEL: remove from pendingBuffer (add+remove cancel)
-       — not found → insert ADD entry into pendingBuffer
-    3. if pendingBuffer.size ≥ 1024 → flushAddsToEngine
+       — found REMOVE → CANCEL: remove from heap + hashIndex (add+remove cancel)
+       — not found → copy key into pendingBuffer.keyData; insert ADD entry into heapArray (heap-swim up)
+    4. if pendingBuffer.size ≥ 1024 → flushPendingToEngine
 
   remove(T element):
-    1. compose key
-    2. pendingBuffer.lookup(key):
-       — found ADD → CANCEL: remove from pendingBuffer (add+remove cancel)
-       — found REMOVE → no-op (idempotent)
-       — not found → insert REMOVE entry into pendingBuffer
-    3. if pendingBuffer.size ≥ 1024 → flushRemovesToEngine
+    1. Compose key into scratchArena
+    2. hash + lookup as above
+       — found ADD → CANCEL
+       — found REMOVE → no-op
+       — not found → insert REMOVE entry into heapArray
+    3. threshold check
 
-  peek() / iterator() (NON-flushing):
-    Merged view: walk pendingBuffer-ADD entries (already sorted by ts) interleaved with
-    engine prefix scan, suppressing entries marked REMOVE. Returns next timer due.
-    O(log N) lookup against the min-heap; O(B) scan against the engine batch size.
+  peek() / iterator() (NON-flushing — merged view):
+    Walk pendingBuffer's heap-min-walk (preorder by ts) interleaved with engine prefix scan.
+    Suppress entries marked REMOVE in pendingBuffer. Return next due timer.
+    O(log N) per heap step + O(B) engine batch read.
 
   advance(maxTimestamp):
-    1. Flush pendingBuffer → engine (deletes + puts via batchPut + batch-delete)
-    2. Open engine prefix-scan iterator for kg-prefix
-    3. For each entry with ts ≤ maxTimestamp:
-       — invoke trigger callback (or collect into firingBatch)
-       — accumulate (kg, ts, T) keys into deleteBatch
-    4. Single linker.frsVectorizedBatchDelete on the deleteBatch
-    5. Close iterator
+    1. flushPendingToEngine — drain heapArray:
+       — collect ADD entries → linker.batchPut keys
+       — collect REMOVE entries → linker.frsVectorizedBatchDelete keys
+       — pendingBuffer.clear() (heap size = 0, keyData reused next call)
+    2. linker.frsBatchPrefixScan(engine kg-prefix) — single FFM, vectorized
+    3. For each entry returned with ts ≤ maxTimestamp:
+       — invoke trigger callback (key view is MemorySegment slice from the scan result)
+       — accumulate keys into deleteBatch (MemorySegment array)
+    4. linker.frsVectorizedBatchDelete(deleteBatch) — single FFM
+    5. Close iterator handle
 
   snapshot(checkpointId):
-    1. Flush pendingBuffer → engine
+    1. flushPendingToEngine
     2. Existing engine snapshot path
 
   close():
-    1. Flush pendingBuffer → engine
-    2. Existing close
+    1. flushPendingToEngine
+    2. pendingBuffer.close() (releases Arena)
+    3. Existing close
 ```
+
+**Zero-copy contract** — at every hot-path interface:
+- Composite key encoded directly into thread-local scratch `MemorySegment` (no byte[])
+- Buffer storage in off-heap Arena (heapArray + keyData are MemorySegment regions)
+- FFM crossings carry `MemorySegment` views (no Java→native byte[] copy)
+- Iterator results carry `MemorySegment` views (no native→Java byte[] alloc)
+- The only Java objects allocated per timer event: NONE on the hot path
 
 ## Four Implementation Invariants (Critical Checklist)
 
