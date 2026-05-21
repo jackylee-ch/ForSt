@@ -97,9 +97,14 @@ The **leverage score** is `worst_case_wallclock × relief_fraction × certainty_
 | **V11** | `state/ForStRsAsyncListStateV2.java` (NO `ArrowBinaryBuffer` fast path; T3 unused) | T1↔T3 | zero-copy + vectorization | HIGH | Q19 | Q19 (135 s after V3) | 30 | MED (see §3.5 D11) | 18.0 |
 | **V12** | `state/ForStRs{Reducing,Aggregating}StateV2.java` (inherit ValueState V2 write-copy gap) | T1 | zero-copy | LOW-MED | Q4-style aggregations (already at 5.37× — secondary lever) | Q4 (46.9 s) | 5 | **LOW** (no firm derivation — see §3.5 D12) | 1.5 |
 | **V13** | V2 async snapshot path — does the columnar buffer flush before the snapshot barrier? **Open**, see §9 OQ-2 | T4 | correctness (not principle) | gating | all V2 snapshots | n/a | n/a | n/a | n/a |
-| **V14** | V1-sync code paths — claim "already off-heap correct" not validated since `537c1403f2f`; see §9 OQ-1 | T1 | unknown | unknown | Q5, Q13 (V1-sync HOP/JOIN) | Q13 (41.1 s) | unknown | LOW | TBD |
+| **V14** | V1-sync code paths — **CLOSED** at Phase 0 sub-spec commit `e8fbbf7a0`. Verdict: ValueState V1 PASS; MapState V1 PARTIAL; ListState/Reducing/Aggregating V1 FAIL. Split into V15–V19 below. | T1 | resolved | n/a | n/a | n/a | n/a | n/a | n/a |
+| **V15** | `state/ForStRsMapState.java:668-670` (`forEachEntry` iter — `byte[] mapKeyBytes = new byte[mapKeyLen]`) | T1 | zero-copy | LOW-MED | Q15, Q19 iter | Q15 (18.34 s) | 3 | MED | 1.8 |
+| **V16** | `state/ForStRsMapState.java:678-679` (`forEachEntry` iter — `byte[] vBytes = new byte[vLen]`) | T1 | zero-copy | LOW-MED | Q15, Q19 iter | Q15 (18.34 s) | 3 | MED | 1.8 |
+| **V17** | `state/ForStRsListState.java:158-182` (`readList`/`writeList` — full GET+PUT, 2× heap `byte[]` per `add`) | T1 | zero-copy + batch | MED | Q5, Q13 V1-sync | Q13 (41.1 s) | 8 | LOW | 2.4 |
+| **V18** | `state/ForStRsReducingState.java:116-130` (`readValue`/`writeValue` — 2× heap `byte[]` per `add`) | T1 | zero-copy | LOW | V1-sync Reducing | n/a | 2 | LOW | 0.6 |
+| **V19** | `state/ForStRsAggregatingState.java:126-140` (`readAccumulator`/`writeAccumulator` — 2× heap `byte[]` per `add`) | T1 | zero-copy | LOW | V1-sync Aggregating | n/a | 2 | LOW | 0.6 |
 
-Total catalog: **14 violations** (8 from today's audit + 2 carried + 4 newly-derived; V13/V14 are gating items, not fix candidates).
+Total catalog: **19 violations** (8 from today's audit + 2 carried + 4 newly-derived gating items V11–V14 + 5 added by Phase 0 sub-spec V15–V19). V13 remains a gating item; V14 CLOSED and split into V15–V19. **Phase A entry gate: UNBLOCKED** (Phase A operates on V2 async ListState only, out of scope for V15–V19). **Phase C gate update**: must NOT use V1-sync `ForStRsMapState.forEachEntry` or V1-sync ListState as templates per Phase 0 sub-spec verdict.
 
 ---
 
@@ -439,15 +444,21 @@ After all 5 phases land, the **portfolio gate** is: `forst-rs wins ≥ 20 of 23 
 
 ## §9 — Open questions (pre-populated, must close before Phase A; OQ-1 promoted to Phase 0)
 
-### OQ-1 — Is V1-sync genuinely "already off-heap correct"? — PROMOTED TO PHASE 0
+### OQ-1 — Is V1-sync genuinely "already off-heap correct"? — **CLOSED**
 
-**Status**: per the PMC review, this open question is upgraded from "parallelizable open work" to a **hard Phase 0 prerequisite** (see §7). The risk of Phase C copying a half-correct pattern from V1-sync if it's not actually compliant is too high to let Phase A start before this closes.
+**Resolution (2026-05-22, commit `e8fbbf7a0`):** Phase 0 sub-spec `docs/superpowers/specs/2026-05-22-v1-sync-compliance-reaudit-design.md` completed. Verdict per V1-sync state class:
 
-The claim that V1-sync ValueState / MapState are principle-compliant since commits `537c1403f2f` and `633af3d3be1` has been twice falsified in this project's history:
-1. **PR-A revert (commit `cb077849...`)** — the "always-on write buffer" caused Q5 to regress to 586 s; reverted to adaptive-disable.
-2. **Large-buffer-breaking-Q11/Q12** — increasing buffer capacity sped up Q5 but tanked Q11/Q12.
+| State class | Status | Evidence |
+|---|---|---|
+| `ForStRsValueState` (V1 sync) | **PASS** | `value()` (line 270-324) + `update()` (line 327-374) flow through `MemorySegment` slices + `MemorySegmentDataInputView` when `statebuf != null`; legacy heap branches dead. |
+| `ForStRsMapState` (V1 sync) | **PARTIAL** | Per-key hot path (`get/put/contains/remove` at L300-505) compliant. Iterator path (`forEachEntry` L642-733) FAILS — allocates `byte[]` per row (now V15, V16). |
+| `ForStRsListState` (V1 sync) | **FAIL** | No off-heap constructor; backend wires legacy heap path. `add()` is full GET+PUT with 2× heap `byte[]` (now V17). |
+| `ForStRsReducingState` (V1 sync) | **FAIL** | No off-heap path (now V18). |
+| `ForStRsAggregatingState` (V1 sync) | **FAIL** | No off-heap path (now V19). Parent spec V12's "inherits ValueState compliance" assumption FALSIFIED for V1. |
 
-Action: see §7 Phase 0. Deliverable is the standalone sub-spec `2026-05-22-v1-sync-compliance-reaudit-design.md`.
+**Phase A entry gate:** UNBLOCKED (Phase A operates on V2 async ListState only).
+
+**Phase C entry gate update:** Phase C must NOT use V1-sync MapState iterator or V1-sync ListState as a template. Use V1-sync ValueState pattern (the only PASS) as the reference.
 
 ### OQ-2 — V2 async pre-snapshot flush
 
