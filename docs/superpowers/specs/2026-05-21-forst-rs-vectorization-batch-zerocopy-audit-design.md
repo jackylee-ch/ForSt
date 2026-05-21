@@ -89,17 +89,56 @@ The **leverage score** is `worst_case_wallclock × relief_fraction × certainty_
 | **V3** | `state/ForStRsAsyncListStateV2.java:135-159` (`asyncAdd` → full-PUT) | T1 | batch | **CRIT** | Q19 | Q19 (135 s) | 55 | HIGH | 55.0 |
 | **V4** | `VectorizedExecutor.java:356-440` (`dispatchAppendMerge` per-row loop) | T4 | batch | HIGH | Q19, future ListState users | Q19 (135 s after V3) | 25 | MED | 15.0 |
 | **V5** | `VectorizedExecutor.java:313-326` (GET-result `byte[] = new byte[len]`) | T4 | zero-copy | HIGH | all V2 GET paths — Q16, Q19, Q11, Q12, Q15, Q17, Q21, Q22 | Q16 (199.5 s) | 30 | HIGH | 30.0 |
-| **V6** | `state/ForStRsAsyncListStateV2.java:201-217` (full-`ArrayList` materialization on `asyncGet`) | T1 | zero-copy | MED | Q19 | Q19 (135 s, after V3) | 15 | MED | 9.0 |
-| **V7** | `cache/MapStateCache.java:66-79` (heap `LinkedHashMap<BytesKey, Object>`) | T2 | zero-copy | MED | Q16, Q19 | Q16 (199.5 s) | 20 | MED | 12.0 |
-| **V8** | `state/ForStRsMapStateV2.java:346-380` (slice-decoder still `byte[] buf = new byte[rangeLen]`) | T1 | zero-copy | LOW-MED | Q16 iterator path | Q16 (199.5 s) | 8 | HIGH | 8.0 |
-| **V9** | `ffm/ForStRsLinker.java:2541-2542` (per-iter-step `MemorySegment.copy` to `byte[]`) — **carried from prior audit** | T5 | zero-copy | MED | Q9, Q20, Q16 iter | Q16 (199.5 s) | 10 | HIGH | 10.0 |
-| **V10** | `crates/forst-rs-ffi/src/lib.rs:~2415-2436` (`frs_vectorized_batch_get` naive per-key db.get() loop) — **carried from prior audit** | T5 | batch | HIGH | all V2 batched GET | Q16 (199.5 s) | 35 | MED | 21.0 |
-| **V11** | `state/ForStRsAsyncListStateV2.java` (NO `ArrowBinaryBuffer` fast path; T3 unused) | T1↔T3 | zero-copy + vectorization | HIGH | Q19 | Q19 (135 s after V3) | 30 | MED | 18.0 |
-| **V12** | `state/ForStRs{Reducing,Aggregating}StateV2.java` (inherit ValueState V2 write-copy gap) | T1 | zero-copy | LOW-MED | Q4-style aggregations (already at 5.37× — secondary lever) | Q4 (46.9 s) | 5 | MED | 3.0 |
+| **V6** | `state/ForStRsAsyncListStateV2.java:201-217` (full-`ArrayList` materialization on `asyncGet`) | T1 | zero-copy | MED | Q19 | Q19 (135 s, after V3) | 15 | **LOW** (no firm derivation — see §3.5 D6) | 4.5 |
+| **V7** | `cache/MapStateCache.java:66-79` (heap `LinkedHashMap<BytesKey, Object>`) | T2 | zero-copy | MED | Q16, Q19 | Q16 (199.5 s) | 20 | **LOW** (no firm derivation — see §3.5 D7) | 6.0 |
+| **V8** | `state/ForStRsMapStateV2.java:346-380` (slice-decoder still `byte[] buf = new byte[rangeLen]`) | T1 | zero-copy | LOW-MED | Q16 iterator path | Q16 (199.5 s) | 8 | HIGH (see §3.5 D8) | 8.0 |
+| **V9** | `ffm/ForStRsLinker.java:2541-2542` (per-iter-step `MemorySegment.copy` to `byte[]`) — **carried from prior audit** | T5 | zero-copy | MED | Q9, Q20, Q16 iter | Q16 (199.5 s) | 10 | HIGH (see §3.5 D9) | 10.0 |
+| **V10** | `crates/forst-rs-ffi/src/lib.rs:~2415-2436` (`frs_vectorized_batch_get` naive per-key db.get() loop) — **carried from prior audit** | T5 | batch | HIGH | all V2 batched GET | Q16 (199.5 s) | 35 | MED (see §3.5 D10) | 21.0 |
+| **V11** | `state/ForStRsAsyncListStateV2.java` (NO `ArrowBinaryBuffer` fast path; T3 unused) | T1↔T3 | zero-copy + vectorization | HIGH | Q19 | Q19 (135 s after V3) | 30 | MED (see §3.5 D11) | 18.0 |
+| **V12** | `state/ForStRs{Reducing,Aggregating}StateV2.java` (inherit ValueState V2 write-copy gap) | T1 | zero-copy | LOW-MED | Q4-style aggregations (already at 5.37× — secondary lever) | Q4 (46.9 s) | 5 | **LOW** (no firm derivation — see §3.5 D12) | 1.5 |
 | **V13** | V2 async snapshot path — does the columnar buffer flush before the snapshot barrier? **Open**, see §9 OQ-2 | T4 | correctness (not principle) | gating | all V2 snapshots | n/a | n/a | n/a | n/a |
 | **V14** | V1-sync code paths — claim "already off-heap correct" not validated since `537c1403f2f`; see §9 OQ-1 | T1 | unknown | unknown | Q5, Q13 (V1-sync HOP/JOIN) | Q13 (41.1 s) | unknown | LOW | TBD |
 
 Total catalog: **14 violations** (8 from today's audit + 2 carried + 4 newly-derived; V13/V14 are gating items, not fix candidates).
+
+---
+
+## §3.5 — Estimated relief derivation
+
+Per the prior PMC review round: **estimated-relief numbers are the leverage formula's single largest risk.** Every non-trivial number in §3's "Est. relief" column must cite one of three derivation sources, or auto-downgrade to Certainty=LOW. This section makes the derivation chain auditable. After-the-fact ablation gates in §7 will confirm or refute each estimate.
+
+| ID | Relief (s) | Derivation source | Certainty | Audit anchor |
+|---|---:|---|---|---|
+| **D1** | 12 | Arithmetic: 8 distinct-aggregate ops × 100 M events × ~15 ns/byte[] alloc ≈ 12 s. Allocation cost from JEP 482 JOL measurements (~10–20 ns/heap alloc on Apple Silicon G1). | HIGH | criterion derivation |
+| **D2** | 50 | **Analogous fix**: V1-sync MapState 1c.1 (commit `633af3d3be1`) relief on Q15 was 111.86 → 18.34 s = **93.5 s on Q15**. Q16 has ~6-10 MapState ops/event vs Q15's higher density; pro-rata at 50–60% of Q15's relief ≈ 50 s on Q16's 199.5 s wall-clock. | HIGH | analogous fix proven |
+| **D3** | 55 | **Analogous fix**: batched-timer commit `a5fd9f70dd6` removed GET+PUT cycle on Q12 = 116.56 → 30.22 s = **86.3 s relief**. Q19's GET+PUT pattern is structurally identical; relief estimated at 50–70% of Q12's = 55 s on Q19's 135 s. | HIGH | analogous fix proven |
+| **D4** | 25 | Arithmetic: per-row FFM ≈ 1 µs × Q19's ~3 LIST_ADDs per event × 100 M events / N=1024 batch size ≈ 300 ms FFM overhead after V3 (negligible). Real relief from batching = the per-row Arena.ofConfined() allocation (`Arena` alloc ≈ 50 ns × 300 M rows = 15 s) plus per-row memcpy cost (~30 ns × 300 M = 9 s) = ~24 s. | MED | arithmetic; no proven analog at this batch size |
+| **D5** | 30 | **Analogous fix**: V1-sync ValueState off-heap commit `5ad6e12abb8` eliminated per-event `byte[]` for read path; flame-graph at v3.2 showed `byte[]` alloc was ~25–30 % of executor CPU on heavy-GET queries (Q9/Q20 prior-audit Violation #3). Apply to Q16's 199.5 s × 15 % executor-fraction-of-wall-clock ≈ 30 s. | HIGH | analogous fix proven + prior audit flame-graph cite |
+| **D6** | 15 | No firm derivation. Lazy iterator deferring per-element deserialize would relieve GC pressure but not deserialization CPU; Q19 fully iterates for Top-N decision. **Downgraded to LOW.** | LOW | no derivation — must validate with flame-graph before locking |
+| **D7** | 20 | No firm derivation. Off-heap cache cap raised 256K → 1M; Q16's working set is ~200K bidders × 100K auctions but distinct-aggregates index by `(channel, day, bidder)` triple. Hit-rate model is hypothesis-only — no flame-graph or cache-miss perf-counter data. **Downgraded to LOW.** | LOW | no derivation — must validate with miss-rate counter before locking |
+| **D8** | 8 | **Subsumed by V5**. Same fix shape (slice decoder reads MemorySegment directly). Q16 iterator path is ~10 % of total wall-clock; 80 % of that is per-entry alloc, so 0.8 × 0.1 × 199.5 ≈ 16 s ceiling; conservatively 8 s. | HIGH | same fix as D5 |
+| **D9** | 10 | **Subsumed by V5/V8**. Per-iter-step memcpy is the same allocation pattern at the linker level. | HIGH | same fix as D5/D8 |
+| **D10** | 35 | **Criterion micro projection**: today's `batch_get/1024` = 42 µs; `multi_get` engine path benchmarked at 4.2× speedup → projected 10 µs. Q16 GET-heavy iterator path estimated at ~25 % of wall-clock from prior audit's per-key engine call analysis → 0.25 × 199.5 × (1 − 1/4.2) ≈ 38 s. Conservatively 35. | MED | criterion projection; needs end-to-end bench validation |
+| **D11** | 30 | **Analogous to D2** for ListState. Q19's LIST_ADD/LIST_GET pattern after V3 still uses heap `byte[]` for element bytes; off-heap ArrowBuffer replicates the V1-sync MapState 1c.1 pattern. Apply D2's 50 % pro-rata to Q19's residual 80 s post-V3 ≈ 30 s. | MED | analogous fix shape; workload-specific dependency on V3 results |
+| **D12** | 5 | No standalone derivation — V12 is inherited from V2's fix (Reducing/Aggregating State delegate to ValueState V2 internals). Q4 is already at 5.37× rocksdb so the absolute relief ceiling is small. **Downgraded to LOW.** | LOW | inherited fix; needs Q4-specific ablation to confirm |
+
+### Downgrade rule applied
+
+D6, D7, D12 lack firm derivations and are downgraded MED → LOW. Their leverage in §3 table drops accordingly: V6 9.0 → 4.5, V7 12.0 → 6.0, V12 3.0 → 1.5. The §4 matrix tier-fix-leverage row reflects these downgrades (§4 already shows post-downgrade sums).
+
+### Pre-Phase-A ablation gates derived from D-numbers
+
+Each phase's expected wall-clock relief = sum of constituent D-numbers (with certainty weight applied). If the actual measured relief at phase end diverges from the estimated by > 30 %, an ablation bench is mandatory before the phase merges. See §7 Per-fix attribution step.
+
+| Phase | Constituent | Σ Est. relief (HIGH+MED only) | Ablation trigger |
+|---|---|---:|---|
+| A (V4+V3) | D3 (55) + D4 (25) | 80 s on Q19 | If Q19 measured relief outside [56, 104] s |
+| B (V5+V8+V9) | D5 (30) + D8 (8) + D9 (10) | 48 s on Q16 (D5 also touches Q19) | If Q16 measured relief outside [34, 62] s OR Q19 relief outside [21, 39] s |
+| C (V2+V11+V12) | D2 (50) + D11 (30) | 80 s on Q16, 30 s on Q19 | Q16 outside [56, 104], Q19 outside [21, 39] |
+| D (V1+V7) | D1 (12) + D7 (6 LOW) | 18 s on Q16 (only D1 firm) | Q16 outside [8, 16] (firm-only band) |
+| E (V10) | D10 (35) | 35 s on Q16 (also benchmark-micro gate) | criterion `batch_get/1024` outside [8, 14] µs |
+
+These ablation bands ARE the "empirical attribution" mechanism §7's Per-fix attribution step references.
 
 ---
 
@@ -114,28 +153,30 @@ Rows = violations. Columns = the tier(s) in which the violation lives or where t
 | V3  | 55.0 | **✓** | — | — | ✓ | ✓ |
 | V4  | 15.0 | — | — | — | **✓** | ✓ |
 | V5  | 30.0 | ✓ | — | — | **✓** | — |
-| V6  | 9.0 | **✓** | — | — | — | — |
-| V7  | 12.0 | — | **✓** | ✓ | — | — |
+| V6  | 4.5 (LOW) | **✓** | — | — | — | — |
+| V7  | 6.0 (LOW) | — | **✓** | ✓ | — | — |
 | V8  | 8.0 | **✓** | — | — | — | — |
 | V9  | 10.0 | — | — | — | — | **✓** |
 | V10 | 21.0 | — | — | — | — | **✓** |
 | V11 | 18.0 | **✓** | — | ✓ | — | — |
-| V12 | 3.0 | **✓** | — | ✓ | — | — |
-| **Tier-fix leverage** | **(Σ touched × lev)** | **185.0** | **12.0** | **83.0** | **150.0** | **101.0** |
+| V12 | 1.5 (LOW) | **✓** | — | ✓ | — | — |
+| **Tier-fix leverage** | **(Σ touched × lev)** | **179.0** | **6.0** | **75.5** | **150.0** | **101.0** |
 
-### Reading the matrix
-- **T1 (State API, 185) is the highest-leverage tier** — concentrating fixes at the V2 async state-class entry points closes V1/V2/V3/V5/V6/V8/V11/V12, i.e. 8 of the 12 fix-candidate violations. This validates §5's ranking: the first phase should rewrite the V2 async per-state-class entry to use the same off-heap pattern V1-sync ValueState already uses.
+### Reading the matrix (with post-downgrade leverages)
+- **T1 (State API, 179) is the highest-leverage tier** — concentrating fixes at the V2 async state-class entry points closes V1/V2/V3/V5/V6/V8/V11/V12, i.e. 8 of the 12 fix-candidate violations. This validates §5's ranking: the first phase should rewrite the V2 async per-state-class entry to use the same off-heap pattern V1-sync ValueState already uses.
 - **T4 (V2 dispatch/executor, 150)** comes second because V2/V3/V4/V5 all need the columnar dispatcher to learn new ops (append-merge batch, slice-decoder views). One executor refactor unlocks four violations.
 - **T5 (Linker/Engine, 101)** carries the new Rust FFI primitives (V3 wiring of `frs_vec_merge_append_batch`, V10 fix of `frs_vectorized_batch_get`). These are engine-side and need new test coverage but the surface is small.
-- **T3 (Off-heap buffer, 83)** is the cross-cutting refactor — V2/V7/V11/V12 want to **replicate the per-state-instance ArrowBinaryBuffer pattern** (one buffer per registered state, NOT one pool shared across states). The v3.3 cross-state-shared buffer attempt regressed Q5 to 586 s; the audit rejects that approach and adopts the per-instance pattern proven at `537c1403f2f`.
-- **T2 (Cache, 12)** has lowest leverage — V7 is the only resident — meaning the cache fix can ship independently without coordinating with other phases.
+- **T3 (Off-heap buffer, 75.5)** is the cross-cutting refactor — V2/V7/V11/V12 want to **replicate the per-state-instance ArrowBinaryBuffer pattern** (one buffer per registered state, NOT one pool shared across states). The v3.3 cross-state-shared buffer attempt regressed Q5 to 586 s; the audit rejects that approach and adopts the per-instance pattern proven at `537c1403f2f`.
+- **T2 (Cache, 6)** has lowest leverage — V7 is the only resident and was downgraded to LOW in §3.5 — meaning the cache fix can ship independently without coordinating with other phases, and ranks lowest in the Phase D order.
 
 ---
 
 ## §5 — Per-violation fix design (ranked by leverage)
 
-**Fix order** is the leverage column, descending:
-**V3 (55) → V2 (50) → V5 (30) → V10 (21) → V11 (18) → V4 (15) → V1 (12) → V7 (12) → V9 (10) → V6 (9) → V8 (8) → V12 (3).**
+**Fix order** is the post-downgrade leverage column (§3.5 applied), descending:
+**V3 (55) → V2 (50) → V5 (30) → V10 (21) → V11 (18) → V4 (15) → V1 (12) → V9 (10) → V8 (8) → V7 (6, LOW) → V6 (4.5, LOW) → V12 (1.5, LOW).**
+
+Last three are LOW certainty (per §3.5 downgrade rule) and ship as fold-ins after the HIGH/MED violations measure as estimated. If any LOW-certainty violation's flame-graph / ablation evidence comes in post-Phase-B, it can be re-ranked.
 
 Each subsection: (a) current data flow, (b) proposed data flow, (c) required Tier-by-Tier changes, (d) new engine FFI primitives if any, (e) test plan, (f) regression risk.
 
@@ -150,7 +191,7 @@ Each subsection: (a) current data flow, (b) proposed data flow, (c) required Tie
 - T4: classifier registers ListState names in a new `appendMergeStates` set so it routes correctly; `VectorizedExecutor.dispatchAppendMerge` becomes the entry point.
 - T5: see V4.
 
-(d) **New engine FFI**: V3 alone uses the existing `frsVecMergeAppend` per-row primitive (acceptable as Phase 1 before V4 lands). Batching is V4.
+(d) **New engine FFI**: V3 depends on V4's `frs_vec_merge_append_batch` (V4 ships first as commit A.1 — infrastructure with zero behavior change — per §7 Phase A's locked V4 → V3 order).
 
 (e) **Tests**: (1) snapshot/restore correctness — write 1000 entries to a single key via `asyncAdd`, snapshot, restart, verify `asyncGet` returns all 1000 in order. (2) interleaved add/clear/add — verify the merge state is properly cleared on `asyncClear`. (3) Nexmark Q19 wall-clock — gate ≤ 90 s on the bench.
 
@@ -299,13 +340,54 @@ Aggregated from §5. **Three new FFI symbols** + **one replacement body**:
 
 ## §7 — Phased implementation plan (preview only)
 
-The writing-plans hand-off will produce the full per-PR breakdown. This preview groups fixes into **phases ordered by tier-fix leverage** (§4 row) and inter-phase dependencies:
+The writing-plans hand-off will produce the full per-PR breakdown. This preview groups fixes into **phases ordered by tier-fix leverage** (§4 row) and inter-phase dependencies.
 
-### Phase A: T4 + T5 batched merge-append (V3 + V4)
-- V3 wiring (ListState `asyncAdd` → APPEND_MERGE)
-- V4 batched FFI (`frs_vec_merge_append_batch`)
-- **Acceptance**: Q19 ≤ 70 s, Q19/rocksdb ≥ 2.07×, no regression > 5 % on any of Q11/Q12/Q15/Q20/Q23
-- **Why first**: highest single leverage (V3=55, V4=15), self-contained (no T1/T3 changes outside ListState).
+### Cross-phase rule: per-fix attribution step (empirical, not intuitive)
+
+Every phase ends with an **attribution check** before merge to `main`:
+
+1. Measure: full Nexmark Q0–Q23 sweep on the phase's HEAD vs the phase's BASELINE (the commit just before the phase started).
+2. Compute: ΔWallClock per query = baseline – HEAD. Sum the relief on the phase's worst-case queries.
+3. Compare to §3.5's Est. relief sum (HIGH+MED only). If the measured relief is within **±30 %** of the estimated, attribute passes — proceed to merge.
+4. If measured relief is outside **±30 %** of the estimated, **trigger ablation bench** (revert each constituent commit one at a time, re-bench, compute per-violation actual relief). Block merge until ablation explains the divergence.
+5. Update §3.5's D-numbers with the measured relief; mark Certainty=HIGH if ablation confirms, or LOW if it falsifies.
+
+This rule applies to **every** phase (including Phase 0). It is the empirical-attribution mechanism the prior 4.6 µs regime correction taught us.
+
+---
+
+### Phase 0: V1-sync compliance re-audit (hard prerequisite, BLOCKS Phase A)
+
+**Purpose**: validate that the V1-sync ValueState / MapState / ListState off-heap paths are genuinely principle-compliant. If they are not, Phase C copies a half-correct pattern from V1-sync and contaminates the entire workflow — exactly the failure mode the PR-A revert and the large-buffer Q11/Q12 experiment each produced once.
+
+**Deliverable**: standalone sub-spec `2026-05-22-v1-sync-compliance-reaudit-design.md` enumerating every V1-sync state class against the Tier 1–5 model and the three principles. If any violation is found, add it to §3 as V15+ before Phase A begins.
+
+**Acceptance**: sub-spec landed AND user-reviewed. No Nexmark bench gate (Phase 0 measures correctness, not perf). Time budget: 1 day of focused code-reading + writing.
+
+**Sequencing**: hard prerequisite. Phase A cannot start until Phase 0 closes. NOT parallelizable — the spec output gates Phase C's pattern choice. This is a direct application of the §1 "batch first, only then per-call" rule one level up: validate the source pattern before propagating it.
+
+**Output of attribution step**: n/a (no perf measurement).
+
+---
+
+### Phase A: T4 + T5 batched merge-append (V4 then V3, in that strict order)
+
+**Locked commit order: V4 first (infrastructure, zero behavior change), then V3 (call-site switch).** This extends the PR-A A0/A1/A2 discipline pattern. Reversing the order means V3 ships a per-row dispatchAppendMerge (V4 not yet landed) — an interim regression that the per-phase attribution step would flag.
+
+- **Commit A.1 — V4 batched FFI infrastructure (zero behavior change)**:
+  - Add Rust `frs_vec_merge_append_batch(keys_off, keys_data, ops_off, ops_data, n_rows) -> i32`
+  - Add `ForStRsLinker.frsVecMergeAppendBatch(...)` Java FFM binding
+  - `VectorizedExecutor.dispatchAppendMergeBatch(...)` new method — NOT yet wired to any call site (the per-row `dispatchAppendMerge` is still the only caller of the engine FFI)
+  - **Acceptance for A.1**: criterion micros `merge_append_batch/1024` ≤ 10 µs; existing test suite green; Nexmark wall-clocks unchanged (A.1 introduces no call-site switch, so portfolio gate is "no regression > 2 % anywhere")
+
+- **Commit A.2 — V3 call-site switch (single step)**:
+  - `ForStRsAsyncListStateV2.asyncAdd` override → `AppendMergeRequest`
+  - `VectorizedClassifier` registers ListState names in `appendMergeStates`
+  - `dispatchAppendMerge` per-row loop replaced with single `dispatchAppendMergeBatch` call
+  - **Acceptance for A.2**: Q19 ≤ 70 s, Q19/rocksdb ≥ 2.07×, no regression > 5 % on Q11/Q12/Q15/Q20/Q23
+  - Snapshot/restore unit tests green (see §8)
+
+- **Per-fix attribution step at Phase A end**: Q19 measured relief sum vs §3.5's D3+D4 = 80 s (HIGH+MED only). If Q19 relief is in [56, 104] s, attribution passes. Outside that band → ablation.
 
 ### Phase B: T1 + T4 zero-copy GET-result (V5 + V8 + V9)
 - `MemorySegmentDataInputView` introduction in V2 async state classes
@@ -355,15 +437,17 @@ After all 5 phases land, the **portfolio gate** is: `forst-rs wins ≥ 20 of 23 
 
 ---
 
-## §9 — Open questions (pre-populated, must close before Phase A)
+## §9 — Open questions (pre-populated, must close before Phase A; OQ-1 promoted to Phase 0)
 
-### OQ-1 — Is V1-sync genuinely "already off-heap correct"?
+### OQ-1 — Is V1-sync genuinely "already off-heap correct"? — PROMOTED TO PHASE 0
+
+**Status**: per the PMC review, this open question is upgraded from "parallelizable open work" to a **hard Phase 0 prerequisite** (see §7). The risk of Phase C copying a half-correct pattern from V1-sync if it's not actually compliant is too high to let Phase A start before this closes.
 
 The claim that V1-sync ValueState / MapState are principle-compliant since commits `537c1403f2f` and `633af3d3be1` has been twice falsified in this project's history:
 1. **PR-A revert (commit `cb077849...`)** — the "always-on write buffer" caused Q5 to regress to 586 s; reverted to adaptive-disable.
 2. **Large-buffer-breaking-Q11/Q12** — increasing buffer capacity sped up Q5 but tanked Q11/Q12.
 
-Action: a 1-day code re-audit of `ForStRsValueState` + `ForStRsMapState` V1-sync paths against the same Tier 1–5 model. If found compliant, document the audit as evidence. If not, add V1-sync violations to §3 as V15+ before any phase ships.
+Action: see §7 Phase 0. Deliverable is the standalone sub-spec `2026-05-22-v1-sync-compliance-reaudit-design.md`.
 
 ### OQ-2 — V2 async pre-snapshot flush
 
@@ -402,11 +486,14 @@ Action: 0.5-day trace of Q13's runtime call path through the V1-sync state class
 - [x] §0 hard assumption (JDK 25) explicit
 - [x] §2 includes per-state-type access pattern (compact 2D table)
 - [x] §3 4-subcolumn query-impact (Hit / Worst-case / Relief / Certainty) with leverage formula
-- [x] §4 matrix includes tier-fix-leverage summary row
+- [x] §3.5 estimated-relief derivation section with citations (D1–D12), LOW-certainty downgrades applied (PMC adjustment 1)
+- [x] §4 matrix includes tier-fix-leverage summary row (post-downgrade sums)
 - [x] §5 fix ordering matches §3 leverage ranking
 - [x] §6 engine API budget enumerated (3 symbols)
-- [x] §7 phases mapped to writing-plans hand-off
+- [x] §7 Phase 0 (V1-sync re-audit) is a hard prerequisite blocking Phase A (PMC adjustment 3)
+- [x] §7 Phase A locked to V4 → V3 commit order (A.1 = infrastructure, A.2 = call-site switch) (PMC adjustment 2)
+- [x] §7 per-fix attribution step + ablation trigger at every phase end (PMC adjustment 4)
 - [x] §8 acceptance gates embedded (no separate §7.5)
-- [x] §9 open questions pre-populated (OQ-1, OQ-2, OQ-3, OQ-4)
+- [x] §9 open questions pre-populated (OQ-1 promoted to Phase 0; OQ-2, OQ-3, OQ-4)
 - [x] §10 cross-refs listed
 - [x] Tier 1–5 naming used throughout (no L-prefix collision with CONTRIBUTING.md benchmark levels)
