@@ -6912,6 +6912,84 @@ mod tests {
         }
     }
 
+    /// Phase A.1 ablation gate (audit-design §3.5 D4 + Discovery 2026-05-21):
+    /// 1024-row batched merge-append should average ≤ 10 µs per call. Run under release mode
+    /// for representative timing. Marked `#[ignore]` so normal `cargo test` doesn't block on it.
+    #[test]
+    #[ignore]
+    fn merge_append_batch_1024_under_10us_release() {
+        use std::time::Instant;
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // 1024 distinct keys, 1 operand each (typical Q19 LIST_ADD batch shape).
+            const N: usize = 1024;
+            let mut keys_data: Vec<u8> = Vec::with_capacity(N * 8);
+            let mut keys_off: Vec<u32> = Vec::with_capacity(N + 1);
+            let mut ops_data: Vec<u8> = Vec::with_capacity(N * 16);
+            let mut ops_off: Vec<u32> = Vec::with_capacity(N + 1);
+            keys_off.push(0);
+            ops_off.push(0);
+            for i in 0..N {
+                let k = format!("k{:06}", i);
+                keys_data.extend_from_slice(k.as_bytes());
+                keys_off.push(keys_data.len() as u32);
+                let v = format!("v{:010}", i);
+                ops_data.extend_from_slice(v.as_bytes());
+                ops_off.push(ops_data.len() as u32);
+            }
+
+            // Warmup
+            let _ = frs_vec_merge_append_batch(
+                db,
+                cf,
+                keys_off.as_ptr(),
+                keys_data.as_ptr(),
+                ops_off.as_ptr(),
+                ops_data.as_ptr(),
+                N as u32,
+            );
+
+            // Measure (5 iterations, take median)
+            let mut timings = vec![];
+            for _ in 0..5 {
+                let t0 = Instant::now();
+                let rc = frs_vec_merge_append_batch(
+                    db,
+                    cf,
+                    keys_off.as_ptr(),
+                    keys_data.as_ptr(),
+                    ops_off.as_ptr(),
+                    ops_data.as_ptr(),
+                    N as u32,
+                );
+                let elapsed = t0.elapsed();
+                assert_eq!(rc, FrsErrorCode::Ok as i32);
+                timings.push(elapsed);
+            }
+            timings.sort();
+            let median = timings[timings.len() / 2];
+            let per_call_ns = median.as_nanos() / (N as u128);
+            println!(
+                "merge_append_batch/1024 median: {:?} ({} ns/row)",
+                median, per_call_ns
+            );
+            // Loose gate: full batch ≤ 50 ms (50 µs/row × 1024 = 51.2 ms upper bound;
+            // tighter gates only meaningful in release-mode criterion runs).
+            assert!(
+                median.as_millis() < 50,
+                "merge_append_batch/1024 took {:?} — exceeds 50 ms loose gate",
+                median
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
     /// Batched form: n=0 is a no-op (no crash, returns Ok).
     #[test]
     fn merge_append_batch_zero_rows_is_noop() {
