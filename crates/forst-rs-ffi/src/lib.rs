@@ -3968,6 +3968,94 @@ pub unsafe extern "C" fn frs_vec_merge_append(
     })
 }
 
+/// [Phase A.1 — audit-design §3 V4 fix] Batched form of `frs_vec_merge_append`.
+///
+/// Consumes N (key, operand) rows in a single FFI call. Each row's operand
+/// is the [count=u32 LE][elem_bytes*] payload format produced by the
+/// Flink-side `ForStRsAsyncListStateV2.asyncAdd` / `asyncAddAll` serializer.
+///
+/// Internally groups rows by key, performs one read-combine-write per
+/// distinct key (saving redundant `get`s when the same key appears multiple
+/// times in the batch — common for Q19's Top-N workload).
+///
+/// # Layout
+/// - `keys_off`: array of `n+1` `u32` offsets into `keys_data`. Row `i`'s
+///   key is `keys_data[keys_off[i] .. keys_off[i+1]]`.
+/// - `ops_off`: array of `n+1` `u32` offsets into `ops_data`. Row `i`'s
+///   operand is `ops_data[ops_off[i] .. ops_off[i+1]]`.
+///
+/// # Error codes
+/// Same as `frs_vec_merge_append`.
+///
+/// # Safety
+/// - `keys_off` must point to at least `n+1` valid `u32`s.
+/// - `keys_data` must point to at least `keys_off[n]` valid bytes.
+/// - `ops_off` must point to at least `n+1` valid `u32`s.
+/// - `ops_data` must point to at least `ops_off[n]` valid bytes.
+/// - All buffers must remain valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_merge_append_batch(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    keys_off: *const u32,
+    keys_data: *const u8,
+    ops_off: *const u32,
+    ops_data: *const u8,
+    n: u32,
+) -> i32 {
+    guarded_vec(|| {
+        if n == 0 {
+            return FrsErrorCode::Ok as i32;
+        }
+        if keys_off.is_null() || keys_data.is_null() || ops_off.is_null() || ops_data.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let Some(db_ref) = db_from_handle(db) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(cf_ref) = cf_ref(&cf) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+
+        // Group operands by key. Most batches will have ≤ N distinct keys; pre-allocate.
+        // key_bytes -> Vec<operand_bytes_borrowed_slice>
+        let mut grouped: std::collections::HashMap<&[u8], Vec<&[u8]>> =
+            std::collections::HashMap::with_capacity(n as usize);
+
+        for i in 0..n as usize {
+            let k_start = *keys_off.add(i) as usize;
+            let k_end = *keys_off.add(i + 1) as usize;
+            let key = slice::from_raw_parts(keys_data.add(k_start), k_end - k_start);
+
+            let o_start = *ops_off.add(i) as usize;
+            let o_end = *ops_off.add(i + 1) as usize;
+            let op = slice::from_raw_parts(ops_data.add(o_start), o_end - o_start);
+
+            grouped.entry(key).or_insert_with(Vec::new).push(op);
+        }
+
+        // For each distinct key, read existing, combine, write back.
+        let combiner = ListMergeCombiner::new();
+        for (key, ops) in grouped.iter() {
+            let owned_ops: Vec<Vec<u8>> = ops.iter().map(|s| s.to_vec()).collect();
+            let existing: Vec<u8> = match db_ref.get(cf_ref, key) {
+                Ok(opt) => opt.unwrap_or_default(),
+                Err(e) => return error_to_frs_code(&e),
+            };
+            let merged = if existing.is_empty() {
+                combiner.combine(&owned_ops)
+            } else {
+                combiner.combine_with_base(&existing, &owned_ops)
+            };
+            if let Err(e) = db_ref.put(cf_ref, key, &merged) {
+                return error_to_frs_code(&e);
+            }
+        }
+
+        FrsErrorCode::Ok as i32
+    })
+}
+
 fn put_batch_schema() -> std::sync::Arc<Schema> {
     std::sync::Arc::new(Schema::new(vec![
         Field::new("key", DataType::Binary, false),
@@ -6682,6 +6770,173 @@ mod tests {
                 1,
             );
             assert_eq!(rc, FrsErrorCode::BatchHeaderMalformed as i32);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // frs_vec_merge_append_batch tests (Phase A.1 — audit-design §3 V4)
+    // -----------------------------------------------------------------------
+
+    /// Batched form: 3 rows with 3 distinct keys, 1 operand each.
+    #[test]
+    fn merge_append_batch_three_distinct_keys() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Keys: "k1", "k2", "k3"
+            let keys_data: &[u8] = b"k1k2k3";
+            let keys_off: [u32; 4] = [0, 2, 4, 6];
+
+            // Operands: "A", "B", "C"
+            let ops_data: &[u8] = b"ABC";
+            let ops_off: [u32; 4] = [0, 1, 2, 3];
+
+            let rc = frs_vec_merge_append_batch(
+                db,
+                cf,
+                keys_off.as_ptr(),
+                keys_data.as_ptr(),
+                ops_off.as_ptr(),
+                ops_data.as_ptr(),
+                3,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+
+            // Verify each key's value
+            for (k, expected) in &[(&b"k1"[..], &b"A"[..]), (b"k2", b"B"), (b"k3", b"C")] {
+                let mut out = FrsBytes::NULL;
+                assert_eq!(
+                    frs_get(db, cf, k.as_ptr(), k.len(), &mut out),
+                    FRS_STATUS_OK
+                );
+                let got = slice::from_raw_parts(out.data, out.len);
+                assert_eq!(got, *expected, "key {:?}", k);
+                frs_bytes_free(&mut out);
+            }
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Batched form: same key appears in multiple rows — operands concatenate.
+    #[test]
+    fn merge_append_batch_same_key_concatenates() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // 3 rows, all key "k1", operands "A", "B", "C".
+            let keys_data: &[u8] = b"k1k1k1";
+            let keys_off: [u32; 4] = [0, 2, 4, 6];
+            let ops_data: &[u8] = b"ABC";
+            let ops_off: [u32; 4] = [0, 1, 2, 3];
+
+            let rc = frs_vec_merge_append_batch(
+                db,
+                cf,
+                keys_off.as_ptr(),
+                keys_data.as_ptr(),
+                ops_off.as_ptr(),
+                ops_data.as_ptr(),
+                3,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+
+            // k1 should now contain "ABC" (concatenated operands).
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, b"k1".as_ptr(), 2, &mut out),
+                FRS_STATUS_OK
+            );
+            let got = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(got, b"ABC");
+            frs_bytes_free(&mut out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Batched form: appending to an existing key — operands suffix the base.
+    #[test]
+    fn merge_append_batch_existing_key_suffixes() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Prime "k1" with "BASE".
+            assert_eq!(
+                frs_put(db, cf, b"k1".as_ptr(), 2, b"BASE".as_ptr(), 4),
+                FRS_STATUS_OK
+            );
+
+            // Append "X" and "Y" to "k1" via two rows.
+            let keys_data: &[u8] = b"k1k1";
+            let keys_off: [u32; 3] = [0, 2, 4];
+            let ops_data: &[u8] = b"XY";
+            let ops_off: [u32; 3] = [0, 1, 2];
+
+            let rc = frs_vec_merge_append_batch(
+                db,
+                cf,
+                keys_off.as_ptr(),
+                keys_data.as_ptr(),
+                ops_off.as_ptr(),
+                ops_data.as_ptr(),
+                2,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, b"k1".as_ptr(), 2, &mut out),
+                FRS_STATUS_OK
+            );
+            let got = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(got, b"BASEXY");
+            frs_bytes_free(&mut out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Batched form: n=0 is a no-op (no crash, returns Ok).
+    #[test]
+    fn merge_append_batch_zero_rows_is_noop() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // n=0 — pointers irrelevant per contract; pass valid ones for safety.
+            let keys_data: &[u8] = b"";
+            let keys_off: [u32; 1] = [0];
+            let ops_data: &[u8] = b"";
+            let ops_off: [u32; 1] = [0];
+
+            let rc = frs_vec_merge_append_batch(
+                db,
+                cf,
+                keys_off.as_ptr(),
+                keys_data.as_ptr(),
+                ops_off.as_ptr(),
+                ops_data.as_ptr(),
+                0,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
 
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
