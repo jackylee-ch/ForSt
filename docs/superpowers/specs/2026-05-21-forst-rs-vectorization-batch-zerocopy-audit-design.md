@@ -86,7 +86,7 @@ The **leverage score** is `worst_case_wallclock × relief_fraction × certainty_
 |---|---|---|---|---|---|---|---:|---|---:|
 | **V1** | `state/ForStRsMapStateV2.java:114-130` (`serializeMapEntryKey()`) | T1 | zero-copy | MED | Q16, Q19, Q3 | Q16 (199.5 s) | 12 | HIGH | 12.0 |
 | **V2** | `state/ForStRsMapStateV2.java:205-247` (`buildDBGetRequest` / `buildDBPutRequest`) | T1 | zero-copy | HIGH | Q16, Q19, Q3 | Q16 (199.5 s) | 50 | HIGH | 50.0 |
-| **V3** | `state/ForStRsAsyncListStateV2.java:135-159` (`asyncAdd` → full-PUT) | T1 | batch | **CRIT** | Q19 | Q19 (135 s) | 55 | HIGH | 55.0 |
+| **V3** | `state/ForStRsAsyncListStateV2.java:135-159` (`asyncAdd` → full-PUT) — **DESCRIPTION STALE 2026-05-21 (see V20 + §3.5 D3 STALE note)** — the fix is non-trivial across 3 dimensions (classifier routing, off-heap allocation in classifier, serialization format), not just an override. | T1 | batch | **CRIT** | Q19 | Q19 (135 s) | TBD (re-derive) | **LOW** (re-derivation pending V20 closure) | TBD |
 | **V4** | `VectorizedExecutor.java:356-440` (`dispatchAppendMerge` per-row loop) | T4 | batch | HIGH | Q19, future ListState users | Q19 (135 s after V3) | 25 | MED | 15.0 |
 | **V5** | `VectorizedExecutor.java:313-326` (GET-result `byte[] = new byte[len]`) | T4 | zero-copy | HIGH | all V2 GET paths — Q16, Q19, Q11, Q12, Q15, Q17, Q21, Q22 | Q16 (199.5 s) | 30 | HIGH | 30.0 |
 | **V6** | `state/ForStRsAsyncListStateV2.java:201-217` (full-`ArrayList` materialization on `asyncGet`) | T1 | zero-copy | MED | Q19 | Q19 (135 s, after V3) | 15 | **LOW** (no firm derivation — see §3.5 D6) | 4.5 |
@@ -103,6 +103,7 @@ The **leverage score** is `worst_case_wallclock × relief_fraction × certainty_
 | **V17** | `state/ForStRsListState.java:158-182` (`readList`/`writeList` — full GET+PUT, 2× heap `byte[]` per `add`) | T1 | zero-copy + batch | MED | Q5, Q13 V1-sync | Q13 (41.1 s) | 8 | LOW | 2.4 |
 | **V18** | `state/ForStRsReducingState.java:116-130` (`readValue`/`writeValue` — 2× heap `byte[]` per `add`) | T1 | zero-copy | LOW | V1-sync Reducing | n/a | 2 | LOW | 0.6 |
 | **V19** | `state/ForStRsAggregatingState.java:126-140` (`readAccumulator`/`writeAccumulator` — 2× heap `byte[]` per `add`) | T1 | zero-copy | LOW | V1-sync Aggregating | n/a | 2 | LOW | 0.6 |
+| **V20** | `state/ForStRsAsyncListStateV2` (Flink-integrated) + `state/ForStRsListStateV2` (standalone) — **PARTIAL WIRING**: both classes built, but `ForStRsAsyncListStateV2` writes `[count][elems]` format via destructive PUT, while `ForStRsListStateV2` writes count-free element bytes via `AppendMergeRequest`. The two formats are mutually incompatible — switching `ForStRsAsyncListStateV2.asyncAdd` to use `AppendMergeRequest` (V3) breaks `deserializeValue`'s count prefix expectation. **Gating prerequisite for V3.** | T1 | partial wiring (cross-tier) | HIGH | Q19 (gates V3) | Q19 (135 s, derivative of V3 once V20 closes) | n/a (gating, not direct fix) | HIGH | n/a |
 
 Total catalog: **19 violations** (8 from today's audit + 2 carried + 4 newly-derived gating items V11–V14 + 5 added by Phase 0 sub-spec V15–V19). V13 remains a gating item; V14 CLOSED and split into V15–V19. **Phase A entry gate: UNBLOCKED** (Phase A operates on V2 async ListState only, out of scope for V15–V19). **Phase C gate update**: must NOT use V1-sync `ForStRsMapState.forEachEntry` or V1-sync ListState as templates per Phase 0 sub-spec verdict.
 
@@ -116,7 +117,7 @@ Per the prior PMC review round: **estimated-relief numbers are the leverage form
 |---|---:|---|---|---|
 | **D1** | 12 | Arithmetic: 8 distinct-aggregate ops × 100 M events × ~15 ns/byte[] alloc ≈ 12 s. Allocation cost from JEP 482 JOL measurements (~10–20 ns/heap alloc on Apple Silicon G1). | HIGH | criterion derivation |
 | **D2** | 50 | **Analogous fix**: V1-sync MapState 1c.1 (commit `633af3d3be1`) relief on Q15 was 111.86 → 18.34 s = **93.5 s on Q15**. Q16 has ~6-10 MapState ops/event vs Q15's higher density; pro-rata at 50–60% of Q15's relief ≈ 50 s on Q16's 199.5 s wall-clock. | HIGH | analogous fix proven |
-| **D3** | 55 | **Analogous fix**: batched-timer commit `a5fd9f70dd6` removed GET+PUT cycle on Q12 = 116.56 → 30.22 s = **86.3 s relief**. Q19's GET+PUT pattern is structurally identical; relief estimated at 50–70% of Q12's = 55 s on Q19's 135 s. | HIGH | analogous fix proven |
+| **D3** | ~~55~~ **STALE 2026-05-21** | **Analogous fix**: batched-timer commit `a5fd9f70dd6` removed GET+PUT cycle on Q12 = 116.56 → 30.22 s = 86.3 s relief. Q19's GET+PUT pattern is structurally identical; relief estimated at 50–70% of Q12's = 55 s on Q19's 135 s. **NOTE: The Q12 fix is NOT directly analogous** — the Q12 fix was a timer queue rewrite; the Q19 fix requires the V3 classifier routing + format change. Pro-rata estimate no longer holds. **Re-derivation pending V20 closure** (see Discovery 2026-05-21 below). | ~~HIGH~~ **LOW** | re-derivation pending |
 | **D4** | 25 | Arithmetic: per-row FFM ≈ 1 µs × Q19's ~3 LIST_ADDs per event × 100 M events / N=1024 batch size ≈ 300 ms FFM overhead after V3 (negligible). Real relief from batching = the per-row Arena.ofConfined() allocation (`Arena` alloc ≈ 50 ns × 300 M rows = 15 s) plus per-row memcpy cost (~30 ns × 300 M = 9 s) = ~24 s. | MED | arithmetic; no proven analog at this batch size |
 | **D5** | 30 | **Analogous fix**: V1-sync ValueState off-heap commit `5ad6e12abb8` eliminated per-event `byte[]` for read path; flame-graph at v3.2 showed `byte[]` alloc was ~25–30 % of executor CPU on heavy-GET queries (Q9/Q20 prior-audit Violation #3). Apply to Q16's 199.5 s × 15 % executor-fraction-of-wall-clock ≈ 30 s. | HIGH | analogous fix proven + prior audit flame-graph cite |
 | **D6** | 15 | No firm derivation. Lazy iterator deferring per-element deserialize would relieve GC pressure but not deserialization CPU; Q19 fully iterates for Top-N decision. **Downgraded to LOW.** | LOW | no derivation — must validate with flame-graph before locking |
@@ -131,13 +132,39 @@ Per the prior PMC review round: **estimated-relief numbers are the leverage form
 
 D6, D7, D12 lack firm derivations and are downgraded MED → LOW. Their leverage in §3 table drops accordingly: V6 9.0 → 4.5, V7 12.0 → 6.0, V12 3.0 → 1.5. The §4 matrix tier-fix-leverage row reflects these downgrades (§4 already shows post-downgrade sums).
 
+### Discovery 2026-05-21 — V3 fix is non-trivial across 3 dimensions
+
+Source: A.1 / A.2 implementation pass on the `forst-rs-jdk25` branch revealed that the V3 description in §3 misled the leverage estimate. The fix is non-trivial across **three** dimensions, not the single "asyncAdd override" implied by the original description:
+
+1. **Classifier routing change** — `VectorizedClassifier.offer()` today routes `LIST_ADD` / `LIST_ADD_ALL` through `recordPut` (destructive overwrite). Switching to `recordAppendMerge` requires identifying which state names are `ListState` at classification time AND constructing an `AppendMergeRequest` from a `StateRequest`.
+
+2. **Off-heap allocation in the classifier** — `AppendMergeRequest` carries `MemorySegment` slices for key + value(s). The classifier today operates on `ColumnarBatchBuffer` (shared, fixed-cap, off-heap) and has no per-request `Arena`. Implementing this requires either (a) extending `AppendMergeBatchBuffer` to accept serialized key/value byte ranges from `ColumnarBatchBuffer` directly, or (b) introducing a per-batch shared `Arena` for AppendMerge slice ownership.
+
+3. **Serialization format break** — `ForStRsAsyncListStateV2.serializeValueInto` writes `[count=1 u32 LE][elem_bytes]` per LIST_ADD; the engine's `ListMergeCombiner` concatenates operands by byte (no awareness of the count prefix). After K appends via APPEND_MERGE, the stored value becomes `[1][e0][1][e1]…[1][e(K-1)]` — a multi-chunk format. The existing `deserializeValue` (which reads ONE `[count]` then loops `count` times) cannot parse this. Two format-change options exist:
+   - **Format A — count-free**: drop the `count` prefix everywhere; `deserializeValue` reads elements until EOF. Snapshot-compat break.
+   - **Format B — multi-chunk**: keep the `[count][elems]` operand format; `deserializeValue` loops `[count][elems]` chunks until EOF. Snapshot-compat break (one-time).
+
+Both format options break the v3.8 snapshot wire format. This is acceptable given the v3.8 baseline is recent, but it makes the V3 fix a multi-PR sequence (gated on V20) not a single asyncAdd override.
+
+### V20 closure prerequisite
+
+V20 must close before V3 ships. Closure deliverables:
+1. Design sub-spec choosing Format A or Format B
+2. Snapshot-compat plan (one-time format migration acceptable; document in release notes)
+3. Unification design: either `ForStRsAsyncListStateV2` and standalone `ForStRsListStateV2` MERGE into one class, or the V3 fix updates BOTH consistently with the same format
+4. Re-derive D3 with the new fix shape — likely smaller relief than the original 55 s (some of the 55 s estimate covered the timer-queue-shape work; the actual ListState fix may be 30-40 s)
+
+Until V20 closes, V3 leverage is marked TBD and no Q19-specific bench gate can be enforced for that fix.
+
 ### Pre-Phase-A ablation gates derived from D-numbers
 
 Each phase's expected wall-clock relief = sum of constituent D-numbers (with certainty weight applied). If the actual measured relief at phase end diverges from the estimated by > 30 %, an ablation bench is mandatory before the phase merges. See §7 Per-fix attribution step.
 
 | Phase | Constituent | Σ Est. relief (HIGH+MED only) | Ablation trigger |
 |---|---|---:|---|
-| A (V4+V3) | D3 (55) + D4 (25) | 80 s on Q19 | If Q19 measured relief outside [56, 104] s |
+| A.1 (V4 infra only, 2026-05-21) | D4 (25) | 0 s — V4 is zero-behavior-change for current callers (LIST_ADD still routes through PUT). Predicted: ALL Nexmark queries stay within v3.8 baseline ± 2%. | If any Nexmark query deviates > 5% from v3.8 baseline → HALT (V4 touched an unexpected path) |
+| A.2 (V3, FUTURE — gated on V20) | D3 STALE — re-derive after V20 | TBD | TBD |
+| A (V4+V3, original spec — STALE) | ~~D3 (55) + D4 (25) = 80 s on Q19~~ | — | replaced by A.1 + A.2 split above |
 | B (V5+V8+V9) | D5 (30) + D8 (8) + D9 (10) | 48 s on Q16 (D5 also touches Q19) | If Q16 measured relief outside [34, 62] s OR Q19 relief outside [21, 39] s |
 | C (V2+V11+V12) | D2 (50) + D11 (30) | 80 s on Q16, 30 s on Q19 | Q16 outside [56, 104], Q19 outside [21, 39] |
 | D (V1+V7) | D1 (12) + D7 (6 LOW) | 18 s on Q16 (only D1 firm) | Q16 outside [8, 16] (firm-only band) |
