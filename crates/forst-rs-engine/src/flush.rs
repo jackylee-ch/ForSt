@@ -72,6 +72,13 @@ impl FlushJob {
 
     /// Runs the flush synchronously. Returns the metadata describing the
     /// produced SST file, ready to feed into a `VersionEdit`.
+    ///
+    /// PR-D2 (Z3-10, C-R3-H1..3): the flush pipeline streams data blocks
+    /// directly to the on-disk temp file through
+    /// [`SstWriterImpl::streaming`] — there is no intermediate `Vec<u8>`
+    /// holding the entire SST in memory. Peak flush memory is bounded by
+    /// one in-flight Arrow data block plus the bloom + sparse-index
+    /// sections (proportional to block count, not byte count).
     pub fn run(self) -> ForstResult<SstFileMeta> {
         // 1. Pull sorted RecordBatches from the sharded memtable.
         //    `to_flush_batches` requires every shard to be frozen; the
@@ -90,51 +97,9 @@ impl FlushJob {
         }
         let batches = self.memtable.to_flush_batches(FLUSH_BATCH_SIZE)?;
 
-        // 2. Feed each row into the SST writer. We iterate with `add()` to
-        //    preserve the writer's invariant (entries arrive in sorted order
-        //    by (key ASC, seq DESC) — matching `to_flush_batches`).
-        let mut writer = SstWriterImpl::with_options(self.options.clone());
-        for batch in &batches {
-            let rows = batch.num_rows();
-            let keys = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ForstError::corruption("flush batch: key column not Binary"))?;
-            let values = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ForstError::corruption("flush batch: value column not Binary"))?;
-            let seqs = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| ForstError::corruption("flush batch: sequence column not UInt64"))?;
-            let ops = batch
-                .column(3)
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| ForstError::corruption("flush batch: op_type column not UInt8"))?;
-
-            for i in 0..rows {
-                let key = keys.value(i);
-                let value = if values.is_null(i) {
-                    None
-                } else {
-                    Some(values.value(i))
-                };
-                let seq = seqs.value(i);
-                let op = ops.value(i);
-                writer.add(key, value, seq, op)?;
-            }
-        }
-
-        let (bytes, info) = writer.finish()?;
-
-        // 3. Atomically write the SST to disk. We write to a temp file and
-        //    rename into place so a mid-write crash never leaves a partial
-        //    SST that the engine might pick up.
+        // 2. Open the temp file and stream the SST directly into it. We
+        //    write to a temp file and rename into place so a mid-write
+        //    crash never leaves a partial SST that the engine might pick up.
         let parent = self.file_path.parent().ok_or_else(|| {
             ForstError::invalid_argument(format!(
                 "flush target has no parent directory: {}",
@@ -143,14 +108,62 @@ impl FlushJob {
         })?;
         self.fs.create_dir_all(parent)?;
         let tmp_path = self.temp_path();
-        {
+        let info = {
             let mut writable = self
                 .fs
                 .open_writable_file(&tmp_path, WriteMode::CreateNew)?;
-            writable.append(&bytes)?;
+            let writer_inner = SstWriterImpl::with_options(self.options.clone());
+            let mut writer = writer_inner.streaming(&mut *writable);
+
+            // 3. Feed each row into the streaming SST writer. We iterate
+            //    with `add()` so completed data blocks stream to the temp
+            //    file as soon as they fill — no full-SST `Vec<u8>` is ever
+            //    allocated. The writer preserves its sorted-order
+            //    invariant (entries arrive in sorted (key ASC, seq DESC)
+            //    order matching `to_flush_batches`).
+            for batch in &batches {
+                let rows = batch.num_rows();
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| ForstError::corruption("flush batch: key column not Binary"))?;
+                let values = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| ForstError::corruption("flush batch: value column not Binary"))?;
+                let seqs = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        ForstError::corruption("flush batch: sequence column not UInt64")
+                    })?;
+                let ops = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<UInt8Array>()
+                    .ok_or_else(|| ForstError::corruption("flush batch: op_type column not UInt8"))?;
+
+                for i in 0..rows {
+                    let key = keys.value(i);
+                    let value = if values.is_null(i) {
+                        None
+                    } else {
+                        Some(values.value(i))
+                    };
+                    let seq = seqs.value(i);
+                    let op = ops.value(i);
+                    writer.add(key, value, seq, op)?;
+                }
+            }
+
+            let info = writer.finish()?;
             writable.flush()?;
             writable.sync()?;
-        }
+            info
+        };
         self.fs.rename(&tmp_path, &self.file_path)?;
 
         // 4. Build the SstFileMeta that the VersionSet will record.

@@ -39,6 +39,29 @@ use super::sparse_index::{decode_index, search_index, BlockStats, SparseIndexEnt
 /// `(key, value, sequence, op_type)`.
 pub type SstScanRow = (Vec<u8>, Option<Vec<u8>>, u64, OpType);
 
+/// Zero-copy borrowed view of a single SST row.
+///
+/// The `key` and `value` slices borrow directly from an Arrow `BinaryArray`
+/// backing buffer (which itself wraps the bytes read from the SST data block).
+/// No `Vec<u8>` is allocated per row. The lifetime `'a` ties the view to the
+/// `RecordBatch` that owns the underlying Arrow buffer; callers must consume
+/// the view before the batch is dropped, or convert to owned bytes themselves
+/// via `key.to_vec()` / `value.map(|v| v.to_vec())`.
+///
+/// PR-D2 (Z3-10, Z3-11, C-R3-H1..3): replaces per-row `Vec<u8>` materialization
+/// in the SST scan/get hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowView<'a> {
+    /// Key bytes, borrowed from the Arrow key column.
+    pub key: &'a [u8],
+    /// Value bytes, `None` if this row is a delete tombstone.
+    pub value: Option<&'a [u8]>,
+    /// Sequence number.
+    pub sequence: u64,
+    /// Operation type.
+    pub op_type: OpType,
+}
+
 /// Result of a point lookup: the value bytes and operation type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupResult {
@@ -328,25 +351,65 @@ impl SstReaderImpl {
         }))
     }
 
-    /// Scans the SST file for all entries in the `[lower, upper)` key range,
-    /// returning them as `(key, value, sequence, op_type)` tuples.
+    /// Returns the number of index entries (one per data block).
+    /// Used by streaming callers (e.g. compaction) to iterate blocks via
+    /// [`Self::read_block_at`].
+    pub fn index_entry_count(&self) -> usize {
+        self.index_entries.len()
+    }
+
+    /// Reads and decodes the data block at `block_idx` (0-based). Returns the
+    /// `RecordBatch` plus the index entry's `last_key`. Used by the streaming
+    /// compaction path to feed rows into the k-way merge without first
+    /// materialising every entry into a `Vec<u8>`.
     ///
-    /// Entries are ordered by `(key ASC, sequence DESC)` (the on-disk order
-    /// produced by [`crate::sst::writer::SstWriterImpl`]). Unlike [`SstReaderImpl::get`], this
-    /// returns ALL versions of each key; callers resolve visibility and
-    /// merges.
-    pub fn scan(&self, lower: &[u8], upper: Option<&[u8]>) -> ForstResult<Vec<SstScanRow>> {
+    /// PR-D2: this is the public streaming primitive that replaces the
+    /// `scan() -> Vec<SstScanRow>` materialisation. Callers iterate the
+    /// returned `RecordBatch` directly via [`for_each_row_in_batch`] (which
+    /// yields zero-copy [`RowView`]s borrowing from the batch buffers).
+    pub fn read_block_at(&self, block_idx: usize) -> ForstResult<RecordBatch> {
+        let entry = self.index_entries.get(block_idx).ok_or_else(|| {
+            ForstError::invalid_argument(format!(
+                "SST block index {} out of range (have {} blocks)",
+                block_idx,
+                self.index_entries.len()
+            ))
+        })?;
+        self.read_data_block(entry.block_offset, entry.block_size)
+    }
+
+    /// Scans the SST file for all entries in the `[lower, upper)` key range,
+    /// invoking `cb` once per matching row with a zero-copy [`RowView`] that
+    /// borrows from the underlying Arrow batch buffer.
+    ///
+    /// PR-D2 zero-copy primitive: no `Vec<u8>` is allocated per row. Each
+    /// `RecordBatch` is dropped between blocks, so the callback must either
+    /// process the view inline or copy out via `view.key.to_vec()` /
+    /// `view.value.map(|v| v.to_vec())`.
+    ///
+    /// Entries are visited in `(key ASC, sequence DESC)` order — the on-disk
+    /// order produced by [`crate::sst::writer::SstWriterImpl`]. Unlike
+    /// [`SstReaderImpl::get`], this visits ALL versions of each key; callers
+    /// resolve visibility and merges themselves.
+    pub fn scan_borrowed<F>(
+        &self,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        mut cb: F,
+    ) -> ForstResult<()>
+    where
+        F: FnMut(RowView<'_>) -> ForstResult<()>,
+    {
         // Short-circuit if the scan range doesn't intersect [min_key, max_key].
         if let Some(hi) = upper {
             if hi <= self.footer.min_key.as_slice() {
-                return Ok(Vec::new());
+                return Ok(());
             }
         }
         if lower > self.footer.max_key.as_slice() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
-        let mut out = Vec::new();
         for (entry, stats) in self.index_entries.iter().zip(self.index_stats.iter()) {
             // Skip blocks whose key ranges lie entirely outside [lower, upper).
             if entry.last_key.as_slice() < lower {
@@ -359,53 +422,98 @@ impl SstReaderImpl {
             }
 
             let batch = self.read_data_block(entry.block_offset, entry.block_size)?;
-            let keys = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("column 0 must be BinaryArray");
-            let values = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .expect("column 1 must be BinaryArray");
-            let sequences = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .expect("column 2 must be UInt64Array");
-            let op_types = batch
-                .column(3)
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .expect("column 3 must be UInt8Array");
-
-            for row in 0..batch.num_rows() {
-                let key = keys.value(row);
-                if key < lower {
-                    continue;
+            for_each_row_in_batch(&batch, |view| {
+                if view.key < lower {
+                    return Ok(());
                 }
                 if let Some(hi) = upper {
-                    if key >= hi {
-                        break;
+                    if view.key >= hi {
+                        // We could `break` if we had a control-flow channel; the
+                        // wrapper loop in `for_each_row_in_batch` is row-linear,
+                        // so we just no-op the remaining rows of this block via
+                        // an unrolled compare on the caller side. For batch sizes
+                        // ≤ 8192 (FLUSH_BATCH_SIZE) this is at worst a few µs.
+                        return Ok(());
                     }
                 }
-                let value = if values.is_null(row) {
-                    None
-                } else {
-                    Some(values.value(row).to_vec())
-                };
-                let op = OpType::from_u8(op_types.value(row)).ok_or_else(|| {
-                    ForstError::corruption(format!(
-                        "invalid op_type in SST scan: {}",
-                        op_types.value(row)
-                    ))
-                })?;
-                out.push((key.to_vec(), value, sequences.value(row), op));
-            }
+                cb(view)
+            })?;
         }
+        Ok(())
+    }
+
+    /// Backwards-compatible owned-row scan. Reimplemented atop
+    /// [`Self::scan_borrowed`] so the single place that pays the `to_vec`
+    /// cost is here, in callers that explicitly opt into ownership.
+    ///
+    /// Prefer [`Self::scan_borrowed`] in new code (compaction, replication,
+    /// snapshot reads) — it skips the per-row allocation entirely.
+    pub fn scan(&self, lower: &[u8], upper: Option<&[u8]>) -> ForstResult<Vec<SstScanRow>> {
+        let mut out = Vec::new();
+        self.scan_borrowed(lower, upper, |view| {
+            out.push((
+                view.key.to_vec(),
+                view.value.map(|v| v.to_vec()),
+                view.sequence,
+                view.op_type,
+            ));
+            Ok(())
+        })?;
         Ok(out)
     }
+}
+
+/// Iterates every row of a decoded SST data-block `RecordBatch`, invoking
+/// `cb` once per row with a zero-copy [`RowView`] that borrows from the batch
+/// buffers.
+///
+/// Internal helper exposed at module scope so streaming callers (compaction,
+/// flush re-write) can drive the iteration themselves after fetching the
+/// batch via [`SstReaderImpl::read_block_at`].
+pub fn for_each_row_in_batch<F>(batch: &RecordBatch, mut cb: F) -> ForstResult<()>
+where
+    F: FnMut(RowView<'_>) -> ForstResult<()>,
+{
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
+    let values = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
+    let sequences = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
+    let op_types = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
+
+    for row in 0..batch.num_rows() {
+        let key = keys.value(row);
+        let value = if values.is_null(row) {
+            None
+        } else {
+            Some(values.value(row))
+        };
+        let op_byte = op_types.value(row);
+        let op_type = OpType::from_u8(op_byte).ok_or_else(|| {
+            ForstError::corruption(format!("invalid op_type in SST batch: {}", op_byte))
+        })?;
+        cb(RowView {
+            key,
+            value,
+            sequence: sequences.value(row),
+            op_type,
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -841,5 +949,122 @@ mod tests {
             let result = reader.get(key.as_bytes()).unwrap();
             assert!(result.is_some(), "Zstd key {} not found", key);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-D2 zero-copy scan tests (Z3-10, Z3-11, C-R3-H1..3)
+    // -----------------------------------------------------------------------
+
+    /// PR-D2 invariant: `RowView::key` and `RowView::value` borrow into the
+    /// Arrow `BinaryArray` backing buffer of the decoded data block — they
+    /// must NOT be a fresh `Vec` allocated per row. We assert this by
+    /// checking the addresses fall inside a single decoded `RecordBatch`'s
+    /// key/value buffers (which themselves are heap allocations owned by the
+    /// batch's Arc-backed `Buffer`s).
+    #[test]
+    fn sst_read_arrow_zero_copy() {
+        let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+            block_size: 4096,
+            compression: CompressionType::None,
+        });
+        for i in 0..32u64 {
+            writer
+                .add(
+                    format!("zc_{:04}", i).as_bytes(),
+                    Some(format!("zc_val_{:04}", i).as_bytes()),
+                    i + 1,
+                    1,
+                )
+                .unwrap();
+        }
+        let (data, info) = writer.finish().unwrap();
+        let file = Box::new(MemRandomAccessFile {
+            data: Arc::new(data),
+        });
+        let reader = SstReaderImpl::open(file).unwrap();
+        assert!(info.data_block_count >= 1);
+
+        // Read the first data block ourselves so we can keep the batch alive
+        // while comparing pointer ranges with what `for_each_row_in_batch`
+        // yields.
+        let batch = reader.read_block_at(0).unwrap();
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+
+        let key_buf = keys.values().as_slice();
+        let val_buf = values.values().as_slice();
+        let key_buf_range = key_buf.as_ptr() as usize..(key_buf.as_ptr() as usize + key_buf.len());
+        let val_buf_range = val_buf.as_ptr() as usize..(val_buf.as_ptr() as usize + val_buf.len());
+
+        let mut rows_seen = 0usize;
+        for_each_row_in_batch(&batch, |view| {
+            let kp = view.key.as_ptr() as usize;
+            assert!(
+                key_buf_range.contains(&kp),
+                "RowView::key must borrow into the Arrow BinaryArray buffer (got ptr {:p}, buf range {:?})",
+                view.key.as_ptr(),
+                key_buf_range,
+            );
+            if let Some(v) = view.value {
+                let vp = v.as_ptr() as usize;
+                assert!(
+                    val_buf_range.contains(&vp),
+                    "RowView::value must borrow into the Arrow BinaryArray buffer"
+                );
+            }
+            rows_seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(rows_seen > 0);
+    }
+
+    /// PR-D2: `scan_borrowed` yields the same logical rows as the legacy
+    /// `scan()` API. This is the round-trip parity test required by the spec.
+    #[test]
+    fn sst_scan_borrowed_matches_scan() {
+        let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+            block_size: 256,
+            compression: CompressionType::None,
+        });
+        for i in 0..100u64 {
+            writer
+                .add(
+                    format!("scan_{:05}", i).as_bytes(),
+                    Some(format!("v_{:05}", i).as_bytes()),
+                    i + 1,
+                    1,
+                )
+                .unwrap();
+        }
+        let (data, _info) = writer.finish().unwrap();
+        let file = Box::new(MemRandomAccessFile {
+            data: Arc::new(data),
+        });
+        let reader = SstReaderImpl::open(file).unwrap();
+
+        let owned: Vec<_> = reader.scan(b"", None).unwrap();
+        let mut borrowed_count = 0usize;
+        reader
+            .scan_borrowed(b"", None, |view| {
+                let (ek, ev, eseq, eop) = &owned[borrowed_count];
+                assert_eq!(view.key, ek.as_slice());
+                assert_eq!(view.value, ev.as_deref());
+                assert_eq!(view.sequence, *eseq);
+                assert_eq!(view.op_type, *eop);
+                borrowed_count += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(borrowed_count, owned.len());
+        assert_eq!(borrowed_count, 100);
     }
 }

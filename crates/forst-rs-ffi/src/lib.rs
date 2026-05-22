@@ -3806,6 +3806,201 @@ pub extern "C" fn frs_vec_iter_prefix_abort(handle: u64) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// 12.b. Batched vectorized chunked iterator open — frs_vec_iter_prefix_open_batch
+//       (PR-E3 / E-HIGH-5 / F5-4)
+//
+// Replaces N FFI crossings (one per `frs_vec_iter_prefix_open`) with a single
+// crossing that opens N prefix iterators in one call.  Layout mirrors PR-D3's
+// packed SoA (offsets + flat data) for the prefixes, and an AoS output array
+// of `FrsChunk` per iter.  Caller pre-allocates one chunk buffer per iter at
+// a uniform capacity `chunk_cap`, passing each per-iter pointer in the
+// `FrsChunk::buf_ptr` input slot; the engine fills `row_count` + `bytes_used`
+// for that iter.  Handles are written to `out_handles[i]` (0 if open i
+// failed).  All iters that successfully open are registered in the shared
+// per-shard registry exactly as if opened individually.
+//
+// Partial-failure semantics: each row is independent; a malformed prefix
+// offset, an out-of-range prefix slice, or an engine error on a single iter
+// sets `out_handles[i] = 0` and `out_first_chunks[i] = {NULL, 0, 0}` for
+// that row only.  The return code reflects the first non-Ok per-row error
+// or `Ok` if all opens succeeded.  Successfully-opened iters remain valid
+// regardless of failures on other rows in the batch.
+// ---------------------------------------------------------------------------
+
+/// Per-iter chunk descriptor for `frs_vec_iter_prefix_open_batch`.
+///
+/// Layout (24 bytes, `repr(C)`):
+/// - `buf_ptr`     — **input**: caller-owned chunk buffer pointer for this iter.
+/// - `buf_cap`     — **input**: capacity of `buf_ptr` in bytes (caller-supplied).
+/// - `row_count`   — **output**: rows written to `buf_ptr` (0 on failure/empty).
+/// - `bytes_used`  — **output**: bytes written to `buf_ptr` (0 on failure/empty).
+/// - `_reserved`   — explicit padding for u64-alignment and ABI stability.
+///
+/// Each per-iter chunk follows the same wire format as
+/// `frs_vec_iter_prefix_open`: rows packed as `[klen u32 LE][vlen u32 LE]
+/// [key bytes][value bytes]`.
+#[repr(C)]
+pub struct FrsChunk {
+    pub buf_ptr: *mut u8,
+    pub buf_cap: u32,
+    pub row_count: u32,
+    pub bytes_used: u32,
+    pub _reserved: u32,
+}
+
+/// Batched open of N prefix iterators in a single FFI crossing.
+///
+/// Inputs (packed SoA — same layout PR-D3 used for batched gets):
+/// - `prefixes_off[i]` ranges over `[i .. i+1]` to identify prefix bytes
+///   `prefixes_data[prefixes_off[i] .. prefixes_off[i+1]]`.
+/// - `prefixes_off` length is `n + 1` (the sentinel terminator is required).
+/// - `out_handles` is an array of `n` `u64` slots; on success slot `i`
+///   carries the opened handle id, otherwise `0`.
+/// - `out_first_chunks` is an array of `n` `FrsChunk` structs; caller fills
+///   `buf_ptr` + `buf_cap` per row, engine fills `row_count` + `bytes_used`.
+/// - `chunk_cap` is the uniform per-iter capacity assumed for all rows; it
+///   serves as a sanity bound (caller-supplied `FrsChunk::buf_cap` MUST equal
+///   `chunk_cap`, else the row returns `BatchHeaderMalformed` for that slot).
+///
+/// # Returns
+/// - `FrsErrorCode::Ok` (0) if all N opens succeeded.
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) on null args, count > MAX,
+///   bad offsets, or bad chunk descriptor.  Per-row malformed inputs set
+///   `out_handles[i] = 0` but do not abort the rest of the batch.
+/// - `FrsErrorCode::EngineIo` (300) on engine-side errors (per-row; first
+///   error code is propagated as the function return; the rest of the
+///   batch continues processing).
+/// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
+///
+/// # Safety
+/// All pointers must be valid for reads/writes of the indicated counts for
+/// the duration of the call.  `prefixes_off` MUST be a non-decreasing
+/// sequence of `n + 1` `u32` values; the last entry MUST equal the total
+/// length of `prefixes_data`.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    prefixes_off: *const u32,
+    prefixes_data: *const u8,
+    n: u32,
+    out_handles: *mut u64,
+    out_first_chunks: *mut FrsChunk,
+    chunk_cap: u32,
+) -> i32 {
+    guarded_vec(|| {
+        if n == 0 {
+            return FrsErrorCode::Ok as i32;
+        }
+        if (n as usize) > MAX_BATCH_COUNT {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if prefixes_off.is_null() || out_handles.is_null() || out_first_chunks.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let Some(db_ref) = db_from_handle(db) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(cf_ref_) = cf_ref(&cf) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+
+        let n_us = n as usize;
+        let offs = slice::from_raw_parts(prefixes_off, n_us + 1);
+        let total_pref = offs[n_us] as usize;
+        let data_buf: &[u8] = if prefixes_data.is_null() || total_pref == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(prefixes_data, total_pref)
+        };
+        let handles_out = slice::from_raw_parts_mut(out_handles, n_us);
+        let chunks_out = slice::from_raw_parts_mut(out_first_chunks, n_us);
+
+        let mut first_err: i32 = FrsErrorCode::Ok as i32;
+
+        for i in 0..n_us {
+            // Pre-zero outputs so partial-failure rows have well-defined state.
+            handles_out[i] = 0;
+            let chunk = &mut chunks_out[i];
+            // Snapshot the input fields BEFORE we zero them — we still need
+            // to write into `buf_ptr` if the open succeeds.
+            let buf_ptr = chunk.buf_ptr;
+            let buf_cap = chunk.buf_cap;
+            chunk.row_count = 0;
+            chunk.bytes_used = 0;
+
+            // Per-row offset validation.
+            let ks = offs[i] as usize;
+            let ke = offs[i + 1] as usize;
+            if ke < ks || ke > total_pref {
+                if first_err == FrsErrorCode::Ok as i32 {
+                    first_err = FrsErrorCode::BatchHeaderMalformed as i32;
+                }
+                continue;
+            }
+            let prefix_len = ke - ks;
+            if prefix_len > MAX_KEY_LEN {
+                if first_err == FrsErrorCode::Ok as i32 {
+                    first_err = FrsErrorCode::BatchHeaderMalformed as i32;
+                }
+                continue;
+            }
+
+            // Per-row chunk descriptor validation.  `buf_cap` must equal
+            // `chunk_cap` (uniform sizing) and `buf_ptr` may be null only
+            // when `chunk_cap == 0` (degenerate; first chunk will be empty
+            // and caller will pull subsequent chunks via _next).
+            if buf_cap != chunk_cap {
+                if first_err == FrsErrorCode::Ok as i32 {
+                    first_err = FrsErrorCode::BatchHeaderMalformed as i32;
+                }
+                continue;
+            }
+            if buf_ptr.is_null() && buf_cap > 0 {
+                if first_err == FrsErrorCode::Ok as i32 {
+                    first_err = FrsErrorCode::BatchHeaderMalformed as i32;
+                }
+                continue;
+            }
+
+            let prefix: &[u8] = if prefix_len == 0 { &[] } else { &data_buf[ks..ke] };
+
+            let rows = match db_ref.prefix_scan(cf_ref_, prefix) {
+                Ok(r) => r,
+                Err(_) => {
+                    if first_err == FrsErrorCode::Ok as i32 {
+                        first_err = FrsErrorCode::EngineIo as i32;
+                    }
+                    continue;
+                }
+            };
+            let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
+                Box::new(rows.into_iter());
+            let mut handle_state = IterHandle::new(inner);
+
+            // Fill the first chunk into the caller-owned buffer.
+            let (bytes_used, row_count) =
+                fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap as usize);
+
+            // Register on the shared sharded registry — same path as the
+            // single-shot open so subsequent _next/_close/_abort calls work
+            // transparently.
+            let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            shard_for(handle_id)
+                .lock()
+                .unwrap()
+                .insert(handle_id, handle_state);
+
+            handles_out[i] = handle_id;
+            chunk.row_count = row_count;
+            chunk.bytes_used = bytes_used;
+        }
+
+        first_err
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 13. Vectorized chunked range iterator — frs_vec_iter_range_* (P9)
 //
 // Mirrors the prefix-iterator symbols (section 12) but bounds the scan by a
@@ -6720,6 +6915,162 @@ mod tests {
     #[test]
     fn vec_iter_prefix_close_zero_handle_is_noop() {
         assert_eq!(frs_vec_iter_prefix_close(0), FrsErrorCode::Ok as i32);
+    }
+
+    /// PR-E3: `frs_vec_iter_prefix_open_batch` opens 4 prefix iterators in ONE
+    /// FFI call.  Verifies that all 4 handles are non-zero and unique, that
+    /// each handle's first chunk decodes to the expected row set, and that
+    /// each handle is independently closable (so the shared registry is
+    /// populated correctly by the batched path).
+    #[test]
+    fn vec_iter_prefix_open_batch_four_iters_in_one_call() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // 4 prefixes, each with 2 rows + 1 distractor row outside all prefixes.
+            let prefixes: [&[u8]; 4] = [b"pA/", b"pB/", b"pC/", b"pD/"];
+            for p in &prefixes {
+                for sfx in [&b"x"[..], &b"y"[..]] {
+                    let mut k = Vec::with_capacity(p.len() + sfx.len());
+                    k.extend_from_slice(p);
+                    k.extend_from_slice(sfx);
+                    let v = b"v";
+                    assert_eq!(
+                        frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                        FRS_STATUS_OK
+                    );
+                }
+            }
+            let distractor = (&b"zzz"[..], &b"vz"[..]);
+            assert_eq!(
+                frs_put(
+                    db,
+                    cf,
+                    distractor.0.as_ptr(),
+                    distractor.0.len(),
+                    distractor.1.as_ptr(),
+                    distractor.1.len(),
+                ),
+                FRS_STATUS_OK
+            );
+
+            // Pack the prefixes SoA.
+            let n = prefixes.len();
+            let mut offs: Vec<u32> = Vec::with_capacity(n + 1);
+            let mut data: Vec<u8> = Vec::new();
+            offs.push(0);
+            for p in &prefixes {
+                data.extend_from_slice(p);
+                offs.push(data.len() as u32);
+            }
+
+            // One chunk buffer per iter at uniform capacity.
+            const CHUNK_CAP: u32 = 4096;
+            let mut chunk_storage: Vec<Vec<u8>> =
+                (0..n).map(|_| vec![0u8; CHUNK_CAP as usize]).collect();
+            let mut chunks: Vec<FrsChunk> = (0..n)
+                .map(|i| FrsChunk {
+                    buf_ptr: chunk_storage[i].as_mut_ptr(),
+                    buf_cap: CHUNK_CAP,
+                    row_count: 0,
+                    bytes_used: 0,
+                    _reserved: 0,
+                })
+                .collect();
+            let mut handles: Vec<u64> = vec![0; n];
+
+            let rc = frs_vec_iter_prefix_open_batch(
+                db,
+                cf,
+                offs.as_ptr(),
+                data.as_ptr(),
+                n as u32,
+                handles.as_mut_ptr(),
+                chunks.as_mut_ptr(),
+                CHUNK_CAP,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "batch open should return Ok");
+
+            // All 4 handles non-zero and unique.
+            for (i, h) in handles.iter().enumerate() {
+                assert_ne!(*h, 0, "handle {} should be non-zero", i);
+            }
+            let mut sorted = handles.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), n, "all handles must be unique");
+
+            // Each chunk decoded to 2 rows under its prefix.
+            for i in 0..n {
+                let chunk = &chunks[i];
+                assert_eq!(
+                    chunk.row_count, 2,
+                    "iter {} first chunk should have 2 rows",
+                    i
+                );
+                assert!(
+                    chunk.bytes_used > 0,
+                    "iter {} bytes_used should be > 0",
+                    i
+                );
+                let rows =
+                    decode_chunk_buf(&chunk_storage[i], chunk.bytes_used, chunk.row_count);
+                assert_eq!(rows.len(), 2);
+                for (k, _) in &rows {
+                    assert!(
+                        k.starts_with(prefixes[i]),
+                        "iter {} returned key {:?} not under prefix {:?}",
+                        i,
+                        k,
+                        prefixes[i],
+                    );
+                }
+            }
+
+            // Each handle is independently closable via the standard close fn,
+            // confirming the shared sharded registry is populated.
+            for h in &handles {
+                assert_eq!(
+                    frs_vec_iter_prefix_close(*h),
+                    FrsErrorCode::Ok as i32,
+                    "close should succeed for batched handle"
+                );
+            }
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// PR-E3: `frs_vec_iter_prefix_open_batch` with `n == 0` returns Ok and
+    /// is a no-op (no panic, no allocation).
+    #[test]
+    fn vec_iter_prefix_open_batch_zero_n_is_noop() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let offs: [u32; 1] = [0];
+            let rc = frs_vec_iter_prefix_open_batch(
+                db,
+                cf,
+                offs.as_ptr(),
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
     }
 
     /// PR-D4: Open 4 iterators concurrently from 4 different threads against

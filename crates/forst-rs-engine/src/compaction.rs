@@ -28,9 +28,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber};
-use forst_rs_io::FileSystem;
+use forst_rs_io::{FileSystem, WritableFile};
 use forst_rs_storage::merge_operator::MergeOperator;
-use forst_rs_storage::sst::{SstReaderImpl, SstWriterImpl, SstWriterOptions};
+use forst_rs_storage::sst::{
+    writer::StreamingSstWriter, SstReaderImpl, SstWriterImpl, SstWriterOptions,
+};
 use forst_rs_storage::version::{SstFileMeta, VersionEdit};
 
 use crate::compaction_filter::{CompactionDecision, CompactionFilter};
@@ -65,6 +67,15 @@ pub struct CompactionJob {
 impl CompactionJob {
     /// Runs the compaction synchronously and returns a [`VersionEdit`] that
     /// the caller should apply atomically to the [`forst_rs_storage::version::VersionSetImpl`].
+    ///
+    /// PR-D2 (Z3-10, C-R3-H1..3): the output SST is streamed directly to
+    /// the temp file via [`SstWriterImpl::streaming`] — no full-SST
+    /// `Vec<u8>` is materialised. Inputs are read block-by-block through
+    /// [`SstReaderImpl::scan_borrowed`], which exposes Arrow-backed zero-
+    /// copy [`forst_rs_storage::sst::RowView`]s; the per-entry copy into
+    /// `CompactionEntry` is the single materialisation point (unavoidable
+    /// because the merge sort outlives each individual block's
+    /// `RecordBatch`).
     pub fn run(self) -> ForstResult<Option<VersionEdit>> {
         // 1. Gather every entry from every input SST, tagging each with the
         //    source file_number so we can break ties when two SSTs use the
@@ -73,16 +84,20 @@ impl CompactionJob {
         let mut all: Vec<CompactionEntry> = Vec::new();
         for (level, meta, reader) in &self.inputs {
             let _ = level;
-            let scan = reader.scan(&meta.smallest_key, None)?;
-            for (key, value, sequence, op_type) in scan {
+            let file_num = meta.file_number.value();
+            // Stream via `scan_borrowed` — no `Vec<u8>` per row inside the
+            // reader. The owned copy is paid here, ONCE per entry, into the
+            // sort buffer (which has to be owned to outlive the block).
+            reader.scan_borrowed(&meta.smallest_key, None, |view| {
                 all.push(CompactionEntry {
-                    key,
-                    value,
-                    sequence,
-                    op_type,
-                    file_number: meta.file_number.value(),
+                    key: view.key.to_vec(),
+                    value: view.value.map(|v| v.to_vec()),
+                    sequence: view.sequence,
+                    op_type: view.op_type,
+                    file_number: file_num,
                 });
-            }
+                Ok(())
+            })?;
         }
 
         if all.is_empty() {
@@ -110,51 +125,20 @@ impl CompactionJob {
             ord => ord,
         });
 
-        // 3. Walk keys, consolidating versions per key. We apply:
+        // 3. Walk keys, consolidating versions per key, and stream the
+        //    output SST directly to the temp file via the streaming writer.
+        //    We apply:
         //    - Delete tombstones: drop all older versions for the same key;
         //      emit the tombstone only if NOT bottommost.
         //    - Merge chains: if a merge operator is present, collapse via
         //      full_merge once we reach the Put base (or exhaust the chain).
-        let writer_opts = self.writer_options.clone();
-        let mut writer = SstWriterImpl::with_options(writer_opts);
-        let mut i = 0;
-        let mut emitted = 0u64;
+        //
+        // PR-D2: the output file is streamed block-by-block — peak memory
+        // is bounded by one in-flight Arrow data block plus the bloom +
+        // sparse-index sections (proportional to block count, not byte
+        // count). No full-SST `Vec<u8>` is allocated.
 
-        while i < all.len() {
-            let key_end = {
-                let key = all[i].key.clone();
-                let mut j = i + 1;
-                while j < all.len() && all[j].key == key {
-                    j += 1;
-                }
-                j
-            };
-
-            // Versions for this key, newest first.
-            let versions = &all[i..key_end];
-            i = key_end;
-
-            self.emit_key_versions(&mut writer, versions, &mut emitted)?;
-        }
-
-        // 4. If we emitted zero rows (e.g. everything was a bottommost
-        //    tombstone), produce only a VersionEdit that deletes inputs.
-        if emitted == 0 {
-            let deleted = self
-                .inputs
-                .iter()
-                .map(|(lvl, m, _)| (*lvl, m.file_number))
-                .collect();
-            return Ok(Some(VersionEdit {
-                deleted_files: deleted,
-                new_files: Vec::new(),
-                next_file_number: None,
-                last_sequence: None,
-            }));
-        }
-
-        // 5. Finalise the writer and write the SST file to disk atomically.
-        let (bytes, info) = writer.finish()?;
+        // Open the temp file up front so the streaming writer has a sink.
         let tmp_path = {
             let mut base = self.output_path.clone();
             let existing = base
@@ -167,14 +151,66 @@ impl CompactionJob {
         if let Some(parent) = self.output_path.parent() {
             self.fs.create_dir_all(parent)?;
         }
-        {
+
+        let info = {
             let mut wf = self
                 .fs
                 .open_writable_file(&tmp_path, forst_rs_io::WriteMode::CreateNew)?;
-            wf.append(&bytes)?;
+            let writer_opts = self.writer_options.clone();
+            let writer_inner = SstWriterImpl::with_options(writer_opts);
+            let mut writer = writer_inner.streaming(&mut *wf);
+
+            let mut i = 0;
+            let mut emitted = 0u64;
+            while i < all.len() {
+                let key_end = {
+                    let key = &all[i].key;
+                    let mut j = i + 1;
+                    while j < all.len() && all[j].key == *key {
+                        j += 1;
+                    }
+                    j
+                };
+
+                // Versions for this key, newest first.
+                let versions = &all[i..key_end];
+                i = key_end;
+
+                self.emit_key_versions(&mut writer, versions, &mut emitted)?;
+            }
+
+            // 4. If we emitted zero rows (e.g. everything was a bottommost
+            //    tombstone), drop the writer without finishing — the
+            //    streaming-finish() call would have tried to emit a footer
+            //    but the streaming writer requires ≥ 1 entry. The temp
+            //    file may be partially written, but we never `rename` it,
+            //    so the engine never sees it; the caller's `fs` cleanup
+            //    will sweep it on the next compaction round. We also
+            //    short-circuit with a deletion-only VersionEdit below.
+            if emitted == 0 {
+                drop(writer);
+                drop(wf);
+                // Best-effort tmp cleanup; ignore errors (the file may not
+                // exist if the writer hasn't emitted anything yet, and the
+                // VersionEdit doesn't reference it).
+                let _ = self.fs.delete_file(&tmp_path);
+                return Ok(Some(VersionEdit {
+                    deleted_files: self
+                        .inputs
+                        .iter()
+                        .map(|(lvl, m, _)| (*lvl, m.file_number))
+                        .collect(),
+                    new_files: Vec::new(),
+                    next_file_number: None,
+                    last_sequence: None,
+                }));
+            }
+
+            let info = writer.finish()?;
             wf.flush()?;
             wf.sync()?;
-        }
+            info
+        };
         self.fs.rename(&tmp_path, &self.output_path)?;
 
         // 6. Build the VersionEdit: add the new file, remove all inputs.
@@ -200,12 +236,15 @@ impl CompactionJob {
         }))
     }
 
-    fn emit_key_versions(
+    fn emit_key_versions<W>(
         &self,
-        writer: &mut SstWriterImpl,
+        writer: &mut StreamingSstWriter<'_, W>,
         versions: &[CompactionEntry],
         emitted: &mut u64,
-    ) -> ForstResult<()> {
+    ) -> ForstResult<()>
+    where
+        W: WritableFile + ?Sized,
+    {
         debug_assert!(!versions.is_empty());
         // `versions` is sorted by sequence DESC — the newest version is at
         // index 0.
