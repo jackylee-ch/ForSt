@@ -52,6 +52,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use forst_rs_common::error::{ForstError, ForstResult};
 use forst_rs_io::{
     FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile, WriteMode,
@@ -166,14 +167,20 @@ impl CachedFileSystem {
     /// Fetches the full object bytes, populating the cache on success.
     /// Returns the bytes either from the cache (on hit) or the remote
     /// backend (on miss).
-    fn fetch_through_cache(&self, path: &Path) -> ForstResult<Vec<u8>> {
+    ///
+    /// The returned [`Bytes`] is ref-counted and slice-able — callers can
+    /// hand it to multiple readers without recopying. The conversion from
+    /// `Vec<u8>` (returned by [`LocalCache::get`]) to `Bytes` is zero-copy.
+    fn fetch_through_cache(&self, path: &Path) -> ForstResult<Bytes> {
         let key = self.cache_key(path)?.to_string();
         if let Some(bytes) = self
             .cache
             .get(&key)
             .map_err(|e| ForstError::Io(std::io::Error::other(format!("cache get: {e}"))))?
         {
-            return Ok(bytes);
+            // `Bytes::from(Vec<u8>)` is zero-copy in `bytes` 1.x — the Vec's
+            // allocation is transferred into a refcounted Bytes handle.
+            return Ok(Bytes::from(bytes));
         }
         // Miss: pull the whole file via the remote backend's sequential
         // reader. This is the same pattern OpenDAL itself uses for small
@@ -205,7 +212,9 @@ impl CachedFileSystem {
             .cache
             .put(&key, &bytes)
             .map_err(|e| ForstError::Io(std::io::Error::other(format!("cache put: {e}"))))?;
-        Ok(bytes)
+        // Zero-copy hand-off into the refcounted Bytes container. Callers
+        // can slice / share without recopying the full payload.
+        Ok(Bytes::from(bytes))
     }
 }
 
@@ -303,19 +312,20 @@ impl FileSystem for CachedFileSystem {
 // ---------------------------------------------------------------------------
 // In-memory file adapters
 //
-// Both adapters serve cached bytes from a Vec<u8> held in the heap. The
-// engine's SST reader is happy with any RandomAccessFile / SequentialFile
-// impl — these adapters keep the heap copy alive for the lifetime of the
-// read.
+// Both adapters serve cached bytes from a `bytes::Bytes` handle. `Bytes`
+// is ref-counted and slice-able without memcpy — the engine's SST reader
+// can hold any number of overlapping views without recopying the payload.
+// These adapters keep the refcounted buffer alive for the lifetime of the
+// reader handle.
 // ---------------------------------------------------------------------------
 
 struct InMemorySequential {
-    bytes: Vec<u8>,
+    bytes: Bytes,
     pos: usize,
 }
 
 impl InMemorySequential {
-    fn new(bytes: Vec<u8>) -> Self {
+    fn new(bytes: Bytes) -> Self {
         Self { bytes, pos: 0 }
     }
 }
@@ -324,6 +334,8 @@ impl SequentialFile for InMemorySequential {
     fn read(&mut self, buf: &mut [u8]) -> ForstResult<usize> {
         let remaining = self.bytes.len().saturating_sub(self.pos);
         let n = remaining.min(buf.len());
+        // `Bytes` deref-coerces to `&[u8]`; a single memcpy from the
+        // ref-counted buffer to the caller's slice.
         buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
@@ -338,11 +350,11 @@ impl SequentialFile for InMemorySequential {
 }
 
 struct InMemoryRandom {
-    bytes: Vec<u8>,
+    bytes: Bytes,
 }
 
 impl InMemoryRandom {
-    fn new(bytes: Vec<u8>) -> Self {
+    fn new(bytes: Bytes) -> Self {
         Self { bytes }
     }
 }

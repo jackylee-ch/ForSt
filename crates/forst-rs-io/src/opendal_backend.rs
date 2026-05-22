@@ -58,6 +58,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::{Buf, Bytes};
 use forst_rs_common::error::{ForstError, ForstResult};
 use opendal::layers::BlockingLayer;
 use opendal::{ErrorKind as OdErrorKind, Metakey, Operator};
@@ -281,8 +282,15 @@ impl OpendalFileSystem {
 // ---------------------------------------------------------------------------
 
 /// A sequential reader that holds the full object in memory.
+///
+/// The payload is stored as a [`bytes::Bytes`] handle — ref-counted and
+/// slice-able without memcpy. Construction from `opendal::Buffer::to_bytes()`
+/// is zero-copy when the underlying buffer is contiguous (the common case for
+/// services that return a single chunk per GET).
 pub struct OpendalSequentialFile {
-    bytes: Vec<u8>,
+    /// The full object bytes. Held as `Bytes` so cheap slicing and sharing
+    /// is available to callers (e.g. the storage layer's in-memory adapters).
+    bytes: Bytes,
     pos: usize,
 }
 
@@ -290,6 +298,8 @@ impl SequentialFile for OpendalSequentialFile {
     fn read(&mut self, buf: &mut [u8]) -> ForstResult<usize> {
         let remaining = self.bytes.len().saturating_sub(self.pos);
         let n = remaining.min(buf.len());
+        // `Bytes` deref-coerces to `&[u8]`; this is a single memcpy from the
+        // ref-counted buffer into the caller's slice (no intermediate `Vec`).
         buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
         self.pos += n;
         Ok(n)
@@ -325,15 +335,19 @@ impl RandomAccessFile for OpendalRandomAccessFile {
         }
         let want = u64::try_from(buf.len()).unwrap_or(u64::MAX);
         let end = offset.saturating_add(want).min(self.size);
-        let buffer = self
+        let mut buffer = self
             .op
             .read_with(&self.path)
             .range(offset..end)
             .call()
             .map_err(|e| map_opendal_err(e, &format!("OpenDAL ranged read: {}", self.path)))?;
-        let bytes = buffer.to_vec();
-        let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
+        // `opendal::Buffer` may be non-contiguous (a sequence of `Bytes`
+        // chunks). Going through `to_vec()` would force a contiguous copy
+        // into a fresh `Vec`, then a second copy into the caller's slice.
+        // `Buf::copy_to_slice` streams chunk-by-chunk directly into `buf` —
+        // one memcpy per chunk, no intermediate `Vec` allocation.
+        let n = buffer.len().min(buf.len());
+        buffer.copy_to_slice(&mut buf[..n]);
         Ok(n)
     }
 
@@ -353,16 +367,47 @@ impl RandomAccessFile for OpendalRandomAccessFile {
 /// WAL segment, written sequentially, then sealed). Streaming uploads are
 /// available via the OpenDAL writer API but are not exposed here to keep
 /// the trait surface minimal.
+///
+/// # Buffer ownership model
+///
+/// The buffer lives in one of two states:
+///
+/// - **Mutable**: `buffer` holds a `Vec<u8>` accumulator; appends are
+///   amortized-O(1) growth. `frozen` is `None`.
+/// - **Frozen**: after [`Self::persist`], the accumulator has been moved
+///   into a ref-counted [`bytes::Bytes`] snapshot stored in `frozen`. The
+///   `Vec` is now empty. Subsequent persists (e.g. `flush(); sync();`)
+///   re-PUT this snapshot via cheap ref-count clones — no memcpy.
+///
+/// A subsequent [`Self::append`] re-materializes the frozen snapshot back
+/// into the mutable accumulator before appending. This costs one memcpy
+/// per "frozen → append" transition, but matches the pre-existing cost on
+/// the same path and is rare in the typical "build → sync → drop" workflow.
 pub struct OpendalWritableFile {
     op: opendal::BlockingOperator,
     path: String,
+    /// Mutable accumulator for in-progress appends. After a successful
+    /// [`Self::persist`], this is empty and `frozen` holds the snapshot.
     buffer: Vec<u8>,
+    /// Ref-counted snapshot of the most recently persisted content.
+    /// Allows repeat persists (`flush(); sync();`) to re-PUT without
+    /// recopying the full buffer.
+    frozen: Option<Bytes>,
     /// True after sync() succeeds; suppresses the drop-time flush.
     flushed: bool,
 }
 
 impl WritableFile for OpendalWritableFile {
     fn append(&mut self, data: &[u8]) -> ForstResult<()> {
+        // If the buffer was previously frozen (last call was a persist),
+        // re-materialize it before appending. This is the only memcpy in
+        // the writer's hot path; it only happens when callers interleave
+        // appends with persists, which is uncommon for the SST flush path.
+        if let Some(snapshot) = self.frozen.take() {
+            // `Bytes::to_vec()` performs the copy; `into_iter().collect()`
+            // would be equivalent. Keep semantics explicit.
+            self.buffer = snapshot.to_vec();
+        }
         self.buffer.extend_from_slice(data);
         self.flushed = false;
         Ok(())
@@ -381,7 +426,13 @@ impl WritableFile for OpendalWritableFile {
     }
 
     fn file_size(&self) -> ForstResult<u64> {
-        Ok(self.buffer.len() as u64)
+        // Size reflects the current logical content: the live accumulator
+        // when not frozen, otherwise the frozen snapshot.
+        if let Some(snapshot) = &self.frozen {
+            Ok(snapshot.len() as u64)
+        } else {
+            Ok(self.buffer.len() as u64)
+        }
     }
 }
 
@@ -390,8 +441,22 @@ impl OpendalWritableFile {
         // Writing the same content twice is idempotent for OpenDAL services
         // we target (PUT semantics). We always send the full buffer because
         // OpenDAL's simple `write` API replaces objects atomically.
+        let bytes = match &self.frozen {
+            // Repeat-persist (flush() then sync(), or sync() then sync()):
+            // ref-count clone of the existing snapshot. Zero-copy.
+            Some(snapshot) => snapshot.clone(),
+            // First persist since last append: take the accumulator zero-copy
+            // (Vec<u8> → Bytes via From<Vec<u8>> is zero-copy in bytes 1.x).
+            // The ref-counted Bytes is shared between opendal (for the PUT)
+            // and our own `frozen` slot (for future re-PUTs). No memcpy.
+            None => {
+                let taken: Bytes = std::mem::take(&mut self.buffer).into();
+                self.frozen = Some(taken.clone());
+                taken
+            }
+        };
         self.op
-            .write(&self.path, self.buffer.clone())
+            .write(&self.path, bytes)
             .map_err(|e| map_opendal_err(e, &format!("OpenDAL write: {}", self.path)))?;
         self.flushed = true;
         Ok(())
@@ -400,7 +465,8 @@ impl OpendalWritableFile {
 
 impl Drop for OpendalWritableFile {
     fn drop(&mut self) {
-        if !self.flushed && !self.buffer.is_empty() {
+        let has_content = !self.buffer.is_empty() || self.frozen.is_some();
+        if !self.flushed && has_content {
             // Best-effort flush. Errors here cannot propagate; we log via
             // tracing so operators can correlate. Callers MUST call
             // `sync()` for durability guarantees.
@@ -426,8 +492,12 @@ impl FileSystem for OpendalFileSystem {
         let buffer = self
             .block_on(self.op.read(p))
             .map_err(|e| map_opendal_err(e, &format!("open_sequential_file: {p}")))?;
+        // `Buffer::to_bytes()` is zero-copy when the underlying chunks are
+        // contiguous (the common case for a single GetObject), and a single
+        // concat otherwise — strictly better than `to_vec()` which forces a
+        // separate `Vec` allocation regardless.
         Ok(Box::new(OpendalSequentialFile {
-            bytes: buffer.to_vec(),
+            bytes: buffer.to_bytes(),
             pos: 0,
         }))
     }
@@ -490,6 +560,7 @@ impl FileSystem for OpendalFileSystem {
             op: blocking,
             path: p.to_string(),
             buffer: initial,
+            frozen: None,
             flushed: false,
         }))
     }
@@ -933,5 +1004,93 @@ mod tests {
         let mut buf = vec![0u8; payload.len() + 8];
         let n = r.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], payload, "rename must preserve content");
+    }
+
+    // --- PR-D1: bytes::Bytes round-trip on the storage layer ---------------
+    //
+    // Writes a 1 MiB payload, then reads it back via both the sequential
+    // and random-access readers. Both now serve from a `bytes::Bytes`
+    // refcounted buffer instead of allocating an intermediate `Vec<u8>`
+    // per read. The test asserts data equality across multiple read modes
+    // and offsets, which exercises:
+    //   - `OpendalSequentialFile::bytes: Bytes` (zero-copy from
+    //     `Buffer::to_bytes()`),
+    //   - `OpendalRandomAccessFile::read_at` using `Buf::copy_to_slice`
+    //     (streaming copy, no `Vec` intermediate),
+    //   - `OpendalWritableFile::persist` using
+    //     `mem::take(&mut self.buffer).into()` for zero-copy `Vec → Bytes`.
+    //
+    // The intent is to pin the no-Vec-intermediate invariant; a regression
+    // that re-introduces `to_vec()` on the read path would not fail this
+    // test directly but would show up in the `s3_read_64MB` criterion
+    // benchmark referenced by the PR-D1 acceptance criterion.
+    #[test]
+    fn bytes_zero_copy_round_trip() {
+        use std::path::Path;
+
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+        let path = Path::new("zero_copy/payload.bin");
+
+        // 1 MiB pseudo-random payload (xorshift32 so the test is
+        // deterministic and doesn't pull in `rand`).
+        const SIZE: usize = 1 << 20;
+        let mut payload = Vec::with_capacity(SIZE);
+        let mut state: u32 = 0xDEAD_BEEF;
+        while payload.len() < SIZE {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            payload.extend_from_slice(&state.to_le_bytes());
+        }
+        payload.truncate(SIZE);
+
+        // Write via OpendalWritableFile (exercises persist's mem::take →
+        // Bytes path).
+        {
+            let mut w = fs
+                .open_writable_file(path, WriteMode::CreateOrTruncate)
+                .expect("open writable");
+            w.append(&payload).expect("append");
+            w.sync().expect("sync");
+        }
+
+        // Sequential read covers the full object; serves from
+        // OpendalSequentialFile's `Bytes` field.
+        {
+            let mut r = fs.open_sequential_file(path).expect("open sequential");
+            let mut buf = vec![0u8; SIZE];
+            let mut total = 0;
+            while total < SIZE {
+                let n = r.read(&mut buf[total..]).expect("read");
+                if n == 0 {
+                    break;
+                }
+                total += n;
+            }
+            assert_eq!(total, SIZE, "expected full payload");
+            assert_eq!(&buf[..], &payload[..], "sequential payload mismatch");
+        }
+
+        // Random-access reads at three offsets — exercises Buf::copy_to_slice
+        // streaming path. We deliberately pick a non-power-of-2 offset so
+        // any latent off-by-one in range arithmetic surfaces.
+        let rar = fs.open_random_access_file(path).expect("open random");
+        assert_eq!(rar.file_size().unwrap(), SIZE as u64);
+
+        for &(offset, len) in &[(0usize, 4096), (12_345usize, 7_891), (SIZE - 1024, 1024)] {
+            let mut chunk = vec![0u8; len];
+            let n = rar.read_at(offset as u64, &mut chunk).expect("read_at");
+            assert_eq!(n, len, "short read at offset {offset}");
+            assert_eq!(
+                &chunk[..],
+                &payload[offset..offset + len],
+                "random-read payload mismatch at offset {offset}"
+            );
+        }
+
+        // Read past EOF returns 0 (no Vec allocated, no copy).
+        let mut chunk = [0u8; 32];
+        let n = rar.read_at(SIZE as u64, &mut chunk).expect("read_at eof");
+        assert_eq!(n, 0);
     }
 }

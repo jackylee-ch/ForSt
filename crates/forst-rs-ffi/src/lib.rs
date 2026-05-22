@@ -2410,17 +2410,31 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
         } else {
             slice::from_raw_parts_mut(out_data, out_data_cap)
         };
-        let mut pos: usize = 0;
-        out_offs[0] = 0;
+        // PR-D3 (V10): build the key-slice vector once and route to the
+        // engine's batched `db.batch_get` API in a single call. The engine's
+        // batch path warms the SST reader cache via `prefetch_sst_files_for_batch`
+        // (one GetObject per SST file instead of one per key on S3) and uses
+        // the active-memtable hash-index fast path before falling through to
+        // the full read pipeline. Replaces the previous per-key `db.get(cf, k)`
+        // loop that defeated block-cache prefetch / S3 batched-read.
+        let mut keys_vec: Vec<&[u8]> = Vec::with_capacity(count);
         for i in 0..count {
             let ks = key_offs[i] as usize;
             let ke = key_offs[i + 1] as usize;
             if ke < ks || ke > total_keys {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
-            let k = &key_buf[ks..ke];
-            match db.get(cf, k) {
-                Ok(Some(v)) => {
+            keys_vec.push(&key_buf[ks..ke]);
+        }
+        let results = match db.batch_get(cf, &keys_vec) {
+            Ok(v) => v,
+            Err(e) => return error_to_frs_code(&e),
+        };
+        let mut pos: usize = 0;
+        out_offs[0] = 0;
+        for (i, slot) in results.into_iter().enumerate() {
+            match slot {
+                Some(v) => {
                     let vl = v.len();
                     if pos + vl > out_data_cap {
                         *out_data_len = pos + vl;
@@ -2430,8 +2444,7 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
                     pos += vl;
                     out_vld[i] = 1;
                 }
-                Ok(None) => out_vld[i] = 0,
-                Err(e) => return error_to_frs_code(&e),
+                None => out_vld[i] = 0,
             }
             out_offs[i + 1] = pos as i32;
         }
@@ -3470,51 +3483,135 @@ pub unsafe extern "C" fn frs_db_ingest_external_sst(
 //   [klen: u32 LE][vlen: u32 LE][key bytes][value bytes]
 // repeated, with no padding between rows.
 //
-// V1 snapshot semantics: `prefix_scan` materialises the full result set
-// into a Vec at open time; subsequent writes do not affect the iterator.
-// The Vec is heap-resident for the handle's lifetime.  Proper streaming
-// snapshot ref-counting is deferred to V2.
+// V1 snapshot semantics: the engine's `prefix_scan` / `scan` APIs return a
+// Vec<(Vec<u8>, Vec<u8>)>; we wrap that Vec's `IntoIter` as the boxed
+// iterator stored inside `IterHandle`.  No additional intermediate Vec is
+// allocated at the FFI layer — `fill_chunk_from_iter` drives the boxed
+// iterator directly into the caller's buffer (zero-clone first chunk).
+// Engine-side streaming snapshots (true cursors) are deferred to a later
+// engine PR (out of PR-D4 scope: "lib.rs only").
 //
-// Handle registry: `ITER_HANDLES` maps `u64` IDs to boxed `NativeIter`
-// instances.  The Java side treats the ID as opaque, passing it back
-// through next/close/abort.  IDs are monotonically increasing from 1;
-// overflow at u64::MAX wraps to 0 (harmless: the handle registry will
-// simply miss a lookup and return `IterCursorInvalid`).
+// Handle registry (PR-D4): a 16-shard `Mutex<HashMap>` keyed by handle id.
+// The shard is selected by the lower 4 bits of the id, so opens from
+// different threads with monotonically-assigned ids land on different
+// shards and do not serialize on a single global Mutex.  Per spec PR-D4
+// closes V2-4 / B2-H2 / B2-H5: "global Mutex<HashMap> that serializes
+// ALL iter opens across slots".  The 16-way sharding removes that
+// serialization point while preserving the safety invariant that
+// dereferencing an arbitrary `u64` handle is impossible — every access
+// goes through a HashMap lookup and missing handles return
+// `IterCursorInvalid`.
+//
+// IDs are monotonically increasing from 1; overflow at u64::MAX wraps to
+// 0 (harmless: the lookup misses and we return `IterCursorInvalid`).
 // ---------------------------------------------------------------------------
 
-use forst_rs_storage::NativeIter;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Mutex, OnceLock};
 
-/// Boxed, type-erased iterator stored in `ITER_HANDLES`.
-type AnyNativeIter = NativeIter<Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>>;
-
-static ITER_HANDLES: OnceLock<Mutex<HashMap<u64, AnyNativeIter>>> = OnceLock::new();
-static NEXT_ITER_ID: AtomicU64 = AtomicU64::new(1);
-
-fn iter_handles() -> &'static Mutex<HashMap<u64, AnyNativeIter>> {
-    ITER_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+/// Per-handle state owned by the FFI iter registry.  Holds:
+/// - a live boxed iterator over `(Vec<u8>, Vec<u8>)` pairs;
+/// - an optional `pending` row peeked from the iterator but not yet
+///   written into the caller's buffer (rollback for overflow);
+/// - an `aborted` flag so the watchdog can short-circuit `_next` calls.
+///
+/// PR-D4 zero-clone: the open/next path drains directly from `inner` into
+/// the caller's buffer — no intermediate `Vec<(Vec<u8>, Vec<u8>)>`
+/// allocation happens at the FFI layer.  (The engine still materializes
+/// the full prefix into a Vec inside `prefix_scan`/`scan`; replacing that
+/// with a true streaming cursor is engine-side work and outside the
+/// PR-D4 "lib.rs only" scope.)
+struct IterHandle {
+    inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>,
+    pending: Option<(Vec<u8>, Vec<u8>)>,
+    aborted: AtomicBool,
 }
 
-/// Pack `chunk.rows` into `buf[0..cap]` using the wire format
-/// `[klen u32 LE][vlen u32 LE][key bytes][value bytes]`.
+impl IterHandle {
+    fn new(inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>) -> Self {
+        Self {
+            inner,
+            pending: None,
+            aborted: AtomicBool::new(false),
+        }
+    }
+
+    /// Pull the next row from the iterator, preferring the pending row
+    /// (rolled back from a previous overflow).
+    fn next_row(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+        if let Some(p) = self.pending.take() {
+            return Some(p);
+        }
+        self.inner.next()
+    }
+
+    /// Push a row back to be returned on the next `next_row()` call.
+    fn put_back(&mut self, row: (Vec<u8>, Vec<u8>)) {
+        debug_assert!(self.pending.is_none(), "put_back called with pending row already set");
+        self.pending = Some(row);
+    }
+
+    fn abort(&self) {
+        self.aborted.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_aborted(&self) -> bool {
+        self.aborted.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// Number of registry shards.  Power-of-two so the shard index is a fast
+/// bit-mask.  16 shards is enough headroom for typical Flink slot counts
+/// (8–16 task slots per TM) without serializing iter opens on a single
+/// global Mutex (PR-D4 / B2-H5).
+const ITER_SHARD_COUNT: usize = 16;
+const ITER_SHARD_MASK: u64 = (ITER_SHARD_COUNT as u64) - 1;
+
+static ITER_SHARDS: OnceLock<[Mutex<HashMap<u64, IterHandle>>; ITER_SHARD_COUNT]> =
+    OnceLock::new();
+static NEXT_ITER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Initialise the shard array on first access.  Each shard is independent;
+/// the lock taken in `open`/`next`/`close`/`abort` is per-shard, never
+/// global — that is the property PR-D4 needs.
+fn iter_shards() -> &'static [Mutex<HashMap<u64, IterHandle>>; ITER_SHARD_COUNT] {
+    ITER_SHARDS.get_or_init(|| std::array::from_fn(|_| Mutex::new(HashMap::new())))
+}
+
+#[inline]
+fn shard_for(handle: u64) -> &'static Mutex<HashMap<u64, IterHandle>> {
+    &iter_shards()[(handle & ITER_SHARD_MASK) as usize]
+}
+
+/// Pull rows directly from `iter` into the caller's buffer.  Each row is
+/// serialised as `[klen u32 LE][vlen u32 LE][key bytes][value bytes]`.
 ///
-/// Stops before a row would overflow the buffer. Returns the number of
-/// bytes written and the number of rows that fit.
+/// Capacity is enforced against the *actual* wire bytes (header + payload).
+/// If a row would overflow, it is rolled back to `iter.pending` so the
+/// next call returns it first — no rows are silently dropped.
+///
+/// Returns `(bytes_written, row_count)`.  Stops at first row that would
+/// overflow or when the iterator is exhausted.
 ///
 /// # Safety
-/// Caller must ensure `buf` points to at least `cap` writable bytes for
-/// the duration of the call.
-unsafe fn write_chunk_into_buf(
-    rows: &[(Vec<u8>, Vec<u8>)],
+/// `buf` must point to at least `cap` writable bytes for the duration of
+/// the call.
+unsafe fn fill_chunk_from_iter(
+    iter: &mut IterHandle,
     buf: *mut u8,
     cap: usize,
 ) -> (u32, u32) {
+    // Aborted iters return an empty chunk — preserve the abort semantic.
+    if iter.is_aborted() {
+        return (0, 0);
+    }
     let mut off = 0usize;
     let mut row_count = 0u32;
-    for (k, v) in rows {
+    while let Some((k, v)) = iter.next_row() {
         let row_size = 8 + k.len() + v.len();
         if off + row_size > cap {
+            // Row doesn't fit — roll back so the next call returns it.
+            iter.put_back((k, v));
             break;
         }
         let klen = k.len() as u32;
@@ -3584,26 +3681,30 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             slice::from_raw_parts(prefix_ptr, prefix_len as usize)
         };
 
-        // V1: materialize the full prefix result set at open time.
+        // V1: the engine's `prefix_scan` returns an owned Vec; we wrap its
+        // IntoIter as the boxed cursor.  PR-D4 zero-clone: NO intermediate
+        // Vec is allocated at the FFI layer — `fill_chunk_from_iter` drains
+        // the boxed iter directly into the caller's buffer.
         let rows = match db_ref.prefix_scan(cf_ref_, prefix) {
             Ok(r) => r,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
-
         let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> = Box::new(rows.into_iter());
-        let mut native_iter = NativeIter::new(inner);
+        let mut handle_state = IterHandle::new(inner);
 
-        // Fill the first chunk into the caller's buffer.
-        let chunk = native_iter.next_chunk(chunk_buf_cap as usize);
+        // Fill the first chunk lazily into the caller's buffer.
         let (bytes_used, row_count) =
-            write_chunk_into_buf(&chunk.rows, chunk_buf_ptr, chunk_buf_cap as usize);
+            fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
 
-        // Register the iterator so subsequent next/close calls can find it.
+        // Register the iterator on a sharded registry.  Shard is selected
+        // by the lower 4 bits of `handle_id`, so opens from different
+        // threads with sequential ids fall on different shards and never
+        // contend on a single global Mutex.
         let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        iter_handles()
+        shard_for(handle_id)
             .lock()
             .unwrap()
-            .insert(handle_id, native_iter);
+            .insert(handle_id, handle_state);
 
         *out_handle = handle_id;
         *out_row_count = row_count;
@@ -3642,14 +3743,13 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
         if chunk_buf_ptr.is_null() && chunk_buf_cap > 0 {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
-        let mut guard = iter_handles().lock().unwrap();
+        let mut guard = shard_for(handle).lock().unwrap();
         let iter = match guard.get_mut(&handle) {
             Some(it) => it,
             None => return FrsErrorCode::IterCursorInvalid as i32,
         };
-        let chunk = iter.next_chunk(chunk_buf_cap as usize);
         let (bytes_used, row_count) =
-            write_chunk_into_buf(&chunk.rows, chunk_buf_ptr, chunk_buf_cap as usize);
+            fill_chunk_from_iter(iter, chunk_buf_ptr, chunk_buf_cap as usize);
         *out_row_count = row_count;
         *out_bytes_used = bytes_used;
         FrsErrorCode::Ok as i32
@@ -3671,7 +3771,7 @@ pub extern "C" fn frs_vec_iter_prefix_close(handle: u64) -> i32 {
         if handle == 0 {
             return FrsErrorCode::Ok as i32;
         }
-        iter_handles().lock().unwrap().remove(&handle);
+        shard_for(handle).lock().unwrap().remove(&handle);
         FrsErrorCode::Ok as i32
     })
 }
@@ -3683,6 +3783,10 @@ pub extern "C" fn frs_vec_iter_prefix_close(handle: u64) -> i32 {
 /// breach.  The handle remains in the registry until `frs_vec_iter_prefix_close`
 /// is called; the watchdog should call close immediately after abort.
 ///
+/// Safe to call from a different thread than the one that opened the
+/// handle — abort writes to an `AtomicBool` inside the handle, and the
+/// per-shard `Mutex` is the only synchronisation point we need.
+///
 /// # Returns
 /// - `FrsErrorCode::Ok` (0) on success.
 /// - `FrsErrorCode::IterCursorInvalid` (201) if `handle` is unknown.
@@ -3690,7 +3794,7 @@ pub extern "C" fn frs_vec_iter_prefix_close(handle: u64) -> i32 {
 #[no_mangle]
 pub extern "C" fn frs_vec_iter_prefix_abort(handle: u64) -> i32 {
     guarded_vec(|| {
-        let guard = iter_handles().lock().unwrap();
+        let guard = shard_for(handle).lock().unwrap();
         match guard.get(&handle) {
             Some(iter) => {
                 iter.abort();
@@ -3708,9 +3812,9 @@ pub extern "C" fn frs_vec_iter_prefix_abort(handle: u64) -> i32 {
 // half-open interval [lo, hi) instead of a single prefix.  The engine's
 // `scan(cf, lo, Some(hi))` API provides proper range semantics at V1.
 //
-// Handle lifecycle is shared with the prefix iterator: both kinds use the same
-// ITER_HANDLES registry and NEXT_ITER_ID counter, so close/abort are
-// functionally identical to the prefix variants.
+// Handle lifecycle is shared with the prefix iterator: both kinds use the
+// same sharded `ITER_SHARDS` registry and `NEXT_ITER_ID` counter, so
+// close/abort are functionally identical to the prefix variants.
 // ---------------------------------------------------------------------------
 
 /// Open a range-scoped iterator over [lo, hi).
@@ -3776,26 +3880,27 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
             Some(slice::from_raw_parts(hi_ptr, hi_len as usize))
         };
 
-        // V1: materialize the [lo, hi) result set via the engine's range scan.
+        // V1: the engine's `scan` returns an owned Vec; we wrap its
+        // IntoIter as the boxed cursor.  PR-D4 zero-clone: NO intermediate
+        // Vec is allocated at the FFI layer — `fill_chunk_from_iter` drains
+        // the boxed iter directly into the caller's buffer.
         let rows = match db_ref.scan(cf_ref_, lo, hi_opt) {
             Ok(r) => r,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
-
         let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> = Box::new(rows.into_iter());
-        let mut native_iter = NativeIter::new(inner);
+        let mut handle_state = IterHandle::new(inner);
 
-        // Fill the first chunk into the caller's buffer.
-        let chunk = native_iter.next_chunk(chunk_buf_cap as usize);
+        // Fill the first chunk lazily into the caller's buffer.
         let (bytes_used, row_count) =
-            write_chunk_into_buf(&chunk.rows, chunk_buf_ptr, chunk_buf_cap as usize);
+            fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
 
-        // Register — shares the same global registry as prefix iterators.
+        // Register — shares the same sharded registry as prefix iterators.
         let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        iter_handles()
+        shard_for(handle_id)
             .lock()
             .unwrap()
-            .insert(handle_id, native_iter);
+            .insert(handle_id, handle_state);
 
         *out_handle = handle_id;
         *out_row_count = row_count;
@@ -6389,7 +6494,7 @@ mod tests {
     // frs_vec_iter_prefix_* tests (P3-A, spec §1 §b + §2 component E)
     // -----------------------------------------------------------------------
 
-    /// Helper: decode rows from a chunk buffer written by `write_chunk_into_buf`.
+    /// Helper: decode rows from a chunk buffer written by `fill_chunk_from_iter`.
     /// Returns a Vec of (key, value) byte vecs.
     fn decode_chunk_buf(buf: &[u8], bytes_used: u32, row_count: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
         let mut rows = Vec::new();
@@ -6615,6 +6720,138 @@ mod tests {
     #[test]
     fn vec_iter_prefix_close_zero_handle_is_noop() {
         assert_eq!(frs_vec_iter_prefix_close(0), FrsErrorCode::Ok as i32);
+    }
+
+    /// PR-D4: Open 4 iterators concurrently from 4 different threads against
+    /// the same DB.  The 16-shard registry must allow all 4 opens to proceed
+    /// without serialising on a single global Mutex.  This is a functional
+    /// regression test (every thread sees all rows in its own iterator and
+    /// closes cleanly) — the *non-contention* property is verified by
+    /// inspection of the implementation (each open computes a per-thread
+    /// shard from `handle_id & 0xF` so opens from different threads never
+    /// collide on the same Mutex unless ids happen to collide modulo 16).
+    #[test]
+    fn vec_iter_prefix_concurrent_opens() {
+        const N_THREADS: usize = 4;
+        const ROWS_PER_THREAD_PREFIX: usize = 8;
+
+        // SAFETY-bridge wrapper: FrsDb / FrsCfHandle are raw pointers
+        // (*mut c_void) and don't implement Send.  The underlying objects
+        // are reference-counted (Arc<DbImpl>) and read-safe across
+        // threads, so wrapping the pointer as `usize` for the move and
+        // casting back inside the worker is sound.
+        #[derive(Copy, Clone)]
+        struct SendPtr(usize);
+        unsafe impl Send for SendPtr {}
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Pre-populate: each thread T scans prefix "tT/" with N rows.
+            for t in 0..N_THREADS {
+                for i in 0..ROWS_PER_THREAD_PREFIX {
+                    let k = format!("t{}/{:03}", t, i);
+                    let v = format!("val-t{}-{:03}", t, i);
+                    assert_eq!(
+                        frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                        FRS_STATUS_OK
+                    );
+                }
+            }
+
+            let db_ptr = SendPtr(db as usize);
+            let cf_ptr = SendPtr(cf as usize);
+
+            let mut handles = Vec::with_capacity(N_THREADS);
+            for t in 0..N_THREADS {
+                let db_ptr = db_ptr;
+                let cf_ptr = cf_ptr;
+                let h = std::thread::spawn(move || {
+                    let db = db_ptr.0 as FrsDb;
+                    let cf = cf_ptr.0 as FrsCfHandle;
+                    let prefix = format!("t{}/", t);
+
+                    let mut chunk_buf = vec![0u8; 4096];
+                    let mut handle: u64 = 0;
+                    let mut row_count: u32 = 0;
+                    let mut bytes_used: u32 = 0;
+
+                    let rc = unsafe {
+                        frs_vec_iter_prefix_open(
+                            db,
+                            cf,
+                            prefix.as_ptr(),
+                            prefix.len() as u32,
+                            chunk_buf.as_mut_ptr(),
+                            chunk_buf.len() as u32,
+                            &mut handle,
+                            &mut row_count,
+                            &mut bytes_used,
+                        )
+                    };
+                    assert_eq!(rc, FrsErrorCode::Ok as i32, "thread {} open failed", t);
+                    assert_ne!(handle, 0, "thread {} got zero handle", t);
+                    assert_eq!(
+                        row_count as usize, ROWS_PER_THREAD_PREFIX,
+                        "thread {} expected {} rows, got {}",
+                        t, ROWS_PER_THREAD_PREFIX, row_count
+                    );
+
+                    // Verify every key in this iterator starts with this
+                    // thread's prefix — confirms shards stay isolated and
+                    // we never see another thread's rows.
+                    let rows = decode_chunk_buf(&chunk_buf, bytes_used, row_count);
+                    for (k, _) in &rows {
+                        assert!(
+                            k.starts_with(prefix.as_bytes()),
+                            "thread {} saw foreign key {:?}",
+                            t,
+                            k
+                        );
+                    }
+
+                    // Exhaustion: next chunk is empty.
+                    let rc = unsafe {
+                        frs_vec_iter_prefix_next(
+                            handle,
+                            chunk_buf.as_mut_ptr(),
+                            chunk_buf.len() as u32,
+                            &mut row_count,
+                            &mut bytes_used,
+                        )
+                    };
+                    assert_eq!(rc, FrsErrorCode::Ok as i32);
+                    assert_eq!(row_count, 0);
+
+                    assert_eq!(
+                        frs_vec_iter_prefix_close(handle),
+                        FrsErrorCode::Ok as i32
+                    );
+
+                    handle
+                });
+                handles.push(h);
+            }
+
+            // Collect all assigned handles and assert they are unique
+            // (no two threads were assigned the same id).
+            let mut ids: Vec<u64> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(
+                ids.len(),
+                N_THREADS,
+                "expected {} unique handle ids, got {}",
+                N_THREADS,
+                ids.len()
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7288,4 +7525,110 @@ mod tests {
     //   2. Call the relevant frs_vec_* function
     //   3. Assert the injected code is returned
     //   4. Verify Java-side FrsException carries the right code (integration only)
+
+    // -----------------------------------------------------------------
+    // PR-D3 (V10): frs_vectorized_batch_get routes through db.batch_get
+    // -----------------------------------------------------------------
+
+    /// Data-integrity test for the PR-D3 multi_get / batch_get routing.
+    ///
+    /// Inserts 1024 keys, then issues a single `frs_vectorized_batch_get`
+    /// covering all 1024 keys plus one missing key, and verifies that:
+    ///   - All 1024 inserted keys come back with the right validity + value.
+    ///   - The missing key returns validity = 0 (no value).
+    ///   - The output offsets are monotonically non-decreasing.
+    ///   - The total `out_data_len` matches the sum of returned value lengths.
+    ///
+    /// Performance expectation (not asserted here, gated by manual bench):
+    /// the engine-level `db.batch_get` warms the SST reader cache via
+    /// `prefetch_sst_files_for_batch` (one GetObject per SST file on S3-backed
+    /// filesystems instead of one per key) and uses the active-memtable
+    /// hash-index fast path before falling through, so the FFI call cost
+    /// should be substantially lower than the previous per-key `db.get(cf, k)`
+    /// loop, especially when reads spill to immutable memtables / SSTs.
+    #[test]
+    fn vec_batch_get_multi_get_path() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Write 1024 keys with deterministic value bytes.
+            const N: usize = 1024;
+            let mut keys: Vec<Vec<u8>> = Vec::with_capacity(N);
+            let mut vals: Vec<Vec<u8>> = Vec::with_capacity(N);
+            for i in 0..N {
+                let k = format!("pr-d3-key-{:06}", i).into_bytes();
+                // Varying value lengths exercise offset arithmetic.
+                let v_len = 4 + (i % 13);
+                let mut v = Vec::with_capacity(v_len);
+                for j in 0..v_len {
+                    v.push(((i + j) as u8).wrapping_add(0x33));
+                }
+                assert_eq!(
+                    frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                    FRS_STATUS_OK,
+                );
+                keys.push(k);
+                vals.push(v);
+            }
+
+            // Build the batch input: N inserted keys + 1 missing key.
+            let missing = b"pr-d3-key-MISSING".to_vec();
+            let batch_count = N + 1;
+
+            let mut key_data: Vec<u8> = Vec::new();
+            let mut key_offs: Vec<i32> = Vec::with_capacity(batch_count + 1);
+            key_offs.push(0);
+            for k in &keys {
+                key_data.extend_from_slice(k);
+                key_offs.push(key_data.len() as i32);
+            }
+            key_data.extend_from_slice(&missing);
+            key_offs.push(key_data.len() as i32);
+
+            // Output buffers — over-allocate to avoid BUFFER_TOO_SMALL.
+            let total_val_bytes: usize = vals.iter().map(|v| v.len()).sum();
+            let cap = total_val_bytes + 64;
+            let mut out_data: Vec<u8> = vec![0u8; cap];
+            let mut out_offs: Vec<i32> = vec![0i32; batch_count + 1];
+            let mut out_vld: Vec<u8> = vec![0u8; batch_count];
+            let mut out_len: usize = 0;
+
+            let rc = frs_vectorized_batch_get(
+                db,
+                cf,
+                key_offs.as_ptr(),
+                key_data.as_ptr(),
+                batch_count,
+                out_offs.as_mut_ptr(),
+                out_data.as_mut_ptr(),
+                out_vld.as_mut_ptr(),
+                cap,
+                &mut out_len,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "expected FrsErrorCode::Ok (0)");
+            assert_eq!(out_len, total_val_bytes, "out_data_len mismatch");
+            assert_eq!(out_offs[0], 0, "first offset must be 0");
+
+            // First N entries must be present with the expected value bytes.
+            for i in 0..N {
+                assert_eq!(out_vld[i], 1, "key {} should be found", i);
+                let lo = out_offs[i] as usize;
+                let hi = out_offs[i + 1] as usize;
+                assert!(hi >= lo, "offsets must be monotonic at i={}", i);
+                assert_eq!(&out_data[lo..hi], vals[i].as_slice(), "value mismatch at i={}", i);
+            }
+            // Last slot is the missing key.
+            assert_eq!(out_vld[N], 0, "missing key must report validity 0");
+            assert_eq!(
+                out_offs[N + 1] as usize, total_val_bytes,
+                "trailing offset must equal total value bytes"
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
 }

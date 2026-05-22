@@ -26,6 +26,7 @@ repository.workspace = true
 forst-rs-common = { workspace = true }
 forst-rs-io = { workspace = true }
 arrow = { workspace = true }
+bytes = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
