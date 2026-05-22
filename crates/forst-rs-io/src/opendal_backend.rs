@@ -58,9 +58,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use bytes::{Buf, Bytes};
 use forst_rs_common::error::{ForstError, ForstResult};
-use opendal::layers::BlockingLayer;
+use opendal::layers::{BlockingLayer, RetryLayer};
 use opendal::{ErrorKind as OdErrorKind, Metakey, Operator};
 use tokio::runtime::{Handle, Runtime};
 
@@ -176,13 +178,65 @@ impl std::fmt::Debug for OpendalFileSystem {
     }
 }
 
+/// Default retry policy applied to every [`OpendalFileSystem`] (PR-A12).
+///
+/// Transient S3 / GCS / Azure failures (`5xx`, throttling, RST connections)
+/// are very common at scale: a checkpoint that writes N SSTs in parallel
+/// will see at least one transient fault per ckpt once N grows past a
+/// dozen. Fail-fast on the first retry-able error multiplies failure
+/// probability across SSTs and produces a high per-ckpt failure rate.
+///
+/// We attach an [`opendal::layers::RetryLayer`] to every constructed
+/// operator with parameters chosen to match Flink's
+/// `ExponentialBackoffDelayRetryStrategyBuilder` defaults on the Java
+/// side:
+///
+/// - `max_times = 5` — five retries → six total attempts.
+/// - `min_delay = 100ms`, `factor = 2.0` — 100 / 200 / 400 / 800 / 1600 ms.
+/// - `max_delay = 30s` — clamps the exponential schedule.
+/// - `jitter` — adds ±50% noise to each delay to prevent thundering
+///   herds when many SSTs retry simultaneously.
+///
+/// OpenDAL classifies errors as retryable internally
+/// ([`opendal::Error::is_temporary`]) so non-transient failures
+/// (NotFound, PermissionDenied, …) still fail fast.
+fn default_retry_layer() -> RetryLayer {
+    RetryLayer::new()
+        .with_max_times(5)
+        .with_factor(2.0)
+        .with_min_delay(Duration::from_millis(100))
+        .with_max_delay(Duration::from_secs(30))
+        .with_jitter()
+}
+
 impl OpendalFileSystem {
     /// Wraps an existing [`opendal::Operator`].
     ///
-    /// The operator is used as-is; this constructor does NOT layer
-    /// [`BlockingLayer`] onto it. Callers who already have a configured
-    /// operator are presumed to have done that themselves if needed.
+    /// The operator is wrapped in a [`RetryLayer`] (see
+    /// [`default_retry_layer`]) so transient S3/GCS/Azure failures
+    /// retry with exponential backoff before propagating to the
+    /// caller. This does NOT layer [`BlockingLayer`] onto it; callers
+    /// who already have a configured operator are presumed to have
+    /// done that themselves if needed.
     pub fn with_operator(op: Operator) -> ForstResult<Self> {
+        let rt = RuntimeHandle::acquire()?;
+        let name = format!("OpendalFileSystem({})", op.info().scheme().into_static());
+        // RetryLayer is idempotent w.r.t. layering: applying it twice
+        // multiplies retries, which is not what we want. Callers that
+        // need a custom retry policy should use
+        // `with_operator_no_retry`.
+        let op = op.layer(default_retry_layer());
+        Ok(Self { op, rt, name })
+    }
+
+    /// Wraps an existing [`opendal::Operator`] WITHOUT attaching the
+    /// default [`RetryLayer`].
+    ///
+    /// Used by tests that need to observe the underlying error
+    /// behaviour, or by callers that have already attached a custom
+    /// retry policy to the operator. Production code should prefer
+    /// [`with_operator`].
+    pub fn with_operator_no_retry(op: Operator) -> ForstResult<Self> {
         let rt = RuntimeHandle::acquire()?;
         let name = format!("OpendalFileSystem({})", op.info().scheme().into_static());
         Ok(Self { op, rt, name })
@@ -952,6 +1006,74 @@ mod tests {
             Ok(_) => panic!("non-UTF-8 path must be rejected"),
         };
         assert!(err.is_invalid_argument(), "got {err}");
+    }
+
+    // --- PR-A12: default RetryLayer is non-destructive on happy-path ------
+    //
+    // The retry layer ships on every constructed `OpendalFileSystem`. We
+    // can't easily fault-inject from a unit test (the `ChaosLayer` is
+    // feature-gated and we don't enable it here), so this test pins two
+    // looser but still-meaningful contracts:
+    //
+    //   1. The default constructor builds with the retry layer attached
+    //      and a happy-path round-trip still succeeds (no regression vs
+    //      the no-retry variant).
+    //   2. The `with_operator_no_retry` escape hatch exists for callers
+    //      that need to observe raw errors (used by tests / custom
+    //      retry policies). Both paths produce equal results on a
+    //      successful write+read.
+    //
+    // Real fault-injection lives in the Java `S3Retry*Test` suite where
+    // we mock the storage layer to surface transient errors.
+    #[test]
+    fn test_pr_a12_default_retry_layer_happy_path() {
+        // Direct constructor (retry attached).
+        let with_retry = OpendalFileSystem::memory().expect("build memory fs with retry");
+
+        // Mirror the same operator but bypass the retry layer.
+        let raw_op = Operator::new(opendal::services::Memory::default())
+            .expect("memory builder")
+            .finish();
+        let no_retry =
+            OpendalFileSystem::with_operator_no_retry(raw_op).expect("build memory fs no retry");
+
+        let path = Path::new("retry/probe.bin");
+        let payload = b"pr-a12-retry-layer-roundtrip";
+
+        for fs in [&with_retry, &no_retry] {
+            let mut w = fs
+                .open_writable_file(path, WriteMode::CreateOrTruncate)
+                .expect("open writable");
+            w.append(payload).expect("append");
+            w.sync().expect("sync");
+            drop(w);
+
+            let mut r = fs.open_sequential_file(path).expect("open sequential");
+            let mut buf = vec![0u8; payload.len()];
+            let n = r.read(&mut buf).expect("read");
+            assert_eq!(n, payload.len());
+            assert_eq!(&buf, payload, "retry layer must be transparent on happy path");
+        }
+    }
+
+    // --- PR-A12: retry policy builder pins the documented parameters ------
+    //
+    // The default policy is referenced by the Java-side SstRetryStrategy
+    // (max=5, base=100ms, factor=2.0, cap=30s, jitter). Any future tuning
+    // must update both sides in lock-step. This test pins the builder
+    // exists and produces a usable layer; we can't introspect the
+    // configured parameters because RetryLayer is opaque, so this is
+    // really a "did someone delete the function" guard.
+    #[test]
+    fn test_pr_a12_default_retry_layer_constructible() {
+        let _layer = default_retry_layer();
+        // The layer is opaque; just confirm we can apply it to a fresh
+        // operator without panicking. The happy-path test above
+        // exercises that operations still complete.
+        let op = Operator::new(opendal::services::Memory::default())
+            .expect("memory builder")
+            .finish();
+        let _wrapped = op.layer(default_retry_layer());
     }
 
     // --- name() and Debug ---------------------------------------------------
