@@ -3681,19 +3681,21 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             slice::from_raw_parts(prefix_ptr, prefix_len as usize)
         };
 
-        // PR-B5-H2: the engine grew a streaming `prefix_scan_iter` that
-        // would let us skip the outer `Vec` materialisation here. Routing
-        // it through the per-shard `IterHandle` registry requires an
-        // `Arc<DbImpl>`-rooted self-referential cursor (the iterator
-        // borrows `&self` from the engine), which is a follow-up. For now
-        // we still call the eager `prefix_scan` — itself a one-liner
-        // `prefix_scan_iter().collect()` post-refactor — and pull rows
-        // through `fill_chunk_from_iter` lazily.
-        let rows = match db_ref.prefix_scan(cf_ref_, prefix) {
-            Ok(r) => r,
+        // PR-C6-H1: route through the owned-Arc streaming
+        // `prefix_scan_iter_owned`. The iterator captures `Arc<DbImpl>`
+        // internally so it can be stashed in the per-shard `IterHandle`
+        // registry and outlive this FFI call. No outer Vec is allocated
+        // here — rows are pulled into the caller buffer on demand.
+        let owned_iter = match db_ref.prefix_scan_iter_owned(cf_ref_, prefix) {
+            Ok(it) => it,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
-        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> = Box::new(rows.into_iter());
+        // Strip per-row `ForstResult` — engine errors that surface mid-iter
+        // terminate the chunk (caller will see exhaustion). The eager
+        // `prefix_scan` had the same property (any error on lookup
+        // poisoned the whole call).
+        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
+            Box::new(owned_iter.filter_map(|r| r.ok()));
         let mut handle_state = IterHandle::new(inner);
 
         // Fill the first chunk lazily into the caller's buffer.
@@ -3969,8 +3971,11 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
 
             let prefix: &[u8] = if prefix_len == 0 { &[] } else { &data_buf[ks..ke] };
 
-            let rows = match db_ref.prefix_scan(cf_ref_, prefix) {
-                Ok(r) => r,
+            // PR-C6-H1: same owned streaming path as the single-shot
+            // open above. Each iterator captures `Arc<DbImpl>` so the
+            // FFI registry can outlive this call.
+            let owned_iter = match db_ref.prefix_scan_iter_owned(cf_ref_, prefix) {
+                Ok(it) => it,
                 Err(_) => {
                     if first_err == FrsErrorCode::Ok as i32 {
                         first_err = FrsErrorCode::EngineIo as i32;
@@ -3979,7 +3984,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                 }
             };
             let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
-                Box::new(rows.into_iter());
+                Box::new(owned_iter.filter_map(|r| r.ok()));
             let mut handle_state = IterHandle::new(inner);
 
             // Fill the first chunk into the caller-owned buffer.

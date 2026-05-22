@@ -106,6 +106,36 @@ static SEQ_HIGH_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Name of the default column family (always id 0).
 pub const DEFAULT_CF_NAME: &str = "default";
 
+// PR-C6-H2: re-export `ValueSink` from the storage layer so callers
+// who already depend on `forst-rs-engine` do not need to take a direct
+// dep on `forst-rs-storage` just to name the trait.
+pub use forst_rs_storage::memtable::{SinkGetOutcome, ValueSink};
+
+/// `BinaryBuilder` implements `ValueSink` so the engine can stream the
+/// memtable inline-cache fast path directly into an Arrow value
+/// buffer.
+///
+/// This impl lives in `forst-rs-engine` (not the storage crate) because
+/// it is the read-path coupling point: the storage crate purposefully
+/// stays Arrow-agnostic on the trait definition so a non-Arrow consumer
+/// (e.g. a future packed-byte sink) can also implement `ValueSink`.
+struct BinaryBuilderSink<'a>(&'a mut arrow::array::BinaryBuilder);
+
+impl<'a> ValueSink for BinaryBuilderSink<'a> {
+    #[inline]
+    fn append_borrowed(&mut self, value: &[u8]) {
+        // `append_value(impl AsRef<[u8]>)` -> `append_slice(&[u8])`:
+        // one memcpy into the Arrow value buffer, no extra alloc when
+        // the builder was pre-sized in `with_capacity`.
+        self.0.append_value(value);
+    }
+
+    #[inline]
+    fn append_null(&mut self) {
+        self.0.append_null();
+    }
+}
+
 /// Per-SST descriptor returned by [`DbImpl::list_live_files`].
 ///
 /// The Vec is enumerated in (level, smallest_key) order so callers can
@@ -2402,6 +2432,10 @@ impl DbImpl {
         // The keys Vec is owned and moves into the closure; `cf_data`/`mem_arc`
         // are Arc-cloned to keep the memtable alive while we stream.
         let mem_arc = cf_data.active_memtable();
+        // PR-C6-H3: `prefix_scan_keys` now returns `Vec<Arc<[u8]>>`; the
+        // fast prefix-index path performs an Arc clone (atomic refcount
+        // bump) per key instead of a full byte-slice copy. We convert to
+        // `Vec<u8>` lazily inside the closure only when emitting a row.
         let keys = mem_arc.prefix_scan_keys(prefix, upper.as_deref());
         let cf_handle = cf.clone();
         let mem_arc_capture = mem_arc.clone();
@@ -2411,15 +2445,16 @@ impl DbImpl {
         Ok(keys.into_iter().filter_map(move |key| {
             // Active memtable inline-cache fast path mirrors the eager
             // version below.
-            match mem_arc_capture.get(&key, read_seq) {
+            let key_slice: &[u8] = key.as_ref();
+            match mem_arc_capture.get(key_slice, read_seq) {
                 Ok(Some(entry)) if entry.op_type == OpType::Put => entry
                     .value
-                    .map(|value| Ok((key, value))),
+                    .map(|value| Ok((key_slice.to_vec(), value))),
                 Ok(Some(_)) => None, // tombstone in active memtable
                 Ok(None) => {
                     // Fall back to the full versioned read path.
-                    match db.get(&cf_handle, &key) {
-                        Ok(Some(value)) => Some(Ok((key, value))),
+                    match db.get(&cf_handle, key_slice) {
+                        Ok(Some(value)) => Some(Ok((key_slice.to_vec(), value))),
                         Ok(None) => None,
                         Err(e) => Some(Err(e)),
                     }
@@ -2427,6 +2462,55 @@ impl DbImpl {
                 Err(e) => Some(Err(e)),
             }
         }))
+    }
+
+    /// Owned-Arc variant of [`Self::prefix_scan_iter`] returning a
+    /// `'static`-lifetime iterator.
+    ///
+    /// PR-C6-H1: the FFI chunked-iterator path (`frs_vec_iter_prefix_open*`)
+    /// needs to stash the resulting iterator in a per-shard `IterHandle`
+    /// registry that outlives the originating FFI call. The borrowing
+    /// `prefix_scan_iter` cannot be stashed (its lifetime is tied to the
+    /// `&self` borrow). This variant takes an `Arc<DbImpl>` and captures
+    /// it inside the iterator closure so the iterator can outlive any
+    /// caller-side borrow — exactly what the FFI registry needs.
+    ///
+    /// Value resolution is lazy: keys are materialised eagerly (the
+    /// memtable prefix-index returns them as `Arc<[u8]>` clones, so on the
+    /// fast prefix-index path there is *no per-key byte copy*), but each
+    /// value is resolved on demand via `db.get(...)` as the iterator is
+    /// drained.
+    pub fn prefix_scan_iter_owned(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> ForstResult<Box<dyn Iterator<Item = ForstResult<(Vec<u8>, Vec<u8>)>> + Send + 'static>>
+    {
+        let upper = prefix_upper_bound(prefix);
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        let mem_arc = cf_data.active_memtable();
+        let keys = mem_arc.prefix_scan_keys(prefix, upper.as_deref());
+        let cf_handle = cf.clone();
+        let mem_arc_capture = mem_arc.clone();
+        let db = Arc::clone(self);
+
+        let read_seq = u64::MAX;
+        Ok(Box::new(keys.into_iter().filter_map(move |key| {
+            let key_slice: &[u8] = key.as_ref();
+            match mem_arc_capture.get(key_slice, read_seq) {
+                Ok(Some(entry)) if entry.op_type == OpType::Put => entry
+                    .value
+                    .map(|value| Ok((key_slice.to_vec(), value))),
+                Ok(Some(_)) => None,
+                Ok(None) => match db.get(&cf_handle, key_slice) {
+                    Ok(Some(value)) => Some(Ok((key_slice.to_vec(), value))),
+                    Ok(None) => None,
+                    Err(e) => Some(Err(e)),
+                },
+                Err(e) => Some(Err(e)),
+            }
+        })))
     }
 
     #[allow(clippy::type_complexity)]
@@ -3032,17 +3116,40 @@ impl DbImpl {
         let mut value_builder = BinaryBuilder::with_capacity(n, n * 32);
         let mut found_builder = BooleanBuilder::with_capacity(n);
 
+        // PR-C6-H2: active-memtable inline-cache fast path writes
+        // borrowed value bytes directly into the Arrow BinaryBuilder
+        // via the `ValueSink` trait — no intermediate `Vec<u8>` per
+        // key. Only the slow-path tail (immutable memtables, SST
+        // files, merge resolution) still goes through the
+        // `Option<Vec<u8>>`-returning `get_internal`. The slow path
+        // contributes one alloc + one memcpy per missed key, exactly
+        // as before.
+        let mem = cf_data.active_memtable();
         let read_seq = u64::MAX;
         for i in 0..n {
             let key = keys.value(i);
-            match self.get_internal(&cf_data, key, read_seq)? {
-                Some(value) => {
-                    value_builder.append_value(&value);
+            let mut sink = BinaryBuilderSink(&mut value_builder);
+            match mem.get_into(key, read_seq, &mut sink) {
+                SinkGetOutcome::HitPut => {
                     found_builder.append_value(true);
                 }
-                None => {
-                    value_builder.append_null();
+                SinkGetOutcome::HitTombstone => {
                     found_builder.append_value(false);
+                }
+                SinkGetOutcome::Miss | SinkGetOutcome::NeedsFullPath => {
+                    // Drop the sink borrow before re-borrowing the
+                    // builder via the legacy `Option<Vec<u8>>` path.
+                    drop(sink);
+                    match self.get_internal(&cf_data, key, read_seq)? {
+                        Some(value) => {
+                            value_builder.append_value(&value);
+                            found_builder.append_value(true);
+                        }
+                        None => {
+                            value_builder.append_null();
+                            found_builder.append_value(false);
+                        }
+                    }
                 }
             }
         }
@@ -3471,7 +3578,7 @@ impl DbImpl {
         }
     }
 
-    fn lookup_cf_by_id(&self, id: ColumnFamilyId) -> ForstResult<Arc<ColumnFamilyData>> {
+    pub(crate) fn lookup_cf_by_id(&self, id: ColumnFamilyId) -> ForstResult<Arc<ColumnFamilyData>> {
         let cfs = self.cfs.read().expect("lock poisoned");
         let cf_data = cfs.get(&id).cloned().ok_or_else(|| {
             ForstError::invalid_argument(format!("column family id {} not found", id))

@@ -45,14 +45,14 @@
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use arrow::array::{Array, BinaryArray, BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstError, ForstResult, OpType};
 
 use super::vectorized::VectorizedMemTable;
-use super::{GetResult, MemTableConfig, ScanRow};
+use super::{GetResult, MemTableConfig, ScanRow, SinkGetOutcome, ValueSink};
 
 /// Default number of shards. Must be a power of two so the shard index can
 /// be derived by a single AND mask. 16 keeps the per-shard `RwLock`
@@ -411,6 +411,25 @@ impl ShardedMemTable {
         shard.get_pinned_ptr(key)
     }
 
+    /// Sink-aware point lookup. See [`VectorizedMemTable::get_into`].
+    ///
+    /// PR-C6-H2: holds the shard's read lock for the duration of the
+    /// sink write so the inline `Box<[u8]>` cannot be reallocated mid
+    /// `append_borrowed` by a concurrent writer. The lock cost is the
+    /// same as the legacy `get()` — but `get_into` saves the per-key
+    /// `Vec<u8>` allocation that `get()` would have made.
+    #[inline]
+    pub fn get_into<S: ValueSink + ?Sized>(
+        &self,
+        key: &[u8],
+        read_sequence: u64,
+        sink: &mut S,
+    ) -> SinkGetOutcome {
+        let idx = self.shard_for_key(key);
+        let shard = self.shards[idx].read().expect("lock poisoned");
+        shard.get_into(key, read_sequence, sink)
+    }
+
     /// Range scan: visits every shard and merges results into a single
     /// `Vec<ScanRow>` sorted by (key ASC, sequence DESC). Each shard's
     /// own `collect_range_entries` already merges its sorted + unsorted
@@ -445,8 +464,8 @@ impl ShardedMemTable {
         out
     }
 
-    pub fn prefix_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Vec<u8>> {
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+    pub fn prefix_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Arc<[u8]>> {
+        let mut keys: Vec<Arc<[u8]>> = Vec::new();
         for shard in &self.shards {
             let guard = shard.read().expect("lock poisoned");
             keys.extend(guard.prefix_scan_keys(lower, upper));

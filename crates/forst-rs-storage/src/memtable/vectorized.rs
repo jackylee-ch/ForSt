@@ -27,7 +27,7 @@ use arrow::array::{Array, BinaryArray, BinaryBuilder, RecordBatch, UInt64Builder
 use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstResult, OpType};
 
-use super::{GetResult, MemTableConfig, ScanRow};
+use super::{GetResult, MemTableConfig, ScanRow, SinkGetOutcome, ValueSink};
 
 /// Index of a single row within the columnar storage arrays.
 #[derive(Debug, Clone, Copy)]
@@ -129,7 +129,7 @@ pub struct VectorizedMemTable {
     /// Prefix index for O(1) prefix scan. Maps prefix bytes → set of full keys
     /// that share that prefix. The prefix is extracted as everything up to and
     /// including the last '/' byte in the key. Keys without '/' are not indexed.
-    prefix_index: HashMap<Box<[u8]>, Vec<Box<[u8]>>>,
+    prefix_index: HashMap<Box<[u8]>, Vec<Arc<[u8]>>>,
 
     // -- State --
     /// Current sequence counter (incremented on each insert).
@@ -358,7 +358,7 @@ impl VectorizedMemTable {
                     self.prefix_index
                         .entry(Box::from(prefix))
                         .or_default()
-                        .push(Box::from(key));
+                        .push(Arc::<[u8]>::from(key));
                 }
             }
         }
@@ -559,18 +559,28 @@ impl VectorizedMemTable {
     /// Fast prefix scan: returns all live keys matching the prefix range [lower, upper).
     /// Uses sorted_index (BTreeMap range) + unsorted_lookup (prefix filter) without
     /// rebuilding a merged BTreeMap. Much faster than collect_range_entries for prefix scans.
+    ///
+    /// PR-C6-H3: returns `Vec<Arc<[u8]>>` (not `Vec<Vec<u8>>`). On the
+    /// prefix-index fast path each "clone" is an `Arc::clone` (atomic
+    /// refcount bump, zero byte-copy of the key payload). The fallback
+    /// path still pays one allocation per key (sorted_index keys are
+    /// `Vec<u8>`-typed; we materialise into a fresh `Arc<[u8]>` once),
+    /// but emits no per-row temporary `Vec<u8>` downstream.
     #[inline]
-    pub fn prefix_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Vec<u8>> {
+    pub fn prefix_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Arc<[u8]>> {
         // Fast path: if lower ends with '/' and upper is the prefix_upper_bound,
         // use the prefix_index for O(1) lookup.
         if lower.last() == Some(&b'/') {
             if let Some(keys) = self.prefix_index.get(lower) {
-                return keys.iter().map(|k| k.to_vec()).collect();
+                // Zero memory-copy on the hot path: each Arc::clone is an
+                // atomic refcount bump that shares the original key bytes
+                // owned by the prefix-index.
+                return keys.iter().map(Arc::clone).collect();
             }
             return Vec::new();
         }
         // Fallback: merge sorted_index range + unsorted_lookup filter (no temp BTreeMap)
-        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut keys: Vec<Arc<[u8]>> = Vec::new();
         // sorted_index is already sorted — range query is O(log N + K).
         // PR-C5-H2: range over `&[u8]` bounds directly. `BTreeMap<Vec<u8>, _>`
         // accepts borrowed slices via the `Borrow<[u8]>` impl on `Vec<u8>`,
@@ -587,14 +597,14 @@ impl VectorizedMemTable {
                 .range::<[u8], _>((Bound::Included(lower), Bound::Unbounded)),
         };
         for (key, _) in range_iter {
-            keys.push(key.clone());
+            keys.push(Arc::<[u8]>::from(key.as_slice()));
         }
         // Merge unsorted entries (already checked for prefix match)
         let prev_len = keys.len();
         for key in self.unsorted_lookup.keys() {
             let k: &[u8] = key;
             if k >= lower && upper.is_none_or(|hi| k < hi) {
-                keys.push(k.to_vec());
+                keys.push(Arc::<[u8]>::from(k));
             }
         }
         // Only sort+dedup if we added unsorted entries
@@ -717,6 +727,59 @@ impl VectorizedMemTable {
         }
         let inlined = entry.inline_value.as_ref()?;
         Some((inlined.as_ptr(), inlined.len()))
+    }
+
+    /// Sink-aware point lookup that writes directly into a [`ValueSink`]
+    /// when the inline cache is the answer, skipping the `Vec<u8>`
+    /// materialisation that `get()` performs.
+    ///
+    /// PR-C6-H2: this is the zero-extra-alloc primitive that lets
+    /// `DbImpl::batch_get_arrow` stream the memtable hot path straight
+    /// into the Arrow `BinaryBuilder` value buffer (one memcpy from the
+    /// inline `Box<[u8]>` into the buffer; no intermediate Vec).
+    ///
+    /// Returns one of:
+    /// - `HitPut`        → sink received the borrowed value bytes.
+    /// - `HitTombstone`  → sink received an `append_null`.
+    /// - `Miss`          → no entry in this memtable; caller falls back.
+    /// - `NeedsFullPath` → entry is a Merge OR a non-inline value
+    ///   (e.g. oversized Put served from columnar storage). The sink is
+    ///   left untouched so the caller can resolve via the existing
+    ///   `Vec<u8>`-returning path and `sink.append_borrowed(&v)` after.
+    #[inline]
+    pub fn get_into<S: ValueSink + ?Sized>(
+        &self,
+        key: &[u8],
+        read_sequence: u64,
+        sink: &mut S,
+    ) -> SinkGetOutcome {
+        let entry = match self.hash_index.get(key) {
+            Some(e) => e,
+            None => return SinkGetOutcome::Miss,
+        };
+        if entry.latest_seq > read_sequence {
+            // MVCC snapshot read into an older version — fall back.
+            return SinkGetOutcome::NeedsFullPath;
+        }
+        match OpType::from_u8(entry.latest_op).unwrap_or(OpType::Put) {
+            OpType::Delete | OpType::SingleDelete => {
+                sink.append_null();
+                SinkGetOutcome::HitTombstone
+            }
+            OpType::Merge => SinkGetOutcome::NeedsFullPath,
+            OpType::Put => {
+                if let Some(ref inlined) = entry.inline_value {
+                    // Zero-extra-alloc fast path: borrow the inline
+                    // bytes into the sink directly.
+                    sink.append_borrowed(inlined.as_ref());
+                    SinkGetOutcome::HitPut
+                } else {
+                    // Oversized Put — value lives in columnar storage,
+                    // which needs the materialising read path.
+                    SinkGetOutcome::NeedsFullPath
+                }
+            }
+        }
     }
 
     /// Batch-inserts multiple entries at once.
