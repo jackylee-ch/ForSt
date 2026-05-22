@@ -13,8 +13,8 @@
 |---|---:|---:|---:|
 | Round 1 | 37 | 3 | 34 |
 | Round 2 | 18 (incl 2 CRIT) | 3 | 15 |
-| Round 3 | — (pending) | — | — |
-| **Cumulative (incl R3 pending)** | **55+** | **6** | **49+** |
+| Round 3 | 20 (incl FP check) | 0 | 20 |
+| **Cumulative (Rounds 1+2+3)** | **75** | **6** | **69** |
 
 The companion spec `2026-05-22-high-issue-remediation-spec.md` proposes the staged plan to close all 49+ open items.
 
@@ -310,16 +310,53 @@ The companion spec `2026-05-22-high-issue-remediation-spec.md` proposes the stag
 - Round 2: `round-2-agent-{A,B,C,D,E}-*.md` + `round-2-summary.md`
 - Round 3: pending (5 agents in flight at catalogue time)
 
-## Cumulative open count by category
+## Section 7 — Round 3 deltas (all NEW findings 2026-05-22)
+
+### Correctness gaps exposed by Round 2 fix
+- **A3-H1** ⛔ `executeRequestSync` has no outer try/catch → FFI/engine throw bypasses the R2 per-row propagation loop and leaves the sync StateRequest future dangling. Same A1-H5 stall pattern that R2 was supposed to close. **Phase A.7.**
+- **A3-H2** ⛔ `executeBatchRequests` outer `catch (Exception e)` does not catch `Error`; `FrsEnginePanicError extends Error` escapes through `executeGets`, container future never returned, per-row futures hang. **Phase A.7.**
+- **A3-H3** ⛔ `ForStRsMapStateV2.asyncClear` is `final` on the abstract parent and bypasses the per-state LRU cache → put → clear → get returns stale cached value (silent wrong result). **Phase A.4 extension.**
+
+### Vectorization — previously unaudited classes
+- **B3-H1** ⛔ `ForStRsAsyncReducingStateV2` documented as RMW cache + flushOnBarrier — class has NEITHER. Scalar `serializeKey`/`serializeValue` allocates byte[] per event. **Phase C extension.**
+- **B3-H2** ⛔ Same as B3-H1 for `ForStRsAsyncAggregatingStateV2`. **Phase C extension.**
+- **B3-H3** ⛔ `ForStRsKeyGroupedSerializer.encodeForState/Map` heap-path does `stateName.getBytes(UTF_8)` per call (V1 ValueState heap path). **Phase B extension.**
+- **B3-H4** ⛔ V1-sync `ForStRsValueState.update`/`getAndUpdate` still calls `getCopyOfBuffer()` — Q11 V1-sync per-event byte[]. **Phase B extension.**
+- **B3-H5** ⛔ `MapStateCache` `LinkedHashMap accessOrder=true` relinks the entry node per HIT in addition to allocating `BytesKey` (H8 covered the wrapper; this is the access-order relink). **Phase F extension.**
+- **B3-H6** ⛔ My Round 2 `executeRequestSync` fix allocates fresh `VectorizedClassifier` + Arena buffers + `RuntimeException("cause unavailable")` per-row. **Phase A.7.**
+
+### Zero-copy — Rust SST write path
+- **C-R3-H1** ⛔ `compaction.rs:73-86, 157, 174` — full materialization of all input entries + whole-SST `Vec<u8>` buffered before write. **Phase D.2.**
+- **C-R3-H2** ⛔ `flush.rs:133, 150` — `writer.finish()` returns the entire SST as `Vec<u8>` before a single `append` call. **Phase D.2.**
+- **C-R3-H3** ⛔ `sst/writer.rs:175, 178, 188` — `last_added_key`/min/max key tracking does `key.to_vec()` on every `add` call (per-row clone during flush + compaction). **Phase D.2.**
+
+### JDK 25 leverage — additional sites
+- **D-R3-1** ⛔ `ArrowTimerBuffer.hashOf` byte-by-byte polynomial hash on Q12 timer hot path. Same shape as V2-9. **Phase B.2 extension.**
+- **D-R3-2** ⛔ `JAVA_INT` (aligned) vs `JAVA_INT_UNALIGNED` cross-file inconsistency — Linker uses UNALIGNED, executor uses aligned for offsets segments. **Phase F.5 (new).**
+- **D-R3-3** ⛔ `FlatStateCache.readInt/writeInt` manual byte-shift packing on Q11 V1-sync 92M-op cache hot path. **Phase B.2 extension.**
+
+### Flink streaming — savepoint + ckpt semantics
+- **E3-HIGH-1** ⛔ `CheckpointOptions` ignored in `snapshot()/asyncSnapshot()` — SAVEPOINT/SYNC_SAVEPOINT indistinguishable from periodic ckpt. **Phase A.1 extension.**
+- **E3-HIGH-2** ⛔ `stop --savepoint` routes through `snapshot()` (not `savepoint()`) bypassing the UnsupportedOperationException; terminal barrier returns success with no in-flight await → RMW accumulators lost on task finish. **Phase A.1 + Phase E.1.**
+- **E3-HIGH-3** ⛔ Zero `AsyncRetryStrategy`/retry hits in module → SST upload/download fails fast on first transient S3/BOS fault, multiplied across N SSTs per ckpt. **Phase E.5 (new).**
+- **E3-HIGH-4** ⛔ Zero `TypeSerializerSnapshot`/`resolveSchemaCompatibility` hits → serializer changes silently deserialize garbage instead of `StateMigrationException`. **Phase E.6 (new).**
+- **E3-HIGH-5** ⛔ Manifest uploaded with `CheckpointedStateScope.EXCLUSIVE` but `createIncrementalCheckpointAt(...,baseCheckpointId,...)` suggests delta semantics — retained-checkpoint restore breaks after subsumption. **Phase A.1 extension (incremental scope correctness).**
+
+### Audit observations (not single-issue HIGH but worth recording)
+- **B3-JMH** ⛔ None of the three in-tree JMH benches (`ForStRsBProdBenchmark`, `ForStRsFfmBenchmark`, `ForStCompareBenchmark`) actually use `@Benchmark`, and none call `vectorizedBatchPut/Get`, `executeBatchRequests`, `MapStateCache`, or the V2 async dispatch path. **Vectorization perf claims have zero in-tree JMH coverage.** Documented as a gap requiring its own JMH harness rewrite (Phase F.6).
+
+---
+
+## Cumulative open count by category (post Round 3)
 
 | Category | Open | Fixed | Total |
 |---|---:|---:|---:|
-| Section 1 (Correctness/Durability) | 11 | 1 | 12 |
-| Section 2 (Vectorization) | 15 | 0 | 15 |
-| Section 3 (Zero-copy) | 9 | 1 | 10 |
-| Section 4 (JDK 25) | 5 | 1 | 6 |
-| Section 5 (Flink streaming) | 5 | 0 (+1 FP) | 6 |
+| Section 1 (Correctness/Durability) | 14 | 1 | 15 |
+| Section 2 (Vectorization) | 21 | 0 | 21 |
+| Section 3 (Zero-copy) | 12 | 1 | 13 |
+| Section 4 (JDK 25) | 8 | 1 | 9 |
+| Section 5 (Flink streaming) | 10 | 0 (+1 FP) | 11 |
 | Section 6 (MEDIUMs, selected) | 3 | 0 | 3+ |
-| **Total** | **48** | **3** | **52+** |
+| **Total** | **68** | **3** | **75+** |
 
-(Round 3 findings will append further if dispatched-agents return non-empty reports.)
+Note: 6 surgical fixes landed across rounds 1+2; some closed multiple issues (e.g., C-H4 closes 1 issue; A2-H1/H2/H3 close 3 issues from the A1-H5 follow-on).

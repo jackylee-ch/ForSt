@@ -154,18 +154,42 @@ Option (a) is simpler; option (b) is faster but requires Flink-runtime cooperati
 
 **Acceptance:** Round 4 Agent E confirms S1-12 closed.
 
-### Phase A acceptance gate
+### A.7 — Sync-path try/catch + Error escape + per-row alloc cleanup (Round 3 R3-A1/A2/B6)
 
-After A.1–A.6 land:
-- `SnapshotRestoreCorrectnessTest` green
-- `MultiNamespaceCollisionTest` green
-- Rescale test green
-- `MapStateCacheClearStateTest` green
-- `MultiValueStateOperatorTest` green
-- `StateTtlExpiryTest` green
+**Closes:** A3-H1, A3-H2, B3-H6
+
+**Files:** `VectorizedExecutor.java` `executeRequestSync`, `executeBatchRequests`
+
+**Design:**
+- Wrap `executeRequestSync` body in `try {...} catch (Throwable t) { fail all pending requests }` — Throwable not Exception, catches `Error` subclasses.
+- `executeBatchRequests` outer catch widened from `Exception` to `Throwable`.
+- Per-row error wrapping: drop the `RuntimeException("cause unavailable")` allocation; if `amFut.getNow()` doesn't reveal the cause, use a pre-allocated sentinel `Throwable` constant.
+
+**Tests:** `SyncDispatchErrorPropagationTest` — inject FrsEnginePanicError (`extends Error`) in dispatch, verify all StateRequest futures resolve.
+
+### A.8 — Incremental checkpoint scope + CheckpointOptions handling (Round 3 R3-E1/E2/E5)
+
+**Closes:** E3-HIGH-1, E3-HIGH-2, E3-HIGH-5
+
+**Files:** `keyed/ForStRsAsyncKeyedStateBackend.snapshot()` (and `asyncSnapshot()` once it exists)
+
+**Design:**
+- Read `CheckpointOptions.getCheckpointType()` and branch:
+  - `CheckpointType.CHECKPOINT` → incremental (use `CheckpointedStateScope.SHARED` for SSTs in retained-checkpoint set; `EXCLUSIVE` only for the manifest)
+  - `CheckpointType.SAVEPOINT` / `CheckpointType.SYNC_SAVEPOINT` → canonical/portable format (NOT proprietary forst-rs blob)
+- `stop --savepoint` invokes `snapshot()` with `SYNC_SAVEPOINT` type — flow through the proper savepoint path including drain + barrier-await.
+
+### Phase A acceptance gate (updated)
+
+After A.1–A.8 land:
+- All tests from A.1–A.6 acceptance gate
+- `SyncDispatchErrorPropagationTest` green
+- `SavepointPortabilityTest` green (savepoint loadable by community ForSt — with documented schema caveats)
+- `StopWithSavepointTest` green (terminal barrier correctness)
+- `IncrementalCheckpointSubsumptionTest` green (retained-checkpoint restore correct after subsumption)
 - Round 4 Agent A + Agent E find 0 new HIGH in Sections 1, 5
 
-**Wall-clock estimate:** 5-7 engineer-days
+**Wall-clock estimate (updated):** 7-10 engineer-days (was 5-7)
 
 ---
 
@@ -205,13 +229,24 @@ After A.1–A.6 land:
 - Verify each FFI function does NOT block on internal flush/network — required by `critical` mode.
 - Heap-access allowed for the small offset arrays; the value bytes are off-heap.
 
-### Phase B acceptance gate
+### B.4 — Round 3 V1 byte[] cleanup (R3-B3/B4 + R3-D1/D3)
 
-- New `MemorySegmentDataInputViewSmokeTest`
-- Criterion micro: `hash_128b` < scalar baseline by ≥ 2×
-- Round 4 finds 0 new HIGH in V2-6, V2-9, V2-11
+**Closes:** B3-H3, B3-H4, D-R3-1, D-R3-3
 
-**Wall-clock:** 3-4 engineer-days
+**Files:**
+- `state/ForStRsKeyGroupedSerializer.encodeForState/Map` — cache `stateName.getBytes(UTF_8)` once at registration
+- `state/ForStRsValueState.update/getAndUpdate` — drop `getCopyOfBuffer()` on the V1-sync hot path
+- `ArrowTimerBuffer.hashOf` — same SIMD treatment as B.2
+- `cache/FlatStateCache.readInt/writeInt` — `MethodHandles.byteArrayViewVarHandle(int[].class, BIG_ENDIAN)`
+
+### Phase B acceptance gate (updated)
+
+- All B.1–B.3 acceptance items
+- B.4 unit tests: `EncodeForStateZeroCopyTest`, `ValueStateUpdateNoAllocTest`, `TimerHashSimdTest`, `FlatStateCacheVarHandleTest`
+- Criterion: `timer_hash_64b`, `int_pack_unpack` ≥ 2× scalar baseline
+- Round 4 finds 0 new HIGH in V2-6, V2-9, V2-11, B3-H3/H4, D-R3-1/D-R3-3
+
+**Wall-clock (updated):** 5-6 engineer-days (was 3-4)
 
 ---
 
@@ -245,14 +280,27 @@ After A.1–A.6 land:
 
 **Design:** Replace `byte[] buf = new byte[rangeLen]` with `MemorySegmentDataInputView` reading directly off the iter chunk buffer.
 
-### Phase C acceptance gate
+### C.4 — Reducing/Aggregating V2 actual RMW cache + flushOnBarrier (Round 3 B3-H1/H2)
+
+**Closes:** B3-H1, B3-H2
+
+**Files:** `state/ForStRsAsyncReducingStateV2.java`, `state/ForStRsAsyncAggregatingStateV2.java`
+
+**Design:**
+- Build the RMW cache pattern these classes already CLAIM in their Javadoc but don't implement.
+- Per-instance hash-keyed cache of (operatorKey → accumulator).
+- `asyncAdd(v)` looks up cached accumulator, calls `reduce/add` in-memory, marks dirty.
+- `flushOnBarrier()` serializes all dirty accumulators and enqueues PUTs to the classifier.
+
+### Phase C acceptance gate (updated)
 
 - Q16 ≤ 150 s (Phase C target)
 - Q19 ≤ 60 s (Phase C target)
 - No regression >5% on any other Nexmark query
-- Round 4 Agent B/C finds 0 new HIGH in V2-8, V2-14, Z3-6
+- C.4: Reducing/Aggregating-heavy Nexmark queries see ≥1.3× lift over current (specifically Q4/Q11 measure points)
+- Round 4 Agent B/C finds 0 new HIGH in V2-8, V2-14, Z3-6, B3-H1/H2
 
-**Wall-clock:** 7-10 engineer-days (largest phase)
+**Wall-clock (updated):** 9-13 engineer-days (was 7-10)
 
 ---
 
@@ -357,13 +405,35 @@ After A.1–A.6 land:
 
 **Design:** Multiple prefix opens in a single FFI; engine pipelines block-cache loads.
 
-### Phase E acceptance gate
+### E.5 — AsyncRetryStrategy for S3 transient faults (Round 3 E3-HIGH-3)
 
-- `SavepointLoadCrossBackendTest` (savepoint produced by forst-rs loads in community ForSt — with documented caveats)
-- Rescale 4→8 completes in ≤30s (vs current serial unknown)
-- Async dispatch micro shows in-flight parallelism ≥4 ops/dispatcher
+**Closes:** E3-HIGH-3
 
-**Wall-clock:** 6-8 engineer-days
+**Files:** `restore/ForStRsRestoreOperation.java`, `keyed/ForStRsAsyncKeyedStateBackend.snapshot()`, Rust `crates/forst-rs-storage/src/opendal_*.rs`
+
+**Design:**
+- Wrap SST upload/download in Flink's `AsyncRetryStrategy` with bounded retries + exponential backoff.
+- Rust side: opendal client already has retry middleware — verify it's enabled with sensible defaults.
+- Per-ckpt failure rate budget: ≤0.01% with retry vs current fail-fast on first transient fault.
+
+### E.6 — TypeSerializerSnapshot for state migration (Round 3 E3-HIGH-4)
+
+**Closes:** E3-HIGH-4
+
+**Files:** `state/*StateV2.java` — add `getStateSerializer()` exposure, integrate with Flink's `TypeSerializerSnapshot` framework.
+
+**Design:**
+- On state read, compare the snapshot's serializer-config to the current TypeSerializer.
+- If incompatible: throw `StateMigrationException` (per Flink contract).
+- If compatible-after-migration: apply the migration transform.
+
+### Phase E acceptance gate (updated)
+
+- All E.1–E.4 acceptance items
+- E.5: S3-fault-injection test — bench survives 0.1% packet loss without job failure
+- E.6: `SerializerEvolutionTest` — change a state's serializer signature, verify either successful migration or clear `StateMigrationException` (not garbage deserialization)
+
+**Wall-clock (updated):** 8-11 engineer-days (was 6-8)
 
 ---
 
@@ -387,27 +457,54 @@ After A.1–A.6 land:
 - Files: `timer/ArrowTimerBuffer.java`
 - Design: rename current implementation to `drainUnordered`; add a new `drainTo` that pops via removeMin in strict timestamp order
 
-### Phase F acceptance gate
+### F.5 — JAVA_INT_UNALIGNED dialect consistency (Round 3 D-R3-2)
+
+**Closes:** D-R3-2
+
+**Files:** `VectorizedExecutor.java`, `ColumnarBatchBuffer.java` — all `JAVA_INT` indexed-offset access sites
+
+**Design:** Audit every indexed offset write/read site; standardize on `JAVA_INT_UNALIGNED` matching the Linker side. JIT generates unaligned-access machine instructions where supported (Apple Silicon natively).
+
+### F.6 — JMH benchmark rewrite (Round 3 B3-JMH)
+
+**Closes:** B3-JMH observation (gap, not single-issue HIGH)
+
+**Files:** `flink-state-backends/flink-statebackend-forst-rs/src/test/java/.../jmh/`
+
+**Design:** Rewrite the 3 existing benchmarks to actually use `@Benchmark` annotation and call `vectorizedBatchPut`, `vectorizedBatchGet`, `executeBatchRequests`, `MapStateCache`, V2 async dispatch. Without these, every perf claim in commit messages is unverifiable in-tree.
+
+### F.7 — MapStateCache LinkedHashMap → access-order-free (Round 3 B3-H5)
+
+**Closes:** B3-H5
+
+**Files:** `cache/MapStateCache.java`
+
+**Design:** Replace `LinkedHashMap accessOrder=true` with an open-addressed cache + clock-sweep eviction (matches audit-design Phase D V7). Eliminates per-HIT node relink.
+
+### Phase F acceptance gate (updated)
 - All Round 4 reviewers find ≤2 HIGH across the entire codebase
 - Bench portfolio holds the v3.8 baseline ±5%
+- F.5: criterion offset-access micros show no aligned-vs-unaligned divergence
+- F.6: JMH suite produces `Mode.AverageTime` results for batched FFI dispatch
+- F.7: MapStateCache hit-path micro shows no LinkedHashMap relink overhead
 
-**Wall-clock:** 3-5 engineer-days
+**Wall-clock (updated):** 6-9 engineer-days (was 3-5)
 
 ---
 
 ## §7 — Total budget & sequencing
 
-| Phase | Wall-clock | Parallelizable? |
+| Phase | Wall-clock (post-R3) | Parallelizable? |
 |---|---:|---|
-| A — Correctness/Durability | 5-7 days | No (blocking) |
-| B — V1 Vectorization | 3-4 days | Yes, with A |
-| C — MapState/ListState V2 off-heap | 7-10 days | After A.2 (namespace) |
+| A — Correctness/Durability (incl. A.7+A.8) | 7-10 days | No (blocking) |
+| B — V1 Vectorization (incl. B.4) | 5-6 days | Yes, with A |
+| C — MapState/ListState V2 off-heap (incl. C.4) | 9-13 days | After A.2 |
 | D — Rust engine zero-copy | 8-12 days | Yes, with A,B,C |
-| E — Flink streaming semantics | 6-8 days | After A.1 |
-| F — Fold-in cleanup | 3-5 days | After B |
+| E — Flink streaming semantics (incl. E.5+E.6) | 8-11 days | After A.1 |
+| F — Fold-in cleanup (incl. F.5+F.6+F.7) | 6-9 days | After B |
 
-**Sequential minimum:** A (7d) + C (10d) + E (8d) + F (5d) = 30 engineer-days.
-**Parallel (B + D running alongside):** ≈ 20 engineer-days for 2-engineer team.
+**Sequential minimum (post-R3):** A (10d) + C (13d) + E (11d) + F (9d) = 43 engineer-days.
+**Parallel (B + D alongside):** ≈ 28-32 engineer-days for 2-engineer team.
 
 ---
 
