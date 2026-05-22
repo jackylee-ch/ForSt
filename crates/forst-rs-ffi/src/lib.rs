@@ -3681,10 +3681,14 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             slice::from_raw_parts(prefix_ptr, prefix_len as usize)
         };
 
-        // V1: the engine's `prefix_scan` returns an owned Vec; we wrap its
-        // IntoIter as the boxed cursor.  PR-D4 zero-clone: NO intermediate
-        // Vec is allocated at the FFI layer — `fill_chunk_from_iter` drains
-        // the boxed iter directly into the caller's buffer.
+        // PR-B5-H2: the engine grew a streaming `prefix_scan_iter` that
+        // would let us skip the outer `Vec` materialisation here. Routing
+        // it through the per-shard `IterHandle` registry requires an
+        // `Arc<DbImpl>`-rooted self-referential cursor (the iterator
+        // borrows `&self` from the engine), which is a follow-up. For now
+        // we still call the eager `prefix_scan` — itself a one-liner
+        // `prefix_scan_iter().collect()` post-refactor — and pull rows
+        // through `fill_chunk_from_iter` lazily.
         let rows = match db_ref.prefix_scan(cf_ref_, prefix) {
             Ok(r) => r,
             Err(_) => return FrsErrorCode::EngineIo as i32,
@@ -4230,20 +4234,18 @@ pub unsafe extern "C" fn frs_vec_merge_append(
             return FrsErrorCode::Ok as i32;
         }
 
-        // Collect operands.
-        let mut operands: Vec<Vec<u8>> = Vec::with_capacity(num_operands as usize);
+        // PR-B5-H3: collect operand slices as borrowed `&[u8]` (no per-op
+        // alloc + memcpy). The FFI buffers are valid for the duration of
+        // this call; `combine_slices` consumes them synchronously.
+        let mut operands: Vec<&[u8]> = Vec::with_capacity(num_operands as usize);
         for i in 0..num_operands as usize {
             let p = *operand_ptrs.add(i);
             let n = *operand_lens.add(i) as usize;
             if p.is_null() && n > 0 {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
-            let bytes = if n == 0 {
-                Vec::new()
-            } else {
-                slice::from_raw_parts(p, n).to_vec()
-            };
-            operands.push(bytes);
+            let s: &[u8] = if n == 0 { &[] } else { slice::from_raw_parts(p, n) };
+            operands.push(s);
         }
 
         // Read existing value (empty Vec when key absent).
@@ -4253,11 +4255,14 @@ pub unsafe extern "C" fn frs_vec_merge_append(
         };
 
         // Concatenate using the fixed list-append combiner.
+        // PR-B5-H3: use the borrowed-slice combiner variant (already used
+        // by the batched path at frs_vec_merge_append_batch) instead of
+        // cloning each operand into Vec<u8>.
         let combiner = ListMergeCombiner::new();
         let merged = if existing.is_empty() {
-            combiner.combine(&operands)
+            combiner.combine_slices(&operands)
         } else {
-            combiner.combine_with_base(&existing, &operands)
+            combiner.combine_with_base_slices(&existing, &operands)
         };
 
         // Write back.

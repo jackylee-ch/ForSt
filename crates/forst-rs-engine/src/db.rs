@@ -1032,9 +1032,14 @@ impl DbImpl {
         let version = self.version_set.current();
         for sst in version.live_sst_files() {
             let reader = self.get_or_open_sst_reader(&sst)?;
-            for (k, _, _, _) in reader.scan(lower, upper)? {
-                keys.insert(k);
-            }
+            // PR-C5-H1: scan_borrowed avoids the per-row `value.to_vec()`
+            // that `reader.scan(...)` pays inside `SstReaderImpl::scan`
+            // (sst/reader.rs §455). We discard the value here anyway —
+            // only the key is collected into the BTreeSet.
+            reader.scan_borrowed(lower, upper, |view| {
+                keys.insert(view.key.to_vec());
+                Ok(())
+            })?;
         }
 
         // Resolve each candidate key through the versioned read path so
@@ -1388,7 +1393,12 @@ impl DbImpl {
     }
 
     /// Applies a [`WriteBatch`] atomically. Returns the last assigned sequence.
-    pub fn batch_write(&self, batch: WriteBatch) -> ForstResult<u64> {
+    ///
+    /// PR-B5-H1: takes `WriteBatch<'a>` so callers (FFI batch hot path,
+    /// tests, JNI compat) can pass borrowed slices. The batch is fully
+    /// consumed before this function returns, so the borrow's lifetime
+    /// always covers the call.
+    pub fn batch_write<'a>(&self, batch: WriteBatch<'a>) -> ForstResult<u64> {
         if batch.is_empty() {
             return Ok(self.sequence_number());
         }
@@ -1433,7 +1443,10 @@ impl DbImpl {
             let cf_data = cf_datas.get(cf_id).expect("cf_data pre-populated");
             let mem_arc = cf_data.active_memtable();
 
-            let keys: Vec<&[u8]> = indices.iter().map(|&i| entries[i].key.as_slice()).collect();
+            // PR-B5-H1: `entries[i].key` is now `Cow<'_, [u8]>`. `.as_ref()`
+            // yields `&[u8]` for both Borrowed and Owned variants — the
+            // zero-copy FFI path passes borrowed slices straight through.
+            let keys: Vec<&[u8]> = indices.iter().map(|&i| entries[i].key.as_ref()).collect();
             let values: Vec<Option<&[u8]>> = indices
                 .iter()
                 .map(|&i| entries[i].value.as_deref())
@@ -2332,9 +2345,13 @@ impl DbImpl {
                 }
             }
             let reader = self.get_or_open_sst_reader(&sst)?;
-            for (k, _, _, _) in reader.scan(lower, upper)? {
-                keys.insert(k);
-            }
+            // PR-C5-H1: scan_borrowed skips the per-row `value.to_vec()`
+            // baked into `SstReaderImpl::scan`. Value is discarded — only
+            // the key feeds the BTreeSet.
+            reader.scan_borrowed(lower, upper, |view| {
+                keys.insert(view.key.to_vec());
+                Ok(())
+            })?;
         }
 
         // Resolve each key via the normal read path (handles deletes + merges).
@@ -2348,40 +2365,68 @@ impl DbImpl {
     }
 
     /// Prefix scan: all key-value pairs whose keys start with `prefix`.
+    ///
+    /// Materialised form retained for the Arrow-side FFI exports
+    /// (`frs_prefix_scan_arrow`, `frs_batch_prefix_scan`) that build a
+    /// `RecordBatch` from a fully-known row count up front. Streaming
+    /// callers (the chunked iterator FFI: `frs_vec_iter_prefix_open*`)
+    /// should use [`Self::prefix_scan_iter`] to avoid the intermediate
+    /// Vec.
     #[inline]
     pub fn prefix_scan(
         &self,
         cf: &ColumnFamilyHandle,
         prefix: &[u8],
     ) -> ForstResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.prefix_scan_iter(cf, prefix)?.collect()
+    }
+
+    /// Streaming form of [`Self::prefix_scan`].
+    ///
+    /// PR-B5-H2: drains the memtable's prefix-index into an iterator that
+    /// resolves each candidate key on demand. The FFI chunked-iterator
+    /// path (`frs_vec_iter_prefix_open`) wraps this into a
+    /// `Box<dyn Iterator>` and consumes one row at a time into the
+    /// caller's chunk buffer — no engine-side `Vec::with_capacity(N)`
+    /// materialisation. Keys are visited in sorted order (the memtable
+    /// prefix-index is a `BTreeMap` range).
+    pub fn prefix_scan_iter<'a>(
+        &'a self,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> ForstResult<impl Iterator<Item = ForstResult<(Vec<u8>, Vec<u8>)>> + 'a> {
         let upper = prefix_upper_bound(prefix);
         let cf_data = self.lookup_cf_by_id(cf.id())?;
 
-        // Fast path: use prefix_scan_keys on memtable (O(1) prefix index lookup)
+        // Fast path: use prefix_scan_keys on memtable (O(1) prefix index lookup).
+        // The keys Vec is owned and moves into the closure; `cf_data`/`mem_arc`
+        // are Arc-cloned to keep the memtable alive while we stream.
         let mem_arc = cf_data.active_memtable();
         let keys = mem_arc.prefix_scan_keys(prefix, upper.as_deref());
+        let cf_handle = cf.clone();
+        let mem_arc_capture = mem_arc.clone();
+        let db = self;
 
-        // Resolve each key — try active memtable directly (inline cache)
         let read_seq = u64::MAX;
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            let active_hit = mem_arc.get(&key, read_seq)?;
-            match active_hit {
-                Some(entry) if entry.op_type == OpType::Put => {
-                    if let Some(value) = entry.value {
-                        out.push((key, value));
+        Ok(keys.into_iter().filter_map(move |key| {
+            // Active memtable inline-cache fast path mirrors the eager
+            // version below.
+            match mem_arc_capture.get(&key, read_seq) {
+                Ok(Some(entry)) if entry.op_type == OpType::Put => entry
+                    .value
+                    .map(|value| Ok((key, value))),
+                Ok(Some(_)) => None, // tombstone in active memtable
+                Ok(None) => {
+                    // Fall back to the full versioned read path.
+                    match db.get(&cf_handle, &key) {
+                        Ok(Some(value)) => Some(Ok((key, value))),
+                        Ok(None) => None,
+                        Err(e) => Some(Err(e)),
                     }
                 }
-                Some(_) => {} // Delete — skip
-                None => {
-                    // Fall back to full path
-                    if let Some(value) = self.get(cf, &key)? {
-                        out.push((key, value));
-                    }
-                }
+                Err(e) => Some(Err(e)),
             }
-        }
-        Ok(out)
+        }))
     }
 
     #[allow(clippy::type_complexity)]
@@ -4315,8 +4360,9 @@ mod tests {
         let cf = db.default_cf();
         let mut batch = WriteBatch::new();
         for i in 0..50u32 {
-            let k = format!("key{:04}", i);
-            batch.put(&cf, k.as_bytes(), b"v");
+            // PR-B5-H1: put_owned for `format!`-derived keys that don't
+            // outlive the iteration scope.
+            batch.put_owned(&cf, format!("key{:04}", i).into_bytes(), b"v".to_vec());
         }
         db.batch_write(batch).unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
@@ -5248,7 +5294,7 @@ mod tests {
         let pre = db.sequence_number();
         let mut batch = WriteBatch::new();
         for i in 0..100u32 {
-            batch.put(&cf, format!("bk{}", i).as_bytes(), b"v");
+            batch.put_owned(&cf, format!("bk{}", i).into_bytes(), b"v".to_vec());
         }
         let last_seq = db.batch_write(batch).unwrap();
         let post = db.sequence_number();
@@ -5308,7 +5354,7 @@ mod tests {
             barrier_b.wait();
             let mut batch = WriteBatch::new();
             for i in 0..BATCH_SIZE {
-                batch.put(&cf_b, format!("bk{}", i).as_bytes(), b"v");
+                batch.put_owned(&cf_b, format!("bk{}", i).into_bytes(), b"v".to_vec());
             }
             db_b.batch_write(batch).unwrap()
         });

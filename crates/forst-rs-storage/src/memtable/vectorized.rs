@@ -571,12 +571,20 @@ impl VectorizedMemTable {
         }
         // Fallback: merge sorted_index range + unsorted_lookup filter (no temp BTreeMap)
         let mut keys: Vec<Vec<u8>> = Vec::new();
-        // sorted_index is already sorted — range query is O(log N + K)
+        // sorted_index is already sorted — range query is O(log N + K).
+        // PR-C5-H2: range over `&[u8]` bounds directly. `BTreeMap<Vec<u8>, _>`
+        // accepts borrowed slices via the `Borrow<[u8]>` impl on `Vec<u8>`,
+        // so we avoid the `lower.to_vec()..hi.to_vec()` allocations entirely
+        // (hot on Q11/Q12 when MapStateCache is bypassed — one alloc pair
+        // per prefix_scan_keys call).
+        use std::ops::Bound;
         let range_iter = match upper {
             Some(hi) => self
                 .sorted_index
-                .range::<Vec<u8>, _>(lower.to_vec()..hi.to_vec()),
-            None => self.sorted_index.range::<Vec<u8>, _>(lower.to_vec()..),
+                .range::<[u8], _>((Bound::Included(lower), Bound::Excluded(hi))),
+            None => self
+                .sorted_index
+                .range::<[u8], _>((Bound::Included(lower), Bound::Unbounded)),
         };
         for (key, _) in range_iter {
             keys.push(key.clone());

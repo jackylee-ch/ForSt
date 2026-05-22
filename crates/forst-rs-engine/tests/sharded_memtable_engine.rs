@@ -116,9 +116,12 @@ fn test_engine_sharded_batch_write_correctness() {
     // get scattered across shards.
     let mut batch = WriteBatch::new();
     for i in 0..1_000u32 {
-        let k = format!("bk{:05}", i);
-        let v = format!("bv{:05}", i);
-        batch.put(&cf, k.as_bytes(), v.as_bytes());
+        // PR-B5-H1: put_owned for transient `format!` buffers.
+        batch.put_owned(
+            &cf,
+            format!("bk{:05}", i).into_bytes(),
+            format!("bv{:05}", i).into_bytes(),
+        );
     }
     db.batch_write(batch).unwrap();
 

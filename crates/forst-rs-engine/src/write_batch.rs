@@ -19,6 +19,7 @@
 //! `batch_write` path allocates a contiguous range of sequence numbers and
 //! dispatches each entry to its column family's memtable.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use forst_rs_common::{ColumnFamilyId, OpType};
@@ -26,14 +27,22 @@ use forst_rs_common::{ColumnFamilyId, OpType};
 use crate::column_family::ColumnFamilyHandle;
 
 /// A single entry in a [`WriteBatch`].
+///
+/// PR-B5-H1 (zero-copy): `key`/`value` are stored as [`Cow<'a, [u8]>`] so the
+/// FFI hot path (`frs_vectorized_batch_put`, `frs_vectorized_batch_delete`)
+/// can push borrowed slices straight from the caller-owned input buffer
+/// without a per-entry `Vec<u8>` alloc + memcpy. The batch is applied
+/// synchronously inside the same FFI call, so the borrow always outlives
+/// `db.batch_write`. Owned callers (tests, future async paths) hand in
+/// `Cow::Owned` via the `*_owned` helpers.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WriteBatchEntry {
+pub struct WriteBatchEntry<'a> {
     /// Target column family id.
     pub cf_id: ColumnFamilyId,
     /// User key.
-    pub key: Vec<u8>,
+    pub key: Cow<'a, [u8]>,
     /// Value payload. `None` for [`OpType::Delete`] / [`OpType::SingleDelete`].
-    pub value: Option<Vec<u8>>,
+    pub value: Option<Cow<'a, [u8]>>,
     /// Kind of mutation.
     pub op_type: OpType,
 }
@@ -41,13 +50,17 @@ pub struct WriteBatchEntry {
 /// An ordered batch of mutations applied atomically by the engine.
 ///
 /// Entries are appended in insertion order; the engine assigns sequence
-/// numbers in the same order when dispatching the batch.
+/// numbers in the same order when dispatching the batch. The optional
+/// lifetime `'a` is the lifetime of any borrowed source buffer used in
+/// zero-copy appends (`put`/`delete`/`merge`/`single_delete` all borrow
+/// their key/value slices). Use `'static` (the default) for batches that
+/// don't borrow.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WriteBatch {
-    entries: Vec<WriteBatchEntry>,
+pub struct WriteBatch<'a> {
+    entries: Vec<WriteBatchEntry<'a>>,
 }
 
-impl WriteBatch {
+impl<'a> WriteBatch<'a> {
     /// Creates an empty batch.
     pub fn new() -> Self {
         Self::default()
@@ -60,22 +73,26 @@ impl WriteBatch {
         }
     }
 
-    /// Appends a Put mutation.
-    pub fn put(&mut self, cf: &ColumnFamilyHandle, key: &[u8], value: &[u8]) -> &mut Self {
+    /// Appends a Put mutation, borrowing `key` and `value` from the caller.
+    ///
+    /// PR-B5-H1 zero-copy: stores `Cow::Borrowed` references; no allocation
+    /// happens here. The borrows must live until [`Self::into_entries`] is
+    /// drained (typically the same FFI/engine call).
+    pub fn put(&mut self, cf: &ColumnFamilyHandle, key: &'a [u8], value: &'a [u8]) -> &mut Self {
         self.entries.push(WriteBatchEntry {
             cf_id: cf.id(),
-            key: key.to_vec(),
-            value: Some(value.to_vec()),
+            key: Cow::Borrowed(key),
+            value: Some(Cow::Borrowed(value)),
             op_type: OpType::Put,
         });
         self
     }
 
-    /// Appends a Delete mutation.
-    pub fn delete(&mut self, cf: &ColumnFamilyHandle, key: &[u8]) -> &mut Self {
+    /// Appends a Delete mutation, borrowing `key` from the caller.
+    pub fn delete(&mut self, cf: &ColumnFamilyHandle, key: &'a [u8]) -> &mut Self {
         self.entries.push(WriteBatchEntry {
             cf_id: cf.id(),
-            key: key.to_vec(),
+            key: Cow::Borrowed(key),
             value: None,
             op_type: OpType::Delete,
         });
@@ -93,23 +110,43 @@ impl WriteBatch {
     /// the newest `Put`, leaving older shadowed `Put`s visible on the
     /// next read. Use when the caller owns the write history (e.g.
     /// changelog producers, CDC sinks).
-    pub fn single_delete(&mut self, cf: &ColumnFamilyHandle, key: &[u8]) -> &mut Self {
+    pub fn single_delete(&mut self, cf: &ColumnFamilyHandle, key: &'a [u8]) -> &mut Self {
         self.entries.push(WriteBatchEntry {
             cf_id: cf.id(),
-            key: key.to_vec(),
+            key: Cow::Borrowed(key),
             value: None,
             op_type: OpType::SingleDelete,
         });
         self
     }
 
-    /// Appends a Merge mutation.
-    pub fn merge(&mut self, cf: &ColumnFamilyHandle, key: &[u8], operand: &[u8]) -> &mut Self {
+    /// Appends a Merge mutation, borrowing `key` and `operand`.
+    pub fn merge(&mut self, cf: &ColumnFamilyHandle, key: &'a [u8], operand: &'a [u8]) -> &mut Self {
         self.entries.push(WriteBatchEntry {
             cf_id: cf.id(),
-            key: key.to_vec(),
-            value: Some(operand.to_vec()),
+            key: Cow::Borrowed(key),
+            value: Some(Cow::Borrowed(operand)),
             op_type: OpType::Merge,
+        });
+        self
+    }
+
+    /// Appends a Put with owned key/value buffers.
+    ///
+    /// Use this from callers that already own `Vec<u8>` and would otherwise
+    /// have to clone into a temporary slice. The owned form converts into
+    /// `Cow::Owned` directly.
+    pub fn put_owned(
+        &mut self,
+        cf: &ColumnFamilyHandle,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> &mut Self {
+        self.entries.push(WriteBatchEntry {
+            cf_id: cf.id(),
+            key: Cow::Owned(key),
+            value: Some(Cow::Owned(value)),
+            op_type: OpType::Put,
         });
         self
     }
@@ -125,7 +162,7 @@ impl WriteBatch {
     }
 
     /// Returns an iterator over the entries in insertion order.
-    pub fn entries(&self) -> &[WriteBatchEntry] {
+    pub fn entries(&self) -> &[WriteBatchEntry<'a>] {
         &self.entries
     }
 
@@ -147,8 +184,9 @@ impl WriteBatch {
         map
     }
 
-    /// Consumes the batch and returns the owned entries vector.
-    pub fn into_entries(self) -> Vec<WriteBatchEntry> {
+    /// Consumes the batch and returns the entries vector. Borrowed Cows
+    /// retain their borrow; owned Cows retain their `Vec<u8>`.
+    pub fn into_entries(self) -> Vec<WriteBatchEntry<'a>> {
         self.entries
     }
 }
@@ -176,7 +214,7 @@ mod tests {
         assert_eq!(b.len(), 1);
         let e = &b.entries()[0];
         assert_eq!(e.cf_id, ColumnFamilyId(1));
-        assert_eq!(e.key, b"k");
+        assert_eq!(e.key.as_ref(), b"k");
         assert_eq!(e.value.as_deref(), Some(b"v".as_ref()));
         assert_eq!(e.op_type, OpType::Put);
     }
@@ -207,17 +245,19 @@ mod tests {
             .put(&h, b"k2", b"v2")
             .delete(&h, b"k3");
         assert_eq!(b.len(), 3);
-        assert_eq!(b.entries()[0].key, b"k1");
-        assert_eq!(b.entries()[1].key, b"k2");
-        assert_eq!(b.entries()[2].key, b"k3");
+        assert_eq!(b.entries()[0].key.as_ref(), b"k1");
+        assert_eq!(b.entries()[1].key.as_ref(), b"k2");
+        assert_eq!(b.entries()[2].key.as_ref(), b"k3");
     }
 
     #[test]
     fn test_clear_keeps_capacity() {
         let h = handle(1, "a");
         let mut b = WriteBatch::with_capacity(16);
+        // Use put_owned so the keys outlive the per-iteration scope (the
+        // borrowed `put` would tie the batch to each format!() temporary).
         for i in 0..5 {
-            b.put(&h, format!("k{i}").as_bytes(), b"v");
+            b.put_owned(&h, format!("k{i}").into_bytes(), b"v".to_vec());
         }
         assert_eq!(b.len(), 5);
         b.clear();

@@ -78,9 +78,12 @@ fn m4_batch_write_10x100_then_batch_get() {
     for batch_id in 0..10u32 {
         let mut wb = WriteBatch::new();
         for i in 0..100u32 {
-            let k = format!("b{:03}-k{:05}", batch_id, i);
-            let v = format!("b{:03}-v{:05}", batch_id, i);
-            wb.put(&cf, k.as_bytes(), v.as_bytes());
+            // PR-B5-H1: put_owned for transient `format!` buffers.
+            wb.put_owned(
+                &cf,
+                format!("b{:03}-k{:05}", batch_id, i).into_bytes(),
+                format!("b{:03}-v{:05}", batch_id, i).into_bytes(),
+            );
         }
         db.batch_write(wb).unwrap();
     }

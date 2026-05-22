@@ -1155,6 +1155,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "arrow",
+ "bytes",
  "forst-rs-common",
  "forst-rs-io",
  "forst-rs-test-utils",
