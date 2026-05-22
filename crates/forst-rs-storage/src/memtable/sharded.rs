@@ -52,7 +52,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstError, ForstResult, OpType};
 
 use super::vectorized::VectorizedMemTable;
-use super::{GetResult, MemTableConfig, ScanRow, SinkGetOutcome, ValueSink};
+use super::{
+    GetBorrowedResult, GetResult, MemTableConfig, ScanRow, SinkGetOutcome, ValueSink,
+};
 
 /// Default number of shards. Must be a power of two so the shard index can
 /// be derived by a single AND mask. 16 keeps the per-shard `RwLock`
@@ -409,6 +411,35 @@ impl ShardedMemTable {
         let idx = self.shard_for_key(key);
         let shard = self.shards[idx].read().expect("lock poisoned");
         shard.get_pinned_ptr(key)
+    }
+
+    /// Borrowed-value point lookup over the sharded memtable.
+    ///
+    /// PR-B7-H2: callback-based variant of
+    /// [`VectorizedMemTable::get_borrowed`] that holds the shard read
+    /// lock for the duration of `f`'s execution. The closure receives
+    /// `Option<&GetBorrowedResult<'_>>` — the borrow is valid only
+    /// inside `f`; the lock is released when `f` returns. Callers
+    /// that need to retain the value beyond the closure should
+    /// materialise it via [`MemtableValueRef::into_owned`] or
+    /// [`MemtableValueRef::as_bytes`] inside `f`.
+    ///
+    /// Lock-cost is identical to [`Self::get`] (one shard read lock);
+    /// the win is the avoided per-key `Vec<u8>` allocation that
+    /// `get()` performs for the inline-cache and columnar fast paths.
+    #[inline]
+    pub fn get_borrowed_with<R>(
+        &self,
+        key: &[u8],
+        read_sequence: u64,
+        f: impl FnOnce(ForstResult<Option<&GetBorrowedResult<'_>>>) -> R,
+    ) -> R {
+        let idx = self.shard_for_key(key);
+        let shard = self.shards[idx].read().expect("lock poisoned");
+        match shard.get_borrowed(key, read_sequence) {
+            Ok(opt) => f(Ok(opt.as_ref())),
+            Err(e) => f(Err(e)),
+        }
     }
 
     /// Sink-aware point lookup. See [`VectorizedMemTable::get_into`].

@@ -27,7 +27,10 @@ use arrow::array::{Array, BinaryArray, BinaryBuilder, RecordBatch, UInt64Builder
 use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstResult, OpType};
 
-use super::{GetResult, MemTableConfig, ScanRow, SinkGetOutcome, ValueSink};
+use super::{
+    GetBorrowedResult, GetResult, MemTableConfig, MemtableValueRef, ScanRow, SinkGetOutcome,
+    ValueSink,
+};
 
 /// Index of a single row within the columnar storage arrays.
 #[derive(Debug, Clone, Copy)]
@@ -355,10 +358,19 @@ impl VectorizedMemTable {
                     .get(key)
                     .is_none_or(|e| e.row_indices.len() <= 1);
                 if is_new_key {
-                    self.prefix_index
-                        .entry(Box::from(prefix))
-                        .or_default()
-                        .push(Arc::<[u8]>::from(key));
+                    // PERF (C7-H2): `HashMap::entry(K)` consumes the key
+                    // unconditionally — for an existing-prefix hit the
+                    // `Box::from(prefix)` allocation would be wasted and
+                    // immediately dropped. Use the `get_mut`-then-`insert`
+                    // idiom so we only allocate the prefix `Box<[u8]>` when
+                    // the bucket is genuinely new. Hot on Q12 where many
+                    // rows share the same composite-key prefix.
+                    let key_arc = Arc::<[u8]>::from(key);
+                    if let Some(slot) = self.prefix_index.get_mut(prefix) {
+                        slot.push(key_arc);
+                    } else {
+                        self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                    }
                 }
             }
         }
@@ -703,6 +715,59 @@ impl VectorizedMemTable {
         Ok(result)
     }
 
+    /// Borrowed-value point lookup: like [`Self::get`] but returns a
+    /// [`GetBorrowedResult`] whose `value` field borrows from this
+    /// memtable's own storage (`inline_value` cache or `value_data`
+    /// columnar buffer) instead of allocating a fresh `Vec<u8>` per
+    /// call.
+    ///
+    /// PR-B7-H2: this is the zero-extra-alloc point-lookup primitive
+    /// used by the streaming prefix-iterator hot path
+    /// (`DbImpl::prefix_scan_iter_owned`). For the inline-cache and
+    /// columnar fast paths, no per-key heap allocation occurs — the
+    /// returned `MemtableValueRef::Inline(&[u8])` borrows directly
+    /// from the memtable's already-allocated storage.
+    ///
+    /// # Safety / lifetime
+    /// The returned reference borrows from `&self`; the caller must
+    /// release it before any concurrent write to the same key. In
+    /// Flink's single-threaded-per-slot model this is naturally
+    /// upheld during a single record processing cycle. Higher-level
+    /// wrappers (`ShardedMemTable::get_borrowed`) hold the shard read
+    /// lock for the borrow's lifetime to make this safe under
+    /// arbitrary callers.
+    #[inline]
+    pub fn get_borrowed(
+        &self,
+        key: &[u8],
+        read_sequence: u64,
+    ) -> ForstResult<Option<GetBorrowedResult<'_>>> {
+        let entry = match self.hash_index.get(key) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        // Fast path: latest version visible AND inline cache populated.
+        if entry.latest_seq <= read_sequence {
+            if let Some(ref inlined) = entry.inline_value {
+                let op_type = OpType::from_u8(entry.latest_op).unwrap_or(OpType::Put);
+                return Ok(Some(GetBorrowedResult {
+                    value: Some(MemtableValueRef::Inline(inlined.as_ref())),
+                    sequence: entry.latest_seq,
+                    op_type,
+                }));
+            }
+            // No inline cache — fall through to columnar path (still
+            // borrowed via `find_latest_borrowed`).
+        }
+
+        // Slow path: MVCC snapshot read or no inline cache. The
+        // columnar `value_data: Vec<u8>` lives in `&self`, so we can
+        // still return a borrowed view without allocating.
+        let result = self.find_latest_borrowed(&entry.row_indices, read_sequence);
+        Ok(result)
+    }
+
     /// Zero-copy point lookup: returns a raw pointer + length to the inline
     /// value in the hash index, without cloning into a `Vec<u8>`.
     ///
@@ -901,6 +966,7 @@ impl VectorizedMemTable {
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
+            let was_new_key;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
                 entry.latest_seq = seq;
@@ -912,6 +978,7 @@ impl VectorizedMemTable {
                 } else {
                     entry.inline_value = None;
                 }
+                was_new_key = false;
             } else {
                 let inline_value = if op_types[i] == OpType::Put as u8
                     && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
@@ -929,6 +996,34 @@ impl VectorizedMemTable {
                         latest_op: op_types[i],
                     },
                 );
+                was_new_key = true;
+            }
+
+            // Prefix index: maintain mapping from prefix → full keys.
+            // PR-B7-H3 fix: the batch-insert paths previously skipped this
+            // entirely, so the C6-H3 fast path in `prefix_scan_keys` was DEAD
+            // CODE on the Q12 batch-write hot path (it always fell back to
+            // the per-shard O(log N + K) sorted_index merge). Replicate the
+            // single-write maintenance block here, gated on the same
+            // last-slash test, using the `was_new_key` flag computed above
+            // (matches the single-write `row_indices.len() <= 1` check).
+            if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
+                let prefix = &key[..=last_slash];
+                if op_type == OpType::Delete || op_type == OpType::SingleDelete {
+                    if let Some(keys) = self.prefix_index.get_mut(prefix) {
+                        keys.retain(|k| &**k != key);
+                    }
+                } else if op_type == OpType::Put && was_new_key {
+                    // PERF (C7-H2): get_mut-then-insert so a same-prefix
+                    // burst (e.g. all rows in this batch share `ns/`) only
+                    // pays the `Box::from(prefix)` allocation once.
+                    let key_arc = Arc::<[u8]>::from(key);
+                    if let Some(slot) = self.prefix_index.get_mut(prefix) {
+                        slot.push(key_arc);
+                    } else {
+                        self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                    }
+                }
             }
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
@@ -1039,6 +1134,7 @@ impl VectorizedMemTable {
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
+            let was_new_key;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
                 entry.latest_seq = seq;
@@ -1050,6 +1146,7 @@ impl VectorizedMemTable {
                 } else {
                     entry.inline_value = None;
                 }
+                was_new_key = false;
             } else {
                 let inline_value = if op_types[i] == OpType::Put as u8
                     && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
@@ -1067,6 +1164,27 @@ impl VectorizedMemTable {
                         latest_op: op_types[i],
                     },
                 );
+                was_new_key = true;
+            }
+
+            // Prefix index: PR-B7-H3 — replicate single-write maintenance so
+            // the prefix-index fast path in `prefix_scan_keys` activates after
+            // sharded engine batches too (the per-shard sub-batches reach the
+            // memtable through this variant).
+            if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
+                let prefix = &key[..=last_slash];
+                if op_type == OpType::Delete || op_type == OpType::SingleDelete {
+                    if let Some(keys) = self.prefix_index.get_mut(prefix) {
+                        keys.retain(|k| &**k != key);
+                    }
+                } else if op_type == OpType::Put && was_new_key {
+                    let key_arc = Arc::<[u8]>::from(key);
+                    if let Some(slot) = self.prefix_index.get_mut(prefix) {
+                        slot.push(key_arc);
+                    } else {
+                        self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                    }
+                }
             }
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
@@ -1299,6 +1417,7 @@ impl VectorizedMemTable {
             } else {
                 Some(values.value(i))
             };
+            let was_new_key;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
                 entry.latest_seq = seq;
@@ -1310,6 +1429,7 @@ impl VectorizedMemTable {
                 } else {
                     entry.inline_value = None;
                 }
+                was_new_key = false;
             } else {
                 let inline_value = if op_values[i] == OpType::Put as u8
                     && val_bytes.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
@@ -1327,6 +1447,28 @@ impl VectorizedMemTable {
                         latest_op: op_values[i],
                     },
                 );
+                was_new_key = true;
+            }
+
+            // Prefix index: PR-B7-H3 — the FFM zero-copy Arrow batch-write
+            // hot path (Q12 / batchedPutArrow) is the primary reason C6-H3
+            // exists. Without this maintenance block the fast path in
+            // `prefix_scan_keys` always missed and silently fell back to the
+            // sorted_index merge — dead code in production.
+            if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
+                let prefix = &key[..=last_slash];
+                if op_type == OpType::Delete || op_type == OpType::SingleDelete {
+                    if let Some(keys) = self.prefix_index.get_mut(prefix) {
+                        keys.retain(|k| &**k != key);
+                    }
+                } else if op_type == OpType::Put && was_new_key {
+                    let key_arc = Arc::<[u8]>::from(key);
+                    if let Some(slot) = self.prefix_index.get_mut(prefix) {
+                        slot.push(key_arc);
+                    } else {
+                        self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                    }
+                }
             }
 
             // Approximate memory accounting matching put()/batch_insert().
@@ -1362,6 +1504,34 @@ impl VectorizedMemTable {
         }
         best.map(|idx| GetResult {
             value: self.value_at(idx.offset).map(|v| v.to_vec()),
+            sequence: idx.sequence,
+            op_type: idx.op_type,
+        })
+    }
+
+    /// Borrowed-value sibling of [`Self::find_latest`].
+    ///
+    /// PR-B7-H2: same selection logic, but constructs a
+    /// [`GetBorrowedResult`] whose `value` borrows from `self.value_data`
+    /// (the columnar payload buffer) via `value_at()`. No per-key
+    /// allocation. Used by [`Self::get_borrowed`] for the MVCC-snapshot
+    /// and oversized-Put paths where the inline cache is unavailable.
+    fn find_latest_borrowed(
+        &self,
+        indices: &[RowIndex],
+        read_sequence: u64,
+    ) -> Option<GetBorrowedResult<'_>> {
+        let mut best: Option<&RowIndex> = None;
+        for idx in indices {
+            if idx.sequence <= read_sequence {
+                match best {
+                    Some(b) if idx.sequence <= b.sequence => {}
+                    _ => best = Some(idx),
+                }
+            }
+        }
+        best.map(|idx| GetBorrowedResult {
+            value: self.value_at(idx.offset).map(MemtableValueRef::Inline),
             sequence: idx.sequence,
             op_type: idx.op_type,
         })
@@ -1553,6 +1723,72 @@ mod tests {
         assert_eq!(r.value, None);
         assert_eq!(r.op_type, OpType::Delete);
         assert_eq!(r.sequence, 2);
+    }
+
+    // PR-B7-H2: borrowed-value point lookup primitive coverage.
+    // These tests assert that `get_borrowed` returns a `MemtableValueRef::Inline`
+    // for the small-Put inline-cache hot path and that the borrow exposes the
+    // same bytes the legacy `get()` would have allocated.
+
+    #[test]
+    fn test_get_borrowed_inline_hit() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"key", Some(b"hot-value"), 1).unwrap();
+
+        let r = mt.get_borrowed(b"key", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.sequence, 1);
+        assert_eq!(r.op_type, OpType::Put);
+        let v = r.value.expect("Put with value must have borrowed bytes");
+        // Inline path: bytes borrowed from `inline_value: Box<[u8]>`.
+        match &v {
+            MemtableValueRef::Inline(slice) => assert_eq!(*slice, b"hot-value"),
+            MemtableValueRef::Heap(_) => {
+                panic!("small-Put should land on the inline-cache fast path")
+            }
+        }
+        assert_eq!(v.as_bytes(), b"hot-value");
+    }
+
+    #[test]
+    fn test_get_borrowed_missing_key() {
+        let mt = VectorizedMemTable::new(test_config());
+        let r = mt.get_borrowed(b"absent", u64::MAX).unwrap();
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn test_get_borrowed_tombstone() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.put(b"key", Some(b"v"), 1).unwrap();
+        mt.put(b"key", None, 0).unwrap();
+        let r = mt.get_borrowed(b"key", u64::MAX).unwrap().unwrap();
+        assert!(r.value.is_none());
+        assert_eq!(r.op_type, OpType::Delete);
+    }
+
+    #[test]
+    fn test_get_borrowed_matches_get() {
+        // Cross-check: `get_borrowed` must agree with `get` on every key.
+        let mut mt = VectorizedMemTable::new(test_config());
+        for i in 0..32u32 {
+            let k = format!("k{:03}", i);
+            let v = format!("value-{}", i);
+            mt.put(k.as_bytes(), Some(v.as_bytes()), 1).unwrap();
+        }
+        // Force a merge so the columnar (non-inline) path is also exercised
+        // for the unsorted vs sorted lookup.
+        mt.merge_unsorted_to_sorted();
+        for i in 0..32u32 {
+            let k = format!("k{:03}", i);
+            let owned = mt.get(k.as_bytes(), u64::MAX).unwrap().unwrap();
+            let borrowed = mt.get_borrowed(k.as_bytes(), u64::MAX).unwrap().unwrap();
+            assert_eq!(borrowed.sequence, owned.sequence);
+            assert_eq!(borrowed.op_type, owned.op_type);
+            assert_eq!(
+                borrowed.value.as_ref().map(|r| r.as_bytes().to_vec()),
+                owned.value
+            );
+        }
     }
 
     #[test]
@@ -2617,5 +2853,117 @@ mod tests {
         let r = mt.get(b"k", 1).unwrap().unwrap();
         assert_eq!(r.value, Some(b"v1".to_vec()));
         assert_eq!(r.sequence, 1);
+    }
+
+    // === PR-B7-H3: prefix_index population on batch-insert paths ===
+
+    /// Batch-inserts with composite-key pattern `prefix/X` must populate the
+    /// `prefix_index` so the C6-H3 fast path in `prefix_scan_keys` actually
+    /// activates. Pre-fix, the 3 batch paths skipped prefix_index maintenance
+    /// entirely — the fast path was dead code on Q12's batch-write hot path.
+    #[test]
+    fn batch_insert_populates_prefix_index_for_slash_terminated_prefixes() {
+        // --- variant 1: batch_insert_with_base_seq (default sharding path) ---
+        let mut mt = VectorizedMemTable::new(test_config());
+        let keys_owned: Vec<Vec<u8>> = (0..256)
+            .map(|i| format!("prefix/{:04}", i).into_bytes())
+            .collect();
+        let vals_owned: Vec<Vec<u8>> = (0..256u32).map(|i| i.to_le_bytes().to_vec()).collect();
+        let key_refs: Vec<&[u8]> = keys_owned.iter().map(|k| k.as_slice()).collect();
+        let val_refs: Vec<Option<&[u8]>> =
+            vals_owned.iter().map(|v| Some(v.as_slice())).collect();
+        let ops: Vec<u8> = vec![OpType::Put as u8; 256];
+
+        let inserted = mt
+            .batch_insert_with_base_seq(&key_refs, &val_refs, &ops, 1)
+            .unwrap();
+        assert_eq!(inserted, 256);
+
+        // FAST PATH ASSERTION: prefix_index must have a single bucket keyed by
+        // `prefix/` containing all 256 keys.
+        let bucket = mt
+            .prefix_index
+            .get(b"prefix/".as_slice())
+            .expect("prefix_index must contain `prefix/` after batch insert");
+        assert_eq!(
+            bucket.len(),
+            256,
+            "all 256 batch-inserted keys must be registered in prefix_index"
+        );
+
+        // Behavioural: prefix_scan_keys hits the fast path (lower ends with `/`)
+        // and returns exactly the 256 keys (Arc::clone, no byte-copy).
+        let scan_keys = mt.prefix_scan_keys(b"prefix/", None);
+        assert_eq!(scan_keys.len(), 256, "fast-path scan must return all keys");
+
+        // --- variant 2: batch_insert_with_explicit_seqs (sharded engine path) ---
+        let mut mt2 = VectorizedMemTable::new(test_config());
+        let seqs: Vec<u64> = (1..=256u64).collect();
+        mt2.batch_insert_with_explicit_seqs(&key_refs, &val_refs, &ops, &seqs)
+            .unwrap();
+        let bucket2 = mt2
+            .prefix_index
+            .get(b"prefix/".as_slice())
+            .expect("explicit-seqs path must also populate prefix_index");
+        assert_eq!(bucket2.len(), 256);
+        assert_eq!(mt2.prefix_scan_keys(b"prefix/", None).len(), 256);
+
+        // --- variant 3: batch_put_arrow_with_base_seq (FFM zero-copy path) ---
+        let mut mt3 = VectorizedMemTable::new(test_config());
+        let mut kb = BinaryBuilder::new();
+        let mut vb = BinaryBuilder::new();
+        let mut ob = UInt8Builder::new();
+        for i in 0..256 {
+            kb.append_value(&keys_owned[i]);
+            vb.append_value(&vals_owned[i]);
+            ob.append_value(OpType::Put as u8);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
+            Field::new("op_type", DataType::UInt8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(kb.finish()),
+                Arc::new(vb.finish()),
+                Arc::new(ob.finish()),
+            ],
+        )
+        .unwrap();
+        mt3.batch_put_arrow_with_base_seq(&batch, 1).unwrap();
+        let bucket3 = mt3
+            .prefix_index
+            .get(b"prefix/".as_slice())
+            .expect("arrow batch path must also populate prefix_index");
+        assert_eq!(bucket3.len(), 256);
+        assert_eq!(mt3.prefix_scan_keys(b"prefix/", None).len(), 256);
+
+        // --- de-dup check: re-inserting the same keys must NOT double-count.
+        // (Mirrors the single-write `is_new_key` gate so updates to an existing
+        // composite key don't grow the bucket.)
+        mt.batch_insert_with_base_seq(&key_refs, &val_refs, &ops, 1000)
+            .unwrap();
+        let bucket_after_update = mt.prefix_index.get(b"prefix/".as_slice()).unwrap();
+        assert_eq!(
+            bucket_after_update.len(),
+            256,
+            "re-inserting existing keys must not duplicate prefix_index entries"
+        );
+
+        // --- mixed-prefix sanity: a second prefix must produce a second bucket.
+        let mixed_keys_owned: Vec<Vec<u8>> = (0..4)
+            .map(|i| format!("other/{}", i).into_bytes())
+            .collect();
+        let mixed_key_refs: Vec<&[u8]> =
+            mixed_keys_owned.iter().map(|k| k.as_slice()).collect();
+        let mixed_vals: Vec<Option<&[u8]>> = vec![Some(b"x".as_slice()); 4];
+        let mixed_ops: Vec<u8> = vec![OpType::Put as u8; 4];
+        mt.batch_insert_with_base_seq(&mixed_key_refs, &mixed_vals, &mixed_ops, 2000)
+            .unwrap();
+        assert_eq!(mt.prefix_index.get(b"other/".as_slice()).unwrap().len(), 4);
+        // Original bucket still 256, untouched.
+        assert_eq!(mt.prefix_index.get(b"prefix/".as_slice()).unwrap().len(), 256);
     }
 }

@@ -41,6 +41,81 @@ pub struct GetResult {
     pub op_type: OpType,
 }
 
+/// Borrowed value reference returned by the zero-copy point-lookup
+/// primitive [`crate::memtable::VectorizedMemTable::get_borrowed`].
+///
+/// PR-B7-H2: callers that route through `prefix_scan_iter_owned`'s
+/// streaming hot path want to skip the per-row `Vec<u8>` materialisation
+/// baked into the legacy `get() -> Option<GetResult>` signature. This
+/// enum exposes the two sources of value bytes the memtable holds:
+///
+/// - `Inline(&'a [u8])` — borrows directly from the `inline_value`
+///   `Box<[u8]>` cache (the small-Put fast path) OR from the columnar
+///   `value_data: Vec<u8>` buffer (the MVCC/oversized fallback). The
+///   borrow is valid for `'a` (the lifetime of the `&self` borrow that
+///   produced it); no per-key allocation occurs.
+/// - `Heap(Vec<u8>)` — reserved for sources that legitimately materialise
+///   a fresh allocation (e.g. future merge-operator results that combine
+///   multiple stored versions into a new buffer). Currently unused on
+///   the hot path; kept in the enum so the API is forward-compatible
+///   without breaking changes.
+///
+/// Both variants implement [`AsRef<[u8]>`] for uniform consumption.
+#[derive(Debug)]
+pub enum MemtableValueRef<'a> {
+    /// Value bytes borrowed from the memtable's own storage. No
+    /// allocation; valid until the next write to this key.
+    Inline(&'a [u8]),
+    /// Value bytes owned by the caller. Used when the read path had to
+    /// allocate (e.g. merge result). Rare on the hot path.
+    Heap(Vec<u8>),
+}
+
+impl<'a> MemtableValueRef<'a> {
+    /// Borrows the underlying bytes without consuming the reference.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            MemtableValueRef::Inline(s) => s,
+            MemtableValueRef::Heap(v) => v.as_slice(),
+        }
+    }
+
+    /// Consumes the reference into an owned `Vec<u8>`. For `Inline` this
+    /// allocates and copies; for `Heap` it is a move (no copy). Callers
+    /// that emit through a `Vec<u8>`-typed channel use this at the
+    /// emission boundary, after the borrowed view is no longer needed.
+    #[inline]
+    pub fn into_owned(self) -> Vec<u8> {
+        match self {
+            MemtableValueRef::Inline(s) => s.to_vec(),
+            MemtableValueRef::Heap(v) => v,
+        }
+    }
+}
+
+impl<'a> AsRef<[u8]> for MemtableValueRef<'a> {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// Borrowed-value form of [`GetResult`] returned by
+/// [`crate::memtable::VectorizedMemTable::get_borrowed`].
+///
+/// PR-B7-H2: see [`MemtableValueRef`] for the rationale. The `value`
+/// is `None` for delete tombstones, matching `GetResult` semantics.
+#[derive(Debug)]
+pub struct GetBorrowedResult<'a> {
+    /// The value bytes. `None` for delete tombstones.
+    pub value: Option<MemtableValueRef<'a>>,
+    /// The sequence number of this entry.
+    pub sequence: u64,
+    /// The operation type (Put, Delete, Merge).
+    pub op_type: OpType,
+}
+
 /// Output sink for batch point-lookups that accepts borrowed slices.
 ///
 /// PR-C6-H2: callers that want to write read values directly into a

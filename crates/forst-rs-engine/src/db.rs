@@ -109,7 +109,9 @@ pub const DEFAULT_CF_NAME: &str = "default";
 // PR-C6-H2: re-export `ValueSink` from the storage layer so callers
 // who already depend on `forst-rs-engine` do not need to take a direct
 // dep on `forst-rs-storage` just to name the trait.
-pub use forst_rs_storage::memtable::{SinkGetOutcome, ValueSink};
+pub use forst_rs_storage::memtable::{
+    GetBorrowedResult, MemtableValueRef, SinkGetOutcome, ValueSink,
+};
 
 /// `BinaryBuilder` implements `ValueSink` so the engine can stream the
 /// memtable inline-cache fast path directly into an Arrow value
@@ -2486,28 +2488,76 @@ impl DbImpl {
         prefix: &[u8],
     ) -> ForstResult<Box<dyn Iterator<Item = ForstResult<(Vec<u8>, Vec<u8>)>> + Send + 'static>>
     {
+        use std::collections::BTreeSet;
+
         let upper = prefix_upper_bound(prefix);
+        let upper_slice = upper.as_deref();
         let cf_data = self.lookup_cf_by_id(cf.id())?;
 
+        // A7-H2: enumerate keys across ALL three tiers (active memtable, immutable
+        // memtables, live SSTs) and dedup into a sorted BTreeSet. The previous
+        // implementation only walked the active memtable's prefix-index, so any row
+        // that had rotated into an immutable memtable or flushed to an SST silently
+        // VANISHED from the iterator (Q11 `entries()` saw rowloss after flush). The
+        // full `scan()` at db.rs:2342 already does this dedup; we mirror that pattern.
+        //
+        // Trade-off vs C6-H3: the active-memtable fast path used to return
+        // `Vec<Arc<[u8]>>` so the key bytes were Arc-shared with the memtable's
+        // prefix-index. Immutable memtables and SST readers do not share that Arc
+        // store, so we materialise into owned `Vec<u8>` for cross-tier uniformity.
+        // Correctness > Arc savings (the spec explicitly accepts this regression).
+        //
+        // PR-B7-H1 review: switching the BTreeSet to `Arc<[u8]>` was evaluated and
+        // rejected — stable Rust has no zero-copy `Arc<[u8]>` → `Vec<u8>` path, so
+        // the per-key memcpy is unavoidable at the iterator emission boundary
+        // regardless of which type the BTreeSet uses. The current
+        // `k.as_ref().to_vec()` at insert time is provably equivalent and avoids
+        // an extra `Arc::from(&[u8])` allocation on the SST tier.
+        let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
+
+        // Tier 1: active memtable — Arc<[u8]> from the prefix-index is converted to
+        // an owned Vec<u8> at insert time.
         let mem_arc = cf_data.active_memtable();
-        let keys = mem_arc.prefix_scan_keys(prefix, upper.as_deref());
+        for k in mem_arc.prefix_scan_keys(prefix, upper_slice) {
+            keys.insert(k.as_ref().to_vec());
+        }
+        // Tier 2: immutable memtables. ShardedMemTable exposes the same
+        // prefix_scan_keys API; we walk each in turn.
+        for imm in cf_data.imm_memtables() {
+            for k in imm.prefix_scan_keys(prefix, upper_slice) {
+                keys.insert(k.as_ref().to_vec());
+            }
+        }
+        // Tier 3: live SSTs. Reuse the same range-overlap fast-skip as scan() and
+        // pull keys via scan_borrowed (no per-row value copy).
+        let version = self.version_set.current();
+        for sst in version.live_sst_files() {
+            if sst.largest_key.as_slice() < prefix {
+                continue;
+            }
+            if let Some(hi) = upper_slice {
+                if sst.smallest_key.as_slice() >= hi {
+                    continue;
+                }
+            }
+            let reader = self.get_or_open_sst_reader(&sst)?;
+            reader.scan_borrowed(prefix, upper_slice, |view| {
+                keys.insert(view.key.to_vec());
+                Ok(())
+            })?;
+        }
+
         let cf_handle = cf.clone();
-        let mem_arc_capture = mem_arc.clone();
         let db = Arc::clone(self);
 
-        let read_seq = u64::MAX;
+        // Stream the value lookup via the unified read path. Using `db.get(...)`
+        // (rather than the active-memtable inline-cache fast path) ensures that
+        // tombstones in higher tiers correctly hide rows from lower tiers and
+        // merge operands are resolved.
         Ok(Box::new(keys.into_iter().filter_map(move |key| {
-            let key_slice: &[u8] = key.as_ref();
-            match mem_arc_capture.get(key_slice, read_seq) {
-                Ok(Some(entry)) if entry.op_type == OpType::Put => entry
-                    .value
-                    .map(|value| Ok((key_slice.to_vec(), value))),
-                Ok(Some(_)) => None,
-                Ok(None) => match db.get(&cf_handle, key_slice) {
-                    Ok(Some(value)) => Some(Ok((key_slice.to_vec(), value))),
-                    Ok(None) => None,
-                    Err(e) => Some(Err(e)),
-                },
+            match db.get(&cf_handle, &key) {
+                Ok(Some(value)) => Some(Ok((key, value))),
+                Ok(None) => None,
                 Err(e) => Some(Err(e)),
             }
         })))
@@ -4604,6 +4654,54 @@ mod tests {
         db.put(&cf, b"b", b"3").unwrap();
         let out = db.prefix_scan(&cf, b"a").unwrap();
         assert_eq!(out.len(), 2);
+    }
+
+    /// A7-H2 regression test: `prefix_scan_iter_owned` must see ALL rows under the
+    /// prefix even after the active memtable has flushed to SST. The previous
+    /// implementation only walked the active memtable's prefix-index, so after a
+    /// flush rotated rows out of the active memtable they vanished from the
+    /// iterator (Q11 `entries()` silent rowloss).
+    #[test]
+    fn prefix_scan_iter_after_flush_sees_all_rows() {
+        let db = open();
+        let cf = db.default_cf();
+
+        // Seed three rows under `user:` before any flush.
+        db.put(&cf, b"user:a", b"A").unwrap();
+        db.put(&cf, b"user:b", b"B").unwrap();
+        db.put(&cf, b"user:c", b"C").unwrap();
+        // Also seed a row outside the prefix to assert it is not picked up.
+        db.put(&cf, b"order:1", b"O1").unwrap();
+
+        // Open the owned iterator BEFORE flush (mirroring the FFI chunked-iter
+        // contract: the iterator is registered in a per-shard slot at open
+        // time, then drained later — possibly across flush boundaries).
+        let iter = db.prefix_scan_iter_owned(&cf, b"user:").unwrap();
+
+        // Force the active memtable to rotate to an SST. After this call the
+        // prefix-index of the active memtable no longer contains the seeded
+        // rows; only the SST does.
+        db.switch_and_flush(&cf).unwrap().expect("flush produced sst");
+
+        // Drain the iter and verify all three rows are visible in sorted order.
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = iter.collect::<ForstResult<Vec<_>>>().unwrap();
+        out.sort_by(|l, r| l.0.cmp(&r.0));
+        assert_eq!(
+            out,
+            vec![
+                (b"user:a".to_vec(), b"A".to_vec()),
+                (b"user:b".to_vec(), b"B".to_vec()),
+                (b"user:c".to_vec(), b"C".to_vec()),
+            ],
+            "prefix_scan_iter_owned must enumerate active mem + imm mems + SSTs"
+        );
+
+        // Re-open after flush — same expectation, this time the SST is the
+        // only tier holding the rows when the iterator is constructed.
+        let iter2 = db.prefix_scan_iter_owned(&cf, b"user:").unwrap();
+        let mut out2: Vec<(Vec<u8>, Vec<u8>)> = iter2.collect::<ForstResult<Vec<_>>>().unwrap();
+        out2.sort_by(|l, r| l.0.cmp(&r.0));
+        assert_eq!(out2.len(), 3);
     }
 
     // --- W15 compaction tests ---

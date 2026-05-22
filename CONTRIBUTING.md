@@ -43,11 +43,59 @@ This portfolio-aware rule supersedes the earlier "any > 5 % regression auto-reve
 
 Benchmark variance is real (criterion ~5-10 % between runs on the same machine; macOS thermal throttling can add another 10 %). Numbers from prior commits drift. Before measuring your change, run the same query on the current `main` to establish the baseline — then run the same query with your change applied. **Compare those two same-session numbers, not your change vs a number from a week-old report.**
 
+### MUST: Document the 3-layer state-class call stack with grep evidence
+
+Any fix targeting a specific query — Nexmark, TPC-H, or otherwise — must list, in the commit message or the spec it implements, **the actual state-class call stack the query traverses, with at least three layers**: the operator class, the state primitive (Value/Map/List/Reducing/Aggregating), and the backend implementation class. Each layer must cite a file path and the grep that confirmed it.
+
+**Example (good):**
+
+```
+Q12 (PROCTIME tumble) state-class call stack:
+  Layer 1: AsyncStateWindowAggOperator
+           flink-table-runtime/.../window/async/tvf/common/AsyncStateWindowAggOperator.java:75
+           grep: "windowProcessor" in operators/window/async/tvf/common/
+  Layer 2: WindowAsyncValueState<W> wrapping InternalValueState<RowData, W, RowData>
+           flink-table-runtime/.../operators/window/async/tvf/state/WindowAsyncValueState.java
+           grep: "WindowAsyncValueState\|WindowAsyncMapState\|WindowAsyncListState"
+                 → ONLY WindowAsyncValueState exists; no MapState/ListState wrappers.
+  Layer 3: ForStRsValueStateV2 (resolves via getOrCreateKeyedState on ValueStateDescriptor)
+           flink-statebackend-forst-rs/.../state/ForStRsValueStateV2.java
+           grep: "extends AbstractValueState"
+```
+
+**Example (bad — caused multi-day misdirection in 2026-05-19 MapStateCache work):**
+
+```
+Q11/Q12 fix: add LRU cache to MapStateV2 hot path.
+```
+
+The bad example assumed Q11/Q12 hit MapState. They do not. A single grep — `WindowAsyncMapState` returning zero hits across `flink-table-runtime/` — would have caught the misattribution before any code was written. Multiple engineer-days were spent building, benching, reverting, and re-shipping `MapStateCache` under that unvalidated assumption. The fix code is still in the tree but cannot help the target queries.
+
+**Rule:** if you cannot produce three layers of evidence, the fix is targeting an assumed code path, not a verified one. Stop and grep. The cost of the grep is seconds; the cost of a wrong-layer fix is days.
+
+This rule is grounded in [`2026-05-19-q11q12-state-primitive-audit.md`](docs/superpowers/specs/2026-05-19-q11q12-state-primitive-audit.md), the post-mortem that pinned the MapStateCache mis-attribution.
+
 ### MUST: Bench the wins, not just the targeted regression
 
 When fixing a regression (e.g., Q12), it's tempting to bench only Q12. **Always bench at least one representative win (e.g., Q5 or Q7) in the same iteration.** Changes that fix the targeted query but inflate the existing wins are net-negative and must be caught early.
 
 The 2026-05-19 Fix #1 attempt would have shipped if the engineer had benched Q11 only (a +9.6 % win) and not Q12 (a +10.7 % regression). Always bench both.
+
+### SHOULD: Stop when the dominant cost moves outside your layer
+
+If profiling or analysis shows the dominant cost has moved outside the layer you are currently optimizing — for example, you are tuning the forst-rs Java backend but the bottleneck is now in the Flink runtime's AEC dispatch policy, or you are tuning the engine's `frs_vectorized_batch_get` but the bottleneck is now in FFM crossing frequency — **document the ceiling, stop current-layer optimization, and surface the cross-layer fix as its own work item**.
+
+The cross-layer fix needs its own design, its own bench cycle, and its own PR. It must **not** be smuggled into the current layer's PR. Two layers in one commit re-opens the attribution problem (you cannot tell which layer's change caused which delta) and obscures the fact that the original layer's optimizations are at their floor.
+
+**Example (this happened on 2026-05-19):** the forst-rs-only Q11/Q12 speedup session minimized per-record Java overhead (composite key cache for RMW pairs) to the point where the remaining Q12 cost is bounded by `FFM crossings × engine per-op cost`. Both are Rust-engine concerns. The right move was to **stop adding Java-side optimizations**, document the ceiling in [`2026-05-19-q11q12-speedup-execution-plan.md`](docs/superpowers/specs/2026-05-19-q11q12-speedup-execution-plan.md), and surface `merge_compute_into` (RMW fusion engine API) as a separate V1.1 work item. Continuing to look for Java-side wins past that point would have produced churn with no measurable impact — and risked mixing in a wrong-layer fix.
+
+**Mechanics:**
+
+- In the PR or spec, write a one-paragraph **Ceiling Statement**: "this layer's cost contribution is X; the remaining cost is in layer Y. Continuing here yields diminishing returns. The next-larger lever is Z, which lives in layer Y and is filed as ticket/spec W."
+- File the cross-layer fix as a separate work item with its own gating measurement (e.g., flamegraph or §6-style instrumentation).
+- Do not mix the cross-layer change with the current layer's optimization PR.
+
+This rule supersedes the implicit "keep grinding until you're out of ideas" stance. Stop when the data says you should.
 
 ### SHOULD: Async-Profiler / perf flamegraph before architectural changes
 
