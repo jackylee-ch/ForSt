@@ -180,7 +180,16 @@ impl CachedFileSystem {
         // objects, and SST file sizes (~64 MiB by default) are below the
         // threshold where streaming would matter.
         let mut reader = self.remote.open_sequential_file(path)?;
-        let mut bytes = Vec::new();
+        // Round-3 fix C-R2-H1: pre-allocate the destination Vec to the file size when
+        // available — saves ~log2(file_size/64KiB) reallocations + memcpys per cold load.
+        // For 64 MiB SST files that's 10 doubling reallocs / ~250 MiB of memcpy.
+        let cap_hint = self
+            .remote
+            .get_file_metadata(path)
+            .ok()
+            .map(|m| m.size as usize)
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(cap_hint);
         let mut chunk = vec![0u8; 64 * 1024];
         loop {
             let n = reader.read(&mut chunk)?;
