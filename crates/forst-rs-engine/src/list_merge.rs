@@ -43,6 +43,28 @@ impl ListMergeCombiner {
         }
         out
     }
+
+    /// Round-1 fix C-H4: zero-clone variants that accept borrowed slices instead
+    /// of `Vec<Vec<u8>>`. Used by `frs_vec_merge_append_batch` to avoid cloning
+    /// caller-owned operand bytes into owned Vecs solely to satisfy the signature.
+    pub fn combine_slices(&self, operands: &[&[u8]]) -> Vec<u8> {
+        let total: usize = operands.iter().map(|o| o.len()).sum();
+        let mut out = Vec::with_capacity(total);
+        for op in operands {
+            out.extend_from_slice(op);
+        }
+        out
+    }
+
+    pub fn combine_with_base_slices(&self, base: &[u8], operands: &[&[u8]]) -> Vec<u8> {
+        let total = base.len() + operands.iter().map(|o| o.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(base);
+        for op in operands {
+            out.extend_from_slice(op);
+        }
+        out
+    }
 }
 
 impl Default for ListMergeCombiner {

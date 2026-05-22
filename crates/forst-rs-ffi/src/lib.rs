@@ -4035,17 +4035,19 @@ pub unsafe extern "C" fn frs_vec_merge_append_batch(
         }
 
         // For each distinct key, read existing, combine, write back.
+        // Round-1 fix C-H4: pass borrowed slice array directly instead of cloning
+        // each operand into Vec<u8>. Saves one Vec alloc + memcpy per operand
+        // (Q19 ~3 LIST_ADD/event × 100M events = 300M clones eliminated).
         let combiner = ListMergeCombiner::new();
         for (key, ops) in grouped.iter() {
-            let owned_ops: Vec<Vec<u8>> = ops.iter().map(|s| s.to_vec()).collect();
             let existing: Vec<u8> = match db_ref.get(cf_ref, key) {
                 Ok(opt) => opt.unwrap_or_default(),
                 Err(e) => return error_to_frs_code(&e),
             };
             let merged = if existing.is_empty() {
-                combiner.combine(&owned_ops)
+                combiner.combine_slices(ops.as_slice())
             } else {
-                combiner.combine_with_base(&existing, &owned_ops)
+                combiner.combine_with_base_slices(&existing, ops.as_slice())
             };
             if let Err(e) = db_ref.put(cf_ref, key, &merged) {
                 return error_to_frs_code(&e);
