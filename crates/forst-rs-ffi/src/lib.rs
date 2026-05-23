@@ -353,6 +353,19 @@ unsafe fn cstr_to_str(p: &*const c_char) -> Option<&str> {
     CStr::from_ptr(*p).to_str().ok()
 }
 
+/// Clone an `Arc<DbImpl>` from an opaque FFI handle.
+///
+/// # SAFETY
+/// - (a) `h` MUST originate from a prior `Box::into_raw(Box::new(Arc<DbImpl>))`
+///   issued by `frs_db_open_*`. Passing any other pointer is undefined behaviour.
+/// - (b) No concurrent call to `frs_db_close(h)` (or any other deallocation
+///   path that drops the boxed `Arc`) may overlap with this call. The boxed
+///   `Arc` lives behind `h`; close drops the box and invalidates the pointer.
+///   External synchronization is required if close may race with this call.
+/// - (c) `h` MUST be properly aligned for `Arc<DbImpl>` — this is guaranteed
+///   for any pointer produced by `Box::new`, but unaligned pointers (e.g.
+///   from a corrupted handle that callers re-cast) trigger undefined
+///   behaviour on the `*ptr` dereference below.
 unsafe fn db_from_handle(h: FrsDb) -> Option<Arc<DbImpl>> {
     if h.is_null() {
         return None;
@@ -361,15 +374,30 @@ unsafe fn db_from_handle(h: FrsDb) -> Option<Arc<DbImpl>> {
     Some((*ptr).clone())
 }
 
+/// Reconstruct ownership of a `Box<ColumnFamilyHandle>` from an opaque FFI handle.
+///
+/// Reconstructs the `Box<ColumnFamilyHandle>` from the raw pointer, taking
+/// ownership back from C. When the returned `Box` is dropped the handle is
+/// freed; callers that intend to keep the handle alive must use
+/// [`cf_ref`] instead, or must `Box::into_raw` the returned box before it
+/// goes out of scope.
+///
+/// # SAFETY
+/// - (a) `h` MUST originate from a prior
+///   `Box::into_raw(Box::new(ColumnFamilyHandle))` issued by `frs_cf_create_*`
+///   / `frs_cf_open_*`. Any other provenance is undefined behaviour because
+///   `Box::from_raw` would attempt to free memory it does not own.
+/// - (b) No concurrent close of the underlying CF handle (e.g.
+///   `frs_cf_close(h)`) may overlap with this call. The handle behind `h` is
+///   exclusively re-owned by the returned `Box` — a parallel close would
+///   double-free. External synchronization is required if close may race.
+/// - (c) `h` MUST be properly aligned for `ColumnFamilyHandle` — guaranteed
+///   for `Box::new`-produced pointers, but corrupted / re-cast handles would
+///   trigger undefined behaviour on `Box::from_raw`.
 unsafe fn cf_from_handle(h: FrsCfHandle) -> Option<Box<ColumnFamilyHandle>> {
     if h.is_null() {
         return None;
     }
-    // Reconstructs the `Box<ColumnFamilyHandle>` from the raw pointer, taking
-    // ownership back from C. When the returned `Box` is dropped the handle is
-    // freed; callers that intend to keep the handle alive must use
-    // [`cf_ref`] instead, or must `Box::into_raw` the returned box before it
-    // goes out of scope.
     let ptr = h as *mut ColumnFamilyHandle;
     Some(Box::from_raw(ptr))
 }
