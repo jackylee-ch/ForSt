@@ -127,6 +127,22 @@ impl WriteController {
     /// and at the 60s mark the task is marked unresponsive. Even a sub-heartbeat stall
     /// (5-30s) starves every other operator sharing the slot.
     ///
+    /// **R25-L1 — same risk on smaller scale for `ThrottleDecision::Slowdown`.** The
+    /// `Slowdown` branch issues `std::thread::sleep(slowdown_delay)` (default 1ms)
+    /// on the calling thread. On the Flink mailbox path each engine write call
+    /// therefore parks the mailbox for `slowdown_delay`; under a sustained `Slowdown`
+    /// condition (steady L0 pressure where `l0_slowdown_trigger ≤ l0 <
+    /// l0_stop_trigger`) the mailbox progresses at ~1/`slowdown_delay` ops/sec
+    /// instead of returning control to the operator's mailbox loop. Each individual
+    /// sleep is short, but the integral of N back-to-back ops still freezes the
+    /// mailbox for the same wall-clock interval — the heartbeat watchdog warning is
+    /// only avoided because no single sleep crosses the 50s threshold. The same
+    /// async-status migration plan that fixes `Stall` (`WouldBlock` / `BUSY` return
+    /// + Java-side park-and-retry through the async-state framework) is the proper
+    /// fix; operators currently mitigate by ensuring `slowdown_delay` is small
+    /// enough that the per-op cost is acceptable AND `l0_slowdown_trigger` carries
+    /// enough headroom that steady-state ops do not enter the Slowdown branch at all.
+    ///
     /// The correct fix is to return a non-blocking `ThrottleDecision::WouldBlock` /
     /// `BUSY`-style status from the FFI so the Java side can park-and-retry through
     /// the async-state framework (releasing the mailbox while parked). That change
@@ -140,6 +156,8 @@ impl WriteController {
         match self.check() {
             ThrottleDecision::Proceed => Ok(()),
             ThrottleDecision::Slowdown => {
+                // R25-L1: blocks the mailbox thread for `slowdown_delay`; see the
+                // method-level doc-comment for the mitigation plan.
                 std::thread::sleep(self.config.slowdown_delay);
                 Ok(())
             }
