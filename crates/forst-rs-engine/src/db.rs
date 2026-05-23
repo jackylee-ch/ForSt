@@ -4290,12 +4290,35 @@ impl Iterator for LazyPrefixIter {
                             if let Some(slot) = self.shared_error_slot.as_ref() {
                                 let mut guard =
                                     slot.lock().unwrap_or_else(|p| p.into_inner());
-                                let msg = format!("{e}");
-                                *guard = Some(e);
-                                self.last_error =
-                                    Some(ForstError::Aborted(format!(
-                                        "tier peek error (published to FFI slot): {msg}"
-                                    )));
+                                // R18-M3: sticky-FIRST. If the FFI consumer
+                                // has not yet drained a prior error in this
+                                // chunk, preserve it — a later tier-peek
+                                // failure may be a cascade of the first
+                                // and the first is more diagnosable. Pre-
+                                // fix `*guard = Some(e)` overwrote
+                                // unconditionally, hiding root causes when
+                                // multiple tiers failed in the same pass.
+                                if guard.is_none() {
+                                    *guard = Some(e);
+                                }
+                                // R18-L2: when the shared FFI slot is wired,
+                                // the FFI consumer reads errors strictly
+                                // through the slot. Pre-fix this branch
+                                // recorded a sentinel string in `last_error`
+                                // ostensibly to "preserve the in-process
+                                // `take_last_error()` API contract", but that
+                                // dual-channel publish is now wrong: a single
+                                // tier-peek error would surface BOTH through
+                                // the slot AND through `take_last_error()`,
+                                // and downstream FFI consumers (e.g.,
+                                // fill_chunk_from_iter) double-counted it as
+                                // two separate errors. Leave `last_error` as
+                                // None — the slot is the authoritative
+                                // channel when wired. Callers using
+                                // LazyPrefixIter directly (without an FFI
+                                // shared slot) take the else-branch below
+                                // and observe the error through
+                                // `take_last_error()` as before.
                             } else {
                                 self.last_error = Some(e);
                             }

@@ -3659,6 +3659,15 @@ struct IterHandle {
     inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send>,
     pending: Option<(IterKey, IterValue)>,
     aborted: AtomicBool,
+    /// R18-M4: terminal flag set once a deferred error has been surfaced to the
+    /// FFI caller. Subsequent `_next` calls observe `terminal == true` and
+    /// return an empty chunk + `FrsErrorCode::Ok` (EOF), instead of pulling
+    /// more rows from the underlying source. Pre-fix, surfacing the deferred
+    /// error at chunk N+1 left the iterator otherwise live; chunk N+2 would
+    /// return rows from OTHER tier sources (the multi-tier iterator chains
+    /// past the failed tier transparently), confusing the Java consumer which
+    /// had just received an error code and expected the iterator to be done.
+    terminal: AtomicBool,
     /// R16-M2: shared error slot populated by the wrapping
     /// `filter_map`/error-tap closure when the upstream iterator yields an
     /// `Err(_)`. The FFI consumer (`fill_chunk_from_iter` / open / next /
@@ -3696,7 +3705,21 @@ impl IterHandle {
             aborted: AtomicBool::new(false),
             last_error,
             deferred_error: None,
+            terminal: AtomicBool::new(false),
         }
+    }
+
+    /// R18-M4: mark the iterator as terminal. Called after a deferred error
+    /// has been surfaced to the FFI caller; subsequent `_next` calls return
+    /// empty chunks + Ok (EOF semantics) instead of pulling more rows.
+    fn mark_terminal(&self) {
+        self.terminal.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// R18-M4: query the terminal flag. Used by `frs_vec_iter_prefix_next`
+    /// to short-circuit further pulls once the iterator has been retired.
+    fn is_terminal(&self) -> bool {
+        self.terminal.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// R16-M2 + R17-L2: take + clear the last error captured by the upstream
@@ -3920,14 +3943,23 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             Box::new(owned_iter.filter_map(move |r| match r {
                 Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
                 Err(e) => {
-                    // Sticky last-error: a later error overwrites an earlier
-                    // one. The FFI consumer drains via `take_last_error()`
-                    // after every chunk so per-row errors do not accumulate
-                    // beyond a single chunk.
+                    // R18-M3: sticky-FIRST. The FFI consumer drains via
+                    // `take_last_error()` after every chunk so within a
+                    // single chunk we MUST preserve the first error: a
+                    // later error may be a cascade of the first (e.g.,
+                    // tier-source IO failure → downstream merge errors)
+                    // and the first is the most diagnosable cause. Pre-
+                    // fix `*guard = Some(e)` overwrote unconditionally,
+                    // returning the LAST cascade error to the Java side
+                    // and burying the actual root cause. Tolerate a
+                    // poisoned mutex — overwriting a poisoned slot is
+                    // benign because we only write when empty.
                     let mut guard = error_slot_inner
                         .lock()
                         .unwrap_or_else(|p| p.into_inner());
-                    *guard = Some(e);
+                    if guard.is_none() {
+                        *guard = Some(e);
+                    }
                     None
                 }
             }));
@@ -4012,6 +4044,18 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
             Some(it) => it,
             None => return FrsErrorCode::IterCursorInvalid as i32,
         };
+        // R18-M4: if a prior `_next` surfaced a deferred error and marked
+        // the iterator terminal, return EOF without pulling further rows.
+        // Pre-fix, after surfacing the deferred error the iterator was
+        // otherwise live — the next call would return rows from OTHER tier
+        // sources (multi-tier chains past the failed tier transparently),
+        // surprising the Java consumer which had just received an error
+        // code and expected the iterator to be done.
+        if iter.is_terminal() {
+            *out_row_count = 0;
+            *out_bytes_used = 0;
+            return FrsErrorCode::Ok as i32;
+        }
         // R17-M3: drain any deferred error from the previous chunk's
         // partial-chunk fill BEFORE pulling new rows. The caller has already
         // observed the partial rows that triggered this error, so we now owe
@@ -4019,6 +4063,9 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
         if let Some(err) = iter.take_deferred_error() {
             *out_row_count = 0;
             *out_bytes_used = 0;
+            // R18-M4: mark terminal so subsequent _next calls don't reach
+            // past the failed tier into surviving tier sources.
+            iter.mark_terminal();
             return error_to_frs_code(&err);
         }
         let (bytes_used, row_count) =
@@ -4038,6 +4085,10 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
         // this call (no rows to drain first).
         if let Some(err) = iter.take_last_error() {
             if row_count == 0 {
+                // R18-M4: error surfaced with no rows to drain first — mark
+                // terminal here so the next call cannot reach past the
+                // failed tier into surviving tier sources.
+                iter.mark_terminal();
                 return error_to_frs_code(&err);
             }
             iter.set_deferred_error(err);
@@ -4287,10 +4338,16 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                 Box::new(owned_iter.filter_map(move |r| match r {
                     Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
                     Err(e) => {
+                        // R18-M3: sticky-FIRST — preserve the first error in
+                        // the chunk so cascade errors do not bury the root
+                        // cause. See the matching comment on the single-shot
+                        // `frs_vec_iter_prefix_open` path above.
                         let mut guard = batch_error_slot_inner
                             .lock()
                             .unwrap_or_else(|p| p.into_inner());
-                        *guard = Some(e);
+                        if guard.is_none() {
+                            *guard = Some(e);
+                        }
                         None
                     }
                 }));

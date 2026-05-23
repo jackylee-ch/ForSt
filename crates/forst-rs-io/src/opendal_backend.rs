@@ -221,10 +221,15 @@ impl OpendalFileSystem {
     pub fn with_operator(op: Operator) -> ForstResult<Self> {
         let rt = RuntimeHandle::acquire()?;
         let name = format!("OpendalFileSystem({})", op.info().scheme().into_static());
-        // RetryLayer is idempotent w.r.t. layering: applying it twice
-        // multiplies retries, which is not what we want. Callers that
-        // need a custom retry policy should use
-        // `with_operator_no_retry`.
+        // R18-L1: RetryLayer is NOT idempotent w.r.t. layering — applying
+        // it twice MULTIPLIES retries (each layer wraps the previous, so
+        // the effective retry count becomes outer * inner), which is not
+        // what we want. Callers that already have a retry policy on their
+        // operator should use `with_operator_no_retry` to avoid the
+        // double-layer. The pre-fix comment claimed idempotency in the
+        // first sentence but contradicted itself in the next — the
+        // multiplicative behaviour is the actual semantics, and the
+        // wording here now matches.
         let op = op.layer(default_retry_layer());
         Ok(Self { op, rt, name })
     }
