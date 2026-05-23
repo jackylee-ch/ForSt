@@ -36,7 +36,9 @@ use forst_rs_storage::cache::clock::ShardedClockCache;
 use forst_rs_storage::cached_fs::CachedFileSystem;
 use forst_rs_storage::local_cache::LocalCache;
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
-use forst_rs_storage::version::{SstFileMeta, Version, VersionEdit, VersionSetImpl};
+use forst_rs_storage::version::{
+    SstFileMeta, Version, VersionEdit, VersionSetImpl, VersionSetSnapshot,
+};
 
 use crate::checkpoint::{
     copy_live_ssts, serialize_snapshot, write_blob, CheckpointManifest, CHECKPOINT_BLOB_NAME,
@@ -178,6 +180,44 @@ pub struct IncrementalCheckpointResult {
     pub new_ssts: Vec<LiveFileInfo>,
     /// SSTs shared with `base_checkpoint_id` — caller can reuse handles.
     pub shared_ssts: Vec<LiveFileInfo>,
+}
+
+/// RAII guard that releases a previously-reserved chunk back to the cross-CF
+/// [`WriteBufferManager`] when dropped, unless [`Self::commit`] is called.
+///
+/// R31-M3: lets us reserve BEFORE the memtable put while keeping the budget
+/// honest when the put errors. A successful put calls `commit()` so the
+/// reservation persists until the next flush release; an error returns via
+/// `?` and the guard drops, refunding the bytes.
+struct WbmReleaseGuard<'a> {
+    wbm: Option<&'a WriteBufferManager>,
+    charge: u64,
+}
+
+impl<'a> WbmReleaseGuard<'a> {
+    #[inline]
+    fn new(wbm: &'a WriteBufferManager, charge: u64) -> Self {
+        Self {
+            wbm: Some(wbm),
+            charge,
+        }
+    }
+
+    /// Mark the reservation as committed — the put succeeded and the bytes
+    /// should remain charged until the flush release path runs.
+    #[inline]
+    fn commit(mut self) {
+        self.wbm = None;
+    }
+}
+
+impl<'a> Drop for WbmReleaseGuard<'a> {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(wbm) = self.wbm.take() {
+            wbm.release(self.charge);
+        }
+    }
 }
 
 /// The top-level engine struct.
@@ -1204,6 +1244,17 @@ impl DbImpl {
         let seq = self.sequence_number.fetch_add(1, Ordering::Relaxed) + 1;
         Self::check_sequence_overflow(seq)?;
 
+        // R31-M3: charge the WriteBufferManager BEFORE put_with_seq so that
+        // the cross-CF budget accurately reflects the byte commitment even
+        // when the put then errors (saturates over budget triggers a flush;
+        // dropping the reservation on the error path keeps the budget honest).
+        // The reserve was previously placed after the put, so a put returning
+        // Err(...) silently skipped the charge entirely — a slow leak of
+        // unaccounted bytes whenever the memtable rejected a write.
+        let charge = key.len() as u64 + new_value.len() as u64 + 8 + 1 + 48;
+        self.write_buffer_manager.reserve(charge);
+        let wbm_guard = WbmReleaseGuard::new(&self.write_buffer_manager, charge);
+
         {
             // R28-H1: pattern-match the typed FrozenMemTable variant
             // instead of substring-scanning `to_string()` — the prior
@@ -1233,10 +1284,9 @@ impl DbImpl {
                 }
             }
         }
-
-        // WBM charge (same formula as write_single).
-        let charge = key.len() as u64 + new_value.len() as u64 + 8 + 1 + 48;
-        self.write_buffer_manager.reserve(charge);
+        // Put succeeded — keep the reservation; suppress the guard's
+        // drop-time release.
+        wbm_guard.commit();
 
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
@@ -1311,6 +1361,26 @@ impl DbImpl {
         // state is transient (always followed by a swap); retry up to 8 times
         // to re-acquire the new active. The race surfaces under llvm-cov
         // instrumentation slowdown but is rare in production.
+        //
+        // B-Prod-P7 §6d: charge the cross-CF WriteBufferManager for the
+        // reservation this write contributed to the active memtable. The
+        // released amount comes back on a successful flush via
+        // `wbm_release_on_flush`. Approximation matches what
+        // `VectorizedMemTable::put` charges internally
+        // (key + value + 8 + 1 + 48); WBM precision needs are coarse
+        // (cap is 512 MiB by default) so the constant 57-byte overhead
+        // approximation is fine.
+        //
+        // R31-M3: reserve BEFORE put_with_seq so the budget is accurate
+        // even if the put fails. The guard releases the reservation on
+        // drop unless the put succeeds and we commit() it.
+        let charge = key.len() as u64
+            + value.map(|v| v.len() as u64).unwrap_or(0)
+            + 8 // seq
+            + 1 // op-type
+            + 48; // record header
+        self.write_buffer_manager.reserve(charge);
+        let wbm_guard = WbmReleaseGuard::new(&self.write_buffer_manager, charge);
         {
             // R28-H1 + R28-L3: typed retry + bounded exponential backoff.
             // See `get_and_put` comment block for rationale; both retry
@@ -1332,20 +1402,7 @@ impl DbImpl {
                 }
             }
         }
-        // B-Prod-P7 §6d: charge the cross-CF WriteBufferManager for the
-        // reservation this write contributed to the active memtable. The
-        // released amount comes back on a successful flush via
-        // `wbm_release_on_flush`. Approximation matches what
-        // `VectorizedMemTable::put` charges internally
-        // (key + value + 8 + 1 + 48); WBM precision needs are coarse
-        // (cap is 512 MiB by default) so the constant 57-byte overhead
-        // approximation is fine.
-        let charge = key.len() as u64
-            + value.map(|v| v.len() as u64).unwrap_or(0)
-            + 8 // seq
-            + 1 // op-type
-            + 48; // record header
-        self.write_buffer_manager.reserve(charge);
+        wbm_guard.commit();
 
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
@@ -2222,15 +2279,27 @@ impl DbImpl {
 
         // Capture the VersionSet snapshot AFTER flushes so the manifest
         // contains every L0 file the snapshot pins.
-        let version_snapshot = self.version_set.snapshot();
+        //
+        // R31-H1: We take the snapshot AND pin the live files under the
+        // VersionSet apply_lock so a concurrent compaction cannot interleave
+        // its `apply` + `delete_file_guarded` between our snapshot read and
+        // our pin. Without this, a compaction could apply its VersionEdit
+        // (logically removing a file from the new version) and then call
+        // `delete_file_guarded` on the unlinked file BEFORE our pin lands —
+        // resulting in a manifest that references a file already removed
+        // from disk. Under apply_lock, compaction's apply is blocked while
+        // we pin; once our pin is in place, can_delete() returns false and
+        // delete_file_guarded defers the unlink to `pending_deletions`.
+        let (version_snapshot, _pin) =
+            self.version_set
+                .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
+                    let live = snap.version.live_sst_files();
+                    let file_numbers: Vec<FileNumber> =
+                        live.iter().map(|f| f.file_number).collect();
+                    let pin = self.deletion_guard.pin_batch(&file_numbers);
+                    (snap.clone(), pin)
+                });
         let blob = serialize_snapshot(&version_snapshot)?;
-
-        // Compute new vs. shared SSTs against the base checkpoint's
-        // manifest. base_checkpoint_id == 0 means "no base" — every live
-        // file is new.
-        let live = self.version_set.live_sst_files();
-        let file_numbers: Vec<FileNumber> = live.iter().map(|f| f.file_number).collect();
-        let _pin = self.deletion_guard.pin_batch(&file_numbers);
 
         let base_dir = self.incremental_checkpoint_dir(base_checkpoint_id);
         let base_live: std::collections::HashSet<FileNumber> = if base_checkpoint_id != 0
@@ -2338,16 +2407,36 @@ impl DbImpl {
                 .file_name()
                 .ok_or_else(|| ForstError::invalid_argument(format!("bad SST path: {src}")))?;
             let dst = target.join(basename);
-            if dst != src_path && !fs.file_exists(&dst)? {
-                // Try hardlink first (cheap, no copy); fall back to copy
-                // if hardlink fails (cross-device, FS doesn't support, etc.)
-                #[cfg(unix)]
-                let linked = std::fs::hard_link(&src_path, &dst).is_ok();
-                #[cfg(not(unix))]
-                let linked = false;
-                if !linked {
-                    crate::checkpoint::copy_file(fs.as_ref(), &src_path, &dst)?;
+            if dst == src_path {
+                continue;
+            }
+            if fs.file_exists(&dst)? {
+                // R31-M4: dst already exists — only accept it if it is the
+                // same on-disk file as src (hardlink to the same inode, on
+                // unix) or, on non-unix where we can't compare inodes, the
+                // sizes match. Otherwise hard-fail: silently keeping the
+                // stale contents would let an attacker (or a previous failed
+                // restore) seed `target_dir` with rogue data that the engine
+                // would then open as authoritative.
+                if !same_file_or_size(&src_path, &dst)? {
+                    return Err(ForstError::invalid_argument(format!(
+                        "open_from_incremental: dst SST '{}' already exists \
+                         and does not match src '{}' (inode/size mismatch)",
+                        dst.display(),
+                        src_path.display(),
+                    )));
                 }
+                // Identical file already present — nothing to do.
+                continue;
+            }
+            // Try hardlink first (cheap, no copy); fall back to copy
+            // if hardlink fails (cross-device, FS doesn't support, etc.)
+            #[cfg(unix)]
+            let linked = std::fs::hard_link(&src_path, &dst).is_ok();
+            #[cfg(not(unix))]
+            let linked = false;
+            if !linked {
+                crate::checkpoint::copy_file(fs.as_ref(), &src_path, &dst)?;
             }
         }
 
@@ -3947,6 +4036,30 @@ impl DbImpl {
 // ---------------------------------------------------------------------
 // Remote-storage URI -> OpendalFileSystem
 // ---------------------------------------------------------------------
+
+/// R31-M4 helper: returns `true` when `a` and `b` are the same on-disk file
+/// (same device + inode on unix) or, on non-unix where inode comparison is
+/// unavailable, when their sizes match. Used by
+/// [`DbImpl::open_from_incremental`] to validate a pre-existing dst SST.
+fn same_file_or_size(a: &Path, b: &Path) -> ForstResult<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md_a = std::fs::metadata(a)
+            .map_err(|e| ForstError::Io(std::io::Error::other(format!("stat '{}': {e}", a.display()))))?;
+        let md_b = std::fs::metadata(b)
+            .map_err(|e| ForstError::Io(std::io::Error::other(format!("stat '{}': {e}", b.display()))))?;
+        Ok(md_a.dev() == md_b.dev() && md_a.ino() == md_b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let md_a = std::fs::metadata(a)
+            .map_err(|e| ForstError::Io(std::io::Error::other(format!("stat '{}': {e}", a.display()))))?;
+        let md_b = std::fs::metadata(b)
+            .map_err(|e| ForstError::Io(std::io::Error::other(format!("stat '{}': {e}", b.display()))))?;
+        Ok(md_a.len() == md_b.len())
+    }
+}
 
 /// Parses an OpenDAL URI of the form `<scheme>://<authority>[/path]` and
 /// returns a configured [`OpendalFileSystem`]. Used by
@@ -6075,6 +6188,86 @@ mod tests {
         // After checkpoint completes, no pins should remain.
         db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
         assert!(db.deletion_guard().pinned_files().is_empty());
+    }
+
+    /// R31-H1 regression test: incremental checkpoint pinning must be atomic with
+    /// the live-file read so a concurrent compaction cannot delete a file that
+    /// the checkpoint manifest references between the snapshot read and the
+    /// pin_batch call.
+    ///
+    /// The test directly exercises the atomic-snapshot+pin code path under
+    /// concurrent apply pressure: a background thread loops on
+    /// {@code apply_lock}-acquiring work (flush + compact) while the test
+    /// thread takes many snapshots. The invariant is that snapshot_with_locked_view
+    /// observes a self-consistent view: every file_number returned by
+    /// live_sst_files() is pinned (pin_count > 0) by the time the closure
+    /// runs, and the pin remains valid for the body of the closure.
+    #[test]
+    fn test_r31_h1_snapshot_and_pin_are_atomic_with_apply() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
+        let db = open();
+        let cf = db.default_cf();
+        // Seed several L0 SSTs.
+        for batch in 0..4u32 {
+            for k in 0..16u32 {
+                db.put(&cf, format!("b{:02}k{:04}", batch, k).as_bytes(), b"v")
+                    .unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = stop.clone();
+        let db_t = db.clone();
+        let cf_t = cf.clone();
+        let bg = std::thread::spawn(move || {
+            // Apply pressure: alternate flush + compact + writes so apply_lock
+            // is contended continuously.
+            let mut n: u32 = 0;
+            while !stop_t.load(AtomOrd::Relaxed) {
+                let _ = db_t.compact_l0(&cf_t);
+                for k in 0..8u32 {
+                    let _ = db_t.put(&cf_t, format!("bgn{:04}k{}", n, k).as_bytes(), b"v");
+                }
+                let _ = db_t.switch_and_flush(&cf_t);
+                n = n.wrapping_add(1);
+            }
+        });
+
+        // Repeatedly take an atomic snapshot+pin and verify the invariant:
+        // every file_number in the returned live set has pin_count >= 1 while
+        // the closure is still in scope (pin held by the PinHandle below).
+        for _ in 0..200u32 {
+            let result =
+                db.version_set
+                    .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
+                        let live = snap.version.live_sst_files();
+                        let nums: Vec<FileNumber> = live.iter().map(|f| f.file_number).collect();
+                        let pin = db.deletion_guard.pin_batch(&nums);
+                        // Verify every pinned file is still on disk while
+                        // pin is held — a concurrent compaction's
+                        // delete_file_guarded must see can_delete=false.
+                        let mut all_present = true;
+                        for n in &nums {
+                            let p = sst_file_path(&db.db_path, *n);
+                            if !db.fs.file_exists(&p).unwrap_or(false) {
+                                all_present = false;
+                                break;
+                            }
+                        }
+                        (nums, pin, all_present)
+                    });
+            let (nums, _pin, all_present) = result;
+            assert!(
+                all_present,
+                "R31-H1: a pinned file is already gone from disk — apply/delete \
+                 raced with snapshot+pin (nums={:?})",
+                nums.iter().map(|n| n.value()).collect::<Vec<_>>()
+            );
+        }
+
+        stop.store(true, AtomOrd::Relaxed);
+        bg.join().expect("bg thread");
     }
 
     // ============================================================

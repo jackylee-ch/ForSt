@@ -66,6 +66,16 @@ impl FileDeletionGuard {
             if *count == 0 {
                 guard.remove(&file);
             }
+        } else {
+            // R31-L3: unbalanced unpin — caller is releasing a file that
+            // was never pinned (or was already unpinned to zero). Debug
+            // builds catch the imbalance loudly; release builds keep the
+            // saturating no-op above so a misuse can't crash production.
+            debug_assert!(
+                false,
+                "FileDeletionGuard::unpin({:?}): file is not currently pinned",
+                file
+            );
         }
     }
 

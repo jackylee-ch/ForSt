@@ -262,6 +262,35 @@ impl VersionSetImpl {
         }
     }
 
+    /// Take a snapshot AND run a closure while holding the apply_lock. This
+    /// blocks concurrent writers (flush/compaction) for the duration of the
+    /// closure, so callers may safely perform side effects — most notably
+    /// pinning live files in [`FileDeletionGuard`] — atomically with the
+    /// snapshot read.
+    ///
+    /// R31-H1: closes the TOCTOU race where a checkpoint reads the live-file
+    /// set, then a compaction's `apply` + `delete_file_guarded` runs before
+    /// the checkpoint can call `pin_batch`. Holding the apply_lock across the
+    /// snapshot + pin ensures compaction's deletion phase cannot complete
+    /// before the pin lands. The closure must NOT itself call
+    /// `apply`/`snapshot_with_locked_view` (re-entrant lock → deadlock); only
+    /// read-only inspection + external pinning are safe.
+    pub fn snapshot_with_locked_view<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&VersionSetSnapshot) -> R,
+    {
+        let _guard = self
+            .apply_lock
+            .lock()
+            .expect("VersionSetImpl::apply_lock poisoned");
+        let snap = VersionSetSnapshot {
+            version: self.current.load_full(),
+            next_file_number: self.next_file_number.load(Ordering::SeqCst),
+            last_sequence: self.last_sequence.load(Ordering::SeqCst),
+        };
+        f(&snap)
+    }
+
     /// Allocate a new file number (atomic increment).
     pub fn allocate_file_number(&self) -> FileNumber {
         FileNumber(self.next_file_number.fetch_add(1, Ordering::SeqCst))

@@ -255,6 +255,18 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         });
     }
 
+    // R31-M2: after parsing N levels × M files, `pos` must land exactly on
+    // the footer start. Any gap means the encoder wrote extra padding (or a
+    // mismatched length field elsewhere bumped pos past where we expect) —
+    // both are corruption indicators that earlier length-checked reads can
+    // miss when the over-read still fits inside footer_start.
+    if pos != footer_start {
+        return Err(ForstError::corruption(format!(
+            "checkpoint meta-blob trailing-byte mismatch: parsed up to {}, footer starts at {}",
+            pos, footer_start
+        )));
+    }
+
     Ok(VersionSetSnapshot {
         version: std::sync::Arc::new(Version { levels }),
         next_file_number,
