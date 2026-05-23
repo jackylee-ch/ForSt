@@ -3659,15 +3659,43 @@ struct IterHandle {
     inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send>,
     pending: Option<(IterKey, IterValue)>,
     aborted: AtomicBool,
+    /// R16-M2: shared error slot populated by the wrapping
+    /// `filter_map`/error-tap closure when the upstream iterator yields an
+    /// `Err(_)`. The FFI consumer (`fill_chunk_from_iter` / open / next /
+    /// close) drains this slot after each chunk so transient engine errors
+    /// surface to the Java side as `FrsErrorCode` rather than being silently
+    /// dropped (the original Box<dyn Iterator<Item = (Key, Value)>> shape
+    /// erased the LazyPrefixIter type and its `take_last_error` accessor).
+    last_error: Arc<Mutex<Option<forst_rs_common::ForstError>>>,
 }
 
 impl IterHandle {
     fn new(inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send>) -> Self {
+        Self::new_with_error_slot(inner, Arc::new(Mutex::new(None)))
+    }
+
+    /// R16-M2: construct with an externally-shared error slot so the upstream
+    /// `filter_map` adapter can write into the same `Option<ForstError>` that
+    /// the FFI consumer drains after each chunk.
+    fn new_with_error_slot(
+        inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send>,
+        last_error: Arc<Mutex<Option<forst_rs_common::ForstError>>>,
+    ) -> Self {
         Self {
             inner,
             pending: None,
             aborted: AtomicBool::new(false),
+            last_error,
         }
+    }
+
+    /// R16-M2: take + clear the last error captured by the upstream filter
+    /// adapter. Returns `Some(err)` once per occurrence; later calls return
+    /// `None` until another error is captured. Used by
+    /// `fill_chunk_from_iter` (and its open/next callers) to surface engine
+    /// failures to the Java caller as an `FrsErrorCode`.
+    fn take_last_error(&self) -> Option<forst_rs_common::ForstError> {
+        self.last_error.lock().unwrap().take()
     }
 
     /// Pull the next row from the iterator, preferring the pending row
@@ -3837,18 +3865,44 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             Ok(it) => it,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
-        // Strip per-row `ForstResult` — engine errors that surface mid-iter
-        // terminate the chunk (caller will see exhaustion). The eager
-        // `prefix_scan` had the same property (any error on lookup
-        // poisoned the whole call).
-        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> = Box::new(
-            owned_iter.filter_map(|r| r.ok().map(|(k, v)| (IterKey::Arc(k), IterValue::Arc(v)))),
-        );
-        let mut handle_state = IterHandle::new(inner);
+        // R16-M2: replace the bare `r.ok()` (which silently dropped engine
+        // errors) with an error-tap closure that records each `Err(_)` in
+        // the IterHandle's shared error slot. The FFI consumer drains the
+        // slot via `take_last_error` after every chunk-get and translates a
+        // recorded error into an `FrsErrorCode` so the Java side observes
+        // the failure instead of seeing a clean end-of-iterator.
+        let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+            Arc::new(Mutex::new(None));
+        let error_slot_inner = Arc::clone(&error_slot);
+        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+            Box::new(owned_iter.filter_map(move |r| match r {
+                Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                Err(e) => {
+                    // Sticky last-error: a later error overwrites an earlier
+                    // one. The FFI consumer drains via `take_last_error()`
+                    // after every chunk so per-row errors do not accumulate
+                    // beyond a single chunk.
+                    *error_slot_inner.lock().unwrap() = Some(e);
+                    None
+                }
+            }));
+        let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
 
         // Fill the first chunk lazily into the caller's buffer.
         let (bytes_used, row_count) =
             fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
+
+        // R16-M2: surface any error captured during the first chunk fill.
+        if let Some(err) = handle_state.take_last_error() {
+            // The error already populated the slot before we register the
+            // handle, so we surface it directly here (the handle is not yet
+            // registered in the shard map). Returning the error code lets
+            // the Java side observe a clean failure for the open() call.
+            *out_row_count = 0;
+            *out_bytes_used = 0;
+            *out_handle = 0;
+            return error_to_frs_code(&err);
+        }
 
         // Register the iterator on a sharded registry.  Shard is selected
         // by the lower 4 bits of `handle_id`, so opens from different
@@ -3906,6 +3960,13 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
             fill_chunk_from_iter(iter, chunk_buf_ptr, chunk_buf_cap as usize);
         *out_row_count = row_count;
         *out_bytes_used = bytes_used;
+        // R16-M2: drain the per-iter error slot AFTER the chunk fill so a
+        // tier-source error that surfaced mid-chunk is propagated to the
+        // Java side as an `FrsErrorCode`. Pre-fix, the bare `r.ok()` in the
+        // filter_map adapter silently dropped engine errors here.
+        if let Some(err) = iter.take_last_error() {
+            return error_to_frs_code(&err);
+        }
         FrsErrorCode::Ok as i32
     })
 }
@@ -4134,16 +4195,36 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                     continue;
                 }
             };
-            let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> = Box::new(
-                owned_iter.filter_map(|r| {
-                    r.ok().map(|(k, v)| (IterKey::Arc(k), IterValue::Arc(v)))
-                }),
-            );
-            let mut handle_state = IterHandle::new(inner);
+            // R16-M2: error-tap closure mirroring the single-shot
+            // `frs_vec_iter_prefix_open` path so engine errors mid-iter are
+            // captured in the IterHandle's shared error slot and surfaced
+            // back to the Java caller via take_last_error() on the next call.
+            let batch_error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+                Arc::new(Mutex::new(None));
+            let batch_error_slot_inner = Arc::clone(&batch_error_slot);
+            let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+                Box::new(owned_iter.filter_map(move |r| match r {
+                    Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                    Err(e) => {
+                        *batch_error_slot_inner.lock().unwrap() = Some(e);
+                        None
+                    }
+                }));
+            let mut handle_state =
+                IterHandle::new_with_error_slot(inner, batch_error_slot);
 
             // Fill the first chunk into the caller-owned buffer.
             let (bytes_used, row_count) =
                 fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap as usize);
+            // R16-M2: if the first chunk fill captured an error, surface it
+            // through the per-descriptor return path (batch open returns
+            // multiple results; subsequent next() calls will drain the same
+            // slot for additional errors).
+            if let Some(err) = handle_state.take_last_error() {
+                if first_err == FrsErrorCode::Ok as i32 {
+                    first_err = error_to_frs_code(&err);
+                }
+            }
 
             // Register on the shared sharded registry — same path as the
             // single-shot open so subsequent _next/_close/_abort calls work

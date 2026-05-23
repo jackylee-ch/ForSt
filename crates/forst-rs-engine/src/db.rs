@@ -4203,15 +4203,19 @@ impl Iterator for LazyPrefixIter {
                 loop {
                     // Step 1: cheap presence check.
                     //
-                    // R15-M3: on an `Err(_)` from `peek()` we capture the
-                    // error (stickily — later errors overwrite earlier
-                    // ones, since the FFI consumer drains via
-                    // `take_last_error()` after every chunk) AND break the
-                    // inner per-source loop. The outer loop continues
-                    // because other tier sources may still have valid keys
-                    // to emit; the recorded error is surfaced to the FFI
-                    // caller separately so the partial scan does not look
-                    // like a clean end-of-iterator.
+                    // R15-M3 / R16-L2 + R16-M2: on an `Err(_)` from `peek()`
+                    // we capture the error (stickily — later errors
+                    // overwrite earlier ones) AND break the inner per-source
+                    // loop. The outer loop continues because other tier
+                    // sources may still have valid keys to emit; the
+                    // recorded error is surfaced to the FFI caller via the
+                    // FFI-layer shared error slot (`IterHandle::last_error`)
+                    // which is drained from the FFI consumer
+                    // (`fill_chunk_from_iter` callers) after each chunk.
+                    // Note: the previous comment claimed `LazyPrefixIter::
+                    // take_last_error` was drained by the FFI layer, but the
+                    // Box<dyn Iterator> shape erased the concrete type — see
+                    // R16-M2 fix for the actual error-surfacing path.
                     let has_peek = match self.sources[i].peek() {
                         Ok(Some(_)) => true,
                         Ok(None) => false,
