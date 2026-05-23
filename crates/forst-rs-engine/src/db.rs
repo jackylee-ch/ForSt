@@ -2026,69 +2026,97 @@ impl DbImpl {
             }
         }
 
-        // R28-M1: scan db_path for SST files NOT referenced by the snapshot.
-        // The snapshot's `next_file_number` is the writer-side counter the
-        // engine had at checkpoint time. If a crash interrupted a flush
-        // BEFORE the manifest was updated, the orphaned SST sits on disk
-        // with a file number ≥ snapshot.next_file_number — restoring with
-        // the snapshot's counter would reuse those numbers and overwrite
-        // valid checkpoint files mid-flush. Take the max of the snapshot's
-        // counter and (highest observed file number + 1) so the engine
-        // allocates new SST file numbers strictly above anything already
-        // present on disk.
+        // R28-M1 + R29-H1: scan db_path for SST files NOT referenced by the
+        // snapshot. The snapshot's `next_file_number` is the writer-side
+        // counter the engine had at checkpoint time. If a crash interrupted
+        // a flush BEFORE the manifest was updated, the orphaned SST sits on
+        // disk with a file number ≥ snapshot.next_file_number — restoring
+        // with the snapshot's counter would reuse those numbers and
+        // overwrite valid checkpoint files mid-flush. Take the max of the
+        // snapshot's counter and (highest observed file number + 1) so the
+        // engine allocates new SST file numbers strictly above anything
+        // already present on disk.
+        //
+        // R29-H1: drop the outer `fs.file_exists(&db_path)?` guard — every
+        // FileSystem impl returns false for directories, so the entire
+        // scan never ran and the R28-M1 fix was dead code. `list_dir` is
+        // called directly; its `Err` arm (missing-dir, permission, etc.)
+        // is logged at debug and treated as "no observed files".
         let mut max_observed: u64 = 0;
         let mut orphans: Vec<PathBuf> = Vec::new();
-        if fs.file_exists(&db_path)? {
-            // list_dir may error on a fresh restore directory that doesn't
-            // yet exist — treat that as "no observed files" rather than a
-            // fatal restore failure. Same shape used by the live-SST check
-            // above (file_exists swallow).
-            match fs.list_dir(&db_path) {
-                Ok(entries) => {
-                    let referenced: std::collections::HashSet<u64> = snapshot
-                        .version
-                        .live_sst_files()
-                        .iter()
-                        .map(|f| f.file_number.value())
-                        .collect();
-                    for entry in entries {
-                        if entry.is_dir {
-                            continue;
-                        }
-                        let name = match entry.path.file_name().and_then(|n| n.to_str()) {
-                            Some(n) => n,
-                            None => continue,
-                        };
-                        // Match the `<6-digit-number>.sst` naming
-                        // produced by `sst_file_path`.
-                        if let Some(stem) = name.strip_suffix(".sst") {
-                            if let Ok(num) = stem.parse::<u64>() {
-                                if num > max_observed {
-                                    max_observed = num;
-                                }
-                                if !referenced.contains(&num) {
-                                    orphans.push(entry.path.clone());
-                                }
+        match fs.list_dir(&db_path) {
+            Ok(entries) => {
+                let referenced: std::collections::HashSet<u64> = snapshot
+                    .version
+                    .live_sst_files()
+                    .iter()
+                    .map(|f| f.file_number.value())
+                    .collect();
+                for entry in entries {
+                    if entry.is_dir {
+                        continue;
+                    }
+                    let name = match entry.path.file_name().and_then(|n| n.to_str()) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    // Match the `<≥6-digit padded number>.sst` naming
+                    // produced by `sst_file_path` (R29-L1: `{:06}` only
+                    // enforces a minimum width — numbers > 999_999 widen
+                    // naturally, so the regex must accept any length).
+                    if let Some(stem) = name.strip_suffix(".sst") {
+                        if let Ok(num) = stem.parse::<u64>() {
+                            if num > max_observed {
+                                max_observed = num;
+                            }
+                            if !referenced.contains(&num) {
+                                orphans.push(entry.path.clone());
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(
-                        "open_from_checkpoint: list_dir({}) failed during orphan scan: {} \
-                         (continuing with snapshot.next_file_number unchanged)",
-                        db_path.display(),
-                        e
-                    );
-                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "open_from_checkpoint: list_dir({}) failed during orphan scan: {} \
+                     (continuing with snapshot.next_file_number unchanged)",
+                    db_path.display(),
+                    e
+                );
             }
         }
+        // R29-M1: rename orphans to `*.sst.orphan-<unix-millis>` (atomic
+        // single-fs rename) so they no longer match the `<num>.sst` scan
+        // regex on future restarts. Default-safe: no data loss, just
+        // out-of-band file the operator can triage / delete manually.
+        // Rename failures are logged but do not block the restore — the
+        // file simply remains visible to the next scan, which will retry
+        // the rename with a fresh timestamp.
+        let ts_suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
         for orphan in &orphans {
-            tracing::warn!(
-                "open_from_checkpoint: orphaned SST file not referenced by checkpoint \
-                 manifest, leaving on disk for operator triage: {}",
-                orphan.display()
-            );
+            let dst = {
+                let mut s = orphan.as_os_str().to_owned();
+                s.push(format!(".orphan-{}", ts_suffix));
+                PathBuf::from(s)
+            };
+            match fs.rename(orphan, &dst) {
+                Ok(()) => tracing::warn!(
+                    "open_from_checkpoint: renamed orphan SST not referenced by checkpoint \
+                     manifest {} → {} (R29-M1 rename-on-restore default)",
+                    orphan.display(),
+                    dst.display()
+                ),
+                Err(e) => tracing::warn!(
+                    "open_from_checkpoint: failed to rename orphan SST {} → {} ({}); \
+                     leaving in place — next restore will retry",
+                    orphan.display(),
+                    dst.display(),
+                    e
+                ),
+            }
         }
         let restored_next_file_number = snapshot
             .next_file_number
@@ -5930,6 +5958,73 @@ mod tests {
             Ok(_) => panic!("expected NotFound error"),
             Err(e) => assert!(e.is_not_found()),
         }
+    }
+
+    /// R29-H1 regression: drop a higher-numbered SST in db_path BEFORE
+    /// restore and verify the engine's restored `next_file_number` is
+    /// strictly greater than the orphan's number, AND that the orphan was
+    /// renamed out of the `<num>.sst` namespace (R29-M1).
+    ///
+    /// Pre-R29-H1, the outer `fs.file_exists(&db_path)?` guard returned
+    /// false for the checkpoint directory (every FileSystem impl treats
+    /// dirs as non-files), so the entire orphan-scan block was dead code
+    /// and `restored.version_set.next_file_number()` came straight from
+    /// the snapshot — re-using the orphan's file number on the next flush
+    /// and silently corrupting the checkpoint.
+    #[test]
+    fn test_open_from_checkpoint_advances_file_number_past_orphan_sst() {
+        use forst_rs_io::{MemoryFileSystem, WriteMode};
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        for i in 0..10u32 {
+            db.put(&cf, format!("k{}", i).as_bytes(), b"v").unwrap();
+        }
+        db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
+
+        // Drop a higher-numbered SST in the checkpoint dir that's NOT in
+        // the manifest — simulates a crash-mid-flush orphan.
+        let orphan_num: u64 = 999_999;
+        let orphan_path = sst_file_path(std::path::Path::new("/ckpt"), FileNumber(orphan_num));
+        {
+            let mut f = fs
+                .open_writable_file(&orphan_path, WriteMode::CreateNew)
+                .unwrap();
+            f.append(b"fake-orphan-sst-bytes").unwrap();
+            f.sync().unwrap();
+        }
+        assert!(fs.file_exists(&orphan_path).unwrap());
+
+        // Restore — orphan must bump restored_next_file_number and be
+        // renamed out of the `<num>.sst` namespace.
+        let opts = EngineOptions {
+            db_path: "/ckpt".to_string(),
+            ..EngineOptions::default()
+        };
+        let restored = DbImpl::open_from_checkpoint(opts, fs.clone()).unwrap();
+        assert!(
+            restored.version_set.next_file_number() > orphan_num,
+            "expected next_file_number > orphan ({}), got {}",
+            orphan_num,
+            restored.version_set.next_file_number()
+        );
+        // R29-M1: the orphan was renamed; the original path no longer
+        // exists, but a sibling `*.sst.orphan-<ts>` does.
+        assert!(
+            !fs.file_exists(&orphan_path).unwrap(),
+            "orphan SST should have been renamed away from {}",
+            orphan_path.display()
+        );
+        let entries = fs.list_dir(std::path::Path::new("/ckpt")).unwrap();
+        assert!(
+            entries.iter().any(|e| e
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.contains(".sst.orphan-"))
+                .unwrap_or(false)),
+            "expected an `.sst.orphan-<ts>` rename target under /ckpt"
+        );
     }
 
     // --- W16 FileDeletionGuard integration ---
