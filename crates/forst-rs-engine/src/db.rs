@@ -4142,6 +4142,15 @@ pub struct LazyPrefixIter {
     /// which allocates + memcpys the full key payload (≈ 50-100 ns + alloc
     /// pressure for 32-byte composite keys).
     last_emitted: Option<Arc<[u8]>>,
+    /// R15-M3: sticky last-error state set by `next()` when a tier source's
+    /// `peek()` returns an `Err`. Pre-fix, the error was coerced to
+    /// `has_peek = false` so a transient I/O failure on one tier appeared
+    /// as a clean end-of-iterator to the FFI caller (silent data loss for
+    /// the affected key range). The FFI layer
+    /// (`fill_chunk_from_iter`) consults this field via
+    /// `take_last_error()` after each chunk-get cycle to surface the error
+    /// as an `FrsErrorCode` to the Java side.
+    last_error: Option<ForstError>,
 }
 
 impl LazyPrefixIter {
@@ -4149,7 +4158,19 @@ impl LazyPrefixIter {
         Ok(Self {
             sources,
             last_emitted: None,
+            last_error: None,
         })
+    }
+
+    /// R15-M3: take + clear the last tier-peek error, if any. Called by the
+    /// FFI consumer (`fill_chunk_from_iter`) after each chunk-get cycle so
+    /// transient tier errors are surfaced to the Java side as
+    /// `FrsErrorCode` rather than silently truncating the scan.
+    ///
+    /// Returns `Some(err)` once per error and `None` thereafter until a new
+    /// error occurs.
+    pub fn take_last_error(&mut self) -> Option<ForstError> {
+        self.last_error.take()
     }
 }
 
@@ -4181,9 +4202,23 @@ impl Iterator for LazyPrefixIter {
                 // subsequent `advance()` on the same source.
                 loop {
                     // Step 1: cheap presence check.
+                    //
+                    // R15-M3: on an `Err(_)` from `peek()` we capture the
+                    // error (stickily — later errors overwrite earlier
+                    // ones, since the FFI consumer drains via
+                    // `take_last_error()` after every chunk) AND break the
+                    // inner per-source loop. The outer loop continues
+                    // because other tier sources may still have valid keys
+                    // to emit; the recorded error is surfaced to the FFI
+                    // caller separately so the partial scan does not look
+                    // like a clean end-of-iterator.
                     let has_peek = match self.sources[i].peek() {
                         Ok(Some(_)) => true,
-                        Ok(None) | Err(_) => false,
+                        Ok(None) => false,
+                        Err(e) => {
+                            self.last_error = Some(e);
+                            false
+                        }
                     };
                     if !has_peek {
                         break;
