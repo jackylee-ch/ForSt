@@ -2438,11 +2438,20 @@ impl DbImpl {
         // Per-key value resolution closure: route through the full
         // versioned read path so tombstones in upper tiers correctly hide
         // lower-tier rows and merge operands are resolved.
+        //
+        // B10-H3: `LazyPrefixIter::Item` is now `Arc<[u8]>` (zero-copy in
+        // the FFI streaming path). The borrowing variant preserves the
+        // public `(Vec<u8>, Vec<u8>)` contract by calling `to_vec()` at
+        // the boundary — same cost as before this fix. The FFI streaming
+        // path uses `prefix_scan_iter_owned_arc` to skip this conversion.
         let db: &'a DbImpl = self;
-        Ok(inner.filter_map(move |key| match db.get(&cf_handle, &key) {
-            Ok(Some(value)) => Some(Ok((key, value))),
-            Ok(None) => None,
-            Err(e) => Some(Err(e)),
+        Ok(inner.filter_map(move |key_arc| {
+            let key_slice: &[u8] = key_arc.as_ref();
+            match db.get(&cf_handle, key_slice) {
+                Ok(Some(value)) => Some(Ok((key_slice.to_vec(), value))),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
         }))
     }
 
@@ -2473,12 +2482,43 @@ impl DbImpl {
         prefix: &[u8],
     ) -> ForstResult<Box<dyn Iterator<Item = ForstResult<(Vec<u8>, Vec<u8>)>> + Send + 'static>>
     {
+        // B10-H3: thin adapter over the new `_arc` variant — copies the
+        // key Arc into an owned Vec<u8> at the boundary. Existing callers
+        // (engine tests, `prefix_scan` collector) keep the legacy public
+        // contract. New FFI consumers should call `prefix_scan_iter_owned_arc`
+        // directly to skip the per-row Vec allocation.
+        let arc_iter = self.prefix_scan_iter_owned_arc(cf, prefix)?;
+        Ok(Box::new(arc_iter.map(|r| match r {
+            Ok((k, v)) => Ok((k.as_ref().to_vec(), v)),
+            Err(e) => Err(e),
+        })))
+    }
+
+    /// B10-H3 zero-copy key variant of [`Self::prefix_scan_iter_owned`].
+    /// Emits the key as an `Arc<[u8]>` so the FFI chunked-iter consumer
+    /// can call `arc.as_ref()` and `copy_nonoverlapping` into the caller's
+    /// direct ByteBuffer without an intermediate `Vec<u8>` allocation per
+    /// emitted row. The Arc strong-count bump is one atomic add per emit
+    /// — orders of magnitude cheaper than the Vec alloc + memcpy it
+    /// replaces (≈ 8 ns vs ≈ 50-100 ns + heap pressure for the typical
+    /// 32-byte composite keys we emit on Q12-style state-bound scans).
+    ///
+    /// The value is still an owned `Vec<u8>` because it is produced by
+    /// `DbImpl::get` (which resolves merge operands and tombstones into a
+    /// fresh allocation) — there is no upstream `Arc<[u8]>` to share.
+    pub fn prefix_scan_iter_owned_arc(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> ForstResult<
+        Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Vec<u8>)>> + Send + 'static>,
+    > {
         let cf_handle = cf.clone();
         let inner = self.build_lazy_prefix_key_stream(cf, prefix)?;
         let db = Arc::clone(self);
-        Ok(Box::new(inner.filter_map(move |key| {
-            match db.get(&cf_handle, &key) {
-                Ok(Some(value)) => Some(Ok((key, value))),
+        Ok(Box::new(inner.filter_map(move |key_arc| {
+            match db.get(&cf_handle, key_arc.as_ref()) {
+                Ok(Some(value)) => Some(Ok((key_arc, value))),
                 Ok(None) => None,
                 Err(e) => Some(Err(e)),
             }
@@ -4049,9 +4089,9 @@ impl LazyPrefixIter {
 }
 
 impl Iterator for LazyPrefixIter {
-    type Item = Vec<u8>;
+    type Item = Arc<[u8]>;
 
-    fn next(&mut self) -> Option<Vec<u8>> {
+    fn next(&mut self) -> Option<Arc<[u8]>> {
         // Drop already-emitted duplicates from all tiers + find the min
         // pending key across all sources. On error from a tier source we
         // currently swallow it (matches the previous BTreeSet behaviour
@@ -4114,11 +4154,14 @@ impl Iterator for LazyPrefixIter {
             self.sources[idx].advance();
             // `last_emitted` retention: cheap Arc clone, no byte copy.
             self.last_emitted = Some(Arc::clone(&key_arc));
-            // The iterator's public contract is `Item = Vec<u8>` (callers
-            // call `db.get(&key)` which takes `&[u8]`). We pay one
-            // `to_vec()` per EMITTED key (not per probe), which is the
-            // minimum we can do without changing the public signature.
-            return Some(key_arc.as_ref().to_vec());
+            // B10-H3: emit the `Arc<[u8]>` directly — no `to_vec()` at the
+            // emit boundary. The FFI `fill_chunk_from_iter` consumer reads
+            // `arc.as_ref()` and `copy_nonoverlapping`s into the caller's
+            // direct ByteBuffer (no owned-Vec needed). The borrowing /
+            // collect callers (`prefix_scan`) call `arc.as_ref().to_vec()`
+            // explicitly at their boundary so the public Vec<u8> contract
+            // stays intact for downstream consumers.
+            return Some(key_arc);
         }
     }
 }

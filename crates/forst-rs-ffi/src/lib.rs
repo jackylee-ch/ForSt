@@ -3509,26 +3509,80 @@ pub unsafe extern "C" fn frs_db_ingest_external_sst(
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Mutex, OnceLock};
 
+/// B10-H3: zero-copy key wrapper for FFI iterator rows.
+///
+/// Different upstream iterators source keys differently:
+///   * `prefix_scan_iter_owned_arc` yields `Arc<[u8]>` (zero-copy key path
+///     enabled by C9-H2's internal Arc tracking — the FFI consumer just
+///     reads `arc.as_ref()` and `copy_nonoverlapping`s into the caller's
+///     direct ByteBuffer);
+///   * `scan` (range iterator) yields `Vec<u8>` (the engine materialises
+///     the result set as `Vec<(Vec<u8>, Vec<u8>)>` at open time and the
+///     range FFI wraps that Vec's `IntoIter`);
+///
+/// Wrapping both shapes in a single enum lets `IterHandle` hold one
+/// concrete iterator type while the per-row hot path stays alloc-free in
+/// the prefix case (`Arc::clone` is only paid on `put_back` rollback,
+/// which is the cold capacity-overflow edge). The `as_slice` accessor is
+/// inlined by LLVM to a single match-cmov producing a `(ptr, len)` pair.
+enum IterKey {
+    Vec(Vec<u8>),
+    Arc(Arc<[u8]>),
+}
+
+impl IterKey {
+    /// Slice view into the backing store. Currently unused on the hot
+    /// emit path (which prefers raw `as_ptr` + `len` for direct
+    /// `copy_nonoverlapping` into the caller buffer) but kept for future
+    /// callers that want a borrow-friendly accessor.
+    #[allow(dead_code)]
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            IterKey::Vec(v) => v.as_slice(),
+            IterKey::Arc(a) => a.as_ref(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            IterKey::Vec(v) => v.len(),
+            IterKey::Arc(a) => a.len(),
+        }
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            IterKey::Vec(v) => v.as_ptr(),
+            IterKey::Arc(a) => a.as_ptr(),
+        }
+    }
+}
+
 /// Per-handle state owned by the FFI iter registry.  Holds:
-/// - a live boxed iterator over `(Vec<u8>, Vec<u8>)` pairs;
+/// - a live boxed iterator over `(IterKey, Vec<u8>)` pairs;
 /// - an optional `pending` row peeked from the iterator but not yet
 ///   written into the caller's buffer (rollback for overflow);
 /// - an `aborted` flag so the watchdog can short-circuit `_next` calls.
 ///
 /// PR-D4 zero-clone: the open/next path drains directly from `inner` into
-/// the caller's buffer — no intermediate `Vec<(Vec<u8>, Vec<u8>)>`
-/// allocation happens at the FFI layer.  (The engine still materializes
-/// the full prefix into a Vec inside `prefix_scan`/`scan`; replacing that
-/// with a true streaming cursor is engine-side work and outside the
-/// PR-D4 "lib.rs only" scope.)
+/// the caller's buffer — no intermediate `Vec<(...)>` allocation happens
+/// at the FFI layer.
+///
+/// B10-H3: the key half of each row is wrapped in [`IterKey`] so the
+/// prefix iterator path can pass keys through as `Arc<[u8]>` (zero
+/// `Vec::clone` per emit) while the range iterator path keeps its
+/// upstream `Vec<u8>` key as-is.
 struct IterHandle {
-    inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>,
-    pending: Option<(Vec<u8>, Vec<u8>)>,
+    inner: Box<dyn Iterator<Item = (IterKey, Vec<u8>)> + Send>,
+    pending: Option<(IterKey, Vec<u8>)>,
     aborted: AtomicBool,
 }
 
 impl IterHandle {
-    fn new(inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send>) -> Self {
+    fn new(inner: Box<dyn Iterator<Item = (IterKey, Vec<u8>)> + Send>) -> Self {
         Self {
             inner,
             pending: None,
@@ -3538,7 +3592,7 @@ impl IterHandle {
 
     /// Pull the next row from the iterator, preferring the pending row
     /// (rolled back from a previous overflow).
-    fn next_row(&mut self) -> Option<(Vec<u8>, Vec<u8>)> {
+    fn next_row(&mut self) -> Option<(IterKey, Vec<u8>)> {
         if let Some(p) = self.pending.take() {
             return Some(p);
         }
@@ -3546,7 +3600,7 @@ impl IterHandle {
     }
 
     /// Push a row back to be returned on the next `next_row()` call.
-    fn put_back(&mut self, row: (Vec<u8>, Vec<u8>)) {
+    fn put_back(&mut self, row: (IterKey, Vec<u8>)) {
         debug_assert!(self.pending.is_none(), "put_back called with pending row already set");
         self.pending = Some(row);
     }
@@ -3608,22 +3662,31 @@ unsafe fn fill_chunk_from_iter(
     let mut off = 0usize;
     let mut row_count = 0u32;
     while let Some((k, v)) = iter.next_row() {
-        let row_size = 8 + k.len() + v.len();
+        let klen = k.len();
+        let vlen = v.len();
+        let row_size = 8 + klen + vlen;
         if off + row_size > cap {
             // Row doesn't fit — roll back so the next call returns it.
+            // For `IterKey::Arc` this is a cheap atomic refcount move; for
+            // `IterKey::Vec` it is a pointer move. No bytes are copied.
             iter.put_back((k, v));
             break;
         }
-        let klen = k.len() as u32;
-        let vlen = v.len() as u32;
-        std::ptr::copy_nonoverlapping(klen.to_le_bytes().as_ptr(), buf.add(off), 4);
+        let klen_u32 = klen as u32;
+        let vlen_u32 = vlen as u32;
+        std::ptr::copy_nonoverlapping(klen_u32.to_le_bytes().as_ptr(), buf.add(off), 4);
         off += 4;
-        std::ptr::copy_nonoverlapping(vlen.to_le_bytes().as_ptr(), buf.add(off), 4);
+        std::ptr::copy_nonoverlapping(vlen_u32.to_le_bytes().as_ptr(), buf.add(off), 4);
         off += 4;
-        std::ptr::copy_nonoverlapping(k.as_ptr(), buf.add(off), k.len());
-        off += k.len();
-        std::ptr::copy_nonoverlapping(v.as_ptr(), buf.add(off), v.len());
-        off += v.len();
+        // B10-H3: `k.as_ptr()` reads through `IterKey::as_ptr` which
+        // matches on the enum tag and returns the inner backing-store
+        // pointer. For the prefix-iter path this is the `Arc<[u8]>`'s
+        // payload pointer — no `to_vec()` clone, just a memcpy straight
+        // from the Arc-owned bytes into the caller's direct ByteBuffer.
+        std::ptr::copy_nonoverlapping(k.as_ptr(), buf.add(off), klen);
+        off += klen;
+        std::ptr::copy_nonoverlapping(v.as_ptr(), buf.add(off), vlen);
+        off += vlen;
         row_count += 1;
     }
     (off as u32, row_count)
@@ -3681,12 +3744,14 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             slice::from_raw_parts(prefix_ptr, prefix_len as usize)
         };
 
-        // PR-C6-H1: route through the owned-Arc streaming
-        // `prefix_scan_iter_owned`. The iterator captures `Arc<DbImpl>`
+        // PR-C6-H1 + B10-H3: route through the zero-copy-key streaming
+        // `prefix_scan_iter_owned_arc`. The iterator captures `Arc<DbImpl>`
         // internally so it can be stashed in the per-shard `IterHandle`
-        // registry and outlive this FFI call. No outer Vec is allocated
-        // here — rows are pulled into the caller buffer on demand.
-        let owned_iter = match db_ref.prefix_scan_iter_owned(cf_ref_, prefix) {
+        // registry and outlive this FFI call. Keys are emitted as
+        // `Arc<[u8]>` and wrapped in `IterKey::Arc` so the chunk-fill
+        // memcpy reads directly out of the Arc-owned bytes — no per-row
+        // `Vec<u8>` allocation at the public boundary.
+        let owned_iter = match db_ref.prefix_scan_iter_owned_arc(cf_ref_, prefix) {
             Ok(it) => it,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
@@ -3694,8 +3759,8 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         // terminate the chunk (caller will see exhaustion). The eager
         // `prefix_scan` had the same property (any error on lookup
         // poisoned the whole call).
-        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
-            Box::new(owned_iter.filter_map(|r| r.ok()));
+        let inner: Box<dyn Iterator<Item = (IterKey, Vec<u8>)> + Send> =
+            Box::new(owned_iter.filter_map(|r| r.ok().map(|(k, v)| (IterKey::Arc(k), v))));
         let mut handle_state = IterHandle::new(inner);
 
         // Fill the first chunk lazily into the caller's buffer.
@@ -3971,10 +4036,12 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
 
             let prefix: &[u8] = if prefix_len == 0 { &[] } else { &data_buf[ks..ke] };
 
-            // PR-C6-H1: same owned streaming path as the single-shot
-            // open above. Each iterator captures `Arc<DbImpl>` so the
-            // FFI registry can outlive this call.
-            let owned_iter = match db_ref.prefix_scan_iter_owned(cf_ref_, prefix) {
+            // PR-C6-H1 + B10-H3: same zero-copy-key owned streaming path
+            // as the single-shot open above. Each iterator captures
+            // `Arc<DbImpl>` so the FFI registry can outlive this call;
+            // keys are emitted as `Arc<[u8]>` so the chunk-fill memcpy
+            // reads them in place without a per-row Vec allocation.
+            let owned_iter = match db_ref.prefix_scan_iter_owned_arc(cf_ref_, prefix) {
                 Ok(it) => it,
                 Err(_) => {
                     if first_err == FrsErrorCode::Ok as i32 {
@@ -3983,8 +4050,9 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                     continue;
                 }
             };
-            let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> =
-                Box::new(owned_iter.filter_map(|r| r.ok()));
+            let inner: Box<dyn Iterator<Item = (IterKey, Vec<u8>)> + Send> = Box::new(
+                owned_iter.filter_map(|r| r.ok().map(|(k, v)| (IterKey::Arc(k), v))),
+            );
             let mut handle_state = IterHandle::new(inner);
 
             // Fill the first chunk into the caller-owned buffer.
@@ -4088,11 +4156,18 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
         // IntoIter as the boxed cursor.  PR-D4 zero-clone: NO intermediate
         // Vec is allocated at the FFI layer — `fill_chunk_from_iter` drains
         // the boxed iter directly into the caller's buffer.
+        //
+        // B10-H3: each row's key is wrapped in `IterKey::Vec` — the engine's
+        // `scan` materialises keys as `Vec<u8>` (no upstream `Arc<[u8]>`
+        // to share), so we adopt them unchanged. The enum tag is a
+        // single byte and the per-row dispatch in `fill_chunk_from_iter`
+        // compiles to a cmov.
         let rows = match db_ref.scan(cf_ref_, lo, hi_opt) {
             Ok(r) => r,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
-        let inner: Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + Send> = Box::new(rows.into_iter());
+        let inner: Box<dyn Iterator<Item = (IterKey, Vec<u8>)> + Send> =
+            Box::new(rows.into_iter().map(|(k, v)| (IterKey::Vec(k), v)));
         let mut handle_state = IterHandle::new(inner);
 
         // Fill the first chunk lazily into the caller's buffer.
