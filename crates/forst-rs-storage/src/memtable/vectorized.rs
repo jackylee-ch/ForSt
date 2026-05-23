@@ -344,7 +344,19 @@ impl VectorizedMemTable {
         }
 
         // Prefix index: maintain mapping from prefix → full keys.
-        // Skip if key already existed (update to existing key — already indexed).
+        //
+        // C8-H2 fix: the gate on whether to re-add the key on Put used to be
+        // `hash_index.get(key).row_indices.len() <= 1` — i.e. "is this a
+        // logically new key in the hash index?". That fails the
+        // Put → Delete → Put-within-same-memtable resurrection case: the
+        // hash_index still has BOTH version rows (Put and Delete) so
+        // row_indices.len() == 2, the Put branch is skipped, BUT the Delete
+        // branch already removed the key from the prefix_index bucket. Result:
+        // the resurrected Put is invisible to `prefix_scan_iter*`.
+        //
+        // Correct gate: check actual presence in the prefix_index bucket. If
+        // the bucket is missing or the key is not in it, add it. Same idiom
+        // for the per-prefix `Box::from(prefix)` alloc-only-on-miss.
         if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
             let prefix = &key[..=last_slash];
             if op_type == OpType::Delete || op_type == OpType::SingleDelete {
@@ -352,12 +364,12 @@ impl VectorizedMemTable {
                     keys.retain(|k| &**k != key);
                 }
             } else if op_type == OpType::Put {
-                // Only add if this is a NEW key (not an update to existing)
-                let is_new_key = self
-                    .hash_index
-                    .get(key)
-                    .is_none_or(|e| e.row_indices.len() <= 1);
-                if is_new_key {
+                let needs_insert = self
+                    .prefix_index
+                    .get(prefix)
+                    .map(|v| !v.iter().any(|k| &**k == key))
+                    .unwrap_or(true);
+                if needs_insert {
                     // PERF (C7-H2): `HashMap::entry(K)` consumes the key
                     // unconditionally — for an existing-prefix hit the
                     // `Box::from(prefix)` allocation would be wasted and
@@ -966,7 +978,6 @@ impl VectorizedMemTable {
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
-            let was_new_key;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
                 entry.latest_seq = seq;
@@ -978,7 +989,6 @@ impl VectorizedMemTable {
                 } else {
                     entry.inline_value = None;
                 }
-                was_new_key = false;
             } else {
                 let inline_value = if op_types[i] == OpType::Put as u8
                     && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
@@ -996,7 +1006,6 @@ impl VectorizedMemTable {
                         latest_op: op_types[i],
                     },
                 );
-                was_new_key = true;
             }
 
             // Prefix index: maintain mapping from prefix → full keys.
@@ -1004,24 +1013,35 @@ impl VectorizedMemTable {
             // entirely, so the C6-H3 fast path in `prefix_scan_keys` was DEAD
             // CODE on the Q12 batch-write hot path (it always fell back to
             // the per-shard O(log N + K) sorted_index merge). Replicate the
-            // single-write maintenance block here, gated on the same
-            // last-slash test, using the `was_new_key` flag computed above
-            // (matches the single-write `row_indices.len() <= 1` check).
+            // single-write maintenance block here.
+            //
+            // C8-H2 fix: switch the Put gate from `was_new_key` (a hash_index
+            // signal) to a real presence check against the prefix_index bucket
+            // so a Put → Delete → Put-within-same-memtable resurrection still
+            // re-adds the key to the prefix_index. Without this fix the second
+            // Put silently vanishes from `prefix_scan_iter*`.
             if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
                 let prefix = &key[..=last_slash];
                 if op_type == OpType::Delete || op_type == OpType::SingleDelete {
                     if let Some(keys) = self.prefix_index.get_mut(prefix) {
                         keys.retain(|k| &**k != key);
                     }
-                } else if op_type == OpType::Put && was_new_key {
-                    // PERF (C7-H2): get_mut-then-insert so a same-prefix
-                    // burst (e.g. all rows in this batch share `ns/`) only
-                    // pays the `Box::from(prefix)` allocation once.
-                    let key_arc = Arc::<[u8]>::from(key);
-                    if let Some(slot) = self.prefix_index.get_mut(prefix) {
-                        slot.push(key_arc);
-                    } else {
-                        self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                } else if op_type == OpType::Put {
+                    let needs_insert = self
+                        .prefix_index
+                        .get(prefix)
+                        .map(|v| !v.iter().any(|k| &**k == key))
+                        .unwrap_or(true);
+                    if needs_insert {
+                        // PERF (C7-H2): get_mut-then-insert so a same-prefix
+                        // burst (e.g. all rows in this batch share `ns/`) only
+                        // pays the `Box::from(prefix)` allocation once.
+                        let key_arc = Arc::<[u8]>::from(key);
+                        if let Some(slot) = self.prefix_index.get_mut(prefix) {
+                            slot.push(key_arc);
+                        } else {
+                            self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                        }
                     }
                 }
             }
@@ -1134,7 +1154,6 @@ impl VectorizedMemTable {
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
-            let was_new_key;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
                 entry.latest_seq = seq;
@@ -1146,7 +1165,6 @@ impl VectorizedMemTable {
                 } else {
                     entry.inline_value = None;
                 }
-                was_new_key = false;
             } else {
                 let inline_value = if op_types[i] == OpType::Put as u8
                     && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
@@ -1164,25 +1182,36 @@ impl VectorizedMemTable {
                         latest_op: op_types[i],
                     },
                 );
-                was_new_key = true;
             }
 
             // Prefix index: PR-B7-H3 — replicate single-write maintenance so
             // the prefix-index fast path in `prefix_scan_keys` activates after
             // sharded engine batches too (the per-shard sub-batches reach the
             // memtable through this variant).
+            //
+            // C8-H2 fix: gate the Put add on actual prefix_index bucket
+            // membership (not on a hash_index-derived flag) so a
+            // Put → Delete → Put-within-same-memtable sequence still
+            // re-registers the resurrected key.
             if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
                 let prefix = &key[..=last_slash];
                 if op_type == OpType::Delete || op_type == OpType::SingleDelete {
                     if let Some(keys) = self.prefix_index.get_mut(prefix) {
                         keys.retain(|k| &**k != key);
                     }
-                } else if op_type == OpType::Put && was_new_key {
-                    let key_arc = Arc::<[u8]>::from(key);
-                    if let Some(slot) = self.prefix_index.get_mut(prefix) {
-                        slot.push(key_arc);
-                    } else {
-                        self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                } else if op_type == OpType::Put {
+                    let needs_insert = self
+                        .prefix_index
+                        .get(prefix)
+                        .map(|v| !v.iter().any(|k| &**k == key))
+                        .unwrap_or(true);
+                    if needs_insert {
+                        let key_arc = Arc::<[u8]>::from(key);
+                        if let Some(slot) = self.prefix_index.get_mut(prefix) {
+                            slot.push(key_arc);
+                        } else {
+                            self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                        }
                     }
                 }
             }
@@ -1417,7 +1446,6 @@ impl VectorizedMemTable {
             } else {
                 Some(values.value(i))
             };
-            let was_new_key;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
                 entry.latest_seq = seq;
@@ -1429,7 +1457,6 @@ impl VectorizedMemTable {
                 } else {
                     entry.inline_value = None;
                 }
-                was_new_key = false;
             } else {
                 let inline_value = if op_values[i] == OpType::Put as u8
                     && val_bytes.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
@@ -1447,7 +1474,6 @@ impl VectorizedMemTable {
                         latest_op: op_values[i],
                     },
                 );
-                was_new_key = true;
             }
 
             // Prefix index: PR-B7-H3 — the FFM zero-copy Arrow batch-write
@@ -1455,18 +1481,30 @@ impl VectorizedMemTable {
             // exists. Without this maintenance block the fast path in
             // `prefix_scan_keys` always missed and silently fell back to the
             // sorted_index merge — dead code in production.
+            //
+            // C8-H2 fix: gate Put add on prefix_index bucket membership so
+            // Put → Delete → Put-within-same-memtable resurrection re-adds
+            // the key. The previous `was_new_key` flag was a hash_index
+            // signal that does not match the prefix_index lifecycle.
             if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
                 let prefix = &key[..=last_slash];
                 if op_type == OpType::Delete || op_type == OpType::SingleDelete {
                     if let Some(keys) = self.prefix_index.get_mut(prefix) {
                         keys.retain(|k| &**k != key);
                     }
-                } else if op_type == OpType::Put && was_new_key {
-                    let key_arc = Arc::<[u8]>::from(key);
-                    if let Some(slot) = self.prefix_index.get_mut(prefix) {
-                        slot.push(key_arc);
-                    } else {
-                        self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                } else if op_type == OpType::Put {
+                    let needs_insert = self
+                        .prefix_index
+                        .get(prefix)
+                        .map(|v| !v.iter().any(|k| &**k == key))
+                        .unwrap_or(true);
+                    if needs_insert {
+                        let key_arc = Arc::<[u8]>::from(key);
+                        if let Some(slot) = self.prefix_index.get_mut(prefix) {
+                            slot.push(key_arc);
+                        } else {
+                            self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
+                        }
                     }
                 }
             }
@@ -2965,5 +3003,84 @@ mod tests {
         assert_eq!(mt.prefix_index.get(b"other/".as_slice()).unwrap().len(), 4);
         // Original bucket still 256, untouched.
         assert_eq!(mt.prefix_index.get(b"prefix/".as_slice()).unwrap().len(), 256);
+    }
+
+    /// C8-H2 regression test: Put → Delete → Put-within-same-memtable must
+    /// re-register the key in the prefix_index. Before the fix the second
+    /// Put's `was_new_key` was false (the hash_index still had both prior
+    /// versions), so the prefix-index re-add was skipped; the Delete had
+    /// already removed the key from the bucket, so `prefix_scan_keys`
+    /// silently missed the resurrected key — Q11 `entries()` row-loss.
+    #[test]
+    fn prefix_index_handles_put_delete_put_within_memtable() {
+        // ---- single-write path ----
+        let mut mt = VectorizedMemTable::new(test_config());
+        let key: &[u8] = b"ns/k1";
+        mt.put(key, Some(b"v1"), OpType::Put as u8).unwrap();
+        mt.put(key, None, OpType::Delete as u8).unwrap();
+        mt.put(key, Some(b"v2"), OpType::Put as u8).unwrap();
+        let keys = mt.prefix_scan_keys(b"ns/", None);
+        assert!(
+            keys.iter().any(|k| &**k == key),
+            "single-write Put→Delete→Put must leave key visible to prefix_scan_keys; got {:?}",
+            keys
+        );
+
+        // ---- batch_insert_with_base_seq path ----
+        let mut mt2 = VectorizedMemTable::new(test_config());
+        let ops = vec![
+            OpType::Put as u8,
+            OpType::Delete as u8,
+            OpType::Put as u8,
+        ];
+        let key_refs: Vec<&[u8]> = vec![key, key, key];
+        let v1: &[u8] = b"v1";
+        let v2: &[u8] = b"v2";
+        let val_refs: Vec<Option<&[u8]>> = vec![Some(v1), None, Some(v2)];
+        mt2.batch_insert_with_base_seq(&key_refs, &val_refs, &ops, 1)
+            .unwrap();
+        let keys2 = mt2.prefix_scan_keys(b"ns/", None);
+        assert!(
+            keys2.iter().any(|k| &**k == key),
+            "batch_insert_with_base_seq Put→Delete→Put must leave key visible; got {:?}",
+            keys2
+        );
+
+        // ---- batch_insert_with_explicit_seqs path ----
+        let mut mt3 = VectorizedMemTable::new(test_config());
+        let seqs = vec![1u64, 2, 3];
+        mt3.batch_insert_with_explicit_seqs(&key_refs, &val_refs, &ops, &seqs)
+            .unwrap();
+        let keys3 = mt3.prefix_scan_keys(b"ns/", None);
+        assert!(
+            keys3.iter().any(|k| &**k == key),
+            "batch_insert_with_explicit_seqs Put→Delete→Put must leave key visible; got {:?}",
+            keys3
+        );
+
+        // ---- batch_put_arrow_with_base_seq (FFM zero-copy) path ----
+        // Reuse the `make_arrow_batch` helper (3-column key|value|op_type
+        // shape that `batch_put_arrow_with_base_seq` expects). Constructing
+        // the RecordBatch directly with `sst_schema()` (which carries a 4th
+        // `sequence` column for on-disk SST format) trips the
+        // "expected 3 columns" guard at the top of `batch_put_arrow`.
+        let mut mt4 = VectorizedMemTable::new(test_config());
+        let key_refs4: Vec<&[u8]> = vec![key, key, key];
+        let v1: &[u8] = b"v1";
+        let v2: &[u8] = b"v2";
+        let val_refs4: Vec<Option<&[u8]>> = vec![Some(v1), None, Some(v2)];
+        let ops4: Vec<u8> = vec![
+            OpType::Put as u8,
+            OpType::Delete as u8,
+            OpType::Put as u8,
+        ];
+        let batch = make_arrow_batch(&key_refs4, &val_refs4, &ops4);
+        mt4.batch_put_arrow_with_base_seq(&batch, 1).unwrap();
+        let keys4 = mt4.prefix_scan_keys(b"ns/", None);
+        assert!(
+            keys4.iter().any(|k| &**k == key),
+            "batch_put_arrow_with_base_seq Put→Delete→Put must leave key visible; got {:?}",
+            keys4
+        );
     }
 }
