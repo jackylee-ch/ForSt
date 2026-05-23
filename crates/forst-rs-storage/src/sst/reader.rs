@@ -78,16 +78,22 @@ pub struct LookupResult {
 /// Returns the index of the first row where key == target_key,
 /// or `None` if the key is not present. The RecordBatch keys must
 /// be sorted in ascending order.
-fn search_key_in_batch(batch: &RecordBatch, target_key: &[u8]) -> Option<usize> {
+///
+/// R39-M3: a crafted or corrupt SST whose schema doesn't match the
+/// writer-side contract surfaces as a corruption error rather than a
+/// panic — matches the `ok_or_else(corruption)` pattern used in
+/// [`SstReaderImpl::get`] downstream of this call (sister fix to
+/// R38-M1).
+fn search_key_in_batch(batch: &RecordBatch, target_key: &[u8]) -> ForstResult<Option<usize>> {
     let keys = batch
         .column(0)
         .as_any()
         .downcast_ref::<BinaryArray>()
-        .expect("column 0 must be BinaryArray");
+        .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
 
     let num_rows = keys.len();
     if num_rows == 0 {
-        return None;
+        return Ok(None);
     }
 
     // Binary search for the first row where key >= target_key.
@@ -103,9 +109,9 @@ fn search_key_in_batch(batch: &RecordBatch, target_key: &[u8]) -> Option<usize> 
     }
 
     if lo < num_rows && keys.value(lo) == target_key {
-        Some(lo)
+        Ok(Some(lo))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -288,7 +294,7 @@ impl SstReaderImpl {
         let batch = self.read_data_block(entry.block_offset, entry.block_size)?;
 
         // 5. Binary search within the RecordBatch.
-        let first_row = match search_key_in_batch(&batch, key) {
+        let first_row = match search_key_in_batch(&batch, key)? {
             Some(idx) => idx,
             None => return Ok(None),
         };
@@ -714,9 +720,9 @@ mod tests {
             &[1, 2, 3, 4],
             &[0, 0, 0, 0],
         );
-        assert_eq!(search_key_in_batch(&batch, b"bbb"), Some(1));
-        assert_eq!(search_key_in_batch(&batch, b"aaa"), Some(0));
-        assert_eq!(search_key_in_batch(&batch, b"ddd"), Some(3));
+        assert_eq!(search_key_in_batch(&batch, b"bbb").unwrap(), Some(1));
+        assert_eq!(search_key_in_batch(&batch, b"aaa").unwrap(), Some(0));
+        assert_eq!(search_key_in_batch(&batch, b"ddd").unwrap(), Some(3));
     }
 
     #[test]
@@ -727,15 +733,15 @@ mod tests {
             &[1, 2, 3],
             &[0, 0, 0],
         );
-        assert_eq!(search_key_in_batch(&batch, b"bbb"), None);
-        assert_eq!(search_key_in_batch(&batch, b"zzz"), None);
+        assert_eq!(search_key_in_batch(&batch, b"bbb").unwrap(), None);
+        assert_eq!(search_key_in_batch(&batch, b"zzz").unwrap(), None);
     }
 
     #[test]
     fn test_search_key_in_batch_empty() {
         let schema = Arc::new(sst_schema());
         let batch = RecordBatch::new_empty(schema);
-        assert_eq!(search_key_in_batch(&batch, b"any"), None);
+        assert_eq!(search_key_in_batch(&batch, b"any").unwrap(), None);
     }
 
     #[test]
@@ -747,7 +753,7 @@ mod tests {
             &[100, 50, 10],
             &[0, 0, 0],
         );
-        assert_eq!(search_key_in_batch(&batch, b"key"), Some(0));
+        assert_eq!(search_key_in_batch(&batch, b"key").unwrap(), Some(0));
     }
 
     // -----------------------------------------------------------------------

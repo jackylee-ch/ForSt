@@ -84,6 +84,13 @@ pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64
 }
 
 /// Writes the checkpoint blob bytes atomically via a tmp file + rename.
+///
+/// R39-H2: same rename-then-leak-on-error pattern fixed in `flush.rs` and
+/// `compaction.rs`. On rename failure the `.<CHECKPOINT_BLOB_NAME>.tmp`
+/// orphan would otherwise persist forever; `open_from_checkpoint`'s
+/// orphan-scan only catches `.sst` / `.sst.tmp`. We delete the tmp file
+/// before propagating the rename error so a future restore is not left with
+/// a stale partial blob in the checkpoint directory.
 pub fn write_blob(fs: &dyn FileSystem, target_dir: &Path, blob: &[u8]) -> ForstResult<PathBuf> {
     fs.create_dir_all(target_dir)?;
     let final_path = target_dir.join(CHECKPOINT_BLOB_NAME);
@@ -94,7 +101,10 @@ pub fn write_blob(fs: &dyn FileSystem, target_dir: &Path, blob: &[u8]) -> ForstR
         wf.flush()?;
         wf.sync()?;
     }
-    fs.rename(&tmp_path, &final_path)?;
+    if let Err(e) = fs.rename(&tmp_path, &final_path) {
+        let _ = fs.delete_file(&tmp_path);
+        return Err(e);
+    }
     Ok(final_path)
 }
 

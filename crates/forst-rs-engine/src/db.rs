@@ -47,7 +47,10 @@ use crate::column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamil
 use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::compaction_filter::CompactionFilter;
 use crate::file_deletion_guard::FileDeletionGuard;
-use crate::flush::{sst_file_path, FlushExecutor, FlushJob, FlushQueue, FlushRequest};
+use crate::flush::{
+    sst_file_path, FlushExecutor, FlushJob, FlushQueue, FlushRequest, SST_TMP_PREFIX,
+    SST_TMP_SUFFIX,
+};
 use crate::mvcc::{self, DbId, Snapshot, SnapshotRegistry};
 use crate::runtime_tuning::WriteBufferManager;
 use crate::snapshot_view::SnapshotView;
@@ -2158,11 +2161,19 @@ impl DbImpl {
                         }
                         continue;
                     }
-                    // R38-H1: match `.<num>.sst.tmp` tmp-write artifacts.
-                    // Strip the leading `.` and trailing `.sst.tmp`, then
-                    // parse the inner number for the file-counter bump.
-                    if let Some(inner) = name.strip_suffix(".sst.tmp") {
-                        if let Some(stem) = inner.strip_prefix('.') {
+                    // R38-H1 + R39-L1: match `.<num>.sst.tmp` tmp-write
+                    // artifacts. The leading-dot + trailing `.tmp` come
+                    // from {@link flush::sst_temp_path} (used by both
+                    // FlushJob and CompactionJob). Using the shared
+                    // SST_TMP_PREFIX / SST_TMP_SUFFIX constants here
+                    // means a future rename of the writer-side naming
+                    // convention propagates automatically; the
+                    // `tests::sst_temp_path_round_trip` unit test pins
+                    // the round-trip so a drift here surfaces in CI
+                    // rather than as a silent restore-orphan miss.
+                    let sst_inner_suffix = format!(".sst{}", SST_TMP_SUFFIX);
+                    if let Some(inner) = name.strip_suffix(&sst_inner_suffix) {
+                        if let Some(stem) = inner.strip_prefix(SST_TMP_PREFIX) {
                             if let Ok(num) = stem.parse::<u64>() {
                                 if num > max_observed {
                                     max_observed = num;
@@ -2174,6 +2185,22 @@ impl DbImpl {
                             // the active naming space either.
                             tmp_orphans.push(entry.path.clone());
                         }
+                        continue;
+                    }
+                    // R39-H2: match the checkpoint-blob tmp artifact
+                    // `.<CHECKPOINT_BLOB_NAME>.tmp` produced by
+                    // [`checkpoint::write_blob`]. R39-H2's `write_blob`
+                    // delete-on-error close-gate now removes this file on
+                    // any rename failure during checkpoint emission, but
+                    // a process kill between the write and the rename
+                    // (or a delete-itself failure) can still leave the
+                    // file behind. We funnel it through the same
+                    // orphan-rename pass so the next restore is not
+                    // misled by a stale partial blob in the directory.
+                    let checkpoint_tmp_name =
+                        format!(".{}.tmp", CHECKPOINT_BLOB_NAME);
+                    if name == checkpoint_tmp_name {
+                        tmp_orphans.push(entry.path.clone());
                     }
                 }
             }

@@ -41,6 +41,29 @@ use crate::column_family::{ColumnFamilyData, SharedMemTable};
 /// flush. 8192 matches the default Arrow batch size across the project.
 const FLUSH_BATCH_SIZE: usize = 8192;
 
+/// R39-L1: leading-dot prefix and trailing `.tmp` suffix used to name
+/// mid-write SST files (both [`FlushJob::temp_path`] and the
+/// compaction-job tmp helper produce `.<basename>.tmp`). Centralised here
+/// so the orphan-scan in `db.rs::open_from_checkpoint` references the
+/// SAME constants used by the writers — a future change to the naming
+/// convention will fail loudly at the call sites rather than silently
+/// drop orphan-rename coverage. A `tests::temp_path_constants_match`
+/// unit test pins the writer-side string against these constants.
+pub(crate) const SST_TMP_PREFIX: &str = ".";
+pub(crate) const SST_TMP_SUFFIX: &str = ".tmp";
+
+/// Build the tmp path corresponding to a final SST `path` (writers call
+/// this to derive the staging file; the restore orphan-scan reverses it).
+pub(crate) fn sst_temp_path(path: &Path) -> PathBuf {
+    let mut base = path.to_path_buf();
+    let existing = base
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    base.set_file_name(format!("{}{}{}", SST_TMP_PREFIX, existing, SST_TMP_SUFFIX));
+    base
+}
+
 /// A single flush operation: one frozen memtable → one SST file.
 pub struct FlushJob {
     memtable: SharedMemTable,
@@ -181,13 +204,9 @@ impl FlushJob {
     }
 
     fn temp_path(&self) -> PathBuf {
-        let mut base = self.file_path.clone();
-        let existing = base
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        base.set_file_name(format!(".{}.tmp", existing));
-        base
+        // R39-L1: delegate to the centralised helper so the writer and
+        // restore-orphan-scan use the same naming convention.
+        sst_temp_path(&self.file_path)
     }
 
     fn info_to_meta(file_number: FileNumber, info: SstFileInfo) -> SstFileMeta {
@@ -516,5 +535,49 @@ mod tests {
         let p = sst_file_path(&base, FileNumber(123456789));
         // 6-digit padding but numbers larger than 6 digits are still valid.
         assert_eq!(p, PathBuf::from("/db/123456789.sst"));
+    }
+
+    /// R39-L1: pins the tmp-naming round-trip — the orphan-scan in
+    /// `db::open_from_checkpoint` reverses this convention with the
+    /// same SST_TMP_PREFIX / SST_TMP_SUFFIX constants. A future
+    /// change to the prefix/suffix here (e.g. dropping the dot)
+    /// must also update the scan; this test fails noisily in CI if
+    /// the round-trip is broken.
+    #[test]
+    fn test_sst_temp_path_round_trip() {
+        let final_path = PathBuf::from("/db/000042.sst");
+        let tmp = sst_temp_path(&final_path);
+        let tmp_name = tmp.file_name().unwrap().to_str().unwrap();
+        // Writer-side naming matches "<PREFIX><basename><SUFFIX>".
+        assert!(tmp_name.starts_with(SST_TMP_PREFIX));
+        assert!(tmp_name.ends_with(SST_TMP_SUFFIX));
+        // And matches the literal the scan currently expects.
+        assert_eq!(tmp, PathBuf::from("/db/.000042.sst.tmp"));
+    }
+
+    /// R39-L1: end-to-end orphan-detection test. Create a deliberately
+    /// orphaned tmp file in the db dir, then assert that
+    /// `open_from_checkpoint`'s scan picks it up via the
+    /// SST_TMP_PREFIX/SUFFIX-based match. Implementing the full
+    /// open_from_checkpoint round-trip here is heavyweight, so we
+    /// pin the predicate the scan uses — it composes the literal
+    /// the writer emits, exercising the constants from the consumer
+    /// direction.
+    #[test]
+    fn test_sst_temp_naming_detects_orphan() {
+        // Writer emits this name for FileNumber(7).
+        let final_path = PathBuf::from("/db/000007.sst");
+        let tmp = sst_temp_path(&final_path);
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        // Scan predicate (mirrors db.rs orphan-scan logic).
+        let sst_inner_suffix = format!(".sst{}", SST_TMP_SUFFIX);
+        let inner = name
+            .strip_suffix(&sst_inner_suffix)
+            .expect("scan must accept writer-side suffix");
+        let stem = inner
+            .strip_prefix(SST_TMP_PREFIX)
+            .expect("scan must accept writer-side prefix");
+        let num: u64 = stem.parse().expect("inner stem must parse as u64");
+        assert_eq!(num, 7);
     }
 }

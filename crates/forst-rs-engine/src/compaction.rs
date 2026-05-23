@@ -36,7 +36,7 @@ use forst_rs_storage::sst::{
 use forst_rs_storage::version::{SstFileMeta, VersionEdit};
 
 use crate::compaction_filter::{CompactionDecision, CompactionFilter};
-use crate::flush::sst_file_path;
+use crate::flush::{sst_file_path, sst_temp_path};
 use crate::mvcc;
 
 /// Description of a single compaction task: merge `inputs` into a new file
@@ -139,15 +139,10 @@ impl CompactionJob {
         // count). No full-SST `Vec<u8>` is allocated.
 
         // Open the temp file up front so the streaming writer has a sink.
-        let tmp_path = {
-            let mut base = self.output_path.clone();
-            let existing = base
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            base.set_file_name(format!(".{}.tmp", existing));
-            base
-        };
+        // R39-L1: shared with FlushJob::temp_path via flush::sst_temp_path so
+        // the restore orphan-scan reverses the SAME naming convention used
+        // by both writers.
+        let tmp_path = sst_temp_path(&self.output_path);
         if let Some(parent) = self.output_path.parent() {
             self.fs.create_dir_all(parent)?;
         }
