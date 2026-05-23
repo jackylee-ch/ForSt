@@ -2536,6 +2536,39 @@ impl DbImpl {
         })))
     }
 
+    /// R17-M1: shared-error-slot variant of [`Self::prefix_scan_iter_owned_arc`].
+    ///
+    /// Identical behaviour to the un-suffixed variant, except a caller-owned
+    /// `Arc<Mutex<Option<ForstError>>>` is installed on the underlying
+    /// [`LazyPrefixIter`] so tier-peek errors land in the SAME slot the FFI
+    /// consumer already drains for outer `db.get_arc` errors (the R16-M2
+    /// path). Pre-fix (R16-M2 only), tier-peek errors were stored in
+    /// `LazyPrefixIter::last_error` but the FFI layer wrapped the iter in a
+    /// `Box<dyn Iterator>` which erased the concrete type, so
+    /// `take_last_error()` was unreachable. Unifying both paths through one
+    /// slot makes tier errors observable to the Java side via the existing
+    /// `FrsErrorCode` mechanism.
+    pub fn prefix_scan_iter_owned_arc_with_error_slot(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+        error_slot: Arc<Mutex<Option<ForstError>>>,
+    ) -> ForstResult<
+        Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>,
+    > {
+        let cf_handle = cf.clone();
+        let mut inner = self.build_lazy_prefix_key_stream(cf, prefix)?;
+        inner.set_shared_error_slot(error_slot);
+        let db = Arc::clone(self);
+        Ok(Box::new(inner.filter_map(move |key_arc| {
+            match db.get_arc(&cf_handle, key_arc.as_ref()) {
+                Ok(Some(value)) => Some(Ok((key_arc, value))),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        })))
+    }
+
     /// Builds the lazy k-way merge over key sources (one per LSM tier)
     /// shared by both [`Self::prefix_scan_iter`] and
     /// [`Self::prefix_scan_iter_owned`]. The returned iterator yields
@@ -4151,6 +4184,18 @@ pub struct LazyPrefixIter {
     /// `take_last_error()` after each chunk-get cycle to surface the error
     /// as an `FrsErrorCode` to the Java side.
     last_error: Option<ForstError>,
+    /// R17-M1: optional shared error slot wired by the FFI consumer when it
+    /// needs tier-peek errors to land in the SAME slot it already drains for
+    /// outer `db.get_arc` errors (the R16-M2 infrastructure). Pre-fix,
+    /// `last_error` lived only on the concrete `LazyPrefixIter`; once the
+    /// FFI wrapped it in `Box<dyn Iterator>` the concrete type was erased
+    /// and `take_last_error` was unreachable — so tier peek errors were
+    /// silently dropped while `db.get_arc` errors were surfaced via the
+    /// R16-M2 path. Plumbing this shared `Arc<Mutex<Option<ForstError>>>`
+    /// into the iter unifies both error paths into a single observable slot.
+    /// `None` preserves the in-process API where callers (engine tests,
+    /// `prefix_scan` collector) consult `take_last_error()` directly.
+    shared_error_slot: Option<Arc<Mutex<Option<ForstError>>>>,
 }
 
 impl LazyPrefixIter {
@@ -4159,7 +4204,18 @@ impl LazyPrefixIter {
             sources,
             last_emitted: None,
             last_error: None,
+            shared_error_slot: None,
         })
+    }
+
+    /// R17-M1: install a shared error slot. When set, tier-peek errors are
+    /// recorded into BOTH the local `last_error` field (legacy in-process
+    /// API) and the shared slot. The FFI layer drains the shared slot via
+    /// `take_last_error()` on `IterHandle` so it sees both tier-peek errors
+    /// (captured here) and outer `db.get_arc` errors (captured by the
+    /// R16-M2 filter_map adapter) through a single mechanism.
+    pub fn set_shared_error_slot(&mut self, slot: Arc<Mutex<Option<ForstError>>>) {
+        self.shared_error_slot = Some(slot);
     }
 
     /// R15-M3: take + clear the last tier-peek error, if any. Called by the
@@ -4220,7 +4276,29 @@ impl Iterator for LazyPrefixIter {
                         Ok(Some(_)) => true,
                         Ok(None) => false,
                         Err(e) => {
-                            self.last_error = Some(e);
+                            // R17-M1: when the FFI shared slot is wired, publish
+                            // the tier-peek error there so the FFI consumer
+                            // (which already drains the slot for outer
+                            // `db.get_arc` errors per R16-M2) observes it
+                            // through a SINGLE mechanism. `ForstError` is not
+                            // `Clone` (it wraps `io::Error`), so we move the
+                            // value into the shared slot and record a sentinel
+                            // string in `last_error` to preserve the
+                            // in-process `take_last_error()` API contract.
+                            // Lock poison is benign here — overwriting a
+                            // poisoned slot restores forward progress.
+                            if let Some(slot) = self.shared_error_slot.as_ref() {
+                                let mut guard =
+                                    slot.lock().unwrap_or_else(|p| p.into_inner());
+                                let msg = format!("{e}");
+                                *guard = Some(e);
+                                self.last_error =
+                                    Some(ForstError::Aborted(format!(
+                                        "tier peek error (published to FFI slot): {msg}"
+                                    )));
+                            } else {
+                                self.last_error = Some(e);
+                            }
                             false
                         }
                     };

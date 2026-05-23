@@ -3667,6 +3667,15 @@ struct IterHandle {
     /// dropped (the original Box<dyn Iterator<Item = (Key, Value)>> shape
     /// erased the LazyPrefixIter type and its `take_last_error` accessor).
     last_error: Arc<Mutex<Option<forst_rs_common::ForstError>>>,
+    /// R17-M3: deferred error stash for the partial-chunk preservation state
+    /// machine. When a chunk-fill captures an upstream error AFTER serialising
+    /// one or more rows, the FFI surface returns the partial chunk + `Ok` so
+    /// the Java consumer drains the in-flight rows; the error is stashed here
+    /// and surfaced on the NEXT `_next` call (before any further pulls).
+    /// Pre-fix the open/next handlers zeroed `row_count`/`bytes_used` on error,
+    /// silently discarding the already-serialised rows and stealing data the
+    /// caller had observable bytes for.
+    deferred_error: Option<forst_rs_common::ForstError>,
 }
 
 impl IterHandle {
@@ -3686,16 +3695,34 @@ impl IterHandle {
             pending: None,
             aborted: AtomicBool::new(false),
             last_error,
+            deferred_error: None,
         }
     }
 
-    /// R16-M2: take + clear the last error captured by the upstream filter
-    /// adapter. Returns `Some(err)` once per occurrence; later calls return
-    /// `None` until another error is captured. Used by
+    /// R16-M2 + R17-L2: take + clear the last error captured by the upstream
+    /// filter adapter. Returns `Some(err)` once per occurrence; later calls
+    /// return `None` until another error is captured. Used by
     /// `fill_chunk_from_iter` (and its open/next callers) to surface engine
-    /// failures to the Java caller as an `FrsErrorCode`.
+    /// failures to the Java caller as an `FrsErrorCode`. Tolerates a poisoned
+    /// mutex — the only way to poison is a panic while we hold the lock; the
+    /// stored value is still readable and overwriting it restores progress.
     fn take_last_error(&self) -> Option<forst_rs_common::ForstError> {
-        self.last_error.lock().unwrap().take()
+        self.last_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+    }
+
+    /// R17-M3: stash a deferred error so the next `_next` call surfaces it
+    /// AFTER the caller has drained the partial chunk that triggered it.
+    fn set_deferred_error(&mut self, err: forst_rs_common::ForstError) {
+        self.deferred_error = Some(err);
+    }
+
+    /// R17-M3: take + clear the deferred error stash. Returns `Some(err)`
+    /// once per occurrence.
+    fn take_deferred_error(&mut self) -> Option<forst_rs_common::ForstError> {
+        self.deferred_error.take()
     }
 
     /// Pull the next row from the iterator, preferring the pending row
@@ -3852,16 +3879,30 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             slice::from_raw_parts(prefix_ptr, prefix_len as usize)
         };
 
-        // PR-C6-H1 + B10-H3 + B11-H3: route through the zero-copy-{key,value}
-        // streaming `prefix_scan_iter_owned_arc`. The iterator captures
-        // `Arc<DbImpl>` internally so it can be stashed in the per-shard
-        // `IterHandle` registry and outlive this FFI call. BOTH halves of
-        // each row are emitted as `Arc<[u8]>` (wrapped in `IterKey::Arc`
-        // and `IterValue::Arc`) so the chunk-fill memcpy reads directly
-        // out of the Arc-owned bytes — no per-row `Vec<u8>` allocation at
-        // the public boundary, and `put_back` rollback is a refcount move
-        // instead of a Vec move.
-        let owned_iter = match db_ref.prefix_scan_iter_owned_arc(cf_ref_, prefix) {
+        // PR-C6-H1 + B10-H3 + B11-H3 + R17-M1: route through the
+        // zero-copy-{key,value} streaming `prefix_scan_iter_owned_arc_with_error_slot`.
+        // The iterator captures `Arc<DbImpl>` internally so it can be stashed
+        // in the per-shard `IterHandle` registry and outlive this FFI call.
+        // BOTH halves of each row are emitted as `Arc<[u8]>` (wrapped in
+        // `IterKey::Arc` and `IterValue::Arc`) so the chunk-fill memcpy reads
+        // directly out of the Arc-owned bytes — no per-row `Vec<u8>`
+        // allocation at the public boundary, and `put_back` rollback is a
+        // refcount move instead of a Vec move.
+        //
+        // R17-M1: allocate the shared error slot UP-FRONT and pass it into
+        // the engine variant so the underlying `LazyPrefixIter` publishes its
+        // tier-peek errors into the SAME slot we already drain for outer
+        // `db.get_arc` errors. Pre-fix (R16-M2 only), the engine variant
+        // boxed the iter as `Box<dyn Iterator>` which erased the
+        // `LazyPrefixIter` type — its `take_last_error()` was unreachable
+        // and tier peek errors were silently dropped.
+        let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+            Arc::new(Mutex::new(None));
+        let owned_iter = match db_ref.prefix_scan_iter_owned_arc_with_error_slot(
+            cf_ref_,
+            prefix,
+            Arc::clone(&error_slot),
+        ) {
             Ok(it) => it,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
@@ -3871,8 +3912,9 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         // slot via `take_last_error` after every chunk-get and translates a
         // recorded error into an `FrsErrorCode` so the Java side observes
         // the failure instead of seeing a clean end-of-iterator.
-        let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
-            Arc::new(Mutex::new(None));
+        // R17-L2: tolerate a poisoned mutex (the only way to poison the lock
+        // is a panic while we hold it — recoverable by overwriting with the
+        // observed error).
         let error_slot_inner = Arc::clone(&error_slot);
         let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
             Box::new(owned_iter.filter_map(move |r| match r {
@@ -3882,7 +3924,10 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
                     // one. The FFI consumer drains via `take_last_error()`
                     // after every chunk so per-row errors do not accumulate
                     // beyond a single chunk.
-                    *error_slot_inner.lock().unwrap() = Some(e);
+                    let mut guard = error_slot_inner
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    *guard = Some(e);
                     None
                 }
             }));
@@ -3892,16 +3937,27 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         let (bytes_used, row_count) =
             fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
 
-        // R16-M2: surface any error captured during the first chunk fill.
+        // R16-M2 + R17-M3: surface any error captured during the first chunk
+        // fill. The partial-chunk state machine has two branches:
+        //   (1) error captured with NO rows serialised → fail open() directly;
+        //       no handle is registered and the caller observes a clean
+        //       failure.
+        //   (2) error captured AFTER one or more rows serialised → return the
+        //       partial chunk + Ok, register the handle, and STASH the error
+        //       on the handle so the next `_next` call surfaces it BEFORE
+        //       pulling more rows. Pre-fix the open path zeroed
+        //       row_count/bytes_used and discarded the already-serialised
+        //       rows — silent data loss for rows the caller had bytes for.
         if let Some(err) = handle_state.take_last_error() {
-            // The error already populated the slot before we register the
-            // handle, so we surface it directly here (the handle is not yet
-            // registered in the shard map). Returning the error code lets
-            // the Java side observe a clean failure for the open() call.
-            *out_row_count = 0;
-            *out_bytes_used = 0;
-            *out_handle = 0;
-            return error_to_frs_code(&err);
+            if row_count == 0 {
+                *out_row_count = 0;
+                *out_bytes_used = 0;
+                *out_handle = 0;
+                return error_to_frs_code(&err);
+            }
+            // Partial chunk path: defer the error to the next `_next` call so
+            // the caller drains the in-flight rows first.
+            handle_state.set_deferred_error(err);
         }
 
         // Register the iterator on a sharded registry.  Shard is selected
@@ -3951,21 +4007,40 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
         if chunk_buf_ptr.is_null() && chunk_buf_cap > 0 {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
-        let mut guard = shard_for(handle).lock().unwrap();
+        let mut guard = shard_for(handle).lock().unwrap_or_else(|p| p.into_inner());
         let iter = match guard.get_mut(&handle) {
             Some(it) => it,
             None => return FrsErrorCode::IterCursorInvalid as i32,
         };
+        // R17-M3: drain any deferred error from the previous chunk's
+        // partial-chunk fill BEFORE pulling new rows. The caller has already
+        // observed the partial rows that triggered this error, so we now owe
+        // them the error code (empty chunk, no further bytes).
+        if let Some(err) = iter.take_deferred_error() {
+            *out_row_count = 0;
+            *out_bytes_used = 0;
+            return error_to_frs_code(&err);
+        }
         let (bytes_used, row_count) =
             fill_chunk_from_iter(iter, chunk_buf_ptr, chunk_buf_cap as usize);
         *out_row_count = row_count;
         *out_bytes_used = bytes_used;
-        // R16-M2: drain the per-iter error slot AFTER the chunk fill so a
-        // tier-source error that surfaced mid-chunk is propagated to the
+        // R16-M2 + R17-M3: drain the per-iter error slot AFTER the chunk fill
+        // so a tier-source error that surfaced mid-chunk is propagated to the
         // Java side as an `FrsErrorCode`. Pre-fix, the bare `r.ok()` in the
         // filter_map adapter silently dropped engine errors here.
+        //
+        // Partial-chunk state machine: if rows were serialised before the
+        // error, return Ok + the partial chunk and STASH the error for the
+        // next `_next` call. Pre-fix the next path overwrote row_count/
+        // bytes_used to 0 — silently discarding the partial chunk the caller
+        // had bytes for. Only when row_count == 0 do we surface the error in
+        // this call (no rows to drain first).
         if let Some(err) = iter.take_last_error() {
-            return error_to_frs_code(&err);
+            if row_count == 0 {
+                return error_to_frs_code(&err);
+            }
+            iter.set_deferred_error(err);
         }
         FrsErrorCode::Ok as i32
     })
@@ -4180,13 +4255,20 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
 
             let prefix: &[u8] = if prefix_len == 0 { &[] } else { &data_buf[ks..ke] };
 
-            // PR-C6-H1 + B10-H3 + B11-H3: same zero-copy-{key,value} owned
-            // streaming path as the single-shot open above. Each iterator
-            // captures `Arc<DbImpl>` so the FFI registry can outlive this
-            // call; both halves of each row are emitted as `Arc<[u8]>` so
-            // the chunk-fill memcpy reads them in place without a per-row
-            // Vec allocation.
-            let owned_iter = match db_ref.prefix_scan_iter_owned_arc(cf_ref_, prefix) {
+            // PR-C6-H1 + B10-H3 + B11-H3 + R17-M1: same zero-copy-{key,value}
+            // owned streaming path as the single-shot open above, but routed
+            // through `prefix_scan_iter_owned_arc_with_error_slot` so the
+            // underlying `LazyPrefixIter`'s tier-peek errors land in the
+            // SAME shared slot we already drain for outer `db.get_arc`
+            // errors. Each iterator captures `Arc<DbImpl>` so the FFI
+            // registry can outlive this call.
+            let batch_error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+                Arc::new(Mutex::new(None));
+            let owned_iter = match db_ref.prefix_scan_iter_owned_arc_with_error_slot(
+                cf_ref_,
+                prefix,
+                Arc::clone(&batch_error_slot),
+            ) {
                 Ok(it) => it,
                 Err(_) => {
                     if first_err == FrsErrorCode::Ok as i32 {
@@ -4195,18 +4277,20 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                     continue;
                 }
             };
-            // R16-M2: error-tap closure mirroring the single-shot
+            // R16-M2 + R17-L2: error-tap closure mirroring the single-shot
             // `frs_vec_iter_prefix_open` path so engine errors mid-iter are
             // captured in the IterHandle's shared error slot and surfaced
             // back to the Java caller via take_last_error() on the next call.
-            let batch_error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
-                Arc::new(Mutex::new(None));
+            // Poison-tolerant lock acquire (R17-L2).
             let batch_error_slot_inner = Arc::clone(&batch_error_slot);
             let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
                 Box::new(owned_iter.filter_map(move |r| match r {
                     Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
                     Err(e) => {
-                        *batch_error_slot_inner.lock().unwrap() = Some(e);
+                        let mut guard = batch_error_slot_inner
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        *guard = Some(e);
                         None
                     }
                 }));
@@ -4216,13 +4300,21 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
             // Fill the first chunk into the caller-owned buffer.
             let (bytes_used, row_count) =
                 fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap as usize);
-            // R16-M2: if the first chunk fill captured an error, surface it
-            // through the per-descriptor return path (batch open returns
-            // multiple results; subsequent next() calls will drain the same
-            // slot for additional errors).
+            // R16-M2 + R17-M3: if the first chunk fill captured an error,
+            // surface it through the per-descriptor return path (batch open
+            // returns multiple results; subsequent next() calls will drain
+            // the same slot for additional errors). Partial-chunk preserving
+            // semantics: when one or more rows already serialised before the
+            // error, stash the error on the handle so the next `_next` call
+            // surfaces it AFTER the caller drains the partial chunk. Pre-fix,
+            // batch-open could lose rows on a mid-chunk error.
             if let Some(err) = handle_state.take_last_error() {
-                if first_err == FrsErrorCode::Ok as i32 {
-                    first_err = error_to_frs_code(&err);
+                if row_count == 0 {
+                    if first_err == FrsErrorCode::Ok as i32 {
+                        first_err = error_to_frs_code(&err);
+                    }
+                } else {
+                    handle_state.set_deferred_error(err);
                 }
             }
 
@@ -4232,7 +4324,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
             let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             shard_for(handle_id)
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .insert(handle_id, handle_state);
 
             handles_out[i] = handle_id;
