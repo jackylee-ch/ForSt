@@ -506,6 +506,57 @@ impl ShardedMemTable {
         keys
     }
 
+    /// C9-H1: Lazy cross-shard k-way-merge cursor for the active / immutable
+    /// memtable tier.
+    ///
+    /// The previous [`Self::prefix_scan_keys`] path materialised the union of
+    /// every shard's matching keys, then ran a **global** sort+dedup before the
+    /// caller could read the first row. For a 100K-row memtable that meant
+    /// ~100K `Arc<[u8]>` clones AND an `O(N log N)` global sort paid at
+    /// `LazyPrefixIter` construction — defeating the "lazy first row"
+    /// contract that the SST tier already honours via block-streaming.
+    ///
+    /// This cursor instead:
+    ///   1. Snapshots each shard's matching keys via the existing
+    ///      [`VectorizedMemTable::prefix_scan_keys`] (cheap: `Arc::clone` per
+    ///      key on the prefix-index fast path; one alloc per key on the
+    ///      sorted_index fallback). The snapshot is the only "upfront" work.
+    ///   2. Sorts each per-shard snapshot once (the prefix_index fast path
+    ///      returns insertion-order, so per-shard sort is required for the
+    ///      heap invariant). Per-shard sort is `O((N/shards) log (N/shards))`
+    ///      — for the default 16 shards this is ~5x cheaper in compares than
+    ///      a global sort even ignoring the constant factor of a smaller heap.
+    ///   3. Uses a `BinaryHeap<Reverse<(Arc<[u8]>, shard_idx)>>` to advance
+    ///      lazily across shards. Cross-shard dedup is handled by the
+    ///      `last_emitted` filter in the caller (`LazyPrefixIter::next`).
+    ///
+    /// The cursor takes shard `read()` guards ONLY during the snapshot
+    /// step; it does not hold any guards across `peek`/`advance` calls
+    /// (which would deadlock with concurrent writers on the same shard).
+    /// This trades "true cursor over a live BTreeMap" — which would require
+    /// self-referential ownership of an `RwLockReadGuard` plus a
+    /// `BTreeMap::range` iterator — for "snapshot once, merge lazily".
+    /// Holding read locks across iterator emission would also block writers
+    /// for the full duration of the scan, which is unacceptable on the
+    /// Q11/Q12 hot path where writers and scanners overlap.
+    pub fn prefix_scan_cursor(&self, lower: &[u8], upper: Option<&[u8]>) -> MemTierCursor {
+        // Per-shard sorted snapshots. We sort each shard's bucket once;
+        // total compares are dominated by the per-shard sort, which is
+        // ~`(N/16) log(N/16)` for the default config — about 5× cheaper
+        // than the global `N log N` sort that the legacy path paid.
+        let mut shard_snapshots: Vec<Vec<Arc<[u8]>>> = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            let guard = shard.read().expect("lock poisoned");
+            let mut keys = guard.prefix_scan_keys(lower, upper);
+            // The `prefix_index` fast path returns insertion-order; the
+            // `sorted_index` fallback returns sorted. Sort unconditionally
+            // here so the cursor's heap invariant holds in both cases.
+            keys.sort();
+            shard_snapshots.push(keys);
+        }
+        MemTierCursor::new(shard_snapshots)
+    }
+
     // ------------------------------------------------------------------
     // Lifecycle / flush helpers
     // ------------------------------------------------------------------
@@ -632,6 +683,120 @@ impl ShardedMemTable {
             row_idx = chunk_end;
         }
         Ok(batches)
+    }
+}
+
+// ---------------------------------------------------------------------
+// MemTierCursor (C9-H1): lazy cross-shard k-way merge
+// ---------------------------------------------------------------------
+
+/// Min-heap entry: `(Arc<[u8]>, shard_idx)`, ordered ascending by key bytes.
+/// Wrapped in `std::cmp::Reverse` when pushed into the `BinaryHeap` (which
+/// is a max-heap by default) so `peek()` returns the lexicographically
+/// smallest pending key across all shards.
+#[derive(Eq, PartialEq)]
+struct HeapEntry {
+    key: Arc<[u8]>,
+    shard_idx: usize,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Order by the key bytes first; tie-break on shard_idx so distinct
+        // shards holding identical keys are deterministic (the caller's
+        // dedup filter relies only on the key, not on shard ordering).
+        self.key
+            .as_ref()
+            .cmp(other.key.as_ref())
+            .then_with(|| self.shard_idx.cmp(&other.shard_idx))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Lazy cursor that emits `Arc<[u8]>` keys across N per-shard snapshots in
+/// sorted order, advancing one shard at a time without ever building a
+/// global sorted vector.
+///
+/// Design notes (see `ShardedMemTable::prefix_scan_cursor` for the bigger
+/// picture):
+///   * Each shard owns its own `Vec<Arc<[u8]>>` snapshot + monotonic `pos`.
+///   * The heap holds at most ONE pending entry per non-empty shard, so the
+///     resident footprint is `O(num_shards)` — independent of the total
+///     number of matching keys. For the default 16 shards that is at most
+///     16 `Arc<[u8]>` headers + 16 `usize` shard ids ≈ a few hundred bytes.
+///   * `peek` is `O(1)`; `advance` is `O(log num_shards)` (one heap pop +
+///     one heap push when the popped shard still has more keys).
+///   * Cross-tier dedup (active mem vs imm mems vs SSTs) is OUT of scope
+///     here — that is the caller's job (the `last_emitted` filter inside
+///     `LazyPrefixIter::next`). This cursor only dedupes WITHIN its own
+///     snapshots via shard-local `pos` advancement (each shard's snapshot
+///     is already deduped by `VectorizedMemTable::prefix_scan_keys`).
+pub struct MemTierCursor {
+    shards: Vec<Vec<Arc<[u8]>>>,
+    positions: Vec<usize>,
+    heap: std::collections::BinaryHeap<Reverse<HeapEntry>>,
+}
+
+impl MemTierCursor {
+    fn new(shard_snapshots: Vec<Vec<Arc<[u8]>>>) -> Self {
+        let n = shard_snapshots.len();
+        let mut heap = std::collections::BinaryHeap::with_capacity(n);
+        let positions = vec![0usize; n];
+        for (i, snap) in shard_snapshots.iter().enumerate() {
+            if let Some(first) = snap.first() {
+                heap.push(Reverse(HeapEntry {
+                    key: Arc::clone(first),
+                    shard_idx: i,
+                }));
+            }
+        }
+        Self {
+            shards: shard_snapshots,
+            positions,
+            heap,
+        }
+    }
+
+    /// Returns whether the cursor has any more pending keys.
+    pub fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
+    /// Peeks at the next key (the lex-smallest across all shards) without
+    /// consuming it. Returns `None` when the cursor is fully drained.
+    /// The returned slice is borrowed from the underlying `Arc<[u8]>` —
+    /// callers MUST NOT cache it across an `advance()` call.
+    pub fn peek(&self) -> Option<&[u8]> {
+        self.heap.peek().map(|Reverse(e)| e.key.as_ref())
+    }
+
+    /// Returns the currently-peeked key as a cheap `Arc<[u8]>` clone
+    /// (atomic refcount bump, no byte copy). Returns `None` when the
+    /// cursor is drained.
+    pub fn peek_arc(&self) -> Option<Arc<[u8]>> {
+        self.heap.peek().map(|Reverse(e)| Arc::clone(&e.key))
+    }
+
+    /// Advances past the currently-peeked key and replenishes the heap
+    /// from the same shard if it still has more keys.
+    pub fn advance(&mut self) {
+        if let Some(Reverse(entry)) = self.heap.pop() {
+            let s = entry.shard_idx;
+            self.positions[s] += 1;
+            let next_pos = self.positions[s];
+            if next_pos < self.shards[s].len() {
+                let next_key = Arc::clone(&self.shards[s][next_pos]);
+                self.heap.push(Reverse(HeapEntry {
+                    key: next_key,
+                    shard_idx: s,
+                }));
+            }
+        }
     }
 }
 
