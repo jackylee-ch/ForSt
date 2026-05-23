@@ -4370,6 +4370,19 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                     if first_err == FrsErrorCode::Ok as i32 {
                         first_err = error_to_frs_code(&err);
                     }
+                    // R19-M1: when the first-chunk fill captured an error AND
+                    // produced zero rows, the per-descriptor `first_err` carries
+                    // the cause to the Java caller (via take_last_error consume +
+                    // error_to_frs_code above). The handle is still registered
+                    // on the sharded registry below so the caller's matching
+                    // `_close` call lands on a valid handle ID — but without
+                    // `mark_terminal()` a subsequent `_next` call would fall
+                    // through to the upstream iterator and silently pull rows
+                    // even though the caller already received an error code on
+                    // open. Mark terminal so any post-open `_next` returns
+                    // empty chunks + Ok (EOF semantics), matching the single-
+                    // shot path's contract after a deferred-error surface.
+                    handle_state.mark_terminal();
                 } else {
                     handle_state.set_deferred_error(err);
                 }

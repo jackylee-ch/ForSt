@@ -4320,7 +4320,19 @@ impl Iterator for LazyPrefixIter {
                                 // and observe the error through
                                 // `take_last_error()` as before.
                             } else {
-                                self.last_error = Some(e);
+                                // R19-L1: sticky-FIRST in the unwired branch too.
+                                // The wired branch above (which routes errors
+                                // into the shared FFI slot) already preserves the
+                                // FIRST captured error per R18-M3. Mirror that
+                                // semantics here so callers using LazyPrefixIter
+                                // directly (no FFI shared slot, e.g., in-process
+                                // engine consumers) observe the same root-cause
+                                // ordering: an early tier-peek failure should NOT
+                                // be buried by a later cascade failure when both
+                                // hit within the same merge pass.
+                                if self.last_error.is_none() {
+                                    self.last_error = Some(e);
+                                }
                             }
                             false
                         }
