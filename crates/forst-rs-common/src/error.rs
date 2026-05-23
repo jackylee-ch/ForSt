@@ -78,6 +78,19 @@ pub enum ForstError {
     /// exhaustion, structural-state mismatch detected at runtime, etc.
     #[error("Internal: {0}")]
     Internal(String),
+
+    /// The target memtable has been frozen by the flush worker and cannot
+    /// accept further writes. This is a transient retryable condition: the
+    /// engine always swaps in a fresh active memtable shortly after the
+    /// freeze; callers spinning on `active_memtable()` re-acquire and retry.
+    ///
+    /// R28-H1: a typed variant rather than a stringly-matched error so
+    /// `db.rs` retry sites can pattern-match precisely without scanning
+    /// `to_string()`. Storage crate emits this directly from `put_with_seq`
+    /// / `batch_insert_*` / `batch_put_arrow_with_base_seq` instead of an
+    /// `InvalidArgument("cannot write to a frozen MemTable")`.
+    #[error("Frozen memtable: write rejected (memtable was frozen by flush worker)")]
+    FrozenMemTable,
 }
 
 /// A convenience type alias for `Result<T, ForstError>`.
@@ -204,6 +217,16 @@ impl ForstError {
     pub fn is_internal(&self) -> bool {
         matches!(self, ForstError::Internal(_))
     }
+
+    /// Returns `true` if this is the [`ForstError::FrozenMemTable`] variant.
+    ///
+    /// R28-H1: predicate used by `DbImpl::write_single` / `get_and_put`
+    /// retry loops to distinguish the transient frozen-memtable race
+    /// (retry-with-yield) from a genuine invalid-argument failure (return
+    /// to caller).
+    pub fn is_frozen_memtable(&self) -> bool {
+        matches!(self, ForstError::FrozenMemTable)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +305,25 @@ mod tests {
     fn test_display_internal() {
         let err = ForstError::internal("engine stopped accepting writes");
         assert_eq!(err.to_string(), "Internal: engine stopped accepting writes");
+    }
+
+    #[test]
+    fn test_display_frozen_memtable() {
+        let err = ForstError::FrozenMemTable;
+        assert!(err.to_string().starts_with("Frozen memtable"));
+        assert!(err.is_frozen_memtable());
+        assert!(!err.is_invalid_argument());
+    }
+
+    #[test]
+    fn test_frozen_memtable_pattern_match() {
+        // R28-H1: db.rs retry sites match via `ForstError::FrozenMemTable`
+        // pattern; verify the pattern compiles and discriminates.
+        let err: ForstError = ForstError::FrozenMemTable;
+        let is_frozen = matches!(err, ForstError::FrozenMemTable);
+        assert!(is_frozen);
+        let other = ForstError::corruption("x");
+        assert!(!matches!(other, ForstError::FrozenMemTable));
     }
 
     // -- From<io::Error> conversion -----------------------------------------

@@ -231,9 +231,13 @@ impl VectorizedMemTable {
         seq: u64,
     ) -> ForstResult<u64> {
         if self.frozen {
-            return Err(forst_rs_common::ForstError::invalid_argument(
-                "cannot write to a frozen MemTable",
-            ));
+            // R28-H1: typed variant — db.rs retry loops match
+            // `ForstError::FrozenMemTable` instead of substring-scanning a
+            // stringly-typed InvalidArgument message. The substring match
+            // was brittle: a future error reformat (or a translation pass
+            // through a wrapping layer) would silently break the retry and
+            // surface the freeze as a hard write failure to the caller.
+            return Err(forst_rs_common::ForstError::FrozenMemTable);
         }
 
         // SECURITY: validate op_type_byte BEFORE mutating any state, so an
@@ -895,9 +899,8 @@ impl VectorizedMemTable {
         base_seq: u64,
     ) -> ForstResult<usize> {
         if self.frozen {
-            return Err(forst_rs_common::ForstError::invalid_argument(
-                "cannot write to a frozen MemTable",
-            ));
+            // R28-H1: typed variant for engine-side retry; see put_with_seq.
+            return Err(forst_rs_common::ForstError::FrozenMemTable);
         }
         if keys.len() != values.len() || keys.len() != op_types.len() {
             return Err(forst_rs_common::ForstError::invalid_argument(
@@ -1083,9 +1086,8 @@ impl VectorizedMemTable {
         seqs: &[u64],
     ) -> ForstResult<usize> {
         if self.frozen {
-            return Err(forst_rs_common::ForstError::invalid_argument(
-                "cannot write to a frozen MemTable",
-            ));
+            // R28-H1: typed variant for engine-side retry; see put_with_seq.
+            return Err(forst_rs_common::ForstError::FrozenMemTable);
         }
         if keys.len() != values.len() || keys.len() != op_types.len() || keys.len() != seqs.len() {
             return Err(forst_rs_common::ForstError::invalid_argument(
@@ -1282,9 +1284,8 @@ impl VectorizedMemTable {
         base_seq: u64,
     ) -> ForstResult<usize> {
         if self.frozen {
-            return Err(forst_rs_common::ForstError::invalid_argument(
-                "cannot write to a frozen MemTable",
-            ));
+            // R28-H1: typed variant for engine-side retry; see put_with_seq.
+            return Err(forst_rs_common::ForstError::FrozenMemTable);
         }
 
         // ---- schema validation ----

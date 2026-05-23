@@ -1205,14 +1205,29 @@ impl DbImpl {
         Self::check_sequence_overflow(seq)?;
 
         {
-            let mut attempt = 0;
+            // R28-H1: pattern-match the typed FrozenMemTable variant
+            // instead of substring-scanning `to_string()` — the prior
+            // `.contains("frozen MemTable")` shape was fragile against any
+            // future Display reformat or wrapper that might prepend a
+            // context prefix.
+            // R28-L3: add bounded exponential backoff between retries so a
+            // protracted freeze (e.g. flush worker stalled on slow remote
+            // storage) doesn't burn a CPU core busy-spinning. Sleeps are
+            // tiny (100us, 200us, 400us, 800us, …) and capped by `attempt
+            // < 8` so worst-case retry duration is ~25.6ms before the
+            // error surfaces to the caller — orders of magnitude shorter
+            // than the original `to_string()` allocation it replaces.
+            let mut attempt: u32 = 0;
             loop {
                 let mem_arc = cf_data.active_memtable();
                 match mem_arc.put_with_seq(key, Some(new_value), OpType::Put as u8, seq) {
                     Ok(_) => break,
-                    Err(e) if attempt < 8 && e.to_string().contains("frozen MemTable") => {
-                        attempt += 1;
+                    Err(ForstError::FrozenMemTable) if attempt < 8 => {
                         std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_micros(
+                            100u64 << attempt,
+                        ));
+                        attempt += 1;
                     }
                     Err(e) => return Err(e),
                 }
@@ -1297,14 +1312,21 @@ impl DbImpl {
         // to re-acquire the new active. The race surfaces under llvm-cov
         // instrumentation slowdown but is rare in production.
         {
-            let mut attempt = 0;
+            // R28-H1 + R28-L3: typed retry + bounded exponential backoff.
+            // See `get_and_put` comment block for rationale; both retry
+            // sites must use the same pattern so neither becomes the slow
+            // path under flush contention.
+            let mut attempt: u32 = 0;
             loop {
                 let mem_arc = cf_data.active_memtable();
                 match mem_arc.put_with_seq(key, value, op as u8, seq) {
                     Ok(_) => break,
-                    Err(e) if attempt < 8 && e.to_string().contains("frozen MemTable") => {
-                        attempt += 1;
+                    Err(ForstError::FrozenMemTable) if attempt < 8 => {
                         std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_micros(
+                            100u64 << attempt,
+                        ));
+                        attempt += 1;
                     }
                     Err(e) => return Err(e),
                 }
@@ -2004,10 +2026,78 @@ impl DbImpl {
             }
         }
 
+        // R28-M1: scan db_path for SST files NOT referenced by the snapshot.
+        // The snapshot's `next_file_number` is the writer-side counter the
+        // engine had at checkpoint time. If a crash interrupted a flush
+        // BEFORE the manifest was updated, the orphaned SST sits on disk
+        // with a file number ≥ snapshot.next_file_number — restoring with
+        // the snapshot's counter would reuse those numbers and overwrite
+        // valid checkpoint files mid-flush. Take the max of the snapshot's
+        // counter and (highest observed file number + 1) so the engine
+        // allocates new SST file numbers strictly above anything already
+        // present on disk.
+        let mut max_observed: u64 = 0;
+        let mut orphans: Vec<PathBuf> = Vec::new();
+        if fs.file_exists(&db_path)? {
+            // list_dir may error on a fresh restore directory that doesn't
+            // yet exist — treat that as "no observed files" rather than a
+            // fatal restore failure. Same shape used by the live-SST check
+            // above (file_exists swallow).
+            match fs.list_dir(&db_path) {
+                Ok(entries) => {
+                    let referenced: std::collections::HashSet<u64> = snapshot
+                        .version
+                        .live_sst_files()
+                        .iter()
+                        .map(|f| f.file_number.value())
+                        .collect();
+                    for entry in entries {
+                        if entry.is_dir {
+                            continue;
+                        }
+                        let name = match entry.path.file_name().and_then(|n| n.to_str()) {
+                            Some(n) => n,
+                            None => continue,
+                        };
+                        // Match the `<6-digit-number>.sst` naming
+                        // produced by `sst_file_path`.
+                        if let Some(stem) = name.strip_suffix(".sst") {
+                            if let Ok(num) = stem.parse::<u64>() {
+                                if num > max_observed {
+                                    max_observed = num;
+                                }
+                                if !referenced.contains(&num) {
+                                    orphans.push(entry.path.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        "open_from_checkpoint: list_dir({}) failed during orphan scan: {} \
+                         (continuing with snapshot.next_file_number unchanged)",
+                        db_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        for orphan in &orphans {
+            tracing::warn!(
+                "open_from_checkpoint: orphaned SST file not referenced by checkpoint \
+                 manifest, leaving on disk for operator triage: {}",
+                orphan.display()
+            );
+        }
+        let restored_next_file_number = snapshot
+            .next_file_number
+            .max(max_observed.saturating_add(1));
+
         // Build the DbImpl with the restored VersionSet.
         let version_set = Arc::new(forst_rs_storage::version::VersionSetImpl::from_restored(
             (*snapshot.version).clone(),
-            snapshot.next_file_number,
+            restored_next_file_number,
             snapshot.last_sequence,
         ));
 
