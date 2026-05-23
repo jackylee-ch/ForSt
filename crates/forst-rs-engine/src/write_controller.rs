@@ -118,6 +118,24 @@ impl WriteController {
     /// Blocks the calling thread (or sleeps briefly) if back-pressure is
     /// active. Returns once the writer may proceed, or an error if the stall
     /// timeout fires.
+    ///
+    /// **R24-M4 — DOCUMENTED LIMITATION (deferred fix).** When the engine is stalled
+    /// (`ThrottleDecision::Stall`) this method blocks the calling thread on a condvar
+    /// for up to `stall_timeout` (default 30s). When invoked across an FFM boundary on
+    /// the Flink mailbox thread, that block freezes the mailbox; if it lasts more than
+    /// ~50s the Flink TaskManager heartbeat watchdog logs a missed-heartbeat warning,
+    /// and at the 60s mark the task is marked unresponsive. Even a sub-heartbeat stall
+    /// (5-30s) starves every other operator sharing the slot.
+    ///
+    /// The correct fix is to return a non-blocking `ThrottleDecision::WouldBlock` /
+    /// `BUSY`-style status from the FFI so the Java side can park-and-retry through
+    /// the async-state framework (releasing the mailbox while parked). That change
+    /// touches the FFI signature, the Java-side dispatch loop, AND the async-state
+    /// adapter, so it is deferred to a dedicated PR; see the planning note
+    /// `docs/superpowers/specs/2026-05-22-throttle-async-fix.md` (to be drafted) for
+    /// the migration plan. Until then, operators should configure
+    /// `write_buffer.max_write_buffer_number` and `l0_slowdown_trigger` headroom so
+    /// `ThrottleDecision::Stall` is rare in steady state.
     pub fn may_throttle(&self) -> ForstResult<()> {
         match self.check() {
             ThrottleDecision::Proceed => Ok(()),
