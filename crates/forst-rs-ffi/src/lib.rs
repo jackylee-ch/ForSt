@@ -1067,6 +1067,31 @@ pub unsafe extern "C" fn frs_cf_set_compaction_filter_ttl(
 // ---------------------------------------------------------------------------
 
 /// Inserts or overwrites a value.
+///
+/// # D12-M1: NULL-value asymmetry vs [`frs_batch_put`] — read carefully.
+///
+/// This single-op variant treats a NULL `value` pointer as a **PUT with an
+/// empty payload**: `value = NULL` produces the same engine effect as
+/// `value = &[]` (any non-null pointer with `value_len = 0`). It NEVER
+/// produces a Delete.
+///
+/// In contrast, [`frs_batch_put`] (the batched variant) treats a NULL entry
+/// in its `values` array as a **DELETE** for the corresponding key. The
+/// two functions therefore have **contradictory NULL-value semantics on
+/// the same FFI surface**.
+///
+/// ## Implications for callers
+///
+/// * If you have a state whose legitimate serialized payload is zero bytes
+///   (e.g. a degenerate ValueState with a Unit serializer), passing a NULL
+///   value pointer to `frs_batch_put` will silently tombstone the row —
+///   data corruption. The Java backend's `flushWriteBuffer` MUST allocate
+///   a 1-byte non-NULL sentinel for empty payloads (see
+///   `ForStRsKeyedStateBackend.flushWriteBuffer` A11-H1 / D11-H2 comment).
+/// * If you want a Delete via `frs_put`, call [`frs_delete`] instead.
+/// * Future cleanup direction (deferred): unify both functions to
+///   "PUT-with-empty on NULL" and provide explicit op-type columns for
+///   the batched delete path. Tracked as a separate refactor.
 #[no_mangle]
 pub unsafe extern "C" fn frs_put(
     handle: FrsDb,
@@ -1297,6 +1322,27 @@ pub unsafe extern "C" fn frs_get_and_put(
 /// Writes multiple put entries in a single batch. `keys`, `key_lens`,
 /// `values`, `value_lens` are parallel arrays of length `count`. A NULL
 /// `value` pointer denotes a Delete.
+///
+/// # D12-M1: NULL-value asymmetry vs [`frs_put`] — read carefully.
+///
+/// This batched variant treats a NULL entry in `values[i]` as a **DELETE**
+/// for `keys[i]`. The single-op [`frs_put`] treats a NULL `value` pointer
+/// as a **PUT with an empty payload** instead. The two functions therefore
+/// have **contradictory NULL-value semantics on the same FFI surface**.
+///
+/// ## Implications for callers
+///
+/// * Java backends that buffer writes and flush via this batch path MUST
+///   substitute a 1-byte non-NULL sentinel for legitimately empty payloads;
+///   passing NULL silently tombstones the row. See
+///   `ForStRsKeyedStateBackend.flushWriteBuffer` (A11-H1 / D11-H2 comment)
+///   for the production workaround.
+/// * To mix puts and deletes in one batch today, set `values[i] = NULL`
+///   for the delete rows and a non-NULL pointer (even to an empty slice)
+///   for the put rows.
+/// * Future cleanup direction (deferred): unify both functions to
+///   "PUT-with-empty on NULL" and add an explicit `op_types` column so the
+///   delete path is unambiguous. Tracked as a separate refactor.
 #[no_mangle]
 pub unsafe extern "C" fn frs_batch_put(
     handle: FrsDb,
@@ -3523,8 +3569,16 @@ use std::sync::{Mutex, OnceLock};
 /// Wrapping both shapes in a single enum lets `IterHandle` hold one
 /// concrete iterator type while the per-row hot path stays alloc-free in
 /// the prefix case (`Arc::clone` is only paid on `put_back` rollback,
-/// which is the cold capacity-overflow edge). The `as_slice` accessor is
-/// inlined by LLVM to a single match-cmov producing a `(ptr, len)` pair.
+/// which is the cold capacity-overflow edge).
+///
+/// C12-M1: the `as_slice` accessor compiles to a tagged-union branch
+/// (NOT a `cmov`) — the `Vec` variant is a 24-byte `(ptr, len, cap)`
+/// triple and the `Arc` variant is a 16-byte `(ptr, len)` fat pointer,
+/// so the two variants have different layouts and LLVM cannot fold the
+/// match into a conditional move. In practice an iterator opens one
+/// variant per handle and yields the same variant on every row, so the
+/// branch is extremely predictable and the per-row cost is dominated by
+/// the `copy_nonoverlapping` into the caller's buffer, not the dispatch.
 enum IterKey {
     Vec(Vec<u8>),
     Arc(Arc<[u8]>),
@@ -4191,17 +4245,22 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
         //
         // B10-H3: each row's key is wrapped in `IterKey::Vec` — the engine's
         // `scan` materialises keys as `Vec<u8>` (no upstream `Arc<[u8]>`
-        // to share), so we adopt them unchanged. The enum tag is a
-        // single byte and the per-row dispatch in `fill_chunk_from_iter`
-        // compiles to a cmov.
+        // to share), so we adopt them unchanged. The enum tag is a single
+        // byte and the per-row dispatch in `fill_chunk_from_iter` is a
+        // tagged-union branch (C12-M1: NOT a cmov — Vec and Arc variants
+        // have different layouts), but the branch is extremely predictable
+        // (one variant per iter handle for its full lifetime), so the
+        // cost is negligible vs the per-row `copy_nonoverlapping`.
         let rows = match db_ref.scan(cf_ref_, lo, hi_opt) {
             Ok(r) => r,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
         // B11-H3: wrap the value half in `IterValue::Vec` — the range iter's
         // engine source returns owned `Vec<u8>` values (no upstream Arc to
-        // share), so we adopt them unchanged. The enum tag is a single
-        // byte and the per-row dispatch compiles to a cmov.
+        // share), so we adopt them unchanged. The per-row dispatch is a
+        // tagged-union branch (C12-M1: NOT a cmov), but the branch is
+        // extremely predictable for the full handle lifetime so the cost
+        // is dominated by the `copy_nonoverlapping` into the caller buffer.
         let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
             Box::new(rows.into_iter().map(|(k, v)| (IterKey::Vec(k), IterValue::Vec(v))));
         let mut handle_state = IterHandle::new(inner);

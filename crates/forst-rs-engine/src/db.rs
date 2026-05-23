@@ -2505,13 +2505,18 @@ impl DbImpl {
     /// 32-byte composite keys we emit on Q12-style state-bound scans).
     ///
     /// B11-H3: the value is ALSO now `Arc<[u8]>` (was `Vec<u8>` in B10-H3).
-    /// Internally `db.get_arc` does one `Arc::from(vec)` to move the Vec's
-    /// buffer into an Arc header — no byte copy. The downstream win is
-    /// that every consumer past the first one only pays a refcount bump
-    /// instead of `Vec::clone`'s alloc + memcpy. Engine-side allocations
-    /// for the value path are unchanged (still one alloc per resolved
-    /// value inside the SST/memtable read path); a structural block-cache
-    /// refactor would be required to eliminate that, tracked as follow-up.
+    /// C12-H1 cost-model correction: `db.get_arc` calls `Arc::<[u8]>::from(vec)`
+    /// which is NOT zero-copy — std's `From<Vec<T>> for Arc<[T]>` allocates a
+    /// fresh `ArcInner<[T]>` block (refcount header + len + data) and memcpys
+    /// the Vec's contents in. So the first emit per row pays alloc + memcpy
+    /// at the engine boundary (roughly equivalent to the legacy `Vec` path,
+    /// plus a constant-size refcount header). The actual downstream win is
+    /// that every consumer past the first only pays a refcount bump instead
+    /// of `Vec::clone`'s alloc + memcpy. Engine-side allocations for the
+    /// value path are unchanged (still one alloc per resolved value inside
+    /// the SST/memtable read path); a structural block-cache refactor would
+    /// be required to make the FFI boundary truly zero-copy, tracked as
+    /// follow-up. See `Db::get_arc` for the per-row cost breakdown.
     pub fn prefix_scan_iter_owned_arc(
         self: &Arc<Self>,
         cf: &ColumnFamilyHandle,
@@ -3119,37 +3124,56 @@ impl DbImpl {
     }
 
     /// B11-H3: ref-counted variant of [`Self::get`] that returns the resolved
-    /// value as `Arc<[u8]>` instead of `Vec<u8>`. The Vec's heap buffer is
-    /// MOVED into the Arc (via [`Arc::from`]) — no byte copy, just a header
-    /// transition.
+    /// value as `Arc<[u8]>` instead of `Vec<u8>`. Refcount-cheap downstream
+    /// sharing is the actual win — see the cost model below.
     ///
     /// Used by [`Self::prefix_scan_iter_owned_arc`] so the FFI chunked-iter
     /// consumer can clone the value Arc into downstream futures / channels
-    /// without re-allocating. The hot per-row emit path stays the same
-    /// allocation count as the `Vec`-returning variant (one alloc inside
-    /// the memtable/SST read path); the win is downstream — every consumer
-    /// after the first sees a refcount bump instead of a fresh `Vec::clone`.
+    /// without re-allocating. Every consumer after the first sees a refcount
+    /// bump instead of a fresh `Vec::clone`.
     ///
-    /// Note: the underlying engine block cache does NOT yet share buffers
-    /// across reads (the SST reader copies out of the Arrow `BinaryArray`
-    /// via `.to_vec()` at line 342 of `sst/reader.rs`; the memtable returns
-    /// owned `Vec<u8>` from `GetResult`). A true zero-alloc per-row value
-    /// path would require a structural refactor of the block-cache layer
-    /// to hand out `Arc<[u8]>` / `Bytes` directly — tracked as a follow-up.
-    /// The Arc wrapper added here is the one piece that does NOT require
-    /// that refactor and is already useful for ref-counted downstream
-    /// sharing.
+    /// # C12-H1 cost model (corrected; supersedes the prior "zero-copy" claim).
+    ///
+    /// `Arc::<[u8]>::from(Vec<u8>)` is NOT zero-copy. The stdlib
+    /// `impl From<Vec<T>> for Arc<[T]>` allocates a fresh
+    /// `ArcInner<[T]>{ refcount, weak, len, [T; len] }` block and memcpys
+    /// the Vec's contents into it; the original Vec is then dropped. So:
+    ///
+    /// * **First consumer (this call):** 1 heap alloc + 1 memcpy at the
+    ///   engine boundary — essentially the same per-byte cost as the
+    ///   `Vec`-returning variant (which also allocates once inside the
+    ///   memtable / SST read path) plus a constant-size refcount header.
+    /// * **Downstream clones:** refcount bump only — this is where the
+    ///   `Arc<[u8]>` shape wins over `Vec::clone`, which would alloc + memcpy
+    ///   each time.
+    ///
+    /// Switching to `Arc::from(vec.into_boxed_slice())` does NOT avoid
+    /// the memcpy: the `Box<[T]>` allocation has no refcount header, so the
+    /// `Arc::<[T]>::from(Box<[T]>)` path still allocates a new
+    /// `ArcInner<[T]>` block and copies. No production-grade fix is
+    /// available short of:
+    ///
+    /// * a structural refactor of the block-cache / memtable layer to hand
+    ///   out `Arc<[u8]>` / `bytes::Bytes` directly, sharing the underlying
+    ///   Arrow buffer across reads (tracked as a follow-up — out of scope
+    ///   for the engine FFI boundary work this method supports); or
+    /// * a custom allocator that lays out `ArcInner` adjacent to a `Vec`'s
+    ///   allocation header so the transition becomes a header rewrite
+    ///   instead of a copy (theoretically possible, not stable in std).
+    ///
+    /// Until that refactor lands, the per-row downstream-share win is real
+    /// (refcount-cheap clones for the FFI fan-out path) but the per-row
+    /// first-emit cost is alloc + memcpy at engine boundary, not zero.
     pub fn get_arc(
         &self,
         cf: &ColumnFamilyHandle,
         key: &[u8],
     ) -> ForstResult<Option<Arc<[u8]>>> {
-        // `Arc::<[u8]>::from(Vec<u8>)` moves the Vec's buffer into the Arc
-        // header without copying. The cost is one heap header reallocation
-        // (the Vec layout `(*ptr, len, cap)` is replaced by the Arc layout
-        // `(refcount, len, [u8; len])` — see std docs on `Arc::from`). On
-        // a 32-byte value, this is ≲ 50 ns; the previous `Vec::clone`
-        // every downstream consumer paid was 100-200 ns + heap pressure.
+        // See method docstring (C12-H1 cost model). `Arc::<[u8]>::from(Vec)`
+        // allocates a refcounted block and memcpys; on a 32-byte value the
+        // cost is roughly the same as `Vec::clone` for the first emit. The
+        // win is downstream — subsequent consumers refcount-bump instead of
+        // allocating + memcpying.
         Ok(self.get(cf, key)?.map(Arc::<[u8]>::from))
     }
 
