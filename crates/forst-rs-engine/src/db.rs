@@ -1979,10 +1979,16 @@ impl DbImpl {
                 cache.remove(file_number);
             }
         }
+        // R32-H2: route deletions through `delete_file_guarded` so any
+        // outstanding pins (e.g. an in-flight `create_checkpoint` or
+        // `create_incremental_checkpoint`) defer the unlink to
+        // `pending_deletions` instead of yanking the file out from
+        // under the copy. Sister path `compact_l0_for_cf` already does
+        // this — L1+ compactions previously bypassed the guard.
         for (_, file_number) in &edit.deleted_files {
-            let path = sst_file_path(&self.db_path, *file_number);
-            let _ = self.fs.delete_file(&path);
+            self.delete_file_guarded(*file_number);
         }
+        self.reap_pending_deletions();
 
         Ok(new_meta)
     }
@@ -2027,14 +2033,26 @@ impl DbImpl {
 
         // 3. Capture the VersionSet snapshot AFTER flushes so it contains
         //    every new L0 file.
-        let snapshot = self.version_set.snapshot();
+        //
+        // R32-H1: Take the snapshot, capture the live-SST list, AND pin the
+        // files atomically under the VersionSet apply_lock — mirrors the
+        // R31-H1 fix for `create_incremental_checkpoint`. Without this, a
+        // concurrent compaction could interleave its `apply` +
+        // `delete_file_guarded` between our snapshot read and our pin,
+        // leaving the manifest pointing at an already-unlinked file. While
+        // the apply_lock is held, compaction's `apply` is blocked, so once
+        // our pin lands `can_delete()` returns false and the unlink defers
+        // to `pending_deletions`.
+        let (snapshot, live, _pin) =
+            self.version_set
+                .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
+                    let live = snap.version.live_sst_files();
+                    let file_numbers: Vec<FileNumber> =
+                        live.iter().map(|f| f.file_number).collect();
+                    let pin = self.deletion_guard.pin_batch(&file_numbers);
+                    (snap.clone(), live, pin)
+                });
         let blob = serialize_snapshot(&snapshot)?;
-
-        // 4. Pin every live SST file so concurrent compactions cannot delete
-        //    them before we finish copying.
-        let live = self.version_set.live_sst_files();
-        let file_numbers: Vec<FileNumber> = live.iter().map(|f| f.file_number).collect();
-        let _pin = self.deletion_guard.pin_batch(&file_numbers);
 
         // 5. Ensure target dir exists, write blob + copy every live SST.
         self.fs.create_dir_all(target_dir)?;
@@ -2373,6 +2391,27 @@ impl DbImpl {
     /// [`Self::open_from_checkpoint`]. The returned engine is fully
     /// writable; callers that want to preserve the original checkpoint
     /// should pass a copy of `sst_files`.
+    ///
+    /// # Caller contract: clean target directory
+    ///
+    /// R32-L1: the dst-already-exists branch (see [`same_file_or_size`])
+    /// validates that a pre-existing dst SST is *plausibly* identical to
+    /// the src by checking inode (unix) or size (non-unix). It does NOT
+    /// perform a content fingerprint (e.g. CRC32C) — adding one would gate
+    /// every restore on a full-file read for every dst, which is the
+    /// hot-path cost an incremental checkpoint exists to avoid. The
+    /// caller's responsibility is to pass a clean `target_dir`: either
+    /// (a) a freshly-created directory, or (b) a directory cleared by
+    /// the framework (e.g. `ForStRsRestoreOperation.ensureTargetDirEmpty`
+    /// already calls `deleteRecursively` before invoking this).
+    ///
+    /// A content-mismatch attack against this code path requires the
+    /// attacker to seed `target_dir` with a same-size (or same-inode-by-
+    /// hardlink) rogue file BEFORE the restore is invoked. That is
+    /// equivalent to compromising the target storage location, at which
+    /// point the entire engine state is already untrusted. The caller-
+    /// clean-target contract converts the property from "weak signal at
+    /// restore time" to "no signal needed; precondition holds".
     pub fn open_from_incremental(
         target_dir: &str,
         base_manifest: &str,
@@ -4041,6 +4080,25 @@ impl DbImpl {
 /// (same device + inode on unix) or, on non-unix where inode comparison is
 /// unavailable, when their sizes match. Used by
 /// [`DbImpl::open_from_incremental`] to validate a pre-existing dst SST.
+///
+/// # Limitations
+///
+/// R32-L2: the non-unix branch uses size-only equality, which is a weak
+/// fingerprint — two distinct SST files of the same byte length match.
+/// A stronger CRC32C-based check would catch this but at the cost of a
+/// full-file read on every restored SST (defeating the purpose of the
+/// incremental checkpoint hot path). The mitigation is the caller-clean-
+/// target contract documented on
+/// [`DbImpl::open_from_incremental`]: callers are required to invoke this
+/// function only with a target directory they own and have cleared, so
+/// the size-only check is a defense-in-depth signal against accidental
+/// reuse, not an attacker-grade integrity check.
+///
+/// CRC32C fallback is deferred behind a future `--features content-verify`
+/// feature flag (no current consumer; benchmarks have not justified the
+/// per-restore cost). When that flag is wired up, this function would
+/// route to a size-then-CRC32C composite predicate without changing the
+/// call sites.
 fn same_file_or_size(a: &Path, b: &Path) -> ForstResult<bool> {
     #[cfg(unix)]
     {
