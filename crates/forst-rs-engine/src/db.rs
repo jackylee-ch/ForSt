@@ -2119,6 +2119,14 @@ impl DbImpl {
         // is logged at debug and treated as "no observed files".
         let mut max_observed: u64 = 0;
         let mut orphans: Vec<PathBuf> = Vec::new();
+        // R38-H1: separate list of mid-write tmp files that crashed before
+        // the rename-into-place (or where the rename itself failed). These
+        // use the `.<num>.sst.tmp` naming produced by `FlushJob::temp_path`
+        // and `CompactionJob`'s temp-path helper (leading dot + `.tmp`
+        // suffix). We rename them just like SST orphans so they never get
+        // picked up as live state and a future flush cannot collide with
+        // the file name.
+        let mut tmp_orphans: Vec<PathBuf> = Vec::new();
         match fs.list_dir(&db_path) {
             Ok(entries) => {
                 let referenced: std::collections::HashSet<u64> = snapshot
@@ -2147,6 +2155,24 @@ impl DbImpl {
                             if !referenced.contains(&num) {
                                 orphans.push(entry.path.clone());
                             }
+                        }
+                        continue;
+                    }
+                    // R38-H1: match `.<num>.sst.tmp` tmp-write artifacts.
+                    // Strip the leading `.` and trailing `.sst.tmp`, then
+                    // parse the inner number for the file-counter bump.
+                    if let Some(inner) = name.strip_suffix(".sst.tmp") {
+                        if let Some(stem) = inner.strip_prefix('.') {
+                            if let Ok(num) = stem.parse::<u64>() {
+                                if num > max_observed {
+                                    max_observed = num;
+                                }
+                            }
+                            // Whether or not the number parses we treat the
+                            // tmp file as orphan-rename-eligible — names
+                            // that fail to parse are by definition not in
+                            // the active naming space either.
+                            tmp_orphans.push(entry.path.clone());
                         }
                     }
                 }
@@ -2186,6 +2212,32 @@ impl DbImpl {
                 ),
                 Err(e) => tracing::warn!(
                     "open_from_checkpoint: failed to rename orphan SST {} → {} ({}); \
+                     leaving in place — next restore will retry",
+                    orphan.display(),
+                    dst.display(),
+                    e
+                ),
+            }
+        }
+        // R38-H1: rename mid-write tmp orphans into `*.sst.tmp.orphan-<ts>`
+        // so the next restore's scan no longer matches them (the suffix
+        // `.orphan-<ts>` is appended in full so neither the `.sst` nor the
+        // `.sst.tmp` arm hits them on a future restart).
+        for orphan in &tmp_orphans {
+            let dst = {
+                let mut s = orphan.as_os_str().to_owned();
+                s.push(format!(".orphan-{}", ts_suffix));
+                PathBuf::from(s)
+            };
+            match fs.rename(orphan, &dst) {
+                Ok(()) => tracing::warn!(
+                    "open_from_checkpoint: renamed orphan tmp SST {} → {} \
+                     (R38-H1 mid-write rename-into-place artifact)",
+                    orphan.display(),
+                    dst.display()
+                ),
+                Err(e) => tracing::warn!(
+                    "open_from_checkpoint: failed to rename tmp orphan {} → {} ({}); \
                      leaving in place — next restore will retry",
                     orphan.display(),
                     dst.display(),

@@ -164,7 +164,17 @@ impl FlushJob {
             writable.sync()?;
             info
         };
-        self.fs.rename(&tmp_path, &self.file_path)?;
+        // R38-H1: best-effort cleanup of the temp file on rename failure
+        // (EXDEV, cross-FS, transient I/O). Without this, a failed flush
+        // leaves a `.<num>.sst.tmp` orphan that the restore scan in
+        // `open_from_checkpoint` did not previously recognise. We delete
+        // before propagating the error; if delete itself fails the file
+        // remains visible to the next restore, which now matches
+        // `.*.sst.tmp` and renames it out of the active naming space.
+        if let Err(e) = self.fs.rename(&tmp_path, &self.file_path) {
+            let _ = self.fs.delete_file(&tmp_path);
+            return Err(e);
+        }
 
         // 4. Build the SstFileMeta that the VersionSet will record.
         Ok(Self::info_to_meta(self.file_number, info))

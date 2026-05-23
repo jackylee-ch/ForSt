@@ -190,10 +190,21 @@ impl CompactionJob {
             if emitted == 0 {
                 drop(writer);
                 drop(wf);
-                // Best-effort tmp cleanup; ignore errors (the file may not
-                // exist if the writer hasn't emitted anything yet, and the
-                // VersionEdit doesn't reference it).
-                let _ = self.fs.delete_file(&tmp_path);
+                // Best-effort tmp cleanup; the file may not exist if the
+                // writer hasn't emitted anything yet, and the VersionEdit
+                // doesn't reference it. R38-L2: surface delete failures
+                // via a warn-level log so operators can spot a leaking
+                // compaction tmp file (the restore orphan-scan in
+                // open_from_checkpoint still catches it on next restart,
+                // but a warn-line helps in-process diagnosis).
+                if let Err(e) = self.fs.delete_file(&tmp_path) {
+                    tracing::warn!(
+                        "CompactionJob: zero-emit tmp delete failed for {}: {} \
+                         (R38-L2; restore orphan-scan will rename on restart)",
+                        tmp_path.display(),
+                        e
+                    );
+                }
                 return Ok(Some(VersionEdit {
                     deleted_files: self
                         .inputs
@@ -211,7 +222,16 @@ impl CompactionJob {
             wf.sync()?;
             info
         };
-        self.fs.rename(&tmp_path, &self.output_path)?;
+        // R38-H1: best-effort cleanup of the temp file on rename failure
+        // (EXDEV, cross-FS, transient I/O). Without this, a failed compaction
+        // leaves a `.<num>.sst.tmp` orphan. We delete before propagating
+        // the error; if delete itself fails the file remains visible to the
+        // next restore, which now matches `.*.sst.tmp` and renames it out
+        // of the active naming space.
+        if let Err(e) = self.fs.rename(&tmp_path, &self.output_path) {
+            let _ = self.fs.delete_file(&tmp_path);
+            return Err(e);
+        }
 
         // 6. Build the VersionEdit: add the new file, remove all inputs.
         let meta = SstFileMeta {

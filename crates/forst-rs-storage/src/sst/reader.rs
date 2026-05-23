@@ -294,26 +294,31 @@ impl SstReaderImpl {
         };
 
         // 6. Find the row with the highest sequence number among matching keys.
+        //
+        // R38-M1: a crafted or corrupt SST whose schema doesn't match the
+        // writer-side contract must surface as a corruption error, not a
+        // panic. The batch path (`for_each_row_in_batch` at line 481+) uses
+        // `ok_or_else(corruption)` here too; mirror that pattern.
         let keys = batch
             .column(0)
             .as_any()
             .downcast_ref::<BinaryArray>()
-            .expect("column 0 must be BinaryArray");
+            .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
         let sequences = batch
             .column(2)
             .as_any()
             .downcast_ref::<UInt64Array>()
-            .expect("column 2 must be UInt64Array");
+            .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
         let op_types = batch
             .column(3)
             .as_any()
             .downcast_ref::<UInt8Array>()
-            .expect("column 3 must be UInt8Array");
+            .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
         let values = batch
             .column(1)
             .as_any()
             .downcast_ref::<BinaryArray>()
-            .expect("column 1 must be BinaryArray");
+            .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
 
         let mut best_row = first_row;
         let mut best_seq = sequences.value(first_row);
