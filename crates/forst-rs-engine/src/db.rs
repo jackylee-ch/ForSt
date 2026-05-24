@@ -2747,15 +2747,30 @@ impl DbImpl {
             self.flush_all()?;
         }
         let version = self.version_set.current();
+        // R80-M2: build a cf_id → name lookup so per-file `cf_name` reflects
+        // the actual owner CF. Pre-fix this hardcoded DEFAULT_CF_NAME for
+        // every file; the compat-JNI `getLiveFilesMetaData` exposes
+        // `columnFamilyName` to RocksDB-shape consumers (Flink restore
+        // planners, ops tooling) which then mis-routed non-default-CF
+        // SSTs onto the default CF.
+        let cf_id_to_name: std::collections::HashMap<ColumnFamilyId, String> = self
+            .collect_cf_descriptors()?
+            .into_iter()
+            .map(|d| (d.cf_id, d.name))
+            .collect();
         let mut out = Vec::new();
         for (level_idx, level_meta) in version.levels.iter().enumerate() {
             for file in &level_meta.files {
+                let cf_name = cf_id_to_name
+                    .get(&file.cf_id)
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_CF_NAME.to_string());
                 out.push(LiveFileInfo {
                     path: sst_file_path(&self.db_path, file.file_number),
                     size: file.file_size,
                     sequence: file.max_sequence.value(),
                     level: level_idx as u8,
-                    cf_name: DEFAULT_CF_NAME.to_string(),
+                    cf_name,
                 });
             }
         }
@@ -3602,23 +3617,27 @@ impl DbImpl {
         // from disk. Under apply_lock, compaction's apply is blocked while
         // we pin; once our pin is in place, can_delete() returns false and
         // delete_file_guarded defers the unlink to `pending_deletions`.
-        let (mut version_snapshot, _pin) =
+        // R80-M1: collect CF descriptors INSIDE the locked-view closure so
+        // both the version snapshot AND the descriptor set are sampled
+        // atomically under `apply_lock`. Pre-fix the collect happened after
+        // `snapshot_with_locked_view` released, leaving a TOCTOU window
+        // where a concurrent `drop_cf` could fall between: its delete-edit
+        // is gated on `apply_lock` (so the version snapshot is consistent)
+        // but its removal from the in-memory `cfs` map happens AFTER apply
+        // releases — so we could observe the pre-drop version + post-drop
+        // descriptor set. The dropped CF's pinned SSTs would then mis-
+        // attribute to DEFAULT_CF_NAME via the cf_id→name fallback.
+        let (mut version_snapshot, _pin, descriptors_result) =
             self.version_set
                 .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
                     let live = snap.version.live_sst_files();
                     let file_numbers: Vec<FileNumber> =
                         live.iter().map(|f| f.file_number).collect();
                     let pin = self.deletion_guard.pin_batch(&file_numbers);
-                    (snap.clone(), pin)
+                    let descriptors = self.collect_cf_descriptors();
+                    (snap.clone(), pin, descriptors)
                 });
-        // R79-H1: stamp CF descriptors onto the snapshot so the blob persists
-        // the full CF set — mirrors the R49-H2 fix already in place in
-        // `create_checkpoint`. Without this, restore via `open_from_incremental`
-        // walks an EMPTY `snapshot.cf_descriptors` and re-creates ONLY the
-        // default CF; every non-default CF's SST files become unreachable AND
-        // `next_cf_id` stays at 1, so a fresh `create_column_family` collides
-        // with an existing cf_id=1 on disk.
-        version_snapshot.cf_descriptors = self.collect_cf_descriptors()?;
+        version_snapshot.cf_descriptors = descriptors_result?;
         let blob = serialize_snapshot(&version_snapshot)?;
 
         // R79-H1: build a cf_id → name lookup so per-file `cf_name` reflects
@@ -3681,6 +3700,22 @@ impl DbImpl {
         // `open_from_incremental` can pick it up by checkpoint id.
         let target_dir = self.incremental_checkpoint_dir(checkpoint_id);
         self.fs.create_dir_all(&target_dir)?;
+        // R80-L1: `write_blob` syncs `target_dir` after rename, but the
+        // PARENT (.../checkpoints/) is not — POSIX requires the parent
+        // dir-entry update to be fsynced for the new subdirectory itself
+        // to survive power loss. Best-effort: log on failure but do not
+        // fail the checkpoint (the blob is durable; the dir-entry will
+        // be re-created on next call).
+        if let Some(parent) = target_dir.parent() {
+            if let Err(e) = self.fs.sync_dir(parent) {
+                tracing::warn!(
+                    "create_incremental_checkpoint: sync_dir({}) failed: {} \
+                     (subdir may not survive power loss; next checkpoint will retry)",
+                    parent.display(),
+                    e
+                );
+            }
+        }
         let manifest_path = write_blob(self.fs.as_ref(), &target_dir, &blob)?;
 
         drop(_pin);
