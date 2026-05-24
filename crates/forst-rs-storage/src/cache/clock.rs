@@ -68,6 +68,19 @@ struct InsertOutcome {
     evictions: usize,
     /// Sum of `charge` across every evicted entry.
     evicted_charge: usize,
+    /// R92-M1: when the key already existed and was replaced in-place,
+    /// the charge of the prior value. The wrapper subtracts this from
+    /// the global metric so an UPDATE doesn't add a second copy of the
+    /// new charge without removing the old. `None` on the
+    /// fresh-insert / table-full-no-insert paths.
+    replaced_charge: Option<usize>,
+    /// R92-M1: `true` when a fresh entry was actually inserted (the
+    /// normal path that adds `charge` to the table). `false` for the
+    /// in-place UPDATE branch (already counted via replaced_charge)
+    /// and for the table-full fast-fail path that returns without
+    /// installing the new entry. The wrapper conditions the
+    /// `fetch_add(charge)` on this flag.
+    inserted: bool,
 }
 
 impl InsertOutcome {
@@ -173,7 +186,14 @@ impl ClockCacheShard {
                 self.table[idx].charge = charge;
                 self.table[idx].countdown = priority.initial_countdown();
                 self.current_charge = self.current_charge - old_charge + charge;
-                return InsertOutcome::default();
+                // R92-M1: surface the replaced charge so the global
+                // metric can compute the net delta (new - old) rather
+                // than double-counting.
+                return InsertOutcome {
+                    replaced_charge: Some(old_charge),
+                    inserted: true, // accounting-wise the slot is occupied
+                    ..InsertOutcome::default()
+                };
             }
             idx = (idx + 1) & self.mask;
         }
@@ -217,6 +237,7 @@ impl ClockCacheShard {
                 };
                 self.occupancy += 1;
                 self.current_charge += charge;
+                outcome.inserted = true;
                 return outcome;
             }
             idx = (idx + 1) & self.mask;
@@ -475,9 +496,22 @@ impl BlockCache for ShardedClockCache {
                     .current_charge
                     .fetch_sub(outcome.evicted_charge, Ordering::Relaxed);
             }
-            self.metrics
-                .current_charge
-                .fetch_add(charge, Ordering::Relaxed);
+            // R92-M1: only add `charge` to the global metric when the
+            // shard actually installed the new entry. Subtract any
+            // replaced-charge from an UPDATE-in-place so the metric
+            // reflects (new - old) rather than (new) added on top.
+            // The table-full fast-fail path returns `inserted = false`
+            // with no replacement, so this is a no-op there.
+            if let Some(replaced) = outcome.replaced_charge {
+                self.metrics
+                    .current_charge
+                    .fetch_sub(replaced, Ordering::Relaxed);
+            }
+            if outcome.inserted {
+                self.metrics
+                    .current_charge
+                    .fetch_add(charge, Ordering::Relaxed);
+            }
             self.metrics.inserts.fetch_add(1, Ordering::Relaxed);
         }
     }
