@@ -1056,10 +1056,21 @@ impl DbImpl {
         // approximate by sampling both the active and immutable memtable
         // usage; the per-shard accounting is precise enough for the
         // cross-CF budget cap which is itself coarse (~512 MiB default).
+        //
+        // R62-H1: ALSO drain the imm list here, under the same
+        // lock_flush we hold. Pre-fix drop_cf released the imm bytes
+        // but left the imms in the list; a queued flush worker that
+        // grabbed lock_flush AFTER drop_cf released it would observe
+        // is_dropped() and, per R61-M1, release the SAME imm's bytes
+        // a SECOND time — double-release inflating the cross-CF budget
+        // toward `over_budget()` never tripping. Popping while we still
+        // hold lock_flush guarantees the post-drop flush worker sees
+        // an empty imm list and refunds 0 (no-op in the R61-M1 path).
         let mut released_bytes: u64 = cf_data.active_memtable().memory_usage() as u64;
         for imm in cf_data.imm_memtables() {
             released_bytes = released_bytes.saturating_add(imm.memory_usage() as u64);
         }
+        while cf_data.pop_oldest_imm().is_some() {}
         self.write_buffer_manager.release(released_bytes);
 
         // R58-H2 / R59-H2 / R59-H3: drop the CF's SST files. Pre-fix
