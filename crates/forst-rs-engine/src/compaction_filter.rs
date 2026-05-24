@@ -247,14 +247,14 @@ pub type CurrentTimeSupplier = Arc<dyn Fn() -> u64 + Send + Sync>;
 ///
 /// # Decision matrix
 ///
-/// | state_type | op_type           | aged > ttl_ms | decision |
-/// |------------|-------------------|---------------|----------|
-/// | Disabled   | any               | n/a           | Keep     |
-/// | Value/List | Delete/SingleDel  | n/a           | Keep     |
-/// | Value/List | Put/Merge         | yes           | Discard  |
-/// | Value/List | Put/Merge         | no            | Keep     |
+/// | state_type | op_type           | now > expiry_ms (BE) | decision |
+/// |------------|-------------------|----------------------|----------|
+/// | Disabled   | any               | n/a                  | Keep     |
+/// | Value/List | Delete/SingleDel  | n/a                  | Keep     |
+/// | Value/List | Put/Merge         | yes                  | Discard  |
+/// | Value/List | Put/Merge         | no                   | Keep     |
 /// | Value/List | Put/Merge w/ short value (< offset+8) | n/a | Keep |
-/// | Value/List | Put/Merge w/ ts in future          | n/a | Keep |
+/// | Value/List | Put/Merge w/ expiry in future      | n/a | Keep |
 ///
 /// `ttl_ms == 0` means "never expire" (mirrors the C++ ConfigHolder
 /// semantics where a zero TTL is treated as "no enforcement").
@@ -307,7 +307,12 @@ impl FlinkTtlCompactionFilter {
     }
 
     /// Returns `true` iff the value at `value[timestamp_offset..+8]`
-    /// decodes to a Unix-millis timestamp older than `now - ttl_ms`.
+    /// decodes (big-endian) to an EXPIRY timestamp less than `now`.
+    /// Matches Flink's `TtlValue.isExpired` predicate (`currentTime >
+    /// expiryTimestamp`) — the stored value is `record.getExpiryTimestamp()
+    /// = now + ttlMillis` written by `TtlSerializer` at write time, so
+    /// the configured `ttl_ms` does NOT participate in this filter's
+    /// expiry decision.
     ///
     /// Conservative on partial values: any value shorter than
     /// `timestamp_offset + 8` is treated as "no timestamp present" → kept.

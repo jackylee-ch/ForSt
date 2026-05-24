@@ -7666,9 +7666,12 @@ mod tests {
             .create_column_family(ColumnFamilyDescriptor::new("flink-ttl"))
             .unwrap();
 
-        // Inject a deterministic clock at "now=2000ms" with TTL=500ms so
-        // a timestamp of 0ms is expired (age=2000 > 500) and a timestamp
-        // of 1800ms is fresh (age=200 < 500).
+        // Inject a deterministic clock at "now=2000ms". The Flink filter
+        // uses Flink's expiry-timestamp predicate `now > expiry_ms`
+        // (R82-H1), NOT an age-vs-TTL comparison. ttl_ms is configured at
+        // 500 only because the filter's name encodes it (R47-H1) and a
+        // sibling test below checks `assert_ne!` on differing ttl values
+        // — it does not participate in the expiry decision.
         let supplier: crate::compaction_filter::CurrentTimeSupplier = Arc::new(|| 2000);
         let filter = Arc::new(FlinkTtlCompactionFilter::with_supplier(
             500,
@@ -7678,15 +7681,22 @@ mod tests {
         ));
         db.set_compaction_filter(&cf, Some(filter)).unwrap();
 
-        // ts=0 → expired → discarded.
+        // R83-H1: build values matching Flink's BE expiry-timestamp wire
+        // format (R81-H1 + R82-H1). Pre-fix this test used `to_le_bytes`
+        // and the assertions passed only by triple-coincidence (LE-zero
+        // == BE-zero gives "expired"; LE-1800 reads BE as ~5.78e17 which
+        // exceeds the supplier's now=2000 so reads as "not yet expired").
+        // Regression coverage was vacuous.
+        //
+        // expiry=500, now=2000 → 2000 > 500 → discard.
         let mut expired_value = Vec::new();
-        expired_value.extend_from_slice(&0u64.to_le_bytes());
+        expired_value.extend_from_slice(&500u64.to_be_bytes());
         expired_value.extend_from_slice(b"old");
         db.put(&cf, b"old", &expired_value).unwrap();
 
-        // ts=1800 → fresh → kept.
+        // expiry=5000, now=2000 → 2000 !> 5000 → kept.
         let mut fresh_value = Vec::new();
-        fresh_value.extend_from_slice(&1800u64.to_le_bytes());
+        fresh_value.extend_from_slice(&5000u64.to_be_bytes());
         fresh_value.extend_from_slice(b"new");
         db.put(&cf, b"new", &fresh_value).unwrap();
 
