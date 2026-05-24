@@ -74,6 +74,16 @@ pub struct CheckpointManifest {
 /// delete the tmp file before propagating. The delete is best-effort because the file
 /// may not exist yet (open failure), or the FS may reject the delete (in which case
 /// the next restore's orphan-scan still rescues us).
+/// Atomic `src → dst` copy with tmp + rename and short-read detection.
+///
+/// **Precondition (R77-M1):** `src` MUST be a fully-written, write-once file
+/// (canonical SST `<N>.sst` is the only intended caller — `copy_live_ssts`
+/// only passes those). The R76-H1 short-read check captures `src`'s size
+/// BEFORE opening the stream; a caller that passes a live, still-growing
+/// file (WAL, in-progress checkpoint blob) would see either a false-positive
+/// Corruption (if more bytes arrived) or a silent acceptance below the
+/// captured size (also Corruption). Either way, the function is unsafe for
+/// non-write-once inputs.
 pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64> {
     // R76-H1: capture the expected source size BEFORE streaming so we can
     // detect a short read after the loop and refuse to publish a truncated
@@ -196,8 +206,9 @@ pub fn read_blob(fs: &dyn FileSystem, target_dir: &Path) -> ForstResult<Vec<u8>>
             MAX_CHECKPOINT_BLOB_SIZE
         )));
     }
-    let mut rac = fs.open_random_access_file(&path)?;
-    let _ = &mut rac; // silence unused warning on older rustc paths
+    // R77-L1: removed dead `open_random_access_file` call — the actual read
+    // uses `open_sequential_file` below. On S3/OpenDAL backends the dead
+    // RAC open issued a wasted GET/HEAD per restore.
     let size = meta.size as usize;
     let mut buf = vec![0u8; size];
     // Sequential read for large blobs.
