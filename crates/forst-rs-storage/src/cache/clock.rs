@@ -53,6 +53,34 @@ impl ClockSlot {
     }
 }
 
+/// Per-insert eviction accounting (R85-M1). Tracks the full set of
+/// evictions triggered by a single `ClockCacheShard::insert` call so
+/// the cache-level metrics counter does not lose track of multi-
+/// eviction inserts (common after R84-H1 — the MAX_PASSES bump now
+/// actually completes for High-priority shards, so eviction
+/// frequently chains).
+#[derive(Default, Debug)]
+struct InsertOutcome {
+    /// Number of entries evicted on this insert.
+    evictions: usize,
+    /// Sum of `charge` across every evicted entry.
+    evicted_charge: usize,
+    /// Last evicted entry's (key, charge) — preserved for callers /
+    /// tests that only care about a single representative eviction
+    /// (e.g. validation tests). May be `None` even if `evictions > 0`
+    /// if all evictions had `charge == 0`, but that does not occur in
+    /// practice.
+    last_evicted: Option<(CacheKey, usize)>,
+}
+
+impl InsertOutcome {
+    fn record(&mut self, evicted: (CacheKey, usize)) {
+        self.evictions += 1;
+        self.evicted_charge = self.evicted_charge.saturating_add(evicted.1);
+        self.last_evicted = Some(evicted);
+    }
+}
+
 /// A single Clock cache shard — owns a hash table and a clock hand.
 struct ClockCacheShard {
     /// Open-addressing hash table (fixed-size).
@@ -114,6 +142,16 @@ impl ClockCacheShard {
     }
 
     /// Insert a key-value pair. Evicts entries if capacity is exceeded.
+    ///
+    /// R85-M1: returns `InsertOutcome` carrying the FULL count of
+    /// evictions and the TOTAL evicted-bytes from this call. Pre-R85
+    /// the return was `Option<(CacheKey, usize)>` which only surfaced
+    /// the LAST eviction's key+charge to the caller; when the
+    /// eviction `while` ran multiple iterations (now common with
+    /// R84-H1's MAX_PASSES=4 actually completing) the cache wrapper
+    /// only decremented its `metrics.current_charge` by ONE eviction's
+    /// charge — every other evicted entry's bytes leaked from the
+    /// global meter, drifting it monotonically upward.
     fn insert(
         &mut self,
         key: CacheKey,
@@ -121,7 +159,7 @@ impl ClockCacheShard {
         charge: usize,
         priority: CachePriority,
         hash: u64,
-    ) -> Option<(CacheKey, usize)> {
+    ) -> InsertOutcome {
         let hash_frag = hash as u32;
         let arc_value = Arc::new(value);
 
@@ -139,7 +177,7 @@ impl ClockCacheShard {
                 self.table[idx].charge = charge;
                 self.table[idx].countdown = priority.initial_countdown();
                 self.current_charge = self.current_charge - old_charge + charge;
-                return None;
+                return InsertOutcome::default();
             }
             idx = (idx + 1) & self.mask;
         }
@@ -153,10 +191,10 @@ impl ClockCacheShard {
         // caller above already accepts transient over-capacity (the
         // load-factor check below + the insertion-probe loop further
         // down also handle "no empty slot" with `evicted` returned).
-        let mut evicted = None;
+        let mut outcome = InsertOutcome::default();
         while self.current_charge + charge > self.capacity && self.occupancy > 0 {
             match self.evict_one() {
-                Some(e) => evicted = Some(e),
+                Some(e) => outcome.record(e),
                 None => break,
             }
         }
@@ -164,7 +202,7 @@ impl ClockCacheShard {
         // Check load factor (max 75%)
         if self.occupancy * 4 >= self.table_size * 3 {
             if let Some(ev) = self.evict_one() {
-                evicted = Some(ev);
+                outcome.record(ev);
             }
         }
 
@@ -183,13 +221,13 @@ impl ClockCacheShard {
                 };
                 self.occupancy += 1;
                 self.current_charge += charge;
-                return evicted;
+                return outcome;
             }
             idx = (idx + 1) & self.mask;
         }
 
         // Table is full (shouldn't happen with proper load factor management)
-        evicted
+        outcome
     }
 
     /// Evict one entry using Clock sweep. Returns the evicted key and charge.
@@ -421,13 +459,15 @@ impl BlockCache for ShardedClockCache {
         let shard_idx = self.shard_index(hash);
 
         if let Ok(mut shard) = self.shards[shard_idx].write() {
-            let evicted = shard.insert(key, value, charge, priority, hash);
-            // Update global metrics
-            if let Some((_evicted_key, evicted_charge)) = evicted {
-                self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
+            let outcome = shard.insert(key, value, charge, priority, hash);
+            // R85-M1: account for ALL evictions, not just the last one.
+            if outcome.evictions > 0 {
+                self.metrics
+                    .evictions
+                    .fetch_add(outcome.evictions as u64, Ordering::Relaxed);
                 self.metrics
                     .current_charge
-                    .fetch_sub(evicted_charge, Ordering::Relaxed);
+                    .fetch_sub(outcome.evicted_charge, Ordering::Relaxed);
             }
             self.metrics
                 .current_charge
