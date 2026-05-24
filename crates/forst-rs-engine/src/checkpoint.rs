@@ -75,6 +75,16 @@ pub struct CheckpointManifest {
 /// may not exist yet (open failure), or the FS may reject the delete (in which case
 /// the next restore's orphan-scan still rescues us).
 pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64> {
+    // R76-H1: capture the expected source size BEFORE streaming so we can
+    // detect a short read after the loop and refuse to publish a truncated
+    // SST at the canonical `<num>.sst` path. Pre-fix a short-read on the
+    // source (network blip, OpenDAL ranged-read truncation — the same failure
+    // mode R75-M1/M2 closed for other sites) produced a truncated SST that
+    // the orphan-scan does NOT catch (valid name), and the poisoned file
+    // would then become a live L0 in the checkpoint manifest. We treat
+    // metadata-unavailable (`expected_size = None`) as best-effort and skip
+    // the comparison, consistent with R75-M2's `cap_hint == 0` branch.
+    let expected_size: Option<u64> = fs.get_file_metadata(src).ok().map(|m| m.size);
     let mut reader = fs.open_sequential_file(src)?;
     if let Some(parent) = dst.parent() {
         fs.create_dir_all(parent)?;
@@ -94,6 +104,16 @@ pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64
         }
         writer.flush()?;
         writer.sync()?;
+        if let Some(want) = expected_size {
+            if total != want {
+                return Err(ForstError::corruption(format!(
+                    "copy_file short read: expected {} bytes, got {} from {}",
+                    want,
+                    total,
+                    src.display()
+                )));
+            }
+        }
         Ok(total)
     })();
     let total = match result {
