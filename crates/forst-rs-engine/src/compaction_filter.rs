@@ -323,7 +323,16 @@ impl FlinkTtlCompactionFilter {
         }
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&value[self.timestamp_offset..end]);
-        let ts = u64::from_le_bytes(buf);
+        // R81-H1: Flink's TtlSerializer writes the 8-byte timestamp via
+        // DataOutput.writeLong (big-endian) and the FFM wiring at
+        // ForStRsLinker.java:3385 documents "8-byte big-endian millisecond
+        // timestamp". Pre-fix this filter decoded as `from_le_bytes`,
+        // turning a BE-serialized timestamp into a huge u64 on x86/ARM;
+        // `now.saturating_sub(huge) == 0`, so the `> ttl_ms` comparison
+        // never tripped and expired rows were NEVER dropped on compaction.
+        // Tests passed because the helpers constructed values with
+        // `to_le_bytes()` — i.e. they exercised the broken endianness.
+        let ts = u64::from_be_bytes(buf);
         let now = (self.current_time_supplier)();
         now.saturating_sub(ts) > self.ttl_ms
     }
@@ -524,12 +533,16 @@ mod tests {
 
     // ---- FlinkTtlCompactionFilter ----
 
-    /// Build a value of the form `[prefix | ts_ms_le | payload]` matching
-    /// the layout that Flink's `MapState` writes.
+    /// Build a value of the form `[prefix | ts_ms_be | payload]` matching
+    /// the layout that Flink's `MapState` writes. R81-H1: the wire format
+    /// is big-endian (`DataOutput.writeLong`), NOT little-endian — prior
+    /// tests used `to_le_bytes` which only "passed" because the production
+    /// decoder was also `from_le_bytes` (a self-consistent bug). Fixing
+    /// the decoder to `from_be_bytes` requires this helper to match.
     fn flink_value(prefix: &[u8], ts_ms: u64, payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(prefix.len() + 8 + payload.len());
         buf.extend_from_slice(prefix);
-        buf.extend_from_slice(&ts_ms.to_le_bytes());
+        buf.extend_from_slice(&ts_ms.to_be_bytes());
         buf.extend_from_slice(payload);
         buf
     }
