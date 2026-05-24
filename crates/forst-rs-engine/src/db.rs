@@ -2803,6 +2803,17 @@ impl DbImpl {
     }
 
     fn compact_once(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<bool> {
+        // R61-M3: short-circuit on dropped CF. If drop_cf hit its retry
+        // cap and left files referenced in the Version (or there's a
+        // race with an in-flight drop_cf), `has_my_l0` stays true but
+        // `compact_l0_for_cf` no-ops on the is_dropped gate, leaving
+        // `compact_all`'s outer loop spinning forever. Returning
+        // `Ok(false)` here lets the outer loop terminate cleanly —
+        // the orphaned files (if any) will be reclaimed on the next
+        // restart's manifest replay rather than wedging compaction.
+        if cf_data.is_dropped() {
+            return Ok(false);
+        }
         // R49-H1: filter by cf_id so an unrelated CF's L0 doesn't spuriously
         // trigger a compaction here that `compact_l0_for_cf` will then no-op
         // (because its own cf_id filter returns an empty input set). Without
@@ -4532,17 +4543,29 @@ impl DbImpl {
         // the same oldest imm and write it twice.
         let _flush_guard = cf_data.lock_flush();
 
-        // R59-H1: a flush enqueued before `drop_cf` would otherwise land
-        // AFTER drop_cf's VersionEdit removed the CF's files — the
-        // `apply` here would install a fresh SST stamped with the
-        // dropped CF's id, defeating R58-H2's cleanup. The flush guard
-        // above serializes us against other flushes; the dropped-flag
-        // check now also gates us against drop_cf having raced. We pop
-        // the imm without writing (its bytes were already refunded to
-        // the WBM by drop_cf at line 1011-1012) and refresh the
-        // controller so back-pressure doesn't stall.
+        // R59-H1 + R61-M1: a flush enqueued before `drop_cf` would
+        // otherwise land AFTER drop_cf's VersionEdit removed the CF's
+        // files — the `apply` here would install a fresh SST stamped
+        // with the dropped CF's id, defeating R58-H2's cleanup. The
+        // flush guard above serializes us against other flushes; the
+        // dropped-flag check now also gates us against drop_cf having
+        // raced.
+        //
+        // R61-M1 caveat: if flush_cf_data grabs `lock_flush` BEFORE
+        // drop_cf does, we observe `is_dropped()==true` here but
+        // drop_cf has not yet sampled+released the imm's bytes — we
+        // pop the imm, drop_cf later samples the (now-empty) imm
+        // list and releases nothing. Refund the imm's bytes here so
+        // the cross-CF WBM counter cannot leak.
         if cf_data.is_dropped() {
+            let leaked = cf_data
+                .imm_memtables()
+                .first()
+                .map_or(0u64, |imm| imm.memory_usage() as u64);
             cf_data.pop_oldest_imm();
+            if leaked > 0 {
+                self.write_buffer_manager.release(leaked);
+            }
             self.write_controller
                 .set_imm_count(cf_data.imm_count() as u32);
             return Ok(None);
@@ -4580,9 +4603,17 @@ impl DbImpl {
         // dropped, do NOT install the fresh SST — that would re-introduce
         // an orphan with the dropped CF's id. Unlink the just-written
         // file (it has no readers and is not in any Version) and bail.
+        //
+        // R61-M1 (companion): release the imm's bytes here too — same
+        // race as the entry-point check, drop_cf may not yet have
+        // sampled this CF.
         if cf_data.is_dropped() {
             let _ = self.fs.delete_file(&path);
+            let leaked = oldest.memory_usage() as u64;
             cf_data.pop_oldest_imm();
+            if leaked > 0 {
+                self.write_buffer_manager.release(leaked);
+            }
             self.write_controller
                 .set_imm_count(cf_data.imm_count() as u32);
             return Ok(None);
