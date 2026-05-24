@@ -1008,6 +1008,50 @@ impl DbImpl {
         // the deleted_files set on the next loop iteration.
         cf_data.mark_dropped();
 
+        // R60-M2: briefly take `write_mutex` to ensure any concurrent
+        // batch_write / batch_put_arrow / write_single that already
+        // resolved this CF's data (and reserved WBM bytes via R58-H1)
+        // either completed its memtable insert before mark_dropped was
+        // visible, or will observe the dropped flag on its NEXT touch
+        // of the CF. The mutex itself doesn't gate writes (writes
+        // don't hold it during memtable insert), but acquiring it
+        // serves as a memory-barrier sync-point: by the time we
+        // release, every prior writer's `is_dropped()` load is
+        // guaranteed to observe `true`, and any future writer that
+        // proceeds had to acquire+release this mutex AFTER us (so
+        // their reserve→insert pair lands wholly after mark_dropped
+        // and they exit via the flag check on the next iteration of
+        // their retry loop — at which point the reserve they made is
+        // refunded by their `WbmReleaseGuard` drop).
+        drop(self.write_mutex.lock().expect("write_mutex poisoned"));
+
+        // R60-H2: take `compaction_mutex` BEFORE the WBM release and
+        // version walk so we serialize against any in-flight
+        // compact_l0_for_cf / compact_level_for_cf that would otherwise
+        // install a fresh L1 SST with this CF's id while we are
+        // mid-cleanup. The compaction paths take `compaction_mutex`
+        // first then check `is_dropped()` — observing our flip means
+        // they no-op. Without this, a compaction picked up before
+        // mark_dropped could finish its `job.run()` and then call
+        // `version_set.apply` with new_files referencing the dead
+        // cf_id AFTER our delete_files apply, producing exactly the
+        // orphan our cleanup is supposed to prevent.
+        //
+        // R60-M1: also take the per-CF flush mutex via `lock_flush()`
+        // before sampling memtable bytes — this serializes us against
+        // `flush_cf_data`, so the WBM byte sampling here and the
+        // `release(oldest.memory_usage())` inside the flush path
+        // cannot double-account the same imm.
+        //
+        // Lock order: `compaction_mutex` → `flush_mutex` matches the
+        // canonical order documented at db.rs:322-327 (compact path),
+        // so no inversion possible.
+        let _compaction_guard = self
+            .compaction_mutex
+            .lock()
+            .expect("compaction_mutex poisoned");
+        let _flush_guard = cf_data.lock_flush();
+
         // Release memtable bytes back to the WriteBufferManager. We
         // approximate by sampling both the active and immutable memtable
         // usage; the per-shard accounting is precise enough for the
@@ -2829,6 +2873,12 @@ impl DbImpl {
             .expect("compaction_mutex poisoned");
         let _guard = cf_data.lock_flush();
 
+        // R60-H1 (companion): same is_dropped gate as compact_l0_for_cf.
+        // See the comment there for the full rationale.
+        if cf_data.is_dropped() {
+            return Ok(None);
+        }
+
         let version = self.version_set.current();
         let level_idx = level as usize;
         if level_idx >= version.num_levels() {
@@ -3740,6 +3790,20 @@ impl DbImpl {
         // same L0 files. We piggyback on the flush_mutex since flush and
         // compaction both rewrite the on-disk layer.
         let _guard = cf_data.lock_flush();
+
+        // R60-H1: gate compaction on `is_dropped()`. drop_cf flips the
+        // flag before its retry loop walks the Version; if the flag is
+        // observed here, drop_cf is either already running or about to,
+        // and producing a fresh L1 SST stamped with this CF's id would
+        // either be unlinked by drop_cf (file leak) or — worse — survive
+        // drop_cf and become an orphan visible to manifest replay. The
+        // compaction_mutex above serializes us against drop_cf's
+        // mark→walk→apply pair (drop_cf takes compaction_mutex first,
+        // see R60-H2), so observing `is_dropped()` here means drop_cf
+        // has already finished or is queued behind us.
+        if cf_data.is_dropped() {
+            return Ok(None);
+        }
 
         // R49-H1: only roll up this CF's L0 files (and overlap into this CF's
         // L1 files). Without the filter, an L0→L1 rollup could fold another
