@@ -141,6 +141,22 @@ impl Version {
         // staged an edit against a level layout that no longer exists),
         // not a silent drop. Returning `Busy` lets the caller retry with
         // a fresh Version snapshot, matching the deleted_files path.
+        //
+        // R46-M3: also reject duplicate file numbers. R45-M2 caught the
+        // out-of-range-level half of the stale-edit hazard; this half
+        // catches the "file_number already present in new_levels" case.
+        // Two concurrent writers (flush + compaction) could otherwise
+        // both stage an edit that inserts a file with the same number —
+        // post-apply the Version would carry two SstFileMeta entries
+        // pointing at the same on-disk file (or, worse, two different
+        // files with the same number after one is later rewritten),
+        // which is a Manifest-consistency bug.
+        //
+        // The check is `O(new_files * total_files_in_version)` in the
+        // worst case; in practice `new_files.len()` is 1–O(low), and the
+        // alternative (precomputing a HashSet) costs an allocation per
+        // apply_edit on a hot path. Returns `Busy` symmetric with the
+        // deleted_files "still present" check.
         for (level, file_meta) in &edit.new_files {
             let level_idx = *level as usize;
             if level_idx >= new_levels.len() {
@@ -151,6 +167,14 @@ impl Version {
                     level,
                     file_meta.file_number.value(),
                     new_levels.len()
+                )));
+            }
+            if file_number_already_present(&new_levels, file_meta.file_number) {
+                return Err(ForstError::busy(format!(
+                    "Version::apply_edit: stale edit inserts file {} but a file with that \
+                     number is already present in the current version — another writer's \
+                     edit already applied; caller should discard staged output and retry",
+                    file_meta.file_number.value()
                 )));
             }
             new_levels[level_idx].files.push(file_meta.clone());
@@ -207,6 +231,16 @@ impl Default for Version {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// R46-M3: returns `true` if any level in `new_levels` already contains an
+/// SST with `file_number`. Used by [`Version::apply_edit`] to reject
+/// duplicate-file-number stale edits (the other half of the R45-M2
+/// stale-edit guard family).
+fn file_number_already_present(new_levels: &[LevelMeta], file_number: FileNumber) -> bool {
+    new_levels
+        .iter()
+        .any(|lvl| lvl.files.iter().any(|f| f.file_number == file_number))
 }
 
 /// Description of a version change (Flush/Compaction result).
@@ -696,6 +730,53 @@ mod tests {
         let v = Version::new();
         let edit = VersionEdit {
             new_files: vec![(MAX_LEVELS as u32 + 5, make_file(99, b"a", b"b"))],
+            ..Default::default()
+        };
+        let err = v.apply_edit(&edit).unwrap_err();
+        assert!(err.is_busy(), "expected Busy, got {:?}", err);
+    }
+
+    /// R46-M3: `new_files` carrying a file_number that already exists in
+    /// the current version is a stale-edit (the other concurrent writer's
+    /// apply landed first and installed a file with the same number).
+    /// Pre-fix, `apply_edit` would happily push a second entry — Manifest
+    /// inconsistency. Returns `Busy` symmetric with the deleted_files
+    /// "still present" check.
+    #[test]
+    fn test_apply_edit_rejects_duplicate_new_file_number() {
+        let v = Version::new();
+        // Seed with file_number 7 at L0.
+        let edit1 = VersionEdit {
+            new_files: vec![(0, make_file(7, b"a", b"c"))],
+            ..Default::default()
+        };
+        let v2 = v.apply_edit(&edit1).unwrap();
+        assert_eq!(v2.levels[0].files.len(), 1);
+        // A second edit that tries to install ANOTHER file_number 7 (at
+        // any level) must be rejected as a stale edit.
+        let edit2 = VersionEdit {
+            new_files: vec![(1, make_file(7, b"d", b"f"))],
+            ..Default::default()
+        };
+        let err = v2.apply_edit(&edit2).unwrap_err();
+        assert!(err.is_busy(), "expected Busy, got {:?}", err);
+    }
+
+    /// R46-M3: also catches the case where a SINGLE edit stages two
+    /// new files with the same file_number (e.g. a writer bug that
+    /// double-inserts). The first push lands; the second observes the
+    /// just-installed file via `file_number_already_present` and
+    /// rejects with `Busy`. The check uses the in-progress
+    /// `new_levels` so duplicates within a single edit are caught,
+    /// not just duplicates between consecutive applies.
+    #[test]
+    fn test_apply_edit_rejects_duplicate_within_single_edit() {
+        let v = Version::new();
+        let edit = VersionEdit {
+            new_files: vec![
+                (0, make_file(11, b"a", b"c")),
+                (0, make_file(11, b"d", b"f")), // duplicate of file 11
+            ],
             ..Default::default()
         };
         let err = v.apply_edit(&edit).unwrap_err();

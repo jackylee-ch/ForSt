@@ -233,6 +233,22 @@ fn extract_host_from_authority(authority: &str) -> &str {
         // Malformed (no closing bracket): return as-is.
         return authority;
     }
+    // R46-L1: an UNBRACKETED IPv6 literal like `::1` or
+    // `2001:db8::1` (no `[]`, no port) carries more than one `:`. RFC
+    // 3986 §3.2.2 requires IPv6 hosts to be bracketed when a port is
+    // present — so authority strings with multiple colons but no
+    // brackets are either malformed (port-implying) or unbracketed
+    // literals. Either way, naively trimming at the rightmost colon
+    // would butcher the address. RFC 6874 / 3986 say: when in doubt,
+    // do not strip. We mirror that conservative behaviour and return
+    // the input unchanged (loopback detection for `::1` then works
+    // correctly because `extract_host_from_authority("::1") == "::1"`).
+    //
+    // Single-colon strings remain `host:port`-shaped (IPv4 or DNS
+    // name + port) and are stripped as before.
+    if authority.bytes().filter(|&b| b == b':').count() > 1 {
+        return authority;
+    }
     // Plain host[:port]: trim any port suffix.
     match authority.rfind(':') {
         Some(idx) => &authority[..idx],
@@ -910,6 +926,32 @@ mod tests {
         // Unclosed bracket — preserve the input so the caller treats it
         // as a non-loopback host and emits the warning (conservative).
         assert_eq!(extract_host_from_authority("[::1"), "[::1");
+    }
+
+    /// R46-L1: unbracketed IPv6 literals (multi-colon, no `[`) must not
+    /// have their rightmost-`:` segment stripped — that would butcher
+    /// `::1` into `:` and `2001:db8::1` into `2001:db8::`. RFC 3986
+    /// §3.2.2 requires brackets when a port is present; multi-colon
+    /// authorities without brackets are either literals or malformed,
+    /// and stripping is wrong in both cases. The conservative choice
+    /// is to return the input unchanged.
+    #[test]
+    fn test_r46_l1_extract_host_unbracketed_ipv6_preserved() {
+        // Loopback IPv6 literal, no brackets, no port.
+        assert_eq!(extract_host_from_authority("::1"), "::1");
+        // Full IPv6 literal, no brackets, no port.
+        assert_eq!(
+            extract_host_from_authority("2001:db8::1"),
+            "2001:db8::1"
+        );
+        // Compressed link-local, no brackets, no port.
+        assert_eq!(extract_host_from_authority("fe80::1"), "fe80::1");
+        // Single-colon strings remain `host:port`-shaped — unchanged
+        // from the R45-M1 behaviour.
+        assert_eq!(
+            extract_host_from_authority("127.0.0.1:9000"),
+            "127.0.0.1"
+        );
     }
 
     // --- Memory backend round-trips -----------------------------------------

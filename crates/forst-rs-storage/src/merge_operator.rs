@@ -58,6 +58,30 @@ pub trait MergeOperator: Send + Sync {
     fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> ForstResult<Vec<u8>>;
 
     /// Returns the name of this merge operator (used for validation).
+    ///
+    /// # Identity contract (R46-L2)
+    ///
+    /// The returned string is the merge operator's IDENTITY — the
+    /// engine's cross-CF homogeneity check (R45-H1 in
+    /// `DbImpl::check_cf_homogeneity_locked`) compares operators ONLY by
+    /// the value returned here. Implementers MUST treat this name as a
+    /// uniqueness contract:
+    ///
+    /// * Two `MergeOperator` impls that return the same `name()` MUST
+    ///   produce semantically-equivalent results from `full_merge` and
+    ///   `partial_merge` for every input. If they don't, the engine
+    ///   will admit them as "the same operator" across CFs and silently
+    ///   produce wrong results during cross-CF L0 compaction.
+    /// * Two impls with different semantics (e.g. ListAppend with `,`
+    ///   vs ListAppend with `|`) MUST return distinct `name()` values.
+    ///   The built-in [`ListAppendMergeOperator`] currently violates
+    ///   the second half of this contract (delimiter is not encoded
+    ///   in the name); callers wanting per-delimiter isolation must
+    ///   wrap it in a newtype that overrides `name()`.
+    ///
+    /// A future hardening pass may switch identity to a `TypeId`-based
+    /// scheme so the contract is enforced by the compiler rather than
+    /// by convention; until then, treat `name()` as load-bearing.
     fn name(&self) -> &str;
 }
 

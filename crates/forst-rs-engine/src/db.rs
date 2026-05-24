@@ -575,7 +575,22 @@ impl DbImpl {
         &self,
         desc: ColumnFamilyDescriptor,
     ) -> ForstResult<ColumnFamilyHandle> {
-        // Reject duplicate names.
+        // R46-M1: hold the `cfs` write-lock across the homogeneity check AND
+        // the `create_cf_with_id` install so two concurrent
+        // `create_column_family` calls cannot both observe an empty
+        // existing-non-default set, then race to install heterogeneous CFs.
+        // Pre-fix: the read-lock was released after `check_cf_homogeneity`,
+        // and the fetch_add + insert ran lock-free — a classic TOCTOU.
+        //
+        // Locking the entire (check, allocate id, insert) sequence is the
+        // simplest fix; the cost is serialized CF creation, which is a
+        // negligibly-rare admin path (Flink's backend creates O(states) CFs
+        // at open and never thereafter).
+        let _create_guard = self.cfs.write().expect("lock poisoned");
+        // Re-check duplicates inside the write lock — the name_map and the
+        // cfs map are kept in sync, so a duplicate must already be reflected
+        // by an existing id in `cfs`, but we go through the name map for
+        // a clearer error message.
         {
             let name_map = self.cf_name_to_id.read().expect("lock poisoned");
             if name_map.contains_key(desc.name()) {
@@ -587,9 +602,36 @@ impl DbImpl {
         }
         // R45-H1: reject heterogeneous merge_operator / compaction_filter
         // across CFs. See doc-comment above for the rationale.
-        self.check_cf_homogeneity(&desc)?;
+        self.check_cf_homogeneity_locked(&_create_guard, None, &desc)?;
         let id = ColumnFamilyId(self.next_cf_id.fetch_add(1, Ordering::SeqCst));
-        self.create_cf_with_id(id, desc)
+        // `create_cf_with_id_locked` reuses the write guard we already hold
+        // for the `cfs` map; the name-map insert still takes its own lock.
+        self.create_cf_with_id_locked(_create_guard, id, desc)
+    }
+
+    /// R46-M2 escape hatch: create a CF without the R45-H1 homogeneity
+    /// check. The TOCTOU-safe lock window from `create_column_family`
+    /// (cfs write-lock held across check + insert) is preserved.
+    ///
+    /// Intentionally NOT public — the only caller is
+    /// [`Self::create_cf_from_import`], which has accepted the
+    /// silent-wrong-result risk in its own doc.
+    fn create_column_family_no_homogeneity_check(
+        &self,
+        desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<ColumnFamilyHandle> {
+        let _create_guard = self.cfs.write().expect("lock poisoned");
+        {
+            let name_map = self.cf_name_to_id.read().expect("lock poisoned");
+            if name_map.contains_key(desc.name()) {
+                return Err(ForstError::invalid_argument(format!(
+                    "column family '{}' already exists",
+                    desc.name()
+                )));
+            }
+        }
+        let id = ColumnFamilyId(self.next_cf_id.fetch_add(1, Ordering::SeqCst));
+        self.create_cf_with_id_locked(_create_guard, id, desc)
     }
 
     /// R45-H1: validates that the new descriptor's merge_operator and
@@ -614,7 +656,16 @@ impl DbImpl {
     /// non-default CF whose merge operator is `Some("StringAppend")`.
     /// This catches the original R45-H1 hazard (two user CFs disagreeing
     /// on policy) where the silent wrong-result risk is highest.
-    fn check_cf_homogeneity(&self, desc: &ColumnFamilyDescriptor) -> ForstResult<()> {
+    fn check_cf_homogeneity_locked(
+        &self,
+        cfs: &HashMap<ColumnFamilyId, Arc<ColumnFamilyData>>,
+        // For `set_compaction_filter`: the id of the CF being modified —
+        // we must NOT compare it against itself (that's the whole point of
+        // a post-create swap). `None` means "compare against every
+        // non-default CF" (the create_column_family path).
+        exclude_self: Option<ColumnFamilyId>,
+        desc: &ColumnFamilyDescriptor,
+    ) -> ForstResult<()> {
         let new_merge_name: Option<String> = desc
             .merge_operator()
             .as_ref()
@@ -624,14 +675,14 @@ impl DbImpl {
             .as_ref()
             .map(|f| f.name().to_string());
 
-        let existing: Vec<Arc<ColumnFamilyData>> = {
-            let cfs = self.cfs.read().expect("lock poisoned");
-            cfs.values()
-                .filter(|cf| cf.handle().id() != DEFAULT_CF_ID)
-                .cloned()
-                .collect()
-        };
-        for cf in &existing {
+        for cf in cfs.values() {
+            let cf_id = cf.handle().id();
+            if cf_id == DEFAULT_CF_ID {
+                continue;
+            }
+            if Some(cf_id) == exclude_self {
+                continue;
+            }
             let exist_merge_name: Option<String> = cf
                 .merge_operator()
                 .map(|op| op.name().to_string());
@@ -674,6 +725,19 @@ impl DbImpl {
         id: ColumnFamilyId,
         desc: ColumnFamilyDescriptor,
     ) -> ForstResult<ColumnFamilyHandle> {
+        let cfs_guard = self.cfs.write().expect("lock poisoned");
+        self.create_cf_with_id_locked(cfs_guard, id, desc)
+    }
+
+    /// `create_cf_with_id` variant that consumes a pre-acquired `cfs`
+    /// write guard. Used by `create_column_family` so the homogeneity
+    /// check and the install happen under a single lock window (R46-M1).
+    fn create_cf_with_id_locked(
+        &self,
+        mut cfs_guard: std::sync::RwLockWriteGuard<'_, HashMap<ColumnFamilyId, Arc<ColumnFamilyData>>>,
+        id: ColumnFamilyId,
+        desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<ColumnFamilyHandle> {
         let name = desc.name().to_string();
         let options = desc.options().clone();
         let merge_op = desc.merge_operator();
@@ -690,10 +754,10 @@ impl DbImpl {
             self.options.memtable_shards,
         ));
 
-        {
-            let mut cfs = self.cfs.write().expect("lock poisoned");
-            cfs.insert(id, cf_data.clone());
-        }
+        cfs_guard.insert(id, cf_data.clone());
+        // Drop the cfs write guard before grabbing name_map's write guard to
+        // keep the lock order consistent everywhere else in the codebase.
+        drop(cfs_guard);
         {
             let mut names = self.cf_name_to_id.write().expect("lock poisoned");
             names.insert(name, id);
@@ -721,16 +785,66 @@ impl DbImpl {
     /// for the CF observes the new filter; in-flight jobs run to
     /// completion against the snapshot they already captured.
     ///
+    /// # R46-H1: homogeneity validation
+    ///
+    /// The same cross-CF homogeneity rule that gates
+    /// [`Self::create_column_family`] applies here too. Flink's
+    /// `ForStRsTtlCompactFiltersManager.setTtlForState` installs a
+    /// `FlinkTtlCompactionFilter` per state, each carrying a different
+    /// `ttlMs`. Two states with different TTLs translate into two
+    /// `set_compaction_filter` calls with filters whose `name()` differs
+    /// (the Flink-shaped filter's name encodes the TTL). The engine's
+    /// L0 layer is shared across CFs, so allowing CF *a* to keep TTL=10s
+    /// while CF *b* runs TTL=60s would silently produce wrong results
+    /// during cross-CF compaction. Pre-fix this path bypassed the same
+    /// check that `create_column_family` enforced.
+    ///
+    /// The validation compares the candidate filter's `name()` against
+    /// every OTHER non-default CF's filter (the target CF itself is
+    /// excluded — that's the whole point of a post-create swap). The
+    /// existing merge_operator on the target CF is also re-validated so
+    /// `set_compaction_filter` cannot create a heterogeneous merge layout
+    /// either (in practice the merge operator is fixed at create time
+    /// and this branch is always a no-op).
+    ///
     /// # Errors
     ///
     /// Returns [`ForstError::InvalidArgument`] when the handle does not
-    /// match a known column family.
+    /// match a known column family, or when installing this filter would
+    /// violate the homogeneity invariant.
     pub fn set_compaction_filter(
         &self,
         cf: &ColumnFamilyHandle,
         filter: Option<Arc<dyn CompactionFilter>>,
     ) -> ForstResult<()> {
         let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        // R46-H1: gate through the same homogeneity check used by
+        // `create_column_family`. The target CF is excluded from the
+        // comparison so its own pre-existing filter does not match
+        // against itself.
+        //
+        // The default CF is exempt from validation entirely. For all
+        // current callers the default CF carries no filter and the
+        // post-create install path targets a non-default user CF — the
+        // exclusion here is for symmetry with the create-time rule.
+        if cf.id() != DEFAULT_CF_ID {
+            // Build a synthetic descriptor that carries the target CF's
+            // existing merge operator (which is fixed for the CF's
+            // lifetime) and the CANDIDATE filter we're about to install.
+            // The homogeneity helper only reads `.name()` off of each
+            // operator/filter, so the synthetic descriptor's behaviour
+            // matches "the CF as it would look once the install lands".
+            let mut probe = ColumnFamilyDescriptor::new(cf.name());
+            if let Some(op) = cf_data.merge_operator() {
+                probe = probe.with_merge_operator(op.clone());
+            }
+            if let Some(f) = filter.clone() {
+                probe = probe.with_compaction_filter(f);
+            }
+            let cfs = self.cfs.read().expect("lock poisoned");
+            self.check_cf_homogeneity_locked(&cfs, Some(cf.id()), &probe)?;
+        }
         cf_data.set_compaction_filter(filter);
         Ok(())
     }
@@ -1651,6 +1765,32 @@ impl DbImpl {
         let l0_count = self.version_set.current().l0_files().len() as u32;
         let trigger = self.write_controller.config().l0_slowdown_trigger;
         if l0_count >= trigger {
+            // R46-L3: surface which CF triggered the auto-compaction and
+            // how many engine-global L0 files are about to be absorbed.
+            // The version_set is engine-global (not per-CF) so the L0
+            // files being compacted may include rows for other CFs — the
+            // log includes the full CF list so post-mortem analysis can
+            // attribute throughput stalls to whichever CF tripped the
+            // trigger. The list of "other CFs with L0 footprint" cannot
+            // be reconstructed from the Version alone (rows are CF-tagged
+            // inside the SST, not at the file-meta level), so we log the
+            // names of every currently-registered non-default CF as the
+            // candidate set.
+            let other_cf_names: Vec<String> = {
+                let cfs = self.cfs.read().expect("lock poisoned");
+                cfs.values()
+                    .filter(|cf| cf.handle().id() != cf_data.handle().id())
+                    .map(|cf| cf.handle().name().to_string())
+                    .collect()
+            };
+            tracing::debug!(
+                cf_id = cf_data.handle().id().0,
+                cf_name = cf_data.handle().name(),
+                l0_count,
+                trigger,
+                other_non_default_cfs = ?other_cf_names,
+                "maybe_auto_compact: triggering L0→L1 compaction"
+            );
             self.compact_l0_for_cf(cf_data)?;
         }
         Ok(())
@@ -2266,6 +2406,35 @@ impl DbImpl {
     /// file it references. The engine is opened with `db_path = target_dir`
     /// (i.e. subsequent reads/writes operate directly on the checkpoint
     /// files; copy the checkpoint first if you want to preserve it).
+    ///
+    /// # R46-L4: CF re-creation order matters for the homogeneity invariant
+    ///
+    /// The current open path re-creates only the default CF
+    /// ([`DEFAULT_CF_NAME`]) — non-default CFs are not persisted in the
+    /// checkpoint blob today (their state is replayed from rows in the
+    /// SSTs, not from CF metadata) and must be re-registered by the
+    /// caller after `open_from_checkpoint` returns, via
+    /// [`Self::create_column_family`].
+    ///
+    /// THE ORDER OF THOSE FOLLOW-UP `create_column_family` CALLS IS
+    /// SIGNIFICANT for the R45-H1 / R46-H1 homogeneity check. The check
+    /// is "every non-default CF must match every other non-default CF"
+    /// — the FIRST non-default CF the caller installs sets the implicit
+    /// (merge_operator name, compaction_filter name) signature that all
+    /// subsequent CFs must agree with. Callers re-creating a mixed-policy
+    /// engine after restore must therefore either:
+    ///
+    /// 1. Install every CF with an identical (merge, filter) pair (the
+    ///    only configuration the engine supports today), or
+    /// 2. Use [`Self::set_compaction_filter`] post-creation, which goes
+    ///    through the same R46-H1 check and rejects heterogeneous
+    ///    installs symmetrically.
+    ///
+    /// The default CF installed below at `db.create_cf_with_id(...)` is
+    /// exempt (id 0, no merge, no filter — the homogeneity check skips
+    /// it). Future work to persist CF metadata in the checkpoint blob
+    /// would also need to re-create CFs in the same order they were
+    /// originally created (or batch-validate the whole set).
     pub fn open_from_checkpoint(
         options: EngineOptions,
         fs: Arc<dyn FileSystem>,
@@ -3376,6 +3545,28 @@ impl DbImpl {
     /// call returns [`ForstError::InvalidArgument`] and no state is
     /// imported.
     ///
+    /// # R46-M2: homogeneity check exemption
+    ///
+    /// The export blob format does not currently carry the source CF's
+    /// merge_operator or compaction_filter name, so the imported CF is
+    /// always created with a default-shape descriptor (no merge, no
+    /// filter). If the destination engine has any existing non-default CF
+    /// with a non-default policy, the R45-H1 / R46-H1 homogeneity check
+    /// would reject the import. To keep §6g cross-job transfer functional
+    /// we deliberately bypass the check here.
+    ///
+    /// SILENT WRONG-RESULT RISK: imports are admitted unconditionally;
+    /// if the source CF in the producing engine used a merge operator
+    /// or compaction filter that the destination engine does NOT carry
+    /// on its other CFs, cross-CF compaction in the destination will
+    /// behave incorrectly for the imported data (the same hazard R45-H1
+    /// guards against on the `create_column_family` path). Callers
+    /// orchestrating cross-job transfer are responsible for ensuring
+    /// source and destination engines use the same per-CF policy. A
+    /// follow-up that propagates the source merge/filter name through
+    /// the export blob would let us tighten this back to a checked
+    /// import; that work is out of scope here.
+    ///
     /// Errors: [`ForstError::InvalidArgument`] for a missing or
     /// magic-mismatched blob; [`ForstError::Corruption`] for a truncated
     /// blob or invalid length prefix; otherwise propagates errors from
@@ -3419,7 +3610,11 @@ impl DbImpl {
         // courtesy.
 
         // ---- Create the destination CF ----
-        let cf = self.create_column_family(ColumnFamilyDescriptor::new(name))?;
+        // R46-M2: bypass the R45-H1/R46-H1 homogeneity check (default-shape
+        // descriptor — see fn doc for the silent-wrong-result caveat).
+        let cf = self.create_column_family_no_homogeneity_check(
+            ColumnFamilyDescriptor::new(name),
+        )?;
 
         // ---- Replay entries ----
         // R42-H1: any failure in the replay loop (truncated blob, put error)
@@ -6878,6 +7073,167 @@ mod tests {
             ColumnFamilyDescriptor::new("merge_cf").with_merge_operator(op),
         )
         .expect("user CF + default CF (no merge) must be accepted");
+    }
+
+    /// R46-H1 reject path: `set_compaction_filter` must reject a
+    /// candidate filter whose `name()` differs from filters on OTHER
+    /// non-default CFs. This mirrors the production hazard from Flink's
+    /// `ForStRsTtlCompactFiltersManager.setTtlForState` — that path
+    /// installs a per-state `FlinkTtlCompactionFilter` whose `name()`
+    /// encodes the TTL, so two states with different TTLs produce two
+    /// filters whose names disagree, and pre-fix this
+    /// `set_compaction_filter` path bypassed the same check that
+    /// `create_column_family` already enforced.
+    ///
+    /// Test shape (per spec): create 2 non-default CFs both with no
+    /// filter (homogeneous baseline). The first `set_compaction_filter`
+    /// install of filter A on cf_a creates a heterogeneous state
+    /// against cf_b (still has no filter), and pre-fix that install
+    /// silently succeeded — post-fix it must be rejected.
+    ///
+    /// In production Flink installs per-state filters in sequence; the
+    /// FIRST install is the one that creates heterogeneity, and
+    /// rejecting it surfaces the configuration error at the earliest
+    /// possible point (before any compaction has had a chance to
+    /// corrupt data).
+    #[test]
+    fn test_r46_h1_set_compaction_filter_rejects_heterogeneous() {
+        use crate::compaction_filter::{CompactionDecision, CompactionFilter};
+        use forst_rs_common::OpType;
+        // Minimal named filters that report different `name()` strings.
+        struct NamedFilter(&'static str);
+        impl CompactionFilter for NamedFilter {
+            fn filter(
+                &self,
+                _level: u32,
+                _key: &[u8],
+                _value: Option<&[u8]>,
+                _sequence: u64,
+                _op_type: OpType,
+                _value_out: &mut Vec<u8>,
+            ) -> CompactionDecision {
+                CompactionDecision::Keep
+            }
+            fn name(&self) -> &str {
+                self.0
+            }
+        }
+
+        let db = open();
+        let cf_a = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf_a"))
+            .expect("cf_a accepted (default-shape)");
+        let _cf_b = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf_b"))
+            .expect("cf_b accepted (default-shape)");
+
+        // Both CFs have no filter — homogeneous baseline. Installing
+        // a filter on cf_a alone would create heterogeneity against
+        // cf_b. Pre-fix: the install silently succeeded (R46-H1
+        // hazard). Post-fix: rejected.
+        let filter_a: Arc<dyn CompactionFilter> = Arc::new(NamedFilter("ttl-A"));
+        let err = db
+            .set_compaction_filter(&cf_a, Some(filter_a))
+            .expect_err("set_compaction_filter on cf_a must be rejected — cf_b still has no filter");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("R45-H1"),
+            "error must cite the homogeneity constraint: {}",
+            msg
+        );
+    }
+
+    /// R46-H1 spec second variant: when both CFs already share a
+    /// non-default filter and one of them is RE-installed with a
+    /// different filter name, the call must be rejected. This is the
+    /// "drift" scenario where the engine is initially homogeneous and
+    /// a follow-up `set_compaction_filter` would create a split.
+    #[test]
+    fn test_r46_h1_set_compaction_filter_rejects_drift() {
+        use crate::compaction_filter::{CompactionDecision, CompactionFilter};
+        use forst_rs_common::OpType;
+        struct NamedFilter(&'static str);
+        impl CompactionFilter for NamedFilter {
+            fn filter(
+                &self,
+                _level: u32,
+                _key: &[u8],
+                _value: Option<&[u8]>,
+                _sequence: u64,
+                _op_type: OpType,
+                _value_out: &mut Vec<u8>,
+            ) -> CompactionDecision {
+                CompactionDecision::Keep
+            }
+            fn name(&self) -> &str {
+                self.0
+            }
+        }
+        let db = open();
+        // Anchor both CFs with matching filter A at create time so the
+        // homogeneity baseline is "filter name = A".
+        let filter_a1: Arc<dyn CompactionFilter> = Arc::new(NamedFilter("ttl-A"));
+        let filter_a2: Arc<dyn CompactionFilter> = Arc::new(NamedFilter("ttl-A"));
+        let cf_a = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cf_a").with_compaction_filter(filter_a1),
+            )
+            .expect("cf_a accepted with filter A");
+        let cf_b = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cf_b").with_compaction_filter(filter_a2),
+            )
+            .expect("cf_b accepted with matching filter A");
+        let _ = &cf_a;
+        // Now drift cf_b to a different filter name — must reject.
+        let filter_b: Arc<dyn CompactionFilter> = Arc::new(NamedFilter("ttl-B"));
+        let err = db
+            .set_compaction_filter(&cf_b, Some(filter_b))
+            .expect_err("drifting cf_b's filter to a different name must be rejected");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("R45-H1"),
+            "error must cite the homogeneity constraint: {}",
+            msg
+        );
+    }
+
+    /// R46-H1: a same-named filter swap (e.g. re-installing the same
+    /// filter, or installing a structurally-identical one) must NOT be
+    /// rejected — the homogeneity check is on `name()`, and equal names
+    /// are explicitly allowed.
+    #[test]
+    fn test_r46_h1_set_compaction_filter_allows_same_name() {
+        use crate::compaction_filter::{CompactionDecision, CompactionFilter};
+        use forst_rs_common::OpType;
+        struct NamedFilter(&'static str);
+        impl CompactionFilter for NamedFilter {
+            fn filter(
+                &self,
+                _level: u32,
+                _key: &[u8],
+                _value: Option<&[u8]>,
+                _sequence: u64,
+                _op_type: OpType,
+                _value_out: &mut Vec<u8>,
+            ) -> CompactionDecision {
+                CompactionDecision::Keep
+            }
+            fn name(&self) -> &str {
+                self.0
+            }
+        }
+
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf"))
+            .expect("cf accepted");
+        let filter_1: Arc<dyn CompactionFilter> = Arc::new(NamedFilter("ttl-X"));
+        let filter_2: Arc<dyn CompactionFilter> = Arc::new(NamedFilter("ttl-X"));
+        db.set_compaction_filter(&cf, Some(filter_1))
+            .expect("first install accepted");
+        db.set_compaction_filter(&cf, Some(filter_2))
+            .expect("same-named re-install accepted");
     }
 
     // ============================================================
