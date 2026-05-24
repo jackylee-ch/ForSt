@@ -396,13 +396,28 @@ impl VersionSetImpl {
         let old = self.current.load_full();
         let new_version = old.apply_edit(edit)?;
 
-        // Update atomic counters if the edit carries new values
+        // Update atomic counters if the edit carries new values.
+        //
+        // R55-M1 / R55-M2: use `fetch_max` (NOT `store`) so a stale or
+        // out-of-order edit cannot REGRESS these counters. Both fields
+        // are monotonically advancing under normal operation:
+        //   * `next_file_number` must never re-issue a value already
+        //     allocated to a live SST — a `store` of a stale lower
+        //     value would let `allocate_file_number` collide with an
+        //     existing file on the next call.
+        //   * `last_sequence` is the upper bound the read path uses to
+        //     gate visibility — regressing it hides newer writes that
+        //     were already acknowledged.
+        // The `apply_lock` above serializes all `apply` calls so this
+        // `fetch_max` under the lock is equivalent to a load+compare+
+        // store but with no concurrent-update window.
         if let Some(file_num) = edit.next_file_number {
             self.next_file_number
-                .store(file_num.value(), Ordering::SeqCst);
+                .fetch_max(file_num.value(), Ordering::SeqCst);
         }
         if let Some(seq) = edit.last_sequence {
-            self.last_sequence.store(seq.value(), Ordering::SeqCst);
+            self.last_sequence
+                .fetch_max(seq.value(), Ordering::SeqCst);
         }
 
         let new_arc = Arc::new(new_version);
@@ -744,6 +759,43 @@ mod tests {
         // After writer completes, current version should have many L0 files
         let v = vs.current();
         assert!(v.levels[0].files.len() >= 100);
+    }
+
+    /// R55-M1 / R55-M2: `apply` must never regress `next_file_number`
+    /// or `last_sequence`. A stale edit carrying smaller values must be
+    /// absorbed monotonically (the larger live value wins).
+    #[test]
+    fn test_version_set_apply_does_not_regress_counters() {
+        let vs = VersionSetImpl::new();
+        let high = VersionEdit {
+            next_file_number: Some(FileNumber(100)),
+            last_sequence: Some(SequenceNumber(500)),
+            ..Default::default()
+        };
+        vs.apply(&high).unwrap();
+        assert_eq!(vs.next_file_number(), 100);
+        assert_eq!(vs.last_sequence(), 500);
+
+        // A stale edit carrying lower values must NOT regress either
+        // counter. Pre-fix, the unconditional `store` regressed both.
+        let stale = VersionEdit {
+            next_file_number: Some(FileNumber(50)),
+            last_sequence: Some(SequenceNumber(200)),
+            ..Default::default()
+        };
+        vs.apply(&stale).unwrap();
+        assert_eq!(vs.next_file_number(), 100);
+        assert_eq!(vs.last_sequence(), 500);
+
+        // A higher edit still advances both.
+        let higher = VersionEdit {
+            next_file_number: Some(FileNumber(150)),
+            last_sequence: Some(SequenceNumber(700)),
+            ..Default::default()
+        };
+        vs.apply(&higher).unwrap();
+        assert_eq!(vs.next_file_number(), 150);
+        assert_eq!(vs.last_sequence(), 700);
     }
 
     #[test]
