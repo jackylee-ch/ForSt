@@ -184,11 +184,26 @@ mod tests {
         assert_eq!(g.pin_count(FileNumber(1)), 0);
     }
 
+    /// Release-mode contract: `unpin` of a never-pinned file is a
+    /// saturating no-op (pin_count stays at 0). R31-L3 added a
+    /// `debug_assert!` so debug builds catch misuse loudly; the
+    /// release no-op is verified here.
+    #[cfg(not(debug_assertions))]
     #[test]
-    fn test_unpin_never_goes_negative() {
+    fn test_unpin_never_goes_negative_release() {
         let g = FileDeletionGuard::new();
         g.unpin(FileNumber(7));
         assert_eq!(g.pin_count(FileNumber(7)), 0);
+    }
+
+    /// Debug-mode contract: `unpin` of a never-pinned file panics via
+    /// `debug_assert!` so an unbalanced pin/unpin is caught in tests.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "is not currently pinned")]
+    fn test_unpin_never_goes_negative_debug() {
+        let g = FileDeletionGuard::new();
+        g.unpin(FileNumber(7));
     }
 
     #[test]

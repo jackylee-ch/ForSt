@@ -1141,7 +1141,14 @@ impl DbImpl {
             // metadata fields VersionEdit needs. We open via the engine's
             // FileSystem (so the OpenDAL / cached-fs paths get exercised
             // uniformly), not std::fs.
+            //
+            // R53-M1: on any failure between here and the
+            // `new_files.push(...)` below, `dest` is on disk but not yet
+            // tracked by `new_files`, so `cleanup_ingested` would not
+            // unlink it. Explicitly delete `dest` before invoking
+            // cleanup so partial ingests do not leak the file.
             let rac = self.fs.open_random_access_file(&dest).inspect_err(|_| {
+                let _ = self.fs.delete_file(&dest);
                 self.cleanup_ingested(&new_files);
             })?;
             // Re-open the dest via a *fresh* RAC so we can sample its
@@ -1153,16 +1160,19 @@ impl DbImpl {
                 Ok(probe) => match probe.file_size() {
                     Ok(sz) => sz,
                     Err(e) => {
+                        let _ = self.fs.delete_file(&dest);
                         self.cleanup_ingested(&new_files);
                         return Err(e);
                     }
                 },
                 Err(e) => {
+                    let _ = self.fs.delete_file(&dest);
                     self.cleanup_ingested(&new_files);
                     return Err(e);
                 }
             };
             let reader = SstReaderImpl::open(rac).inspect_err(|_| {
+                let _ = self.fs.delete_file(&dest);
                 self.cleanup_ingested(&new_files);
             })?;
             let mut footer = reader.footer().clone();
@@ -1350,24 +1360,41 @@ impl DbImpl {
                 )))
             })?;
 
-        const CHUNK: usize = 1 << 20; // 1 MiB
-        let mut buf = vec![0u8; CHUNK];
-        let mut off: u64 = 0;
-        while off < file_size {
-            let want = ((file_size - off) as usize).min(CHUNK);
-            let n = rac.read_at(off, &mut buf[..want])?;
-            if n == 0 {
-                return Err(ForstError::corruption(format!(
-                    "copy_external_sst: short read at off={} of {} from {}",
-                    off,
-                    file_size,
-                    src.display()
-                )));
+        // R53-M1: wrap the copy loop so any failure (read_at, append,
+        // short read, sync) cleans up the partial `dest` we just
+        // created. `cleanup_ingested` in the caller only operates on
+        // entries already pushed into `new_files`, and `dest` is not
+        // pushed until both the copy AND the footer-read succeed — so
+        // a copy-side failure would otherwise leak a partial SST.
+        let res = (|| -> ForstResult<()> {
+            const CHUNK: usize = 1 << 20; // 1 MiB
+            let mut buf = vec![0u8; CHUNK];
+            let mut off: u64 = 0;
+            while off < file_size {
+                let want = ((file_size - off) as usize).min(CHUNK);
+                let n = rac.read_at(off, &mut buf[..want])?;
+                if n == 0 {
+                    return Err(ForstError::corruption(format!(
+                        "copy_external_sst: short read at off={} of {} from {}",
+                        off,
+                        file_size,
+                        src.display()
+                    )));
+                }
+                wf.append(&buf[..n])?;
+                off += n as u64;
             }
-            wf.append(&buf[..n])?;
-            off += n as u64;
+            wf.sync()?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            // Drop the WritableFile handle before unlinking — some
+            // backends keep the open handle pinned and silently retain
+            // the inode otherwise.
+            drop(wf);
+            let _ = self.fs.delete_file(dest);
+            return Err(e);
         }
-        wf.sync()?;
         Ok(())
     }
 

@@ -184,14 +184,25 @@ impl FileSystemRouter {
     /// extension is `.tmp` (→ local) while the destination is `.sst`
     /// (→ remote), even though both files belong on the remote FS.
     fn is_remote_file(path: &Path) -> bool {
-        if path.extension().is_some_and(|ext| ext == "sst") {
+        // R53-M3: restrict the match to the file_name() only and to the
+        // exact suffix shapes documented above. The earlier
+        // `path.to_string_lossy().contains(".sst.")` check matched any
+        // path with `.sst.` anywhere in its string — including unrelated
+        // user paths like `/var/sst.cache/x.log` or `archive.sst.zip` —
+        // which silently misrouted unrelated callers in tiered mode.
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if name.ends_with(".sst")
+            || name.ends_with(".sst.tmp")
+            || name.ends_with(".sst.cf-rewrite.tmp")
+        {
             return true;
         }
-        // Tmp / orphan shapes carry `.sst.` as a non-terminal component.
-        // Use raw string match so we catch every suffix the writer side
-        // may invent (`.tmp`, `.cf-rewrite.tmp`, `.orphan-<ts>`, …)
-        // without enumerating each one here.
-        path.to_string_lossy().contains(".sst.")
+        // Orphan timestamps: `<N>.sst.orphan-<ts>` and
+        // `.<N>.sst.tmp.orphan-<ts>`. Match the infixes against the
+        // filename only (not the whole path).
+        name.contains(".sst.orphan-") || name.contains(".sst.tmp.orphan-")
     }
 
     /// Returns the filesystem that should handle operations for `path`.
@@ -314,19 +325,38 @@ impl FileSystem for FileSystemRouter {
                 return Ok(local_entries);
             }
         };
-        let mut merged: Vec<FileMetadata> =
-            Vec::with_capacity(local_entries.len() + remote_entries.len());
-        let mut seen: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::with_capacity(local_entries.len() + remote_entries.len());
-        for e in local_entries {
-            if seen.insert(e.path.clone()) {
-                merged.push(e);
+        // R53-M2: dedup by `file_name()`, NOT by full PathBuf.
+        // `LocalFileSystem::list_dir` returns absolute paths
+        // (`dir.join(name)`) whereas `OpendalFileSystem::list_dir`
+        // returns operator-root-relative paths whose stems differ.
+        // Without normalising, the same file landing on both legs
+        // would appear twice and orphan-scan would try to rename it
+        // twice (second rename fails with "src not found").
+        // Orphan-scan keys on `file_name()` anyway, so this is the
+        // matching dimension.
+        let cap = local_entries.len() + remote_entries.len();
+        let mut merged: Vec<FileMetadata> = Vec::with_capacity(cap);
+        let mut seen: std::collections::HashSet<std::ffi::OsString> =
+            std::collections::HashSet::with_capacity(cap);
+        let absorb = |e: FileMetadata,
+                          merged: &mut Vec<FileMetadata>,
+                          seen: &mut std::collections::HashSet<std::ffi::OsString>| {
+            match e.path.file_name() {
+                Some(name) => {
+                    if seen.insert(name.to_os_string()) {
+                        merged.push(e);
+                    }
+                }
+                // No filename component (e.g. trailing `/`) — keep
+                // the entry; dedup is unnecessary for these.
+                None => merged.push(e),
             }
+        };
+        for e in local_entries {
+            absorb(e, &mut merged, &mut seen);
         }
         for e in remote_entries {
-            if seen.insert(e.path.clone()) {
-                merged.push(e);
-            }
+            absorb(e, &mut merged, &mut seen);
         }
         Ok(merged)
     }
