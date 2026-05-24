@@ -1302,9 +1302,16 @@ impl DbImpl {
         // because external readers consult `engine.sequence_number()`
         // (e.g. `snapshot()`) while the read path consults
         // `version_set.last_sequence()`.
-        if max_seq_ingested > self.sequence_number.load(Ordering::Acquire) {
+        //
+        // R56-M1: use `fetch_max` so a concurrent writer's `fetch_add`
+        // between the prior `load` + `store` cannot be silently
+        // regressed. The pre-fix shape was a load-then-conditional-store
+        // race exactly analogous to the R55-M1/M2 bug in
+        // `VersionSetImpl::apply` — the engine-side fix is the same
+        // primitive.
+        if max_seq_ingested > 0 {
             self.sequence_number
-                .store(max_seq_ingested, Ordering::Release);
+                .fetch_max(max_seq_ingested, Ordering::AcqRel);
         }
 
         // L0 file count for back-pressure.
@@ -2244,11 +2251,23 @@ impl DbImpl {
         // distinct keys see no engine-level serialization. The switch
         // decision still goes through `write_mutex` to keep
         // `active_memtable` swaps serialized.
+        //
+        // R56-H1: wrap the per-CF `batch_insert_with_base_seq` in the
+        // same bounded retry loop `write_single` uses. The active
+        // memtable can be swapped + frozen by a concurrent flush
+        // between our `active_memtable()` capture (line below) and the
+        // actual insert. Pre-fix, the resulting `FrozenMemTable` error
+        // propagated through `?` AFTER one or more earlier CFs in the
+        // group loop had already committed to their memtables AND after
+        // the `sequence_number.fetch_add(total_count)` had reserved the
+        // whole range — leaving the batch torn and the seq range
+        // partially populated. Retrying within the bounded window
+        // (~25.6ms total backoff) absorbs the swap atomically from the
+        // caller's perspective.
         let entries = batch.into_entries();
         let mut group_offset: u64 = 1; // first owned seq is `prev + 1`
         for (cf_id, indices) in &groups {
             let cf_data = cf_datas.get(cf_id).expect("cf_data pre-populated");
-            let mem_arc = cf_data.active_memtable();
 
             // PR-B5-H1: `entries[i].key` is now `Cow<'_, [u8]>`. `.as_ref()`
             // yields `&[u8]` for both Borrowed and Owned variants — the
@@ -2260,7 +2279,22 @@ impl DbImpl {
                 .collect();
             let op_types: Vec<u8> = indices.iter().map(|&i| entries[i].op_type as u8).collect();
             let base_seq = prev + group_offset;
-            mem_arc.batch_insert_with_base_seq(&keys, &values, &op_types, base_seq)?;
+
+            let mut attempt: u32 = 0;
+            loop {
+                let mem_arc = cf_data.active_memtable();
+                match mem_arc.batch_insert_with_base_seq(&keys, &values, &op_types, base_seq) {
+                    Ok(_) => break,
+                    Err(ForstError::FrozenMemTable) if attempt < 8 => {
+                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_micros(
+                            100u64 << attempt,
+                        ));
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             group_offset += indices.len() as u64;
         }
 
@@ -2330,9 +2364,29 @@ impl DbImpl {
         // each shard takes its own lock so concurrent batches don't
         // serialize on a single memtable lock. Switch decision still
         // serializes on `write_mutex`.
+        //
+        // R56-H1 (companion fix): same FrozenMemTable race as in
+        // `batch_write` — a concurrent flush can swap+freeze the
+        // active memtable between our capture and the insert. Retry
+        // with the same bounded backoff (~25.6ms total) so the swap
+        // is absorbed without surfacing a torn-batch error to the
+        // caller after the sequence range has already been reserved.
         {
-            let mem_arc = cf_data.active_memtable();
-            mem_arc.batch_put_arrow_with_base_seq(batch, base_seq)?;
+            let mut attempt: u32 = 0;
+            loop {
+                let mem_arc = cf_data.active_memtable();
+                match mem_arc.batch_put_arrow_with_base_seq(batch, base_seq) {
+                    Ok(_) => break,
+                    Err(ForstError::FrozenMemTable) if attempt < 8 => {
+                        std::thread::yield_now();
+                        std::thread::sleep(std::time::Duration::from_micros(
+                            100u64 << attempt,
+                        ));
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
