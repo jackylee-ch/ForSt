@@ -221,20 +221,83 @@ impl ShardedMemTable {
             buckets[s].push(i);
         }
 
-        // Dispatch each non-empty shard. We acquire shard locks one at a
-        // time (no global lock); since each shard's row list is independent,
-        // there is no cross-shard ordering hazard.
+        // R57-H1: ALL-OR-NOTHING multi-shard write.
+        //
+        // The pre-fix shape acquired and released each shard's write lock
+        // one at a time. A concurrent `freeze()` (which walks shards in
+        // ascending order with a take-freeze-release cycle per shard)
+        // could interleave between our shard[i] release and our
+        // shard[i+1] acquire — freezing shard[i+1] before we got there.
+        // The result was a torn batch: shards 0..i committed, shard i+1
+        // returned `FrozenMemTable`. The engine-level retry that R56-H1
+        // added would then re-execute the WHOLE batch against the new
+        // active memtable, duplicating shards 0..i at identical seqs in
+        // both M_old and M_new.
+        //
+        // Fix: pre-materialise every per-shard sub-batch, then acquire
+        // every non-empty shard's write lock UP-FRONT in ascending
+        // shard-index order (same order `freeze()` walks, so the two
+        // operations either fully serialize or fail-fast — no deadlock).
+        // Once all guards are held we check `is_frozen()` on each; if
+        // ANY shard is frozen we drop all guards untouched and return
+        // `FrozenMemTable`. Otherwise we perform every write while the
+        // locks are still held, guaranteeing the batch is observed
+        // atomically by `freeze()` (which is blocked on shard[0] for
+        // the duration of our write).
+        //
+        // Note: this serializes concurrent multi-shard batches against
+        // each other on shard[0], but single-shard `put_with_seq` is
+        // unaffected — that path acquires only its own shard's lock.
+        // The vast majority of streaming writes are single-key and hit
+        // `put_with_seq`; the cost of this fix lands on cross-shard
+        // batches, which were the only paths exposed to the torn-batch
+        // race anyway.
+        struct PerShardBatch<'a> {
+            shard_idx: usize,
+            sub_keys: Vec<&'a [u8]>,
+            sub_values: Vec<Option<&'a [u8]>>,
+            sub_ops: Vec<u8>,
+            sub_seqs: Vec<u64>,
+        }
+        let mut prepared: Vec<PerShardBatch<'_>> = Vec::new();
         for (shard_idx, indices) in buckets.iter().enumerate() {
             if indices.is_empty() {
                 continue;
             }
-            let sub_keys: Vec<&[u8]> = indices.iter().map(|&i| keys[i]).collect();
-            let sub_values: Vec<Option<&[u8]>> = indices.iter().map(|&i| values[i]).collect();
-            let sub_ops: Vec<u8> = indices.iter().map(|&i| op_types[i]).collect();
-            let sub_seqs: Vec<u64> = indices.iter().map(|&i| base_seq + i as u64).collect();
+            prepared.push(PerShardBatch {
+                shard_idx,
+                sub_keys: indices.iter().map(|&i| keys[i]).collect(),
+                sub_values: indices.iter().map(|&i| values[i]).collect(),
+                sub_ops: indices.iter().map(|&i| op_types[i]).collect(),
+                sub_seqs: indices.iter().map(|&i| base_seq + i as u64).collect(),
+            });
+        }
 
-            let mut shard = self.shards[shard_idx].write().expect("lock poisoned");
-            shard.batch_insert_with_explicit_seqs(&sub_keys, &sub_values, &sub_ops, &sub_seqs)?;
+        // Acquire all relevant shard locks in ascending order. Matches
+        // `freeze()`'s acquisition order so the two operations cannot
+        // form a circular wait.
+        let mut guards: Vec<std::sync::RwLockWriteGuard<'_, VectorizedMemTable>> =
+            Vec::with_capacity(prepared.len());
+        for p in &prepared {
+            guards.push(self.shards[p.shard_idx].write().expect("lock poisoned"));
+        }
+
+        // All guards held. Check frozen state on every shard; if any
+        // is frozen, drop all guards untouched (no partial write).
+        for g in &guards {
+            if g.is_frozen() {
+                return Err(ForstError::FrozenMemTable);
+            }
+        }
+
+        // Perform writes while every lock is still held.
+        for (g, p) in guards.iter_mut().zip(prepared.iter()) {
+            g.batch_insert_with_explicit_seqs(
+                &p.sub_keys,
+                &p.sub_values,
+                &p.sub_ops,
+                &p.sub_seqs,
+            )?;
         }
         Ok(count)
     }
@@ -349,31 +412,59 @@ impl ShardedMemTable {
             }
         }
 
-        // Slow path: re-batch per shard. We materialise per-shard
-        // (key, value, op, seq) Vecs and dispatch via the explicit-seqs
-        // batch_insert API. Per-row seq is `base_seq + original_index` so
-        // the global ordering matches the input row order.
+        // R57-H2 (companion to R57-H1): same ALL-OR-NOTHING acquisition
+        // pattern as `batch_insert_with_base_seq`. See that function's
+        // comment for the full rationale — in short, pre-fix the per-
+        // shard release-then-reacquire window let `freeze()` interleave
+        // and produce a torn batch that the engine-level retry then
+        // duplicated.
+        struct PerShardArrowBatch<'a> {
+            shard_idx: usize,
+            sub_keys: Vec<&'a [u8]>,
+            sub_values: Vec<Option<&'a [u8]>>,
+            sub_ops: Vec<u8>,
+            sub_seqs: Vec<u64>,
+        }
+        let mut prepared: Vec<PerShardArrowBatch<'_>> = Vec::new();
         for (shard_idx, indices) in buckets.iter().enumerate() {
             if indices.is_empty() {
                 continue;
             }
-            // Pre-extract slices to avoid double-borrowing the Arrow array.
-            let sub_keys: Vec<&[u8]> = indices.iter().map(|&i| keys.value(i)).collect();
-            let sub_values: Vec<Option<&[u8]>> = indices
-                .iter()
-                .map(|&i| {
-                    if values.is_null(i) {
-                        None
-                    } else {
-                        Some(values.value(i))
-                    }
-                })
-                .collect();
-            let sub_ops: Vec<u8> = indices.iter().map(|&i| op_values[i]).collect();
-            let sub_seqs: Vec<u64> = indices.iter().map(|&i| base_seq + i as u64).collect();
+            prepared.push(PerShardArrowBatch {
+                shard_idx,
+                sub_keys: indices.iter().map(|&i| keys.value(i)).collect(),
+                sub_values: indices
+                    .iter()
+                    .map(|&i| {
+                        if values.is_null(i) {
+                            None
+                        } else {
+                            Some(values.value(i))
+                        }
+                    })
+                    .collect(),
+                sub_ops: indices.iter().map(|&i| op_values[i]).collect(),
+                sub_seqs: indices.iter().map(|&i| base_seq + i as u64).collect(),
+            });
+        }
 
-            let mut shard = self.shards[shard_idx].write().expect("lock poisoned");
-            shard.batch_insert_with_explicit_seqs(&sub_keys, &sub_values, &sub_ops, &sub_seqs)?;
+        let mut guards: Vec<std::sync::RwLockWriteGuard<'_, VectorizedMemTable>> =
+            Vec::with_capacity(prepared.len());
+        for p in &prepared {
+            guards.push(self.shards[p.shard_idx].write().expect("lock poisoned"));
+        }
+        for g in &guards {
+            if g.is_frozen() {
+                return Err(ForstError::FrozenMemTable);
+            }
+        }
+        for (g, p) in guards.iter_mut().zip(prepared.iter()) {
+            g.batch_insert_with_explicit_seqs(
+                &p.sub_keys,
+                &p.sub_values,
+                &p.sub_ops,
+                &p.sub_seqs,
+            )?;
         }
         Ok(count)
     }
