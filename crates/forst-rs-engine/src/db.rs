@@ -997,6 +997,15 @@ impl DbImpl {
         //   (a) the CF still in the map but flagged → InvalidArgument
         //   (b) the CF gone from the map → InvalidArgument (not found)
         // Either way the caller sees consistent "CF unusable" rejection.
+        //
+        // R59-H1 ordering: mark_dropped FIRST also gates any flush worker
+        // that picks up a pending imm AFTER this point — flush_cf_data
+        // checks `is_dropped()` at its head and at the post-job-run
+        // boundary, so no fresh SST stamped with this CF's id can be
+        // installed into the Version once the flag is flipped. In-flight
+        // flushes that already passed both checks land their VersionEdit
+        // BEFORE our `current()` walk below, so the file is captured by
+        // the deleted_files set on the next loop iteration.
         cf_data.mark_dropped();
 
         // Release memtable bytes back to the WriteBufferManager. We
@@ -1009,60 +1018,99 @@ impl DbImpl {
         }
         self.write_buffer_manager.release(released_bytes);
 
-        // R58-H2: drop the CF's SST files. Pre-fix, drop_cf removed
-        // the CF from in-memory maps but left every SST file the CF
-        // produced (across all levels) referenced by the Version. The
-        // files were unreachable from the engine API (no CF handle)
-        // but kept their on-disk footprint AND remained in the
-        // manifest/Version, so every restart-from-manifest restored
-        // the now-orphaned files into the new Version's levels.
+        // R58-H2 / R59-H2 / R59-H3: drop the CF's SST files. Pre-fix
+        // (R58-H2), `drop_cf` removed the CF from in-memory maps but
+        // left every SST file the CF produced (across all levels)
+        // referenced by the Version. R59-H2 then identified that the
+        // R58-H2 walk-then-apply pair was not atomic with concurrent
+        // flush/compaction `apply`, so a flush that landed between the
+        // snapshot and the apply could install a fresh L0 file with the
+        // dead cf_id that the deleted_files set would miss.
         //
-        // Walk the current Version, collect every (level, file_number)
-        // whose meta.cf_id matches the dropped CF, then apply a single
-        // VersionEdit with the union as `deleted_files`. After apply
-        // succeeds, route each file through `delete_file_guarded` so
-        // any in-flight checkpoint copy is not yanked out from under;
-        // then reap.
+        // Fix: loop. Each iteration walks the CURRENT Version, collects
+        // every (level, file_number) whose meta.cf_id matches the CF
+        // being dropped, and applies a VersionEdit. If apply returns
+        // `Busy` (stale edit — a concurrent flush/compaction landed
+        // between our walk and our apply), re-walk and re-apply. We cap
+        // the retry attempts so a runaway concurrent flush stream
+        // cannot wedge us forever; the cap is generous (16) because
+        // R59-H1's `is_dropped()` flush gate guarantees that, after
+        // mark_dropped, AT MOST the in-flight flush at the moment of
+        // mark_dropped can install a new file — no new flush enters
+        // the apply path once the flag is observed.
+        //
+        // R59-H3 ordering: this loop runs AFTER mark_dropped + WBM
+        // release so on apply Err the engine state is consistent —
+        // mark_dropped means writes are rejected, WBM means budget is
+        // free, and the orphan files (if any) are deferred to the next
+        // restart's manifest replay rather than leaving an
+        // inconsistent half-cleaned CF.
         let cf_id_to_drop = cf.id();
-        let current_version = self.version_set.current();
-        let mut deleted_files: Vec<(u32, FileNumber)> = Vec::new();
-        for (lvl_idx, lvl) in current_version.levels.iter().enumerate() {
-            for f in &lvl.files {
-                if f.cf_id == cf_id_to_drop {
-                    deleted_files.push((lvl_idx as u32, f.file_number));
+        const DROP_CF_RETRY_MAX: u32 = 16;
+        let mut attempts: u32 = 0;
+        loop {
+            let current_version = self.version_set.current();
+            let mut deleted_files: Vec<(u32, FileNumber)> = Vec::new();
+            for (lvl_idx, lvl) in current_version.levels.iter().enumerate() {
+                for f in &lvl.files {
+                    if f.cf_id == cf_id_to_drop {
+                        deleted_files.push((lvl_idx as u32, f.file_number));
+                    }
                 }
             }
-        }
-        if !deleted_files.is_empty() {
+            if deleted_files.is_empty() {
+                break;
+            }
             let edit = VersionEdit {
                 deleted_files: deleted_files.clone(),
                 ..Default::default()
             };
-            if let Err(e) = self.version_set.apply(&edit) {
-                // The CF is still flagged dropped (no rollback of the
-                // in-memory map state needed); failure here means the
-                // file set diverged between our snapshot and apply.
-                // Leave the files for the next compaction or restart to
-                // reclaim, and surface the error so the caller knows.
-                tracing::warn!(
-                    target: "forst_rs_engine::drop_cf",
-                    cf_id = cf_id_to_drop.0,
-                    error = %e,
-                    "drop_cf: VersionEdit apply failed; SST files remain referenced \
-                     and will be reclaimed by a future apply or restart"
-                );
-                return Err(e);
-            }
-            {
-                let mut cache = self.sst_readers.write().expect("lock poisoned");
-                for (_, file_number) in &deleted_files {
-                    cache.remove(file_number);
+            match self.version_set.apply(&edit) {
+                Ok(_) => {
+                    {
+                        let mut cache = self.sst_readers.write().expect("lock poisoned");
+                        for (_, file_number) in &deleted_files {
+                            cache.remove(file_number);
+                        }
+                    }
+                    for (_, file_number) in &deleted_files {
+                        self.delete_file_guarded(*file_number);
+                    }
+                    self.reap_pending_deletions();
+                    // Re-walk once more to catch a concurrent flush
+                    // that landed between our walk and our apply but
+                    // whose edit happened to be compatible (no Busy
+                    // returned). The `is_dropped` flag at flush_cf_data
+                    // bounds how many such races can occur.
+                    attempts += 1;
+                    if attempts >= DROP_CF_RETRY_MAX {
+                        tracing::warn!(
+                            target: "forst_rs_engine::drop_cf",
+                            cf_id = cf_id_to_drop.0,
+                            "drop_cf: hit retry cap after {} iterations; \
+                             remaining files (if any) will be reclaimed by next restart",
+                            attempts
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                Err(ForstError::Busy(_)) if attempts < DROP_CF_RETRY_MAX => {
+                    attempts += 1;
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "forst_rs_engine::drop_cf",
+                        cf_id = cf_id_to_drop.0,
+                        error = %e,
+                        "drop_cf: VersionEdit apply failed; SST files remain referenced \
+                         and will be reclaimed on next restart"
+                    );
+                    break;
                 }
             }
-            for (_, file_number) in &deleted_files {
-                self.delete_file_guarded(*file_number);
-            }
-            self.reap_pending_deletions();
         }
 
         // R47-M1: standardize lock order to `cfs → name_map` everywhere.
@@ -2451,20 +2499,33 @@ impl DbImpl {
         // cap was silently bypassed for any arrow-batch-heavy workload.
         //
         // Per-row charge mirrors the per-row WriteBatch shape: key +
-        // value + 8 (seq) + 1 (op) + 48 (overhead). For the Arrow path
-        // we sum the BinaryArray buffer lengths once instead of
-        // iterating per-row (zero-copy: the BinaryArray's underlying
-        // values buffer is already a contiguous byte slice).
-        let key_bytes = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::BinaryArray>()
-            .map_or(0u64, |a| a.value_data().len() as u64);
-        let value_bytes = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::BinaryArray>()
-            .map_or(0u64, |a| a.value_data().len() as u64);
+        // value + 8 (seq) + 1 (op) + 48 (overhead).
+        //
+        // R59-M1: compute the actually-used byte span from
+        // `value_offsets()`, NOT `value_data().len()`. arrow-rs slices
+        // share the underlying values buffer between parent and slice;
+        // `value_data().len()` would return the FULL parent-buffer
+        // length even when the caller passes a single-row slice — the
+        // reserve would then far exceed the memtable's `memory_used`
+        // accounting (which sums per-row key.len()+value.len()+57),
+        // leaving a permanent positive drift on every sliced batch.
+        // Using `offsets[len] - offsets[0]` measures only the slice's
+        // span and matches the memtable accounting exactly.
+        fn binary_slice_bytes(col: &dyn arrow::array::Array) -> u64 {
+            use arrow::array::Array;
+            let Some(a) = col.as_any().downcast_ref::<arrow::array::BinaryArray>() else {
+                return 0;
+            };
+            let offsets = a.value_offsets();
+            if offsets.is_empty() {
+                return 0;
+            }
+            let lo = offsets[0];
+            let hi = offsets[a.len()];
+            (hi - lo).max(0) as u64
+        }
+        let key_bytes = binary_slice_bytes(batch.column(0).as_ref());
+        let value_bytes = binary_slice_bytes(batch.column(1).as_ref());
         let total_charge = key_bytes
             .saturating_add(value_bytes)
             .saturating_add((count as u64).saturating_mul(57));
@@ -4407,6 +4468,22 @@ impl DbImpl {
         // the same oldest imm and write it twice.
         let _flush_guard = cf_data.lock_flush();
 
+        // R59-H1: a flush enqueued before `drop_cf` would otherwise land
+        // AFTER drop_cf's VersionEdit removed the CF's files — the
+        // `apply` here would install a fresh SST stamped with the
+        // dropped CF's id, defeating R58-H2's cleanup. The flush guard
+        // above serializes us against other flushes; the dropped-flag
+        // check now also gates us against drop_cf having raced. We pop
+        // the imm without writing (its bytes were already refunded to
+        // the WBM by drop_cf at line 1011-1012) and refresh the
+        // controller so back-pressure doesn't stall.
+        if cf_data.is_dropped() {
+            cf_data.pop_oldest_imm();
+            self.write_controller
+                .set_imm_count(cf_data.imm_count() as u32);
+            return Ok(None);
+        }
+
         // Peek at the oldest imm without popping; if it's empty, return early.
         let imm_list = cf_data.imm_memtables();
         let Some(oldest) = imm_list.first().cloned() else {
@@ -4433,6 +4510,19 @@ impl DbImpl {
             self.fs.clone(),
         );
         let meta = job.run()?;
+
+        // R59-H1 (post-job-run check): drop_cf may have raced while
+        // `job.run()` was streaming bytes to disk. If the CF is now
+        // dropped, do NOT install the fresh SST — that would re-introduce
+        // an orphan with the dropped CF's id. Unlink the just-written
+        // file (it has no readers and is not in any Version) and bail.
+        if cf_data.is_dropped() {
+            let _ = self.fs.delete_file(&path);
+            cf_data.pop_oldest_imm();
+            self.write_controller
+                .set_imm_count(cf_data.imm_count() as u32);
+            return Ok(None);
+        }
 
         // Install the new file into L0 atomically. Note: we install BEFORE
         // popping the memtable so a concurrent reader can never transiently
