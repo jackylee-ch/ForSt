@@ -868,11 +868,41 @@ impl DbImpl {
         // above; this also ensures the cache holds readers opened
         // through the engine's FileSystem (cf. CachedFileSystem
         // bookkeeping).
+        //
+        // R42-H3: the version edit at Phase 2 already landed
+        // successfully — failures here would leave dest files
+        // orphaned and the sst_readers cache half-populated with no
+        // rollback path (calling `cleanup_ingested` now would unlink
+        // SSTs the manifest already references). Treat reader-open
+        // failures as recoverable: log a WARN and let the regular
+        // read path retry via `get_or_open_sst_reader` on first
+        // access. This is safe because that helper opens lazily and
+        // caches on success.
         let mut readers_map = self.sst_readers.write().expect("lock poisoned");
         for (file_number, dest, _meta) in &new_files {
-            let rac = self.fs.open_random_access_file(dest)?;
-            let reader = Arc::new(SstReaderImpl::open(rac)?);
-            readers_map.insert(*file_number, reader);
+            match self.fs.open_random_access_file(dest) {
+                Ok(rac) => match SstReaderImpl::open(rac) {
+                    Ok(reader) => {
+                        readers_map.insert(*file_number, Arc::new(reader));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "ingest_external_sst: reader open failed for {} ({}); \
+                             skipping cache pre-populate, first read will retry: {e}",
+                            file_number.value(),
+                            dest.display(),
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "ingest_external_sst: RAC open failed for {} ({}); \
+                         skipping cache pre-populate, first read will retry: {e}",
+                        file_number.value(),
+                        dest.display(),
+                    );
+                }
+            }
         }
         drop(readers_map);
 
@@ -2519,43 +2549,73 @@ impl DbImpl {
         }
 
         // Hardlink (or copy) every SST file into the target directory.
-        for src in sst_files {
-            let src_path = PathBuf::from(src);
-            let basename = src_path
-                .file_name()
-                .ok_or_else(|| ForstError::invalid_argument(format!("bad SST path: {src}")))?;
-            let dst = target.join(basename);
-            if dst == src_path {
-                continue;
-            }
-            if fs.file_exists(&dst)? {
-                // R31-M4: dst already exists — only accept it if it is the
-                // same on-disk file as src (hardlink to the same inode, on
-                // unix) or, on non-unix where we can't compare inodes, the
-                // sizes match. Otherwise hard-fail: silently keeping the
-                // stale contents would let an attacker (or a previous failed
-                // restore) seed `target_dir` with rogue data that the engine
-                // would then open as authoritative.
-                if !same_file_or_size(&src_path, &dst)? {
-                    return Err(ForstError::invalid_argument(format!(
-                        "open_from_incremental: dst SST '{}' already exists \
-                         and does not match src '{}' (inode/size mismatch)",
-                        dst.display(),
-                        src_path.display(),
-                    )));
+        //
+        // R42-H4: a mid-stream failure (e.g. cross-FS copy ENOSPC,
+        // permission flip on the Nth file) would otherwise leave the
+        // first N-1 dsts in `target` — a subsequent retry could then
+        // mis-accept stale dsts via `same_file_or_size` (size matches
+        // but content differs across two `forst-checkpoint-restore`
+        // calls), or, on unix, fail with a confusing inode-mismatch
+        // error against the new src. Track materialized dsts and
+        // best-effort unlink them in reverse order on error so retries
+        // start from a clean slate.
+        let mut materialized: Vec<PathBuf> = Vec::new();
+        let result = (|| -> ForstResult<()> {
+            for src in sst_files {
+                let src_path = PathBuf::from(src);
+                let basename = src_path
+                    .file_name()
+                    .ok_or_else(|| ForstError::invalid_argument(format!("bad SST path: {src}")))?;
+                let dst = target.join(basename);
+                if dst == src_path {
+                    continue;
                 }
-                // Identical file already present — nothing to do.
-                continue;
+                if fs.file_exists(&dst)? {
+                    // R31-M4: dst already exists — only accept it if it is the
+                    // same on-disk file as src (hardlink to the same inode, on
+                    // unix) or, on non-unix where we can't compare inodes, the
+                    // sizes match. Otherwise hard-fail: silently keeping the
+                    // stale contents would let an attacker (or a previous failed
+                    // restore) seed `target_dir` with rogue data that the engine
+                    // would then open as authoritative.
+                    if !same_file_or_size(&src_path, &dst)? {
+                        return Err(ForstError::invalid_argument(format!(
+                            "open_from_incremental: dst SST '{}' already exists \
+                             and does not match src '{}' (inode/size mismatch)",
+                            dst.display(),
+                            src_path.display(),
+                        )));
+                    }
+                    // Identical file already present — nothing to do.
+                    // Do NOT add to `materialized`: we didn't create it,
+                    // and unwinding would clobber a legitimate pre-existing
+                    // file the caller (or a prior successful run) owns.
+                    continue;
+                }
+                // Try hardlink first (cheap, no copy); fall back to copy
+                // if hardlink fails (cross-device, FS doesn't support, etc.)
+                #[cfg(unix)]
+                let linked = std::fs::hard_link(&src_path, &dst).is_ok();
+                #[cfg(not(unix))]
+                let linked = false;
+                if !linked {
+                    crate::checkpoint::copy_file(fs.as_ref(), &src_path, &dst)?;
+                }
+                // Mark dst as ours-to-unlink on failure.
+                materialized.push(dst);
             }
-            // Try hardlink first (cheap, no copy); fall back to copy
-            // if hardlink fails (cross-device, FS doesn't support, etc.)
-            #[cfg(unix)]
-            let linked = std::fs::hard_link(&src_path, &dst).is_ok();
-            #[cfg(not(unix))]
-            let linked = false;
-            if !linked {
-                crate::checkpoint::copy_file(fs.as_ref(), &src_path, &dst)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            // Best-effort unwind: errors from delete_file are swallowed —
+            // the surfaced error is the original failure that triggered
+            // cleanup, and a cleanup failure would only obscure it. Use
+            // reverse order for symmetry with the create order (so any
+            // dependent state is torn down in LIFO).
+            for path in materialized.iter().rev() {
+                let _ = fs.delete_file(path);
             }
+            return Err(e);
         }
 
         // Now open the engine from the materialized checkpoint dir.
@@ -3161,43 +3221,62 @@ impl DbImpl {
         let cf = self.create_column_family(ColumnFamilyDescriptor::new(name))?;
 
         // ---- Replay entries ----
-        let mut cursor = header_end;
-        while cursor < blob.len() {
-            // key
-            if cursor + 4 > blob.len() {
-                return Err(ForstError::corruption(
-                    "create_cf_from_import: truncated key length",
-                ));
-            }
-            let key_len =
-                u32::from_le_bytes(blob[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
-            cursor += 4;
-            if cursor + key_len > blob.len() {
-                return Err(ForstError::corruption(
-                    "create_cf_from_import: truncated key payload",
-                ));
-            }
-            let key = &blob[cursor..cursor + key_len];
-            cursor += key_len;
+        // R42-H1: any failure in the replay loop (truncated blob, put error)
+        // would otherwise leave the CF registered in `cfs`/`cf_name_to_id`
+        // with partial data — a caller retry would then hit
+        // "column family already exists" with no way to recover. Run the
+        // replay inside an inner closure; on error, best-effort drop the
+        // freshly-created CF before propagating so the name is freed.
+        let result = (|| -> ForstResult<()> {
+            let mut cursor = header_end;
+            while cursor < blob.len() {
+                // key
+                if cursor + 4 > blob.len() {
+                    return Err(ForstError::corruption(
+                        "create_cf_from_import: truncated key length",
+                    ));
+                }
+                let key_len = u32::from_le_bytes(
+                    blob[cursor..cursor + 4].try_into().expect("4 bytes"),
+                ) as usize;
+                cursor += 4;
+                if cursor + key_len > blob.len() {
+                    return Err(ForstError::corruption(
+                        "create_cf_from_import: truncated key payload",
+                    ));
+                }
+                let key = &blob[cursor..cursor + key_len];
+                cursor += key_len;
 
-            // value
-            if cursor + 4 > blob.len() {
-                return Err(ForstError::corruption(
-                    "create_cf_from_import: truncated value length",
-                ));
-            }
-            let value_len =
-                u32::from_le_bytes(blob[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
-            cursor += 4;
-            if cursor + value_len > blob.len() {
-                return Err(ForstError::corruption(
-                    "create_cf_from_import: truncated value payload",
-                ));
-            }
-            let value = &blob[cursor..cursor + value_len];
-            cursor += value_len;
+                // value
+                if cursor + 4 > blob.len() {
+                    return Err(ForstError::corruption(
+                        "create_cf_from_import: truncated value length",
+                    ));
+                }
+                let value_len = u32::from_le_bytes(
+                    blob[cursor..cursor + 4].try_into().expect("4 bytes"),
+                ) as usize;
+                cursor += 4;
+                if cursor + value_len > blob.len() {
+                    return Err(ForstError::corruption(
+                        "create_cf_from_import: truncated value payload",
+                    ));
+                }
+                let value = &blob[cursor..cursor + value_len];
+                cursor += value_len;
 
-            self.put(&cf, key, value)?;
+                self.put(&cf, key, value)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            // Best-effort: free the CF name so the caller can retry.
+            // Errors from drop_cf are intentionally swallowed — the
+            // surfaced error is the original failure that triggered
+            // cleanup, and a cleanup failure would only obscure it.
+            let _ = self.drop_cf(&cf);
+            return Err(e);
         }
 
         Ok(cf)
