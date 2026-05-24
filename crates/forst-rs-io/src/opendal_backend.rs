@@ -287,6 +287,33 @@ impl OpendalFileSystem {
             .bucket(bucket)
             .region(region);
         if let Some(ep) = endpoint {
+            // R44-L1: warn when the operator points at a non-localhost
+            // endpoint over plaintext HTTP. S3 credentials traversing such
+            // a link are observable on the wire; production deployments
+            // should use HTTPS. We do NOT refuse the configuration —
+            // tests and dev MinIO setups still need cleartext — but we
+            // make the risk visible in logs.
+            if ep.starts_with("http://") {
+                let host_part = ep.trim_start_matches("http://");
+                // Trim any path component before checking the host.
+                let host_only = host_part.split('/').next().unwrap_or(host_part);
+                // Trim any port component.
+                let host_no_port = host_only.split(':').next().unwrap_or(host_only);
+                let is_loopback = host_no_port == "localhost"
+                    || host_no_port == "127.0.0.1"
+                    || host_no_port == "::1"
+                    || host_no_port == "[::1]";
+                if !is_loopback {
+                    tracing::warn!(
+                        target: "forst_rs_io::opendal_backend",
+                        endpoint = %ep,
+                        bucket = %bucket,
+                        "S3 endpoint uses plaintext http:// to a non-loopback host — \
+                         credentials and object data will traverse the network unencrypted. \
+                         Use https:// for production deployments."
+                    );
+                }
+            }
             builder = builder.endpoint(ep);
         }
         if let Some(ak) = access_key_id {

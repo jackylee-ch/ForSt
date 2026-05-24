@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use forst_rs_common::{FileNumber, ForstResult, SequenceNumber, MAX_LEVELS};
+use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber, MAX_LEVELS};
 
 /// Metadata for a single SST file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,11 +81,49 @@ impl Version {
     /// Apply a VersionEdit to produce a new Version.
     ///
     /// This creates a new Version by:
-    /// 1. Cloning the current level structure
-    /// 2. Removing deleted files
-    /// 3. Adding new files
-    /// 4. Sorting files within each level by smallest_key
+    /// 1. Validating that every `deleted_files` entry is still present at the
+    ///    declared level (R44-L2 / R44-H1 defense-in-depth). When two
+    ///    compactions race past the `compaction_mutex` (e.g. a future
+    ///    refactor removes it, or a test harness bypasses it), the second
+    ///    compaction's edit will reference SST file numbers that the first
+    ///    already deleted. Returning `ForstError::Busy` here lets the caller
+    ///    discard its staged output SST and retry, instead of installing two
+    ///    L1 files with overlapping ranges.
+    /// 2. Cloning the current level structure
+    /// 3. Removing deleted files
+    /// 4. Adding new files
+    /// 5. Sorting files within each level by smallest_key
     pub fn apply_edit(&self, edit: &VersionEdit) -> ForstResult<Version> {
+        // Stale-edit validation (R44-L2). Every file the edit deletes must
+        // still be present at the declared level in `self`. If even one is
+        // missing, another writer raced ahead and the inputs we read are no
+        // longer the current Version — fail with retry-able `Busy`.
+        for &(level, file_number) in &edit.deleted_files {
+            let level_idx = level as usize;
+            if level_idx >= self.levels.len() {
+                return Err(ForstError::busy(format!(
+                    "Version::apply_edit: stale edit references out-of-range level {} \
+                     (max {}); another writer must have rewritten the version",
+                    level,
+                    self.levels.len()
+                )));
+            }
+            let still_present = self.levels[level_idx]
+                .files
+                .iter()
+                .any(|f| f.file_number == file_number);
+            if !still_present {
+                return Err(ForstError::busy(format!(
+                    "Version::apply_edit: stale edit deletes file {} at level {} \
+                     but it is no longer present in the current version — \
+                     another writer's edit already applied; caller should \
+                     discard staged output and retry",
+                    file_number.value(),
+                    level
+                )));
+            }
+        }
+
         let mut new_levels = self.levels.clone();
 
         // Remove deleted files
@@ -587,6 +625,93 @@ mod tests {
         assert_eq!(vs.next_file_number(), 10);
         assert_eq!(vs.last_sequence(), 500);
         assert_eq!(vs.current().levels[0].files.len(), 1);
+    }
+
+    /// R44-L2 / R44-H1 defense-in-depth: an edit whose deleted_files set
+    /// references a file that is no longer present must be rejected with
+    /// retry-able `Busy`. The caller can then discard its staged SST and
+    /// re-pick inputs from the now-current Version.
+    #[test]
+    fn test_apply_edit_rejects_stale_delete() {
+        let v = Version::new();
+        let edit1 = VersionEdit {
+            new_files: vec![(0, make_file(1, b"a", b"c")), (0, make_file(2, b"d", b"f"))],
+            ..Default::default()
+        };
+        let v2 = v.apply_edit(&edit1).unwrap();
+        // Apply a compaction-style edit that deletes file 1.
+        let edit2 = VersionEdit {
+            deleted_files: vec![(0, FileNumber(1))],
+            new_files: vec![(1, make_file(3, b"a", b"c"))],
+            ..Default::default()
+        };
+        let v3 = v2.apply_edit(&edit2).unwrap();
+        // File 1 is now gone from v3. A second compaction whose inputs were
+        // also picked off v2 (i.e. stale relative to v3) will try to delete
+        // file 1 again — that MUST fail with Busy.
+        let edit3_stale = VersionEdit {
+            deleted_files: vec![(0, FileNumber(1))],
+            new_files: vec![(1, make_file(4, b"a", b"c"))],
+            ..Default::default()
+        };
+        let err = v3.apply_edit(&edit3_stale).unwrap_err();
+        assert!(err.is_busy(), "expected Busy, got {:?}", err);
+    }
+
+    /// R44-L2: out-of-range level in deleted_files is also a stale-edit
+    /// failure (Busy), not silent success. Pre-fix the loop body would
+    /// just skip the delete via the `level_idx < new_levels.len()` guard,
+    /// leaving the new_files installed without the corresponding delete —
+    /// silent stale-input corruption.
+    #[test]
+    fn test_apply_edit_rejects_out_of_range_level() {
+        let v = Version::new();
+        let edit = VersionEdit {
+            deleted_files: vec![(MAX_LEVELS as u32 + 5, FileNumber(99))],
+            ..Default::default()
+        };
+        let err = v.apply_edit(&edit).unwrap_err();
+        assert!(err.is_busy(), "expected Busy, got {:?}", err);
+    }
+
+    /// R44-L2 via VersionSetImpl::apply: the validation surfaces through
+    /// the public apply entrypoint so the engine-side compaction caller
+    /// observes the retry-able error and can discard its staged SST.
+    #[test]
+    fn test_version_set_apply_rejects_stale_compaction_edit() {
+        let vs = VersionSetImpl::new();
+        // Seed v1 with two L0 files.
+        let edit1 = VersionEdit {
+            new_files: vec![(0, make_file(1, b"a", b"c")), (0, make_file(2, b"d", b"f"))],
+            ..Default::default()
+        };
+        vs.apply(&edit1).unwrap();
+        // Compaction A reads v1, builds edit_a deleting file 1 + adding L1 file 3.
+        let edit_a = VersionEdit {
+            deleted_files: vec![(0, FileNumber(1))],
+            new_files: vec![(1, make_file(3, b"a", b"c"))],
+            ..Default::default()
+        };
+        // Compaction B also reads v1, builds edit_b deleting file 1 + adding L1 file 4.
+        let edit_b = VersionEdit {
+            deleted_files: vec![(0, FileNumber(1))],
+            new_files: vec![(1, make_file(4, b"a", b"c"))],
+            ..Default::default()
+        };
+        // A wins.
+        vs.apply(&edit_a).unwrap();
+        // B's apply must now fail with Busy — file 1 is no longer at L0.
+        let err = vs.apply(&edit_b).unwrap_err();
+        assert!(err.is_busy(), "expected Busy, got {:?}", err);
+        // And the version state reflects ONLY A's edit (file 4 must not have
+        // been inserted by B).
+        let v = vs.current();
+        let l1_nums: Vec<u64> = v.levels[1]
+            .files
+            .iter()
+            .map(|f| f.file_number.value())
+            .collect();
+        assert_eq!(l1_nums, vec![3]);
     }
 
     /// Regression test for Sweep R6 H (Reviewer 1): two concurrent
