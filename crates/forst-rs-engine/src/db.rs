@@ -3602,7 +3602,7 @@ impl DbImpl {
         // from disk. Under apply_lock, compaction's apply is blocked while
         // we pin; once our pin is in place, can_delete() returns false and
         // delete_file_guarded defers the unlink to `pending_deletions`.
-        let (version_snapshot, _pin) =
+        let (mut version_snapshot, _pin) =
             self.version_set
                 .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
                     let live = snap.version.live_sst_files();
@@ -3611,7 +3611,25 @@ impl DbImpl {
                     let pin = self.deletion_guard.pin_batch(&file_numbers);
                     (snap.clone(), pin)
                 });
+        // R79-H1: stamp CF descriptors onto the snapshot so the blob persists
+        // the full CF set — mirrors the R49-H2 fix already in place in
+        // `create_checkpoint`. Without this, restore via `open_from_incremental`
+        // walks an EMPTY `snapshot.cf_descriptors` and re-creates ONLY the
+        // default CF; every non-default CF's SST files become unreachable AND
+        // `next_cf_id` stays at 1, so a fresh `create_column_family` collides
+        // with an existing cf_id=1 on disk.
+        version_snapshot.cf_descriptors = self.collect_cf_descriptors()?;
         let blob = serialize_snapshot(&version_snapshot)?;
+
+        // R79-H1: build a cf_id → name lookup so per-file `cf_name` reflects
+        // the actual owner CF, not the hardcoded DEFAULT_CF_NAME. Required by
+        // sticky downstream consumers (state-handle planners that route by
+        // cf_name).
+        let cf_id_to_name: std::collections::HashMap<ColumnFamilyId, String> = version_snapshot
+            .cf_descriptors
+            .iter()
+            .map(|d| (d.cf_id, d.name.clone()))
+            .collect();
 
         let base_dir = self.incremental_checkpoint_dir(base_checkpoint_id);
         let base_live: std::collections::HashSet<FileNumber> = if base_checkpoint_id != 0
@@ -3634,12 +3652,22 @@ impl DbImpl {
         let mut shared_ssts: Vec<LiveFileInfo> = Vec::new();
         for (level_idx, level_meta) in version_snapshot.version.levels.iter().enumerate() {
             for file in &level_meta.files {
+                // R79-H1: derive cf_name from the per-file `cf_id` stamped on
+                // the SST meta (R49-H1). Fall back to DEFAULT_CF_NAME only when
+                // the lookup is empty (i.e. the file's cf_id is not in the
+                // current descriptor set — should not happen post-R79-H1's
+                // stamp above, but keep the fallback to avoid panicking on
+                // legacy SSTs whose cf_id was never recorded).
+                let cf_name = cf_id_to_name
+                    .get(&file.cf_id)
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_CF_NAME.to_string());
                 let info = LiveFileInfo {
                     path: sst_file_path(&self.db_path, file.file_number),
                     size: file.file_size,
                     sequence: file.max_sequence.value(),
                     level: level_idx as u8,
-                    cf_name: DEFAULT_CF_NAME.to_string(),
+                    cf_name,
                 };
                 if base_live.contains(&file.file_number) {
                     shared_ssts.push(info);
