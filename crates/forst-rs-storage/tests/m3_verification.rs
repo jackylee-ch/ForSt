@@ -245,8 +245,12 @@ fn test_m3_merge_operator_list_append() {
         .unwrap();
     assert_eq!(result, vec![0x00, 0x01, 0xFF, 0x02, 0xFF, 0x03]);
 
-    // Name verification
-    assert_eq!(op.name(), "ListAppendMergeOperator");
+    // Name verification. R47-H3: name() now encodes the delimiter
+    // (comma = 0x2C = 44) so two operators with different delimiters
+    // produce distinct identities.
+    assert_eq!(op.name(), "ListAppendMergeOperator(delim=44)");
+    assert_eq!(pipe_op.name(), "ListAppendMergeOperator(delim=124)");
+    assert_ne!(op.name(), pipe_op.name());
 }
 
 // ---------------------------------------------------------------------------

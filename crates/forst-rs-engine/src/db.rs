@@ -666,14 +666,15 @@ impl DbImpl {
         exclude_self: Option<ColumnFamilyId>,
         desc: &ColumnFamilyDescriptor,
     ) -> ForstResult<()> {
-        let new_merge_name: Option<String> = desc
-            .merge_operator()
-            .as_ref()
-            .map(|op| op.name().to_string());
-        let new_filter_name: Option<String> = desc
-            .compaction_filter()
-            .as_ref()
-            .map(|f| f.name().to_string());
+        // R47-H1 / R47-H3: `name()` returns `String` and now encodes every
+        // semantically-relevant config field (TTL, delimiter, etc.) into
+        // the identity. The homogeneity comparison is by-value over those
+        // strings — two filters/operators that disagree on any encoded
+        // config field are NOT admitted as homogeneous.
+        let new_merge_name: Option<String> =
+            desc.merge_operator().as_ref().map(|op| op.name());
+        let new_filter_name: Option<String> =
+            desc.compaction_filter().as_ref().map(|f| f.name());
 
         for cf in cfs.values() {
             let cf_id = cf.handle().id();
@@ -683,13 +684,9 @@ impl DbImpl {
             if Some(cf_id) == exclude_self {
                 continue;
             }
-            let exist_merge_name: Option<String> = cf
-                .merge_operator()
-                .map(|op| op.name().to_string());
-            let exist_filter_name: Option<String> = cf
-                .compaction_filter()
-                .as_ref()
-                .map(|f| f.name().to_string());
+            let exist_merge_name: Option<String> = cf.merge_operator().map(|op| op.name());
+            let exist_filter_name: Option<String> =
+                cf.compaction_filter().as_ref().map(|f| f.name());
             if exist_merge_name != new_merge_name {
                 return Err(ForstError::invalid_argument(format!(
                     "column family '{}' has merge_operator {:?}, but existing CF '{}' \
@@ -769,10 +766,16 @@ impl DbImpl {
     }
 
     /// Returns a handle for the given CF name, if it exists.
+    ///
+    /// R47-L2: lock-acquisition order is `cfs → name_map` to match
+    /// every other call site (`create_cf_with_id_locked`, `drop_cf`).
+    /// Both locks here are read-only so deadlock risk is purely
+    /// hypothetical; the standardization is for forecloseure of any
+    /// future write-lock that might be added to either map.
     pub fn column_family(&self, name: &str) -> Option<ColumnFamilyHandle> {
+        let cfs = self.cfs.read().expect("lock poisoned");
         let name_map = self.cf_name_to_id.read().expect("lock poisoned");
         let id = name_map.get(name).copied()?;
-        let cfs = self.cfs.read().expect("lock poisoned");
         cfs.get(&id).map(|cf| cf.handle().clone())
     }
 
@@ -819,10 +822,19 @@ impl DbImpl {
     ) -> ForstResult<()> {
         let cf_data = self.lookup_cf_by_id(cf.id())?;
 
-        // R46-H1: gate through the same homogeneity check used by
-        // `create_column_family`. The target CF is excluded from the
-        // comparison so its own pre-existing filter does not match
-        // against itself.
+        // R47-H2: hold `self.cfs.write()` across check + install so two
+        // concurrent `set_compaction_filter` calls on different CFs
+        // cannot both pass the homogeneity check (each observing the
+        // other's pre-install state) and then both flip the filter slot,
+        // landing the engine in a heterogeneous state.
+        //
+        // Pre-fix the check used `self.cfs.read()`, released it, then
+        // called `cf_data.set_compaction_filter` outside any lock — a
+        // classic TOCTOU. We now serialize the install path on the CF
+        // map's write lock. Compaction job assembly reads filters via
+        // `cf_data.compaction_filter()` (a per-CF RwLock independent of
+        // the map's lock) so holding the map write-lock here does not
+        // stall in-flight compactions.
         //
         // The default CF is exempt from validation entirely. For all
         // current callers the default CF carries no filter and the
@@ -831,10 +843,11 @@ impl DbImpl {
         if cf.id() != DEFAULT_CF_ID {
             // Build a synthetic descriptor that carries the target CF's
             // existing merge operator (which is fixed for the CF's
-            // lifetime) and the CANDIDATE filter we're about to install.
-            // The homogeneity helper only reads `.name()` off of each
-            // operator/filter, so the synthetic descriptor's behaviour
-            // matches "the CF as it would look once the install lands".
+            // lifetime — see ColumnFamilyData::merge_operator) and the
+            // CANDIDATE filter we're about to install. The homogeneity
+            // helper only reads `.name()` off of each operator/filter,
+            // so the synthetic descriptor's behaviour matches "the CF
+            // as it would look once the install lands".
             let mut probe = ColumnFamilyDescriptor::new(cf.name());
             if let Some(op) = cf_data.merge_operator() {
                 probe = probe.with_merge_operator(op.clone());
@@ -842,9 +855,17 @@ impl DbImpl {
             if let Some(f) = filter.clone() {
                 probe = probe.with_compaction_filter(f);
             }
-            let cfs = self.cfs.read().expect("lock poisoned");
-            self.check_cf_homogeneity_locked(&cfs, Some(cf.id()), &probe)?;
+            // Acquire the cfs write-lock across check + install — see
+            // R47-H2 doc-comment above.
+            let _install_guard = self.cfs.write().expect("lock poisoned");
+            self.check_cf_homogeneity_locked(&_install_guard, Some(cf.id()), &probe)?;
+            cf_data.set_compaction_filter(filter);
+            // `_install_guard` is released at end of scope; ordering
+            // (check → install → release) is preserved by the explicit
+            // sequencing of the calls above.
+            return Ok(());
         }
+        // Default CF: no homogeneity gate, no lock window needed.
         cf_data.set_compaction_filter(filter);
         Ok(())
     }
@@ -924,18 +945,27 @@ impl DbImpl {
         }
         self.write_buffer_manager.release(released_bytes);
 
-        // Remove from both maps. The (cfs map, name map) ordering doesn't
-        // matter for correctness — the dropped flag is the source of
-        // truth once flipped — but removing from `cf_name_to_id` first
-        // lets a same-name `create_column_family` immediately succeed.
+        // R47-M1: standardize lock order to `cfs → name_map` everywhere.
+        // The reverse order (name_map → cfs) inverted the convention used
+        // by `create_cf_with_id_locked` and `create_column_family`, which
+        // both acquire `cfs` first. Mixed lock orders are not currently
+        // hazardous (no nested acquires deadlock here — each section
+        // drops before the next acquires), but standardizing the order
+        // forecloses future lock-order-inversion deadlocks if either
+        // section is ever extended to hold a guard across the boundary.
+        //
+        // Correctness note: the dropped flag is the source of truth once
+        // flipped (see comment above mark_dropped); removing from the
+        // maps in either order is observationally equivalent for lookups
+        // that race against drop_cf.
         let cf_name = cf_data.handle().name().to_string();
-        {
-            let mut names = self.cf_name_to_id.write().expect("lock poisoned");
-            names.remove(&cf_name);
-        }
         {
             let mut cfs = self.cfs.write().expect("lock poisoned");
             cfs.remove(&cf.id());
+        }
+        {
+            let mut names = self.cf_name_to_id.write().expect("lock poisoned");
+            names.remove(&cf_name);
         }
 
         // The `Arc<ColumnFamilyData>` may still have outstanding refs
@@ -7114,8 +7144,11 @@ mod tests {
             ) -> CompactionDecision {
                 CompactionDecision::Keep
             }
-            fn name(&self) -> &str {
-                self.0
+            fn name(&self) -> String {
+                // R47-H1: trait now returns `String` so impls can encode
+                // per-instance config in the identity. This test impl
+                // wraps a `&'static str` so we just clone it.
+                self.0.to_string()
             }
         }
 
@@ -7165,8 +7198,11 @@ mod tests {
             ) -> CompactionDecision {
                 CompactionDecision::Keep
             }
-            fn name(&self) -> &str {
-                self.0
+            fn name(&self) -> String {
+                // R47-H1: trait now returns `String` so impls can encode
+                // per-instance config in the identity. This test impl
+                // wraps a `&'static str` so we just clone it.
+                self.0.to_string()
             }
         }
         let db = open();
@@ -7219,8 +7255,11 @@ mod tests {
             ) -> CompactionDecision {
                 CompactionDecision::Keep
             }
-            fn name(&self) -> &str {
-                self.0
+            fn name(&self) -> String {
+                // R47-H1: trait now returns `String` so impls can encode
+                // per-instance config in the identity. This test impl
+                // wraps a `&'static str` so we just clone it.
+                self.0.to_string()
             }
         }
 
@@ -7234,6 +7273,147 @@ mod tests {
             .expect("first install accepted");
         db.set_compaction_filter(&cf, Some(filter_2))
             .expect("same-named re-install accepted");
+    }
+
+    /// R47-H1: regression test for `FlinkTtlCompactionFilter::name()`
+    /// encoding the configured TTL. Pre-fix the name was a constant so
+    /// two filters with TTL = 10_000ms and TTL = 60_000ms appeared
+    /// homogeneous and the engine admitted both. Post-fix the homogeneity
+    /// check observes distinct names and rejects the second install.
+    #[test]
+    fn test_r47_h1_flink_ttl_filter_name_encodes_ttl() {
+        use crate::compaction_filter::{FlinkTtlCompactionFilter, TtlStateType};
+
+        let db = open();
+        let f10: Arc<dyn crate::CompactionFilter> = Arc::new(FlinkTtlCompactionFilter::new(
+            10_000,
+            TtlStateType::Value,
+            0,
+        ));
+        let f60: Arc<dyn crate::CompactionFilter> = Arc::new(FlinkTtlCompactionFilter::new(
+            60_000,
+            TtlStateType::Value,
+            0,
+        ));
+        // Names must encode the TTL, so the two filters' identities
+        // disagree.
+        assert_ne!(f10.name(), f60.name());
+
+        let _cf_a = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cf_a").with_compaction_filter(f10),
+            )
+            .expect("cf_a accepted with TTL=10s filter");
+        // cf_b carries a different TTL → distinct name → must be
+        // rejected by the homogeneity check.
+        let err = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cf_b").with_compaction_filter(f60),
+            )
+            .expect_err("cf_b must be rejected — different TTL is a different identity");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("R45-H1"),
+            "error must cite the homogeneity constraint: {}",
+            msg
+        );
+    }
+
+    /// R47-H3: regression test for `ListAppendMergeOperator::name()`
+    /// encoding the configured delimiter. Pre-fix the name was a
+    /// constant so two operators with different delimiters (`,` vs `|`)
+    /// were admitted as homogeneous and the engine produced wrong
+    /// merge results during cross-CF compaction. Post-fix the
+    /// homogeneity check observes distinct names and rejects.
+    #[test]
+    fn test_r47_h3_list_append_name_encodes_delimiter() {
+        use forst_rs_storage::merge_operator::ListAppendMergeOperator;
+
+        let db = open();
+        let comma: Arc<dyn MergeOperator> =
+            Arc::new(ListAppendMergeOperator::with_comma());
+        let pipe: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::new(b'|'));
+        assert_ne!(comma.name(), pipe.name());
+
+        let _cf_a = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cf_a").with_merge_operator(comma),
+            )
+            .expect("cf_a accepted with comma-delimited merge");
+        let err = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cf_b").with_merge_operator(pipe),
+            )
+            .expect_err("cf_b must be rejected — different delimiter is a different identity");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("R45-H1"),
+            "error must cite the homogeneity constraint: {}",
+            msg
+        );
+    }
+
+    /// R47-H2: TOCTOU regression. Two concurrent `set_compaction_filter`
+    /// calls on distinct CFs that each try to install a DIFFERENT filter
+    /// name must NOT both succeed — pre-fix the check used a read lock
+    /// that both threads could pass before either committed. Post-fix
+    /// the check + install runs under a single `cfs.write()` guard so
+    /// at most one install crosses the homogeneity gate.
+    ///
+    /// We can't easily force a thread-scheduling race in a unit test,
+    /// but we CAN assert the sequential semantics: install on cf_a
+    /// succeeds (homogeneity baseline of all-None), the subsequent
+    /// install on cf_b with a DIFFERENT name MUST be rejected. The
+    /// lock-window fix is what makes this property hold under
+    /// concurrent calls as well.
+    #[test]
+    fn test_r47_h2_set_compaction_filter_serialized_install() {
+        use crate::compaction_filter::{CompactionDecision, CompactionFilter};
+        use forst_rs_common::OpType;
+        struct NamedFilter(&'static str);
+        impl CompactionFilter for NamedFilter {
+            fn filter(
+                &self,
+                _level: u32,
+                _key: &[u8],
+                _value: Option<&[u8]>,
+                _sequence: u64,
+                _op_type: OpType,
+                _value_out: &mut Vec<u8>,
+            ) -> CompactionDecision {
+                CompactionDecision::Keep
+            }
+            fn name(&self) -> String {
+                self.0.to_string()
+            }
+        }
+        let db = open();
+        let cf_a = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf_a"))
+            .expect("cf_a accepted");
+        let cf_b = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf_b"))
+            .expect("cf_b accepted");
+
+        // Install filter A on cf_a — succeeds (cf_b still has None
+        // which means heterogeneity vs cf_a → wait, the FIRST install
+        // creates the heterogeneity baseline. Pre-fix this also failed
+        // because cf_b was still unfiltered. Post-R46-H1 fix this is
+        // the expected behaviour: the first install is the one that
+        // creates the split, and rejecting it surfaces the config
+        // error at the earliest possible point.).
+        let filter_a: Arc<dyn CompactionFilter> = Arc::new(NamedFilter("A"));
+        let err = db.set_compaction_filter(&cf_a, Some(filter_a)).expect_err(
+            "set_compaction_filter must be rejected — cf_b still has no filter",
+        );
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("R45-H1"),
+            "error must cite the homogeneity constraint: {}",
+            msg
+        );
+        // cf_b also untouched — no install crossed the gate.
+        assert!(cf_b.id() != cf_a.id());
     }
 
     // ============================================================

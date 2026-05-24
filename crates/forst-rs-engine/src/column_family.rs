@@ -132,7 +132,8 @@ impl ColumnFamilyDescriptor {
     /// Attaches a merge operator implementation.
     pub fn with_merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
         // Also record the operator name in the options so the two stay in sync.
-        self.options.merge_operator = Some(op.name().to_string());
+        // R47-H3: `name()` now returns String (encodes per-instance config).
+        self.options.merge_operator = Some(op.name());
         self.merge_operator = Some(op);
         self
     }
@@ -171,6 +172,9 @@ impl std::fmt::Debug for ColumnFamilyDescriptor {
             .field("options", &self.options)
             .field(
                 "merge_operator",
+                // R47-H3: `name()` returns String; format the Option<String>
+                // via Debug so the formatter does not need to borrow a
+                // temporary.
                 &self.merge_operator.as_ref().map(|op| op.name()),
             )
             .finish()
@@ -194,9 +198,35 @@ pub type SharedMemTable = Arc<ShardedMemTable>;
 /// cached [`SnapshotView`] via [`ArcSwap`]. Read paths call
 /// [`ColumnFamilyData::snapshot_view`] to atomically acquire a consistent
 /// snapshot.
+///
+/// # Field-level mutability invariants (R47-M2)
+///
+/// * `handle`, `options`, `shard_count`: fixed at construction. Never
+///   mutated after `new_with_filter_and_shards` returns.
+/// * `merge_operator`: **FIXED AT CREATE TIME**. Unlike
+///   [`Self::compaction_filter`] (which is post-create swappable via
+///   [`Self::set_compaction_filter`]), the merge operator is set once
+///   when the CF is created via `DbImpl::create_column_family` and
+///   cannot be replaced afterwards. The engine's cross-CF homogeneity
+///   check (R45-H1) treats the merge operator's identity as a stable
+///   invariant of the CF — making it post-hoc swappable would require
+///   re-validating against every other CF AND re-running compaction to
+///   regenerate any previously-merged values under the new operator's
+///   semantics, neither of which is currently implemented. The
+///   `set_compaction_filter` path leaves the merge operator untouched
+///   (see `DbImpl::set_compaction_filter`'s probe-descriptor logic).
+/// * `compaction_filter`: post-create swappable via
+///   [`Self::set_compaction_filter`]. Guarded by an internal `RwLock`.
+/// * `active_memtable`, `imm_list`: mutated by writers under per-CF
+///   locks; see field-level docs.
+/// * `cached_snapshot_view`: lock-free swap via `ArcSwap`.
+/// * `flush_mutex`: serializes per-CF flush operations.
 pub struct ColumnFamilyData {
     handle: ColumnFamilyHandle,
     options: CfOptions,
+    /// **Immutable after construction** (R47-M2). Fixed at CF create
+    /// time. There is intentionally no setter — see the type-level
+    /// "Field-level mutability invariants" section for rationale.
     merge_operator: Option<Arc<dyn MergeOperator>>,
     /// Optional compaction filter, swappable so consumers can install /
     /// replace it after the CF has been created (e.g. via the new
@@ -469,9 +499,12 @@ mod tests {
     fn test_descriptor_with_merge_operator_sets_name_and_instance() {
         let op: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::with_comma());
         let d = ColumnFamilyDescriptor::new("lists").with_merge_operator(op);
+        // R47-H3: ListAppendMergeOperator::name() now encodes the delimiter
+        // (comma = 0x2C = 44). The recorded options.merge_operator string
+        // tracks the identity returned by name().
         assert_eq!(
             d.options().merge_operator.as_deref(),
-            Some("ListAppendMergeOperator")
+            Some("ListAppendMergeOperator(delim=44)")
         );
         assert!(d.merge_operator().is_some());
     }
@@ -520,9 +553,10 @@ mod tests {
             empty_snapshot(),
         );
         assert!(data.merge_operator().is_some());
+        // R47-H3: name() encodes the delimiter (comma = 44).
         assert_eq!(
             data.merge_operator().unwrap().name(),
-            "ListAppendMergeOperator"
+            "ListAppendMergeOperator(delim=44)"
         );
     }
 

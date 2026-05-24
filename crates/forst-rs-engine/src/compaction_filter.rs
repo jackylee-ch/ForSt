@@ -71,8 +71,23 @@ pub trait CompactionFilter: Send + Sync {
         value_out: &mut Vec<u8>,
     ) -> CompactionDecision;
 
-    /// Human-readable name for logging / validation.
-    fn name(&self) -> &str;
+    /// Human-readable identity for the filter — used by the engine's
+    /// cross-CF homogeneity check (see `DbImpl::check_cf_homogeneity_locked`).
+    ///
+    /// # Identity contract (R47-H1)
+    ///
+    /// The returned string MUST encode every semantically-relevant
+    /// configuration field. Two filters that disagree on any field that
+    /// changes their `filter()` decision MUST return distinct names —
+    /// otherwise the homogeneity check will admit them as "the same
+    /// filter" across CFs and silently produce wrong results during
+    /// cross-CF L0 compaction. For example, `FlinkTtlCompactionFilter`
+    /// encodes `ttl_ms`, `state_type`, and `timestamp_offset` into its
+    /// name; two filters that differ only in `ttl_ms` are NOT homogeneous.
+    ///
+    /// `String` (rather than `&str`) lets implementations format
+    /// per-instance config without leaking a static buffer.
+    fn name(&self) -> String;
 }
 
 /// TTL filter: drops entries whose encoded timestamp is older than the
@@ -143,8 +158,10 @@ impl CompactionFilter for TtlCompactionFilter {
         }
     }
 
-    fn name(&self) -> &str {
-        "TtlCompactionFilter"
+    fn name(&self) -> String {
+        // TTL is the only semantically-relevant field — `now_fn` is a
+        // test/clock hook that does not affect compaction decisions.
+        format!("TtlCompactionFilter(ttl_seconds={})", self.ttl_seconds)
     }
 }
 
@@ -345,8 +362,19 @@ impl CompactionFilter for FlinkTtlCompactionFilter {
         }
     }
 
-    fn name(&self) -> &str {
-        "FlinkTtlCompactionFilter"
+    fn name(&self) -> String {
+        // R47-H1: encode every semantically-relevant config into the
+        // identity. The homogeneity check at the engine compares filters
+        // by-value via this string, so two FlinkTtlCompactionFilters
+        // that differ in `ttl_ms`, `state_type`, or `timestamp_offset`
+        // are distinct identities and must not be admitted as
+        // "homogeneous" across CFs.
+        format!(
+            "FlinkTtlCompactionFilter(ttl_ms={},state_type={},timestamp_offset={})",
+            self.ttl_ms,
+            self.state_type.ordinal(),
+            self.timestamp_offset,
+        )
     }
 }
 
@@ -379,8 +407,12 @@ mod tests {
 
     #[test]
     fn test_ttl_filter_name() {
+        // R47-H1: name encodes ttl_seconds so two filters with different
+        // TTLs are NOT admitted as homogeneous.
         let f = TtlCompactionFilter::new(60);
-        assert_eq!(f.name(), "TtlCompactionFilter");
+        assert_eq!(f.name(), "TtlCompactionFilter(ttl_seconds=60)");
+        let g = TtlCompactionFilter::new(120);
+        assert_ne!(f.name(), g.name());
     }
 
     #[test]
@@ -526,7 +558,19 @@ mod tests {
             f.filter(0, b"k", Some(&v), 1, OpType::Put, &mut out),
             CompactionDecision::Discard
         );
-        assert_eq!(f.name(), "FlinkTtlCompactionFilter");
+        // R47-H1: name encodes ttl_ms / state_type / timestamp_offset.
+        assert_eq!(
+            f.name(),
+            "FlinkTtlCompactionFilter(ttl_ms=1000,state_type=1,timestamp_offset=0)"
+        );
+        // Two filters that differ in ttl_ms only must produce distinct names.
+        let g = FlinkTtlCompactionFilter::with_supplier(
+            500,
+            TtlStateType::Value,
+            0,
+            fixed_supplier(1100),
+        );
+        assert_ne!(f.name(), g.name());
     }
 
     /// `Value` state: entry whose age is below TTL is kept verbatim.

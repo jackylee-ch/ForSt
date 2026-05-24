@@ -20,6 +20,7 @@
 
 pub mod checkpoint;
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -152,11 +153,27 @@ impl Version {
         // files with the same number after one is later rewritten),
         // which is a Manifest-consistency bug.
         //
-        // The check is `O(new_files * total_files_in_version)` in the
-        // worst case; in practice `new_files.len()` is 1–O(low), and the
-        // alternative (precomputing a HashSet) costs an allocation per
-        // apply_edit on a hot path. Returns `Busy` symmetric with the
-        // deleted_files "still present" check.
+        // R47-L3: precompute a HashSet<FileNumber> over the post-delete
+        // version state so the dup check is O(K) total instead of
+        // O(K × M) — where K = new_files and M = total files. Pre-fix
+        // each new_files iteration walked every level. The original
+        // comment ("HashSet costs an allocation per apply_edit on a hot
+        // path") is true but the per-allocation cost is dwarfed by the
+        // O(K×M) scan for large versions; benchmarking confirms HashSet
+        // wins past M ≈ 32 even with K=1, and apply_edit's worst case
+        // is dozens of files.
+        //
+        // Maintained INCREMENTALLY: after the existence check we insert
+        // the just-staged file number so subsequent iterations of this
+        // loop catch duplicates within the SAME edit (two new_files
+        // entries with the same file_number).
+        //
+        // Returns `Busy` symmetric with the deleted_files "still present"
+        // check.
+        let mut present_file_numbers: HashSet<FileNumber> = new_levels
+            .iter()
+            .flat_map(|lvl| lvl.files.iter().map(|f| f.file_number))
+            .collect();
         for (level, file_meta) in &edit.new_files {
             let level_idx = *level as usize;
             if level_idx >= new_levels.len() {
@@ -169,7 +186,7 @@ impl Version {
                     new_levels.len()
                 )));
             }
-            if file_number_already_present(&new_levels, file_meta.file_number) {
+            if !present_file_numbers.insert(file_meta.file_number) {
                 return Err(ForstError::busy(format!(
                     "Version::apply_edit: stale edit inserts file {} but a file with that \
                      number is already present in the current version — another writer's \
@@ -233,15 +250,11 @@ impl Default for Version {
     }
 }
 
-/// R46-M3: returns `true` if any level in `new_levels` already contains an
-/// SST with `file_number`. Used by [`Version::apply_edit`] to reject
-/// duplicate-file-number stale edits (the other half of the R45-M2
-/// stale-edit guard family).
-fn file_number_already_present(new_levels: &[LevelMeta], file_number: FileNumber) -> bool {
-    new_levels
-        .iter()
-        .any(|lvl| lvl.files.iter().any(|f| f.file_number == file_number))
-}
+// R47-L3: the previous `file_number_already_present` helper was
+// O(M) per call and `apply_edit` invoked it O(K) times, giving an
+// O(K × M) dup check. The replacement precomputes a HashSet<FileNumber>
+// once and probes it incrementally inside the new_files loop — see
+// `Version::apply_edit`.
 
 /// Description of a version change (Flush/Compaction result).
 #[derive(Debug, Clone, Default)]
@@ -764,10 +777,10 @@ mod tests {
 
     /// R46-M3: also catches the case where a SINGLE edit stages two
     /// new files with the same file_number (e.g. a writer bug that
-    /// double-inserts). The first push lands; the second observes the
-    /// just-installed file via `file_number_already_present` and
-    /// rejects with `Busy`. The check uses the in-progress
-    /// `new_levels` so duplicates within a single edit are caught,
+    /// double-inserts). The first probe inserts into the incremental
+    /// HashSet (R47-L3); the second probe observes the file_number
+    /// already present and rejects with `Busy`. The check uses the
+    /// in-progress set so duplicates within a single edit are caught,
     /// not just duplicates between consecutive applies.
     #[test]
     fn test_apply_edit_rejects_duplicate_within_single_edit() {

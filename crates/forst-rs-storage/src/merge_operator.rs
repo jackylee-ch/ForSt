@@ -57,9 +57,9 @@ pub trait MergeOperator: Send + Sync {
     /// operands as separate entries.
     fn partial_merge(&self, key: &[u8], left: &[u8], right: &[u8]) -> ForstResult<Vec<u8>>;
 
-    /// Returns the name of this merge operator (used for validation).
+    /// Returns the identity of this merge operator (used for validation).
     ///
-    /// # Identity contract (R46-L2)
+    /// # Identity contract (R46-L2, R47-H3)
     ///
     /// The returned string is the merge operator's IDENTITY — the
     /// engine's cross-CF homogeneity check (R45-H1 in
@@ -74,15 +74,12 @@ pub trait MergeOperator: Send + Sync {
     ///   produce wrong results during cross-CF L0 compaction.
     /// * Two impls with different semantics (e.g. ListAppend with `,`
     ///   vs ListAppend with `|`) MUST return distinct `name()` values.
-    ///   The built-in [`ListAppendMergeOperator`] currently violates
-    ///   the second half of this contract (delimiter is not encoded
-    ///   in the name); callers wanting per-delimiter isolation must
-    ///   wrap it in a newtype that overrides `name()`.
+    ///   R47-H3 closed this gap on the built-in [`ListAppendMergeOperator`]
+    ///   by formatting the delimiter into the returned name.
     ///
-    /// A future hardening pass may switch identity to a `TypeId`-based
-    /// scheme so the contract is enforced by the compiler rather than
-    /// by convention; until then, treat `name()` as load-bearing.
-    fn name(&self) -> &str;
+    /// `String` (rather than `&str`) lets implementations format
+    /// per-instance config without leaking a static buffer.
+    fn name(&self) -> String;
 }
 
 /// A merge operator that concatenates values with a configurable delimiter.
@@ -147,8 +144,12 @@ impl MergeOperator for ListAppendMergeOperator {
         Ok(result)
     }
 
-    fn name(&self) -> &str {
-        "ListAppendMergeOperator"
+    fn name(&self) -> String {
+        // R47-H3: encode the delimiter so two list-append operators with
+        // different delimiters are NOT admitted as homogeneous across
+        // CFs. The numeric form keeps the identity stable for non-ASCII
+        // delimiters (the delimiter is a raw `u8`).
+        format!("ListAppendMergeOperator(delim={})", self.delimiter)
     }
 }
 
@@ -160,14 +161,19 @@ mod tests {
 
     #[test]
     fn test_list_append_name() {
+        // R47-H3: name encodes the delimiter so two operators with
+        // different delimiters are distinct identities.
         let op = ListAppendMergeOperator::with_comma();
-        assert_eq!(op.name(), "ListAppendMergeOperator");
+        // comma = 0x2C = 44
+        assert_eq!(op.name(), "ListAppendMergeOperator(delim=44)");
+        let pipe = ListAppendMergeOperator::new(b'|');
+        assert_ne!(op.name(), pipe.name());
     }
 
     #[test]
     fn test_list_append_trait_object() {
         let op: Box<dyn MergeOperator> = Box::new(ListAppendMergeOperator::with_comma());
-        assert_eq!(op.name(), "ListAppendMergeOperator");
+        assert_eq!(op.name(), "ListAppendMergeOperator(delim=44)");
     }
 
     // --- full_merge tests ---

@@ -342,8 +342,23 @@ impl OpendalFileSystem {
             // make the risk visible in logs.
             if ep.starts_with("http://") {
                 let host_part = ep.trim_start_matches("http://");
-                // Trim any path component before parsing host.
-                let authority = host_part.split('/').next().unwrap_or(host_part);
+                // R47-L1: strip every authority-trailing component before
+                // parsing the host. URLs may carry a path (`/foo`), query
+                // (`?bar=1`), and/or fragment (`#frag`); a naïve split on
+                // `/` alone leaves `?...`/`#...` attached to the host and
+                // breaks the loopback comparison (e.g. `localhost?x=1`
+                // would NOT match `localhost`). Order: `/` → `?` → `#`
+                // (RFC 3986 section 3 — path > query > fragment).
+                let authority = host_part
+                    .split('/')
+                    .next()
+                    .unwrap_or(host_part)
+                    .split('?')
+                    .next()
+                    .unwrap_or(host_part)
+                    .split('#')
+                    .next()
+                    .unwrap_or(host_part);
                 // R45-M1: properly extract host from an authority that may
                 // include an IPv6 literal (`[::1]:9000`) or a regular
                 // `host:port`. Naïvely splitting on `:` would butcher the
