@@ -1095,23 +1095,46 @@ impl DbImpl {
             let file_number = self.version_set.allocate_file_number();
             let dest = sst_file_path(&self.db_path, file_number);
 
-            // Try hardlink first (fastest, zero-copy on same FS); fall
-            // back to a byte copy on cross-FS / unsupported FS.
-            if let Err(_link_err) = std::fs::hard_link(src, &dest) {
-                std::fs::copy(src, &dest).map_err(|e| {
-                    // Best-effort cleanup of any already-linked dest
-                    // files so a failed ingest doesn't leak SSTs into
-                    // the engine's directory.
+            // R52-H1: try hardlink first (fastest, zero-copy on same
+            // FS) — but only when both source and destination route to
+            // the engine's local leg. In tiered mode, `src` is on the
+            // caller's local FS while `dest` (a `.sst` file) routes to
+            // the remote leg via `self.fs`. `std::fs::hard_link` /
+            // `std::fs::copy` would either fail (cross-fs) or worse
+            // succeed against the local mount and leave the remote leg
+            // missing the SST entirely. Fall back to a route-aware copy
+            // that reads `src` via the local FS and writes `dest` via
+            // `self.fs` so every byte lands on the correct leg.
+            //
+            // The hardlink fast-path remains for the local-only / dev
+            // configuration where `self.fs` IS a local FS — the kernel
+            // call still pays off on a same-FS ingest (no copy at all).
+            // If hardlink fails for any reason we fall back to the
+            // route-aware copy regardless of cause (cross-fs EXDEV,
+            // EPERM, unsupported backend, …) — the slow path is correct
+            // for every configuration.
+            let mut linked = false;
+            if std::fs::hard_link(src, &dest).is_ok() {
+                // Validate the destination is actually visible through
+                // `self.fs` (it would not be on a tiered backend with a
+                // separate remote leg). If not, undo the link and fall
+                // through to the route-aware copy.
+                match self.fs.file_exists(&dest) {
+                    Ok(true) => linked = true,
+                    _ => {
+                        let _ = std::fs::remove_file(&dest);
+                    }
+                }
+            }
+            if !linked {
+                if let Err(e) = self.copy_external_sst(src, &dest) {
                     self.cleanup_ingested(&new_files);
-                    ForstError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ingest_external_sst: hardlink+copy '{}' -> '{}' failed: {e}",
-                            src.display(),
-                            dest.display()
-                        ),
-                    ))
-                })?;
+                    return Err(ForstError::Io(std::io::Error::other(format!(
+                        "ingest_external_sst: copy '{}' -> '{}' failed: {e}",
+                        src.display(),
+                        dest.display()
+                    ))));
+                }
             }
 
             // Open the dest file and read the footer to extract the
@@ -1295,6 +1318,57 @@ impl DbImpl {
         for (_, dest, _) in new_files {
             let _ = self.fs.delete_file(dest);
         }
+    }
+
+    /// R52-H1: route-aware copy of an externally-supplied SST into the
+    /// engine's SST directory. Used by [`Self::ingest_external_sst`] when
+    /// `std::fs::hard_link` is unavailable (cross-fs, unsupported backend,
+    /// or the engine is running in tiered mode where `src` lives on the
+    /// caller's local FS but `dest` routes to the remote leg via
+    /// `self.fs`). Reading `src` via [`LocalFileSystem`] keeps the
+    /// contract that "src is a local path" while writing `dest` via the
+    /// engine's `FileSystem` puts every byte on the correct leg.
+    ///
+    /// Buffered in 1 MiB chunks; never materialises the full file in
+    /// memory regardless of SST size.
+    fn copy_external_sst(&self, src: &Path, dest: &Path) -> ForstResult<()> {
+        // Source is always a caller-supplied local path; open via
+        // `LocalFileSystem` directly (NOT `self.fs`, which may route
+        // `.sst` writes to a remote backend that does not host the
+        // caller's source file).
+        let local_fs = LocalFileSystem::new();
+        let rac = local_fs.open_random_access_file(src)?;
+        let file_size = rac.file_size()?;
+
+        let mut wf = self
+            .fs
+            .open_writable_file(dest, WriteMode::CreateNew)
+            .map_err(|e| {
+                ForstError::Io(std::io::Error::other(format!(
+                    "copy_external_sst: create dest {}: {e}",
+                    dest.display()
+                )))
+            })?;
+
+        const CHUNK: usize = 1 << 20; // 1 MiB
+        let mut buf = vec![0u8; CHUNK];
+        let mut off: u64 = 0;
+        while off < file_size {
+            let want = ((file_size - off) as usize).min(CHUNK);
+            let n = rac.read_at(off, &mut buf[..want])?;
+            if n == 0 {
+                return Err(ForstError::corruption(format!(
+                    "copy_external_sst: short read at off={} of {} from {}",
+                    off,
+                    file_size,
+                    src.display()
+                )));
+            }
+            wf.append(&buf[..n])?;
+            off += n as u64;
+        }
+        wf.sync()?;
+        Ok(())
     }
 
     /// R50-M2: rewrite the on-disk footer of an ingested SST so its
@@ -2890,6 +2964,26 @@ impl DbImpl {
                             // the active naming space either.
                             tmp_orphans.push(entry.path.clone());
                         }
+                        continue;
+                    }
+                    // R52-L1: match the `cf-rewrite` tmp artifact
+                    // `<num>.sst.cf-rewrite.tmp` produced by
+                    // [`Self::rewrite_sst_footer`]. The rewrite path
+                    // writes the new footer into this tmp file, then
+                    // atomically renames it over the bare `<num>.sst`.
+                    // A crash between create and rename leaves the tmp
+                    // in place; without the orphan-scan picking it up,
+                    // a future restart's `list_dir` would still see it
+                    // and a fresh rewrite of the same SST would collide
+                    // on `CreateNew`. We treat it identically to the
+                    // `.<num>.sst.tmp` flush/compaction tmp shape.
+                    if let Some(stem) = name.strip_suffix(".sst.cf-rewrite.tmp") {
+                        if let Ok(num) = stem.parse::<u64>() {
+                            if num > max_observed {
+                                max_observed = num;
+                            }
+                        }
+                        tmp_orphans.push(entry.path.clone());
                         continue;
                     }
                     // R39-H2: match the checkpoint-blob tmp artifact

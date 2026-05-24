@@ -166,11 +166,32 @@ impl FileSystemRouter {
 
     /// Returns `true` if the file at `path` should be stored remotely.
     ///
-    /// Currently, only `.sst` files are considered remote. This matches
-    /// the RocksDB/ForSt convention where SST files are the bulk of
-    /// data and are candidates for offloading to object storage.
+    /// Recognises both the final `<N>.sst` form and every mid-write /
+    /// post-mortem tmp variant we ship today:
+    ///
+    /// * `<N>.sst`                       — final SST (extension `.sst`)
+    /// * `.<N>.sst.tmp`                  — flush + compaction tmp
+    ///   (`flush::sst_temp_path`)
+    /// * `<N>.sst.cf-rewrite.tmp`        — `rewrite_sst_footer` tmp
+    /// * `<N>.sst.orphan-<ts>`           — restore-rename of an orphan
+    /// * `.<N>.sst.tmp.orphan-<ts>`      — restore-rename of a tmp orphan
+    ///
+    /// Implementation: a path routes remote iff its final extension is
+    /// `.sst` OR `.sst` appears as a non-final extension (i.e. the path
+    /// string contains `.sst.`). This is the **R52-H2/H3** fix — without
+    /// it, `Router::rename` rejects the `<tmp>.tmp → <final>.sst`
+    /// rename as a cross-fs move in tiered mode because the source
+    /// extension is `.tmp` (→ local) while the destination is `.sst`
+    /// (→ remote), even though both files belong on the remote FS.
     fn is_remote_file(path: &Path) -> bool {
-        path.extension().is_some_and(|ext| ext == "sst")
+        if path.extension().is_some_and(|ext| ext == "sst") {
+            return true;
+        }
+        // Tmp / orphan shapes carry `.sst.` as a non-terminal component.
+        // Use raw string match so we catch every suffix the writer side
+        // may invent (`.tmp`, `.cf-rewrite.tmp`, `.orphan-<ts>`, …)
+        // without enumerating each one here.
+        path.to_string_lossy().contains(".sst.")
     }
 
     /// Returns the filesystem that should handle operations for `path`.
@@ -249,14 +270,65 @@ impl FileSystem for FileSystemRouter {
         if let Some((fs, stripped)) = self.match_scheme(dir) {
             return fs.list_dir(&stripped);
         }
-        // Directory listing is always handled by the local filesystem,
-        // because directories (WAL dir, db dir, etc.) live locally.
+        // R52-M2: directories live on the local FS (WAL dir, db dir,
+        // checkpoint dir, …) so we always list the local leg. In TIERED
+        // mode, SST writes (and their tmp / orphan variants) land on the
+        // REMOTE leg per `is_remote_file`, and the engine's
+        // `open_from_checkpoint` orphan-scan calls `fs.list_dir(&db_path)`
+        // to find stranded files left behind by a crashed flush /
+        // compaction / rewrite. Without merging the remote leg in, the
+        // orphan-scan never sees remote-resident orphans and the next
+        // restore's `next_file_number` is computed off the local leg only
+        // — a brand-new flush can then collide with an existing remote
+        // SST number.
         //
-        // NOTE: In tiered mode, SST files on the remote filesystem will NOT
-        // appear in this listing. The engine discovers remote SSTs via the
-        // MANIFEST / VersionSet, not via directory listing. Callers that need
-        // to enumerate remote SSTs should query the VersionSet directly.
-        self.local_fs.list_dir(dir)
+        // We merge both listings, dedup by path (exact match), and prefer
+        // the remote-side `FileMetadata` when both backends report the
+        // same entry (in normal operation the same path only appears on
+        // one leg, but the dedup keeps the union well-defined for the
+        // shared-Arc and the dev-mode single-FS configurations).
+        //
+        // A remote-leg `list_dir` failure is best-effort: object-store
+        // backends sometimes return `NotFound` for an empty / yet-to-be-
+        // created prefix. We log and continue with just the local leg
+        // rather than failing the open.
+        let local_entries = self.local_fs.list_dir(dir)?;
+        let Some(remote) = self.remote_fs.as_ref() else {
+            return Ok(local_entries);
+        };
+        // Shared-Arc case: avoid double-listing the same backend.
+        if Arc::ptr_eq(&self.local_fs, remote) {
+            return Ok(local_entries);
+        }
+        let remote_entries = match remote.list_dir(dir) {
+            Ok(v) => v,
+            Err(e) => {
+                // Object stores routinely surface "directory does not
+                // exist" as an error; treat as empty rather than fatal.
+                tracing::debug!(
+                    "Router::list_dir remote leg {} failed: {} \
+                     (continuing with local-only listing)",
+                    dir.display(),
+                    e
+                );
+                return Ok(local_entries);
+            }
+        };
+        let mut merged: Vec<FileMetadata> =
+            Vec::with_capacity(local_entries.len() + remote_entries.len());
+        let mut seen: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::with_capacity(local_entries.len() + remote_entries.len());
+        for e in local_entries {
+            if seen.insert(e.path.clone()) {
+                merged.push(e);
+            }
+        }
+        for e in remote_entries {
+            if seen.insert(e.path.clone()) {
+                merged.push(e);
+            }
+        }
+        Ok(merged)
     }
 
     fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
@@ -352,8 +424,18 @@ impl FileSystem for FileSystemRouter {
         // local first, since that's where the directory entries the
         // engine actually relies on for crash recovery live.
         self.local_fs.sync_dir(dir)?;
+        // R52-M1: only fan out to the remote leg when it is a DIFFERENT
+        // Arc from the local leg. When the engine is configured with a
+        // single shared backend (e.g. a single `LocalFileSystem` for both
+        // local and remote slots in dev / single-tier mode), the second
+        // `sync_dir` would fsync the exact same path again — wasted
+        // syscall and, more importantly, doubles the error surface
+        // (a transient EIO on the second call masquerades as a
+        // remote-leg failure when the directory is local).
         if let Some(remote) = self.remote_fs.as_ref() {
-            remote.sync_dir(dir)?;
+            if !Arc::ptr_eq(&self.local_fs, remote) {
+                remote.sync_dir(dir)?;
+            }
         }
         Ok(())
     }
@@ -468,6 +550,55 @@ mod tests {
             "/data/000042.sst"
         )));
         assert!(FileSystemRouter::is_remote_file(Path::new("table.sst")));
+    }
+
+    // R52-H2/H3: every tmp / orphan variant routes remote in tiered mode.
+    #[test]
+    fn test_is_remote_file_sst_tmp_variants() {
+        // .<N>.sst.tmp — flush + compaction tmp (sst_temp_path)
+        assert!(FileSystemRouter::is_remote_file(Path::new(
+            "/db/.000042.sst.tmp"
+        )));
+        // <N>.sst.cf-rewrite.tmp — rewrite_sst_footer tmp
+        assert!(FileSystemRouter::is_remote_file(Path::new(
+            "/db/000042.sst.cf-rewrite.tmp"
+        )));
+        // <N>.sst.orphan-<ts> — restore-rename of a stranded SST
+        assert!(FileSystemRouter::is_remote_file(Path::new(
+            "/db/000042.sst.orphan-1234567890"
+        )));
+        // .<N>.sst.tmp.orphan-<ts> — restore-rename of a stranded tmp
+        assert!(FileSystemRouter::is_remote_file(Path::new(
+            "/db/.000042.sst.tmp.orphan-1234567890"
+        )));
+    }
+
+    // R52-H2/H3: rename a tmp file (`.<N>.sst.tmp`) → final (`<N>.sst`)
+    // must succeed in tiered mode because both forms route remote.
+    #[test]
+    fn test_tiered_rename_sst_tmp_to_final_succeeds() {
+        let (_local, remote, router) = create_tiered_router();
+        remote.create_dir_all(Path::new("/db")).unwrap();
+
+        // Write the tmp file via the router — must land on remote.
+        let mut w = router
+            .open_writable_file(Path::new("/db/.000001.sst.tmp"), WriteMode::CreateNew)
+            .unwrap();
+        w.append(b"sst-bytes").unwrap();
+        drop(w);
+        assert!(remote.file_exists(Path::new("/db/.000001.sst.tmp")).unwrap());
+
+        // Rename tmp → final (the path the flush job actually drives).
+        router
+            .rename(
+                Path::new("/db/.000001.sst.tmp"),
+                Path::new("/db/000001.sst"),
+            )
+            .unwrap();
+        assert!(!remote
+            .file_exists(Path::new("/db/.000001.sst.tmp"))
+            .unwrap());
+        assert!(remote.file_exists(Path::new("/db/000001.sst")).unwrap());
     }
 
     #[test]
@@ -823,6 +954,42 @@ mod tests {
             entries[0].path.file_name().unwrap().to_string_lossy(),
             "000001.log"
         );
+    }
+
+    // R52-M2: tiered `list_dir` must union local + remote so the engine's
+    // open_from_checkpoint orphan-scan sees stranded SSTs on the remote leg.
+    #[test]
+    fn test_tiered_list_dir_unions_local_and_remote() {
+        let (local, remote, router) = create_tiered_router();
+        local.create_dir_all(Path::new("/db")).unwrap();
+        remote.create_dir_all(Path::new("/db")).unwrap();
+
+        // WAL on local.
+        let mut w = local
+            .open_writable_file(Path::new("/db/000001.log"), WriteMode::CreateNew)
+            .unwrap();
+        w.append(b"wal").unwrap();
+        drop(w);
+        // SST + tmp on remote.
+        let mut w = remote
+            .open_writable_file(Path::new("/db/000001.sst"), WriteMode::CreateNew)
+            .unwrap();
+        w.append(b"sst").unwrap();
+        drop(w);
+        let mut w = remote
+            .open_writable_file(Path::new("/db/.000002.sst.tmp"), WriteMode::CreateNew)
+            .unwrap();
+        w.append(b"tmp").unwrap();
+        drop(w);
+
+        let entries = router.list_dir(Path::new("/db")).unwrap();
+        let names: std::collections::HashSet<String> = entries
+            .iter()
+            .map(|e| e.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains("000001.log"), "got {:?}", names);
+        assert!(names.contains("000001.sst"), "got {:?}", names);
+        assert!(names.contains(".000002.sst.tmp"), "got {:?}", names);
     }
 
     #[test]
