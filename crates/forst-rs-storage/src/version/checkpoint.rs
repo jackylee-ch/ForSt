@@ -90,7 +90,12 @@ const MAX_CFS_PER_CHECKPOINT: u32 = 4096;
 /// R49-H2: defense-in-depth cap on per-string length when decoding CF
 /// descriptors (name, merge_op_name, filter_name). 64 KiB is hilariously
 /// above any sane registered name.
-const MAX_CF_STRING_LEN: u32 = 64 * 1024;
+///
+/// R50-L3: exposed so the engine's `collect_cf_descriptors` can refuse
+/// to serialize a name/merge_op/filter string that would later be
+/// rejected by `deserialize_snapshot` — surfacing the contract violation
+/// at the writer side, not at the next restore attempt.
+pub const MAX_CF_STRING_LEN: u32 = 64 * 1024;
 
 /// Defense-in-depth cap on `num_files` per level decoded from a checkpoint
 /// blob. Prevents OOM-DoS from a crafted blob claiming `num_files = u32::MAX`

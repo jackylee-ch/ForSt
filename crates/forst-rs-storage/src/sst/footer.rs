@@ -274,11 +274,26 @@ impl FooterV1 {
         let format_version = u16::from_le_bytes([data[74], data[75]]);
 
         // R49-H1: read cf_id for v2+; v1 footers use DEFAULT_CF_ID.
-        // The discriminator is min_key_offset: v1 writers emitted 76, v2
-        // writers emit 80. The format_version alone is unreliable because
-        // a malicious or corrupted blob could claim v2 with v1-sized
-        // fixed-field area — using `min_key_offset` (which is bounds-
-        // validated against payload_end below) keeps the parse honest.
+        //
+        // R50-L2 clarification: the discriminator is `min_key_offset`
+        // (v1 writers emitted 76, v2 writers emit 80) rather than
+        // `format_version` even though `format_version` is itself
+        // CRC-protected by the trailing checksum check above. Two
+        // independent reasons keep this gate:
+        //
+        //   1. `format_version` was historically not bumped in lock-step
+        //      with the v2 layout addition — a v1-shaped footer that
+        //      happens to claim `format_version == 2` (test fixtures,
+        //      old in-place rewriters, future format experiments) would
+        //      otherwise read 4 bytes of payload as cf_id.
+        //   2. `min_key_offset` doubles as our structural bounds check
+        //      (`min_key_end <= payload_end` below); if we already
+        //      believe it, gating cf_id on the same field keeps the
+        //      decoder honest by construction.
+        //
+        // Once a future format bump retires v1 support entirely, this
+        // discriminator can collapse to a single
+        // `format_version >= 2` check.
         let cf_id = if (min_key_offset as usize) >= FOOTER_FIXED_FIELDS_SIZE_V2
             && data.len() >= FOOTER_FIXED_FIELDS_SIZE_V2 + FOOTER_TAIL_SIZE
         {

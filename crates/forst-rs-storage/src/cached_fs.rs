@@ -55,7 +55,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use forst_rs_common::error::{ForstError, ForstResult};
 use forst_rs_io::{
-    FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile, WriteMode,
+    FileMetadata, FileSystem, LocalFileSystem, RandomAccessFile, SequentialFile, WritableFile,
+    WriteMode,
 };
 
 use crate::local_cache::LocalCache;
@@ -293,6 +294,30 @@ impl FileSystem for CachedFileSystem {
             let _ = self.cache.invalidate(key);
         }
         self.remote.rename(src, dst)
+    }
+
+    /// R50-H1: fsync both the remote-side directory entry AND the local
+    /// cache directory. The remote leg is delegated to the backing FS
+    /// (object stores no-op, a wrapped POSIX backend honours it). The
+    /// cache leg fsyncs the on-disk cache dir so any cache-file create /
+    /// rename / unlink performed by [`crate::local_cache::LocalCache`]
+    /// (e.g. miss-fetch landing a new SST blob) is durable on a
+    /// power-loss event.
+    ///
+    /// Falling back to the trait default no-op (pre-fix behaviour) made
+    /// the engine's R49-H3 `sync_dir(parent)` silently a no-op when a
+    /// `CachedFileSystem` sat in front of `LocalFileSystem` — a regression
+    /// of the rename-durability contract that motivated R49-H3.
+    ///
+    /// We instantiate a fresh [`LocalFileSystem`] for the cache-side
+    /// fsync. `LocalFileSystem` is stateless (a unit struct) so
+    /// construction is free.
+    fn sync_dir(&self, dir: &Path) -> ForstResult<()> {
+        self.remote.sync_dir(dir)?;
+        let cache_dir = self.cache.cache_dir();
+        let local = LocalFileSystem::new();
+        local.sync_dir(cache_dir)?;
+        Ok(())
     }
 
     fn name(&self) -> &str {

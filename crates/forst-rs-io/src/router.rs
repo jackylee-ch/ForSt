@@ -324,6 +324,24 @@ impl FileSystem for FileSystemRouter {
         self.route(dst).rename(src, dst)
     }
 
+    /// R50-H1: route `sync_dir` to the underlying filesystem instead of
+    /// falling to the trait's default no-op. Without this override, the
+    /// engine's R49-H3 `sync_dir(parent)` after a rename silently no-ops
+    /// even when the underlying backend is `LocalFileSystem` — the rename
+    /// would survive but its directory-entry update would not, defeating
+    /// the entire crash-safety contract.
+    ///
+    /// Routing mirrors `rename`: scheme prefix wins first, then the
+    /// extension-based local/remote split. Directories of `.sst` files
+    /// in tiered mode are on the remote backend (which itself is a no-op
+    /// for object stores) and every other path lands on `local_fs`.
+    fn sync_dir(&self, dir: &Path) -> ForstResult<()> {
+        if let Some((fs, stripped)) = self.match_scheme(dir) {
+            return fs.sync_dir(&stripped);
+        }
+        self.route(dir).sync_dir(dir)
+    }
+
     fn name(&self) -> &str {
         // We return a static string; for display purposes the user can
         // inspect local_fs().name() and remote_fs().map(|f| f.name()).

@@ -739,6 +739,48 @@ impl DbImpl {
         let options = desc.options().clone();
         let merge_op = desc.merge_operator();
         let filter = desc.compaction_filter();
+
+        // R50-H2: validate the (id, name) pair against the engine's CF
+        // invariants BEFORE inserting. Restore (`open_from_checkpoint`)
+        // drives this path with descriptors decoded from an untrusted
+        // checkpoint blob — a duplicate-id, duplicate-name, or a
+        // (DEFAULT_CF_ID, name != "default") pair must be rejected as
+        // corruption rather than silently overwriting the existing entry
+        // (the pre-fix `HashMap::insert` had this exact data-loss footgun).
+        //
+        // The default-cf rule is symmetric: id 0 is reserved for the
+        // built-in default CF whose name is fixed at [`DEFAULT_CF_NAME`].
+        // Any other name carrying id 0 is by construction either a forged
+        // blob or a writer-side bug; refusing it here keeps the
+        // (cf_id == DEFAULT_CF_ID) ⇔ (name == DEFAULT_CF_NAME)
+        // bidirectional invariant intact across the engine.
+        if id == DEFAULT_CF_ID && name != DEFAULT_CF_NAME {
+            return Err(ForstError::corruption(format!(
+                "cf_descriptor: cf_id 0 (DEFAULT_CF_ID) must have name \"{}\", got \"{}\"",
+                DEFAULT_CF_NAME, name
+            )));
+        }
+        if cfs_guard.contains_key(&id) {
+            return Err(ForstError::corruption(format!(
+                "cf_descriptor: duplicate cf_id {} (already registered)",
+                id.value()
+            )));
+        }
+        {
+            // Read-only peek under the cfs write lock — we're about to
+            // drop the cfs guard and then acquire the name-map write
+            // guard, so the peek-then-insert sequence holds against
+            // concurrent CF creates because every install path goes
+            // through this function under cfs.write().
+            let names = self.cf_name_to_id.read().expect("lock poisoned");
+            if names.contains_key(&name) {
+                return Err(ForstError::corruption(format!(
+                    "cf_descriptor: duplicate cf name \"{}\" (already registered)",
+                    name
+                )));
+            }
+        }
+
         let handle = ColumnFamilyHandle::new(id, &name);
 
         let initial_snapshot = Arc::new(SnapshotView::empty());
@@ -878,15 +920,26 @@ impl DbImpl {
     /// [`WriteBufferManager`]. Subsequent operations on the dropped CF
     /// return [`ForstError::InvalidArgument`].
     ///
-    /// SST FILES ARE NOT DELETED. forst-rs's `VersionSet` is currently
-    /// CF-agnostic — a single SST may contain rows for multiple CFs
-    /// (the engine relies on the Flink-side `CfRouter` to disambiguate
-    /// via cf-id key prefixes). Walking the version set to remove "this
-    /// CF's files" would corrupt sibling CFs. The correct reclamation
-    /// story is: drop the CF, let compaction's `should_drop` MVCC logic
-    /// retire the orphaned rows as they age out. This matches the spec
-    /// §6g acceptance criterion ("dropped CF is invisible to subsequent
-    /// reads"; physical storage reclamation is allowed to be lazy).
+    /// SST FILES ARE NOT DELETED. Post-R49-H1 each SST IS tagged with a
+    /// `cf_id` so a per-CF reclamation walk is technically possible
+    /// (filter `version.live_sst_files()` by `cf_id == dropped_cf`).
+    /// We do not do that eagerly today because:
+    ///
+    ///   * A CF's SSTs may still be pinned by an outstanding `Snapshot`
+    ///     or by an in-flight compaction's `PinHandle` — eager unlinking
+    ///     would either trip the deletion guard's assertion or have to
+    ///     re-implement the same defer-until-unpinned logic compaction
+    ///     already runs.
+    ///   * Compaction's `should_drop` MVCC logic retires the orphaned
+    ///     rows as they age out, so the disk-space penalty is bounded
+    ///     by the next compaction sweep — adequate for the spec §6g
+    ///     acceptance criterion ("dropped CF is invisible to subsequent
+    ///     reads"; physical reclamation is allowed to be lazy).
+    ///
+    /// R50-M3 follow-up: eager per-CF reclamation should be added in a
+    /// dedicated PR that wires the SST-set walk through
+    /// `delete_file_guarded` so the pin contract is honoured. Until then,
+    /// lazy reclamation via compaction's MVCC drop path stays correct.
     ///
     /// Idempotent:
     /// - Dropping an already-dropped CF returns `Ok(())` (no-op).
@@ -1078,13 +1131,35 @@ impl DbImpl {
             let reader = SstReaderImpl::open(rac).inspect_err(|_| {
                 Self::cleanup_ingested(&new_files);
             })?;
-            let footer = reader.footer().clone();
+            let mut footer = reader.footer().clone();
 
             // R49-H1: ingested SSTs are stamped with the target CF's id so
             // the engine treats them like any other per-CF file. v1 footers
             // decode with `cf_id = DEFAULT_CF_ID`; if the caller asked to
             // ingest into a non-default CF, we override the legacy default
             // (the ingest contract says the caller owns CF visibility).
+            //
+            // R50-M2: ALSO rewrite the on-disk footer's cf_id so the truth
+            // in the SST matches the truth in the manifest. Pre-fix only the
+            // in-memory `SstFileMeta.cf_id` was overridden — the footer
+            // still carried `DEFAULT_CF_ID`. R50-H3's open-time check
+            // (footer.cf_id == meta.cf_id) would then reject every read of
+            // an ingested file. Keeping the two sources of truth aligned
+            // preserves the single-source-of-truth invariant and lets the
+            // cross-check actually catch genuine corruption.
+            //
+            // Drop the temp reader BEFORE the rewrite so the file handle is
+            // closed; rewriting via tmp+rename below produces a fresh inode
+            // and breaks any hardlink with `src`.
+            drop(reader);
+            if footer.cf_id != cf.id() {
+                footer.cf_id = cf.id();
+                if let Err(e) = Self::rewrite_sst_footer(&dest, &footer, file_size) {
+                    Self::cleanup_ingested(&new_files);
+                    return Err(e);
+                }
+            }
+
             let meta = SstFileMeta {
                 file_number,
                 cf_id: cf.id(),
@@ -1098,10 +1173,6 @@ impl DbImpl {
 
             new_ids.push(file_number.value());
             new_files.push((file_number, dest, meta));
-
-            // Drop the temp reader; we'll re-open into the engine's
-            // sst_readers cache below after the version edit lands.
-            drop(reader);
         }
 
         // Phase 2: install all new SSTs at L0 in a single VersionEdit.
@@ -1203,6 +1274,162 @@ impl DbImpl {
         for (_, dest, _) in new_files {
             let _ = std::fs::remove_file(dest);
         }
+    }
+
+    /// R50-M2: rewrite the on-disk footer of an ingested SST so its
+    /// `cf_id` matches the target CF the caller is ingesting into. Used
+    /// by [`Self::ingest_external_sst`] to keep the footer truth and the
+    /// manifest truth aligned (the R50-H3 open-time check rejects drift
+    /// between the two).
+    ///
+    /// The body of the SST (everything before the footer) is preserved
+    /// byte-for-byte; only the footer is re-encoded with the new cf_id,
+    /// which also produces a fresh CRC. Because `cf_id` is a fixed 4-byte
+    /// field in the v2 layout, the new footer is exactly the same length
+    /// as the old one, so `file_size` is unchanged.
+    ///
+    /// The rewrite is performed via tmp-file + atomic rename so:
+    ///   * Any hardlink between `dest` and the caller-supplied source path
+    ///     (the ingest path hardlinks first, falls back to a copy) is
+    ///     broken — the source file is never mutated.
+    ///   * A crash mid-rewrite leaves either the original file or the
+    ///     successor in place, never a truncated file with no footer.
+    ///
+    /// `expected_file_size` is the size returned by an earlier
+    /// `RandomAccessFile::file_size()` call against `dest`; we sanity-check
+    /// that the post-rewrite size matches so a future regression that
+    /// changes the v2 layout (and therefore the footer length) surfaces
+    /// here instead of silently shifting all reader offsets.
+    fn rewrite_sst_footer(
+        dest: &Path,
+        new_footer: &forst_rs_storage::sst::FooterV1,
+        expected_file_size: u64,
+    ) -> ForstResult<()> {
+        use std::io::{Read, Write};
+        use forst_rs_storage::sst::{FOOTER_TAIL_SIZE};
+
+        // Read the trailing 8 bytes to discover the existing footer
+        // length (matches `SstReaderImpl::open`'s parse).
+        let mut src_file = std::fs::File::open(dest).map_err(|e| {
+            ForstError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "rewrite_sst_footer: open {} for read: {e}",
+                    dest.display()
+                ),
+            ))
+        })?;
+        let total_size = src_file
+            .metadata()
+            .map_err(|e| ForstError::Io(std::io::Error::other(format!("metadata: {e}"))))?
+            .len();
+        if total_size != expected_file_size {
+            return Err(ForstError::corruption(format!(
+                "rewrite_sst_footer: file size {} != expected {}",
+                total_size, expected_file_size
+            )));
+        }
+        if total_size < FOOTER_TAIL_SIZE as u64 {
+            return Err(ForstError::corruption(format!(
+                "rewrite_sst_footer: file {} too small ({} bytes)",
+                dest.display(),
+                total_size
+            )));
+        }
+
+        // Pull the entire file contents into memory. SST files are
+        // typically 64 MiB; reading the whole thing into a Vec keeps the
+        // logic simple and matches the existing ingest path's I/O shape.
+        let mut all_bytes = Vec::with_capacity(total_size as usize);
+        src_file.read_to_end(&mut all_bytes).map_err(|e| {
+            ForstError::Io(std::io::Error::other(format!(
+                "rewrite_sst_footer: read {} failed: {e}",
+                dest.display()
+            )))
+        })?;
+        drop(src_file);
+
+        // The last 8 bytes carry: footer_length(4) | magic(4). Decode
+        // footer_length to slice off the original footer.
+        let tail_off = all_bytes.len() - 8;
+        let footer_length =
+            u32::from_le_bytes(all_bytes[tail_off..tail_off + 4].try_into().map_err(|_| {
+                ForstError::corruption("rewrite_sst_footer: tail length slice")
+            })?) as usize;
+        if footer_length > all_bytes.len() {
+            return Err(ForstError::corruption(format!(
+                "rewrite_sst_footer: footer_length {} > file_size {}",
+                footer_length,
+                all_bytes.len()
+            )));
+        }
+        let body_end = all_bytes.len() - footer_length;
+        let new_footer_bytes = new_footer.encode();
+        if new_footer_bytes.len() != footer_length {
+            return Err(ForstError::corruption(format!(
+                "rewrite_sst_footer: new footer length {} != original {}",
+                new_footer_bytes.len(),
+                footer_length
+            )));
+        }
+
+        // Splice the body bytes with the new footer in a single Vec and
+        // write to a tmp sibling for atomic rename.
+        let mut out = Vec::with_capacity(all_bytes.len());
+        out.extend_from_slice(&all_bytes[..body_end]);
+        out.extend_from_slice(&new_footer_bytes);
+
+        let mut tmp = dest.as_os_str().to_owned();
+        tmp.push(".cf-rewrite.tmp");
+        let tmp_path = PathBuf::from(tmp);
+
+        // Best-effort: remove any stale tmp from a previous failed
+        // attempt before opening the new one (CreateNew would otherwise
+        // error out).
+        let _ = std::fs::remove_file(&tmp_path);
+
+        {
+            let mut tmp_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| {
+                    ForstError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "rewrite_sst_footer: create {} failed: {e}",
+                            tmp_path.display()
+                        ),
+                    ))
+                })?;
+            tmp_file.write_all(&out).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_path);
+                ForstError::Io(std::io::Error::other(format!(
+                    "rewrite_sst_footer: write {} failed: {e}",
+                    tmp_path.display()
+                )))
+            })?;
+            tmp_file.sync_all().map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_path);
+                ForstError::Io(std::io::Error::other(format!(
+                    "rewrite_sst_footer: fsync {} failed: {e}",
+                    tmp_path.display()
+                )))
+            })?;
+        }
+
+        // Atomic rename over the original. This breaks any hardlink to
+        // the caller-supplied source path because the destination inode
+        // is replaced.
+        std::fs::rename(&tmp_path, dest).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            ForstError::Io(std::io::Error::other(format!(
+                "rewrite_sst_footer: rename {} -> {} failed: {e}",
+                tmp_path.display(),
+                dest.display()
+            )))
+        })?;
+        Ok(())
     }
 
     /// Returns a reference to the engine options.
@@ -2176,32 +2403,32 @@ impl DbImpl {
             self.compact_l0_for_cf(cf_data)?;
             return Ok(true);
         }
-        // Priority 2: pick the deepest level that exceeds its size budget.
-        // pick_compaction_level is currently CF-oblivious (it scans the
-        // global level totals); compact_level_for_cf filters by cf_id and
-        // returns None if there's nothing for this CF to compact, so we
-        // additionally check that some file at the picked level belongs to
-        // us before recursing into compaction work for this CF — otherwise
-        // we'd hit the same spin pattern as the L0 priority above.
-        let Some(level) = self.pick_compaction_level() else {
+        // Priority 2: pick the deepest level that exceeds its size budget
+        // FOR THIS CF. R50-M1: pre-fix `pick_compaction_level` summed every
+        // CF's bytes per level; in the multi-CF case `compact_once(A)` could
+        // walk every level only to bail because the over-budget was driven
+        // by CF B. Filtering by cf_id at pick time fixes the scheduling
+        // waste and also removes the redundant `has_my_files_at_level`
+        // re-check below (level is now guaranteed to contain this CF's
+        // files, since they are the only files we summed).
+        let Some(level) = self.pick_compaction_level_for_cf(cf_id) else {
             return Ok(false);
         };
-        let has_my_files_at_level = version.levels[level as usize]
-            .files
-            .iter()
-            .any(|f| f.cf_id == cf_id);
-        if !has_my_files_at_level {
-            return Ok(false);
-        }
         self.compact_level_for_cf(cf_data, level)?;
         Ok(true)
     }
 
-    /// Returns the shallowest level (>= 1) whose total file size exceeds its
-    /// target, or `None` if every level is within budget.
+    /// Returns the shallowest level (>= 1) whose CF-scoped total file size
+    /// exceeds its target, or `None` if every level is within budget for
+    /// the given CF.
+    ///
+    /// R50-M1: only files matching `cf_id` are summed. Pre-fix this method
+    /// summed all CFs' bytes per level which made `compact_once` waste
+    /// scheduling cycles on levels where the over-budget came from a
+    /// different CF.
     ///
     /// Target is `max_bytes_for_level_base * multiplier^(level-1)`.
-    fn pick_compaction_level(&self) -> Option<u32> {
+    fn pick_compaction_level_for_cf(&self, cf_id: ColumnFamilyId) -> Option<u32> {
         let version = self.version_set.current();
         let base = self.options.max_bytes_for_level_base as f64;
         let mult = self.options.max_bytes_for_level_multiplier;
@@ -2209,6 +2436,7 @@ impl DbImpl {
             let total_size: u64 = version.levels[level]
                 .files
                 .iter()
+                .filter(|f| f.cf_id == cf_id)
                 .map(|f| f.file_size)
                 .sum();
             let target = (base * mult.powi(level as i32 - 1)) as u64;
@@ -2454,7 +2682,7 @@ impl DbImpl {
         // R49-H2: stamp CF descriptors onto the snapshot so the blob persists
         // the CF set. Restore re-registers every CF before returning so callers
         // do not have to track CF order or re-issue create_column_family.
-        snapshot.cf_descriptors = self.collect_cf_descriptors();
+        snapshot.cf_descriptors = self.collect_cf_descriptors()?;
         let blob = serialize_snapshot(&snapshot)?;
 
         // R49-M1: copy live SSTs FIRST, write the blob LAST. The blob is the
@@ -2710,6 +2938,23 @@ impl DbImpl {
                 ),
             }
         }
+        // R50-L1: fsync the parent directory once after BOTH rename
+        // passes complete so every orphan rename made above is durable
+        // on a power-loss event. POSIX requires the dir-entry update to
+        // be fsynced for the rename to survive a crash. Failures here
+        // are logged but do not block the open — the renames are
+        // idempotent and the next restore will retry any rename whose
+        // dir-entry update did not make it to disk.
+        if !orphans.is_empty() || !tmp_orphans.is_empty() {
+            if let Err(e) = fs.sync_dir(&db_path) {
+                tracing::warn!(
+                    "open_from_checkpoint: sync_dir({}) after orphan rename failed: {} \
+                     — renames may not be durable until next restart",
+                    db_path.display(),
+                    e
+                );
+            }
+        }
         let restored_next_file_number = snapshot
             .next_file_number
             .max(max_observed.saturating_add(1));
@@ -2775,7 +3020,19 @@ impl DbImpl {
         // need the policy hooks (e.g. read-only verification) get the
         // correct CF set with no extra work.
         for cf in &snapshot.cf_descriptors {
+            // R50-H2: a blob that maps id 0 to anything other than the
+            // built-in default CF name is corrupt — surface as Corruption
+            // rather than silently skipping (the pre-fix `continue` did
+            // exactly that, masking a manifest where DEFAULT_CF_ID had
+            // been rebound to a user CF name).
             if cf.cf_id == DEFAULT_CF_ID {
+                if cf.name != DEFAULT_CF_NAME {
+                    return Err(ForstError::corruption(format!(
+                        "checkpoint cf_descriptor: cf_id 0 (DEFAULT_CF_ID) must have \
+                         name \"{}\", got \"{}\"",
+                        DEFAULT_CF_NAME, cf.name
+                    )));
+                }
                 continue;
             }
             let desc = ColumnFamilyDescriptor::new(cf.name.clone());
@@ -4552,6 +4809,29 @@ impl DbImpl {
         let path = sst_file_path(&self.db_path, meta.file_number);
         let file = self.fs.open_random_access_file(&path)?;
         let reader = Arc::new(SstReaderImpl::open(file)?);
+
+        // R50-H3: cross-check the on-disk footer cf_id against the meta
+        // cf_id the VersionSet handed us. R49-H1 persisted cf_id in the
+        // footer for exactly this restore-time check, but the validation
+        // was never wired — drift between the two sources (e.g. the
+        // R50-M2 ingest path that rewrote meta.cf_id without touching
+        // the footer) would have stayed silent.
+        //
+        // v1 footers (pre-R49-H1) decode their cf_id as DEFAULT_CF_ID;
+        // a v1 SST living in a non-default CF's meta would still trip
+        // this check, which is correct — those SSTs cannot exist in
+        // a v2-format DB without a corrupt manifest.
+        let footer_cf_id = reader.footer().cf_id;
+        if footer_cf_id != meta.cf_id {
+            return Err(ForstError::corruption(format!(
+                "SST {}: footer cf_id ({}) does not match meta cf_id ({}); \
+                 manifest and on-disk truth diverged",
+                meta.file_number.value(),
+                footer_cf_id.value(),
+                meta.cf_id.value(),
+            )));
+        }
+
         cache.insert(meta.file_number, reader.clone());
         Ok(reader)
     }
@@ -4741,27 +5021,55 @@ impl DbImpl {
     /// R49-H2: collect a `CfDescriptor` snapshot for every currently-open
     /// CF. Sorted by cf_id so the blob's CF table has a deterministic order
     /// (helps diff-based debugging; the restore path doesn't depend on it).
-    fn collect_cf_descriptors(&self) -> Vec<forst_rs_storage::version::CfDescriptor> {
+    ///
+    /// R50-L3: rejects any CF whose `name`, `merge_operator().name()`, or
+    /// `compaction_filter().name()` exceeds
+    /// [`MAX_CF_STRING_LEN`](forst_rs_storage::version::checkpoint::MAX_CF_STRING_LEN).
+    /// The decode-side already enforces the same cap; surfacing the
+    /// violation at write time prevents a checkpoint blob that the
+    /// restore path will refuse to load.
+    fn collect_cf_descriptors(
+        &self,
+    ) -> ForstResult<Vec<forst_rs_storage::version::CfDescriptor>> {
+        use forst_rs_storage::version::checkpoint::MAX_CF_STRING_LEN;
         use forst_rs_storage::version::CfDescriptor;
+        let cap = MAX_CF_STRING_LEN as usize;
+        let check = |what: &str, cf_id: ColumnFamilyId, s: &str| -> ForstResult<()> {
+            if s.len() > cap {
+                return Err(ForstError::invalid_argument(format!(
+                    "cf {} {} length {} exceeds MAX_CF_STRING_LEN ({})",
+                    cf_id.value(),
+                    what,
+                    s.len(),
+                    cap
+                )));
+            }
+            Ok(())
+        };
         let cfs = self.cfs.read().expect("lock poisoned");
         let mut entries: Vec<&Arc<ColumnFamilyData>> = cfs.values().collect();
         entries.sort_by_key(|cf| cf.handle().id().value());
-        entries
-            .into_iter()
-            .map(|cf| CfDescriptor {
-                cf_id: cf.handle().id(),
-                name: cf.handle().name().to_string(),
-                merge_op_name: cf
-                    .merge_operator()
-                    .map(|op| op.name())
-                    .unwrap_or_default(),
-                filter_name: cf
-                    .compaction_filter()
-                    .as_ref()
-                    .map(|f| f.name())
-                    .unwrap_or_default(),
-            })
-            .collect()
+        let mut out = Vec::with_capacity(entries.len());
+        for cf in entries {
+            let cf_id = cf.handle().id();
+            let name = cf.handle().name().to_string();
+            check("name", cf_id, &name)?;
+            let merge_op_name = cf.merge_operator().map(|op| op.name()).unwrap_or_default();
+            check("merge_operator name", cf_id, &merge_op_name)?;
+            let filter_name = cf
+                .compaction_filter()
+                .as_ref()
+                .map(|f| f.name())
+                .unwrap_or_default();
+            check("compaction_filter name", cf_id, &filter_name)?;
+            out.push(CfDescriptor {
+                cf_id,
+                name,
+                merge_op_name,
+                filter_name,
+            });
+        }
+        Ok(out)
     }
 
     pub(crate) fn lookup_cf_by_id(&self, id: ColumnFamilyId) -> ForstResult<Arc<ColumnFamilyData>> {
@@ -6092,6 +6400,40 @@ mod tests {
         let r1 = db.get_or_open_sst_reader(meta).unwrap();
         let r2 = db.get_or_open_sst_reader(meta).unwrap();
         assert!(Arc::ptr_eq(&r1, &r2));
+    }
+
+    /// R50-H3 regression: opening an SST whose footer cf_id disagrees
+    /// with the meta cf_id must surface as `Corruption`. The pre-fix
+    /// path silently accepted the drift, masking the R50-M2 ingest
+    /// foot-gun (which rewrote meta.cf_id without touching the footer).
+    #[test]
+    fn test_sst_reader_rejects_cf_id_mismatch() {
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        // Pull the live meta, then forge a copy whose cf_id is a value
+        // the footer was NOT stamped with (footer carries DEFAULT_CF_ID).
+        // Drop the cached reader so `get_or_open_sst_reader` performs a
+        // fresh open + footer comparison against the forged meta.
+        let meta = db.version_set.current().l0_files()[0].clone();
+        assert_eq!(meta.cf_id, DEFAULT_CF_ID);
+        {
+            let mut readers = db.sst_readers.write().unwrap();
+            readers.remove(&meta.file_number);
+        }
+        let mut forged = meta.clone();
+        forged.cf_id = ColumnFamilyId(0xDEAD_BEEF);
+
+        let err = match db.get_or_open_sst_reader(&forged) {
+            Ok(_) => panic!("mismatched cf_id must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.is_corruption(),
+            "expected Corruption error, got: {err:?}"
+        );
     }
 
     // --- W14.2 scan tests ---
