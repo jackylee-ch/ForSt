@@ -133,6 +133,40 @@ pub struct SstReaderImpl {
     bloom_filter: Sbbf,
 }
 
+/// R74-H1: read `buf.len()` bytes at `offset` and require ALL of them.
+///
+/// `RandomAccessFile::read_at` is documented to return short reads at
+/// EOF, but the SST reader bounds every read against `file_size` before
+/// issuing it, so a mid-file short read is a corruption signal — typically
+/// from an OpenDAL ranged-read returning fewer bytes than requested
+/// (`buffer.len().min(buf.len())` in `OpendalRandomAccessFile::read_at`).
+/// Pre-fix the SST reader discarded the `usize` return from `read_at`,
+/// silently consuming truncated buffers in the bloom-filter, sparse-index,
+/// and data-block decoders (no whole-section checksum to catch it).
+///
+/// The loop re-issues the read on partial fill; `n == 0` is treated as
+/// premature EOF and surfaced as `Corruption`.
+fn read_at_exact(
+    file: &dyn RandomAccessFile,
+    offset: u64,
+    buf: &mut [u8],
+) -> ForstResult<()> {
+    let mut filled: usize = 0;
+    while filled < buf.len() {
+        let n = file.read_at(offset + filled as u64, &mut buf[filled..])?;
+        if n == 0 {
+            return Err(ForstError::corruption(format!(
+                "SST read_at_exact: short read at offset {} (filled {} of {})",
+                offset,
+                filled,
+                buf.len()
+            )));
+        }
+        filled = filled.saturating_add(n);
+    }
+    Ok(())
+}
+
 impl SstReaderImpl {
     /// Opens an SST file for reading.
     ///
@@ -149,7 +183,7 @@ impl SstReaderImpl {
 
         // Step 1: Read the last 8 bytes to get footer_length + magic.
         let mut tail = [0u8; 8];
-        file.read_at(file_size - 8, &mut tail)?;
+        read_at_exact(file.as_ref(), file_size - 8, &mut tail)?;
         if &tail[4..8] != SST_MAGIC {
             return Err(ForstError::corruption("SST file missing trailing magic"));
         }
@@ -172,7 +206,7 @@ impl SstReaderImpl {
             return Err(ForstError::corruption("SST footer_length is zero"));
         }
         let mut footer_buf = vec![0u8; footer_length as usize];
-        file.read_at(footer_start, &mut footer_buf)?;
+        read_at_exact(file.as_ref(), footer_start, &mut footer_buf)?;
         let footer = FooterV1::decode(&footer_buf)?;
 
         // Step 3: Read and decode bloom filter.
@@ -188,7 +222,7 @@ impl SstReaderImpl {
             )));
         }
         let mut bloom_buf = vec![0u8; footer.bloom_filter_size as usize];
-        file.read_at(footer.bloom_filter_offset, &mut bloom_buf)?;
+        read_at_exact(file.as_ref(), footer.bloom_filter_offset, &mut bloom_buf)?;
         let bloom_filter = Sbbf::decode(&bloom_buf)?;
 
         // Step 4: Read and decode sparse index.
@@ -203,7 +237,7 @@ impl SstReaderImpl {
             )));
         }
         let mut index_buf = vec![0u8; footer.index_size as usize];
-        file.read_at(footer.index_offset, &mut index_buf)?;
+        read_at_exact(file.as_ref(), footer.index_offset, &mut index_buf)?;
         let (index_entries, index_stats) = decode_index(&index_buf)?;
 
         Ok(Self {
@@ -255,7 +289,7 @@ impl SstReaderImpl {
             )));
         }
         let mut buf = vec![0u8; block_size as usize];
-        self.file.read_at(block_offset, &mut buf)?;
+        read_at_exact(self.file.as_ref(), block_offset, &mut buf)?;
         decode_data_block(&buf)
     }
 
