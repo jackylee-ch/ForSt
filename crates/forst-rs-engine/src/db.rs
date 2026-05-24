@@ -3657,6 +3657,13 @@ impl DbImpl {
 
         drop(_pin);
 
+        // R78-L2: sibling site `create_checkpoint` reaps deferred deletions
+        // immediately after the pin drops; the incremental path previously
+        // omitted this and accumulated `pending_deletions` until the next
+        // compaction-side reap. Bounded delay only (no correctness issue),
+        // but eagerly reclaiming disk matches the sister contract.
+        self.reap_pending_deletions();
+
         Ok(IncrementalCheckpointResult {
             manifest_path,
             new_ssts,

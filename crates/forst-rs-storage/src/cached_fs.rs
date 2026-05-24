@@ -223,12 +223,22 @@ impl CachedFileSystem {
             )));
         }
         // Best-effort cache write; failures here just mean the next read
-        // pays the same miss, so we propagate I/O errors but ignore the
-        // "did not admit" case (e.g., entry larger than capacity).
-        let _ = self
-            .cache
-            .put(&key, &bytes)
-            .map_err(|e| ForstError::Io(std::io::Error::other(format!("cache put: {e}"))))?;
+        // pays the same miss, so we swallow the error (the streamed
+        // bytes are still good) rather than failing an otherwise-good
+        // SST read. Pre-R78-M1 the `?` at the end of the chain
+        // propagated the cache-put error, contradicting the comment
+        // and turning a transient cache-disk hiccup (ENOSPC, EACCES on
+        // cache_dir) into a hard read failure. `forst-rs-storage` does
+        // not pull in `tracing` so the diagnostic is via `eprintln!`
+        // to stderr — the engine layer above relays anything important.
+        if let Err(e) = self.cache.put(&key, &bytes) {
+            eprintln!(
+                "CachedFileSystem cache put for {} failed: {} \
+                 (continuing with the streamed bytes; next read will retry)",
+                path.display(),
+                e
+            );
+        }
         // Zero-copy hand-off into the refcounted Bytes container. Callers
         // can slice / share without recopying the full payload.
         Ok(Bytes::from(bytes))
