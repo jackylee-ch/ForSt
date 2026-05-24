@@ -1057,20 +1057,26 @@ impl DbImpl {
         // usage; the per-shard accounting is precise enough for the
         // cross-CF budget cap which is itself coarse (~512 MiB default).
         //
-        // R62-H1: ALSO drain the imm list here, under the same
-        // lock_flush we hold. Pre-fix drop_cf released the imm bytes
-        // but left the imms in the list; a queued flush worker that
-        // grabbed lock_flush AFTER drop_cf released it would observe
-        // is_dropped() and, per R61-M1, release the SAME imm's bytes
-        // a SECOND time — double-release inflating the cross-CF budget
-        // toward `over_budget()` never tripping. Popping while we still
-        // hold lock_flush guarantees the post-drop flush worker sees
-        // an empty imm list and refunds 0 (no-op in the R61-M1 path).
+        // R62-H1 + R63-H1: drain the imm list AND sample byte counts in
+        // a SINGLE loop, so a concurrent writer that completes
+        // `swap_active_memtable` between our sample and our drain
+        // cannot push an un-accounted imm. Pre-R63 the two passes were
+        // separate (`imm_memtables()` clone for the sum, then
+        // `pop_oldest_imm()` to drain); a new imm pushed in between
+        // would be popped without its bytes being refunded —
+        // re-introducing the very leak R62-H1 was supposed to close.
+        //
+        // Folding the sample into the drain pulls each imm via
+        // pop_oldest_imm, measures its bytes BEFORE its Arc drops, and
+        // accumulates into `released_bytes`. The loop terminates when
+        // the imm_list is genuinely empty; any post-drain imm pushed
+        // by an in-flight writer is caught by R61-M1 when the queued
+        // flush worker observes `is_dropped()` after we release
+        // lock_flush.
         let mut released_bytes: u64 = cf_data.active_memtable().memory_usage() as u64;
-        for imm in cf_data.imm_memtables() {
+        while let Some(imm) = cf_data.pop_oldest_imm() {
             released_bytes = released_bytes.saturating_add(imm.memory_usage() as u64);
         }
-        while cf_data.pop_oldest_imm().is_some() {}
         self.write_buffer_manager.release(released_bytes);
 
         // R58-H2 / R59-H2 / R59-H3: drop the CF's SST files. Pre-fix
@@ -1167,6 +1173,21 @@ impl DbImpl {
                 }
             }
         }
+
+        // R63-M1: refresh the shared WriteController metrics so its
+        // `may_throttle()` stall logic reflects the post-drop state.
+        // After this CF's imms were drained and its L0/Ln SSTs deleted,
+        // the global imm/L0 counts the controller uses for back-pressure
+        // are stale — pre-fix every subsequent writer (across all CFs)
+        // could trip a phantom throttle until some other CF's flush or
+        // compaction happened to call the setters. R62-H1's eager imm
+        // drain made this stale state more visible because the queued
+        // flush worker that would have called `set_imm_count` on each
+        // pop is now a no-op via R61-M1's is_dropped short-circuit.
+        self.write_controller
+            .set_imm_count(cf_data.imm_count() as u32);
+        self.write_controller
+            .set_l0_file_count(self.version_set.current().l0_files().len() as u32);
 
         // R47-M1: standardize lock order to `cfs → name_map` everywhere.
         // The reverse order (name_map → cfs) inverted the convention used
