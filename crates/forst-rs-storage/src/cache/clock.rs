@@ -144,10 +144,21 @@ impl ClockCacheShard {
             idx = (idx + 1) & self.mask;
         }
 
-        // Evict until we have space
+        // Evict until we have space.
+        //
+        // R84-H2: `evict_one` can legitimately return `None` (safety bail
+        // — see its comment) — pre-fix this `while` looped forever in
+        // that case, hanging the engine on every cache insert. Break out
+        // as soon as the evictor reports it could not free a slot; the
+        // caller above already accepts transient over-capacity (the
+        // load-factor check below + the insertion-probe loop further
+        // down also handle "no empty slot" with `evicted` returned).
         let mut evicted = None;
         while self.current_charge + charge > self.capacity && self.occupancy > 0 {
-            evicted = self.evict_one();
+            match self.evict_one() {
+                Some(e) => evicted = Some(e),
+                None => break,
+            }
         }
 
         // Check load factor (max 75%)
@@ -184,13 +195,26 @@ impl ClockCacheShard {
     /// Evict one entry using Clock sweep. Returns the evicted key and charge.
     fn evict_one(&mut self) -> Option<(CacheKey, usize)> {
         let mut scanned = 0;
+        // R84-H1: the safety bound must cover enough passes to drop the
+        // HIGHEST `initial_countdown` (3 for `CachePriority::High`) to 0
+        // for every occupied slot. Pre-fix the bound was `table_size * 2`
+        // (2 passes), which only decrements High entries from 3 → 1 and
+        // never to 0 — so a shard filled entirely with High-priority
+        // entries returned None on every call, and the caller's
+        // `while self.current_charge + charge > self.capacity { ... }`
+        // hung the engine. (R84-H2 above also breaks out of that loop on
+        // None as defense-in-depth, but the deeper fix is making
+        // evict_one actually succeed when there IS something to evict.)
+        // 4 passes = (MAX_COUNTDOWN=3) + 1, enough to drop every slot
+        // through countdown=0 and reach the eviction branch.
+        const MAX_PASSES: usize = 4;
 
         loop {
             let idx = self.clock_hand % self.table_size;
             self.clock_hand = (self.clock_hand + 1) % self.table_size;
             scanned += 1;
 
-            if scanned > self.table_size * 2 {
+            if scanned > self.table_size * MAX_PASSES {
                 return None; // Safety: prevent infinite loop
             }
 
@@ -751,5 +775,43 @@ mod tests {
         // Bottom entry should be evicted (countdown was 0)
         // High entry should still exist (countdown was 3)
         assert!(shard.get(&high_key, high_hash).is_some());
+    }
+
+    /// R84-H1 regression: a shard filled entirely with High-priority
+    /// entries must still evict on the next `insert` (no infinite loop
+    /// in the eviction `while` and no silent hang). Pre-fix `evict_one`
+    /// bailed after `table_size * 2` scans which only decremented every
+    /// High countdown from 3 → 1, never to 0; the caller's `while
+    /// current_charge + charge > capacity` then looped forever calling
+    /// the always-`None`-returning evictor.
+    #[test]
+    fn test_shard_all_high_priority_still_evicts() {
+        // 16-slot shard with capacity 1200 = 12 × 100 — fills below the
+        // 75% load-factor trigger (12/16 = 75%, exactly at the boundary).
+        // All entries are CachePriority::High (countdown=3). Pre-fix the
+        // 13th insert would have hung the engine in the eviction
+        // `while` because `evict_one`'s 2-pass safety bound never
+        // dropped a High countdown to 0.
+        let mut shard = ClockCacheShard::new(1200, 16);
+        for i in 1..=12u64 {
+            let key = CacheKey::new(i, 0);
+            let hash = key.hash();
+            let _ = shard.insert(key, make_entry(100), 100, CachePriority::High, hash);
+        }
+
+        // 13th insert MUST return (no hang) and must evict at least one
+        // of the older entries because the capacity is full and all
+        // High-priority entries reach countdown=0 within 4 passes.
+        let key_new = CacheKey::new(99, 0);
+        let hash_new = key_new.hash();
+        let _evicted = shard.insert(
+            key_new,
+            make_entry(100),
+            100,
+            CachePriority::High,
+            hash_new,
+        );
+        assert!(shard.current_charge <= 1200);
+        assert!(shard.get(&key_new, hash_new).is_some());
     }
 }
