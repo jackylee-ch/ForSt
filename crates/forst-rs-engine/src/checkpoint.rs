@@ -36,7 +36,7 @@ use forst_rs_common::{ForstError, ForstResult};
 use forst_rs_io::{FileSystem, WriteMode};
 use forst_rs_storage::version::{checkpoint, SstFileMeta};
 
-use crate::flush::sst_file_path;
+use crate::flush::{sst_file_path, sst_temp_path};
 
 /// File name used for the serialised checkpoint blob.
 pub const CHECKPOINT_BLOB_NAME: &str = "CHECKPOINT.blob";
@@ -62,24 +62,51 @@ pub struct CheckpointManifest {
 
 /// Copies `src` to `dst` through the supplied filesystem. Used by the
 /// checkpoint to duplicate SST files into the checkpoint directory.
+///
+/// R40-M2: writes to a `.<basename>.tmp` staging path first, then renames into place
+/// atomically. Mirrors the tmp+rename pattern in `flush.rs` and `compaction.rs` so an
+/// interrupt mid-copy never leaves a partial `<num>.sst` at the canonical name — which
+/// a retry would otherwise observe as an inode/size mismatch and reject. The orphan-scan
+/// in `db::open_from_checkpoint` already recognises `.*.sst.tmp` (via `sst_temp_path`'s
+/// constants), so a leftover staging file is cleaned up automatically on next open.
+///
+/// On any error along the streaming-copy → flush → sync → rename path we best-effort
+/// delete the tmp file before propagating. The delete is best-effort because the file
+/// may not exist yet (open failure), or the FS may reject the delete (in which case
+/// the next restore's orphan-scan still rescues us).
 pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64> {
     let mut reader = fs.open_sequential_file(src)?;
     if let Some(parent) = dst.parent() {
         fs.create_dir_all(parent)?;
     }
-    let mut writer = fs.open_writable_file(dst, WriteMode::CreateNew)?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
+    let tmp_path = sst_temp_path(dst);
+    let result: ForstResult<u64> = (|| {
+        let mut writer = fs.open_writable_file(&tmp_path, WriteMode::CreateNew)?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            writer.append(&buf[..n])?;
+            total += n as u64;
         }
-        writer.append(&buf[..n])?;
-        total += n as u64;
+        writer.flush()?;
+        writer.sync()?;
+        Ok(total)
+    })();
+    let total = match result {
+        Ok(total) => total,
+        Err(e) => {
+            let _ = fs.delete_file(&tmp_path);
+            return Err(e);
+        }
+    };
+    if let Err(e) = fs.rename(&tmp_path, dst) {
+        let _ = fs.delete_file(&tmp_path);
+        return Err(e);
     }
-    writer.flush()?;
-    writer.sync()?;
     Ok(total)
 }
 

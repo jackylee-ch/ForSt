@@ -131,7 +131,14 @@ impl FlushJob {
         })?;
         self.fs.create_dir_all(parent)?;
         let tmp_path = self.temp_path();
-        let info = {
+        // R40-M1: wrap the writer/flush/sync block in a closure so any `?`-propagated error from
+        // `writer.add`, `writer.finish`, `writable.flush`, or `writable.sync` triggers a best-
+        // effort delete of the staging tmp file before we propagate. The pre-existing R38-H1 fix
+        // only covered the post-block `fs.rename` failure; an earlier writer-flow throw would
+        // leave `.<num>.sst.tmp` orphaned in-process until the restore orphan-scan picked it up
+        // on next restart. Mirrors the same wrapper in `compaction.rs` so all SST-write sites
+        // share one tmp-leak-safe contract.
+        let info_result: ForstResult<SstFileInfo> = (|| {
             let mut writable = self
                 .fs
                 .open_writable_file(&tmp_path, WriteMode::CreateNew)?;
@@ -185,7 +192,15 @@ impl FlushJob {
             let info = writer.finish()?;
             writable.flush()?;
             writable.sync()?;
-            info
+            Ok(info)
+        })();
+        let info = match info_result {
+            Ok(info) => info,
+            Err(e) => {
+                // Best-effort cleanup; orphan-scan on restart still covers any residual file.
+                let _ = self.fs.delete_file(&tmp_path);
+                return Err(e);
+            }
         };
         // R38-H1: best-effort cleanup of the temp file on rename failure
         // (EXDEV, cross-FS, transient I/O). Without this, a failed flush

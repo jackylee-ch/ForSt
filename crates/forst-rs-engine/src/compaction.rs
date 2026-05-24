@@ -31,7 +31,7 @@ use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber};
 use forst_rs_io::{FileSystem, WritableFile};
 use forst_rs_storage::merge_operator::MergeOperator;
 use forst_rs_storage::sst::{
-    writer::StreamingSstWriter, SstReaderImpl, SstWriterImpl, SstWriterOptions,
+    writer::StreamingSstWriter, SstFileInfo, SstReaderImpl, SstWriterImpl, SstWriterOptions,
 };
 use forst_rs_storage::version::{SstFileMeta, VersionEdit};
 
@@ -147,7 +147,21 @@ impl CompactionJob {
             self.fs.create_dir_all(parent)?;
         }
 
-        let info = {
+        // R40-M1: wrap the writer/flush/sync block in a closure so any `?`-propagated error from
+        // `emit_key_versions`, `writer.finish`, `wf.flush`, or `wf.sync` triggers a best-effort
+        // delete of the staging tmp file before we propagate. The pre-existing R38-H1 fix only
+        // covered the post-block `fs.rename` failure; an earlier writer-flow throw would leave
+        // `.<num>.sst.tmp` orphaned in-process until the restore orphan-scan picked it up on
+        // next restart. Mirrors the same wrapper in `flush.rs` so all SST-write sites share one
+        // tmp-leak-safe contract.
+        //
+        // Closure returns:
+        //   * `Ok(Some(info))` — wrote ≥ 1 row, ready to rename into place
+        //   * `Ok(None)`       — zero-emit (bottommost tombstones); inner branch already
+        //                        best-effort-deleted the tmp file and the caller short-circuits
+        //                        with a deletion-only VersionEdit
+        //   * `Err(e)`         — writer/flush/sync throw; caller cleans up the tmp file
+        let write_outcome: ForstResult<Option<SstFileInfo>> = (|| {
             let mut wf = self
                 .fs
                 .open_writable_file(&tmp_path, forst_rs_io::WriteMode::CreateNew)?;
@@ -200,6 +214,19 @@ impl CompactionJob {
                         e
                     );
                 }
+                return Ok(None);
+            }
+
+            let info = writer.finish()?;
+            wf.flush()?;
+            wf.sync()?;
+            Ok(Some(info))
+        })();
+        let info = match write_outcome {
+            Ok(Some(info)) => info,
+            Ok(None) => {
+                // Zero-emit: tmp already cleaned up by the inner branch; emit a deletion-only
+                // VersionEdit.
                 return Ok(Some(VersionEdit {
                     deleted_files: self
                         .inputs
@@ -211,11 +238,11 @@ impl CompactionJob {
                     last_sequence: None,
                 }));
             }
-
-            let info = writer.finish()?;
-            wf.flush()?;
-            wf.sync()?;
-            info
+            Err(e) => {
+                // Best-effort cleanup; orphan-scan on restart still covers any residual file.
+                let _ = self.fs.delete_file(&tmp_path);
+                return Err(e);
+            }
         };
         // R38-H1: best-effort cleanup of the temp file on rename failure
         // (EXDEV, cross-FS, transient I/O). Without this, a failed compaction
