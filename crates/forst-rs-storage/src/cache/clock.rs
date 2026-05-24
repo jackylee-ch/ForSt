@@ -53,31 +53,27 @@ impl ClockSlot {
     }
 }
 
-/// Per-insert eviction accounting (R85-M1). Tracks the full set of
-/// evictions triggered by a single `ClockCacheShard::insert` call so
+/// Per-insert eviction accounting (R85-M1). Tracks the full count and
+/// total bytes evicted by a single `ClockCacheShard::insert` call so
 /// the cache-level metrics counter does not lose track of multi-
 /// eviction inserts (common after R84-H1 — the MAX_PASSES bump now
-/// actually completes for High-priority shards, so eviction
-/// frequently chains).
+/// actually completes for High-priority shards, so eviction frequently
+/// chains).
+///
+/// R86-L1: previously also carried a `last_evicted: Option<(CacheKey,
+/// usize)>` field but no caller consumed it; removed.
 #[derive(Default, Debug)]
 struct InsertOutcome {
     /// Number of entries evicted on this insert.
     evictions: usize,
     /// Sum of `charge` across every evicted entry.
     evicted_charge: usize,
-    /// Last evicted entry's (key, charge) — preserved for callers /
-    /// tests that only care about a single representative eviction
-    /// (e.g. validation tests). May be `None` even if `evictions > 0`
-    /// if all evictions had `charge == 0`, but that does not occur in
-    /// practice.
-    last_evicted: Option<(CacheKey, usize)>,
 }
 
 impl InsertOutcome {
     fn record(&mut self, evicted: (CacheKey, usize)) {
         self.evictions += 1;
         self.evicted_charge = self.evicted_charge.saturating_add(evicted.1);
-        self.last_evicted = Some(evicted);
     }
 }
 
@@ -330,14 +326,20 @@ impl ClockCacheShard {
     }
 
     /// Remove a specific key from the shard.
-    fn erase(&mut self, key: &CacheKey, hash: u64) -> bool {
+    /// R86-M1: returns `Some(freed_charge)` when an entry was erased,
+    /// `None` when no matching entry was found. The wrapper uses the
+    /// returned charge to decrement the global `metrics.current_charge`
+    /// — pre-fix the shard's `current_charge` was decremented but the
+    /// global meter was not, drifting the operator-visible cache
+    /// utilization metric upward on every erase.
+    fn erase(&mut self, key: &CacheKey, hash: u64) -> Option<usize> {
         let hash_frag = hash as u32;
         let mut idx = (hash as usize) & self.mask;
 
         for _ in 0..self.table_size {
             let slot = &self.table[idx];
             if !slot.occupied {
-                return false;
+                return None;
             }
             if slot.hash_fragment == hash_frag && slot.key == *key {
                 let charge = self.table[idx].charge;
@@ -347,21 +349,23 @@ impl ClockCacheShard {
                 self.occupancy -= 1;
                 self.current_charge -= charge;
                 self.rehash_after_removal(idx);
-                return true;
+                return Some(charge);
             }
             idx = (idx + 1) & self.mask;
         }
-        false
+        None
     }
 
-    /// Remove all entries for a given file_number.
-    fn erase_by_file(&mut self, file_number: u64) {
+    /// Remove all entries for a given file_number. R86-M1: returns
+    /// total bytes freed so the wrapper can update global metrics.
+    fn erase_by_file(&mut self, file_number: u64) -> usize {
         let mut indices_to_remove = Vec::new();
         for i in 0..self.table_size {
             if self.table[i].occupied && self.table[i].key.file_number == file_number {
                 indices_to_remove.push(i);
             }
         }
+        let mut total_freed: usize = 0;
         // Remove from highest index to lowest to avoid rehash interference
         for &idx in indices_to_remove.iter().rev() {
             if self.table[idx].occupied && self.table[idx].key.file_number == file_number {
@@ -372,8 +376,10 @@ impl ClockCacheShard {
                 self.occupancy -= 1;
                 self.current_charge -= charge;
                 self.rehash_after_removal(idx);
+                total_freed = total_freed.saturating_add(charge);
             }
         }
+        total_freed
     }
 }
 
@@ -481,15 +487,29 @@ impl BlockCache for ShardedClockCache {
         let shard_idx = self.shard_index(hash);
 
         if let Ok(mut shard) = self.shards[shard_idx].write() {
-            shard.erase(key, hash);
+            // R86-M1: propagate the freed charge to the global metric so
+            // operator-visible `current_charge` matches the shard sums.
+            if let Some(freed) = shard.erase(key, hash) {
+                self.metrics
+                    .current_charge
+                    .fetch_sub(freed, Ordering::Relaxed);
+            }
         }
     }
 
     fn erase_by_file(&self, file_number: u64) {
+        let mut total_freed: usize = 0;
         for shard_lock in &self.shards {
             if let Ok(mut shard) = shard_lock.write() {
-                shard.erase_by_file(file_number);
+                total_freed =
+                    total_freed.saturating_add(shard.erase_by_file(file_number));
             }
+        }
+        // R86-M1: same metric-update fix as `erase` above.
+        if total_freed > 0 {
+            self.metrics
+                .current_charge
+                .fetch_sub(total_freed, Ordering::Relaxed);
         }
     }
 
@@ -764,7 +784,9 @@ mod tests {
         let key = CacheKey::new(1, 0);
         let hash = key.hash();
         shard.insert(key, make_entry(100), 100, CachePriority::Low, hash);
-        assert!(shard.erase(&key, hash));
+        // R86-M1: shard::erase now returns Option<usize> (freed_charge);
+        // pre-R86 it returned bool.
+        assert_eq!(shard.erase(&key, hash), Some(100));
         assert!(shard.get(&key, hash).is_none());
     }
 
