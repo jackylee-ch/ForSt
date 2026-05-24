@@ -209,6 +209,37 @@ fn default_retry_layer() -> RetryLayer {
         .with_jitter()
 }
 
+/// R45-M1: extract host string from an HTTP authority component (after
+/// `http://` and before any path). Handles both `host[:port]` and the
+/// IPv6 bracketed form `[v6addr][:port]`.
+///
+/// Examples:
+/// - `"127.0.0.1:9000"` → `"127.0.0.1"`
+/// - `"localhost"`      → `"localhost"`
+/// - `"[::1]:9000"`     → `"::1"` (brackets stripped)
+/// - `"[::1]"`          → `"::1"`
+/// - `"[2001:db8::1]:9000"` → `"2001:db8::1"`
+///
+/// Falls back to returning the input slice unchanged for malformed
+/// inputs (e.g. a `[` with no closing `]`) — the caller treats it as a
+/// non-loopback host and emits the warning anyway, which is the correct
+/// conservative behavior.
+fn extract_host_from_authority(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: the host runs to the closing `]`.
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+        // Malformed (no closing bracket): return as-is.
+        return authority;
+    }
+    // Plain host[:port]: trim any port suffix.
+    match authority.rfind(':') {
+        Some(idx) => &authority[..idx],
+        None => authority,
+    }
+}
+
 impl OpendalFileSystem {
     /// Wraps an existing [`opendal::Operator`].
     ///
@@ -295,14 +326,16 @@ impl OpendalFileSystem {
             // make the risk visible in logs.
             if ep.starts_with("http://") {
                 let host_part = ep.trim_start_matches("http://");
-                // Trim any path component before checking the host.
-                let host_only = host_part.split('/').next().unwrap_or(host_part);
-                // Trim any port component.
-                let host_no_port = host_only.split(':').next().unwrap_or(host_only);
+                // Trim any path component before parsing host.
+                let authority = host_part.split('/').next().unwrap_or(host_part);
+                // R45-M1: properly extract host from an authority that may
+                // include an IPv6 literal (`[::1]:9000`) or a regular
+                // `host:port`. Naïvely splitting on `:` would butcher the
+                // IPv6 literal into `[` and never match the loopback list.
+                let host_no_port = extract_host_from_authority(authority);
                 let is_loopback = host_no_port == "localhost"
                     || host_no_port == "127.0.0.1"
-                    || host_no_port == "::1"
-                    || host_no_port == "[::1]";
+                    || host_no_port == "::1";
                 if !is_loopback {
                     tracing::warn!(
                         target: "forst_rs_io::opendal_backend",
@@ -843,6 +876,41 @@ const _: fn() = || {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    // --- R45-M1 IPv6-aware authority parsing --------------------------------
+
+    /// R45-M1: `extract_host_from_authority` must not butcher IPv6
+    /// literals. Pre-fix, splitting on the first `:` would turn
+    /// `[::1]:9000` into `[`, which never matches the loopback list and
+    /// silently spammed the warning on every loopback IPv6 endpoint.
+    #[test]
+    fn test_r45_m1_extract_host_ipv4_strips_port() {
+        assert_eq!(extract_host_from_authority("127.0.0.1:9000"), "127.0.0.1");
+        assert_eq!(extract_host_from_authority("127.0.0.1"), "127.0.0.1");
+        assert_eq!(extract_host_from_authority("localhost:9000"), "localhost");
+        assert_eq!(extract_host_from_authority("localhost"), "localhost");
+    }
+
+    #[test]
+    fn test_r45_m1_extract_host_ipv6_unwraps_brackets() {
+        assert_eq!(extract_host_from_authority("[::1]:9000"), "::1");
+        assert_eq!(extract_host_from_authority("[::1]"), "::1");
+        assert_eq!(
+            extract_host_from_authority("[2001:db8::1]:9000"),
+            "2001:db8::1"
+        );
+        assert_eq!(
+            extract_host_from_authority("[fe80::1%eth0]:80"),
+            "fe80::1%eth0"
+        );
+    }
+
+    #[test]
+    fn test_r45_m1_extract_host_malformed_returns_input() {
+        // Unclosed bracket — preserve the input so the caller treats it
+        // as a non-loopback host and emits the warning (conservative).
+        assert_eq!(extract_host_from_authority("[::1"), "[::1");
+    }
 
     // --- Memory backend round-trips -----------------------------------------
 

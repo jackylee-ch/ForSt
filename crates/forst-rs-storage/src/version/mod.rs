@@ -136,12 +136,24 @@ impl Version {
             }
         }
 
-        // Add new files
+        // Add new files. R45-M2: mirror the deleted_files stale-edit guard
+        // above — an out-of-range `level` is a structural error (the writer
+        // staged an edit against a level layout that no longer exists),
+        // not a silent drop. Returning `Busy` lets the caller retry with
+        // a fresh Version snapshot, matching the deleted_files path.
         for (level, file_meta) in &edit.new_files {
             let level_idx = *level as usize;
-            if level_idx < new_levels.len() {
-                new_levels[level_idx].files.push(file_meta.clone());
+            if level_idx >= new_levels.len() {
+                return Err(ForstError::busy(format!(
+                    "Version::apply_edit: stale edit references out-of-range level {} \
+                     for new file {} (max {}); another writer must have rewritten \
+                     the version — caller should discard staged output and retry",
+                    level,
+                    file_meta.file_number.value(),
+                    new_levels.len()
+                )));
             }
+            new_levels[level_idx].files.push(file_meta.clone());
         }
 
         // Sort files within each level by smallest_key
@@ -668,6 +680,22 @@ mod tests {
         let v = Version::new();
         let edit = VersionEdit {
             deleted_files: vec![(MAX_LEVELS as u32 + 5, FileNumber(99))],
+            ..Default::default()
+        };
+        let err = v.apply_edit(&edit).unwrap_err();
+        assert!(err.is_busy(), "expected Busy, got {:?}", err);
+    }
+
+    /// R45-M2: `new_files` at an out-of-range level used to be silently
+    /// dropped — `if level_idx < new_levels.len()` was the only guard,
+    /// asymmetric with the `deleted_files` validation. Mirror the
+    /// stale-edit treatment so the caller observes a retry-able `Busy`
+    /// rather than a silent loss of the file installation.
+    #[test]
+    fn test_apply_edit_rejects_out_of_range_new_file_level() {
+        let v = Version::new();
+        let edit = VersionEdit {
+            new_files: vec![(MAX_LEVELS as u32 + 5, make_file(99, b"a", b"b"))],
             ..Default::default()
         };
         let err = v.apply_edit(&edit).unwrap_err();

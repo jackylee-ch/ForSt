@@ -550,6 +550,27 @@ impl DbImpl {
     }
 
     /// Creates a new column family with the given descriptor.
+    ///
+    /// # R45-H1: multi-CF + heterogeneous merge/filter restriction
+    ///
+    /// The engine's `VersionSet` and L0 layer are currently shared across
+    /// every CF: `compact_l0_for_cf` reads `version_set.current().l0_files()`
+    /// without a CF filter, so an L0 file produced by CF *b*'s flush can be
+    /// picked up and rewritten by a compaction job that captured CF *a*'s
+    /// merge operator and compaction filter. When the two CFs disagree on
+    /// either of those (e.g. CF *a* has TTL, CF *b* doesn't; or each uses a
+    /// different merge operator), this silently produces wrong results.
+    ///
+    /// Until per-CF `Version` scoping lands (requires a manifest format
+    /// change — codec v2 — to tag every [`SstFileMeta`] with its
+    /// `ColumnFamilyId`), we refuse the configuration up front. A CF can
+    /// be created with a non-default merge operator OR a non-default
+    /// compaction filter only when every other CF carries the same
+    /// (operator name, filter name) pair. Equality is checked by name —
+    /// the trait's `name()` is the documented identity surface.
+    ///
+    /// Homogeneous multi-CF deployments (every CF default, or every CF
+    /// using the exact same merge/filter) remain fully supported.
     pub fn create_column_family(
         &self,
         desc: ColumnFamilyDescriptor,
@@ -564,8 +585,88 @@ impl DbImpl {
                 )));
             }
         }
+        // R45-H1: reject heterogeneous merge_operator / compaction_filter
+        // across CFs. See doc-comment above for the rationale.
+        self.check_cf_homogeneity(&desc)?;
         let id = ColumnFamilyId(self.next_cf_id.fetch_add(1, Ordering::SeqCst));
         self.create_cf_with_id(id, desc)
+    }
+
+    /// R45-H1: validates that the new descriptor's merge_operator and
+    /// compaction_filter are compatible with every existing non-default
+    /// CF.
+    ///
+    /// Compatibility rule (until per-CF Version scoping lands):
+    /// - the (merge_operator_name, compaction_filter_name) pair of the
+    ///   new CF must equal the pair of every existing non-default CF.
+    ///
+    /// The default CF is exempt: it is auto-created at `open` time with
+    /// no merge_operator and no compaction_filter, and pre-existing
+    /// `set_compaction_filter` callers (notably the FFI) rely on
+    /// installing a non-default filter on user CFs while the default CF
+    /// stays empty. Users who actually write to BOTH the default CF and
+    /// a CF with a non-default policy still risk silent wrong results
+    /// when their L0 files end up shared — but that pattern is
+    /// undocumented and not exercised by any current binding.
+    ///
+    /// `None` is a distinct value from `Some("...")` — i.e. a non-default
+    /// CF with no merge operator is NOT compatible with another
+    /// non-default CF whose merge operator is `Some("StringAppend")`.
+    /// This catches the original R45-H1 hazard (two user CFs disagreeing
+    /// on policy) where the silent wrong-result risk is highest.
+    fn check_cf_homogeneity(&self, desc: &ColumnFamilyDescriptor) -> ForstResult<()> {
+        let new_merge_name: Option<String> = desc
+            .merge_operator()
+            .as_ref()
+            .map(|op| op.name().to_string());
+        let new_filter_name: Option<String> = desc
+            .compaction_filter()
+            .as_ref()
+            .map(|f| f.name().to_string());
+
+        let existing: Vec<Arc<ColumnFamilyData>> = {
+            let cfs = self.cfs.read().expect("lock poisoned");
+            cfs.values()
+                .filter(|cf| cf.handle().id() != DEFAULT_CF_ID)
+                .cloned()
+                .collect()
+        };
+        for cf in &existing {
+            let exist_merge_name: Option<String> = cf
+                .merge_operator()
+                .map(|op| op.name().to_string());
+            let exist_filter_name: Option<String> = cf
+                .compaction_filter()
+                .as_ref()
+                .map(|f| f.name().to_string());
+            if exist_merge_name != new_merge_name {
+                return Err(ForstError::invalid_argument(format!(
+                    "column family '{}' has merge_operator {:?}, but existing CF '{}' \
+                     uses {:?}; the engine's L0 layer is shared across CFs and \
+                     heterogeneous merge operators would silently produce wrong \
+                     results during cross-CF compaction (R45-H1). Use the same \
+                     merge_operator on every non-default CF, or open separate engines.",
+                    desc.name(),
+                    new_merge_name,
+                    cf.handle().name(),
+                    exist_merge_name
+                )));
+            }
+            if exist_filter_name != new_filter_name {
+                return Err(ForstError::invalid_argument(format!(
+                    "column family '{}' has compaction_filter {:?}, but existing CF \
+                     '{}' uses {:?}; the engine's L0 layer is shared across CFs and \
+                     heterogeneous compaction filters would silently produce wrong \
+                     results during cross-CF compaction (R45-H1). Use the same \
+                     compaction_filter on every non-default CF, or open separate engines.",
+                    desc.name(),
+                    new_filter_name,
+                    cf.handle().name(),
+                    exist_filter_name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn create_cf_with_id(
@@ -2024,6 +2125,20 @@ impl DbImpl {
         // past the compaction_mutex (defense-in-depth). On reject, remove
         // the orphaned output SST so it doesn't leak.
         if let Err(e) = self.version_set.apply(&edit) {
+            // R45-L1: this unlink intentionally bypasses
+            // `delete_file_guarded`. The output file was freshly minted
+            // for this compaction and the `apply` call failed BEFORE the
+            // file was installed into any Version, so no checkpoint, no
+            // reader, and no concurrent compaction can have observed —
+            // let alone pinned — `output_file_number`. The guard's
+            // pin-count for it must be zero; assert it in debug builds
+            // so any future regression (e.g. someone pinning before
+            // apply) trips the test suite loudly.
+            debug_assert!(
+                self.deletion_guard.can_delete(output_file_number),
+                "orphan-delete bypass for L→L+1 output {} is unsafe: file is pinned",
+                output_file_number.value()
+            );
             if let Err(rm_err) = self.fs.delete_file(&output_path) {
                 tracing::warn!(
                     target: "forst_rs_engine::compaction",
@@ -2750,6 +2865,19 @@ impl DbImpl {
             // file is not referenced by any Version (apply failed before
             // installation), so it is safe to remove without going through
             // delete_file_guarded.
+            //
+            // R45-L1: this bypass of `delete_file_guarded` is sound because
+            // `output_file_number` was just allocated for this compaction
+            // job and never installed into a Version — no checkpoint /
+            // reader / sibling compaction can have observed it, so the
+            // deletion guard's pin count for it must be zero. Debug
+            // builds assert this invariant; release builds rely on the
+            // documented allocation+install ordering.
+            debug_assert!(
+                self.deletion_guard.can_delete(output_file_number),
+                "orphan-delete bypass for L0→L1 output {} is unsafe: file is pinned",
+                output_file_number.value()
+            );
             if let Err(rm_err) = self.fs.delete_file(&output_path) {
                 tracing::warn!(
                     target: "forst_rs_engine::compaction",
@@ -6559,33 +6687,29 @@ mod tests {
         bg.join().expect("bg thread");
     }
 
-    /// R44-H1 regression test: two threads compacting different CFs
-    /// concurrently must NOT produce overlapping L1 files.
+    /// R44-H1 regression test: no duplicate L1 file numbers under
+    /// concurrent `compact_l0` invocations.
     ///
-    /// Pre-fix the per-CF `flush_mutex` was the only serialization; since
-    /// the `VersionSet` is engine-global, both threads would read the same
-    /// `V0` (each thread's CF holding its own `flush_mutex`), both pick the
-    /// same L0/L1 inputs from `version_set.current()`, build edits that
-    /// delete the same input file numbers, and both call `version_set.apply`.
-    /// The second `apply` would (a) silently succeed in the lost-update
-    /// fix's window — both edits applying back-to-back — leaving stale
-    /// references, or (b) corrupt the level by inserting two new L1 files
-    /// for the same key range.
+    /// Two threads run `compact_l0` against different CFs. Pre-fix, the
+    /// per-CF `flush_mutex` was the only serialization; because the
+    /// `VersionSet` is engine-global, both threads could pick the same
+    /// L0 inputs and both `version_set.apply` their edits, leaving the
+    /// same L1 file number installed twice (or a stale L0 reference
+    /// alongside its compaction output).
     ///
-    /// Post-fix:
-    /// - The engine-global `compaction_mutex` serializes the two
-    ///   compactions. Whichever thread acquires it first runs to
-    ///   completion; the other only reads `current()` AFTER the first
-    ///   has applied its edit, so its inputs are fresh.
-    /// - As defense-in-depth, `Version::apply_edit` rejects stale-edit
-    ///   delete sets with `ForstError::Busy`. Even if a future change
-    ///   removes the mutex, the second apply would fail loudly rather
-    ///   than silently corrupting.
+    /// Post-fix, the engine-global `compaction_mutex` serializes the two
+    /// jobs and `Version::apply_edit` rejects stale-edit delete sets
+    /// with `ForstError::Busy` as defense-in-depth.
     ///
-    /// We assert post-condition: after both threads finish, the total
-    /// number of L1 files across both CFs equals the number of completed
-    /// compactions (no double-installs), and no L0 file referenced by
-    /// either compaction's input list is still listed in any version.
+    /// The asserted post-condition is narrow: after both threads finish,
+    /// the L1 file-number set must contain no duplicates. (Pre-fix the
+    /// same file number could appear twice in L1 — i.e. the same data
+    /// installed twice.) This test does NOT assert per-CF L1 separation,
+    /// L0 input-disjointness across the two jobs, or anything about
+    /// cross-CF merge-operator / compaction-filter semantics —
+    /// `VersionSet` is engine-global today, so those invariants are
+    /// addressed by R45-H1's create-time CF homogeneity check, not by
+    /// runtime per-CF Version scoping.
     #[test]
     fn test_r44_h1_concurrent_multi_cf_compaction_no_overlap() {
         let db = open();
@@ -6665,6 +6789,95 @@ mod tests {
             "duplicate L1 file numbers: {:?}",
             l1_nums
         );
+    }
+
+    // ============================================================
+    // R45-H1: heterogeneous CF merge/filter rejection
+    // ============================================================
+
+    /// R45-H1 happy path: two non-default CFs that share the same
+    /// merge_operator (by name) are accepted. The engine's L0 layer is
+    /// shared across CFs, but with identical merge operators the
+    /// cross-CF compaction hazard collapses (same policy applied either
+    /// way), so the homogeneity check must NOT reject this.
+    #[test]
+    fn test_r45_h1_accepts_homogeneous_merge_operator() {
+        let db = open();
+        let op_a: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::with_comma());
+        let op_b: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::with_comma());
+        db.create_column_family(
+            ColumnFamilyDescriptor::new("cf_merge_1").with_merge_operator(op_a),
+        )
+        .expect("first non-default CF with merge accepted");
+        db.create_column_family(
+            ColumnFamilyDescriptor::new("cf_merge_2").with_merge_operator(op_b),
+        )
+        .expect("second CF with same merge_operator name accepted");
+    }
+
+    /// R45-H1 reject path: a second non-default CF with NO merge
+    /// operator is rejected when an earlier non-default CF already has
+    /// one. Pre-fix, `compact_l0_for_cf` would rewrite cf_b's L0 files
+    /// under cf_a's merge operator (silent wrong result).
+    #[test]
+    fn test_r45_h1_rejects_heterogeneous_merge_operator() {
+        let db = open();
+        let op: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::with_comma());
+        db.create_column_family(
+            ColumnFamilyDescriptor::new("cf_merge").with_merge_operator(op),
+        )
+        .expect("first non-default CF with merge accepted");
+        // Adding a non-default CF with no merge operator must be
+        // rejected (heterogeneous against the existing non-default CF).
+        let err = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf_plain"))
+            .expect_err("heterogeneous CF must be rejected");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("R45-H1"),
+            "error must cite the constraint: {}",
+            msg
+        );
+    }
+
+    /// R45-H1 reject path for compaction_filter: a second non-default CF
+    /// without the same filter is rejected when an earlier non-default
+    /// CF has one set at create time.
+    #[test]
+    fn test_r45_h1_rejects_heterogeneous_compaction_filter() {
+        use crate::compaction_filter::TtlCompactionFilter;
+        let db = open();
+        let now: fn() -> u64 = || 1_000;
+        let filter = Arc::new(TtlCompactionFilter::with_clock(50, now));
+        db.create_column_family(
+            ColumnFamilyDescriptor::new("cf_ttl").with_compaction_filter(filter),
+        )
+        .expect("first non-default CF with filter accepted");
+        let err = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf_no_filter"))
+            .expect_err("CF without matching filter must be rejected");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("R45-H1"),
+            "error must cite the constraint: {}",
+            msg
+        );
+    }
+
+    /// R45-H1: the default CF is exempt from the homogeneity check.
+    /// `DbImpl::open` always installs a default CF with no merge /
+    /// filter; legacy callers (notably the FFI) rely on then creating a
+    /// single non-default CF with a merge operator alongside it.
+    #[test]
+    fn test_r45_h1_default_cf_is_exempt() {
+        let db = open();
+        let op: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::with_comma());
+        // Default exists with no merge; this single user CF with merge
+        // must still succeed despite the default CF having no merge.
+        db.create_column_family(
+            ColumnFamilyDescriptor::new("merge_cf").with_merge_operator(op),
+        )
+        .expect("user CF + default CF (no merge) must be accepted");
     }
 
     // ============================================================
