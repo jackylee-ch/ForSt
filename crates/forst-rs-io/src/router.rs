@@ -331,15 +331,49 @@ impl FileSystem for FileSystemRouter {
     /// would survive but its directory-entry update would not, defeating
     /// the entire crash-safety contract.
     ///
-    /// Routing mirrors `rename`: scheme prefix wins first, then the
-    /// extension-based local/remote split. Directories of `.sst` files
-    /// in tiered mode are on the remote backend (which itself is a no-op
-    /// for object stores) and every other path lands on `local_fs`.
+    /// R51-M1: in tiered mode, the engine calls `sync_dir(parent_of_sst)`
+    /// after a remote SST rename. Parent directories have no `.sst`
+    /// extension, so `is_remote_file` returns `false` and `route()`
+    /// dispatches to `local_fs` — fsyncing the WRONG filesystem and
+    /// leaving the remote rename's directory entry un-synced. Fix: when
+    /// a remote filesystem is configured, fan the call out to BOTH the
+    /// local and the remote filesystems. Object-store backends implement
+    /// `sync_dir` as a no-op (no kernel-cached directory entry), so the
+    /// extra leg is essentially free; a wrapped POSIX remote (e.g. NFS
+    /// behind OpenDAL) honours it correctly. Scheme-prefixed paths still
+    /// dispatch through the registry first.
     fn sync_dir(&self, dir: &Path) -> ForstResult<()> {
         if let Some((fs, stripped)) = self.match_scheme(dir) {
             return fs.sync_dir(&stripped);
         }
-        self.route(dir).sync_dir(dir)
+        // Fan-out: always fsync local (directories live there) and, if
+        // configured, also fsync remote so SST renames on the remote leg
+        // become durable. Order matters only for error propagation —
+        // local first, since that's where the directory entries the
+        // engine actually relies on for crash recovery live.
+        self.local_fs.sync_dir(dir)?;
+        if let Some(remote) = self.remote_fs.as_ref() {
+            remote.sync_dir(dir)?;
+        }
+        Ok(())
+    }
+
+    /// R51-M2: dispatch `ensure_cached` to the underlying filesystem
+    /// that owns `path` instead of falling through to the trait default
+    /// no-op. The engine calls this to prefetch SST files into the local
+    /// cache before opening readers (amortising S3 round-trip latency).
+    /// Without an override, the call silently no-ops in tiered mode and
+    /// every reader open still pays the full remote-fetch cost.
+    ///
+    /// Routing mirrors the read path: scheme prefix wins, then the
+    /// extension-based local/remote split. Local files are no-ops via
+    /// the trait default; remote files (in particular `CachedFileSystem`-
+    /// wrapped remotes) actually populate the local cache.
+    fn ensure_cached(&self, path: &Path) -> ForstResult<()> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.ensure_cached(&stripped);
+        }
+        self.route(path).ensure_cached(path)
     }
 
     fn name(&self) -> &str {

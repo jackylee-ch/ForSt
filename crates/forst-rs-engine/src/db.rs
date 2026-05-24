@@ -31,7 +31,7 @@ use forst_rs_common::{
     ColumnFamilyId, EngineOptions, FileNumber, ForstError, ForstResult, InternalKey, OpType,
     SequenceNumber, DEFAULT_CF_ID,
 };
-use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSystem};
+use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSystem, WriteMode};
 use forst_rs_storage::cache::clock::ShardedClockCache;
 use forst_rs_storage::cached_fs::CachedFileSystem;
 use forst_rs_storage::local_cache::LocalCache;
@@ -772,6 +772,17 @@ impl DbImpl {
             // guard, so the peek-then-insert sequence holds against
             // concurrent CF creates because every install path goes
             // through this function under cfs.write().
+            //
+            // R51-L2 — Lock order invariant (write paths only):
+            //   cfs.write()  →  cf_name_to_id.read()
+            //   cfs.write()  →  (drop)  →  cf_name_to_id.write()
+            // CF-install / CF-drop sites are the only writers and ALL go
+            // through this function under `cfs.write()`. Future write
+            // paths MUST NOT take `cf_name_to_id` (read or write) first
+            // and then attempt `cfs.write()` — that would invert this
+            // order and deadlock against an in-flight install. Read-only
+            // callers (lookup_cf_by_name etc.) take only `cf_name_to_id`
+            // and are not part of this ordering.
             let names = self.cf_name_to_id.read().expect("lock poisoned");
             if names.contains_key(&name) {
                 return Err(ForstError::corruption(format!(
@@ -1091,7 +1102,7 @@ impl DbImpl {
                     // Best-effort cleanup of any already-linked dest
                     // files so a failed ingest doesn't leak SSTs into
                     // the engine's directory.
-                    Self::cleanup_ingested(&new_files);
+                    self.cleanup_ingested(&new_files);
                     ForstError::Io(std::io::Error::new(
                         e.kind(),
                         format!(
@@ -1108,7 +1119,7 @@ impl DbImpl {
             // FileSystem (so the OpenDAL / cached-fs paths get exercised
             // uniformly), not std::fs.
             let rac = self.fs.open_random_access_file(&dest).inspect_err(|_| {
-                Self::cleanup_ingested(&new_files);
+                self.cleanup_ingested(&new_files);
             })?;
             // Re-open the dest via a *fresh* RAC so we can sample its
             // file_size BEFORE consuming the handle into SstReaderImpl
@@ -1119,17 +1130,17 @@ impl DbImpl {
                 Ok(probe) => match probe.file_size() {
                     Ok(sz) => sz,
                     Err(e) => {
-                        Self::cleanup_ingested(&new_files);
+                        self.cleanup_ingested(&new_files);
                         return Err(e);
                     }
                 },
                 Err(e) => {
-                    Self::cleanup_ingested(&new_files);
+                    self.cleanup_ingested(&new_files);
                     return Err(e);
                 }
             };
             let reader = SstReaderImpl::open(rac).inspect_err(|_| {
-                Self::cleanup_ingested(&new_files);
+                self.cleanup_ingested(&new_files);
             })?;
             let mut footer = reader.footer().clone();
 
@@ -1152,13 +1163,6 @@ impl DbImpl {
             // closed; rewriting via tmp+rename below produces a fresh inode
             // and breaks any hardlink with `src`.
             drop(reader);
-            if footer.cf_id != cf.id() {
-                footer.cf_id = cf.id();
-                if let Err(e) = Self::rewrite_sst_footer(&dest, &footer, file_size) {
-                    Self::cleanup_ingested(&new_files);
-                    return Err(e);
-                }
-            }
 
             let meta = SstFileMeta {
                 file_number,
@@ -1171,8 +1175,20 @@ impl DbImpl {
                 num_entries: footer.total_entries,
             };
 
+            // R51-H3: register `dest` in `new_files` BEFORE attempting the
+            // footer rewrite. If the rewrite fails, `cleanup_ingested` below
+            // will unlink it — otherwise it would leak (orphan-scan keys on
+            // `*.sst.tmp`, not on bare `<N>.sst`).
             new_ids.push(file_number.value());
-            new_files.push((file_number, dest, meta));
+            new_files.push((file_number, dest.clone(), meta));
+
+            if footer.cf_id != cf.id() {
+                footer.cf_id = cf.id();
+                if let Err(e) = self.rewrite_sst_footer(&dest, &footer, file_size) {
+                    self.cleanup_ingested(&new_files);
+                    return Err(e);
+                }
+            }
         }
 
         // Phase 2: install all new SSTs at L0 in a single VersionEdit.
@@ -1199,7 +1215,7 @@ impl DbImpl {
             ..Default::default()
         };
         if let Err(e) = self.version_set.apply(&edit) {
-            Self::cleanup_ingested(&new_files);
+            self.cleanup_ingested(&new_files);
             return Err(e);
         }
 
@@ -1270,9 +1286,14 @@ impl DbImpl {
     /// failed. Errors are intentionally swallowed (the surfaced error is
     /// the original failure that triggered cleanup; cleanup failures
     /// would only obscure it).
-    fn cleanup_ingested(new_files: &[(FileNumber, PathBuf, SstFileMeta)]) {
+    ///
+    /// Routes through `self.fs` so the wrapping `CachedFileSystem` /
+    /// router invalidates any cached bytes / metadata for the destination
+    /// path; otherwise a re-ingest under the same file-number could see
+    /// stale cached contents from the failed attempt.
+    fn cleanup_ingested(&self, new_files: &[(FileNumber, PathBuf, SstFileMeta)]) {
         for (_, dest, _) in new_files {
-            let _ = std::fs::remove_file(dest);
+            let _ = self.fs.delete_file(dest);
         }
     }
 
@@ -1300,29 +1321,37 @@ impl DbImpl {
     /// that the post-rewrite size matches so a future regression that
     /// changes the v2 layout (and therefore the footer length) surfaces
     /// here instead of silently shifting all reader offsets.
+    ///
+    /// R51-H1 / R51-H2 / R51-L1: every file op routes through `self.fs`
+    /// (so the wrapping `CachedFileSystem` invalidates the stale cache
+    /// the temp reader populated at `open_random_access_file` above; if we
+    /// went through `std::fs` directly the cache would still hold the
+    /// pre-rewrite bytes and R50-H3's footer-cf_id check would reject
+    /// every read of the ingested SST). The rename is followed by a
+    /// `sync_dir(parent)` so the directory-entry update is durable
+    /// (closing the R49-H3 gap re-introduced by the previous `std::fs`
+    /// path). The body bytes are written straight to the tmp file
+    /// instead of being spliced through a second equal-sized `Vec` —
+    /// avoids 2× peak allocation on 64 MiB SSTs.
     fn rewrite_sst_footer(
+        &self,
         dest: &Path,
         new_footer: &forst_rs_storage::sst::FooterV1,
         expected_file_size: u64,
     ) -> ForstResult<()> {
-        use std::io::{Read, Write};
-        use forst_rs_storage::sst::{FOOTER_TAIL_SIZE};
+        use forst_rs_storage::sst::FOOTER_TAIL_SIZE;
 
-        // Read the trailing 8 bytes to discover the existing footer
-        // length (matches `SstReaderImpl::open`'s parse).
-        let mut src_file = std::fs::File::open(dest).map_err(|e| {
-            ForstError::Io(std::io::Error::new(
-                e.kind(),
-                format!(
-                    "rewrite_sst_footer: open {} for read: {e}",
-                    dest.display()
-                ),
-            ))
+        // Open the dest via the engine's FileSystem and confirm its
+        // on-disk size matches what the caller measured. Going through
+        // `self.fs` ensures CachedFileSystem (or any wrapping FS)
+        // observes the read and stays consistent with the later rename.
+        let src = self.fs.open_random_access_file(dest).map_err(|e| {
+            ForstError::Io(std::io::Error::other(format!(
+                "rewrite_sst_footer: open {} for read: {e}",
+                dest.display()
+            )))
         })?;
-        let total_size = src_file
-            .metadata()
-            .map_err(|e| ForstError::Io(std::io::Error::other(format!("metadata: {e}"))))?
-            .len();
+        let total_size = src.file_size()?;
         if total_size != expected_file_size {
             return Err(ForstError::corruption(format!(
                 "rewrite_sst_footer: file size {} != expected {}",
@@ -1338,16 +1367,22 @@ impl DbImpl {
         }
 
         // Pull the entire file contents into memory. SST files are
-        // typically 64 MiB; reading the whole thing into a Vec keeps the
-        // logic simple and matches the existing ingest path's I/O shape.
-        let mut all_bytes = Vec::with_capacity(total_size as usize);
-        src_file.read_to_end(&mut all_bytes).map_err(|e| {
-            ForstError::Io(std::io::Error::other(format!(
-                "rewrite_sst_footer: read {} failed: {e}",
-                dest.display()
-            )))
-        })?;
-        drop(src_file);
+        // typically 64 MiB; reading the whole thing keeps the logic
+        // simple and matches the existing ingest path's I/O shape.
+        let mut all_bytes = vec![0u8; total_size as usize];
+        let mut filled = 0usize;
+        while filled < all_bytes.len() {
+            let n = src.read_at(filled as u64, &mut all_bytes[filled..])?;
+            if n == 0 {
+                return Err(ForstError::corruption(format!(
+                    "rewrite_sst_footer: short read at offset {} of {}",
+                    filled,
+                    all_bytes.len()
+                )));
+            }
+            filled += n;
+        }
+        drop(src);
 
         // The last 8 bytes carry: footer_length(4) | magic(4). Decode
         // footer_length to slice off the original footer.
@@ -1373,62 +1408,66 @@ impl DbImpl {
             )));
         }
 
-        // Splice the body bytes with the new footer in a single Vec and
-        // write to a tmp sibling for atomic rename.
-        let mut out = Vec::with_capacity(all_bytes.len());
-        out.extend_from_slice(&all_bytes[..body_end]);
-        out.extend_from_slice(&new_footer_bytes);
-
         let mut tmp = dest.as_os_str().to_owned();
         tmp.push(".cf-rewrite.tmp");
         let tmp_path = PathBuf::from(tmp);
 
         // Best-effort: remove any stale tmp from a previous failed
         // attempt before opening the new one (CreateNew would otherwise
-        // error out).
-        let _ = std::fs::remove_file(&tmp_path);
+        // error out). Route through `self.fs` for consistency.
+        let _ = self.fs.delete_file(&tmp_path);
 
+        // R51-L1: write the body slice and the new footer directly to
+        // the tmp file in two `append` calls instead of splicing through
+        // a second `Vec<u8>` of the full file size. Cuts peak memory of
+        // an ingest rewrite from 2× SST size to 1× SST size.
         {
-            let mut tmp_file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)
+            let mut tmp_file = self
+                .fs
+                .open_writable_file(&tmp_path, WriteMode::CreateNew)
                 .map_err(|e| {
-                    ForstError::Io(std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "rewrite_sst_footer: create {} failed: {e}",
-                            tmp_path.display()
-                        ),
-                    ))
+                    ForstError::Io(std::io::Error::other(format!(
+                        "rewrite_sst_footer: create {} failed: {e}",
+                        tmp_path.display()
+                    )))
                 })?;
-            tmp_file.write_all(&out).map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                ForstError::Io(std::io::Error::other(format!(
-                    "rewrite_sst_footer: write {} failed: {e}",
-                    tmp_path.display()
-                )))
-            })?;
-            tmp_file.sync_all().map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                ForstError::Io(std::io::Error::other(format!(
-                    "rewrite_sst_footer: fsync {} failed: {e}",
-                    tmp_path.display()
-                )))
-            })?;
+            if let Err(e) = tmp_file.append(&all_bytes[..body_end]) {
+                let _ = self.fs.delete_file(&tmp_path);
+                return Err(e);
+            }
+            if let Err(e) = tmp_file.append(&new_footer_bytes) {
+                let _ = self.fs.delete_file(&tmp_path);
+                return Err(e);
+            }
+            if let Err(e) = tmp_file.sync() {
+                let _ = self.fs.delete_file(&tmp_path);
+                return Err(e);
+            }
         }
 
         // Atomic rename over the original. This breaks any hardlink to
         // the caller-supplied source path because the destination inode
-        // is replaced.
-        std::fs::rename(&tmp_path, dest).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
+        // is replaced. `CachedFileSystem::rename` invalidates the cache
+        // entries for both `src` and `dst`, so the next read of `dest`
+        // sees the new footer bytes instead of the stale cached body.
+        self.fs.rename(&tmp_path, dest).map_err(|e| {
+            let _ = self.fs.delete_file(&tmp_path);
             ForstError::Io(std::io::Error::other(format!(
                 "rewrite_sst_footer: rename {} -> {} failed: {e}",
                 tmp_path.display(),
                 dest.display()
             )))
         })?;
+
+        // R49-H3 / R51-H2: fsync the parent directory so the rename's
+        // directory-entry change survives a power-loss event. On the
+        // tiered router the `parent_of_sst` is a directory (no `.sst`
+        // extension) so the call lands on `local_fs.sync_dir`; the
+        // router's R51-M1 fix below also fans it out to the remote FS
+        // (object stores treat it as a no-op).
+        if let Some(parent) = dest.parent() {
+            self.fs.sync_dir(parent)?;
+        }
         Ok(())
     }
 
