@@ -1080,8 +1080,14 @@ impl DbImpl {
             })?;
             let footer = reader.footer().clone();
 
+            // R49-H1: ingested SSTs are stamped with the target CF's id so
+            // the engine treats them like any other per-CF file. v1 footers
+            // decode with `cf_id = DEFAULT_CF_ID`; if the caller asked to
+            // ingest into a non-default CF, we override the legacy default
+            // (the ingest contract says the caller owns CF visibility).
             let meta = SstFileMeta {
                 file_number,
+                cf_id: cf.id(),
                 file_size,
                 smallest_key: footer.min_key.clone(),
                 largest_key: footer.max_key.clone(),
@@ -2157,15 +2163,36 @@ impl DbImpl {
     }
 
     fn compact_once(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<bool> {
-        // Priority 1: drain L0 if any files exist.
-        if !self.version_set.current().l0_files().is_empty() {
+        // R49-H1: filter by cf_id so an unrelated CF's L0 doesn't spuriously
+        // trigger a compaction here that `compact_l0_for_cf` will then no-op
+        // (because its own cf_id filter returns an empty input set). Without
+        // this, `compact_all` walks every CF and for each one keeps looping
+        // because L0 still has SOME files (from other CFs) — an infinite
+        // loop in the multi-CF case.
+        let cf_id = cf_data.handle().id();
+        let version = self.version_set.current();
+        let has_my_l0 = version.l0_files().iter().any(|f| f.cf_id == cf_id);
+        if has_my_l0 {
             self.compact_l0_for_cf(cf_data)?;
             return Ok(true);
         }
         // Priority 2: pick the deepest level that exceeds its size budget.
+        // pick_compaction_level is currently CF-oblivious (it scans the
+        // global level totals); compact_level_for_cf filters by cf_id and
+        // returns None if there's nothing for this CF to compact, so we
+        // additionally check that some file at the picked level belongs to
+        // us before recursing into compaction work for this CF — otherwise
+        // we'd hit the same spin pattern as the L0 priority above.
         let Some(level) = self.pick_compaction_level() else {
             return Ok(false);
         };
+        let has_my_files_at_level = version.levels[level as usize]
+            .files
+            .iter()
+            .any(|f| f.cf_id == cf_id);
+        if !has_my_files_at_level {
+            return Ok(false);
+        }
         self.compact_level_for_cf(cf_data, level)?;
         Ok(true)
     }
@@ -2210,7 +2237,16 @@ impl DbImpl {
         if level_idx >= version.num_levels() {
             return Ok(None);
         }
-        let src_files: Vec<SstFileMeta> = version.levels[level_idx].files.clone();
+        // R49-H1: scope compaction to this CF's files only. Without the
+        // cf_id filter, an inter-level compaction could pull SSTs from other
+        // CFs into this CF's output, silently merging key streams across CFs.
+        let cf_id = cf_data.handle().id();
+        let src_files: Vec<SstFileMeta> = version.levels[level_idx]
+            .files
+            .iter()
+            .filter(|f| f.cf_id == cf_id)
+            .cloned()
+            .collect();
         if src_files.is_empty() {
             return Ok(None);
         }
@@ -2219,7 +2255,12 @@ impl DbImpl {
             // Can't go deeper — the engine is at max depth. Treat as no-op.
             return Ok(None);
         }
-        let dst_candidates: Vec<SstFileMeta> = version.levels[next_level].files.clone();
+        let dst_candidates: Vec<SstFileMeta> = version.levels[next_level]
+            .files
+            .iter()
+            .filter(|f| f.cf_id == cf_id)
+            .cloned()
+            .collect();
 
         // Compute the key range spanned by src_files; pull any dst file
         // whose range overlaps.
@@ -2267,6 +2308,7 @@ impl DbImpl {
         let writer_options = SstWriterOptions {
             block_size: self.options.block_size,
             compression: self.options.compression,
+            cf_id: cf_data.handle().id(),
         };
 
         // Snapshot the registry's min-active sequence ONCE per pass so the
@@ -2276,6 +2318,7 @@ impl DbImpl {
         // -looking, not retroactive. See spec §6a.5.
         let min_active_snapshot = self.snapshot_registry.min_active();
         let job = CompactionJob {
+            cf_id: cf_data.handle().id(),
             inputs,
             output_level: next_level as u32,
             output_file_number,
@@ -2399,7 +2442,7 @@ impl DbImpl {
         // the apply_lock is held, compaction's `apply` is blocked, so once
         // our pin lands `can_delete()` returns false and the unlink defers
         // to `pending_deletions`.
-        let (snapshot, live, _pin) =
+        let (mut snapshot, live, _pin) =
             self.version_set
                 .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
                     let live = snap.version.live_sst_files();
@@ -2408,14 +2451,27 @@ impl DbImpl {
                     let pin = self.deletion_guard.pin_batch(&file_numbers);
                     (snap.clone(), live, pin)
                 });
+        // R49-H2: stamp CF descriptors onto the snapshot so the blob persists
+        // the CF set. Restore re-registers every CF before returning so callers
+        // do not have to track CF order or re-issue create_column_family.
+        snapshot.cf_descriptors = self.collect_cf_descriptors();
         let blob = serialize_snapshot(&snapshot)?;
 
-        // 5. Ensure target dir exists, write blob + copy every live SST.
+        // R49-M1: copy live SSTs FIRST, write the blob LAST. The blob is the
+        // crash-recovery anchor — a valid blob that references SSTs not yet
+        // copied is worse than no blob at all (restore would observe missing
+        // files and refuse). The write_blob path already uses tmp+rename for
+        // atomicity (R39-H2) and now fsyncs the parent dir afterwards
+        // (R49-H3) so a mid-write crash leaves either: (a) no blob — restore
+        // sees the directory but no manifest and refuses gracefully, or
+        // (b) a valid blob whose every referenced SST is fully copied and
+        // synced.
         self.fs.create_dir_all(target_dir)?;
-        write_blob(self.fs.as_ref(), target_dir, &blob)?;
 
         let (sst_bytes, sst_files) =
             copy_live_ssts(self.fs.as_ref(), &self.db_path, target_dir, &live)?;
+
+        write_blob(self.fs.as_ref(), target_dir, &blob)?;
 
         // PinHandle is released here when `_pin` drops; any deletions that
         // were deferred during the checkpoint will be reaped on the next
@@ -2703,6 +2759,43 @@ impl DbImpl {
 
         let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
+
+        // R49-H2: re-register every non-default CF that the blob recorded.
+        // This frees operators from having to track CF order and re-issue
+        // `create_column_family` after restore. Restoration creates each CF
+        // *without* a merge operator or compaction filter, because the
+        // operator instances are runtime objects the engine cannot
+        // resurrect from a string name alone. The blob's recorded
+        // (merge_op_name, filter_name) pair is exposed via
+        // [`restored_cf_descriptors`] so callers that DO have those
+        // operator handles can install them post-open via
+        // [`set_compaction_filter`] (the merge operator is fixed-at-create;
+        // for now restored CFs always come up without one — a future PR can
+        // accept an operator registry parameter here). Callers that don't
+        // need the policy hooks (e.g. read-only verification) get the
+        // correct CF set with no extra work.
+        for cf in &snapshot.cf_descriptors {
+            if cf.cf_id == DEFAULT_CF_ID {
+                continue;
+            }
+            let desc = ColumnFamilyDescriptor::new(cf.name.clone());
+            // Best-effort: bump next_cf_id past every restored id so future
+            // `create_column_family` doesn't collide.
+            let cur = db.next_cf_id.load(Ordering::SeqCst);
+            if cf.cf_id.value() >= cur {
+                db.next_cf_id
+                    .store(cf.cf_id.value() + 1, Ordering::SeqCst);
+            }
+            // We bypass the homogeneity check (the restored set is by
+            // construction whatever the engine had at snapshot time; the
+            // descriptors carry only NAMES, not operator instances, so the
+            // by-string check would falsely reject mixed-policy CFs we are
+            // legitimately resurrecting). `create_cf_with_id` is the
+            // engine's id-preserving path used at open time for the default
+            // CF; reusing it here preserves the on-disk cf_id mapping.
+            db.create_cf_with_id(cf.cf_id, desc)?;
+        }
+
         Self::spawn_flush_worker(&db);
         Self::spawn_snapshot_age_worker(&db);
         Ok(db)
@@ -3002,12 +3095,26 @@ impl DbImpl {
         // compaction both rewrite the on-disk layer.
         let _guard = cf_data.lock_flush();
 
+        // R49-H1: only roll up this CF's L0 files (and overlap into this CF's
+        // L1 files). Without the filter, an L0→L1 rollup could fold another
+        // CF's data into this CF's stream.
+        let cf_id = cf_data.handle().id();
         let version = self.version_set.current();
-        let l0_files: Vec<SstFileMeta> = version.l0_files().to_vec();
+        let l0_files: Vec<SstFileMeta> = version
+            .l0_files()
+            .iter()
+            .filter(|f| f.cf_id == cf_id)
+            .cloned()
+            .collect();
         if l0_files.is_empty() {
             return Ok(None);
         }
-        let l1_files: Vec<SstFileMeta> = version.levels[1].files.clone();
+        let l1_files: Vec<SstFileMeta> = version.levels[1]
+            .files
+            .iter()
+            .filter(|f| f.cf_id == cf_id)
+            .cloned()
+            .collect();
 
         // Gather input readers.
         let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> = Vec::new();
@@ -3030,12 +3137,14 @@ impl DbImpl {
         let writer_options = SstWriterOptions {
             block_size: self.options.block_size,
             compression: self.options.compression,
+            cf_id: cf_data.handle().id(),
         };
 
         // Snapshot the registry's min-active sequence ONCE per pass — see
         // the matching read in `compact_level_for_cf` for rationale.
         let min_active_snapshot = self.snapshot_registry.min_active();
         let job = CompactionJob {
+            cf_id: cf_data.handle().id(),
             inputs,
             output_level: 1,
             output_file_number,
@@ -3722,13 +3831,18 @@ impl DbImpl {
         // Allocate a fresh file number and build the flush job.
         let file_number = self.version_set.allocate_file_number();
         let path = sst_file_path(&self.db_path, file_number);
+        // R49-H1: stamp cf_id onto the writer options so the resulting SST
+        // footer + SstFileMeta carry CF identity through the LSM. `FlushJob::new`
+        // will also overwrite `cf_id` defensively in case a caller pre-set it.
         let writer_opts = SstWriterOptions {
             block_size: self.options.block_size,
             compression: self.options.compression,
+            cf_id: cf_data.handle().id(),
         };
         let job = FlushJob::new(
             oldest.clone(),
             file_number,
+            cf_data.handle().id(),
             path.clone(),
             writer_opts,
             self.fs.clone(),
@@ -4288,6 +4402,13 @@ impl DbImpl {
     /// Searches the SST layers for `key`. Returns the resolved user value
     /// (None for missing / tombstoned) — including full merge chains that
     /// start in the SST layer.
+    ///
+    /// R49-H1: SST files are filtered by `cf_id` so this CF only sees its
+    /// own SSTs. Without this filter, two CFs writing the same user-key
+    /// would corrupt each other's reads after flush (cross-CF SST read
+    /// corruption). The check is a single u32 comparison per file in the
+    /// candidate set, performed BEFORE `sst_lookup` opens / probes the
+    /// file — so it is essentially free on the hot read path.
     fn sst_get(
         &self,
         cf_data: &Arc<ColumnFamilyData>,
@@ -4295,8 +4416,13 @@ impl DbImpl {
         key: &[u8],
         merge_operands: &mut Vec<Vec<u8>>,
     ) -> ForstResult<Option<Vec<u8>>> {
+        let cf_id = cf_data.handle().id();
         // L0: iterate newest → oldest. L0 files may overlap; each is checked.
         for sst in version.l0_files().iter().rev() {
+            // R49-H1: skip SSTs from other CFs.
+            if sst.cf_id != cf_id {
+                continue;
+            }
             if let Some(res) = self.sst_lookup(sst, key)? {
                 match res.op_type {
                     OpType::Put => {
@@ -4336,11 +4462,21 @@ impl DbImpl {
         }
 
         // L1..Ln: at most one candidate per level.
+        //
+        // R49-H1 nuance: `find_sst_for_key` searches by key range across ALL
+        // CFs at the level (today's VersionSet is global). The cf_id filter
+        // below makes this safe by gating the actual file access on
+        // `sst.cf_id == cf_id`. A future per-CF VersionSet (referenced in
+        // `open_from_checkpoint`'s docs) will narrow the search itself, at
+        // which point this filter becomes defense-in-depth.
         for level in 1..version.num_levels() {
             let Some(idx) = version.find_sst_for_key(level, key) else {
                 continue;
             };
             let sst = &version.levels[level].files[idx];
+            if sst.cf_id != cf_id {
+                continue;
+            }
             if let Some(res) = self.sst_lookup(sst, key)? {
                 match res.op_type {
                     OpType::Put => {
@@ -4519,12 +4655,17 @@ impl DbImpl {
     ///   no base — the caller treats this as "base is empty".
     fn peel_merges_from_sst(
         &self,
-        _cf_data: &Arc<ColumnFamilyData>,
+        cf_data: &Arc<ColumnFamilyData>,
         key: &[u8],
         operands: &mut Vec<Vec<u8>>,
     ) -> ForstResult<Option<Vec<u8>>> {
+        // R49-H1: scope merge-peeling to the calling CF's SSTs.
+        let cf_id = cf_data.handle().id();
         let version = self.version_set.current();
         for sst in version.l0_files().iter().rev() {
+            if sst.cf_id != cf_id {
+                continue;
+            }
             if let Some(res) = self.sst_lookup(sst, key)? {
                 match res.op_type {
                     OpType::Put => return Ok(res.value),
@@ -4542,6 +4683,9 @@ impl DbImpl {
                 continue;
             };
             let sst = &version.levels[level].files[idx];
+            if sst.cf_id != cf_id {
+                continue;
+            }
             if let Some(res) = self.sst_lookup(sst, key)? {
                 match res.op_type {
                     OpType::Put => return Ok(res.value),
@@ -4592,6 +4736,32 @@ impl DbImpl {
                 }
             }
         }
+    }
+
+    /// R49-H2: collect a `CfDescriptor` snapshot for every currently-open
+    /// CF. Sorted by cf_id so the blob's CF table has a deterministic order
+    /// (helps diff-based debugging; the restore path doesn't depend on it).
+    fn collect_cf_descriptors(&self) -> Vec<forst_rs_storage::version::CfDescriptor> {
+        use forst_rs_storage::version::CfDescriptor;
+        let cfs = self.cfs.read().expect("lock poisoned");
+        let mut entries: Vec<&Arc<ColumnFamilyData>> = cfs.values().collect();
+        entries.sort_by_key(|cf| cf.handle().id().value());
+        entries
+            .into_iter()
+            .map(|cf| CfDescriptor {
+                cf_id: cf.handle().id(),
+                name: cf.handle().name().to_string(),
+                merge_op_name: cf
+                    .merge_operator()
+                    .map(|op| op.name())
+                    .unwrap_or_default(),
+                filter_name: cf
+                    .compaction_filter()
+                    .as_ref()
+                    .map(|f| f.name())
+                    .unwrap_or_default(),
+            })
+            .collect()
     }
 
     pub(crate) fn lookup_cf_by_id(&self, id: ColumnFamilyId) -> ForstResult<Arc<ColumnFamilyData>> {

@@ -25,18 +25,58 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber, MAX_LEVELS};
+use forst_rs_common::{
+    ColumnFamilyId, FileNumber, ForstError, ForstResult, SequenceNumber, DEFAULT_CF_ID, MAX_LEVELS,
+};
 
 /// Metadata for a single SST file.
+///
+/// R49-H1 (cross-CF SST read corruption): `cf_id` identifies which column
+/// family this SST belongs to. The engine MUST gate file access on
+/// `meta.cf_id == cf_data.id()` so two CFs writing the same user-key never
+/// observe each other's values after flush. Older SSTs (format version < 2)
+/// that lack a persisted cf_id in their footer are decoded with
+/// `cf_id = DEFAULT_CF_ID` for backwards compatibility.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SstFileMeta {
     pub file_number: FileNumber,
+    /// R49-H1: column family that produced this SST. Set by `FlushJob` /
+    /// `CompactionJob` at write time. Persisted in the SST footer (v2+)
+    /// for restore-time validation; restore from a v1 footer falls back
+    /// to [`DEFAULT_CF_ID`].
+    pub cf_id: ColumnFamilyId,
     pub file_size: u64,
     pub smallest_key: Vec<u8>,
     pub largest_key: Vec<u8>,
     pub min_sequence: SequenceNumber,
     pub max_sequence: SequenceNumber,
     pub num_entries: u64,
+}
+
+impl SstFileMeta {
+    /// Convenience constructor for legacy call sites (tests, restore paths)
+    /// that pre-date R49-H1's cf_id field — they get [`DEFAULT_CF_ID`] which
+    /// matches the on-disk v1 footer fallback.
+    pub fn new_default_cf(
+        file_number: FileNumber,
+        file_size: u64,
+        smallest_key: Vec<u8>,
+        largest_key: Vec<u8>,
+        min_sequence: SequenceNumber,
+        max_sequence: SequenceNumber,
+        num_entries: u64,
+    ) -> Self {
+        Self {
+            file_number,
+            cf_id: DEFAULT_CF_ID,
+            file_size,
+            smallest_key,
+            largest_key,
+            min_sequence,
+            max_sequence,
+            num_entries,
+        }
+    }
 }
 
 /// Metadata for a single LSM-tree level.
@@ -269,12 +309,32 @@ pub struct VersionEdit {
     pub last_sequence: Option<SequenceNumber>,
 }
 
+/// R49-H2: a single column family's identity, persisted in the checkpoint
+/// blob so restore can reconstruct the CF set without operator intervention.
+/// The `merge_op_name` and `filter_name` carry the by-value identity strings
+/// returned by `MergeOperator::name()` / `CompactionFilter::name()`; empty
+/// strings represent "no operator" / "no filter".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfDescriptor {
+    pub cf_id: ColumnFamilyId,
+    pub name: String,
+    /// Empty string when the CF was created without a merge operator.
+    pub merge_op_name: String,
+    /// Empty string when the CF was created without a compaction filter.
+    pub filter_name: String,
+}
+
 /// A frozen snapshot of the VersionSet state at a point in time.
 #[derive(Debug, Clone)]
 pub struct VersionSetSnapshot {
     pub version: Arc<Version>,
     pub next_file_number: u64,
     pub last_sequence: u64,
+    /// R49-H2: descriptors for every column family the engine had open at
+    /// snapshot time. Persisted into the checkpoint blob so restore can
+    /// re-register them. Empty for legacy v1 blobs (decoded as "assume
+    /// DEFAULT_CF only").
+    pub cf_descriptors: Vec<CfDescriptor>,
 }
 
 /// Lock-free reads + serialized writes for version management.
@@ -351,11 +411,19 @@ impl VersionSetImpl {
     }
 
     /// Atomically take a snapshot of the current state.
+    ///
+    /// `cf_descriptors` is empty here — callers that want CF metadata
+    /// persisted into the checkpoint blob (R49-H2) must populate the field
+    /// themselves after this returns (the version layer doesn't own CF
+    /// state; the engine layer does). See
+    /// [`forst_rs_engine::DbImpl::create_checkpoint`] for the call site
+    /// that does this.
     pub fn snapshot(&self) -> VersionSetSnapshot {
         VersionSetSnapshot {
             version: self.current.load_full(),
             next_file_number: self.next_file_number.load(Ordering::SeqCst),
             last_sequence: self.last_sequence.load(Ordering::SeqCst),
+            cf_descriptors: Vec::new(),
         }
     }
 
@@ -384,6 +452,7 @@ impl VersionSetImpl {
             version: self.current.load_full(),
             next_file_number: self.next_file_number.load(Ordering::SeqCst),
             last_sequence: self.last_sequence.load(Ordering::SeqCst),
+            cf_descriptors: Vec::new(),
         };
         f(&snap)
     }
@@ -423,6 +492,7 @@ mod tests {
     fn make_file(num: u64, smallest: &[u8], largest: &[u8]) -> SstFileMeta {
         SstFileMeta {
             file_number: FileNumber(num),
+            cf_id: DEFAULT_CF_ID,
             file_size: 1024,
             smallest_key: smallest.to_vec(),
             largest_key: largest.to_vec(),

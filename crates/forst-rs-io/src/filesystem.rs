@@ -160,6 +160,23 @@ pub trait FileSystem: Send + Sync {
     /// and SST file rotation).
     fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()>;
 
+    /// R49-H3: fsync the directory at `dir` so any prior `rename()` /
+    /// create / unlink of a file inside it survives a power-loss event.
+    /// POSIX requires this for the directory entry change to be durable
+    /// even after the renamed file's own contents are fsynced.
+    ///
+    /// Implementations:
+    /// * `LocalFileSystem` opens the directory with `O_RDONLY` and fsyncs
+    ///   the descriptor.
+    /// * Memory / object-store / OpenDAL backends are no-ops — they have
+    ///   no notion of a kernel-cached directory entry.
+    ///
+    /// Default implementation is a no-op so non-POSIX backends don't need
+    /// to override.
+    fn sync_dir(&self, _dir: &Path) -> ForstResult<()> {
+        Ok(())
+    }
+
     /// Returns a human-readable name for this filesystem implementation.
     fn name(&self) -> &str;
 

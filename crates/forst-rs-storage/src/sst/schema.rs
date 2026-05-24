@@ -26,7 +26,14 @@ use arrow::datatypes::{DataType, Field, Schema};
 pub const SST_MAGIC: &[u8; 4] = b"FRST";
 
 /// Current SST file format version.
-pub const SST_FORMAT_VERSION: u16 = 1;
+///
+/// Version history:
+/// * `1` — initial layout (no per-CF identification).
+/// * `2` — adds `cf_id: u32` at the end of the fixed-field area of
+///   [`super::footer::FooterV1`] to enforce per-CF SST isolation (R49-H1).
+///   v1 footers continue to decode; their `cf_id` defaults to
+///   [`forst_rs_common::DEFAULT_CF_ID`].
+pub const SST_FORMAT_VERSION: u16 = 2;
 
 /// Block type discriminant for data blocks.
 pub const BLOCK_TYPE_DATA: u8 = 0x01;
@@ -105,7 +112,8 @@ mod tests {
 
     #[test]
     fn test_format_version() {
-        assert_eq!(SST_FORMAT_VERSION, 1);
+        // v2: footer carries cf_id (R49-H1).
+        assert_eq!(SST_FORMAT_VERSION, 2);
     }
 
     #[test]

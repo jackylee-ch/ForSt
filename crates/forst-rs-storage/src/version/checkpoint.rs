@@ -37,6 +37,7 @@
 //! |     num_files: u32 (LE)                  |
 //! |     for each file:                       |
 //! |       file_number: u64 (LE)              |
+//! |       cf_id: u32 (LE)             [v2+]  |
 //! |       file_size: u64 (LE)                |
 //! |       smallest_key_len: u32 (LE)         |
 //! |       smallest_key: [u8]                 |
@@ -46,6 +47,17 @@
 //! |       max_sequence: u64 (LE)             |
 //! |       num_entries: u64 (LE)              |
 //! +------------------------------------------+
+//! | CF Descriptors                    [v2+]  |
+//! |   num_cfs: u32 (LE)                      |
+//! |   for each CF:                           |
+//! |     cf_id: u32 (LE)                      |
+//! |     name_len: u32 (LE)                   |
+//! |     name: [u8]                           |
+//! |     merge_op_name_len: u32 (LE)          |
+//! |     merge_op_name: [u8] (empty = None)   |
+//! |     filter_name_len: u32 (LE)            |
+//! |     filter_name: [u8] (empty = None)     |
+//! +------------------------------------------+
 //! | Footer (12 bytes)                        |
 //! |   checksum: u32 (CRC32C of all above)    |
 //! |   blob_length: u64 (LE, total incl footer)|
@@ -53,8 +65,8 @@
 //! ```
 
 use forst_rs_common::{
-    crc32c, get_fixed32, get_fixed64, put_fixed32, put_fixed64, FileNumber, ForstError,
-    ForstResult, SequenceNumber, MAX_LEVELS,
+    crc32c, get_fixed32, get_fixed64, put_fixed32, put_fixed64, ColumnFamilyId, FileNumber,
+    ForstError, ForstResult, SequenceNumber, DEFAULT_CF_ID, MAX_LEVELS,
 };
 
 use super::{LevelMeta, SstFileMeta, Version, VersionSetImpl, VersionSetSnapshot};
@@ -63,7 +75,22 @@ use super::{LevelMeta, SstFileMeta, Version, VersionSetImpl, VersionSetSnapshot}
 const CHECKPOINT_MAGIC: &[u8; 4] = b"FRCP";
 
 /// Current format version.
-const FORMAT_VERSION: u16 = 1;
+///
+/// Version history:
+/// * `1` — initial layout (no per-CF metadata, files lack cf_id).
+/// * `2` — adds per-file `cf_id` (R49-H1) and a trailing CF descriptors
+///   table (R49-H2). v1 blobs decode with `cf_id = DEFAULT_CF_ID` and an
+///   empty CF descriptor list ("assume DEFAULT_CF only").
+const FORMAT_VERSION: u16 = 2;
+
+/// R49-H2: defense-in-depth cap on the number of CF descriptors in a blob.
+/// Way above any sane user limit; protects against OOM-DoS from a crafted blob.
+const MAX_CFS_PER_CHECKPOINT: u32 = 4096;
+
+/// R49-H2: defense-in-depth cap on per-string length when decoding CF
+/// descriptors (name, merge_op_name, filter_name). 64 KiB is hilariously
+/// above any sane registered name.
+const MAX_CF_STRING_LEN: u32 = 64 * 1024;
 
 /// Defense-in-depth cap on `num_files` per level decoded from a checkpoint
 /// blob. Prevents OOM-DoS from a crafted blob claiming `num_files = u32::MAX`
@@ -79,6 +106,10 @@ const HEADER_SIZE: usize = 16;
 const FOOTER_SIZE: usize = 12;
 
 /// Serialize a VersionSetSnapshot to a checkpoint blob.
+///
+/// R49-H1 + R49-H2: emits format v2, which carries per-file `cf_id` and a
+/// trailing CF descriptors table. The decoder accepts both v1 (legacy, no
+/// per-CF metadata) and v2.
 pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> {
     let mut buf = Vec::with_capacity(4096);
 
@@ -101,6 +132,8 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
 
         for file in &level.files {
             put_fixed64(&mut buf, file.file_number.value());
+            // R49-H1: per-file cf_id (v2+).
+            put_fixed32(&mut buf, file.cf_id.value());
             put_fixed64(&mut buf, file.file_size);
 
             // smallest_key
@@ -115,6 +148,21 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
             put_fixed64(&mut buf, file.max_sequence.value());
             put_fixed64(&mut buf, file.num_entries);
         }
+    }
+
+    // --- R49-H2: CF descriptor table (v2+) ---
+    put_fixed32(&mut buf, snapshot.cf_descriptors.len() as u32);
+    for cf in &snapshot.cf_descriptors {
+        put_fixed32(&mut buf, cf.cf_id.value());
+        let name_bytes = cf.name.as_bytes();
+        put_fixed32(&mut buf, name_bytes.len() as u32);
+        buf.extend_from_slice(name_bytes);
+        let merge_bytes = cf.merge_op_name.as_bytes();
+        put_fixed32(&mut buf, merge_bytes.len() as u32);
+        buf.extend_from_slice(merge_bytes);
+        let filter_bytes = cf.filter_name.as_bytes();
+        put_fixed32(&mut buf, filter_bytes.len() as u32);
+        buf.extend_from_slice(filter_bytes);
     }
 
     // --- Footer ---
@@ -147,12 +195,13 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         return Err(ForstError::corruption("invalid checkpoint magic"));
     }
     let version = u16::from_le_bytes([data[4], data[5]]);
-    if version != FORMAT_VERSION {
+    if version != 1 && version != FORMAT_VERSION {
         return Err(ForstError::corruption(format!(
             "unsupported checkpoint format version: {}",
             version
         )));
     }
+    let is_v2 = version >= 2;
     // flags at [6..8] -- reserved, ignore
     let blob_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
     if blob_size != data.len() as u64 {
@@ -212,6 +261,14 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         for _ in 0..num_files {
             let (file_number, n) = get_fixed64(&data[pos..])?;
             pos += n;
+            // R49-H1: v2+ carries cf_id; v1 blobs default to DEFAULT_CF_ID.
+            let cf_id = if is_v2 {
+                let (raw, n) = get_fixed32(&data[pos..])?;
+                pos += n;
+                ColumnFamilyId(raw)
+            } else {
+                DEFAULT_CF_ID
+            };
             let (file_size, n) = get_fixed64(&data[pos..])?;
             pos += n;
 
@@ -240,6 +297,7 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
 
             files.push(SstFileMeta {
                 file_number: FileNumber(file_number),
+                cf_id,
                 file_size,
                 smallest_key,
                 largest_key,
@@ -255,11 +313,42 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         });
     }
 
-    // R31-M2: after parsing N levels × M files, `pos` must land exactly on
-    // the footer start. Any gap means the encoder wrote extra padding (or a
-    // mismatched length field elsewhere bumped pos past where we expect) —
-    // both are corruption indicators that earlier length-checked reads can
-    // miss when the over-read still fits inside footer_start.
+    // R49-H2: CF descriptor table (v2+). Empty list for v1 (legacy fallback).
+    let cf_descriptors = if is_v2 {
+        let (num_cfs, n) = get_fixed32(&data[pos..])?;
+        pos += n;
+        if num_cfs > MAX_CFS_PER_CHECKPOINT {
+            return Err(ForstError::corruption(format!(
+                "checkpoint num_cfs {} exceeds cap {}",
+                num_cfs, MAX_CFS_PER_CHECKPOINT
+            )));
+        }
+        let mut cfs = Vec::with_capacity(num_cfs as usize);
+        for _ in 0..num_cfs {
+            let (cf_id_raw, n) = get_fixed32(&data[pos..])?;
+            pos += n;
+            let name = read_bounded_string(data, &mut pos, footer_start, "cf name")?;
+            let merge_op_name =
+                read_bounded_string(data, &mut pos, footer_start, "cf merge_op name")?;
+            let filter_name = read_bounded_string(data, &mut pos, footer_start, "cf filter name")?;
+            cfs.push(crate::version::CfDescriptor {
+                cf_id: ColumnFamilyId(cf_id_raw),
+                name,
+                merge_op_name,
+                filter_name,
+            });
+        }
+        cfs
+    } else {
+        Vec::new()
+    };
+
+    // R31-M2: after parsing N levels × M files (+ optional v2 CF table),
+    // `pos` must land exactly on the footer start. Any gap means the
+    // encoder wrote extra padding (or a mismatched length field
+    // elsewhere bumped pos past where we expect) — both are corruption
+    // indicators that earlier length-checked reads can miss when the
+    // over-read still fits inside footer_start.
     if pos != footer_start {
         return Err(ForstError::corruption(format!(
             "checkpoint meta-blob trailing-byte mismatch: parsed up to {}, footer starts at {}",
@@ -271,10 +360,46 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         version: std::sync::Arc::new(Version { levels }),
         next_file_number,
         last_sequence,
+        cf_descriptors,
     })
 }
 
+/// Helper: decode a length-prefixed UTF-8 string, bounds-checking against
+/// `MAX_CF_STRING_LEN` and `footer_start`. Empty length is allowed
+/// (represents "no merge operator" / "no compaction filter").
+fn read_bounded_string(
+    data: &[u8],
+    pos: &mut usize,
+    footer_start: usize,
+    what: &str,
+) -> ForstResult<String> {
+    let (len, n) = get_fixed32(&data[*pos..])?;
+    *pos += n;
+    if len > MAX_CF_STRING_LEN {
+        return Err(ForstError::corruption(format!(
+            "checkpoint {} length {} exceeds cap {}",
+            what, len, MAX_CF_STRING_LEN
+        )));
+    }
+    if *pos + len as usize > footer_start {
+        return Err(ForstError::corruption(format!(
+            "checkpoint {} extends past data",
+            what
+        )));
+    }
+    let s = std::str::from_utf8(&data[*pos..*pos + len as usize])
+        .map_err(|e| ForstError::corruption(format!("checkpoint {} not valid UTF-8: {}", what, e)))?
+        .to_owned();
+    *pos += len as usize;
+    Ok(s)
+}
+
 /// Convenience: restore a full VersionSetImpl from a checkpoint blob.
+///
+/// Note: the CF descriptor list is dropped — only the VersionSet state
+/// (file layout, counters) is materialised here. Engine-level callers
+/// that need CF descriptors should call [`restore_from_blob`] directly
+/// and consume the `cf_descriptors` field.
 pub fn restore_version_set(data: &[u8]) -> ForstResult<VersionSetImpl> {
     let snapshot = restore_from_blob(data)?;
     let version = (*snapshot.version).clone();
@@ -295,6 +420,7 @@ mod tests {
     fn make_file(num: u64, smallest: &[u8], largest: &[u8]) -> SstFileMeta {
         SstFileMeta {
             file_number: FileNumber(num),
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
             file_size: 4096,
             smallest_key: smallest.to_vec(),
             largest_key: largest.to_vec(),
@@ -313,6 +439,7 @@ mod tests {
             version: Arc::new(version),
             next_file_number: 42,
             last_sequence: 1000,
+            cf_descriptors: Vec::new(),
         }
     }
 
@@ -322,6 +449,7 @@ mod tests {
             version: Arc::new(Version::new()),
             next_file_number: 1,
             last_sequence: 0,
+            cf_descriptors: Vec::new(),
         };
         let blob = serialize_to_blob(&snap).unwrap();
         assert!(blob.len() >= HEADER_SIZE + FOOTER_SIZE);
@@ -334,12 +462,57 @@ mod tests {
             version: Arc::new(Version::new()),
             next_file_number: 1,
             last_sequence: 0,
+            cf_descriptors: Vec::new(),
         };
         let blob = serialize_to_blob(&snap).unwrap();
         let restored = restore_from_blob(&blob).unwrap();
         assert_eq!(restored.next_file_number, 1);
         assert_eq!(restored.last_sequence, 0);
         assert_eq!(restored.version.levels.len(), MAX_LEVELS);
+        assert!(restored.cf_descriptors.is_empty());
+    }
+
+    /// R49-H2: CF descriptors round-trip through the blob.
+    #[test]
+    fn test_roundtrip_cf_descriptors() {
+        use crate::version::CfDescriptor;
+        let snap = VersionSetSnapshot {
+            version: Arc::new(Version::new()),
+            next_file_number: 1,
+            last_sequence: 0,
+            cf_descriptors: vec![
+                CfDescriptor {
+                    cf_id: forst_rs_common::DEFAULT_CF_ID,
+                    name: "default".to_string(),
+                    merge_op_name: String::new(),
+                    filter_name: String::new(),
+                },
+                CfDescriptor {
+                    cf_id: ColumnFamilyId(7),
+                    name: "windows".to_string(),
+                    merge_op_name: "ListAppend".to_string(),
+                    filter_name: "TtlFilter(7d)".to_string(),
+                },
+            ],
+        };
+        let blob = serialize_to_blob(&snap).unwrap();
+        let restored = restore_from_blob(&blob).unwrap();
+        assert_eq!(restored.cf_descriptors.len(), 2);
+        assert_eq!(restored.cf_descriptors[1].name, "windows");
+        assert_eq!(restored.cf_descriptors[1].merge_op_name, "ListAppend");
+        assert_eq!(restored.cf_descriptors[1].filter_name, "TtlFilter(7d)");
+        assert_eq!(restored.cf_descriptors[1].cf_id, ColumnFamilyId(7));
+    }
+
+    /// R49-H1: a v2 blob round-trips per-file cf_id.
+    #[test]
+    fn test_roundtrip_cf_id_per_file() {
+        let mut f = make_file(1, b"a", b"z");
+        f.cf_id = ColumnFamilyId(42);
+        let snap = make_snapshot(vec![(0, f)]);
+        let blob = serialize_to_blob(&snap).unwrap();
+        let restored = restore_from_blob(&blob).unwrap();
+        assert_eq!(restored.version.levels[0].files[0].cf_id, ColumnFamilyId(42));
     }
 
     #[test]

@@ -29,7 +29,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 
 use arrow::array::{Array, BinaryArray, UInt64Array, UInt8Array};
-use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber};
+use forst_rs_common::{ColumnFamilyId, FileNumber, ForstError, ForstResult, SequenceNumber};
 use forst_rs_io::{FileSystem, WriteMode};
 use forst_rs_storage::sst::{SstFileInfo, SstWriterImpl, SstWriterOptions};
 use forst_rs_storage::version::SstFileMeta;
@@ -68,6 +68,10 @@ pub(crate) fn sst_temp_path(path: &Path) -> PathBuf {
 pub struct FlushJob {
     memtable: SharedMemTable,
     file_number: FileNumber,
+    /// R49-H1: column family that owns the memtable being flushed. Stamped
+    /// onto the resulting SST footer and `SstFileMeta` so per-CF SST
+    /// isolation is enforced end-to-end.
+    cf_id: ColumnFamilyId,
     file_path: PathBuf,
     options: SstWriterOptions,
     fs: Arc<dyn FileSystem>,
@@ -77,16 +81,25 @@ impl FlushJob {
     /// Constructs a new flush job. The `file_path` must be an absolute or
     /// engine-relative path at which the SST file will be written. The
     /// memtable must already be frozen.
+    ///
+    /// R49-H1: `cf_id` is captured from the caller's
+    /// [`ColumnFamilyData::handle().id()`] so the produced SST carries
+    /// CF identity all the way through the LSM. The writer options'
+    /// `cf_id` field is overwritten with this value — callers should
+    /// not pre-set it.
     pub fn new(
         memtable: SharedMemTable,
         file_number: FileNumber,
+        cf_id: ColumnFamilyId,
         file_path: PathBuf,
-        options: SstWriterOptions,
+        mut options: SstWriterOptions,
         fs: Arc<dyn FileSystem>,
     ) -> Self {
+        options.cf_id = cf_id;
         Self {
             memtable,
             file_number,
+            cf_id,
             file_path,
             options,
             fs,
@@ -213,9 +226,23 @@ impl FlushJob {
             let _ = self.fs.delete_file(&tmp_path);
             return Err(e);
         }
+        // R49-H3: fsync(parent_dir) so the rename's directory entry change
+        // is durable. Without this, a power-loss event between rename and
+        // the next checkpoint could leave the directory entry pointing at
+        // nothing (the file inode survives but the dirent doesn't), so
+        // the SST goes missing on restart.
+        if let Err(e) = self.fs.sync_dir(parent) {
+            tracing::warn!(
+                "FlushJob: sync_dir({}) failed after rename: {} (R49-H3); \
+                 SST contents are on disk but the directory entry may be \
+                 lost on power-failure restart",
+                parent.display(),
+                e
+            );
+        }
 
         // 4. Build the SstFileMeta that the VersionSet will record.
-        Ok(Self::info_to_meta(self.file_number, info))
+        Ok(Self::info_to_meta(self.file_number, self.cf_id, info))
     }
 
     fn temp_path(&self) -> PathBuf {
@@ -224,9 +251,15 @@ impl FlushJob {
         sst_temp_path(&self.file_path)
     }
 
-    fn info_to_meta(file_number: FileNumber, info: SstFileInfo) -> SstFileMeta {
+    fn info_to_meta(file_number: FileNumber, cf_id: ColumnFamilyId, info: SstFileInfo) -> SstFileMeta {
+        // R49-H1: stamp cf_id onto the meta record so the engine's `sst_get`
+        // and friends can filter by CF. We assert agreement with the writer-
+        // side value to catch any future drift between `SstWriterOptions::cf_id`
+        // and the `SstFileMeta::cf_id` install path.
+        debug_assert_eq!(info.cf_id, cf_id);
         SstFileMeta {
             file_number,
+            cf_id,
             file_size: info.file_size,
             smallest_key: info.min_key,
             largest_key: info.max_key,
@@ -368,7 +401,7 @@ pub(crate) fn flush_loop<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forst_rs_common::{CompressionType, OpType};
+    use forst_rs_common::{CompressionType, OpType, DEFAULT_CF_ID};
     use forst_rs_io::MemoryFileSystem;
     use forst_rs_storage::memtable::ShardedMemTable;
 
@@ -387,6 +420,7 @@ mod tests {
         SstWriterOptions {
             block_size: 4 * 1024,
             compression: CompressionType::None,
+            cf_id: DEFAULT_CF_ID,
         }
     }
 
@@ -398,6 +432,7 @@ mod tests {
         let job = FlushJob::new(
             shared,
             FileNumber(1),
+            DEFAULT_CF_ID,
             PathBuf::from("/db/000001.sst"),
             default_writer_opts(),
             fs,
@@ -415,6 +450,7 @@ mod tests {
         let job = FlushJob::new(
             shared,
             FileNumber(1),
+            DEFAULT_CF_ID,
             PathBuf::from("/db/000001.sst"),
             default_writer_opts(),
             fs,
@@ -435,12 +471,14 @@ mod tests {
         let job = FlushJob::new(
             mem,
             FileNumber(7),
+            DEFAULT_CF_ID,
             path.clone(),
             default_writer_opts(),
             fs.clone(),
         );
         let meta = job.run().unwrap();
         assert_eq!(meta.file_number, FileNumber(7));
+        assert_eq!(meta.cf_id, DEFAULT_CF_ID);
         assert_eq!(meta.num_entries, 3);
         assert_eq!(meta.smallest_key, b"a");
         assert_eq!(meta.largest_key, b"c");
@@ -455,6 +493,7 @@ mod tests {
         let job = FlushJob::new(
             mem,
             FileNumber(1),
+            DEFAULT_CF_ID,
             path.clone(),
             default_writer_opts(),
             fs.clone(),
@@ -481,6 +520,7 @@ mod tests {
         let job = FlushJob::new(
             shared,
             FileNumber(1),
+            DEFAULT_CF_ID,
             PathBuf::from("/db/000001.sst"),
             default_writer_opts(),
             fs,
@@ -510,6 +550,7 @@ mod tests {
         let job = FlushJob::new(
             shared,
             FileNumber(42),
+            DEFAULT_CF_ID,
             PathBuf::from("/db/000042.sst"),
             default_writer_opts(),
             fs,
@@ -529,6 +570,7 @@ mod tests {
         let job = FlushJob::new(
             mem,
             FileNumber(1),
+            DEFAULT_CF_ID,
             deep.clone(),
             default_writer_opts(),
             fs.clone(),

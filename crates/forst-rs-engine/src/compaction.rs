@@ -27,7 +27,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use forst_rs_common::{FileNumber, ForstError, ForstResult, SequenceNumber};
+use forst_rs_common::{ColumnFamilyId, FileNumber, ForstError, ForstResult, SequenceNumber};
 use forst_rs_io::{FileSystem, WritableFile};
 use forst_rs_storage::merge_operator::MergeOperator;
 use forst_rs_storage::sst::{
@@ -42,6 +42,11 @@ use crate::mvcc;
 /// Description of a single compaction task: merge `inputs` into a new file
 /// `output_file_number` placed at level `output_level`.
 pub struct CompactionJob {
+    /// R49-H1: column family this compaction belongs to. Stamped onto the
+    /// output `SstFileMeta` and the SST footer so per-CF SST isolation is
+    /// enforced through compaction as well as flush. Every input meta must
+    /// agree with this cf_id (debug-asserted on entry).
+    pub cf_id: ColumnFamilyId,
     pub inputs: Vec<(u32 /* level */, SstFileMeta, Arc<SstReaderImpl>)>,
     pub output_level: u32,
     pub output_file_number: FileNumber,
@@ -77,6 +82,22 @@ impl CompactionJob {
     /// because the merge sort outlives each individual block's
     /// `RecordBatch`).
     pub fn run(self) -> ForstResult<Option<VersionEdit>> {
+        // R49-H1 defense-in-depth: every input must already belong to the
+        // same CF as the compaction job. The engine-side caller (db.rs)
+        // builds compaction inputs by reading one CF's file list, so a
+        // cross-CF input here would be a structural bug — we trip a debug
+        // assertion and continue in release. Once the engine wires per-CF
+        // version lists this check becomes a hard error.
+        for (_, meta, _) in &self.inputs {
+            debug_assert_eq!(
+                meta.cf_id, self.cf_id,
+                "CompactionJob cf_id {:?} ≠ input file {} cf_id {:?} — cross-CF input",
+                self.cf_id,
+                meta.file_number.value(),
+                meta.cf_id,
+            );
+        }
+
         // 1. Gather every entry from every input SST, tagging each with the
         //    source file_number so we can break ties when two SSTs use the
         //    same memtable-local sequence (each VectorizedMemTable starts
@@ -165,7 +186,10 @@ impl CompactionJob {
             let mut wf = self
                 .fs
                 .open_writable_file(&tmp_path, forst_rs_io::WriteMode::CreateNew)?;
-            let writer_opts = self.writer_options.clone();
+            // R49-H1: stamp this compaction's cf_id onto the writer options so
+            // the resulting SST footer + SstFileMeta carry CF identity.
+            let mut writer_opts = self.writer_options.clone();
+            writer_opts.cf_id = self.cf_id;
             let writer_inner = SstWriterImpl::with_options(writer_opts);
             let mut writer = writer_inner.streaming(&mut *wf);
 
@@ -254,10 +278,26 @@ impl CompactionJob {
             let _ = self.fs.delete_file(&tmp_path);
             return Err(e);
         }
+        // R49-H3: fsync(parent_dir) so the rename's directory entry change
+        // is durable across a power-loss event. Best-effort: a failure here
+        // leaves the SST contents on disk; the next checkpoint cycle will
+        // re-attempt the dirent sync via its own copy_live_ssts pass.
+        if let Some(parent) = self.output_path.parent() {
+            if let Err(e) = self.fs.sync_dir(parent) {
+                tracing::warn!(
+                    "CompactionJob: sync_dir({}) failed after rename: {} (R49-H3)",
+                    parent.display(),
+                    e
+                );
+            }
+        }
 
         // 6. Build the VersionEdit: add the new file, remove all inputs.
+        // R49-H1: stamp the job's cf_id onto the meta record.
+        debug_assert_eq!(info.cf_id, self.cf_id);
         let meta = SstFileMeta {
             file_number: self.output_file_number,
+            cf_id: self.cf_id,
             file_size: info.file_size,
             smallest_key: info.min_key,
             largest_key: info.max_key,

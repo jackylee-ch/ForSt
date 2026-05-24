@@ -51,6 +51,7 @@ fn write_and_verify(n: usize, compression: CompressionType, block_size: usize) {
     let options = SstWriterOptions {
         block_size,
         compression,
+        cf_id: forst_rs_common::DEFAULT_CF_ID,
     };
     let mut writer = SstWriterImpl::with_options(options);
 
@@ -70,7 +71,13 @@ fn write_and_verify(n: usize, compression: CompressionType, block_size: usize) {
     // 1. FileHeader
     assert_eq!(&data[..4], SST_MAGIC);
     let header = FileHeader::decode(&data[..FILE_HEADER_SIZE]).unwrap();
-    assert_eq!(header.format_version, 1);
+    // R49-H1: writer emits SST_FORMAT_VERSION (now 2 after the cf_id footer
+    // bump). We assert against the constant rather than a literal so future
+    // version bumps don't drift this test out of sync.
+    assert_eq!(
+        header.format_version,
+        forst_rs_storage::sst::SST_FORMAT_VERSION
+    );
 
     // 2. Footer (from tail)
     let len = data.len();
@@ -164,6 +171,7 @@ fn test_e2e_search_index_point_lookup() {
     let options = SstWriterOptions {
         block_size: 256,
         compression: CompressionType::None,
+        cf_id: forst_rs_common::DEFAULT_CF_ID,
     };
     let mut writer = SstWriterImpl::with_options(options);
 
@@ -215,6 +223,7 @@ fn test_e2e_bloom_filter_filters_keys() {
     let options = SstWriterOptions {
         block_size: 512,
         compression: CompressionType::None,
+        cf_id: forst_rs_common::DEFAULT_CF_ID,
     };
     let mut writer = SstWriterImpl::with_options(options);
 
@@ -292,6 +301,7 @@ fn test_m2_write_10k_read_all() {
     let options = SstWriterOptions {
         block_size: 4096,
         compression: CompressionType::Lz4,
+        cf_id: forst_rs_common::DEFAULT_CF_ID,
     };
     let mut writer = SstWriterImpl::with_options(options);
 
@@ -339,6 +349,7 @@ fn test_m2_bloom_filter_fpr_below_1_percent() {
     let mut writer = SstWriterImpl::with_options(SstWriterOptions {
         block_size: 4096,
         compression: CompressionType::None,
+        cf_id: forst_rs_common::DEFAULT_CF_ID,
     });
     for i in 0..n {
         let key = format!("bfp_{:06}", i);
@@ -383,6 +394,7 @@ fn test_m2_reader_full_pipeline_with_deletes() {
     let mut writer = SstWriterImpl::with_options(SstWriterOptions {
         block_size: 2048,
         compression: CompressionType::Lz4,
+        cf_id: forst_rs_common::DEFAULT_CF_ID,
     });
 
     // Mix of puts and deletes

@@ -28,9 +28,9 @@
 //! 20      bloom_filter_size   4     u32 LE
 //! 24      index_offset        8     u64 LE
 //! 32      index_size          4     u32 LE
-//! 36      min_key_offset      4     u32 LE  (always = 76)
+//! 36      min_key_offset      4     u32 LE  (= 76 for v1, 80 for v2)
 //! 40      min_key_len         2     u16 LE
-//! 42      max_key_offset      4     u32 LE  (always = 76 + min_key_len)
+//! 42      max_key_offset      4     u32 LE  (= min_key_offset + min_key_len)
 //! 46      max_key_len         2     u16 LE
 //! 48      min_sequence        8     u64 LE
 //! 56      max_sequence        8     u64 LE
@@ -38,23 +38,32 @@
 //! 65      checksum_type       1     u8
 //! 66      creation_time       8     u64 LE
 //! 74      format_version      2     u16 LE
-//! --- 76 bytes fixed fields ---
-//! 76      [min_key bytes]     variable
-//! 76+mkl  [max_key bytes]     variable
-//!         footer_checksum     4     u32 LE (masked CRC32C of everything before)
-//!         footer_length       4     u32 LE (total footer size incl. length + magic)
-//!         magic               4     b"FRST"
+//! --- 76 bytes (v1 fixed fields end) ---
+//! 76      cf_id               4     u32 LE  (R49-H1, v2+ only)
+//! --- 80 bytes (v2 fixed fields end) ---
+//! [min_key_offset] [min_key bytes]    variable
+//! [max_key_offset] [max_key bytes]    variable
+//!                  footer_checksum     4     u32 LE (masked CRC32C of everything before)
+//!                  footer_length       4     u32 LE (total footer size incl. length + magic)
+//!                  magic               4     b"FRST"
 //! ```
 
 use forst_rs_common::{
-    crc32c, get_fixed32, get_fixed64, mask_crc, put_fixed32, put_fixed64, CompressionType,
-    ForstError, ForstResult,
+    crc32c, get_fixed32, get_fixed64, mask_crc, put_fixed32, put_fixed64, ColumnFamilyId,
+    CompressionType, ForstError, ForstResult, DEFAULT_CF_ID,
 };
 
 use super::schema::SST_MAGIC;
 
-/// Size in bytes of the fixed-field portion of a V1 footer (before variable-length keys).
-pub const FOOTER_FIXED_FIELDS_SIZE: usize = 76;
+/// Size in bytes of the v1 fixed-field portion of the footer (legacy compat).
+pub const FOOTER_FIXED_FIELDS_SIZE_V1: usize = 76;
+
+/// Size in bytes of the v2 fixed-field portion of the footer (adds cf_id).
+pub const FOOTER_FIXED_FIELDS_SIZE_V2: usize = 80;
+
+/// Backwards-compatible alias for callers that expect the current writer-
+/// side size. Always equals the v2 size since v2 is the writer's emit format.
+pub const FOOTER_FIXED_FIELDS_SIZE: usize = FOOTER_FIXED_FIELDS_SIZE_V2;
 
 /// Size in bytes of the footer tail: checksum (4) + length (4) + magic (4).
 pub const FOOTER_TAIL_SIZE: usize = 12;
@@ -90,10 +99,14 @@ impl ChecksumType {
 // FooterV1
 // ---------------------------------------------------------------------------
 
-/// A variable-length footer that closes every SST file (format version 1).
+/// A variable-length footer that closes every SST file (format version 2).
 ///
 /// The footer carries section offsets, key-range statistics, and a CRC32C
 /// integrity checksum. See the [module docs](self) for the full binary layout.
+///
+/// Despite the historical name `FooterV1`, this struct represents the
+/// current footer encoding (v2 as of R49-H1). The `format_version` field
+/// discriminates v1 (no cf_id) from v2 (cf_id persisted) on decode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FooterV1 {
     /// Number of data blocks in the SST file.
@@ -124,6 +137,10 @@ pub struct FooterV1 {
     pub creation_time: u64,
     /// SST format version (should match [`super::schema::SST_FORMAT_VERSION`]).
     pub format_version: u16,
+    /// R49-H1: column family that produced this SST. Only persisted for
+    /// `format_version >= 2`. Decoding a v1 footer fills this with
+    /// [`DEFAULT_CF_ID`] so legacy SSTs continue to be readable.
+    pub cf_id: ColumnFamilyId,
 }
 
 impl FooterV1 {
@@ -132,27 +149,32 @@ impl FooterV1 {
     /// The returned buffer includes the fixed fields, variable-length keys,
     /// a masked CRC32C checksum, the total footer length, and the trailing
     /// magic bytes.
+    ///
+    /// R49-H1: the writer always emits v2 fixed-field layout (80 bytes,
+    /// trailing `cf_id`). The decoder accepts v1 (76 bytes) for backwards
+    /// compatibility with SSTs produced before R49-H1.
     pub fn encode(&self) -> Vec<u8> {
         let min_key_len = self.min_key.len() as u16;
         let max_key_len = self.max_key.len() as u16;
-        let total_size =
-            FOOTER_FIXED_FIELDS_SIZE + self.min_key.len() + self.max_key.len() + FOOTER_TAIL_SIZE;
+        // R49-H1: writer always emits the v2 layout (cf_id appended to the
+        // fixed-field area). `min_key_offset` and `max_key_offset` are
+        // relative to the v2 fixed-field size so decoders parse the keys at
+        // the correct location regardless of whether they understand cf_id.
+        let fixed_size = FOOTER_FIXED_FIELDS_SIZE_V2;
+        let total_size = fixed_size + self.min_key.len() + self.max_key.len() + FOOTER_TAIL_SIZE;
 
         let mut buf = Vec::with_capacity(total_size);
 
-        // Fixed fields (76 bytes)
+        // Fixed fields (80 bytes for v2).
         put_fixed32(&mut buf, self.data_block_count);
         put_fixed64(&mut buf, self.total_entries);
         put_fixed64(&mut buf, self.bloom_filter_offset);
         put_fixed32(&mut buf, self.bloom_filter_size);
         put_fixed64(&mut buf, self.index_offset);
         put_fixed32(&mut buf, self.index_size);
-        put_fixed32(&mut buf, FOOTER_FIXED_FIELDS_SIZE as u32); // min_key_offset
+        put_fixed32(&mut buf, fixed_size as u32); // min_key_offset
         buf.extend_from_slice(&min_key_len.to_le_bytes());
-        put_fixed32(
-            &mut buf,
-            (FOOTER_FIXED_FIELDS_SIZE as u32) + (min_key_len as u32),
-        ); // max_key_offset
+        put_fixed32(&mut buf, (fixed_size as u32) + (min_key_len as u32)); // max_key_offset
         buf.extend_from_slice(&max_key_len.to_le_bytes());
         put_fixed64(&mut buf, self.min_sequence);
         put_fixed64(&mut buf, self.max_sequence);
@@ -161,7 +183,11 @@ impl FooterV1 {
         put_fixed64(&mut buf, self.creation_time);
         buf.extend_from_slice(&self.format_version.to_le_bytes());
 
-        debug_assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE);
+        debug_assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE_V1);
+
+        // R49-H1: v2-only cf_id at offset 76.
+        put_fixed32(&mut buf, self.cf_id.value());
+        debug_assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE_V2);
 
         // Variable-length keys
         buf.extend_from_slice(&self.min_key);
@@ -183,9 +209,14 @@ impl FooterV1 {
     /// reading the file tail to discover `footer_length`, then reading that
     /// many bytes).
     ///
+    /// R49-H1: accepts v1 (no cf_id) and v2 (cf_id at offset 76) footers.
+    /// v1 footers decode with `cf_id = DEFAULT_CF_ID` for backwards
+    /// compatibility — old SSTs predate per-CF SST isolation and are treated
+    /// as belonging to the default CF.
+    ///
     /// Returns [`ForstError::Corruption`] on any structural or checksum error.
     pub fn decode(data: &[u8]) -> ForstResult<Self> {
-        let min_size = FOOTER_FIXED_FIELDS_SIZE + FOOTER_TAIL_SIZE;
+        let min_size = FOOTER_FIXED_FIELDS_SIZE_V1 + FOOTER_TAIL_SIZE;
         if data.len() < min_size {
             return Err(ForstError::corruption(format!(
                 "footer too short: expected at least {} bytes, got {}",
@@ -242,6 +273,24 @@ impl FooterV1 {
         let (creation_time, _) = get_fixed64(&data[66..])?;
         let format_version = u16::from_le_bytes([data[74], data[75]]);
 
+        // R49-H1: read cf_id for v2+; v1 footers use DEFAULT_CF_ID.
+        // The discriminator is min_key_offset: v1 writers emitted 76, v2
+        // writers emit 80. The format_version alone is unreliable because
+        // a malicious or corrupted blob could claim v2 with v1-sized
+        // fixed-field area — using `min_key_offset` (which is bounds-
+        // validated against payload_end below) keeps the parse honest.
+        let cf_id = if (min_key_offset as usize) >= FOOTER_FIXED_FIELDS_SIZE_V2
+            && data.len() >= FOOTER_FIXED_FIELDS_SIZE_V2 + FOOTER_TAIL_SIZE
+        {
+            let (raw, _) = get_fixed32(&data[FOOTER_FIXED_FIELDS_SIZE_V1..])?;
+            ColumnFamilyId(raw)
+        } else {
+            // v1 fallback (or a corrupted v2 footer with a too-small
+            // min_key_offset). The downstream `min_key_end > payload_end`
+            // bounds check still catches the corruption case.
+            DEFAULT_CF_ID
+        };
+
         // Validate compression type
         let compression = match compression_byte {
             0 => CompressionType::None,
@@ -293,6 +342,7 @@ impl FooterV1 {
             checksum_type,
             creation_time,
             format_version,
+            cf_id,
         })
     }
 }
@@ -322,6 +372,7 @@ mod tests {
             checksum_type: ChecksumType::Crc32c,
             creation_time: 1_700_000_000_000,
             format_version: SST_FORMAT_VERSION,
+            cf_id: DEFAULT_CF_ID,
         }
     }
 
@@ -444,7 +495,9 @@ mod tests {
 
     #[test]
     fn test_decode_too_short() {
-        let min_size = FOOTER_FIXED_FIELDS_SIZE + FOOTER_TAIL_SIZE;
+        // R49-H1: the decoder allows the v1 minimum (FOOTER_FIXED_FIELDS_SIZE_V1
+        // + FOOTER_TAIL_SIZE), so we bound against the smaller v1 floor here.
+        let min_size = FOOTER_FIXED_FIELDS_SIZE_V1 + FOOTER_TAIL_SIZE;
         let short = vec![0u8; min_size - 1];
         let result = FooterV1::decode(&short);
         assert!(result.is_err());
@@ -477,7 +530,10 @@ mod tests {
 
     #[test]
     fn test_fixed_fields_size() {
-        assert_eq!(FOOTER_FIXED_FIELDS_SIZE, 76);
+        // R49-H1: writer emits v2 (80-byte) fixed-field area.
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE, 80);
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V1, 76);
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V2, 80);
     }
 
     #[test]
@@ -487,7 +543,65 @@ mod tests {
 
     #[test]
     fn test_min_size() {
-        assert_eq!(FOOTER_FIXED_FIELDS_SIZE + FOOTER_TAIL_SIZE, 88);
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE + FOOTER_TAIL_SIZE, 92);
+    }
+
+    /// R49-H1: a v1-encoded footer (no cf_id) decodes with
+    /// `cf_id = DEFAULT_CF_ID` so SSTs produced before R49-H1 remain
+    /// readable. We synthesise a v1 footer by hand (the live writer
+    /// only emits v2) and verify the round-trip.
+    #[test]
+    fn test_decode_v1_footer_defaults_cf_id() {
+        // Build a v1 footer (76-byte fixed area, format_version=1).
+        let min_key = b"aaa".to_vec();
+        let max_key = b"zzz".to_vec();
+        let total_size =
+            FOOTER_FIXED_FIELDS_SIZE_V1 + min_key.len() + max_key.len() + FOOTER_TAIL_SIZE;
+        let mut buf = Vec::with_capacity(total_size);
+        // Fixed fields, v1 layout.
+        put_fixed32(&mut buf, 10); // data_block_count
+        put_fixed64(&mut buf, 5000); // total_entries
+        put_fixed64(&mut buf, 16384); // bloom_filter_offset
+        put_fixed32(&mut buf, 2048); // bloom_filter_size
+        put_fixed64(&mut buf, 18432); // index_offset
+        put_fixed32(&mut buf, 512); // index_size
+        put_fixed32(&mut buf, FOOTER_FIXED_FIELDS_SIZE_V1 as u32); // min_key_offset
+        buf.extend_from_slice(&(min_key.len() as u16).to_le_bytes());
+        put_fixed32(
+            &mut buf,
+            (FOOTER_FIXED_FIELDS_SIZE_V1 + min_key.len()) as u32,
+        ); // max_key_offset
+        buf.extend_from_slice(&(max_key.len() as u16).to_le_bytes());
+        put_fixed64(&mut buf, 1); // min_sequence
+        put_fixed64(&mut buf, 5000); // max_sequence
+        buf.push(CompressionType::Lz4 as u8);
+        buf.push(ChecksumType::Crc32c as u8);
+        put_fixed64(&mut buf, 1_700_000_000_000); // creation_time
+        buf.extend_from_slice(&1u16.to_le_bytes()); // format_version = 1
+        assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE_V1);
+        buf.extend_from_slice(&min_key);
+        buf.extend_from_slice(&max_key);
+        // CRC + length + magic.
+        let checksum = mask_crc(crc32c(&buf));
+        put_fixed32(&mut buf, checksum);
+        put_fixed32(&mut buf, total_size as u32);
+        buf.extend_from_slice(SST_MAGIC);
+
+        let decoded = FooterV1::decode(&buf).expect("v1 footer must decode");
+        assert_eq!(decoded.format_version, 1);
+        assert_eq!(decoded.cf_id, DEFAULT_CF_ID, "v1 fallback must use DEFAULT_CF_ID");
+        assert_eq!(decoded.min_key, b"aaa");
+        assert_eq!(decoded.max_key, b"zzz");
+    }
+
+    /// R49-H1: a v2 footer encodes and decodes a non-default cf_id.
+    #[test]
+    fn test_roundtrip_cf_id_v2() {
+        let mut footer = sample_footer();
+        footer.cf_id = ColumnFamilyId(42);
+        let encoded = footer.encode();
+        let decoded = FooterV1::decode(&encoded).unwrap();
+        assert_eq!(decoded.cf_id, ColumnFamilyId(42));
     }
 
     // -----------------------------------------------------------------------

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::thread;
 
 use arrow::array::{Array, BinaryArray, UInt64Array};
-use forst_rs_common::{FileNumber, OpType, SequenceNumber};
+use forst_rs_common::{FileNumber, OpType, SequenceNumber, DEFAULT_CF_ID};
 use forst_rs_storage::cache::clock::ShardedClockCache;
 use forst_rs_storage::cache::{BlockCache, CacheEntry, CacheKey, CachePriority};
 use forst_rs_storage::memtable::{MemTableConfig, VectorizedMemTable};
@@ -49,6 +49,7 @@ fn large_memtable_config() -> MemTableConfig {
 fn make_file(num: u64, smallest: &[u8], largest: &[u8]) -> SstFileMeta {
     SstFileMeta {
         file_number: FileNumber(num),
+        cf_id: DEFAULT_CF_ID,
         file_size: 4096,
         smallest_key: smallest.to_vec(),
         largest_key: largest.to_vec(),
@@ -636,6 +637,7 @@ fn test_m3_checkpoint_serialize_restore_consistent() {
         version: Arc::new((*restored_snap.version).clone()),
         next_file_number: restored_snap.next_file_number,
         last_sequence: restored_snap.last_sequence,
+        cf_descriptors: restored_snap.cf_descriptors.clone(),
     };
     let blob2 = serialize_to_blob(&re_snap).unwrap();
     let re_restored = restore_from_blob(&blob2).unwrap();

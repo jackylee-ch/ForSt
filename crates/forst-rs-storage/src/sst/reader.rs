@@ -562,6 +562,7 @@ mod tests {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 4096,
             compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
         for i in 0..n {
             let key = format!("key_{:05}", i);
@@ -847,6 +848,7 @@ mod tests {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 4096,
             compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
         writer.add(b"aaa", Some(b"val"), 1, 1).unwrap(); // Put (OpType::Put = 1, RocksDB byte-compat)
         writer.add(b"bbb", None, 2, 0).unwrap(); // Delete (OpType::Delete = 0, RocksDB byte-compat)
@@ -886,6 +888,7 @@ mod tests {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 128,
             compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
         for i in 0..200u64 {
             let key = format!("mb_{:05}", i);
@@ -917,6 +920,7 @@ mod tests {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 4096,
             compression: CompressionType::Lz4,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
         for i in 0..100u64 {
             let key = format!("lz4_{:05}", i);
@@ -942,6 +946,7 @@ mod tests {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 4096,
             compression: CompressionType::Zstd,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
         for i in 0..100u64 {
             let key = format!("zstd_{:05}", i);
@@ -977,6 +982,7 @@ mod tests {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 4096,
             compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
         for i in 0..32u64 {
             writer
@@ -1045,6 +1051,7 @@ mod tests {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 256,
             compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
         for i in 0..100u64 {
             writer

@@ -292,6 +292,34 @@ impl FileSystem for LocalFileSystem {
         })
     }
 
+    /// R49-H3: fsync(parent_dir) so the prior rename / create / unlink
+    /// inside `dir` is durable on persistent storage. POSIX requires this
+    /// for the directory entry change to survive a power-loss event even
+    /// after the renamed file's contents have been fsynced.
+    ///
+    /// On Unix we open the directory with `O_RDONLY` and call `fsync(2)`
+    /// on the descriptor. `fsync` on a directory FD is the documented
+    /// POSIX primitive for this; ext4/xfs/btrfs all honour it. On
+    /// non-Unix targets (cross-compilation paths only) this falls back
+    /// to the default no-op — production deployments target Linux.
+    fn sync_dir(&self, dir: &Path) -> ForstResult<()> {
+        #[cfg(unix)]
+        {
+            let f = File::open(dir).map_err(|e| {
+                map_io_error(e, &format!("sync_dir open: {}", dir.display()))
+            })?;
+            f.sync_all().map_err(|e| {
+                map_io_error(e, &format!("sync_dir fsync: {}", dir.display()))
+            })?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+            Ok(())
+        }
+    }
+
     fn name(&self) -> &str {
         "LocalFileSystem"
     }

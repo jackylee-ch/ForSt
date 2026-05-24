@@ -44,6 +44,7 @@ fn build_sst_bytes(n: usize) -> Vec<u8> {
         // Force several blocks so the index/bloom paths are exercised.
         block_size: 4096,
         compression: CompressionType::Lz4,
+        cf_id: forst_rs_common::DEFAULT_CF_ID,
     });
     for i in 0..n {
         let key = format!("key_{i:06}");

@@ -29,7 +29,7 @@ use arrow::array::{ArrayBuilder, BinaryBuilder, RecordBatch, UInt64Builder, UInt
 use arrow::datatypes::Schema;
 
 use bytes::Bytes;
-use forst_rs_common::{CompressionType, ForstError, ForstResult};
+use forst_rs_common::{ColumnFamilyId, CompressionType, ForstError, ForstResult, DEFAULT_CF_ID};
 use forst_rs_io::filesystem::WritableFile;
 
 use super::bloom_filter::Sbbf;
@@ -56,6 +56,10 @@ pub struct SstFileInfo {
     pub min_sequence: u64,
     /// Largest sequence number.
     pub max_sequence: u64,
+    /// R49-H1: column family the writer was configured with. Returned so
+    /// callers can stamp it onto the resulting `SstFileMeta` without
+    /// shipping the descriptor around separately.
+    pub cf_id: ColumnFamilyId,
 }
 
 /// Options controlling SST file generation.
@@ -65,6 +69,10 @@ pub struct SstWriterOptions {
     pub block_size: usize,
     /// Compression algorithm for DataBlocks. Default: LZ4.
     pub compression: CompressionType,
+    /// R49-H1: column family this SST belongs to. Written into the footer
+    /// (v2+) so restore-time validation and runtime per-CF filtering can
+    /// gate access. Defaults to [`DEFAULT_CF_ID`] for legacy callers.
+    pub cf_id: ColumnFamilyId,
 }
 
 impl Default for SstWriterOptions {
@@ -72,6 +80,7 @@ impl Default for SstWriterOptions {
         Self {
             block_size: 64 * 1024,
             compression: CompressionType::Lz4,
+            cf_id: DEFAULT_CF_ID,
         }
     }
 }
@@ -412,6 +421,7 @@ impl SstWriterImpl {
             checksum_type: ChecksumType::Crc32c,
             creation_time,
             format_version: SST_FORMAT_VERSION,
+            cf_id: self.options.cf_id,
         };
         let footer_bytes = footer.encode();
         out.append(&footer_bytes)?;
@@ -425,6 +435,7 @@ impl SstWriterImpl {
             max_key,
             min_sequence: self.global_min_sequence,
             max_sequence: self.global_max_sequence,
+            cf_id: self.options.cf_id,
         };
         Ok(info)
     }
@@ -651,6 +662,7 @@ impl<'a, W: WritableFile + ?Sized> StreamingSstWriter<'a, W> {
             checksum_type: ChecksumType::Crc32c,
             creation_time,
             format_version: SST_FORMAT_VERSION,
+            cf_id: inner.options.cf_id,
         };
         let footer_bytes = footer.encode();
         self.sink.out.append(&footer_bytes)?;
@@ -664,6 +676,7 @@ impl<'a, W: WritableFile + ?Sized> StreamingSstWriter<'a, W> {
             max_key,
             min_sequence: inner.global_min_sequence,
             max_sequence: inner.global_max_sequence,
+            cf_id: inner.options.cf_id,
         })
     }
 }
@@ -790,6 +803,7 @@ mod tests {
         let options = SstWriterOptions {
             block_size: 128,
             compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         };
         let mut writer = SstWriterImpl::with_options(options);
         for i in 0..100u64 {
@@ -837,6 +851,7 @@ mod tests {
         let options = SstWriterOptions {
             block_size: 64,
             compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         };
         let mut writer = SstWriterImpl::with_options(options);
         for i in 0..50u64 {
@@ -866,6 +881,7 @@ mod tests {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 200,
             compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
         for i in 0..20u64 {
             let key = format!("key{:03}", i);
@@ -916,6 +932,7 @@ mod tests {
         let options = SstWriterOptions {
             block_size: 64 * 1024,
             compression: CompressionType::Lz4,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
         };
         let mut writer = SstWriterImpl::with_options(options);
         for i in 0..10u64 {

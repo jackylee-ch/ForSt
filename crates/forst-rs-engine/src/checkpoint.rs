@@ -107,6 +107,16 @@ pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64
         let _ = fs.delete_file(&tmp_path);
         return Err(e);
     }
+    // R49-H3: fsync(parent_dir) so the rename's dirent change is durable.
+    if let Some(parent) = dst.parent() {
+        if let Err(e) = fs.sync_dir(parent) {
+            tracing::warn!(
+                "copy_file: sync_dir({}) failed after rename: {} (R49-H3)",
+                parent.display(),
+                e
+            );
+        }
+    }
     Ok(total)
 }
 
@@ -131,6 +141,16 @@ pub fn write_blob(fs: &dyn FileSystem, target_dir: &Path, blob: &[u8]) -> ForstR
     if let Err(e) = fs.rename(&tmp_path, &final_path) {
         let _ = fs.delete_file(&tmp_path);
         return Err(e);
+    }
+    // R49-H3: fsync the checkpoint directory so the blob's dirent change
+    // (and any SST dirents from copy_live_ssts that ran earlier — R49-M1
+    // reorders the writer so copy precedes blob) is durable on power-loss.
+    if let Err(e) = fs.sync_dir(target_dir) {
+        tracing::warn!(
+            "write_blob: sync_dir({}) failed after rename: {} (R49-H3)",
+            target_dir.display(),
+            e
+        );
     }
     Ok(final_path)
 }
