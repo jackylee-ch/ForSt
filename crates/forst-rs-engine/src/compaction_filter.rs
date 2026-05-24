@@ -323,18 +323,24 @@ impl FlinkTtlCompactionFilter {
         }
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&value[self.timestamp_offset..end]);
-        // R81-H1: Flink's TtlSerializer writes the 8-byte timestamp via
-        // DataOutput.writeLong (big-endian) and the FFM wiring at
-        // ForStRsLinker.java:3385 documents "8-byte big-endian millisecond
-        // timestamp". Pre-fix this filter decoded as `from_le_bytes`,
-        // turning a BE-serialized timestamp into a huge u64 on x86/ARM;
-        // `now.saturating_sub(huge) == 0`, so the `> ttl_ms` comparison
-        // never tripped and expired rows were NEVER dropped on compaction.
-        // Tests passed because the helpers constructed values with
-        // `to_le_bytes()` — i.e. they exercised the broken endianness.
-        let ts = u64::from_be_bytes(buf);
+        // R81-H1 + R82-H1: Flink's TtlSerializer writes the 8-byte value
+        // as a big-endian EXPIRY timestamp (`record.getExpiryTimestamp()`,
+        // computed at write time as `now + ttlMillis`), and the read-side
+        // predicate is `currentTime > expiryTimestamp` (see
+        // `TtlValue.isExpired` and TtlSerializer.java:94). Pre-R81 the
+        // decoder was `from_le_bytes` (endianness wrong). R81 fixed the
+        // endianness but still computed `now.saturating_sub(ts) > ttl_ms`
+        // — treating the stored value as a CREATION timestamp. That
+        // made the effective drop point `2 * ttl_ms` past write, not
+        // `ttl_ms` (Flink's expiry already includes ttl_ms).
+        //
+        // The correct predicate is simply `now > expiry`. The `ttl_ms`
+        // field is retained on the struct for the legacy non-Flink
+        // `TtlCompactionFilter` semantics and for future API symmetry,
+        // but is not used by this filter's expiry decision.
+        let expiry_ms = u64::from_be_bytes(buf);
         let now = (self.current_time_supplier)();
-        now.saturating_sub(ts) > self.ttl_ms
+        now > expiry_ms
     }
 }
 
@@ -553,19 +559,21 @@ mod tests {
         Arc::new(move || now_ms)
     }
 
-    /// `Value` state: entry timestamped 100ms past TTL must be discarded.
-    /// Mirrors the expected behavior when Flink's wall clock has advanced
-    /// past the configured retention window.
+    /// `Value` state: entry whose EXPIRY timestamp is past `now` must be
+    /// discarded. R82-H1: Flink's TtlSerializer stores the EXPIRY
+    /// timestamp (not the creation timestamp); predicate is `now >
+    /// expiry`. ttl_ms is retained on the filter struct but does not
+    /// participate in the expiry decision.
     #[test]
     fn test_ttl_filter_value_expired() {
-        // ts=0, now=1100, ttl=1000 → age=1100 > 1000 → discard.
+        // expiry=500, now=1100 → 1100 > 500 → discard.
         let f = FlinkTtlCompactionFilter::with_supplier(
             1000,
             TtlStateType::Value,
             0,
             fixed_supplier(1100),
         );
-        let v = flink_value(b"", 0, b"payload");
+        let v = flink_value(b"", 500, b"payload");
         let mut out = Vec::new();
         assert_eq!(
             f.filter(0, b"k", Some(&v), 1, OpType::Put, &mut out),
@@ -586,17 +594,18 @@ mod tests {
         assert_ne!(f.name(), g.name());
     }
 
-    /// `Value` state: entry whose age is below TTL is kept verbatim.
+    /// `Value` state: entry whose EXPIRY timestamp is in the future is
+    /// kept verbatim. R82-H1 expiry-semantics shape (was age-based).
     #[test]
     fn test_ttl_filter_value_not_expired() {
-        // ts=900, now=1000, ttl=1000 → age=100 → keep.
+        // expiry=2000, now=1000 → 1000 !> 2000 → keep.
         let f = FlinkTtlCompactionFilter::with_supplier(
             1000,
             TtlStateType::Value,
             0,
             fixed_supplier(1000),
         );
-        let v = flink_value(b"", 900, b"payload");
+        let v = flink_value(b"", 2000, b"payload");
         let mut out = Vec::new();
         assert_eq!(
             f.filter(0, b"k", Some(&v), 1, OpType::Put, &mut out),
