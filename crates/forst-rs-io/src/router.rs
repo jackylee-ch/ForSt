@@ -199,10 +199,19 @@ impl FileSystemRouter {
         {
             return true;
         }
-        // Orphan timestamps: `<N>.sst.orphan-<ts>` and
-        // `.<N>.sst.tmp.orphan-<ts>`. Match the infixes against the
-        // filename only (not the whole path).
-        name.contains(".sst.orphan-") || name.contains(".sst.tmp.orphan-")
+        // Orphan timestamps:
+        //   <N>.sst.orphan-<ts>                 — orphan of bare SST
+        //   .<N>.sst.tmp.orphan-<ts>            — orphan of flush/compaction tmp
+        //   <N>.sst.cf-rewrite.tmp.orphan-<ts>  — orphan of rewrite_sst_footer tmp
+        // R54-M2: the cf-rewrite orphan rename target was missing from
+        // this list; without it, `Router::rename(src, dst)` rejected the
+        // restore-time rename as "cross-filesystem" because src matched
+        // `.sst.cf-rewrite.tmp` (remote) but dst matched nothing (local),
+        // leaving cf-rewrite tmp orphans permanently un-renamed on every
+        // restart in tiered mode.
+        name.contains(".sst.orphan-")
+            || name.contains(".sst.tmp.orphan-")
+            || name.contains(".sst.cf-rewrite.tmp.orphan-")
     }
 
     /// Returns the filesystem that should handle operations for `path`.
@@ -334,6 +343,14 @@ impl FileSystem for FileSystemRouter {
         // twice (second rename fails with "src not found").
         // Orphan-scan keys on `file_name()` anyway, so this is the
         // matching dimension.
+        //
+        // R54-M1: when an entry collides on `file_name()`, prefer the
+        // REMOTE-leg FileMetadata. SSTs (and their tmp / orphan shapes)
+        // route to the remote backend per `is_remote_file`, so the
+        // remote-leg path is the one the engine will use for subsequent
+        // open / rename / delete calls. Inserting the remote entry first
+        // means the dedup's "already seen" check filters the local
+        // duplicate.
         let cap = local_entries.len() + remote_entries.len();
         let mut merged: Vec<FileMetadata> = Vec::with_capacity(cap);
         let mut seen: std::collections::HashSet<std::ffi::OsString> =
@@ -352,10 +369,11 @@ impl FileSystem for FileSystemRouter {
                 None => merged.push(e),
             }
         };
-        for e in local_entries {
+        // Remote first so on conflict the remote-leg metadata wins.
+        for e in remote_entries {
             absorb(e, &mut merged, &mut seen);
         }
-        for e in remote_entries {
+        for e in local_entries {
             absorb(e, &mut merged, &mut seen);
         }
         Ok(merged)
@@ -601,6 +619,52 @@ mod tests {
         assert!(FileSystemRouter::is_remote_file(Path::new(
             "/db/.000042.sst.tmp.orphan-1234567890"
         )));
+        // R54-M2: <N>.sst.cf-rewrite.tmp.orphan-<ts> — restore-rename of
+        // a stranded cf-rewrite tmp (orphan-scan appends .orphan-<ts> to
+        // the existing cf-rewrite tmp filename).
+        assert!(FileSystemRouter::is_remote_file(Path::new(
+            "/db/000042.sst.cf-rewrite.tmp.orphan-1234567890"
+        )));
+    }
+
+    // R53-M3 negative: unrelated paths that contain `.sst.` as an infix
+    // (but not in a recognised suffix shape) must NOT be misrouted.
+    #[test]
+    fn test_is_remote_file_rejects_unrelated_sst_infix() {
+        assert!(!FileSystemRouter::is_remote_file(Path::new(
+            "/var/sst.cache/log"
+        )));
+        assert!(!FileSystemRouter::is_remote_file(Path::new(
+            "/db/foo.sst.config"
+        )));
+        assert!(!FileSystemRouter::is_remote_file(Path::new(
+            "archive.sst.zip"
+        )));
+    }
+
+    // R54-M2: orphan-scan rename of a stranded cf-rewrite tmp
+    // (`<N>.sst.cf-rewrite.tmp` → `<N>.sst.cf-rewrite.tmp.orphan-<ts>`)
+    // must succeed in tiered mode because both shapes route remote.
+    // Pre-fix the rename was rejected with "cross-filesystem" and the
+    // cf-rewrite tmp would accumulate as garbage on every restart.
+    #[test]
+    fn test_tiered_rename_cf_rewrite_tmp_to_orphan_succeeds() {
+        let (_local, remote, router) = create_tiered_router();
+        remote.create_dir_all(Path::new("/db")).unwrap();
+
+        let src = Path::new("/db/000042.sst.cf-rewrite.tmp");
+        let dst = Path::new("/db/000042.sst.cf-rewrite.tmp.orphan-1700000000");
+
+        let mut w = router
+            .open_writable_file(src, WriteMode::CreateNew)
+            .unwrap();
+        w.append(b"stale-rewrite-bytes").unwrap();
+        drop(w);
+        assert!(remote.file_exists(src).unwrap());
+
+        router.rename(src, dst).unwrap();
+        assert!(!remote.file_exists(src).unwrap());
+        assert!(remote.file_exists(dst).unwrap());
     }
 
     // R52-H2/H3: rename a tmp file (`.<N>.sst.tmp`) → final (`<N>.sst`)
