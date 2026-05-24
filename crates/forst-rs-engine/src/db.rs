@@ -1009,6 +1009,62 @@ impl DbImpl {
         }
         self.write_buffer_manager.release(released_bytes);
 
+        // R58-H2: drop the CF's SST files. Pre-fix, drop_cf removed
+        // the CF from in-memory maps but left every SST file the CF
+        // produced (across all levels) referenced by the Version. The
+        // files were unreachable from the engine API (no CF handle)
+        // but kept their on-disk footprint AND remained in the
+        // manifest/Version, so every restart-from-manifest restored
+        // the now-orphaned files into the new Version's levels.
+        //
+        // Walk the current Version, collect every (level, file_number)
+        // whose meta.cf_id matches the dropped CF, then apply a single
+        // VersionEdit with the union as `deleted_files`. After apply
+        // succeeds, route each file through `delete_file_guarded` so
+        // any in-flight checkpoint copy is not yanked out from under;
+        // then reap.
+        let cf_id_to_drop = cf.id();
+        let current_version = self.version_set.current();
+        let mut deleted_files: Vec<(u32, FileNumber)> = Vec::new();
+        for (lvl_idx, lvl) in current_version.levels.iter().enumerate() {
+            for f in &lvl.files {
+                if f.cf_id == cf_id_to_drop {
+                    deleted_files.push((lvl_idx as u32, f.file_number));
+                }
+            }
+        }
+        if !deleted_files.is_empty() {
+            let edit = VersionEdit {
+                deleted_files: deleted_files.clone(),
+                ..Default::default()
+            };
+            if let Err(e) = self.version_set.apply(&edit) {
+                // The CF is still flagged dropped (no rollback of the
+                // in-memory map state needed); failure here means the
+                // file set diverged between our snapshot and apply.
+                // Leave the files for the next compaction or restart to
+                // reclaim, and surface the error so the caller knows.
+                tracing::warn!(
+                    target: "forst_rs_engine::drop_cf",
+                    cf_id = cf_id_to_drop.0,
+                    error = %e,
+                    "drop_cf: VersionEdit apply failed; SST files remain referenced \
+                     and will be reclaimed by a future apply or restart"
+                );
+                return Err(e);
+            }
+            {
+                let mut cache = self.sst_readers.write().expect("lock poisoned");
+                for (_, file_number) in &deleted_files {
+                    cache.remove(file_number);
+                }
+            }
+            for (_, file_number) in &deleted_files {
+                self.delete_file_guarded(*file_number);
+            }
+            self.reap_pending_deletions();
+        }
+
         // R47-M1: standardize lock order to `cfs → name_map` everywhere.
         // The reverse order (name_map → cfs) inverted the convention used
         // by `create_cf_with_id_locked` and `create_column_family`, which
@@ -2246,6 +2302,31 @@ impl DbImpl {
         // refusing the whole batch is correct.
         Self::check_sequence_overflow(last_seq)?;
 
+        // R58-H1: charge the WriteBufferManager BEFORE the per-CF insert
+        // loop. The pre-fix code skipped this charge entirely on the
+        // batch path; only `write_single` reserved bytes. At flush time
+        // the engine still released `oldest.memory_usage()` (which
+        // includes bytes from batched writes), driving the WBM counter
+        // toward zero via `saturating_sub` and silently bypassing the
+        // cross-CF budget cap for any batch-heavy workload.
+        //
+        // Per-row charge mirrors `write_single`'s shape:
+        //   key + value + 8 (seq) + 1 (op) + 48 (overhead).
+        // For batched writes with N entries that's
+        //   sum(key_len + value_len) + N * 57.
+        let entries_ref = batch.entries();
+        let mut total_charge: u64 = 0;
+        for &i in groups.values().flat_map(|v| v.iter()) {
+            let k_len = entries_ref[i].key.len() as u64;
+            let v_len = entries_ref[i].value.as_deref().map_or(0, |v| v.len() as u64);
+            total_charge = total_charge
+                .saturating_add(k_len)
+                .saturating_add(v_len)
+                .saturating_add(57);
+        }
+        self.write_buffer_manager.reserve(total_charge);
+        let wbm_guard = WbmReleaseGuard::new(&self.write_buffer_manager, total_charge);
+
         // E1: per-CF batch insert routes rows by shard; each shard takes
         // its own write lock independently, so concurrent batches across
         // distinct keys see no engine-level serialization. The switch
@@ -2297,6 +2378,9 @@ impl DbImpl {
             }
             group_offset += indices.len() as u64;
         }
+        // Every per-CF insert succeeded — keep the WBM reservation
+        // until flush releases it.
+        wbm_guard.commit();
 
         let mut cfs_to_flush: Vec<Arc<ColumnFamilyData>> = Vec::new();
         {
@@ -2360,6 +2444,33 @@ impl DbImpl {
         // `batch_write` — check the HIGHEST seq in the reserved range.
         Self::check_sequence_overflow(last_seq)?;
 
+        // R58-H1: charge the WriteBufferManager BEFORE the insert. Same
+        // rationale as `batch_write` — pre-fix the Arrow batch path
+        // never reserved bytes, so flush-time release drove the WBM
+        // counter to zero via saturating_sub and the cross-CF budget
+        // cap was silently bypassed for any arrow-batch-heavy workload.
+        //
+        // Per-row charge mirrors the per-row WriteBatch shape: key +
+        // value + 8 (seq) + 1 (op) + 48 (overhead). For the Arrow path
+        // we sum the BinaryArray buffer lengths once instead of
+        // iterating per-row (zero-copy: the BinaryArray's underlying
+        // values buffer is already a contiguous byte slice).
+        let key_bytes = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .map_or(0u64, |a| a.value_data().len() as u64);
+        let value_bytes = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .map_or(0u64, |a| a.value_data().len() as u64);
+        let total_charge = key_bytes
+            .saturating_add(value_bytes)
+            .saturating_add((count as u64).saturating_mul(57));
+        self.write_buffer_manager.reserve(total_charge);
+        let wbm_guard = WbmReleaseGuard::new(&self.write_buffer_manager, total_charge);
+
         // E1: arrow batch is partitioned across shards in `ShardedMemTable`;
         // each shard takes its own lock so concurrent batches don't
         // serialize on a single memtable lock. Switch decision still
@@ -2388,6 +2499,9 @@ impl DbImpl {
                 }
             }
         }
+        // Insert succeeded — keep the WBM reservation until flush
+        // releases it.
+        wbm_guard.commit();
         let needs_flush = {
             let _writer = self.write_mutex.lock().expect("lock poisoned");
             self.maybe_switch_memtable_in_lock(&cf_data)?
