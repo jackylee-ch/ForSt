@@ -190,7 +190,23 @@ pub fn read_blob(fs: &dyn FileSystem, target_dir: &Path) -> ForstResult<Vec<u8>>
         }
         offset += n;
     }
-    buf.truncate(offset);
+    // R75-M1: surface a short read as corruption rather than silently
+    // truncating the buffer. `read_blob` is on the checkpoint-restore
+    // critical path; a truncated blob whose prefix happens to parse
+    // (e.g., the version-set header decodes but the L0 file list is
+    // cut) would silently restore the engine to a stale state. Source
+    // of short reads: OpenDAL ranged sequential reads under network
+    // flake. The `meta.size` upper bound came from the same FS so a
+    // legitimate EOF before `meta.size` indicates corruption / out-of-
+    // band truncation.
+    if offset != size {
+        return Err(ForstError::corruption(format!(
+            "checkpoint blob short read: expected {} bytes, got {} at {}",
+            size,
+            offset,
+            path.display()
+        )));
+    }
     Ok(buf)
 }
 

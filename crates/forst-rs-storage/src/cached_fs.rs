@@ -206,6 +206,22 @@ impl CachedFileSystem {
             }
             bytes.extend_from_slice(&chunk[..n]);
         }
+        // R75-M2: a short stream (truncation mid-transfer, OpenDAL ranged-
+        // sequential bug) would otherwise admit a partial file into the
+        // on-disk cache, and the poisoned cache entry would persist across
+        // process restarts — infecting every reader until eviction. Compare
+        // against the metadata-reported `cap_hint` and refuse to admit any
+        // entry whose length disagrees. `cap_hint == 0` means metadata was
+        // unavailable; we cannot validate and admit the streamed bytes as-is
+        // (consistent with the prior best-effort behavior on that branch).
+        if cap_hint > 0 && bytes.len() != cap_hint {
+            return Err(ForstError::corruption(format!(
+                "CachedFileSystem fetch_through_cache short read: expected {} bytes, got {} for {}",
+                cap_hint,
+                bytes.len(),
+                path.display()
+            )));
+        }
         // Best-effort cache write; failures here just mean the next read
         // pays the same miss, so we propagate I/O errors but ignore the
         // "did not admit" case (e.g., entry larger than capacity).
