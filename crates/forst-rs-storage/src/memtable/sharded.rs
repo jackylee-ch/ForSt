@@ -52,9 +52,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstError, ForstResult, OpType};
 
 use super::vectorized::VectorizedMemTable;
-use super::{
-    GetBorrowedResult, GetResult, MemTableConfig, ScanRow, SinkGetOutcome, ValueSink,
-};
+use super::{GetBorrowedResult, GetResult, MemTableConfig, ScanRow, SinkGetOutcome, ValueSink};
 
 /// Default number of shards. Must be a power of two so the shard index can
 /// be derived by a single AND mask. 16 keeps the per-shard `RwLock`
@@ -292,12 +290,7 @@ impl ShardedMemTable {
 
         // Perform writes while every lock is still held.
         for (g, p) in guards.iter_mut().zip(prepared.iter()) {
-            g.batch_insert_with_explicit_seqs(
-                &p.sub_keys,
-                &p.sub_values,
-                &p.sub_ops,
-                &p.sub_seqs,
-            )?;
+            g.batch_insert_with_explicit_seqs(&p.sub_keys, &p.sub_values, &p.sub_ops, &p.sub_seqs)?;
         }
         Ok(count)
     }
@@ -459,12 +452,7 @@ impl ShardedMemTable {
             }
         }
         for (g, p) in guards.iter_mut().zip(prepared.iter()) {
-            g.batch_insert_with_explicit_seqs(
-                &p.sub_keys,
-                &p.sub_values,
-                &p.sub_ops,
-                &p.sub_seqs,
-            )?;
+            g.batch_insert_with_explicit_seqs(&p.sub_keys, &p.sub_values, &p.sub_ops, &p.sub_seqs)?;
         }
         Ok(count)
     }

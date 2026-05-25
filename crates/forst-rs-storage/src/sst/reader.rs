@@ -146,11 +146,7 @@ pub struct SstReaderImpl {
 ///
 /// The loop re-issues the read on partial fill; `n == 0` is treated as
 /// premature EOF and surfaced as `Corruption`.
-fn read_at_exact(
-    file: &dyn RandomAccessFile,
-    offset: u64,
-    buf: &mut [u8],
-) -> ForstResult<()> {
+fn read_at_exact(file: &dyn RandomAccessFile, offset: u64, buf: &mut [u8]) -> ForstResult<()> {
     let mut filled: usize = 0;
     while filled < buf.len() {
         let n = file.read_at(offset + filled as u64, &mut buf[filled..])?;
@@ -396,6 +392,90 @@ impl SstReaderImpl {
         }))
     }
 
+    /// Returns every visible version of `key` in this SST, newest first.
+    ///
+    /// `get()` intentionally returns the highest-sequence row for legacy point lookups. Merge
+    /// resolution needs more: a single flushed SST can legally contain `Put(base), Merge(a),
+    /// Merge(b)` for the same user key. Returning only `Merge(b)` loses `base` and `a`. This
+    /// method scans the candidate block and any adjacent blocks whose key range still contains
+    /// `key`, then sorts matching rows by descending sequence.
+    pub fn get_versions(&self, key: &[u8]) -> ForstResult<Vec<LookupResult>> {
+        if key < self.footer.min_key.as_slice() || key > self.footer.max_key.as_slice() {
+            return Ok(Vec::new());
+        }
+        if !self.bloom_filter.check(key) {
+            return Ok(Vec::new());
+        }
+
+        let Some(start_idx) = search_index(&self.index_entries, key) else {
+            return Ok(Vec::new());
+        };
+
+        let mut out = Vec::new();
+        for block_idx in start_idx..self.index_entries.len() {
+            let stats = &self.index_stats[block_idx];
+            if key < stats.min_key.as_slice() {
+                break;
+            }
+            if key > stats.max_key.as_slice() {
+                continue;
+            }
+
+            let entry = &self.index_entries[block_idx];
+            let batch = self.read_data_block(entry.block_offset, entry.block_size)?;
+            let Some(first_row) = search_key_in_batch(&batch, key)? else {
+                continue;
+            };
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
+            let sequences = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
+            let op_types = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
+
+            let mut row = first_row;
+            while row < batch.num_rows() && keys.value(row) == key {
+                let op_byte = op_types.value(row);
+                let op = OpType::from_u8(op_byte).ok_or_else(|| {
+                    ForstError::corruption(format!("invalid op_type byte: {}", op_byte))
+                })?;
+                let value = match op {
+                    OpType::Delete | OpType::SingleDelete => None,
+                    OpType::Put | OpType::Merge => {
+                        if values.is_null(row) {
+                            None
+                        } else {
+                            Some(values.value(row).to_vec())
+                        }
+                    }
+                };
+                out.push(LookupResult {
+                    value,
+                    sequence: sequences.value(row),
+                    op_type: op,
+                });
+                row += 1;
+            }
+        }
+
+        out.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+        Ok(out)
+    }
+
     /// Returns the number of index entries (one per data block).
     /// Used by streaming callers (e.g. compaction) to iterate blocks via
     /// [`Self::read_block_at`].
@@ -436,12 +516,7 @@ impl SstReaderImpl {
     /// order produced by [`crate::sst::writer::SstWriterImpl`]. Unlike
     /// [`SstReaderImpl::get`], this visits ALL versions of each key; callers
     /// resolve visibility and merges themselves.
-    pub fn scan_borrowed<F>(
-        &self,
-        lower: &[u8],
-        upper: Option<&[u8]>,
-        mut cb: F,
-    ) -> ForstResult<()>
+    pub fn scan_borrowed<F>(&self, lower: &[u8], upper: Option<&[u8]>, mut cb: F) -> ForstResult<()>
     where
         F: FnMut(RowView<'_>) -> ForstResult<()>,
     {

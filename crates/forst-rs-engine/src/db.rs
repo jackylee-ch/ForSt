@@ -29,12 +29,13 @@ use std::thread::JoinHandle;
 
 use forst_rs_common::{
     ColumnFamilyId, EngineOptions, FileNumber, ForstError, ForstResult, InternalKey, OpType,
-    SequenceNumber, DEFAULT_CF_ID,
+    SequenceNumber, DEFAULT_CF_ID, MAX_SEQUENCE_NUMBER,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSystem, WriteMode};
 use forst_rs_storage::cache::clock::ShardedClockCache;
 use forst_rs_storage::cached_fs::CachedFileSystem;
 use forst_rs_storage::local_cache::LocalCache;
+use forst_rs_storage::merge_operator::{ListAppendMergeOperator, RawConcatMergeOperator};
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
 use forst_rs_storage::version::{
     SstFileMeta, Version, VersionEdit, VersionSetImpl, VersionSetSnapshot,
@@ -80,26 +81,18 @@ const FLUSH_QUEUE_CAPACITY: usize = 64;
 /// a snapshot to be live past the threshold.
 const SNAPSHOT_AGE_TICK_MS: u64 = 1_000;
 
-/// Sequence-number warn threshold (spec §6a.4). 2^59 — at this point
-/// the writer has burned half of the engine's 2^60-bit usable seq
+/// Sequence-number warn threshold (spec §6a.4). 2^55 — at this point
+/// the writer has burned half of the engine's 56-bit usable seq
 /// space; surfacing the condition early lets an operator schedule a
 /// checkpoint-and-restart cycle before the fatal threshold lands.
 /// Process-singleton warn (gated via [`SEQ_HIGH_WARNED`]) so logs do
 /// not get spammed on every write past the line.
-const SEQ_NUMBER_WARN_THRESHOLD: u64 = 1u64 << 59;
+const SEQ_NUMBER_WARN_THRESHOLD: u64 = 1u64 << 55;
 
-/// Sequence-number fatal threshold (spec §6a.4). 2^60 — at this point
-/// the engine refuses further writes; the only safe recovery is a
-/// checkpoint + restart cycle. We stop BEFORE the InternalKey 56-bit
-/// packed-seq invariant trips (a `debug_assert!` in
-/// `SequenceNumber::new` that release builds elide); the 2^60 limit
-/// gives operators a 4-bit safety margin against the absolute hard
-/// stop at `u64::MAX >> 8` = 2^56 - 1. NOTE: the spec uses 2^60 as a
-/// conservative bar to flag well before the 56-bit packed-seq limit
-/// would actually fire in misuse; see the inline comment on
-/// `write_single` for why the check still triggers a real fatal even
-/// though the on-disk encoder would tolerate slightly more.
-const SEQ_NUMBER_FATAL_THRESHOLD: u64 = 1u64 << 60;
+/// Sequence-number fatal threshold (spec §6a.4). InternalKey packs the
+/// sequence into the upper 56 bits, so `MAX_SEQUENCE_NUMBER + 1` must never
+/// reach memtable or SST encoding.
+const SEQ_NUMBER_FATAL_THRESHOLD: u64 = MAX_SEQUENCE_NUMBER.0 + 1;
 
 /// Process-singleton flag that gates the one-time `tracing::warn!` for
 /// the sequence-number warn threshold. We use a plain `AtomicBool`
@@ -355,6 +348,19 @@ impl DbImpl {
     /// Creates a new engine with a pluggable [`FileSystem`]. Useful for
     /// in-memory tests with [`MemoryFileSystem`].
     pub fn open_with_fs(options: EngineOptions, fs: Arc<dyn FileSystem>) -> ForstResult<Arc<Self>> {
+        Self::open_with_fs_and_default_cf(options, fs, ColumnFamilyDescriptor::new(DEFAULT_CF_NAME))
+    }
+
+    /// Creates a new engine with a caller-supplied default-CF descriptor.
+    ///
+    /// General engine callers should use [`Self::open_with_fs`]. The descriptor variant exists for
+    /// the ForSt-RS FFI backend, which needs the default CF to own the raw-concat ListState merge
+    /// operator so vectorized append batches can be written as real Merge records.
+    pub fn open_with_fs_and_default_cf(
+        options: EngineOptions,
+        fs: Arc<dyn FileSystem>,
+        default_desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<Arc<Self>> {
         if options.write_buffer_size == 0 {
             return Err(ForstError::invalid_argument(
                 "write_buffer_size must be greater than zero",
@@ -412,7 +418,6 @@ impl DbImpl {
             compaction_mutex: Mutex::new(()),
         });
 
-        let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
         Self::spawn_flush_worker(&db);
         Self::spawn_snapshot_age_worker(&db);
@@ -535,6 +540,25 @@ impl DbImpl {
         cache_dir: &std::path::Path,
         cache_capacity_bytes: u64,
     ) -> ForstResult<Arc<Self>> {
+        Self::open_remote_with_default_cf(
+            options,
+            uri,
+            opendal_config,
+            cache_dir,
+            cache_capacity_bytes,
+            ColumnFamilyDescriptor::new(DEFAULT_CF_NAME),
+        )
+    }
+
+    /// Opens a remote-storage-backed engine with a caller-supplied default-CF descriptor.
+    pub fn open_remote_with_default_cf(
+        options: EngineOptions,
+        uri: &str,
+        opendal_config: HashMap<String, String>,
+        cache_dir: &std::path::Path,
+        cache_capacity_bytes: u64,
+        default_desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<Arc<Self>> {
         let remote_fs = build_opendal_fs_from_uri(uri, &opendal_config)?;
         let cache = LocalCache::open(cache_dir, cache_capacity_bytes).map_err(|e| {
             ForstError::Io(std::io::Error::other(format!(
@@ -544,7 +568,7 @@ impl DbImpl {
         })?;
         let cached_fs: Arc<dyn FileSystem> =
             Arc::new(CachedFileSystem::new(remote_fs, Arc::new(cache)));
-        Self::open_with_fs(options, cached_fs)
+        Self::open_with_fs_and_default_cf(options, cached_fs, default_desc)
     }
 
     /// Returns a handle to the default column family.
@@ -2361,7 +2385,7 @@ impl DbImpl {
     ///   AND emits a one-time `tracing::warn!` if no prior write has
     ///   already claimed the warn slot (process-singleton);
     /// - `Err(ForstError::Internal(...))` when `seq >= SEQ_NUMBER_FATAL_THRESHOLD`
-    ///   (2^60). Writes never land on the memtable past this line; the
+    ///   (`MAX_SEQUENCE_NUMBER + 1`). Writes never land on the memtable past this line; the
     ///   error message names checkpoint+restart as the recovery path.
     ///
     /// The check is intentionally per-write rather than per-batch so a
@@ -2374,7 +2398,7 @@ impl DbImpl {
     fn check_sequence_overflow(seq: u64) -> ForstResult<()> {
         if seq >= SEQ_NUMBER_FATAL_THRESHOLD {
             return Err(ForstError::internal(format!(
-                "sequence number {} exceeded 2^60 threshold; engine stopped \
+                "sequence number {} exceeded InternalKey 56-bit threshold; engine stopped \
                  accepting writes; restart from checkpoint to recover",
                 seq
             )));
@@ -2398,7 +2422,7 @@ impl DbImpl {
                 warn_threshold = SEQ_NUMBER_WARN_THRESHOLD,
                 fatal_threshold = SEQ_NUMBER_FATAL_THRESHOLD,
                 "sequence number high; consider checkpoint + restart \
-                 before the engine reaches the 2^60 fatal threshold"
+                 before the engine reaches the InternalKey 56-bit fatal threshold"
             );
         }
         Ok(())
@@ -3357,6 +3381,19 @@ impl DbImpl {
         options: EngineOptions,
         fs: Arc<dyn FileSystem>,
     ) -> ForstResult<Arc<Self>> {
+        Self::open_from_checkpoint_with_default_cf(
+            options,
+            fs,
+            ColumnFamilyDescriptor::new(DEFAULT_CF_NAME),
+        )
+    }
+
+    /// Opens an engine from a checkpoint directory with a caller-supplied default-CF descriptor.
+    pub fn open_from_checkpoint_with_default_cf(
+        options: EngineOptions,
+        fs: Arc<dyn FileSystem>,
+        default_desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<Arc<Self>> {
         use crate::checkpoint::{deserialize_snapshot, read_blob};
 
         let db_path = PathBuf::from(&options.db_path);
@@ -3626,23 +3663,42 @@ impl DbImpl {
             compaction_mutex: Mutex::new(()),
         });
 
-        let default_desc = ColumnFamilyDescriptor::new(DEFAULT_CF_NAME);
+        let default_desc = if let Some(cf) = snapshot
+            .cf_descriptors
+            .iter()
+            .find(|cf| cf.cf_id == DEFAULT_CF_ID)
+        {
+            if cf.name != DEFAULT_CF_NAME {
+                return Err(ForstError::corruption(format!(
+                    "checkpoint cf_descriptor: cf_id 0 (DEFAULT_CF_ID) must have \
+                     name \"{}\", got \"{}\"",
+                    DEFAULT_CF_NAME, cf.name
+                )));
+            }
+            match cf.merge_op_name.as_str() {
+                "" => default_desc,
+                "RawConcatMergeOperator" => ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
+                    .with_merge_operator(Arc::new(RawConcatMergeOperator::new())),
+                "ListAppendMergeOperator" | "ListAppendMergeOperator(delim=44)" => {
+                    ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
+                        .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma()))
+                }
+                other => {
+                    return Err(ForstError::invalid_argument(format!(
+                        "checkpoint cf_descriptor for default CF references unknown merge operator '{}'",
+                        other
+                    )));
+                }
+            }
+        } else {
+            default_desc
+        };
+
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
 
         // R49-H2: re-register every non-default CF that the blob recorded.
-        // This frees operators from having to track CF order and re-issue
-        // `create_column_family` after restore. Restoration creates each CF
-        // *without* a merge operator or compaction filter, because the
-        // operator instances are runtime objects the engine cannot
-        // resurrect from a string name alone. The blob's recorded
-        // (merge_op_name, filter_name) pair is exposed via
-        // [`restored_cf_descriptors`] so callers that DO have those
-        // operator handles can install them post-open via
-        // [`set_compaction_filter`] (the merge operator is fixed-at-create;
-        // for now restored CFs always come up without one — a future PR can
-        // accept an operator registry parameter here). Callers that don't
-        // need the policy hooks (e.g. read-only verification) get the
-        // correct CF set with no extra work.
+        // Known built-in merge operators are restored by name so Merge rows
+        // in per-state CFs remain readable after checkpoint restore.
         for cf in &snapshot.cf_descriptors {
             // R50-H2: a blob that maps id 0 to anything other than the
             // built-in default CF name is corrupt — surface as Corruption
@@ -3659,7 +3715,22 @@ impl DbImpl {
                 }
                 continue;
             }
-            let desc = ColumnFamilyDescriptor::new(cf.name.clone());
+            let mut desc = ColumnFamilyDescriptor::new(cf.name.clone());
+            desc = match cf.merge_op_name.as_str() {
+                "" => desc,
+                "RawConcatMergeOperator" => {
+                    desc.with_merge_operator(Arc::new(RawConcatMergeOperator::new()))
+                }
+                "ListAppendMergeOperator" | "ListAppendMergeOperator(delim=44)" => {
+                    desc.with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma()))
+                }
+                other => {
+                    return Err(ForstError::invalid_argument(format!(
+                        "checkpoint cf_descriptor for '{}' references unknown merge operator '{}'",
+                        cf.name, other
+                    )));
+                }
+            };
             // Best-effort: bump next_cf_id past every restored id so future
             // `create_column_family` doesn't collide.
             let cur = db.next_cf_id.load(Ordering::SeqCst);
@@ -3906,6 +3977,21 @@ impl DbImpl {
         base_manifest: &str,
         sst_files: &[String],
     ) -> ForstResult<Arc<Self>> {
+        Self::open_from_incremental_with_default_cf(
+            target_dir,
+            base_manifest,
+            sst_files,
+            ColumnFamilyDescriptor::new(DEFAULT_CF_NAME),
+        )
+    }
+
+    /// Opens an engine from incremental state with a caller-supplied default-CF descriptor.
+    pub fn open_from_incremental_with_default_cf(
+        target_dir: &str,
+        base_manifest: &str,
+        sst_files: &[String],
+        default_desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<Arc<Self>> {
         let target = PathBuf::from(target_dir);
         let manifest = PathBuf::from(base_manifest);
 
@@ -4003,7 +4089,7 @@ impl DbImpl {
             db_path: target.to_string_lossy().into_owned(),
             ..EngineOptions::default()
         };
-        Self::open_from_checkpoint(options, fs)
+        Self::open_from_checkpoint_with_default_cf(options, fs, default_desc)
     }
 
     fn compact_l0_for_cf(
@@ -5236,9 +5322,15 @@ impl DbImpl {
                 Some(entry) if entry.op_type == OpType::Put => {
                     out.push(entry.value);
                 }
-                Some(_) => {
-                    // Delete/Merge in active memtable
+                Some(entry)
+                    if entry.op_type == OpType::Delete || entry.op_type == OpType::SingleDelete =>
+                {
                     out.push(None);
+                }
+                Some(_) => {
+                    // Merge entries need the full LSM merge chain. The active-memtable fast path
+                    // only owns the newest operand, so fall back to the merge-aware point path.
+                    out.push(self.get_internal(&cf_data, k, read_seq)?);
                 }
                 None => {
                     // Not in active memtable — fall back to full path
@@ -5459,7 +5551,7 @@ impl DbImpl {
             if sst.cf_id != cf_id {
                 continue;
             }
-            if let Some(res) = self.sst_lookup(sst, key)? {
+            for res in self.sst_lookup_versions(sst, key)? {
                 l0_hits.push((res.sequence, sst.file_number.value(), res));
             }
         }
@@ -5514,7 +5606,9 @@ impl DbImpl {
                 continue;
             };
             let sst = &version.levels[level].files[idx];
-            if let Some(res) = self.sst_lookup(sst, key)? {
+            let mut versions = self.sst_lookup_versions(sst, key)?;
+            versions.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+            for res in versions {
                 match res.op_type {
                     OpType::Put => {
                         if merge_operands.is_empty() {
@@ -5561,17 +5655,17 @@ impl DbImpl {
         Ok(None)
     }
 
-    fn sst_lookup(
+    fn sst_lookup_versions(
         &self,
         meta: &SstFileMeta,
         key: &[u8],
-    ) -> ForstResult<Option<forst_rs_storage::sst::LookupResult>> {
+    ) -> ForstResult<Vec<forst_rs_storage::sst::LookupResult>> {
         // Quick key-range check — avoids opening the file for obvious misses.
         if key < meta.smallest_key.as_slice() || key > meta.largest_key.as_slice() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let reader = self.get_or_open_sst_reader(meta)?;
-        reader.get(key)
+        reader.get_versions(key)
     }
 
     fn get_or_open_sst_reader(&self, meta: &SstFileMeta) -> ForstResult<Arc<SstReaderImpl>> {
@@ -5743,7 +5837,7 @@ impl DbImpl {
             if sst.cf_id != cf_id {
                 continue;
             }
-            if let Some(res) = self.sst_lookup(sst, key)? {
+            for res in self.sst_lookup_versions(sst, key)? {
                 l0_hits.push((res.sequence, sst.file_number.value(), res));
             }
         }
@@ -5772,7 +5866,9 @@ impl DbImpl {
                 continue;
             };
             let sst = &version.levels[level].files[idx];
-            if let Some(res) = self.sst_lookup(sst, key)? {
+            let mut versions = self.sst_lookup_versions(sst, key)?;
+            versions.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+            for res in versions {
                 match res.op_type {
                     OpType::Put => return Ok(res.value),
                     OpType::Delete | OpType::SingleDelete => return Ok(None),
@@ -6035,15 +6131,17 @@ fn build_opendal_fs_from_uri(
             Arc::new(OpendalFileSystem::local(std::path::Path::new(&root))?)
         }
         "s3" => {
-            // `s3://bucket` or `s3://bucket/`. The path portion (if any)
-            // is treated as the bucket prefix; OpenDAL's `bucket` field
-            // is just the name, so we use the host portion.
-            let bucket = rest.split('/').next().unwrap_or(rest).to_string();
+            // `s3://bucket` or `s3://bucket/prefix`. OpenDAL's `bucket`
+            // field is only the bucket name; the URI path must become the
+            // operator root so remote files stay under the configured prefix.
+            let (bucket_part, prefix_part) = rest.split_once('/').unwrap_or((rest, ""));
+            let bucket = bucket_part.to_string();
             if bucket.is_empty() {
                 return Err(ForstError::invalid_argument(format!(
                     "open_remote: s3 URI '{uri}' missing bucket name"
                 )));
             }
+            let prefix = prefix_part.trim_matches('/');
             let region = extra_config.get("region").cloned().ok_or_else(|| {
                 ForstError::invalid_argument(
                     "open_remote: s3 scheme requires 'region' in opendal_config",
@@ -6052,8 +6150,9 @@ fn build_opendal_fs_from_uri(
             let endpoint = extra_config.get("endpoint").map(String::as_str);
             let access_key_id = extra_config.get("access_key_id").map(String::as_str);
             let secret_access_key = extra_config.get("secret_access_key").map(String::as_str);
-            Arc::new(OpendalFileSystem::s3(
+            Arc::new(OpendalFileSystem::s3_with_root(
                 &bucket,
+                prefix,
                 &region,
                 endpoint,
                 access_key_id,
@@ -7757,6 +7856,31 @@ mod tests {
     }
 
     #[test]
+    fn test_non_bottommost_merge_only_compaction_preserves_lower_level_base() {
+        let (db, cf) = open_with_merge_cf();
+        db.put(&cf, b"k", b"base").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+        db.compact_level(&cf, 1).unwrap().unwrap();
+        db.compact_level(&cf, 2).unwrap().unwrap();
+
+        db.merge(&cf, b"k", b"delta").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+
+        assert_eq!(
+            db.get(&cf, b"k").unwrap().as_deref(),
+            Some(b"base,delta".as_ref())
+        );
+        db.compact_level(&cf, 1).unwrap().unwrap();
+        assert_eq!(
+            db.get(&cf, b"k").unwrap().as_deref(),
+            Some(b"base,delta".as_ref()),
+            "non-bottommost merge-only compaction must not rewrite a merge operand as a Put"
+        );
+    }
+
+    #[test]
     fn test_compact_l0_deletes_old_files_from_disk() {
         let db = open();
         let cf = db.default_cf();
@@ -9299,7 +9423,7 @@ mod tests {
     fn test_seq_overflow_at_fatal_threshold_returns_internal_error() {
         let db = open();
         // Seed the counter so the next `fetch_add(1)` returns a value
-        // at-or-past the 2^60 fatal threshold. The write path must
+        // at-or-past the InternalKey 56-bit fatal threshold. The write path must
         // bail with ForstError::Internal and refuse to plumb the seq
         // into the memtable.
         db.force_set_sequence(super::SEQ_NUMBER_FATAL_THRESHOLD - 1);
@@ -9319,5 +9443,23 @@ mod tests {
             .put(&cf, b"fatal2", b"v")
             .expect_err("subsequent put at fatal threshold must also error");
         assert!(err2.is_internal());
+    }
+
+    #[test]
+    fn test_seq_overflow_past_internal_key_56_bit_limit_returns_internal_error() {
+        let db = open();
+        // InternalKey stores sequence in the upper 56 bits of the tag. The
+        // write path must refuse the first value above that limit before it
+        // reaches memtable/SST encoding.
+        db.force_set_sequence(forst_rs_common::MAX_SEQUENCE_NUMBER.0);
+        let cf = db.default_cf();
+        let err = db
+            .put(&cf, b"past-56-bit", b"v")
+            .expect_err("sequence past InternalKey 56-bit limit must error");
+        assert!(
+            err.is_internal(),
+            "expected Internal error past 56-bit sequence limit, got {:?}",
+            err
+        );
     }
 }

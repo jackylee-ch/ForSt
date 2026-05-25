@@ -463,8 +463,7 @@ impl VersionSetImpl {
                 .fetch_max(file_num.value(), Ordering::SeqCst);
         }
         if let Some(seq) = edit.last_sequence {
-            self.last_sequence
-                .fetch_max(seq.value(), Ordering::SeqCst);
+            self.last_sequence.fetch_max(seq.value(), Ordering::SeqCst);
         }
 
         let new_arc = Arc::new(new_version);

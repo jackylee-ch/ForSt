@@ -322,17 +322,19 @@ impl FileSystem for FileSystemRouter {
         }
         let remote_entries = match remote.list_dir(dir) {
             Ok(v) => v,
-            Err(e) => {
-                // Object stores routinely surface "directory does not
-                // exist" as an error; treat as empty rather than fatal.
+            Err(e) if e.is_not_found() => {
+                // Object stores routinely surface a missing prefix as NotFound; that exact case
+                // is an empty remote listing. Permission, throttling and transport failures must
+                // propagate so restore/orphan scans do not silently ignore remote-resident files.
                 tracing::debug!(
-                    "Router::list_dir remote leg {} failed: {} \
+                    "Router::list_dir remote leg {} missing: {} \
                      (continuing with local-only listing)",
                     dir.display(),
                     e
                 );
                 return Ok(local_entries);
             }
+            Err(e) => return Err(e),
         };
         // R53-M2: dedup by `file_name()`, NOT by full PathBuf.
         // `LocalFileSystem::list_dir` returns absolute paths
@@ -355,20 +357,21 @@ impl FileSystem for FileSystemRouter {
         let mut merged: Vec<FileMetadata> = Vec::with_capacity(cap);
         let mut seen: std::collections::HashSet<std::ffi::OsString> =
             std::collections::HashSet::with_capacity(cap);
-        let absorb = |e: FileMetadata,
-                          merged: &mut Vec<FileMetadata>,
-                          seen: &mut std::collections::HashSet<std::ffi::OsString>| {
-            match e.path.file_name() {
-                Some(name) => {
-                    if seen.insert(name.to_os_string()) {
-                        merged.push(e);
+        let absorb =
+            |e: FileMetadata,
+             merged: &mut Vec<FileMetadata>,
+             seen: &mut std::collections::HashSet<std::ffi::OsString>| {
+                match e.path.file_name() {
+                    Some(name) => {
+                        if seen.insert(name.to_os_string()) {
+                            merged.push(e);
+                        }
                     }
+                    // No filename component (e.g. trailing `/`) — keep
+                    // the entry; dedup is unnecessary for these.
+                    None => merged.push(e),
                 }
-                // No filename component (e.g. trailing `/`) — keep
-                // the entry; dedup is unnecessary for these.
-                None => merged.push(e),
-            }
-        };
+            };
         // Remote first so on conflict the remote-leg metadata wins.
         for e in remote_entries {
             absorb(e, &mut merged, &mut seen);
@@ -680,7 +683,9 @@ mod tests {
             .unwrap();
         w.append(b"sst-bytes").unwrap();
         drop(w);
-        assert!(remote.file_exists(Path::new("/db/.000001.sst.tmp")).unwrap());
+        assert!(remote
+            .file_exists(Path::new("/db/.000001.sst.tmp"))
+            .unwrap());
 
         // Rename tmp → final (the path the flush job actually drives).
         router

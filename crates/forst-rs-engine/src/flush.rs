@@ -175,7 +175,9 @@ impl FlushJob {
                     .column(1)
                     .as_any()
                     .downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| ForstError::corruption("flush batch: value column not Binary"))?;
+                    .ok_or_else(|| {
+                        ForstError::corruption("flush batch: value column not Binary")
+                    })?;
                 let seqs = batch
                     .column(2)
                     .as_any()
@@ -187,7 +189,9 @@ impl FlushJob {
                     .column(3)
                     .as_any()
                     .downcast_ref::<UInt8Array>()
-                    .ok_or_else(|| ForstError::corruption("flush batch: op_type column not UInt8"))?;
+                    .ok_or_else(|| {
+                        ForstError::corruption("flush batch: op_type column not UInt8")
+                    })?;
 
                 for i in 0..rows {
                     let key = keys.value(i);
@@ -251,7 +255,11 @@ impl FlushJob {
         sst_temp_path(&self.file_path)
     }
 
-    fn info_to_meta(file_number: FileNumber, cf_id: ColumnFamilyId, info: SstFileInfo) -> SstFileMeta {
+    fn info_to_meta(
+        file_number: FileNumber,
+        cf_id: ColumnFamilyId,
+        info: SstFileInfo,
+    ) -> SstFileMeta {
         // R49-H1: stamp cf_id onto the meta record so the engine's `sst_get`
         // and friends can filter by CF. We assert agreement with the writer-
         // side value to catch any future drift between `SstWriterOptions::cf_id`

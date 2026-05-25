@@ -90,7 +90,8 @@ impl CompactionJob {
         // version lists this check becomes a hard error.
         for (_, meta, _) in &self.inputs {
             debug_assert_eq!(
-                meta.cf_id, self.cf_id,
+                meta.cf_id,
+                self.cf_id,
                 "CompactionJob cf_id {:?} ≠ input file {} cf_id {:?} — cross-CF input",
                 self.cf_id,
                 meta.file_number.value(),
@@ -653,14 +654,47 @@ impl CompactionJob {
                 if let Some(op) = &self.merge_operator {
                     // operands was newest-first; merge op expects oldest-first.
                     let reversed: Vec<&[u8]> = operands.iter().copied().rev().collect();
-                    let merged = op.full_merge(&newest.key, base, &reversed)?;
-                    writer.add(
-                        &newest.key,
-                        Some(&merged),
-                        newest.sequence,
-                        OpType::Put as u8,
-                    )?;
-                    *emitted += 1;
+                    if base.is_some() || stop_on_delete || self.is_bottommost {
+                        let merged = op.full_merge(&newest.key, base, &reversed)?;
+                        writer.add(
+                            &newest.key,
+                            Some(&merged),
+                            newest.sequence,
+                            OpType::Put as u8,
+                        )?;
+                        *emitted += 1;
+                    } else if let Some((first, rest)) = reversed.split_first() {
+                        let mut partial = (*first).to_vec();
+                        let mut partial_ok = true;
+                        for operand in rest {
+                            match op.partial_merge(&newest.key, &partial, operand) {
+                                Ok(v) => partial = v,
+                                Err(_) => {
+                                    partial_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if partial_ok {
+                            writer.add(
+                                &newest.key,
+                                Some(&partial),
+                                newest.sequence,
+                                OpType::Merge as u8,
+                            )?;
+                            *emitted += 1;
+                        } else {
+                            for v in versions {
+                                writer.add(
+                                    &v.key,
+                                    v.value.as_deref(),
+                                    v.sequence,
+                                    v.op_type as u8,
+                                )?;
+                                *emitted += 1;
+                            }
+                        }
+                    }
                 } else {
                     // No merge operator — preserve every version exactly as
                     // written. This is correct but doesn't shrink the data.

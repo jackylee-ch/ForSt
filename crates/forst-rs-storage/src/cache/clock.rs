@@ -535,8 +535,7 @@ impl BlockCache for ShardedClockCache {
         let mut total_freed: usize = 0;
         for shard_lock in &self.shards {
             if let Ok(mut shard) = shard_lock.write() {
-                total_freed =
-                    total_freed.saturating_add(shard.erase_by_file(file_number));
+                total_freed = total_freed.saturating_add(shard.erase_by_file(file_number));
             }
         }
         // R86-M1: same metric-update fix as `erase` above.
@@ -900,13 +899,7 @@ mod tests {
         // High-priority entries reach countdown=0 within 4 passes.
         let key_new = CacheKey::new(99, 0);
         let hash_new = key_new.hash();
-        let _evicted = shard.insert(
-            key_new,
-            make_entry(100),
-            100,
-            CachePriority::High,
-            hash_new,
-        );
+        let _evicted = shard.insert(key_new, make_entry(100), 100, CachePriority::High, hash_new);
         assert!(shard.current_charge <= 1200);
         assert!(shard.get(&key_new, hash_new).is_some());
     }

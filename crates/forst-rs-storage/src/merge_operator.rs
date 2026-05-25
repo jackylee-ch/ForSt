@@ -153,6 +153,56 @@ impl MergeOperator for ListAppendMergeOperator {
     }
 }
 
+/// A merge operator that concatenates operands byte-for-byte without a delimiter.
+///
+/// ForSt-RS ListState append operands are already self-delimiting serialized chunks. This operator
+/// keeps the append path as real LSM Merge records without changing the byte stream with an extra
+/// separator.
+pub struct RawConcatMergeOperator;
+
+impl RawConcatMergeOperator {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for RawConcatMergeOperator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MergeOperator for RawConcatMergeOperator {
+    fn full_merge(
+        &self,
+        _key: &[u8],
+        base_value: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> ForstResult<Vec<u8>> {
+        let total =
+            base_value.map_or(0, |v| v.len()) + operands.iter().map(|v| v.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        if let Some(base) = base_value {
+            out.extend_from_slice(base);
+        }
+        for op in operands {
+            out.extend_from_slice(op);
+        }
+        Ok(out)
+    }
+
+    fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> ForstResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(left.len() + right.len());
+        out.extend_from_slice(left);
+        out.extend_from_slice(right);
+        Ok(out)
+    }
+
+    fn name(&self) -> String {
+        "RawConcatMergeOperator".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,5 +343,21 @@ mod tests {
         let op: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::with_comma());
         let result = op.full_merge(b"k", Some(b"a"), &[b"b"]).unwrap();
         assert_eq!(result, b"a,b");
+    }
+
+    #[test]
+    fn test_raw_concat_full_merge_preserves_operand_bytes() {
+        let op = RawConcatMergeOperator::new();
+        let result = op
+            .full_merge(b"key", Some(b"BASE"), &[b"\0A", b"B\0"])
+            .unwrap();
+        assert_eq!(result, b"BASE\0AB\0");
+    }
+
+    #[test]
+    fn test_raw_concat_partial_merge_has_no_separator() {
+        let op = RawConcatMergeOperator::new();
+        let result = op.partial_merge(b"key", b"A", b"B").unwrap();
+        assert_eq!(result, b"AB");
     }
 }

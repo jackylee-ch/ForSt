@@ -121,7 +121,12 @@ impl<'a> WriteBatch<'a> {
     }
 
     /// Appends a Merge mutation, borrowing `key` and `operand`.
-    pub fn merge(&mut self, cf: &ColumnFamilyHandle, key: &'a [u8], operand: &'a [u8]) -> &mut Self {
+    pub fn merge(
+        &mut self,
+        cf: &ColumnFamilyHandle,
+        key: &'a [u8],
+        operand: &'a [u8],
+    ) -> &mut Self {
         self.entries.push(WriteBatchEntry {
             cf_id: cf.id(),
             key: Cow::Borrowed(key),

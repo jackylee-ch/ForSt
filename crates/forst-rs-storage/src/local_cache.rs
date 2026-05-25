@@ -47,10 +47,11 @@
 //! the engine. That keeps engine internals unchanged.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Per-entry bookkeeping. `bytes` is the on-disk size; the LRU position
 /// is implied by membership in the `lru` deque.
@@ -106,6 +107,10 @@ impl LocalCache {
                 // Skip non-UTF-8 file names; they cannot have come from us.
                 Err(_) => continue,
             };
+            if file_name.starts_with(".tmp-") {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
             let key = unsanitize_key(&file_name);
             let bytes = meta.len();
             inner.entries.insert(key.clone(), Entry { bytes });
@@ -209,7 +214,27 @@ impl LocalCache {
             return Ok(false);
         }
 
-        // Compute eviction set under the lock; perform disk writes outside.
+        let path = self.path_for(key);
+        let tmp_path = self.temp_path_for(key);
+        let mut tmp = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        if let Err(e) = tmp.write_all(data).and_then(|_| tmp.sync_all()) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        drop(tmp);
+        if let Err(e) = fs::rename(&tmp_path, &path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        OpenOptions::new()
+            .read(true)
+            .open(&self.cache_dir)
+            .and_then(|dir| dir.sync_all())?;
+
+        // Compute eviction set under the lock after the atomic rename has published the bytes.
         let to_evict = {
             let mut inner = self.inner.lock().expect("local cache mutex poisoned");
 
@@ -233,7 +258,6 @@ impl LocalCache {
                 }
             }
 
-            // Reserve the slot now so concurrent puts see the new accounting.
             inner
                 .entries
                 .insert(key.to_string(), Entry { bytes: new_bytes });
@@ -250,20 +274,6 @@ impl LocalCache {
             let _ = fs::remove_file(&path);
         }
 
-        // Write the new entry. If the disk write fails we MUST roll back
-        // the in-memory accounting so we don't claim to have something we
-        // don't.
-        let path = self.path_for(key);
-        if let Err(e) = fs::write(&path, data) {
-            let mut inner = self.inner.lock().expect("local cache mutex poisoned");
-            if let Some(entry) = inner.entries.remove(key) {
-                inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
-            }
-            if let Some(pos) = inner.lru.iter().position(|k| k == key) {
-                inner.lru.remove(pos);
-            }
-            return Err(e);
-        }
         Ok(true)
     }
 
@@ -290,6 +300,19 @@ impl LocalCache {
 
     fn path_for(&self, key: &str) -> PathBuf {
         self.cache_dir.join(sanitize_key(key))
+    }
+
+    fn temp_path_for(&self, key: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        self.cache_dir.join(format!(
+            ".tmp-{}-{}-{:?}",
+            sanitize_key(key),
+            nanos,
+            std::thread::current().id()
+        ))
     }
 }
 

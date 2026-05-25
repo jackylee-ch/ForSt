@@ -37,17 +37,14 @@
 //!
 //! # File model
 //!
-//! - [`OpendalSequentialFile`]: eagerly downloads the entire object on
-//!   open, then serves reads from an in-memory cursor. SSTs and WAL
-//!   segments fit comfortably here.
+//! - [`OpendalSequentialFile`]: streams the object through OpenDAL's blocking
+//!   reader, keeping memory bounded by OpenDAL's internal chunks.
 //! - [`OpendalRandomAccessFile`]: serves [`RandomAccessFile::read_at`] via
 //!   `op.read_with(path).range(off..off+len)`, performing one ranged GET
 //!   per call.
-//! - [`OpendalWritableFile`]: buffers the entire write in memory and
-//!   flushes the object on [`WritableFile::sync`] (or on `Drop` as a
-//!   best-effort fallback). This matches the typical SST/WAL write
-//!   pattern (build → flush → never re-open) and avoids OpenDAL's more
-//!   complex multipart writer state machine.
+//! - [`OpendalWritableFile`]: streams writes through OpenDAL's blocking
+//!   writer, enabling multipart/object-store uploads without retaining the
+//!   full SST in Rust heap memory.
 //!
 //! # Path handling
 //!
@@ -55,12 +52,13 @@
 //! paths are rejected with [`ForstError::invalid_argument`]. Directory
 //! operations append a trailing `/` to satisfy OpenDAL's convention.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
+use bytes::Buf;
 use forst_rs_common::error::{ForstError, ForstResult};
 use opendal::layers::{BlockingLayer, RetryLayer};
 use opendal::{ErrorKind as OdErrorKind, Metakey, Operator};
@@ -330,9 +328,31 @@ impl OpendalFileSystem {
         access_key_id: Option<&str>,
         secret_access_key: Option<&str>,
     ) -> ForstResult<Self> {
+        Self::s3_with_root(
+            bucket,
+            "",
+            region,
+            endpoint,
+            access_key_id,
+            secret_access_key,
+        )
+    }
+
+    /// Constructs an S3-backed filesystem rooted under `root` inside the bucket.
+    pub fn s3_with_root(
+        bucket: &str,
+        root: &str,
+        region: &str,
+        endpoint: Option<&str>,
+        access_key_id: Option<&str>,
+        secret_access_key: Option<&str>,
+    ) -> ForstResult<Self> {
         let mut builder = opendal::services::S3::default()
             .bucket(bucket)
             .region(region);
+        if !root.is_empty() {
+            builder = builder.root(root);
+        }
         if let Some(ep) = endpoint {
             // R44-L1: warn when the operator points at a non-localhost
             // endpoint over plaintext HTTP. S3 credentials traversing such
@@ -431,35 +451,25 @@ impl OpendalFileSystem {
 // SequentialFile — eagerly download then read from cursor
 // ---------------------------------------------------------------------------
 
-/// A sequential reader that holds the full object in memory.
-///
-/// The payload is stored as a [`bytes::Bytes`] handle — ref-counted and
-/// slice-able without memcpy. Construction from `opendal::Buffer::to_bytes()`
-/// is zero-copy when the underlying buffer is contiguous (the common case for
-/// services that return a single chunk per GET).
+/// A sequential reader that streams the object through OpenDAL's blocking reader.
 pub struct OpendalSequentialFile {
-    /// The full object bytes. Held as `Bytes` so cheap slicing and sharing
-    /// is available to callers (e.g. the storage layer's in-memory adapters).
-    bytes: Bytes,
-    pos: usize,
+    reader: opendal::StdReader,
 }
 
 impl SequentialFile for OpendalSequentialFile {
     fn read(&mut self, buf: &mut [u8]) -> ForstResult<usize> {
-        let remaining = self.bytes.len().saturating_sub(self.pos);
-        let n = remaining.min(buf.len());
-        // `Bytes` deref-coerces to `&[u8]`; this is a single memcpy from the
-        // ref-counted buffer into the caller's slice (no intermediate `Vec`).
-        buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
-        self.pos += n;
-        Ok(n)
+        self.reader
+            .read(buf)
+            .map_err(|e| ForstError::Io(std::io::Error::other(format!("OpenDAL stream read: {e}"))))
     }
 
     fn skip(&mut self, n: u64) -> ForstResult<()> {
-        let n_usize = usize::try_from(n).map_err(|_| {
-            ForstError::invalid_argument(format!("skip offset {n} exceeds usize::MAX"))
+        let delta = i64::try_from(n).map_err(|_| {
+            ForstError::invalid_argument(format!("skip offset {n} exceeds i64::MAX"))
         })?;
-        self.pos = self.pos.saturating_add(n_usize).min(self.bytes.len());
+        self.reader.seek(SeekFrom::Current(delta)).map_err(|e| {
+            ForstError::Io(std::io::Error::other(format!("OpenDAL stream skip: {e}")))
+        })?;
         Ok(())
     }
 }
@@ -507,125 +517,72 @@ impl RandomAccessFile for OpendalRandomAccessFile {
 }
 
 // ---------------------------------------------------------------------------
-// WritableFile — buffered, flush on sync/drop
+// WritableFile — streaming OpenDAL writer
 // ---------------------------------------------------------------------------
 
-/// A writable file that buffers all writes in memory and flushes on
-/// [`Self::sync`] (or on drop as a best-effort fallback).
-///
-/// This matches the typical ForSt-RS write pattern (one writer per SST or
-/// WAL segment, written sequentially, then sealed). Streaming uploads are
-/// available via the OpenDAL writer API but are not exposed here to keep
-/// the trait surface minimal.
-///
-/// # Buffer ownership model
-///
-/// The buffer lives in one of two states:
-///
-/// - **Mutable**: `buffer` holds a `Vec<u8>` accumulator; appends are
-///   amortized-O(1) growth. `frozen` is `None`.
-/// - **Frozen**: after [`Self::persist`], the accumulator has been moved
-///   into a ref-counted [`bytes::Bytes`] snapshot stored in `frozen`. The
-///   `Vec` is now empty. Subsequent persists (e.g. `flush(); sync();`)
-///   re-PUT this snapshot via cheap ref-count clones — no memcpy.
-///
-/// A subsequent [`Self::append`] re-materializes the frozen snapshot back
-/// into the mutable accumulator before appending. This costs one memcpy
-/// per "frozen → append" transition, but matches the pre-existing cost on
-/// the same path and is rare in the typical "build → sync → drop" workflow.
+/// A writable file that streams bytes to OpenDAL's blocking writer.
 pub struct OpendalWritableFile {
-    op: opendal::BlockingOperator,
     path: String,
-    /// Mutable accumulator for in-progress appends. After a successful
-    /// [`Self::persist`], this is empty and `frozen` holds the snapshot.
-    buffer: Vec<u8>,
-    /// Ref-counted snapshot of the most recently persisted content.
-    /// Allows repeat persists (`flush(); sync();`) to re-PUT without
-    /// recopying the full buffer.
-    frozen: Option<Bytes>,
-    /// True after sync() succeeds; suppresses the drop-time flush.
-    flushed: bool,
+    writer: Option<opendal::BlockingWriter>,
+    bytes_written: u64,
+    closed: bool,
 }
 
 impl WritableFile for OpendalWritableFile {
     fn append(&mut self, data: &[u8]) -> ForstResult<()> {
-        // If the buffer was previously frozen (last call was a persist),
-        // re-materialize it before appending. This is the only memcpy in
-        // the writer's hot path; it only happens when callers interleave
-        // appends with persists, which is uncommon for the SST flush path.
-        if let Some(snapshot) = self.frozen.take() {
-            // `Bytes::to_vec()` performs the copy; `into_iter().collect()`
-            // would be equivalent. Keep semantics explicit.
-            self.buffer = snapshot.to_vec();
+        if self.closed {
+            return Err(ForstError::invalid_argument(format!(
+                "OpenDAL append after close: {}",
+                self.path
+            )));
         }
-        self.buffer.extend_from_slice(data);
-        self.flushed = false;
+        let writer = self.writer.as_mut().ok_or_else(|| {
+            ForstError::invalid_argument(format!("OpenDAL writer missing: {}", self.path))
+        })?;
+        writer
+            .write(data.to_vec())
+            .map_err(|e| map_opendal_err(e, &format!("OpenDAL streaming write: {}", self.path)))?;
+        self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
         Ok(())
     }
 
     fn flush(&mut self) -> ForstResult<()> {
-        // Buffered writes in memory; nothing to push to the OS yet.
-        // The semantic contract is "data is visible to readers"; for object
-        // stores that means PUT. We honor it via the same path as sync() so
-        // callers that flush-without-sync still observe consistent reads.
-        self.persist()
+        Ok(())
     }
 
     fn sync(&mut self) -> ForstResult<()> {
-        self.persist()
+        self.close_writer()
     }
 
     fn file_size(&self) -> ForstResult<u64> {
-        // Size reflects the current logical content: the live accumulator
-        // when not frozen, otherwise the frozen snapshot.
-        if let Some(snapshot) = &self.frozen {
-            Ok(snapshot.len() as u64)
-        } else {
-            Ok(self.buffer.len() as u64)
-        }
+        Ok(self.bytes_written)
     }
 }
 
 impl OpendalWritableFile {
-    fn persist(&mut self) -> ForstResult<()> {
-        // Writing the same content twice is idempotent for OpenDAL services
-        // we target (PUT semantics). We always send the full buffer because
-        // OpenDAL's simple `write` API replaces objects atomically.
-        let bytes = match &self.frozen {
-            // Repeat-persist (flush() then sync(), or sync() then sync()):
-            // ref-count clone of the existing snapshot. Zero-copy.
-            Some(snapshot) => snapshot.clone(),
-            // First persist since last append: take the accumulator zero-copy
-            // (Vec<u8> → Bytes via From<Vec<u8>> is zero-copy in bytes 1.x).
-            // The ref-counted Bytes is shared between opendal (for the PUT)
-            // and our own `frozen` slot (for future re-PUTs). No memcpy.
-            None => {
-                let taken: Bytes = std::mem::take(&mut self.buffer).into();
-                self.frozen = Some(taken.clone());
-                taken
-            }
-        };
-        self.op
-            .write(&self.path, bytes)
-            .map_err(|e| map_opendal_err(e, &format!("OpenDAL write: {}", self.path)))?;
-        self.flushed = true;
+    fn close_writer(&mut self) -> ForstResult<()> {
+        if self.closed {
+            return Ok(());
+        }
+        if let Some(mut writer) = self.writer.take() {
+            writer
+                .close()
+                .map_err(|e| map_opendal_err(e, &format!("OpenDAL close writer: {}", self.path)))?;
+        }
+        self.closed = true;
         Ok(())
     }
 }
 
 impl Drop for OpendalWritableFile {
     fn drop(&mut self) {
-        let has_content = !self.buffer.is_empty() || self.frozen.is_some();
-        if !self.flushed && has_content {
-            // Best-effort flush. Errors here cannot propagate; we log via
-            // tracing so operators can correlate. Callers MUST call
-            // `sync()` for durability guarantees.
-            if let Err(e) = self.persist() {
+        if !self.closed {
+            if let Err(e) = self.close_writer() {
                 tracing::warn!(
                     target: "forst_rs_io::opendal_backend",
                     path = %self.path,
                     error = %e,
-                    "OpendalWritableFile dropped without sync; best-effort flush failed",
+                    "OpendalWritableFile dropped before sync; best-effort close failed",
                 );
             }
         }
@@ -639,17 +596,12 @@ impl Drop for OpendalWritableFile {
 impl FileSystem for OpendalFileSystem {
     fn open_sequential_file(&self, path: &Path) -> ForstResult<Box<dyn SequentialFile>> {
         let p = path_str(path, "open_sequential_file")?;
-        let buffer = self
-            .block_on(self.op.read(p))
+        let blocking = self.blocking_op()?;
+        let reader = blocking
+            .reader(p)
+            .and_then(|r| r.into_std_read(..))
             .map_err(|e| map_opendal_err(e, &format!("open_sequential_file: {p}")))?;
-        // `Buffer::to_bytes()` is zero-copy when the underlying chunks are
-        // contiguous (the common case for a single GetObject), and a single
-        // concat otherwise — strictly better than `to_vec()` which forces a
-        // separate `Vec` allocation regardless.
-        Ok(Box::new(OpendalSequentialFile {
-            bytes: buffer.to_bytes(),
-            pos: 0,
-        }))
+        Ok(Box::new(OpendalSequentialFile { reader }))
     }
 
     fn open_random_access_file(&self, path: &Path) -> ForstResult<Box<dyn RandomAccessFile>> {
@@ -674,17 +626,8 @@ impl FileSystem for OpendalFileSystem {
         let p = path_str(path, "open_writable_file")?;
         let blocking = self.blocking_op()?;
 
-        // Seed the buffer based on the requested mode. OpenDAL has no native
-        // append semantics for most services, so Append is implemented as
-        // "read current contents, buffer them, append new writes, PUT".
-        let (buffer, exists) = match self.block_on(self.op.exists(p)) {
-            Ok(true) => {
-                let buf = self
-                    .block_on(self.op.read(p))
-                    .map_err(|e| map_opendal_err(e, &format!("open_writable_file read: {p}")))?;
-                (buf.to_vec(), true)
-            }
-            Ok(false) => (Vec::new(), false),
+        let exists = match self.block_on(self.op.exists(p)) {
+            Ok(v) => v,
             Err(e) => {
                 return Err(map_opendal_err(
                     e,
@@ -693,25 +636,36 @@ impl FileSystem for OpendalFileSystem {
             }
         };
 
-        let initial = match mode {
+        let append = match mode {
             WriteMode::CreateNew => {
                 if exists {
                     return Err(ForstError::invalid_argument(format!(
                         "open_writable_file: file already exists: {p}"
                     )));
                 }
-                Vec::new()
+                false
             }
-            WriteMode::CreateOrTruncate => Vec::new(),
-            WriteMode::Append => buffer,
+            WriteMode::CreateOrTruncate => false,
+            WriteMode::Append => true,
         };
+        let initial_size = if append && exists {
+            self.block_on(self.op.stat(p))
+                .map_err(|e| map_opendal_err(e, &format!("open_writable_file stat: {p}")))?
+                .content_length()
+        } else {
+            0
+        };
+        let writer = blocking
+            .writer_with(p)
+            .append(append)
+            .call()
+            .map_err(|e| map_opendal_err(e, &format!("open_writable_file writer: {p}")))?;
 
         Ok(Box::new(OpendalWritableFile {
-            op: blocking,
             path: p.to_string(),
-            buffer: initial,
-            frozen: None,
-            flushed: false,
+            writer: Some(writer),
+            bytes_written: initial_size,
+            closed: false,
         }))
     }
 
@@ -839,46 +793,14 @@ impl FileSystem for OpendalFileSystem {
     fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
         let s = path_str(src, "rename src")?;
         let d = path_str(dst, "rename dst")?;
-        // OpenDAL's `rename` is supported on services that have native
-        // move (FS, GCS, …); others return `Unsupported`. The engine
-        // flush path relies on rename for atomic temp→final SST moves,
-        // so we transparently fall back to copy+delete on services that
-        // lack native rename. This is non-atomic but matches what
-        // OpenDAL itself does internally for S3 today, and matches the
-        // user's expectation that any FileSystem-backed engine works
-        // regardless of substrate.
+        // The engine relies on rename for atomic temp→final publication. A copy+delete fallback
+        // can expose two objects or publish the destination while returning failure if deleting
+        // the source fails, so object stores without native rename must fail fast.
         match self.block_on(self.op.rename(s, d)) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == OdErrorKind::Unsupported => {
-                // copy() is also Unsupported on some services (notably
-                // services-memory). Emulate via read + write + delete
-                // as a last resort. PUT is atomic per object, so the
-                // destination either appears whole or not at all; the
-                // source delete that follows might leave behind a stale
-                // copy if it fails, but that is the same risk profile
-                // as OpenDAL's own copy+delete fallback.
-                let copy_res = self.block_on(self.op.copy(s, d));
-                match copy_res {
-                    Ok(()) => {}
-                    Err(ce) if ce.kind() == OdErrorKind::Unsupported => {
-                        let buf = self.block_on(self.op.read(s)).map_err(|re| {
-                            map_opendal_err(re, &format!("rename fallback read: {s}"))
-                        })?;
-                        self.block_on(self.op.write(d, buf)).map_err(|we| {
-                            map_opendal_err(we, &format!("rename fallback write: {d}"))
-                        })?;
-                    }
-                    Err(ce) => {
-                        return Err(map_opendal_err(
-                            ce,
-                            &format!("rename copy fallback: {s} -> {d}"),
-                        ))
-                    }
-                }
-                self.block_on(self.op.delete(s))
-                    .map_err(|de| map_opendal_err(de, &format!("rename delete src: {s}")))?;
-                Ok(())
-            }
+            Err(e) if e.kind() == OdErrorKind::Unsupported => Err(ForstError::not_supported(
+                format!("rename requires native atomic move support: {s} -> {d}: {e}"),
+            )),
             Err(e) => Err(map_opendal_err(e, &format!("rename: {s} -> {d}"))),
         }
     }
@@ -955,18 +877,12 @@ mod tests {
         // Loopback IPv6 literal, no brackets, no port.
         assert_eq!(extract_host_from_authority("::1"), "::1");
         // Full IPv6 literal, no brackets, no port.
-        assert_eq!(
-            extract_host_from_authority("2001:db8::1"),
-            "2001:db8::1"
-        );
+        assert_eq!(extract_host_from_authority("2001:db8::1"), "2001:db8::1");
         // Compressed link-local, no brackets, no port.
         assert_eq!(extract_host_from_authority("fe80::1"), "fe80::1");
         // Single-colon strings remain `host:port`-shaped — unchanged
         // from the R45-M1 behaviour.
-        assert_eq!(
-            extract_host_from_authority("127.0.0.1:9000"),
-            "127.0.0.1"
-        );
+        assert_eq!(extract_host_from_authority("127.0.0.1:9000"), "127.0.0.1");
     }
 
     // --- Memory backend round-trips -----------------------------------------
@@ -1121,6 +1037,22 @@ mod tests {
         assert!(err.is_invalid_argument(), "got {err}");
     }
 
+    #[test]
+    fn test_s3_with_root_preserves_bucket_prefix() {
+        let fs = OpendalFileSystem::s3_with_root(
+            "forst-checkpoints",
+            "jobs/app-1/chk",
+            "us-east-1",
+            Some("http://127.0.0.1:9000"),
+            Some("access-key"),
+            Some("secret-key"),
+        )
+        .expect("build s3 fs");
+
+        assert_eq!(fs.op.info().name(), "forst-checkpoints");
+        assert_eq!(fs.op.info().root(), "/jobs/app-1/chk/");
+    }
+
     // --- WriteMode::Append preserves existing bytes -------------------------
 
     #[test]
@@ -1209,7 +1141,10 @@ mod tests {
             let mut buf = vec![0u8; payload.len()];
             let n = r.read(&mut buf).expect("read");
             assert_eq!(n, payload.len());
-            assert_eq!(&buf, payload, "retry layer must be transparent on happy path");
+            assert_eq!(
+                &buf, payload,
+                "retry layer must be transparent on happy path"
+            );
         }
     }
 
@@ -1243,15 +1178,13 @@ mod tests {
         assert!(dbg.contains("OpendalFileSystem"), "got {dbg}");
     }
 
-    // --- rename fallback on services without native rename ------------------
+    // --- rename requires native atomic move support -------------------------
     //
-    // The in-memory service rejects `rename` with `Unsupported`. We added a
-    // copy+delete fallback so the engine's atomic-temp-file flush path keeps
-    // working on these substrates. This test pins that contract: rename must
-    // succeed end-to-end on memory backend, and the destination must contain
-    // the source bytes while the source disappears.
+    // The in-memory service rejects `rename` with `Unsupported`. The engine
+    // relies on rename for atomic temp→final publication, so copy+delete must
+    // not be used as a transparent fallback.
     #[test]
-    fn test_opendal_rename_fallback_on_unsupported() {
+    fn test_opendal_rename_unsupported_fails_fast() {
         let fs = OpendalFileSystem::memory().unwrap();
         let src = Path::new("rename/src.dat");
         let dst = Path::new("rename/dst.dat");
@@ -1267,42 +1200,32 @@ mod tests {
         assert!(fs.file_exists(src).unwrap());
         assert!(!fs.file_exists(dst).unwrap());
 
-        fs.rename(src, dst)
-            .expect("rename via copy+delete fallback");
+        let err = fs
+            .rename(src, dst)
+            .expect_err("unsupported rename must fail");
+        assert!(err.is_not_supported(), "got {err}");
 
         assert!(
-            !fs.file_exists(src).unwrap(),
-            "source must be gone after rename"
+            fs.file_exists(src).unwrap(),
+            "source must remain after failed rename"
         );
         assert!(
-            fs.file_exists(dst).unwrap(),
-            "destination must exist after rename"
+            !fs.file_exists(dst).unwrap(),
+            "destination must not be published by failed rename"
         );
-
-        let mut r = fs.open_sequential_file(dst).unwrap();
-        let mut buf = vec![0u8; payload.len() + 8];
-        let n = r.read(&mut buf).unwrap();
-        assert_eq!(&buf[..n], payload, "rename must preserve content");
     }
 
-    // --- PR-D1: bytes::Bytes round-trip on the storage layer ---------------
+    // --- PR-D1: streaming round-trip on the storage layer -------------------
     //
     // Writes a 1 MiB payload, then reads it back via both the sequential
-    // and random-access readers. Both now serve from a `bytes::Bytes`
-    // refcounted buffer instead of allocating an intermediate `Vec<u8>`
-    // per read. The test asserts data equality across multiple read modes
+    // and random-access readers. Sequential reads stream through OpenDAL's
+    // blocking reader, while random-access reads copy directly from OpenDAL
+    // buffers into the caller slice. The test asserts data equality across multiple read modes
     // and offsets, which exercises:
-    //   - `OpendalSequentialFile::bytes: Bytes` (zero-copy from
-    //     `Buffer::to_bytes()`),
+    //   - `OpendalSequentialFile` streaming `StdReader`,
     //   - `OpendalRandomAccessFile::read_at` using `Buf::copy_to_slice`
     //     (streaming copy, no `Vec` intermediate),
-    //   - `OpendalWritableFile::persist` using
-    //     `mem::take(&mut self.buffer).into()` for zero-copy `Vec → Bytes`.
-    //
-    // The intent is to pin the no-Vec-intermediate invariant; a regression
-    // that re-introduces `to_vec()` on the read path would not fail this
-    // test directly but would show up in the `s3_read_64MB` criterion
-    // benchmark referenced by the PR-D1 acceptance criterion.
+    //   - `OpendalWritableFile` streaming writer close.
     #[test]
     fn bytes_zero_copy_round_trip() {
         use std::path::Path;
@@ -1323,8 +1246,7 @@ mod tests {
         }
         payload.truncate(SIZE);
 
-        // Write via OpendalWritableFile (exercises persist's mem::take →
-        // Bytes path).
+        // Write via OpendalWritableFile's streaming writer.
         {
             let mut w = fs
                 .open_writable_file(path, WriteMode::CreateOrTruncate)
@@ -1333,8 +1255,7 @@ mod tests {
             w.sync().expect("sync");
         }
 
-        // Sequential read covers the full object; serves from
-        // OpendalSequentialFile's `Bytes` field.
+        // Sequential read covers the full object through the streaming reader.
         {
             let mut r = fs.open_sequential_file(path).expect("open sequential");
             let mut buf = vec![0u8; SIZE];

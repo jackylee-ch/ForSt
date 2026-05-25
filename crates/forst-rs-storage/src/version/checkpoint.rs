@@ -517,7 +517,10 @@ mod tests {
         let snap = make_snapshot(vec![(0, f)]);
         let blob = serialize_to_blob(&snap).unwrap();
         let restored = restore_from_blob(&blob).unwrap();
-        assert_eq!(restored.version.levels[0].files[0].cf_id, ColumnFamilyId(42));
+        assert_eq!(
+            restored.version.levels[0].files[0].cf_id,
+            ColumnFamilyId(42)
+        );
     }
 
     #[test]

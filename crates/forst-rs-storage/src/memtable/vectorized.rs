@@ -304,20 +304,7 @@ impl VectorizedMemTable {
         // Persistent hash index: always append so get() is O(1).
         // Also maintain the inline value cache for the latest version.
         //
-        // PERF: For Put operations on existing keys where the value fits inline,
-        // skip the columnar append entirely — just update the hash_index entry.
-        // This makes memory usage proportional to DISTINCT keys, not total updates.
         if let Some(entry) = self.hash_index.get_mut(key) {
-            if op_type_byte == OpType::Put as u8
-                && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                && entry.latest_op == OpType::Put as u8
-            {
-                // Fast path: update inline value in-place, skip columnar append
-                entry.latest_seq = seq;
-                entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
-                self.memory_used += 8; // approximate: seq update
-                return Ok(seq);
-            }
             entry.row_indices.push(row_index);
             entry.latest_seq = seq;
             entry.latest_op = op_type_byte;
@@ -367,7 +354,7 @@ impl VectorizedMemTable {
                 if let Some(keys) = self.prefix_index.get_mut(prefix) {
                     keys.retain(|k| &**k != key);
                 }
-            } else if op_type == OpType::Put {
+            } else if op_type == OpType::Put || op_type == OpType::Merge {
                 let needs_insert = self
                     .prefix_index
                     .get(prefix)
@@ -1029,7 +1016,7 @@ impl VectorizedMemTable {
                     if let Some(keys) = self.prefix_index.get_mut(prefix) {
                         keys.retain(|k| &**k != key);
                     }
-                } else if op_type == OpType::Put {
+                } else if op_type == OpType::Put || op_type == OpType::Merge {
                     let needs_insert = self
                         .prefix_index
                         .get(prefix)
@@ -1201,7 +1188,7 @@ impl VectorizedMemTable {
                     if let Some(keys) = self.prefix_index.get_mut(prefix) {
                         keys.retain(|k| &**k != key);
                     }
-                } else if op_type == OpType::Put {
+                } else if op_type == OpType::Put || op_type == OpType::Merge {
                     let needs_insert = self
                         .prefix_index
                         .get(prefix)
@@ -1493,7 +1480,7 @@ impl VectorizedMemTable {
                     if let Some(keys) = self.prefix_index.get_mut(prefix) {
                         keys.retain(|k| &**k != key);
                     }
-                } else if op_type == OpType::Put {
+                } else if op_type == OpType::Put || op_type == OpType::Merge {
                     let needs_insert = self
                         .prefix_index
                         .get(prefix)
@@ -2909,8 +2896,7 @@ mod tests {
             .collect();
         let vals_owned: Vec<Vec<u8>> = (0..256u32).map(|i| i.to_le_bytes().to_vec()).collect();
         let key_refs: Vec<&[u8]> = keys_owned.iter().map(|k| k.as_slice()).collect();
-        let val_refs: Vec<Option<&[u8]>> =
-            vals_owned.iter().map(|v| Some(v.as_slice())).collect();
+        let val_refs: Vec<Option<&[u8]>> = vals_owned.iter().map(|v| Some(v.as_slice())).collect();
         let ops: Vec<u8> = vec![OpType::Put as u8; 256];
 
         let inserted = mt
@@ -2995,15 +2981,17 @@ mod tests {
         let mixed_keys_owned: Vec<Vec<u8>> = (0..4)
             .map(|i| format!("other/{}", i).into_bytes())
             .collect();
-        let mixed_key_refs: Vec<&[u8]> =
-            mixed_keys_owned.iter().map(|k| k.as_slice()).collect();
+        let mixed_key_refs: Vec<&[u8]> = mixed_keys_owned.iter().map(|k| k.as_slice()).collect();
         let mixed_vals: Vec<Option<&[u8]>> = vec![Some(b"x".as_slice()); 4];
         let mixed_ops: Vec<u8> = vec![OpType::Put as u8; 4];
         mt.batch_insert_with_base_seq(&mixed_key_refs, &mixed_vals, &mixed_ops, 2000)
             .unwrap();
         assert_eq!(mt.prefix_index.get(b"other/".as_slice()).unwrap().len(), 4);
         // Original bucket still 256, untouched.
-        assert_eq!(mt.prefix_index.get(b"prefix/".as_slice()).unwrap().len(), 256);
+        assert_eq!(
+            mt.prefix_index.get(b"prefix/".as_slice()).unwrap().len(),
+            256
+        );
     }
 
     /// C8-H2 regression test: Put → Delete → Put-within-same-memtable must
@@ -3029,11 +3017,7 @@ mod tests {
 
         // ---- batch_insert_with_base_seq path ----
         let mut mt2 = VectorizedMemTable::new(test_config());
-        let ops = vec![
-            OpType::Put as u8,
-            OpType::Delete as u8,
-            OpType::Put as u8,
-        ];
+        let ops = vec![OpType::Put as u8, OpType::Delete as u8, OpType::Put as u8];
         let key_refs: Vec<&[u8]> = vec![key, key, key];
         let v1: &[u8] = b"v1";
         let v2: &[u8] = b"v2";
@@ -3070,11 +3054,7 @@ mod tests {
         let v1: &[u8] = b"v1";
         let v2: &[u8] = b"v2";
         let val_refs4: Vec<Option<&[u8]>> = vec![Some(v1), None, Some(v2)];
-        let ops4: Vec<u8> = vec![
-            OpType::Put as u8,
-            OpType::Delete as u8,
-            OpType::Put as u8,
-        ];
+        let ops4: Vec<u8> = vec![OpType::Put as u8, OpType::Delete as u8, OpType::Put as u8];
         let batch = make_arrow_batch(&key_refs4, &val_refs4, &ops4);
         mt4.batch_put_arrow_with_base_seq(&batch, 1).unwrap();
         let keys4 = mt4.prefix_scan_keys(b"ns/", None);
@@ -3082,6 +3062,20 @@ mod tests {
             keys4.iter().any(|k| &**k == key),
             "batch_put_arrow_with_base_seq Put→Delete→Put must leave key visible; got {:?}",
             keys4
+        );
+    }
+
+    #[test]
+    fn prefix_index_tracks_merge_only_keys() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        let key: &[u8] = b"ns/list-key";
+        mt.put(key, Some(b"A"), OpType::Merge as u8).unwrap();
+
+        let keys = mt.prefix_scan_keys(b"ns/", None);
+        assert!(
+            keys.iter().any(|k| &**k == key),
+            "merge-only key must be visible to prefix_scan_keys; got {:?}",
+            keys
         );
     }
 }

@@ -51,10 +51,12 @@ use std::sync::Arc;
 
 use forst_rs_common::EngineOptions;
 use forst_rs_engine::{
-    ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, ListMergeCombiner, WriteBatch,
+    ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, WriteBatch, DEFAULT_CF_NAME,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
-use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
+use forst_rs_storage::merge_operator::{
+    ListAppendMergeOperator, MergeOperator, RawConcatMergeOperator,
+};
 
 /// Defense-in-depth cap on `count` (or row count) passed to FFI batch
 /// operations. Untrusted C-side caller could otherwise drive
@@ -71,6 +73,43 @@ pub const MAX_BATCH_COUNT: usize = 1_000_000;
 /// for an LSM (RocksDB recommends ≤ 8 KiB); see Delta-Join Lookup design
 /// (2.13_deltajoin_localization.md) for the consumer-side budget.
 pub const MAX_KEY_LEN: usize = 1 << 20;
+
+fn validate_i32_offsets(offsets: &[i32]) -> Option<usize> {
+    if offsets.first().copied()? != 0 {
+        return None;
+    }
+    let mut prev = 0i32;
+    for &off in offsets {
+        if off < 0 || off < prev {
+            return None;
+        }
+        prev = off;
+    }
+    Some(prev as usize)
+}
+
+fn validate_u32_offsets(offsets: &[u32]) -> Option<usize> {
+    if offsets.first().copied()? != 0 {
+        return None;
+    }
+    let mut prev = 0u32;
+    for &off in offsets {
+        if off < prev {
+            return None;
+        }
+        prev = off;
+    }
+    Some(prev as usize)
+}
+
+fn raw_concat_default_cf_descriptor() -> ColumnFamilyDescriptor {
+    ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
+        .with_merge_operator(Arc::new(RawConcatMergeOperator::new()))
+}
+
+fn raw_concat_cf_descriptor(name: impl Into<String>) -> ColumnFamilyDescriptor {
+    ColumnFamilyDescriptor::new(name).with_merge_operator(Arc::new(RawConcatMergeOperator::new()))
+}
 
 // ---------------------------------------------------------------------------
 // Status codes
@@ -477,7 +516,7 @@ pub unsafe extern "C" fn frs_db_open(db_path: *const c_char, out_handle: *mut Fr
             ..EngineOptions::default()
         };
         let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
-        match DbImpl::open_with_fs(opts, fs) {
+        match DbImpl::open_with_fs_and_default_cf(opts, fs, raw_concat_default_cf_descriptor()) {
             Ok(db) => {
                 let boxed = Box::new(db);
                 *out_handle = Box::into_raw(boxed) as *mut c_void;
@@ -501,7 +540,7 @@ pub unsafe extern "C" fn frs_db_open_memory(out_handle: *mut FrsDb) -> i32 {
             ..EngineOptions::default()
         };
         let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
-        match DbImpl::open_with_fs(opts, fs) {
+        match DbImpl::open_with_fs_and_default_cf(opts, fs, raw_concat_default_cf_descriptor()) {
             Ok(db) => {
                 let boxed = Box::new(db);
                 *out_handle = Box::into_raw(boxed) as *mut c_void;
@@ -561,7 +600,7 @@ pub unsafe extern "C" fn frs_db_open_memory_tuned(
             Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
         };
         let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
-        match DbImpl::open_with_fs(opts, fs) {
+        match DbImpl::open_with_fs_and_default_cf(opts, fs, raw_concat_default_cf_descriptor()) {
             Ok(db) => {
                 let boxed = Box::new(db);
                 *out_handle = Box::into_raw(boxed) as *mut c_void;
@@ -625,7 +664,107 @@ pub unsafe extern "C" fn frs_db_open_remote(
             ..EngineOptions::default()
         };
         let cache_path = PathBuf::from(&cache_dir_str);
-        match DbImpl::open_remote(opts, &uri_str, config, &cache_path, cache_capacity_bytes) {
+        match DbImpl::open_remote_with_default_cf(
+            opts,
+            &uri_str,
+            config,
+            &cache_path,
+            cache_capacity_bytes,
+            raw_concat_default_cf_descriptor(),
+        ) {
+            Ok(db) => {
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Opens a remote-storage-backed engine with the same structured tuning
+/// surface as [`frs_db_open_with_options`]. The `db_path` field inside
+/// `opts` is intentionally ignored: remote engines derive their logical
+/// path from `uri` so logs and manifests stay stable across local cache
+/// directories.
+///
+/// # SAFETY
+/// - `opts` must point to a valid [`FrsEngineOptions`] for the duration
+///   of this call.
+/// - `uri` and `cache_dir` must be non-null, NUL-terminated UTF-8.
+/// - `opendal_config_json` may be null, otherwise it must be
+///   NUL-terminated UTF-8.
+/// - `out_handle` must be a valid pointer to a `FrsDb` slot.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_remote_with_options(
+    opts: *const FrsEngineOptions,
+    uri: *const c_char,
+    opendal_config_json: *const c_char,
+    cache_dir: *const c_char,
+    cache_capacity_bytes: u64,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if out_handle.is_null() || opts.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let cfg = &*opts;
+        let uri_str = match cstr_to_str(&uri) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let cache_dir_str = match cstr_to_str(&cache_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let json_str = if opendal_config_json.is_null() {
+            String::new()
+        } else {
+            match cstr_to_str(&opendal_config_json) {
+                Some(s) => s.to_string(),
+                None => return FRS_STATUS_NULL_ARG,
+            }
+        };
+        let config = match parse_flat_json_object(&json_str) {
+            Ok(m) => m,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+
+        let mut builder =
+            EngineOptions::builder().db_path(format!("/db-remote-{}", uri_str_hash(&uri_str)));
+        if cfg.write_buffer_size != 0 {
+            builder = builder.write_buffer_size(cfg.write_buffer_size as usize);
+        }
+        if cfg.max_write_buffer_number != 0 {
+            builder = builder.max_write_buffer_number(cfg.max_write_buffer_number as usize);
+        }
+        if cfg.max_background_compactions != 0 {
+            builder = builder.max_background_compactions(cfg.max_background_compactions as usize);
+        }
+        if cfg.max_background_flushes != 0 {
+            builder = builder.max_background_flushes(cfg.max_background_flushes as usize);
+        }
+        if cfg.block_cache_capacity_bytes != 0 {
+            builder = builder.block_cache_capacity_bytes(cfg.block_cache_capacity_bytes);
+        }
+        if cfg.write_buffer_manager_capacity_bytes != 0 {
+            builder = builder
+                .write_buffer_manager_capacity_bytes(cfg.write_buffer_manager_capacity_bytes);
+        }
+        let engine_opts = match builder.try_build() {
+            Ok(o) => o,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+
+        let cache_path = PathBuf::from(&cache_dir_str);
+        match DbImpl::open_remote_with_default_cf(
+            engine_opts,
+            &uri_str,
+            config,
+            &cache_path,
+            cache_capacity_bytes,
+            raw_concat_default_cf_descriptor(),
+        ) {
             Ok(db) => {
                 let boxed = Box::new(db);
                 *out_handle = Box::into_raw(boxed) as *mut c_void;
@@ -857,7 +996,11 @@ pub unsafe extern "C" fn frs_db_open_with_options(
             Arc::new(LocalFileSystem::new())
         };
 
-        match DbImpl::open_with_fs(engine_opts, fs) {
+        match DbImpl::open_with_fs_and_default_cf(
+            engine_opts,
+            fs,
+            raw_concat_default_cf_descriptor(),
+        ) {
             Ok(db) => {
                 let boxed = Box::new(db);
                 *out_handle = Box::into_raw(boxed) as *mut c_void;
@@ -940,7 +1083,25 @@ pub unsafe extern "C" fn frs_db_create_cf(
     name: *const c_char,
     out_cf: *mut FrsCfHandle,
 ) -> i32 {
-    frs_db_create_cf_with_merge(handle, name, std::ptr::null(), out_cf)
+    guarded(|| {
+        if out_cf.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf_name) = cstr_to_str(&name) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        match db.create_column_family(raw_concat_cf_descriptor(cf_name)) {
+            Ok(cf) => {
+                let boxed = Box::new(cf);
+                *out_cf = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
 }
 
 /// Creates a new column family with the named merge operator attached.
@@ -948,6 +1109,7 @@ pub unsafe extern "C" fn frs_db_create_cf(
 ///
 /// Currently recognised merge operators:
 /// - `"ListAppendMergeOperator"` — comma-separated concatenation
+/// - `"RawConcatMergeOperator"` — byte-for-byte concatenation
 #[no_mangle]
 pub unsafe extern "C" fn frs_db_create_cf_with_merge(
     handle: FrsDb,
@@ -972,6 +1134,7 @@ pub unsafe extern "C" fn frs_db_create_cf_with_merge(
             };
             let op: Arc<dyn MergeOperator> = match op_name {
                 "ListAppendMergeOperator" => Arc::new(ListAppendMergeOperator::with_comma()),
+                "RawConcatMergeOperator" => Arc::new(RawConcatMergeOperator::new()),
                 _ => return FRS_STATUS_INVALID_ARGUMENT,
             };
             desc = desc.with_merge_operator(op);
@@ -1646,7 +1809,11 @@ pub unsafe extern "C" fn frs_db_open_from_checkpoint(
             ..EngineOptions::default()
         };
         let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
-        match DbImpl::open_from_checkpoint(opts, fs) {
+        match DbImpl::open_from_checkpoint_with_default_cf(
+            opts,
+            fs,
+            raw_concat_default_cf_descriptor(),
+        ) {
             Ok(db) => {
                 let boxed = Box::new(db);
                 *out_handle = Box::into_raw(boxed) as *mut c_void;
@@ -1676,7 +1843,11 @@ pub unsafe extern "C" fn frs_db_open_from_checkpoint_memory(
             ..EngineOptions::default()
         };
         let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
-        match DbImpl::open_from_checkpoint(opts, fs) {
+        match DbImpl::open_from_checkpoint_with_default_cf(
+            opts,
+            fs,
+            raw_concat_default_cf_descriptor(),
+        ) {
             Ok(db) => {
                 let boxed = Box::new(db);
                 *out_handle = Box::into_raw(boxed) as *mut c_void;
@@ -2426,6 +2597,7 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
     cf: FrsCfHandle,
     key_offsets: *const i32,
     key_data: *const u8,
+    key_data_len: usize,
     count: usize,
     out_offsets: *mut i32,
     out_data: *mut u8,
@@ -2471,15 +2643,26 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         let key_offs = slice::from_raw_parts(key_offsets, count + 1);
-        let total_keys = key_offs[count] as usize;
-        let key_buf: &[u8] = if key_data.is_null() || total_keys == 0 {
+        let Some(total_keys) = validate_i32_offsets(key_offs) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if total_keys > key_data_len {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if total_keys > 0 && key_data.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let key_buf: &[u8] = if total_keys == 0 {
             &[]
         } else {
             slice::from_raw_parts(key_data, total_keys)
         };
         let out_offs = slice::from_raw_parts_mut(out_offsets, count + 1);
         let out_vld = slice::from_raw_parts_mut(out_validity, count);
-        let out_buf: &mut [u8] = if out_data.is_null() || out_data_cap == 0 {
+        if out_data.is_null() && out_data_cap > 0 {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let out_buf: &mut [u8] = if out_data_cap == 0 {
             &mut []
         } else {
             slice::from_raw_parts_mut(out_data, out_data_cap)
@@ -2495,7 +2678,7 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
         for i in 0..count {
             let ks = key_offs[i] as usize;
             let ke = key_offs[i + 1] as usize;
-            if ke < ks || ke > total_keys {
+            if ke - ks > MAX_KEY_LEN {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
             keys_vec.push(&key_buf[ks..ke]);
@@ -2504,18 +2687,35 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
             Ok(v) => v,
             Err(e) => return error_to_frs_code(&e),
         };
+        let mut required_total: usize = 0;
+        for slot in &results {
+            if let Some(v) = slot {
+                required_total = match required_total.checked_add(v.len()) {
+                    Some(n) => n,
+                    None => {
+                        *out_data_len = usize::MAX;
+                        return FRS_STATUS_BUFFER_TOO_SMALL;
+                    }
+                };
+                if required_total > i32::MAX as usize {
+                    *out_data_len = required_total;
+                    return FRS_STATUS_BUFFER_TOO_SMALL;
+                }
+            }
+        }
+        if required_total > out_data_cap {
+            *out_data_len = required_total;
+            return FRS_STATUS_BUFFER_TOO_SMALL;
+        }
         let mut pos: usize = 0;
         out_offs[0] = 0;
         for (i, slot) in results.into_iter().enumerate() {
             match slot {
                 Some(v) => {
                     let vl = v.len();
-                    if pos + vl > out_data_cap {
-                        *out_data_len = pos + vl;
-                        return FRS_STATUS_BUFFER_TOO_SMALL;
-                    }
+                    let required = pos + vl;
                     ptr::copy_nonoverlapping(v.as_ptr(), out_buf.as_mut_ptr().add(pos), vl);
-                    pos += vl;
+                    pos = required;
                     out_vld[i] = 1;
                 }
                 None => out_vld[i] = 0,
@@ -2542,8 +2742,10 @@ pub unsafe extern "C" fn frs_vectorized_batch_put(
     cf: FrsCfHandle,
     key_offsets: *const i32,
     key_data: *const u8,
+    key_data_len: usize,
     val_offsets: *const i32,
     val_data: *const u8,
+    val_data_len: usize,
     count: usize,
 ) -> i32 {
     guarded_vec(|| {
@@ -2564,14 +2766,24 @@ pub unsafe extern "C" fn frs_vectorized_batch_put(
         }
         let key_offs = slice::from_raw_parts(key_offsets, count + 1);
         let val_offs = slice::from_raw_parts(val_offsets, count + 1);
-        let total_keys = key_offs[count] as usize;
-        let total_vals = val_offs[count] as usize;
-        let key_buf: &[u8] = if key_data.is_null() || total_keys == 0 {
+        let Some(total_keys) = validate_i32_offsets(key_offs) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(total_vals) = validate_i32_offsets(val_offs) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if total_keys > key_data_len || total_vals > val_data_len {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if (total_keys > 0 && key_data.is_null()) || (total_vals > 0 && val_data.is_null()) {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let key_buf: &[u8] = if total_keys == 0 {
             &[]
         } else {
             slice::from_raw_parts(key_data, total_keys)
         };
-        let val_buf: &[u8] = if val_data.is_null() || total_vals == 0 {
+        let val_buf: &[u8] = if total_vals == 0 {
             &[]
         } else {
             slice::from_raw_parts(val_data, total_vals)
@@ -2580,11 +2792,11 @@ pub unsafe extern "C" fn frs_vectorized_batch_put(
         for i in 0..count {
             let ks = key_offs[i] as usize;
             let ke = key_offs[i + 1] as usize;
-            let vs = val_offs[i] as usize;
-            let ve = val_offs[i + 1] as usize;
-            if ke < ks || ke > total_keys || ve < vs || ve > total_vals {
+            if ke - ks > MAX_KEY_LEN {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
+            let vs = val_offs[i] as usize;
+            let ve = val_offs[i + 1] as usize;
             wb.put(cf, &key_buf[ks..ke], &val_buf[vs..ve]);
         }
         match db.batch_write(wb) {
@@ -2609,6 +2821,7 @@ pub unsafe extern "C" fn frs_vectorized_batch_delete(
     cf: FrsCfHandle,
     key_offsets: *const i32,
     key_data: *const u8,
+    key_data_len: usize,
     count: usize,
 ) -> i32 {
     guarded_vec(|| {
@@ -2628,8 +2841,16 @@ pub unsafe extern "C" fn frs_vectorized_batch_delete(
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         let key_offs = slice::from_raw_parts(key_offsets, count + 1);
-        let total_keys = key_offs[count] as usize;
-        let key_buf: &[u8] = if key_data.is_null() || total_keys == 0 {
+        let Some(total_keys) = validate_i32_offsets(key_offs) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if total_keys > key_data_len {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if total_keys > 0 && key_data.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let key_buf: &[u8] = if total_keys == 0 {
             &[]
         } else {
             slice::from_raw_parts(key_data, total_keys)
@@ -2638,7 +2859,7 @@ pub unsafe extern "C" fn frs_vectorized_batch_delete(
         for i in 0..count {
             let ks = key_offs[i] as usize;
             let ke = key_offs[i + 1] as usize;
-            if ke < ks || ke > total_keys {
+            if ke - ks > MAX_KEY_LEN {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
             wb.delete(cf, &key_buf[ks..ke]);
@@ -3298,7 +3519,12 @@ pub unsafe extern "C" fn frs_db_open_from_incremental(
                 Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
             }
         }
-        match DbImpl::open_from_incremental(&target, &manifest, &paths) {
+        match DbImpl::open_from_incremental_with_default_cf(
+            &target,
+            &manifest,
+            &paths,
+            raw_concat_default_cf_descriptor(),
+        ) {
             Ok(db) => {
                 // Same handle layout as `frs_db_open` / `frs_db_open_memory`:
                 // a Box-allocated Arc that `frs_db_close` reclaims via
@@ -3741,7 +3967,8 @@ impl IterHandle {
     /// has been surfaced to the FFI caller; subsequent `_next` calls return
     /// empty chunks + Ok (EOF semantics) instead of pulling more rows.
     fn mark_terminal(&self) {
-        self.terminal.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.terminal
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// R18-M4: query the terminal flag. Used by `frs_vec_iter_prefix_next`
@@ -3787,12 +4014,16 @@ impl IterHandle {
 
     /// Push a row back to be returned on the next `next_row()` call.
     fn put_back(&mut self, row: (IterKey, IterValue)) {
-        debug_assert!(self.pending.is_none(), "put_back called with pending row already set");
+        debug_assert!(
+            self.pending.is_none(),
+            "put_back called with pending row already set"
+        );
         self.pending = Some(row);
     }
 
     fn abort(&self) {
-        self.aborted.store(true, std::sync::atomic::Ordering::Release);
+        self.aborted
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     fn is_aborted(&self) -> bool {
@@ -3807,8 +4038,7 @@ impl IterHandle {
 const ITER_SHARD_COUNT: usize = 16;
 const ITER_SHARD_MASK: u64 = (ITER_SHARD_COUNT as u64) - 1;
 
-static ITER_SHARDS: OnceLock<[Mutex<HashMap<u64, IterHandle>>; ITER_SHARD_COUNT]> =
-    OnceLock::new();
+static ITER_SHARDS: OnceLock<[Mutex<HashMap<u64, IterHandle>>; ITER_SHARD_COUNT]> = OnceLock::new();
 static NEXT_ITER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Initialise the shard array on first access.  Each shard is independent;
@@ -3836,11 +4066,7 @@ fn shard_for(handle: u64) -> &'static Mutex<HashMap<u64, IterHandle>> {
 /// # Safety
 /// `buf` must point to at least `cap` writable bytes for the duration of
 /// the call.
-unsafe fn fill_chunk_from_iter(
-    iter: &mut IterHandle,
-    buf: *mut u8,
-    cap: usize,
-) -> (u32, u32) {
+unsafe fn fill_chunk_from_iter(iter: &mut IterHandle, buf: *mut u8, cap: usize) -> (u32, u32) {
     // Aborted iters return an empty chunk — preserve the abort semantic.
     if iter.is_aborted() {
         return (0, 0);
@@ -3982,9 +4208,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
                     // and burying the actual root cause. Tolerate a
                     // poisoned mutex — overwriting a poisoned slot is
                     // benign because we only write when empty.
-                    let mut guard = error_slot_inner
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
+                    let mut guard = error_slot_inner.lock().unwrap_or_else(|p| p.into_inner());
                     if guard.is_none() {
                         *guard = Some(e);
                     }
@@ -4332,7 +4556,11 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                 continue;
             }
 
-            let prefix: &[u8] = if prefix_len == 0 { &[] } else { &data_buf[ks..ke] };
+            let prefix: &[u8] = if prefix_len == 0 {
+                &[]
+            } else {
+                &data_buf[ks..ke]
+            };
 
             // PR-C6-H1 + B10-H3 + B11-H3 + R17-M1: same zero-copy-{key,value}
             // owned streaming path as the single-shot open above, but routed
@@ -4379,8 +4607,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                         None
                     }
                 }));
-            let mut handle_state =
-                IterHandle::new_with_error_slot(inner, batch_error_slot);
+            let mut handle_state = IterHandle::new_with_error_slot(inner, batch_error_slot);
 
             // Fill the first chunk into the caller-owned buffer.
             let (bytes_used, row_count) =
@@ -4532,8 +4759,10 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
         // tagged-union branch (C12-M1: NOT a cmov), but the branch is
         // extremely predictable for the full handle lifetime so the cost
         // is dominated by the `copy_nonoverlapping` into the caller buffer.
-        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
-            Box::new(rows.into_iter().map(|(k, v)| (IterKey::Vec(k), IterValue::Vec(v))));
+        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> = Box::new(
+            rows.into_iter()
+                .map(|(k, v)| (IterKey::Vec(k), IterValue::Vec(v))),
+        );
         let mut handle_state = IterHandle::new(inner);
 
         // Fill the first chunk lazily into the caller's buffer.
@@ -4674,15 +4903,18 @@ pub unsafe extern "C" fn frs_vec_merge_append(
         };
 
         let key = slice::from_raw_parts(key_ptr, key_len as usize);
+        if key.len() > MAX_KEY_LEN {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
 
         // No-op fast path.
         if num_operands == 0 {
             return FrsErrorCode::Ok as i32;
         }
 
-        // PR-B5-H3: collect operand slices as borrowed `&[u8]` (no per-op
-        // alloc + memcpy). The FFI buffers are valid for the duration of
-        // this call; `combine_slices` consumes them synchronously.
+        // Write real Merge operands instead of read-combine-put. This keeps concurrent appends
+        // lossless: the engine resolves merge chains at read/compaction time under the CF's
+        // raw-concat operator.
         let mut operands: Vec<&[u8]> = Vec::with_capacity(num_operands as usize);
         for i in 0..num_operands as usize {
             let p = *operand_ptrs.add(i);
@@ -4690,29 +4922,19 @@ pub unsafe extern "C" fn frs_vec_merge_append(
             if p.is_null() && n > 0 {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
-            let s: &[u8] = if n == 0 { &[] } else { slice::from_raw_parts(p, n) };
+            let s: &[u8] = if n == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(p, n)
+            };
             operands.push(s);
         }
 
-        // Read existing value (empty Vec when key absent).
-        let existing: Vec<u8> = match db_ref.get(cf_ref, key) {
-            Ok(opt) => opt.unwrap_or_default(),
-            Err(e) => return error_to_frs_code(&e),
-        };
-
-        // Concatenate using the fixed list-append combiner.
-        // PR-B5-H3: use the borrowed-slice combiner variant (already used
-        // by the batched path at frs_vec_merge_append_batch) instead of
-        // cloning each operand into Vec<u8>.
-        let combiner = ListMergeCombiner::new();
-        let merged = if existing.is_empty() {
-            combiner.combine_slices(&operands)
-        } else {
-            combiner.combine_with_base_slices(&existing, &operands)
-        };
-
-        // Write back.
-        match db_ref.put(cf_ref, key, &merged) {
+        let mut wb = WriteBatch::with_capacity(operands.len());
+        for operand in operands {
+            wb.merge(cf_ref, key, operand);
+        }
+        match db_ref.batch_write(wb) {
             Ok(_) => FrsErrorCode::Ok as i32,
             Err(e) => error_to_frs_code(&e),
         }
@@ -4725,9 +4947,9 @@ pub unsafe extern "C" fn frs_vec_merge_append(
 /// is the [count=u32 LE][elem_bytes*] payload format produced by the
 /// Flink-side `ForStRsAsyncListStateV2.asyncAdd` / `asyncAddAll` serializer.
 ///
-/// Internally groups rows by key, performs one read-combine-write per
-/// distinct key (saving redundant `get`s when the same key appears multiple
-/// times in the batch — common for Q19's Top-N workload).
+/// Internally writes one engine Merge row per input row in the same order as the Arrow buffers.
+/// This avoids the lost-update window of read-combine-put and lets the LSM merge operator resolve
+/// concurrent append chains.
 ///
 /// # Layout
 /// - `keys_off`: array of `n+1` `u32` offsets into `keys_data`. Row `i`'s
@@ -4750,15 +4972,20 @@ pub unsafe extern "C" fn frs_vec_merge_append_batch(
     cf: FrsCfHandle,
     keys_off: *const u32,
     keys_data: *const u8,
+    keys_data_len: usize,
     ops_off: *const u32,
     ops_data: *const u8,
+    ops_data_len: usize,
     n: u32,
 ) -> i32 {
     guarded_vec(|| {
         if n == 0 {
             return FrsErrorCode::Ok as i32;
         }
-        if keys_off.is_null() || keys_data.is_null() || ops_off.is_null() || ops_data.is_null() {
+        if (n as usize) > MAX_BATCH_COUNT {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if keys_off.is_null() || ops_off.is_null() {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         let Some(db_ref) = db_from_handle(db) else {
@@ -4768,41 +4995,53 @@ pub unsafe extern "C" fn frs_vec_merge_append_batch(
             return FrsErrorCode::BatchHeaderMalformed as i32;
         };
 
-        // Group operands by key. Most batches will have ≤ N distinct keys; pre-allocate.
-        // key_bytes -> Vec<operand_bytes_borrowed_slice>
-        let mut grouped: std::collections::HashMap<&[u8], Vec<&[u8]>> =
-            std::collections::HashMap::with_capacity(n as usize);
+        let count = n as usize;
+        let keys_offs = slice::from_raw_parts(keys_off, count + 1);
+        let ops_offs = slice::from_raw_parts(ops_off, count + 1);
+        let Some(total_keys) = validate_u32_offsets(keys_offs) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(total_ops) = validate_u32_offsets(ops_offs) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if total_keys > keys_data_len || total_ops > ops_data_len {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if (total_keys > 0 && keys_data.is_null()) || (total_ops > 0 && ops_data.is_null()) {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let key_buf: &[u8] = if total_keys == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(keys_data, total_keys)
+        };
+        let ops_buf: &[u8] = if total_ops == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(ops_data, total_ops)
+        };
 
-        for i in 0..n as usize {
-            let k_start = *keys_off.add(i) as usize;
-            let k_end = *keys_off.add(i + 1) as usize;
-            let key = slice::from_raw_parts(keys_data.add(k_start), k_end - k_start);
+        // Preserve row order exactly: batch_write assigns monotonically increasing sequence
+        // numbers to these Merge records, and the read path reverses newest-first operands back to
+        // oldest-first before invoking the raw-concat operator.
+        let mut wb = WriteBatch::with_capacity(count);
+        for i in 0..count {
+            let k_start = keys_offs[i] as usize;
+            let k_end = keys_offs[i + 1] as usize;
+            let key = &key_buf[k_start..k_end];
+            if key.len() > MAX_KEY_LEN {
+                return FrsErrorCode::BatchHeaderMalformed as i32;
+            }
 
-            let o_start = *ops_off.add(i) as usize;
-            let o_end = *ops_off.add(i + 1) as usize;
-            let op = slice::from_raw_parts(ops_data.add(o_start), o_end - o_start);
+            let o_start = ops_offs[i] as usize;
+            let o_end = ops_offs[i + 1] as usize;
+            let op = &ops_buf[o_start..o_end];
 
-            grouped.entry(key).or_insert_with(Vec::new).push(op);
+            wb.merge(cf_ref, key, op);
         }
 
-        // For each distinct key, read existing, combine, write back.
-        // Round-1 fix C-H4: pass borrowed slice array directly instead of cloning
-        // each operand into Vec<u8>. Saves one Vec alloc + memcpy per operand
-        // (Q19 ~3 LIST_ADD/event × 100M events = 300M clones eliminated).
-        let combiner = ListMergeCombiner::new();
-        for (key, ops) in grouped.iter() {
-            let existing: Vec<u8> = match db_ref.get(cf_ref, key) {
-                Ok(opt) => opt.unwrap_or_default(),
-                Err(e) => return error_to_frs_code(&e),
-            };
-            let merged = if existing.is_empty() {
-                combiner.combine_slices(ops.as_slice())
-            } else {
-                combiner.combine_with_base_slices(&existing, ops.as_slice())
-            };
-            if let Err(e) = db_ref.put(cf_ref, key, &merged) {
-                return error_to_frs_code(&e);
-            }
+        if let Err(e) = db_ref.batch_write(wb) {
+            return error_to_frs_code(&e);
         }
 
         FrsErrorCode::Ok as i32
@@ -6591,6 +6830,40 @@ mod tests {
     }
 
     #[test]
+    fn test_frs_db_open_remote_with_options_honours_engine_tuning() {
+        let cache_dir = tempfile::TempDir::new().expect("cache tempdir");
+        let cache_dir_str = cache_dir.path().to_string_lossy().into_owned();
+        unsafe {
+            let uri = CString::new("memory://").unwrap();
+            let cfg = CString::new("{}").unwrap();
+            let cdir = CString::new(cache_dir_str).unwrap();
+            let opts = FrsEngineOptions {
+                db_path: ptr::null(),
+                write_buffer_size: 8 * 1024 * 1024,
+                max_write_buffer_number: 2,
+                max_background_compactions: 2,
+                max_background_flushes: 1,
+                block_cache_capacity_bytes: 32 * 1024 * 1024,
+                write_buffer_manager_capacity_bytes: 96 * 1024 * 1024,
+            };
+
+            let mut db: FrsDb = ptr::null_mut();
+            let rc = frs_db_open_remote_with_options(
+                &opts,
+                uri.as_ptr(),
+                cfg.as_ptr(),
+                cdir.as_ptr(),
+                64 * 1024 * 1024,
+                &mut db,
+            );
+            assert_eq!(rc, FRS_STATUS_OK, "open_remote_with_options failed");
+            assert!(!db.is_null());
+            assert_eq!(frs_db_write_buffer_manager_capacity(db), 96 * 1024 * 1024);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
     fn test_frs_db_open_remote_invalid_scheme_returns_invalid_argument() {
         let cache_dir = tempfile::TempDir::new().expect("cache tempdir");
         let cdir = CString::new(cache_dir.path().to_string_lossy().into_owned()).unwrap();
@@ -6968,6 +7241,7 @@ mod tests {
                 cf,
                 key_offs.as_ptr(),
                 key.as_ptr(),
+                key.len(),
                 1,
                 out_offs.as_mut_ptr(),
                 out_data.as_mut_ptr(),
@@ -6986,6 +7260,7 @@ mod tests {
                 cf,
                 key_offs.as_ptr(),
                 key.as_ptr(),
+                key.len(),
                 1,
                 out_offs.as_mut_ptr(),
                 out_data.as_mut_ptr(),
@@ -7005,6 +7280,7 @@ mod tests {
                 cf,
                 key_offs.as_ptr(),
                 key.as_ptr(),
+                key.len(),
                 MAX_BATCH_COUNT + 1,
                 out_offs.as_mut_ptr(),
                 out_data.as_mut_ptr(),
@@ -7044,8 +7320,10 @@ mod tests {
                 cf,
                 key_offs.as_ptr(),
                 key.as_ptr(),
+                key.len(),
                 val_offs.as_ptr(),
                 val.as_ptr(),
+                val.len(),
                 1,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32, "expected FrsErrorCode::Ok (0)");
@@ -7056,8 +7334,10 @@ mod tests {
                 ptr::null_mut(),
                 key_offs.as_ptr(),
                 key.as_ptr(),
+                key.len(),
                 val_offs.as_ptr(),
                 val.as_ptr(),
+                val.len(),
                 1,
             );
             assert_eq!(
@@ -7089,7 +7369,8 @@ mod tests {
             );
 
             let key_offs: [i32; 2] = [0, key.len() as i32];
-            let rc = frs_vectorized_batch_delete(db, cf, key_offs.as_ptr(), key.as_ptr(), 1);
+            let rc =
+                frs_vectorized_batch_delete(db, cf, key_offs.as_ptr(), key.as_ptr(), key.len(), 1);
             assert_eq!(rc, FrsErrorCode::Ok as i32, "expected FrsErrorCode::Ok (0)");
 
             // null key_offsets → BatchHeaderMalformed (110)
@@ -7098,6 +7379,7 @@ mod tests {
                 cf,
                 ptr::null(), // null key_offsets
                 key.as_ptr(),
+                key.len(),
                 1,
             );
             assert_eq!(
@@ -7106,6 +7388,43 @@ mod tests {
                 "null key_offsets should return BatchHeaderMalformed (110)"
             );
 
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn vec_batch_get_rejects_negative_offsets_before_slicing_data() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key_offs = [0i32, -1i32];
+            let mut out_offs = [0i32; 2];
+            let mut out_vld = [0u8; 1];
+            let mut out_len: usize = 0;
+
+            let rc = frs_vectorized_batch_get(
+                db,
+                cf,
+                key_offs.as_ptr(),
+                ptr::null(),
+                0,
+                1,
+                out_offs.as_mut_ptr(),
+                ptr::null_mut(),
+                out_vld.as_mut_ptr(),
+                0,
+                &mut out_len,
+            );
+
+            assert_eq!(
+                rc,
+                FrsErrorCode::BatchHeaderMalformed as i32,
+                "negative Arrow offset must be rejected before any data slice is formed"
+            );
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
@@ -7462,13 +7781,8 @@ mod tests {
                     "iter {} first chunk should have 2 rows",
                     i
                 );
-                assert!(
-                    chunk.bytes_used > 0,
-                    "iter {} bytes_used should be > 0",
-                    i
-                );
-                let rows =
-                    decode_chunk_buf(&chunk_storage[i], chunk.bytes_used, chunk.row_count);
+                assert!(chunk.bytes_used > 0, "iter {} bytes_used should be > 0", i);
+                let rows = decode_chunk_buf(&chunk_storage[i], chunk.bytes_used, chunk.row_count);
                 assert_eq!(rows.len(), 2);
                 for (k, _) in &rows {
                     assert!(
@@ -7628,10 +7942,7 @@ mod tests {
                     assert_eq!(rc, FrsErrorCode::Ok as i32);
                     assert_eq!(row_count, 0);
 
-                    assert_eq!(
-                        frs_vec_iter_prefix_close(handle),
-                        FrsErrorCode::Ok as i32
-                    );
+                    assert_eq!(frs_vec_iter_prefix_close(handle), FrsErrorCode::Ok as i32);
 
                     handle
                 });
@@ -7817,6 +8128,181 @@ mod tests {
         }
     }
 
+    #[test]
+    fn vec_batch_get_reads_active_merge_operand_chain() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"active-merge";
+            let keys_off = [0u32, key.len() as u32, (key.len() * 2) as u32];
+            let mut keys_data = Vec::new();
+            keys_data.extend_from_slice(key);
+            keys_data.extend_from_slice(key);
+            let ops = b"AB";
+            let ops_off = [0u32, 1, 2];
+            assert_eq!(
+                frs_vec_merge_append_batch(
+                    db,
+                    cf,
+                    keys_off.as_ptr(),
+                    keys_data.as_ptr(),
+                    keys_data.len(),
+                    ops_off.as_ptr(),
+                    ops.as_ptr(),
+                    ops.len(),
+                    2,
+                ),
+                FrsErrorCode::Ok as i32
+            );
+
+            let key_offsets = [0i32, key.len() as i32];
+            let mut out_offsets = [0i32; 2];
+            let mut out_data = [0u8; 16];
+            let mut out_validity = [0u8; 1];
+            let mut out_len = 0usize;
+            let rc = frs_vectorized_batch_get(
+                db,
+                cf,
+                key_offsets.as_ptr(),
+                key.as_ptr(),
+                key.len(),
+                1,
+                out_offsets.as_mut_ptr(),
+                out_data.as_mut_ptr(),
+                out_validity.as_mut_ptr(),
+                out_data.len(),
+                &mut out_len,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32);
+            assert_eq!(out_validity[0], 1);
+            assert_eq!(&out_data[..out_len], b"AB");
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn flushed_put_merge_chain_same_sst_reads_full_value() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"sst-merge";
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), b"base".as_ptr(), 4),
+                FRS_STATUS_OK
+            );
+            let keys_off = [0u32, key.len() as u32, (key.len() * 2) as u32];
+            let mut keys_data = Vec::new();
+            keys_data.extend_from_slice(key);
+            keys_data.extend_from_slice(key);
+            let ops = b"XY";
+            let ops_off = [0u32, 1, 2];
+            assert_eq!(
+                frs_vec_merge_append_batch(
+                    db,
+                    cf,
+                    keys_off.as_ptr(),
+                    keys_data.as_ptr(),
+                    keys_data.len(),
+                    ops_off.as_ptr(),
+                    ops.as_ptr(),
+                    ops.len(),
+                    2,
+                ),
+                FrsErrorCode::Ok as i32
+            );
+            assert_eq!(frs_flush(db), FRS_STATUS_OK);
+
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            assert_eq!(slice::from_raw_parts(out.data, out.len), b"baseXY");
+            frs_bytes_free(&mut out);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn vectorized_ffi_rejects_offsets_beyond_declared_data_len() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"short";
+            let key_offsets = [0i32, key.len() as i32];
+            let mut out_offsets = [0i32; 2];
+            let mut out_data = [0u8; 8];
+            let mut out_validity = [0u8; 1];
+            let mut out_len = 0usize;
+            assert_eq!(
+                frs_vectorized_batch_get(
+                    db,
+                    cf,
+                    key_offsets.as_ptr(),
+                    key.as_ptr(),
+                    key.len() - 1,
+                    1,
+                    out_offsets.as_mut_ptr(),
+                    out_data.as_mut_ptr(),
+                    out_validity.as_mut_ptr(),
+                    out_data.len(),
+                    &mut out_len,
+                ),
+                FrsErrorCode::BatchHeaderMalformed as i32
+            );
+
+            let val = b"value";
+            let val_offsets = [0i32, val.len() as i32];
+            assert_eq!(
+                frs_vectorized_batch_put(
+                    db,
+                    cf,
+                    key_offsets.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offsets.as_ptr(),
+                    val.as_ptr(),
+                    val.len() - 1,
+                    1,
+                ),
+                FrsErrorCode::BatchHeaderMalformed as i32
+            );
+
+            let merge_key_offsets = [0u32, key.len() as u32];
+            let op_offsets = [0u32, val.len() as u32];
+            assert_eq!(
+                frs_vec_merge_append_batch(
+                    db,
+                    cf,
+                    merge_key_offsets.as_ptr(),
+                    key.as_ptr(),
+                    key.len() - 1,
+                    op_offsets.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                    1,
+                ),
+                FrsErrorCode::BatchHeaderMalformed as i32
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // frs_vec_merge_append_batch tests (Phase A.1 — audit-design §3 V4)
     // -----------------------------------------------------------------------
@@ -7843,8 +8329,10 @@ mod tests {
                 cf,
                 keys_off.as_ptr(),
                 keys_data.as_ptr(),
+                keys_data.len(),
                 ops_off.as_ptr(),
                 ops_data.as_ptr(),
+                ops_data.len(),
                 3,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
@@ -7886,18 +8374,17 @@ mod tests {
                 cf,
                 keys_off.as_ptr(),
                 keys_data.as_ptr(),
+                keys_data.len(),
                 ops_off.as_ptr(),
                 ops_data.as_ptr(),
+                ops_data.len(),
                 3,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
 
             // k1 should now contain "ABC" (concatenated operands).
             let mut out = FrsBytes::NULL;
-            assert_eq!(
-                frs_get(db, cf, b"k1".as_ptr(), 2, &mut out),
-                FRS_STATUS_OK
-            );
+            assert_eq!(frs_get(db, cf, b"k1".as_ptr(), 2, &mut out), FRS_STATUS_OK);
             let got = slice::from_raw_parts(out.data, out.len);
             assert_eq!(got, b"ABC");
             frs_bytes_free(&mut out);
@@ -7933,17 +8420,16 @@ mod tests {
                 cf,
                 keys_off.as_ptr(),
                 keys_data.as_ptr(),
+                keys_data.len(),
                 ops_off.as_ptr(),
                 ops_data.as_ptr(),
+                ops_data.len(),
                 2,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
 
             let mut out = FrsBytes::NULL;
-            assert_eq!(
-                frs_get(db, cf, b"k1".as_ptr(), 2, &mut out),
-                FRS_STATUS_OK
-            );
+            assert_eq!(frs_get(db, cf, b"k1".as_ptr(), 2, &mut out), FRS_STATUS_OK);
             let got = slice::from_raw_parts(out.data, out.len);
             assert_eq!(got, b"BASEXY");
             frs_bytes_free(&mut out);
@@ -7989,8 +8475,10 @@ mod tests {
                 cf,
                 keys_off.as_ptr(),
                 keys_data.as_ptr(),
+                keys_data.len(),
                 ops_off.as_ptr(),
                 ops_data.as_ptr(),
+                ops_data.len(),
                 N as u32,
             );
 
@@ -8003,8 +8491,10 @@ mod tests {
                     cf,
                     keys_off.as_ptr(),
                     keys_data.as_ptr(),
+                    keys_data.len(),
                     ops_off.as_ptr(),
                     ops_data.as_ptr(),
+                    ops_data.len(),
                     N as u32,
                 );
                 let elapsed = t0.elapsed();
@@ -8051,8 +8541,10 @@ mod tests {
                 cf,
                 keys_off.as_ptr(),
                 keys_data.as_ptr(),
+                keys_data.len(),
                 ops_off.as_ptr(),
                 ops_data.as_ptr(),
+                ops_data.len(),
                 0,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
@@ -8301,6 +8793,7 @@ mod tests {
                 std::ptr::null_mut(), // null FrsCfHandle
                 std::ptr::null(),     // key_offsets
                 std::ptr::null(),     // key_data
+                0,                    // key_data_len
                 0,                    // count
                 std::ptr::null_mut(), // out_offsets
                 std::ptr::null_mut(), // out_data
@@ -8403,6 +8896,7 @@ mod tests {
                 cf,
                 key_offs.as_ptr(),
                 key_data.as_ptr(),
+                key_data.len(),
                 batch_count,
                 out_offs.as_mut_ptr(),
                 out_data.as_mut_ptr(),
@@ -8420,12 +8914,18 @@ mod tests {
                 let lo = out_offs[i] as usize;
                 let hi = out_offs[i + 1] as usize;
                 assert!(hi >= lo, "offsets must be monotonic at i={}", i);
-                assert_eq!(&out_data[lo..hi], vals[i].as_slice(), "value mismatch at i={}", i);
+                assert_eq!(
+                    &out_data[lo..hi],
+                    vals[i].as_slice(),
+                    "value mismatch at i={}",
+                    i
+                );
             }
             // Last slot is the missing key.
             assert_eq!(out_vld[N], 0, "missing key must report validity 0");
             assert_eq!(
-                out_offs[N + 1] as usize, total_val_bytes,
+                out_offs[N + 1] as usize,
+                total_val_bytes,
                 "trailing offset must equal total value bytes"
             );
 

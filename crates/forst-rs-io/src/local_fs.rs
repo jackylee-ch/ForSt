@@ -305,12 +305,10 @@ impl FileSystem for LocalFileSystem {
     fn sync_dir(&self, dir: &Path) -> ForstResult<()> {
         #[cfg(unix)]
         {
-            let f = File::open(dir).map_err(|e| {
-                map_io_error(e, &format!("sync_dir open: {}", dir.display()))
-            })?;
-            f.sync_all().map_err(|e| {
-                map_io_error(e, &format!("sync_dir fsync: {}", dir.display()))
-            })?;
+            let f = File::open(dir)
+                .map_err(|e| map_io_error(e, &format!("sync_dir open: {}", dir.display())))?;
+            f.sync_all()
+                .map_err(|e| map_io_error(e, &format!("sync_dir fsync: {}", dir.display())))?;
             Ok(())
         }
         #[cfg(not(unix))]

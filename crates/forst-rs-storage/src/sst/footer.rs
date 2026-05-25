@@ -604,7 +604,10 @@ mod tests {
 
         let decoded = FooterV1::decode(&buf).expect("v1 footer must decode");
         assert_eq!(decoded.format_version, 1);
-        assert_eq!(decoded.cf_id, DEFAULT_CF_ID, "v1 fallback must use DEFAULT_CF_ID");
+        assert_eq!(
+            decoded.cf_id, DEFAULT_CF_ID,
+            "v1 fallback must use DEFAULT_CF_ID"
+        );
         assert_eq!(decoded.min_key, b"aaa");
         assert_eq!(decoded.max_key, b"zzz");
     }
