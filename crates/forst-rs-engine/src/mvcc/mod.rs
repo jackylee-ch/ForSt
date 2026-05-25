@@ -30,7 +30,7 @@ pub mod reader;
 pub mod snapshot;
 
 pub use compaction_policy::should_drop;
-pub use reader::{get_at, VersionedEntry};
+pub use reader::{get_at, get_at_with_merge, VersionedEntry};
 pub use snapshot::{
     DbId, Snapshot, SnapshotAgeWarning, SnapshotRegistry, DEFAULT_MAX_AGE_MS, SNAPSHOT_AGE_HINT,
 };

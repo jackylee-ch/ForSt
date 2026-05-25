@@ -260,6 +260,13 @@ impl Version {
     ///
     /// For L0, returns None (L0 files may overlap; caller must check all).
     /// For L1+, uses binary search on smallest_key.
+    ///
+    /// A-H2: this variant DOES NOT filter by CF — it assumes the
+    /// level's file list is single-CF or the caller will gate the
+    /// result on `cf_id`. Per-CF readers in a global VersionSet
+    /// (today's layout) MUST use [`Self::find_sst_for_key_in_cf`]
+    /// instead, otherwise multi-CF deployments with overlapping
+    /// byte-range keyspaces silently miss point reads at L1+.
     pub fn find_sst_for_key(&self, level: usize, key: &[u8]) -> Option<usize> {
         if level == 0 || level >= self.levels.len() {
             return None;
@@ -281,6 +288,46 @@ impl Version {
         } else {
             None
         }
+    }
+
+    /// A-H2: CF-aware key lookup at `level`. With a global VersionSet,
+    /// `levels[i].files` interleaves files from every CF — binary
+    /// search by `smallest_key` alone can land on a non-matching
+    /// CF's file. The pre-A-H2 caller pattern
+    /// (`find_sst_for_key + cf_id check + continue`) silently
+    /// abandoned the entire level when the picked candidate was
+    /// another CF's file. This variant filters by `cf_id` BEFORE the
+    /// search, so the result is always the correct CF's file (or
+    /// `None`).
+    ///
+    /// Cost: linear scan filtered by cf_id is O(N_level). For the
+    /// audited deployment (≤ thousands of files per level, single-
+    /// digit CFs) the cache-friendly linear scan is faster in
+    /// practice than building a per-CF sorted view. If profiling
+    /// shows this becomes hot, switch to a precomputed per-CF index.
+    pub fn find_sst_for_key_in_cf(
+        &self,
+        level: usize,
+        key: &[u8],
+        cf_id: forst_rs_common::ColumnFamilyId,
+    ) -> Option<usize> {
+        if level == 0 || level >= self.levels.len() {
+            return None;
+        }
+        let files = &self.levels[level].files;
+        // Per-CF, files at L1+ are non-overlapping. Walk in order and
+        // find the file whose range contains `key`. We cannot binary
+        // search the unfiltered slice (see A-H2 above); the filtered
+        // sub-sequence preserves order so a single pass suffices.
+        for (idx, f) in files.iter().enumerate() {
+            if f.cf_id != cf_id {
+                continue;
+            }
+            if f.smallest_key.as_slice() <= key && key <= f.largest_key.as_slice() {
+                return Some(idx);
+            }
+        }
+        None
     }
 }
 

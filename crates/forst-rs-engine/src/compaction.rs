@@ -130,11 +130,29 @@ impl CompactionJob {
                 .iter()
                 .map(|(lvl, m, _)| (*lvl, m.file_number))
                 .collect();
+            // R0A-H1: preserve the input files' max sequence so the
+            // version-set high-water mark does not regress after a
+            // compaction that drops every entry. Without this, a
+            // checkpoint taken right after such a compaction would
+            // initialize the restored engine's `sequence_number` from a
+            // stale value, allowing later writes to reuse seqs of any
+            // SSTs that survived. We compute the max across all inputs.
+            let max_in_seq = self
+                .inputs
+                .iter()
+                .map(|(_, m, _)| m.max_sequence.value())
+                .max()
+                .unwrap_or(0);
+            let last_seq = if max_in_seq > 0 {
+                Some(forst_rs_common::SequenceNumber(max_in_seq))
+            } else {
+                None
+            };
             return Ok(Some(VersionEdit {
                 deleted_files: deleted,
                 new_files: Vec::new(),
                 next_file_number: None,
-                last_sequence: None,
+                last_sequence: last_seq,
             }));
         }
 
@@ -251,6 +269,19 @@ impl CompactionJob {
             Ok(None) => {
                 // Zero-emit: tmp already cleaned up by the inner branch; emit a deletion-only
                 // VersionEdit.
+                // R0A-H1: same rationale as above — keep last_sequence at
+                // the input max so the version counter does not regress.
+                let max_in_seq = self
+                    .inputs
+                    .iter()
+                    .map(|(_, m, _)| m.max_sequence.value())
+                    .max()
+                    .unwrap_or(0);
+                let last_seq = if max_in_seq > 0 {
+                    Some(forst_rs_common::SequenceNumber(max_in_seq))
+                } else {
+                    None
+                };
                 return Ok(Some(VersionEdit {
                     deleted_files: self
                         .inputs
@@ -259,7 +290,7 @@ impl CompactionJob {
                         .collect(),
                     new_files: Vec::new(),
                     next_file_number: None,
-                    last_sequence: None,
+                    last_sequence: last_seq,
                 }));
             }
             Err(e) => {
@@ -310,11 +341,23 @@ impl CompactionJob {
             .iter()
             .map(|(lvl, m, _)| (*lvl, m.file_number))
             .collect();
+        // R0A-H1: stamp last_sequence with the output file's max seq so the
+        // version-set's `last_sequence` counter tracks the persistent
+        // high-water mark. Pre-fix compaction left it at `None`, so
+        // checkpoint→restore reset `sequence_number` to a stale value and
+        // subsequent writes silently overwrote restored SST rows (the mvcc
+        // read path returned the older SST row because it had a higher
+        // seq than the post-restore write).
+        let last_seq = if info.max_sequence > 0 {
+            Some(forst_rs_common::SequenceNumber(info.max_sequence))
+        } else {
+            None
+        };
         Ok(Some(VersionEdit {
             new_files: vec![(self.output_level, meta)],
             deleted_files: deleted,
             next_file_number: None,
-            last_sequence: None,
+            last_sequence: last_seq,
         }))
     }
 
@@ -394,15 +437,79 @@ impl CompactionJob {
         if tail.is_empty() {
             return Ok(());
         }
-        // If pinned was non-empty, every tail entry has `seq < min_active`
-        // AND a newer version was already emitted for this user_key —
-        // [`mvcc::should_drop`] returns `true` for all of them. Reclaim
-        // the entire tail without running the consolidation logic
-        // (which would resurrect the tail's newest entry as a Put / Delete
-        // tombstone visible to readers below `min_active`, contradicting
-        // MVCC's contract that everything below `min_active` is fair
-        // game once shadowed).
+        // A-NEW-H2: when pinned is non-empty, we used to drop the
+        // ENTIRE tail on the theory that "newer_emitted satisfies the
+        // shadowing rule for every tail entry". That's wrong for the
+        // snapshot at S = min_active: its read of a key is
+        // `max(v.seq | v.seq <= min_active)`. If the smallest pinned
+        // version has `seq > min_active`, the snapshot at S =
+        // min_active never sees pinned and instead needs the FLOOR
+        // version in tail (the largest version with seq <
+        // min_active). Pre-fix code reclaimed that floor, leaving
+        // snapshot-at-min_active reads returning `None` instead of
+        // the floor's value.
+        //
+        // The fix: when pinned is non-empty AND
+        // `pinned[last].sequence > min_active_snapshot`, also emit
+        // the floor (tail[0]) so reads at S = min_active see it.
+        // Older tail entries (tail[1..]) are shadowed by the floor
+        // for every S in [min_active, pinned[last].sequence) and can
+        // be reclaimed.
+        //
+        // When `pinned[last].sequence == min_active`, the smallest
+        // pinned version IS the floor for S = min_active, so tail[0]
+        // is shadowed and we can drop it (matches pre-fix behavior
+        // for that sub-case).
         if newer_emitted_for_key {
+            let smallest_pinned = pinned.last().unwrap();
+            let smallest_pinned_seq = smallest_pinned.sequence;
+            // A-R3-H2: the prior A-NEW-H2 rule emitted tail[0] only
+            // when the smallest pinned seq STRICTLY EXCEEDED
+            // min_active. That's correct only when smallest_pinned
+            // is a TERMINAL op (Put/Delete/SingleDelete). When
+            // smallest_pinned is a Merge — possibly at
+            // seq == min_active — the snapshot at S = min_active
+            // sees the Merge operand and the merge-aware reader
+            // (mvcc::get_at_with_merge) must walk to an older
+            // Put/Delete to resolve the chain. Dropping the tail
+            // would leave that walk with no base.
+            //
+            // The corrected rule:
+            // 1. If smallest_pinned_seq > min_active OR the pinned
+            //    slice contains ANY non-terminal Merge: we must
+            //    preserve enough tail to give the merge-aware
+            //    reader a Put/Delete base for the snapshot at
+            //    seq <= smallest_pinned_seq.
+            // 2. We walk tail forward, emitting Merge operands and
+            //    stopping at the first Put/Delete/SingleDelete
+            //    (terminal). Anything older than the terminal is
+            //    shadowed for every active snapshot and can be
+            //    reclaimed.
+            // 3. If the entire tail is Merge entries (no terminal),
+            //    we emit ALL of them — the chain has no base and
+            //    the merge operator's full_merge handles `base=None`.
+            //
+            // We DO NOT skip is_bottommost handling for the floor —
+            // floor retention is required precisely to serve a
+            // live snapshot, so reclamation would defeat the fix.
+            let need_floor = smallest_pinned_seq > self.min_active_snapshot.0
+                || pinned.iter().any(|v| v.op_type == OpType::Merge);
+            if need_floor {
+                for entry in tail.iter() {
+                    writer.add(
+                        &entry.key,
+                        entry.value.as_deref(),
+                        entry.sequence,
+                        entry.op_type as u8,
+                    )?;
+                    *emitted += 1;
+                    match entry.op_type {
+                        OpType::Put | OpType::Delete | OpType::SingleDelete => break,
+                        OpType::Merge => continue,
+                    }
+                }
+            }
+            let _ = smallest_pinned; // suppress unused-warning when need_floor=false
             return Ok(());
         }
         // Pinned was empty (no live snapshots see this key's history) —
