@@ -170,6 +170,55 @@ job's FINISHED wall-clock `duration` + verifies the source emitted 100 M records
 `validate-q7.sh` reinvented this badly (and used the broken monitor) — removed. Tuned q7 is being
 re-measured via `QUERY=q7 CONFIG=forst-rs-ffm-local measure-completion.sh`.
 
+## ★★★ DEFINITIVE ROOT CAUSE (2026-06-02) — checkpoint blocks on compaction uploads ★★★
+Hard JobManager `CheckpointCoordinator` evidence from a clean q7 measurement job (`c1fd1e3…`):
+
+| ckpt | state size | duration |
+|---|---|---|
+| 1 | 560 MB | **1764 ms** |
+| 2 | 992 MB | **1553 ms** |
+| 3 | 1268 MB | **332272 ms (332 s!)** — `request time in queue: 302273` |
+
+State grew only +276 MB from ckpt 2→3, but duration exploded **~200×**. Checkpoint 3 is the first
+one that overlaps a **major L0→L1 compaction**. Cause (confirmed in code): the async snapshot calls
+the *flushing* `createIncrementalCheckpointAt` → `create_incremental_checkpoint_impl` →
+**`self.fs.await_all_uploads()`**, and `await_all_uploads` (opendal_backend.rs:1449) **drains EVERY
+in-flight upload** — including background **compaction** output SSTs that are NOT part of this
+checkpoint's pinned version. So once compaction starts (~3rd checkpoint), each checkpoint stalls for
+the entire compaction-upload duration (~330 s). With a 30 s interval that means the pipeline is
+frozen ~95% of the time → q7 never finishes. This is the heavy-join "freeze."
+
+**This overturns every prior sub-hypothesis** (get_arc drain CPU, block-cache thrash, resident-tier
+count). Those were red herrings sampled during the brief fast windows. It also answers the headline
+question: **v3.8/v6f's q7 "8×" was measured ckpt-OFF**; the ckpt-ON requirement exposes this
+checkpoint↔compaction coupling. v3.8 (flink `e0809571483`) already had this exact snapshot strategy,
+so it is NOT a v3.8→HEAD code regression — it is a latent checkpoint-architecture defect that only
+bites under ckpt-ON + heavy compacting state.
+
+### Fix design (checkpoint-correctness-sensitive — needs review before landing)
+The checkpoint pins the SSTs live at `snapshot.seq` (`deletion_guard.pin_batch`) and flushes the
+memtable to new SSTs that ARE in its version. It MUST await the uploads of **only those files** so
+the manifest never references an un-uploaded SST. It must NOT wait for unrelated background
+compaction uploads (their outputs post-date / aren't in the pinned version).
+- **Targeted fix (preferred):** replace the blanket `await_all_uploads()` in
+  `create_incremental_checkpoint_impl` with a per-file `await_upload(path)` loop over exactly the
+  file numbers in `version_snapshot.version.live_sst_files()`. Correctness-preserving (still awaits
+  everything the manifest references) and decouples checkpoint latency from compaction I/O.
+  RISK: if a referenced SST's upload is registered under a path the loop misses → manifest references
+  an un-uploaded file → restore data loss. Must enumerate the pinned set exactly + add a restore test.
+- **Alternative:** wire the existing `frs_create_incremental_checkpoint_at_noflush` + capture the
+  live memtable as an Arrow-IPC artifact (keeps memtable RAM-resident, skips the flush+upload). Larger
+  change; the no-flush memtable artifact is itself re-uploaded each ckpt (non-incremental for the
+  memtable delta) — the true-incremental-memtable design is the harder follow-up.
+- Secondary: investigate why a LOCAL (file://) compaction upload of ~1 GB takes ~330 s (~3 MB/s) —
+  the OpenDAL file-backend write path may itself be pathologically slow / serialized, which would be
+  an independent win (and aligns with the no-per-record / no-copy mandate on the I/O path).
+
+NOTE: the heavy-query 5× lever is THIS (checkpoint↔compaction decoupling), not the join drain. The
+join itself runs at 270–370K/s (rocksdb-competitive) between checkpoints. Diagnostic harness bug
+found + to fix: `diag-ckpt-long-q7.sh` latched onto the nexmark **warmup** job id (canceled after
+120 s) instead of the measurement job — track the job whose source emits the most records instead.
+
 ### Honest scale check
 rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
 collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
