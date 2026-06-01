@@ -10,6 +10,7 @@ JDK25=/Library/Java/JavaVirtualMachines/zulu-25.jdk/Contents/Home
 Q=q7; OUT=/tmp/diag-probe; rm -rf "$OUT"; mkdir -p "$OUT"
 export RUN_ID="probe-$(date +%s)"
 export FRS_PROBE_DIAG=1
+export FRS_ITER_DIAG=1
 S3VARS='${S3_ENDPOINT} ${S3_ACCESS_KEY} ${S3_SECRET_KEY} ${S3_BUCKET} ${S3_REGION} ${S3_PREFIX} ${RUN_ID}'
 "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1 || true
 "$FLINK_HOME"/bin/sql-gateway.sh stop >/dev/null 2>&1 || true
@@ -26,7 +27,7 @@ sql-gateway:
       port: 8083
       bind-port: 8083
 EOF
-JAVA_HOME="$JDK25" FRS_PROBE_DIAG=1 "$FLINK_HOME"/bin/start-cluster.sh >/dev/null 2>&1
+JAVA_HOME="$JDK25" FRS_PROBE_DIAG=1 FRS_ITER_DIAG=1 "$FLINK_HOME"/bin/start-cluster.sh >/dev/null 2>&1
 for i in $(seq 1 30); do curl -sf http://localhost:8081/jobs >/dev/null 2>&1 && break; sleep 1; done
 JAVA_HOME="$JDK25" "$FLINK_HOME"/bin/sql-gateway.sh start >/dev/null 2>&1
 for i in $(seq 1 30); do curl -sf http://localhost:8083/v1/info >/dev/null 2>&1 && break; sleep 1; done
@@ -57,6 +58,10 @@ print(f'BUILD share={100*bd//max(1,tot)}%  FILL share={100*fl//max(1,tot)}%')
 " 2>/dev/null
 echo "=== sample slow-probe lines ==="
 grep "FRS-PROBE-DIAG" "$TO" 2>/dev/null | tail -6
+echo "=== FRS-ITER-DIAG sst_sources fan-out distribution (peak builds) ==="
+grep "FRS-ITER-DIAG" "$TO" 2>/dev/null | grep -oE "sst_sources=[0-9]+" | sort -t= -k2 -n | uniq -c | tail -20
+echo "=== peak sst_sources lines (new_peak=true) ==="
+grep "new_peak=true" "$TO" 2>/dev/null | tail -10
 echo "=== FRS-ITER-DIAG (build internals) if any ==="
 grep "FRS-ITER-DIAG" "$TO" 2>/dev/null | tail -4
 "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1 || true

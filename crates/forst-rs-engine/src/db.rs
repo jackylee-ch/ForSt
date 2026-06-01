@@ -5522,27 +5522,41 @@ impl DbImpl {
 
         if let Some(start) = diag_start {
             let us = start.elapsed().as_micros();
-            if us > 1000 {
-                let mut mem_sources = 0usize;
-                let mut mem_keys = 0usize;
-                let mut sst_sources = 0usize;
-                for s in &sources {
-                    match s {
-                        TierKeySource::MemCursor { cursor } => {
-                            mem_sources += 1;
-                            mem_keys += cursor.snapshot_len();
-                        }
-                        TierKeySource::Sst { .. } => sst_sources += 1,
+            let mut mem_sources = 0usize;
+            let mut mem_keys = 0usize;
+            let mut sst_sources = 0usize;
+            for s in &sources {
+                match s {
+                    TierKeySource::MemCursor { cursor } => {
+                        mem_sources += 1;
+                        mem_keys += cursor.snapshot_len();
                     }
+                    TierKeySource::Sst { .. } => sst_sources += 1,
                 }
+            }
+            // FRS-FANOUT-DIAG (2026-06-02): log a build whenever it sets a NEW
+            // peak SST-source fan-out (flood-free — only fires on a new record),
+            // in addition to the slow-build (>1ms) path. This reveals whether the
+            // q7 empty-probe stall is MANY overlapping L0 SSTs (compaction
+            // starved) vs FEW SSTs each slow to peek (OpenDAL read latency).
+            static MAX_SST_SOURCES: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let new_peak = sst_sources
+                > MAX_SST_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
+                && {
+                    MAX_SST_SOURCES.store(sst_sources, std::sync::atomic::Ordering::Relaxed);
+                    true
+                };
+            if us > 1000 || new_peak {
                 eprintln!(
-                    "FRS-ITER-DIAG build_lazy_prefix us={} prefix_len={} mem_sources={} mem_keys={} sst_sources={} resident_shadowed={}",
+                    "FRS-ITER-DIAG build_lazy_prefix us={} prefix_len={} mem_sources={} mem_keys={} sst_sources={} resident_shadowed={} new_peak={}",
                     us,
                     prefix.len(),
                     mem_sources,
                     mem_keys,
                     sst_sources,
-                    resident_shadowed.len()
+                    resident_shadowed.len(),
+                    new_peak
                 );
             }
         }
