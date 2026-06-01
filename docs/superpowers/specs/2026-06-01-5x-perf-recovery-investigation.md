@@ -283,6 +283,31 @@ the recorded "join probe opens O(num_L0) SSTs" wall, now precisely localized to 
    (RocksDB prefix-bloom equivalent; full-key blooms don't answer prefix queries) — larger engine
    change.
 
+## ✅ FIX #2 LANDED + VALIDATED (2026-06-02) — upper-bound early-termination
+Commit `34f24163a` (engine + reader). `TierKeySource::Sst::peek` now stops at the first key `>= upper`
+(marks the source drained) instead of skipping `>= upper` rows and reading the next block to EOF. TDD:
+`test_empty_prefix_scan_stops_at_upper_bound` (restore-fresh straddling SST, empty gap probe) RED 16/31
+blocks → GREEN ≤3. Suites: engine 257, storage 331, ffi 96. Added `SstReaderImpl::blocks_read()`.
+
+### q7 end-to-end with BOTH fixes — the wall is BROKEN
+| metric | before fixes | after fix#1+#2 |
+|---|---|---|
+| ckpt 3 duration | 332 s | 1.16 s |
+| join throughput | ~100/s (collapsed) | **~8–16K/s sustained** |
+| records before stall | hard wall ~21M | **42.4M @ 1300 s, still progressing** |
+
+**~100× throughput recovery** on the q7 ckpt-ON join. q7 no longer freezes/collapses. BUT it still does
+not FINISH within 1300 s, and steady-state ~8–10K/s is still ~10–13× below rocksdb's 106K/s, and it
+**decays** as state grows (16K→7.7K from 37M→42M). The decay = the LSM deepening + L0 SSTs still being
+minted by the 30 s checkpoint force-flush (`createIncrementalCheckpointAt` flushes the memtable every
+checkpoint) faster than size-only compaction drains them → per-probe source/level count creeps up.
+
+**Next lever (review-gated): the no-flush checkpoint.** Wire `frs_create_incremental_checkpoint_at_noflush`
++ capture the live memtable as an Arrow-IPC artifact, so checkpoints STOP sealing the memtable into a new
+L0 SST every 30 s. This should flatten the throughput decay. Restore-sensitive (must reconstruct the
+memtable artifact) → a focused TDD+restore-test session. Secondary: an L0-file-count compaction trigger
+(compaction is currently size-only) to bound fan-out; and the OpenDAL local I/O speed.
+
 ### Honest scale check
 rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
 collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
