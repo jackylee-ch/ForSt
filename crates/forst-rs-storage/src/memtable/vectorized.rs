@@ -597,7 +597,7 @@ impl VectorizedMemTable {
     /// As [`Self::snapshot_batches`] but only includes entries with
     /// `sequence <= max_seq` when `max_seq` is `Some` — the consistent
     /// snapshot cut for checkpoint-without-flush (see
-    /// [`Self::build_sorted_batches_bounded`]).
+    /// `Self::build_sorted_batches_bounded`).
     pub fn snapshot_batches_bounded(
         &mut self,
         batch_size: usize,
@@ -652,7 +652,7 @@ impl VectorizedMemTable {
     }
 
     /// FRS-CKPT-NOFLUSH streaming snapshot (2026-06-01): builds the same sorted
-    /// batches as [`Self::build_sorted_batches_bounded`] but hands each batch to
+    /// batches as `Self::build_sorted_batches_bounded` but hands each batch to
     /// `emit` and DROPS it before building the next, so peak memory is one batch
     /// (~`MAX_BATCH_BYTES`) rather than the whole memtable materialized as a
     /// `Vec<RecordBatch>`. The checkpoint-without-flush snapshot uses this to

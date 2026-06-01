@@ -496,8 +496,8 @@ impl ShardedMemTable {
     /// `Option<&GetBorrowedResult<'_>>` — the borrow is valid only
     /// inside `f`; the lock is released when `f` returns. Callers
     /// that need to retain the value beyond the closure should
-    /// materialise it via [`MemtableValueRef::into_owned`] or
-    /// [`MemtableValueRef::as_bytes`] inside `f`.
+    /// materialise it via `MemtableValueRef::into_owned` or
+    /// `MemtableValueRef::as_bytes` inside `f`.
     ///
     /// Lock-cost is identical to [`Self::get`] (one shard read lock);
     /// the win is the avoided per-key `Vec<u8>` allocation that

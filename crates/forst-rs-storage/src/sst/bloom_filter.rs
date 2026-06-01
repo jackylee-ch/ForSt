@@ -166,7 +166,7 @@ impl Sbbf {
         if data.is_empty() {
             return Err(ForstError::corruption("SBBF data is empty"));
         }
-        if data.len() % 32 != 0 {
+        if !data.len().is_multiple_of(32) {
             return Err(ForstError::corruption(format!(
                 "SBBF data size {} is not a multiple of 32",
                 data.len()

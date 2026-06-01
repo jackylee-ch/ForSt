@@ -299,7 +299,7 @@ impl OpendalFileSystem {
     /// Wraps an existing [`opendal::Operator`].
     ///
     /// The operator is wrapped in a [`RetryLayer`] (see
-    /// [`default_retry_layer`]) so transient S3/GCS/Azure failures
+    /// `default_retry_layer`) so transient S3/GCS/Azure failures
     /// retry with exponential backoff before propagating to the
     /// caller. This does NOT layer [`BlockingLayer`] onto it; callers
     /// who already have a configured operator are presumed to have
@@ -332,7 +332,7 @@ impl OpendalFileSystem {
     /// Used by tests that need to observe the underlying error
     /// behaviour, or by callers that have already attached a custom
     /// retry policy to the operator. Production code should prefer
-    /// [`with_operator`].
+    /// [`OpendalFileSystem::with_operator`].
     pub fn with_operator_no_retry(op: Operator) -> ForstResult<Self> {
         let rt = RuntimeHandle::acquire()?;
         let name = format!("OpendalFileSystem({})", op.info().scheme().into_static());
@@ -668,7 +668,7 @@ impl RandomAccessFile for OpendalRandomAccessFile {
     }
 
     /// Issues every range as a concurrent ranged GET on the bridged runtime,
-    /// capped at [`READ_RANGES_CONCURRENCY`] in flight. Returns one `Vec` per
+    /// capped at `READ_RANGES_CONCURRENCY` in flight. Returns one `Vec` per
     /// range in input order, byte-identical to looping `read_at` serially.
     fn read_ranges(&self, ranges: &[(u64, usize)]) -> ForstResult<Vec<Vec<u8>>> {
         if ranges.is_empty() {
@@ -747,16 +747,9 @@ impl RandomAccessFile for OpendalRandomAccessFile {
 // WritableFile — streaming OpenDAL writer
 // ---------------------------------------------------------------------------
 
-/// FRS-S3-MULTIPART: minimum/target multipart part size. S3 requires parts
-/// in [5 MiB, 5 GiB]; 8 MiB amortizes per-request overhead while keeping
-/// per-part memory bounded under the concurrency factor below.
-const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
-/// FRS-S3-MULTIPART: number of part uploads dispatched concurrently per SST.
-/// Object stores scale write throughput with request concurrency, so an SST
-/// flush/compaction-output upload that was previously one-part-at-a-time now
-/// fans out this many parts in parallel. Bounded so per-writer peak memory is
-/// ~`MULTIPART_CHUNK_BYTES * WRITE_CONCURRENCY`.
-const WRITE_CONCURRENCY: usize = 4;
+// FRS (dead_code): the earlier 8 MiB / 4-way multipart constants were superseded by the
+// 16 MiB / 8-way BUFFERED object-store path below (S3_WRITE_CHUNK_BYTES / S3_WRITE_CONCURRENCY);
+// removed as unused.
 
 /// 2026-05-29 FRS-S3-FLUSH-CONCURRENT: multipart params for the BUFFERED
 /// object-store write path (the active SST flush/compaction-output path).
@@ -778,6 +771,11 @@ const S3_WRITE_CONCURRENCY: usize = 8;
 /// parts). Local-FS / append-mode writes keep the proven blocking writer.
 enum WriterKind {
     /// Async writer (object-store multipart); driven via the runtime handle.
+    ///
+    /// FRS (dead_code): currently never constructed — the object-store CreateNew/
+    /// CreateOrTruncate path uses the BUFFERED variant below. Retained for the
+    /// streaming async-multipart writer path (kept off the unused-variant gate).
+    #[allow(dead_code)]
     Async(opendal::Writer),
     /// Blocking writer (local FS, memory, or append mode) — self-driving.
     Blocking(opendal::BlockingWriter),
@@ -1178,6 +1176,27 @@ impl FileSystem for OpendalFileSystem {
             WriterKind::Buffered {
                 op: self.op.clone(),
                 buf: Vec::new(),
+            }
+        } else if append && self.op.info().scheme() != opendal::Scheme::Fs {
+            // FRS-APPEND-EMULATION: only the local FS service supports native append;
+            // object stores (S3) and the in-memory service do not, and OpenDAL returns
+            // `Unsupported` for `.append(true)` there. Emulate append via the buffered
+            // writer: load the existing object into the buffer up front, accumulate
+            // subsequent appends in memory, and write the whole object once on
+            // close()/sync() (a synchronous, durable write — `pending` is None on this
+            // path). This makes WriteMode::Append work uniformly across backends instead
+            // of failing on memory/object stores. Memory cost is bounded by the object
+            // size (append targets — e.g. small WAL/manifest blobs — stay small).
+            let mut buf = Vec::with_capacity(initial_size as usize);
+            if exists {
+                let existing = self.block_on(self.op.read(p)).map_err(|e| {
+                    map_opendal_err(e, &format!("open_writable_file append-read: {p}"))
+                })?;
+                buf.extend_from_slice(&existing.to_vec());
+            }
+            WriterKind::Buffered {
+                op: self.op.clone(),
+                buf,
             }
         } else {
             let w = blocking

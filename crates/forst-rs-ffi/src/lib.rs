@@ -32,6 +32,12 @@
 //!   length and capacity; consumers call `frs_bytes_free` to release them.
 
 #![allow(clippy::missing_safety_doc)]
+// FRS clippy policy: index-based loops over caller-provided FFI arrays are
+// bounds-checked per element by design (style-only allow).
+#![allow(clippy::needless_range_loop)]
+// Doc comments cross-reference private internals (documented via --document-private-items);
+// such links don't resolve under the strict rustdoc gate (doc-rendering cosmetics only).
+#![allow(rustdoc::broken_intra_doc_links)]
 
 /// JNI compatibility shim — exports `Java_org_forstdb_RocksDB_*` symbols
 /// so the resulting cdylib is a drop-in for the community
@@ -3087,19 +3093,17 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
             Err(e) => return error_to_frs_code(&e),
         };
         let mut required_total: usize = 0;
-        for slot in &results {
-            if let Some(v) = slot {
-                required_total = match required_total.checked_add(v.len()) {
-                    Some(n) => n,
-                    None => {
-                        *out_data_len = usize::MAX;
-                        return FRS_STATUS_BUFFER_TOO_SMALL;
-                    }
-                };
-                if required_total > i32::MAX as usize {
-                    *out_data_len = required_total;
+        for v in results.iter().flatten() {
+            required_total = match required_total.checked_add(v.len()) {
+                Some(n) => n,
+                None => {
+                    *out_data_len = usize::MAX;
                     return FRS_STATUS_BUFFER_TOO_SMALL;
                 }
+            };
+            if required_total > i32::MAX as usize {
+                *out_data_len = required_total;
+                return FRS_STATUS_BUFFER_TOO_SMALL;
             }
         }
         // C-R13-NEW-H2: output-aggregate cap. Even after the i32::MAX check
@@ -3718,15 +3722,11 @@ pub unsafe extern "C" fn frs_iterator_next_chunk(
                 *out_eof = true;
                 break;
             }
-            // Borrow the row in place (zero-copy); take/clone semantics
-            // mirror the per-row `frs_iterator_next` allow_rewind gate.
-            let (k, v) = if state.allow_rewind {
-                let (kk, vv) = &state.rows[state.cursor];
-                (kk.as_slice(), vv.as_slice())
-            } else {
-                let (kk, vv) = &state.rows[state.cursor];
-                (kk.as_slice(), vv.as_slice())
-            };
+            // Borrow the row in place (zero-copy). The `allow_rewind` rewind-safety gate is
+            // enforced in `frs_iterator_next`; here both arms borrowed the row identically, so
+            // the branch is collapsed (clippy::if_same_then_else) with no behavior change.
+            let (kk, vv) = &state.rows[state.cursor];
+            let (k, v) = (kk.as_slice(), vv.as_slice());
             // Capacity check: if we can't fit the row, stop and let the
             // caller pull what's been emitted so far. Overflow on the
             // FIRST row signals "data_cap too small" — distinguish via
@@ -8679,6 +8679,10 @@ mod tests {
     /// shard from `handle_id & 0xF` so opens from different threads never
     /// collide on the same Mutex unless ids happen to collide modulo 16).
     #[test]
+    // The test body runs under one broad `unsafe` block (the FFI entry points are all
+    // `unsafe extern "C"`); the per-call `unsafe { ... }` wrappers inside it are therefore
+    // nested-redundant. Allow that here rather than thread the outer block through each call.
+    #[allow(unused_unsafe)]
     fn vec_iter_prefix_concurrent_opens() {
         const N_THREADS: usize = 4;
         const ROWS_PER_THREAD_PREFIX: usize = 8;
@@ -8715,8 +8719,9 @@ mod tests {
 
             let mut handles = Vec::with_capacity(N_THREADS);
             for t in 0..N_THREADS {
-                let db_ptr = db_ptr;
-                let cf_ptr = cf_ptr;
+                // `SendPtr` is Copy, so the `move` closure copies these from the enclosing
+                // scope per iteration — no per-iteration shadow binding needed
+                // (clippy::redundant_locals).
                 let h = std::thread::spawn(move || {
                     let db = db_ptr.0 as FrsDb;
                     let cf = cf_ptr.0 as FrsCfHandle;

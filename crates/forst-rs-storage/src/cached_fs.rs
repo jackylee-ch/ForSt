@@ -911,7 +911,7 @@ impl RangeCachedRandomAccessFile {
     /// Tries to serve chunk `chunk_idx` from the local LRU. Returns
     /// `Ok(Some(bytes))` on a length-validated hit, `Ok(None)` on miss (also
     /// invalidating a poisoned wrong-length entry so the concurrent fetch
-    /// re-reads it). Mirrors the hit-path validation in [`chunk_bytes`].
+    /// re-reads it). Mirrors the hit-path validation in `chunk_bytes`.
     fn cache_hit(&self, chunk_idx: u64) -> ForstResult<Option<Vec<u8>>> {
         let key = format!("{}#c{}", self.path_key, chunk_idx);
         if let Some(bytes) = self
@@ -930,7 +930,7 @@ impl RangeCachedRandomAccessFile {
     /// Fetches several missing chunks CONCURRENTLY via the remote backend's
     /// [`read_ranges`] primitive (true parallelism on OpenDAL/S3; serial on
     /// local/memory). Each fetched chunk is length-validated (short read →
-    /// corruption, same guard as [`chunk_bytes`]) and best-effort cached.
+    /// corruption, same guard as `chunk_bytes`) and best-effort cached.
     /// Returns the chunks in the SAME order as `missing`.
     ///
     /// [`read_ranges`]: forst_rs_io::RandomAccessFile::read_ranges
@@ -968,7 +968,7 @@ impl RangeCachedRandomAccessFile {
     }
 
     /// The original serial chunk-at-a-time read of `[offset, end)` into `buf`,
-    /// fetching each chunk via [`chunk_bytes`] (cache hit or single ranged
+    /// fetching each chunk via `chunk_bytes` (cache hit or single ranged
     /// remote read). Used for single-chunk reads and the 0-1-missing fast path.
     fn serial_read_at(&self, offset: u64, end: u64, buf: &mut [u8]) -> ForstResult<usize> {
         let total = (end - offset) as usize;

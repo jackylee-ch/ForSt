@@ -390,7 +390,7 @@ mod tests {
         // current block but doesn't overflow padding math.
         let s = arena.allocate_aligned(128, 16);
         assert_eq!(s.len(), 128);
-        assert!(s.as_ptr() as usize % 16 == 0);
+        assert!((s.as_ptr() as usize).is_multiple_of(16));
         assert!(arena.block_count() > blocks_before);
     }
 }

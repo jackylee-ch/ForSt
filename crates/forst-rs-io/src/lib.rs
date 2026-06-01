@@ -18,6 +18,10 @@
 //! storage engine, including async I/O operations via Tokio.
 
 #![forbid(unsafe_code)]
+// FRS doc policy: this crate documents private internals (`--document-private-items`), so doc
+// comments cross-reference private/in-module items that don't resolve as intra-doc links under
+// the strict rustdoc gate. These are doc-rendering cosmetics, not code issues.
+#![allow(rustdoc::broken_intra_doc_links)]
 
 pub mod async_io;
 pub mod filesystem;

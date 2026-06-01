@@ -4811,7 +4811,7 @@ impl DbImpl {
     ///
     /// # Caller contract: clean target directory
     ///
-    /// R32-L1: the dst-already-exists branch (see [`same_file_or_size`])
+    /// R32-L1: the dst-already-exists branch (see `same_file_or_size`)
     /// validates that a pre-existing dst SST is *plausibly* identical to
     /// the src by checking inode (unix) or size (non-unix). It does NOT
     /// perform a content fingerprint (e.g. CRC32C) — adding one would gate
@@ -5466,7 +5466,7 @@ impl DbImpl {
                     continue;
                 }
             }
-            let reader = self.get_or_open_sst_reader(&sst)?;
+            let reader = self.get_or_open_sst_reader(sst)?;
             // FRS-L0-FANOUT-PRUNE (2026-05-31): skip this SST's source entirely
             // when its in-memory block index proves it holds NO key in
             // [prefix, upper) — WITHOUT decoding a block. The coarse
@@ -5574,7 +5574,7 @@ impl DbImpl {
                     continue;
                 }
             }
-            let reader = self.get_or_open_sst_reader(&sst)?;
+            let reader = self.get_or_open_sst_reader(sst)?;
             // FRS-PREFIX-SEEK: seek to the first index block >= lower (see sister
             // site in prefix_scan_iter_owned*) instead of scanning from block 0.
             let start_block = reader.first_block_ge(lower);
@@ -6925,9 +6925,11 @@ impl DbImpl {
                     found_builder.append_value(false);
                 }
                 SinkGetOutcome::Miss | SinkGetOutcome::NeedsFullPath => {
-                    // Drop the sink borrow before re-borrowing the
-                    // builder via the legacy `Option<Vec<u8>>` path.
-                    drop(sink);
+                    // `sink` (a `&mut value_builder` borrow) is dead after the `get_into`
+                    // call above; NLL ends that borrow at its last use, so the legacy
+                    // `Option<Vec<u8>>` path below can re-borrow `value_builder` freely. No
+                    // explicit `drop(sink)` is needed (and `drop()` on a non-`Drop` borrow
+                    // would only EXTEND its lifetime, not shorten it — clippy::drop_non_drop).
                     match self.get_internal(&cf_data, key, read_seq)? {
                         Some(value) => {
                             value_builder.append_value(&value);
@@ -8428,7 +8430,12 @@ impl Iterator for LazyPrefixIter {
         // currently swallow it (matches the previous BTreeSet behaviour
         // for transient SST read failures during compaction races — the
         // caller's `db.get` will surface any persistent corruption).
-        loop {
+        //
+        // FRS (clippy::never_loop fix): this is a SINGLE pass. Per-source duplicate-skipping
+        // is handled by the inner `loop` over each source below (advance + continue), so the
+        // body always returns the min non-duplicate key (or None) without ever re-iterating.
+        // The previous outer `loop {}` wrapper was vestigial dead structure (removed).
+        {
             // C9-H2: the running candidate is an `Arc<[u8]>`. `Arc::clone`
             // on each update is an atomic refcount bump (≈ 8 ns) versus
             // `Vec::clone` (alloc + memcpy of the full key payload, ≈ 50-
@@ -8566,7 +8573,7 @@ impl Iterator for LazyPrefixIter {
             // collect callers (`prefix_scan`) call `arc.as_ref().to_vec()`
             // explicitly at their boundary so the public Vec<u8> contract
             // stays intact for downstream consumers.
-            return Some(key_arc);
+            Some(key_arc)
         }
     }
 }
@@ -10025,7 +10032,7 @@ mod tests {
         // emitted exactly once in sorted order.
         let mut count = 1u32;
         let mut last_key = first_key;
-        while let Some(item) = iter.next() {
+        for item in iter {
             let (k, _) = item.expect("ok row");
             assert!(
                 k > last_key,

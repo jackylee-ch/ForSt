@@ -214,7 +214,7 @@ impl SstWriterImpl {
         value: Option<&[u8]>,
         sequence: u64,
         op_type: u8,
-        mut sink: Option<&mut StreamingSink<'_, W>>,
+        sink: Option<&mut StreamingSink<'_, W>>,
     ) -> ForstResult<()>
     where
         W: WritableFile + ?Sized,
@@ -269,7 +269,7 @@ impl SstWriterImpl {
         self.key_hashes.push(Sbbf::hash_key(key));
 
         if self.current_estimated_size >= self.options.block_size {
-            self.flush_block(sink.as_deref_mut())?;
+            self.flush_block(sink)?;
         }
 
         Ok(())
@@ -453,7 +453,7 @@ impl SstWriterImpl {
     /// (Arrow's IPC writer is buffer-oriented and cannot stream a single
     /// RecordBatch in chunks — this is an Arrow constraint, not a ForSt-RS
     /// one).
-    fn flush_block<W>(&mut self, mut sink: Option<&mut StreamingSink<'_, W>>) -> ForstResult<()>
+    fn flush_block<W>(&mut self, sink: Option<&mut StreamingSink<'_, W>>) -> ForstResult<()>
     where
         W: WritableFile + ?Sized,
     {
@@ -502,7 +502,7 @@ impl SstWriterImpl {
         let block_offset = self.bytes_written;
         let block_size = block_bytes.len() as u32;
 
-        match sink.as_deref_mut() {
+        match sink {
             Some(s) => {
                 // Streaming mode: emit the block bytes into the WritableFile
                 // sink directly. The transient `block_bytes` Vec lives only

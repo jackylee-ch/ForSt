@@ -156,19 +156,10 @@ pub struct SstReaderImpl {
     cache_file_id: u64,
 }
 
-/// R74-H1: read `buf.len()` bytes at `offset` and require ALL of them.
-///
-/// `RandomAccessFile::read_at` is documented to return short reads at
-/// EOF, but the SST reader bounds every read against `file_size` before
-/// issuing it, so a mid-file short read is a corruption signal — typically
-/// from an OpenDAL ranged-read returning fewer bytes than requested
-/// (`buffer.len().min(buf.len())` in `OpendalRandomAccessFile::read_at`).
-/// Pre-fix the SST reader discarded the `usize` return from `read_at`,
-/// silently consuming truncated buffers in the bloom-filter, sparse-index,
-/// and data-block decoders (no whole-section checksum to catch it).
-///
-/// The loop re-issues the read on partial fill; `n == 0` is treated as
-/// premature EOF and surfaced as `Corruption`.
+// R74-H1: the read-fully helper (a `read_at` loop that requires all `buf.len()` bytes and
+// treats a mid-file short read as `Corruption`) is documented at its own definition below.
+// This is a plain `//` comment, not `///`, because the next item is a `thread_local!` macro
+// invocation, which cannot carry a doc comment (rustc unused_doc_comments).
 std::thread_local! {
     /// FRS-NOZERO-BLOCKREAD (2026-06-01): per-thread reusable scratch for raw
     /// SST data-block bytes, so `read_data_block` doesn't malloc (+ zero-fill) a

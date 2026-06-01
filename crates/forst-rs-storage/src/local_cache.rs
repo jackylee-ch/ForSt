@@ -238,7 +238,7 @@ impl LocalCache {
             self.misses.fetch_add(1, Ordering::Relaxed);
         }
         let n = self.gets.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 100_000 == 0 {
+        if n.is_multiple_of(100_000) {
             let hits = self.hits.load(Ordering::Relaxed);
             let misses = self.misses.load(Ordering::Relaxed);
             let total = hits + misses;
