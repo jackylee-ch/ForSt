@@ -5541,8 +5541,7 @@ impl DbImpl {
             // starved) vs FEW SSTs each slow to peek (OpenDAL read latency).
             static MAX_SST_SOURCES: std::sync::atomic::AtomicUsize =
                 std::sync::atomic::AtomicUsize::new(0);
-            let new_peak = sst_sources
-                > MAX_SST_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
+            let new_peak = sst_sources > MAX_SST_SOURCES.load(std::sync::atomic::Ordering::Relaxed)
                 && {
                     MAX_SST_SOURCES.store(sst_sources, std::sync::atomic::Ordering::Relaxed);
                     true
@@ -10620,14 +10619,21 @@ mod tests {
             self.awaited_paths.lock().unwrap().clear();
         }
         fn await_all_count(&self) -> usize {
-            self.await_all_count.load(std::sync::atomic::Ordering::SeqCst)
+            self.await_all_count
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
     }
     impl FileSystem for UploadRecordingFs {
-        fn open_sequential_file(&self, path: &Path) -> ForstResult<Box<dyn forst_rs_io::SequentialFile>> {
+        fn open_sequential_file(
+            &self,
+            path: &Path,
+        ) -> ForstResult<Box<dyn forst_rs_io::SequentialFile>> {
             self.inner.open_sequential_file(path)
         }
-        fn open_random_access_file(&self, path: &Path) -> ForstResult<Box<dyn forst_rs_io::RandomAccessFile>> {
+        fn open_random_access_file(
+            &self,
+            path: &Path,
+        ) -> ForstResult<Box<dyn forst_rs_io::RandomAccessFile>> {
             self.inner.open_random_access_file(path)
         }
         fn open_writable_file(
@@ -10701,6 +10707,11 @@ mod tests {
 
         let snap = db.snapshot();
         let result = db.create_incremental_checkpoint(&snap, 1, 0).unwrap();
+        // The flush produced at least one new SST for this checkpoint to upload.
+        assert!(
+            !result.new_ssts.is_empty(),
+            "checkpoint should have at least one new SST to upload"
+        );
 
         // BEHAVIOR: the checkpoint must NOT use the blanket all-uploads barrier
         // (it would couple checkpoint latency to background compaction I/O).
