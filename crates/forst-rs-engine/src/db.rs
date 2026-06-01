@@ -4495,12 +4495,19 @@ impl DbImpl {
             }
         }
 
-        // 2026-05-29 WRITE-BACK FLUSH durability barrier (CRITICAL): same as
-        // `create_checkpoint` — block until every spawned S3 upload of the
-        // just-flushed SSTs has completed before snapshotting the VersionSet, so
-        // the incremental manifest never references an SST that is only in a
-        // local/in-flight buffer.
-        self.fs.await_all_uploads()?;
+        // 2026-06-02 q7 ckpt-ON FREEZE FIX: the durability barrier is deferred
+        // until AFTER the VersionSet snapshot below, where it awaits the upload
+        // of ONLY the SSTs this checkpoint actually references (its pinned live
+        // set) — see the per-file `await_upload` loop after the snapshot. The
+        // previous blanket `self.fs.await_all_uploads()?` here drained EVERY
+        // in-flight upload, including large background COMPACTION outputs that
+        // are NOT part of this checkpoint's version. Once compaction kicked in
+        // (~3rd checkpoint on a heavy join), each 30s-interval checkpoint stalled
+        // for the entire compaction-upload duration (measured: ckpt3 = 332s vs
+        // ckpt1/2 ≈ 1.6s), freezing the pipeline. Awaiting exactly the pinned
+        // set preserves the durability guarantee (the manifest never references
+        // an un-uploaded SST) while decoupling checkpoint latency from unrelated
+        // compaction I/O.
 
         // Capture the VersionSet snapshot AFTER flushes so the manifest
         // contains every L0 file the snapshot pins.
@@ -4535,6 +4542,22 @@ impl DbImpl {
                 (snap.clone(), pin, descriptors)
             });
         version_snapshot.cf_descriptors = descriptors_result?;
+
+        // 2026-06-02 q7 ckpt-ON FREEZE FIX (durability barrier, scoped): await
+        // the upload of ONLY the SSTs this checkpoint references. `_pin` above
+        // holds these files live, so awaiting their uploads here is race-free,
+        // and the manifest we are about to serialize references exactly this set
+        // — so a restore can never point at an SST whose bytes are still in a
+        // local/in-flight buffer. Unrelated background compaction uploads are
+        // NOT awaited (they are not in this version), which is what keeps the
+        // checkpoint off the compaction critical path. `await_upload` is a cheap
+        // no-op for any file whose upload already completed (or for backends
+        // that write synchronously).
+        for file in version_snapshot.version.live_sst_files() {
+            let sst_path = crate::flush::sst_file_path(Path::new(&self.db_path), file.file_number);
+            self.fs.await_upload(&sst_path)?;
+        }
+
         let blob = serialize_snapshot(&version_snapshot)?;
 
         // R79-H1: build a cf_id → name lookup so per-file `cf_name` reflects
@@ -6339,21 +6362,20 @@ impl DbImpl {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        // 2026-05-29 WRITE-BACK FLUSH: the flush counter above only tracks the
-        // in-RAM serialization step; the S3 upload of each flushed/compacted SST
-        // runs asynchronously and may still be in flight here. Block until all
-        // uploads complete so a caller that uses this as a flush barrier (e.g.
-        // shutdown drain) gets remote durability, not just local serialization.
-        // Best-effort: a failing upload is logged, since this fn has no error
-        // channel; the checkpoint path (`create_checkpoint`) calls
-        // `await_all_uploads()` directly and DOES surface the error.
-        if let Err(e) = self.fs.await_all_uploads() {
-            tracing::warn!(
-                target: "forst_rs_engine::db",
-                error = %e,
-                "wait_for_pending_flushes: in-flight upload failed",
-            );
-        }
+        // 2026-06-02 q7 ckpt-ON FREEZE FIX: this method now waits ONLY for the
+        // in-RAM flush counter to drain — true to its name. It no longer calls
+        // the blanket `await_all_uploads()`. That bolted-on barrier (2026-05-29)
+        // made EVERY `flush_all()` — including the one at the top of
+        // `create_incremental_checkpoint_impl` — block on ALL in-flight uploads,
+        // including large background COMPACTION outputs unrelated to the caller.
+        // On a heavy join that turned each 30 s-interval checkpoint into a
+        // ~330 s stall once compaction started (the freeze). Remote durability
+        // is now established by the callers that actually need it, scoped to the
+        // files they reference: `create_checkpoint` and
+        // `create_incremental_checkpoint_impl` await their pinned SST set, and
+        // the engine `drop` path awaits all uploads explicitly for a clean
+        // shutdown. A plain flush (memtable → local SST) no longer implies
+        // remote upload — which matches RocksDB semantics (flush ≠ checkpoint).
     }
 
     /// In-lock portion of the switch decision. Returns `true` if a switch
@@ -8125,6 +8147,19 @@ impl Drop for DbImpl {
         //    `flush_all` explicitly before dropping the engine if they
         //    care about those.)
         self.wait_for_pending_flushes();
+        // 2026-06-02: `wait_for_pending_flushes` now waits for the in-RAM flush
+        // counter only (no longer the blanket upload barrier — see its body for
+        // why). Shutdown still wants remote durability of every flushed/compacted
+        // SST, so await all in-flight uploads here explicitly. Best-effort: Drop
+        // has no error channel, so a failing upload is logged, mirroring the
+        // prior behaviour.
+        if let Err(e) = self.fs.await_all_uploads() {
+            tracing::warn!(
+                target: "forst_rs_engine::db",
+                error = %e,
+                "DbImpl::drop: in-flight upload failed during shutdown drain",
+            );
+        }
 
         // 2. Drop our last sender by replacing the queue with an empty
         //    one. This closes the channel and the worker's `recv()`
@@ -10516,6 +10551,144 @@ mod tests {
                 Some(v.as_bytes()),
                 "mismatch at i={}",
                 i
+            );
+        }
+    }
+
+    /// Recording filesystem wrapper: delegates everything to an inner FS but
+    /// counts `await_all_uploads()` calls and records every `await_upload(path)`
+    /// path. Used to prove the incremental-checkpoint barrier waits ONLY for the
+    /// SSTs it references (per-file `await_upload`) and NOT for ALL in-flight
+    /// uploads (`await_all_uploads`, which would also block on unrelated
+    /// background compaction outputs — the q7 ckpt-ON freeze, 2026-06-02).
+    struct UploadRecordingFs {
+        inner: Arc<dyn FileSystem>,
+        await_all_count: std::sync::atomic::AtomicUsize,
+        awaited_paths: std::sync::Mutex<Vec<PathBuf>>,
+    }
+    impl UploadRecordingFs {
+        fn new(inner: Arc<dyn FileSystem>) -> Self {
+            Self {
+                inner,
+                await_all_count: std::sync::atomic::AtomicUsize::new(0),
+                awaited_paths: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn reset(&self) {
+            self.await_all_count
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+            self.awaited_paths.lock().unwrap().clear();
+        }
+        fn await_all_count(&self) -> usize {
+            self.await_all_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl FileSystem for UploadRecordingFs {
+        fn open_sequential_file(&self, path: &Path) -> ForstResult<Box<dyn forst_rs_io::SequentialFile>> {
+            self.inner.open_sequential_file(path)
+        }
+        fn open_random_access_file(&self, path: &Path) -> ForstResult<Box<dyn forst_rs_io::RandomAccessFile>> {
+            self.inner.open_random_access_file(path)
+        }
+        fn open_writable_file(
+            &self,
+            path: &Path,
+            mode: WriteMode,
+        ) -> ForstResult<Box<dyn forst_rs_io::WritableFile>> {
+            self.inner.open_writable_file(path, mode)
+        }
+        fn file_exists(&self, path: &Path) -> ForstResult<bool> {
+            self.inner.file_exists(path)
+        }
+        fn get_file_metadata(&self, path: &Path) -> ForstResult<forst_rs_io::FileMetadata> {
+            self.inner.get_file_metadata(path)
+        }
+        fn list_dir(&self, dir: &Path) -> ForstResult<Vec<forst_rs_io::FileMetadata>> {
+            self.inner.list_dir(dir)
+        }
+        fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+            self.inner.create_dir_all(dir)
+        }
+        fn delete_file(&self, path: &Path) -> ForstResult<()> {
+            self.inner.delete_file(path)
+        }
+        fn delete_dir(&self, path: &Path, recursive: bool) -> ForstResult<()> {
+            self.inner.delete_dir(path, recursive)
+        }
+        fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+            self.inner.rename(src, dst)
+        }
+        fn supports_atomic_rename(&self) -> bool {
+            self.inner.supports_atomic_rename()
+        }
+        fn sync_dir(&self, dir: &Path) -> ForstResult<()> {
+            self.inner.sync_dir(dir)
+        }
+        fn name(&self) -> &str {
+            "upload-recording"
+        }
+        fn await_upload(&self, path: &Path) -> ForstResult<()> {
+            self.awaited_paths.lock().unwrap().push(path.to_path_buf());
+            self.inner.await_upload(path)
+        }
+        fn await_all_uploads(&self) -> ForstResult<()> {
+            self.await_all_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.await_all_uploads()
+        }
+    }
+
+    /// 2026-06-02 q7 ckpt-ON freeze regression: an incremental checkpoint must
+    /// establish remote durability of the SSTs IT references by awaiting their
+    /// individual uploads — NOT by calling the blanket `await_all_uploads()`,
+    /// which also blocks on unrelated in-flight background compaction uploads
+    /// (the freeze: ckpt3 took 332s vs ckpt1/2 ~1.6s once compaction started).
+    #[test]
+    fn test_incremental_checkpoint_awaits_only_referenced_ssts() {
+        use forst_rs_io::MemoryFileSystem;
+        let rec = Arc::new(UploadRecordingFs::new(Arc::new(MemoryFileSystem::new())));
+        let fs: Arc<dyn FileSystem> = rec.clone();
+        let db = open_in_shared_fs("/db", fs);
+        let cf = db.default_cf();
+        for i in 0..200u32 {
+            let k = format!("k{:05}", i);
+            db.put(&cf, k.as_bytes(), b"value-payload").unwrap();
+        }
+        db.flush_all().unwrap();
+
+        // Isolate the checkpoint's filesystem interactions from setup/flush.
+        rec.reset();
+
+        let snap = db.snapshot();
+        let result = db.create_incremental_checkpoint(&snap, 1, 0).unwrap();
+
+        // BEHAVIOR: the checkpoint must NOT use the blanket all-uploads barrier
+        // (it would couple checkpoint latency to background compaction I/O).
+        assert_eq!(
+            rec.await_all_count(),
+            0,
+            "incremental checkpoint must not call await_all_uploads() (couples \
+             checkpoint latency to unrelated background compaction uploads)"
+        );
+        // CORRECTNESS: it MUST still await the upload of every LIVE SST the
+        // checkpoint's pinned version references (resolved to the engine's
+        // db_path — the files the engine actually uploads), so a restore never
+        // points at an SST whose bytes are still in a local/in-flight buffer.
+        let awaited = rec.awaited_paths.lock().unwrap().clone();
+        let live = db.version_set.current();
+        let live_files: Vec<_> = live.live_sst_files_iter().collect();
+        assert!(
+            !live_files.is_empty(),
+            "test precondition: the flush should have produced at least one live SST"
+        );
+        for f in &live_files {
+            let p = crate::flush::sst_file_path(Path::new("/db"), f.file_number);
+            assert!(
+                awaited.contains(&p),
+                "referenced live SST {:?} was not awaited (manifest could reference \
+                 an un-uploaded file → restore data loss); awaited={:?}",
+                p,
+                awaited
             );
         }
     }
