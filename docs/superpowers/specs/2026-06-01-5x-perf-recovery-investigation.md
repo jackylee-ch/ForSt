@@ -256,6 +256,33 @@ reader-open, and instrument the OpenDAL file-backend write/read latency — the 
 pathologically slow OpenDAL local path (independent engine win; aligns with the no-per-record/
 no-copy I/O mandate). The checkpoint fix (#1) stands as a validated, banked win regardless.
 
+## ★ SECOND wall ROOT CAUSE (2026-06-02) — L0 fan-out on EMPTY join probes
+`FRS_PROBE_DIAG` split of `frs_vec_iter_prefix_open` over ~480 s of q7 (23,090 slow probes >5ms):
+```
+total_us  p50=46086  p90=79066  max=186307
+build_us  p50=24     p90=38     max=275      (negligible)
+fill_us   p50=46057  p90=79040  max=186287   <-- 99% of cost
+```
+Every slow probe has **rows=0** — they are EMPTY join probes (a join key with no matching records)
+that still take **46 ms**. The merge BUILD is lazy/cheap (24µs); the cost is the first-chunk FILL,
+which must `peek()` every overlapping L0 SST source — reading/scanning each one's first in-range
+block — only to find nothing. `may_contain_range` (coarse per-block key-range index) lets wide L0
+blocks that straddle the 37-byte prefix through as false positives, so the probe fans out across
+many L0 SSTs. As L0 accumulates (the 30 s checkpoint force-flush mints a new L0 SST each time +
+compaction not keeping up), fan-out grows → 46 ms per empty probe → the ~100/s collapse. Confirms
+the recorded "join probe opens O(num_L0) SSTs" wall, now precisely localized to the FILL/peek path.
+
+**Fix candidates (decreasing leverage / increasing risk):**
+1. **Bound L0** so fan-out stays small — the real lever. Either (a) the checkpoint stops minting L0
+   every 30 s (wire `frs_create_incremental_checkpoint_at_noflush` + capture the live memtable as an
+   Arrow-IPC artifact, so the hot memtable is NOT sealed to a new L0 SST each checkpoint — review-
+   gated, restore must reconstruct the artifact), or (b) more aggressive L0→L1 compaction (a
+   level0_file_num_compaction_trigger) so L0 never grows deep. Need to confirm what currently bounds
+   L0 and whether compaction is keeping up.
+2. **Prefix bloom on SSTs** so an empty prefix probe skips non-matching L0 SSTs without a block read
+   (RocksDB prefix-bloom equivalent; full-key blooms don't answer prefix queries) — larger engine
+   change.
+
 ### Honest scale check
 rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
 collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
