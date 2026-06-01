@@ -182,7 +182,28 @@ impl CompactionJob {
         // R39-L1: shared with FlushJob::temp_path via flush::sst_temp_path so
         // the restore orphan-scan reverses the SAME naming convention used
         // by both writers.
-        let tmp_path = sst_temp_path(&self.output_path);
+        // FRS-S3-SSTRENAME: object stores have no atomic rename, so stream the
+        // compacted SST straight to its final key (multipart upload publishes
+        // atomically on close). Local FS keeps the temp→rename convention for
+        // crash-atomic publication. Mirrors the flush.rs branch.
+        let atomic_rename = self.fs.supports_atomic_rename();
+        let write_path = if atomic_rename {
+            sst_temp_path(&self.output_path)
+        } else {
+            self.output_path.clone()
+        };
+        // FRS-S3-ORPHAN-FIX (sister to flush.rs): on object stores the
+        // compaction output streams to its FINAL path. After a crash +
+        // restart (esp. with checkpointing off) the output file number can
+        // collide with a stale orphan from the failed attempt, making
+        // `CreateNew` fail "already exists" and crash-looping the job. The
+        // colliding object is necessarily that orphan, so overwrite it; the
+        // local-FS temp-path branch keeps `CreateNew`.
+        let write_mode = if atomic_rename {
+            forst_rs_io::WriteMode::CreateNew
+        } else {
+            forst_rs_io::WriteMode::CreateOrTruncate
+        };
         if let Some(parent) = self.output_path.parent() {
             self.fs.create_dir_all(parent)?;
         }
@@ -204,7 +225,7 @@ impl CompactionJob {
         let write_outcome: ForstResult<Option<SstFileInfo>> = (|| {
             let mut wf = self
                 .fs
-                .open_writable_file(&tmp_path, forst_rs_io::WriteMode::CreateNew)?;
+                .open_writable_file(&write_path, write_mode)?;
             // R49-H1: stamp this compaction's cf_id onto the writer options so
             // the resulting SST footer + SstFileMeta carry CF identity.
             let mut writer_opts = self.writer_options.clone();
@@ -249,11 +270,11 @@ impl CompactionJob {
                 // compaction tmp file (the restore orphan-scan in
                 // open_from_checkpoint still catches it on next restart,
                 // but a warn-line helps in-process diagnosis).
-                if let Err(e) = self.fs.delete_file(&tmp_path) {
+                if let Err(e) = self.fs.delete_file(&write_path) {
                     tracing::warn!(
                         "CompactionJob: zero-emit tmp delete failed for {}: {} \
                          (R38-L2; restore orphan-scan will rename on restart)",
-                        tmp_path.display(),
+                        write_path.display(),
                         e
                     );
                 }
@@ -296,31 +317,35 @@ impl CompactionJob {
             }
             Err(e) => {
                 // Best-effort cleanup; orphan-scan on restart still covers any residual file.
-                let _ = self.fs.delete_file(&tmp_path);
+                let _ = self.fs.delete_file(&write_path);
                 return Err(e);
             }
         };
-        // R38-H1: best-effort cleanup of the temp file on rename failure
-        // (EXDEV, cross-FS, transient I/O). Without this, a failed compaction
-        // leaves a `.<num>.sst.tmp` orphan. We delete before propagating
-        // the error; if delete itself fails the file remains visible to the
-        // next restore, which now matches `.*.sst.tmp` and renames it out
-        // of the active naming space.
-        if let Err(e) = self.fs.rename(&tmp_path, &self.output_path) {
-            let _ = self.fs.delete_file(&tmp_path);
-            return Err(e);
-        }
-        // R49-H3: fsync(parent_dir) so the rename's directory entry change
-        // is durable across a power-loss event. Best-effort: a failure here
-        // leaves the SST contents on disk; the next checkpoint cycle will
-        // re-attempt the dirent sync via its own copy_live_ssts pass.
-        if let Some(parent) = self.output_path.parent() {
-            if let Err(e) = self.fs.sync_dir(parent) {
-                tracing::warn!(
-                    "CompactionJob: sync_dir({}) failed after rename: {} (R49-H3)",
-                    parent.display(),
-                    e
-                );
+        // On object stores `write_path == output_path` and the upload already
+        // published atomically on close — no rename or dir-fsync needed.
+        if atomic_rename {
+            // R38-H1: best-effort cleanup of the temp file on rename failure
+            // (EXDEV, cross-FS, transient I/O). Without this, a failed compaction
+            // leaves a `.<num>.sst.tmp` orphan. We delete before propagating
+            // the error; if delete itself fails the file remains visible to the
+            // next restore, which now matches `.*.sst.tmp` and renames it out
+            // of the active naming space.
+            if let Err(e) = self.fs.rename(&write_path, &self.output_path) {
+                let _ = self.fs.delete_file(&write_path);
+                return Err(e);
+            }
+            // R49-H3: fsync(parent_dir) so the rename's directory entry change
+            // is durable across a power-loss event. Best-effort: a failure here
+            // leaves the SST contents on disk; the next checkpoint cycle will
+            // re-attempt the dirent sync via its own copy_live_ssts pass.
+            if let Some(parent) = self.output_path.parent() {
+                if let Err(e) = self.fs.sync_dir(parent) {
+                    tracing::warn!(
+                        "CompactionJob: sync_dir({}) failed after rename: {} (R49-H3)",
+                        parent.display(),
+                        e
+                    );
+                }
             }
         }
 
@@ -521,9 +546,10 @@ impl CompactionJob {
         let newest = &reduction[0];
 
         // Run the optional compaction filter on the consolidation root —
-        // if it says Discard, drop the root. (Pinned siblings emitted
-        // above are not re-evaluated; they're contractually required by
-        // an active snapshot.)
+        // if it says Discard, drop the root (only when bottommost; see
+        // A-R3-NEW-H1 below). (Pinned siblings emitted above are not
+        // re-evaluated; they're contractually required by an active
+        // snapshot.)
         if let Some(ref filter) = self.compaction_filter {
             let mut scratch = Vec::new();
             let decision = filter.filter(
@@ -535,7 +561,25 @@ impl CompactionJob {
                 &mut scratch,
             );
             match decision {
-                CompactionDecision::Discard => return Ok(()),
+                CompactionDecision::Discard => {
+                    // A-R3-NEW-H1: gate Discard on `is_bottommost`,
+                    // mirroring A-R6-H1 / Delete / SD-pair gates.
+                    // `versions` is only this compaction's view of the
+                    // user key; OLDER versions for the same user_key
+                    // may live in SST files outside this compaction's
+                    // input set. Unconditionally dropping `newest` at
+                    // a non-bottommost level resurrects those stale
+                    // versions on subsequent reads, breaking the
+                    // filter's intent (e.g. TTL expiry: an expired
+                    // Put@s1 with an older Put@s0 underneath would
+                    // resurrect s0 on reads after the s1 drop). At
+                    // non-bottommost, fall through to the newest-wins
+                    // emit below; bottommost compaction will re-apply
+                    // the filter and drop the entry safely.
+                    if self.is_bottommost {
+                        return Ok(());
+                    }
+                }
                 CompactionDecision::Keep => {}
                 CompactionDecision::Replace => {
                     writer.add(
@@ -584,8 +628,21 @@ impl CompactionJob {
                 // key (newest-first, across its input SSTs + memtables).
                 // Keys living in SST files outside this compaction's
                 // input set are unaffected by elision.
-                if versions.len() == 2 && versions[1].op_type == OpType::Put {
-                    // Drop both entries entirely from this compaction's output.
+                if versions.len() == 2
+                    && versions[1].op_type == OpType::Put
+                    && self.is_bottommost
+                {
+                    // A-R6-H1: drop-both elision REQUIRES `is_bottommost`.
+                    // Pre-fix the elision ran on any compaction whose input
+                    // view happened to contain exactly {SD, Put}, but
+                    // `versions` is only this compaction's input — lower-
+                    // level SSTs outside the input set may still hold an
+                    // older Put for the same user_key. Dropping both
+                    // entries at a non-bottommost level resurrects that
+                    // stale Put on subsequent reads, breaking
+                    // read-after-delete semantics. The Delete branch
+                    // below already gates correctly on `is_bottommost`;
+                    // the SD-pair branch was the outlier.
                     return Ok(());
                 }
                 // Fallback: behave exactly like Delete.
@@ -636,8 +693,25 @@ impl CompactionJob {
                 for v in versions {
                     match v.op_type {
                         OpType::Merge => {
-                            if let Some(ref val) = v.value {
-                                operands.push(val.as_slice());
+                            // A-R7-H2: surface corruption on missing
+                            // operand payload — sibling of the
+                            // read-side checks A-R5R-NEW-H1 /
+                            // A-R6-H2 / C-R5-H1. Compaction is the
+                            // last line of defense: if it silently
+                            // absorbs a None-valued Merge into a
+                            // collapsed Put, the read-side corruption
+                            // detection NEVER fires again on that
+                            // key (the bad row has been rewritten as
+                            // well-formed output bytes). Raise here
+                            // so the bad input is surfaced before
+                            // compaction's collapse can hide it.
+                            match v.value.as_deref() {
+                                Some(val) => operands.push(val),
+                                None => {
+                                    return Err(ForstError::corruption(
+                                        "compaction: Merge entry missing operand payload",
+                                    ));
+                                }
                             }
                         }
                         OpType::Put => {
@@ -654,7 +728,29 @@ impl CompactionJob {
                 if let Some(op) = &self.merge_operator {
                     // operands was newest-first; merge op expects oldest-first.
                     let reversed: Vec<&[u8]> = operands.iter().copied().rev().collect();
-                    if base.is_some() || stop_on_delete || self.is_bottommost {
+                    // D-R11-H1: split the "collapse" condition. The
+                    // chain can be safely collapsed into a single
+                    // synthetic Put@newest.seq ONLY when there is no
+                    // intermediate snapshot that would be served by
+                    // an older operand or the deletion tombstone:
+                    //   - `base.is_some()`: a Put base exists IN this
+                    //     compaction's input — collapse is at-most
+                    //     equivalent to the read path.
+                    //   - `self.is_bottommost`: no lower-level data
+                    //     remains, so the synthesized Put covers
+                    //     every visible snapshot at this level.
+                    //   - `stop_on_delete && !self.is_bottommost`:
+                    //     PRE-D-R11-H1 we collapsed here AND emitted
+                    //     the Delete (A-R9-N2). That collapse drops
+                    //     intermediate Merges, and a snapshot at S
+                    //     in [delete.seq, newest.seq) would see the
+                    //     Delete but lose the partial-merge result
+                    //     it should have returned. The CORRECT
+                    //     non-bottommost handling is to emit ALL
+                    //     versions verbatim and let the bottommost
+                    //     compaction collapse the chain once no
+                    //     intermediate snapshot can land.
+                    if base.is_some() || self.is_bottommost {
                         let merged = op.full_merge(&newest.key, base, &reversed)?;
                         writer.add(
                             &newest.key,
@@ -663,36 +759,41 @@ impl CompactionJob {
                             OpType::Put as u8,
                         )?;
                         *emitted += 1;
-                    } else if let Some((first, rest)) = reversed.split_first() {
-                        let mut partial = (*first).to_vec();
-                        let mut partial_ok = true;
-                        for operand in rest {
-                            match op.partial_merge(&newest.key, &partial, operand) {
-                                Ok(v) => partial = v,
-                                Err(_) => {
-                                    partial_ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if partial_ok {
+                    } else if stop_on_delete {
+                        // D-R11-H1: emit every version verbatim — the
+                        // Merges (newest → oldest) followed by the
+                        // terminal Delete. The bottommost compaction
+                        // will eventually do the collapse safely.
+                        for v in versions {
                             writer.add(
-                                &newest.key,
-                                Some(&partial),
-                                newest.sequence,
-                                OpType::Merge as u8,
+                                &v.key,
+                                v.value.as_deref(),
+                                v.sequence,
+                                v.op_type as u8,
                             )?;
                             *emitted += 1;
-                        } else {
-                            for v in versions {
-                                writer.add(
-                                    &v.key,
-                                    v.value.as_deref(),
-                                    v.sequence,
-                                    v.op_type as u8,
-                                )?;
-                                *emitted += 1;
-                            }
+                        }
+                    } else {
+                        // A-R12-H3: Merge-only chain at non-bottommost MUST
+                        // be emitted verbatim. Pre-fix we partial-merged the
+                        // chain into a single Merge@newest.seq, but that
+                        // breaks snapshot visibility identically to the
+                        // collapse case D-R11-H1 already fixed: a reader at
+                        // S in [oldest.seq, newest.seq) cannot see the
+                        // collapsed Merge@newest.seq, and the intermediate
+                        // Merges that would have served that snapshot have
+                        // been deleted. Emit all versions verbatim and let
+                        // the bottommost compaction collapse the chain once
+                        // no intermediate snapshot can land below it.
+                        let _ = reversed;
+                        for v in versions {
+                            writer.add(
+                                &v.key,
+                                v.value.as_deref(),
+                                v.sequence,
+                                v.op_type as u8,
+                            )?;
+                            *emitted += 1;
                         }
                     }
                 } else {
@@ -700,6 +801,26 @@ impl CompactionJob {
                     // written. This is correct but doesn't shrink the data.
                     // (If stop_on_delete is true we still emit the older
                     // Delete so subsequent reads see it.)
+                    //
+                    // A-R8-H3: at a BOTTOMMOST compaction this branch silently
+                    // retains un-foldable Merge chains FOREVER — the LSM's
+                    // reclamation invariant requires bottommost levels to
+                    // collapse to a single terminal per user_key. If a Merge
+                    // chain reaches bottommost without a merge operator, the
+                    // CF was mis-configured (operator dropped between CF
+                    // creation and a later restart). Surface that as
+                    // ForstError::invalid_argument so the configuration drift
+                    // is visible at compaction time rather than as silent
+                    // unbounded SST growth.
+                    if self.is_bottommost {
+                        return Err(ForstError::invalid_argument(format!(
+                            "compaction: bottommost CF has no merge operator but the input \
+                             contains an un-folded Merge chain for key {:?} (len={}); the LSM \
+                             reclamation invariant cannot be satisfied. The CF was likely \
+                             re-opened without re-registering its merge operator.",
+                            &newest.key, versions.len()
+                        )));
+                    }
                     let _ = stop_on_delete;
                     for v in versions {
                         writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;

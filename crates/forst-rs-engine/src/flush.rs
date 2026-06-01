@@ -143,7 +143,33 @@ impl FlushJob {
             ))
         })?;
         self.fs.create_dir_all(parent)?;
-        let tmp_path = self.temp_path();
+        // FRS-S3-SSTRENAME: on local FS, stage to a `.tmp` file and rename into
+        // place so a mid-write crash never leaves a partial SST under the final
+        // name. On object stores there is no atomic rename (OpenDAL surfaces it
+        // as Unsupported), so stream straight to the final key — the multipart
+        // upload only publishes on a successful close, giving the same
+        // crash-atomic guarantee without a rename.
+        let atomic_rename = self.fs.supports_atomic_rename();
+        let write_path = if atomic_rename {
+            self.temp_path()
+        } else {
+            self.file_path.clone()
+        };
+        // FRS-S3-ORPHAN-FIX: on object stores (no atomic rename) the SST
+        // streams straight to its FINAL path. After a crash + restart with
+        // checkpointing off, the file-number counter resets and re-allocates
+        // a number whose SST from the failed attempt still lingers on S3, so
+        // `CreateNew` fails with "file already exists" and the job crash-loops
+        // forever. A collision here can only be such a stale orphan (file
+        // numbers are uniquely allocated within a run), so overwriting is
+        // correct — the freshly-flushed SST is authoritative. The local-FS
+        // branch writes to a unique temp path and keeps `CreateNew` so a
+        // genuine number-reuse bug is still caught.
+        let write_mode = if atomic_rename {
+            WriteMode::CreateNew
+        } else {
+            WriteMode::CreateOrTruncate
+        };
         // R40-M1: wrap the writer/flush/sync block in a closure so any `?`-propagated error from
         // `writer.add`, `writer.finish`, `writable.flush`, or `writable.sync` triggers a best-
         // effort delete of the staging tmp file before we propagate. The pre-existing R38-H1 fix
@@ -154,7 +180,7 @@ impl FlushJob {
         let info_result: ForstResult<SstFileInfo> = (|| {
             let mut writable = self
                 .fs
-                .open_writable_file(&tmp_path, WriteMode::CreateNew)?;
+                .open_writable_file(&write_path, write_mode)?;
             let writer_inner = SstWriterImpl::with_options(self.options.clone());
             let mut writer = writer_inner.streaming(&mut *writable);
 
@@ -193,17 +219,12 @@ impl FlushJob {
                         ForstError::corruption("flush batch: op_type column not UInt8")
                     })?;
 
-                for i in 0..rows {
-                    let key = keys.value(i);
-                    let value = if values.is_null(i) {
-                        None
-                    } else {
-                        Some(values.value(i))
-                    };
-                    let seq = seqs.value(i);
-                    let op = ops.value(i);
-                    writer.add(key, value, seq, op)?;
-                }
+                // B-NEW-H1: bulk-batch dispatch hoists global min/max key
+                // bound computation (one copy at row 0 and row N-1 — flush
+                // input is sorted ASC) out of the per-row interleave.
+                // Block-boundary flush is still respected by the writer.
+                let _ = rows;
+                writer.add_batch(keys, values, seqs, ops)?;
             }
 
             let info = writer.finish()?;
@@ -215,34 +236,38 @@ impl FlushJob {
             Ok(info) => info,
             Err(e) => {
                 // Best-effort cleanup; orphan-scan on restart still covers any residual file.
-                let _ = self.fs.delete_file(&tmp_path);
+                let _ = self.fs.delete_file(&write_path);
                 return Err(e);
             }
         };
-        // R38-H1: best-effort cleanup of the temp file on rename failure
-        // (EXDEV, cross-FS, transient I/O). Without this, a failed flush
-        // leaves a `.<num>.sst.tmp` orphan that the restore scan in
-        // `open_from_checkpoint` did not previously recognise. We delete
-        // before propagating the error; if delete itself fails the file
-        // remains visible to the next restore, which now matches
-        // `.*.sst.tmp` and renames it out of the active naming space.
-        if let Err(e) = self.fs.rename(&tmp_path, &self.file_path) {
-            let _ = self.fs.delete_file(&tmp_path);
-            return Err(e);
-        }
-        // R49-H3: fsync(parent_dir) so the rename's directory entry change
-        // is durable. Without this, a power-loss event between rename and
-        // the next checkpoint could leave the directory entry pointing at
-        // nothing (the file inode survives but the dirent doesn't), so
-        // the SST goes missing on restart.
-        if let Err(e) = self.fs.sync_dir(parent) {
-            tracing::warn!(
-                "FlushJob: sync_dir({}) failed after rename: {} (R49-H3); \
-                 SST contents are on disk but the directory entry may be \
-                 lost on power-failure restart",
-                parent.display(),
-                e
-            );
+        // On object stores `write_path == file_path` and the upload already
+        // published atomically on close — no rename or dir-fsync needed.
+        if atomic_rename {
+            // R38-H1: best-effort cleanup of the temp file on rename failure
+            // (EXDEV, cross-FS, transient I/O). Without this, a failed flush
+            // leaves a `.<num>.sst.tmp` orphan that the restore scan in
+            // `open_from_checkpoint` did not previously recognise. We delete
+            // before propagating the error; if delete itself fails the file
+            // remains visible to the next restore, which now matches
+            // `.*.sst.tmp` and renames it out of the active naming space.
+            if let Err(e) = self.fs.rename(&write_path, &self.file_path) {
+                let _ = self.fs.delete_file(&write_path);
+                return Err(e);
+            }
+            // R49-H3: fsync(parent_dir) so the rename's directory entry change
+            // is durable. Without this, a power-loss event between rename and
+            // the next checkpoint could leave the directory entry pointing at
+            // nothing (the file inode survives but the dirent doesn't), so
+            // the SST goes missing on restart.
+            if let Err(e) = self.fs.sync_dir(parent) {
+                tracing::warn!(
+                    "FlushJob: sync_dir({}) failed after rename: {} (R49-H3); \
+                     SST contents are on disk but the directory entry may be \
+                     lost on power-failure restart",
+                    parent.display(),
+                    e
+                );
+            }
         }
 
         // 4. Build the SstFileMeta that the VersionSet will record.

@@ -989,6 +989,16 @@ pub extern "system" fn Java_org_forstdb_RocksDB_iteratorOpen<'local>(
             if check_status(env, status, "RocksDB.iteratorOpen") {
                 return 0;
             }
+            // R14A-H1 (mirror R11A-H1 on the legacy 2-arg opener): pre-flip
+            // allow_rewind=true so the public RocksDB.iteratorSeek ABI keeps
+            // working — D-C4R8-H1's guard otherwise rejects iteratorSeek
+            // after any iteratorNext. The 3-arg sibling at line ~3329 was
+            // patched in R11; the legacy 2-arg path here was the missed
+            // sister.
+            unsafe {
+                let state = &mut *(iter as *mut crate::IteratorState);
+                state.allow_rewind = true;
+            }
             iter as jlong
         },
     )
@@ -3353,6 +3363,18 @@ pub extern "system" fn Java_org_forstdb_RocksDB_iterator<'local>(
             if check_status(env, status, "RocksDB.iterator") {
                 return 0_i64;
             }
+            // R11A-H1 (post-B-C4R10): pre-flip allow_rewind=true at open. The
+            // JNI compat shim's RocksIterator ABI is bidirectional (seek0,
+            // seekToLast0, seekForPrev0, prev0 all rewind), so every next0
+            // MUST use clone() — never mem::take. Pre-fix the seek0/
+            // seekToFirst0 entries pre-flipped just-in-time, but a sequence
+            // like next0; next0; seek0 would have already corrupted rows[0..2]
+            // under the forward-only fast path before seek0 ran the
+            // binary_search.
+            unsafe {
+                let state = &mut *(iter as *mut crate::IteratorState);
+                state.allow_rewind = true;
+            }
             RocksIteratorHandle {
                 frs_iter: iter,
                 last_key: None,
@@ -3409,6 +3431,14 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seek0<'local>(
                 throw_rocksdb(env, "RocksIterator.seek0: null handle");
                 return;
             };
+            // A-C5R2-NEW-H1: null-check h.frs_iter BEFORE the raw deref
+            // (the allow_rewind pre-flip below is unsafe and would UB on
+            // NULL). Mirror seekToLast0/seekForPrev0/prev0 which already
+            // guard. compat_jni.rs:3491 has the same missed-sister gap.
+            if h.frs_iter.is_null() {
+                throw_rocksdb(env, "RocksIterator.seek0: null frs_iter");
+                return;
+            }
             // SAFETY: read_byte_slice requires offset+len bounds; we pass 0/key_len.
             let needle = if key_len <= 0 {
                 Vec::new()
@@ -3418,6 +3448,17 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seek0<'local>(
                 };
                 k
             };
+            // B-C4R10-H1: pre-set allow_rewind=true so frs_iterator_seek's
+            // D-C4R8-H1 guard does NOT reject a legitimate `iter.next();
+            // iter.seek(...);` RocksIterator ABI sequence. The guard is for
+            // forward-only callers whose mem::take has corrupted the row
+            // array; the JNI compat shim cannot be forward-only because
+            // RocksIterator exposes seek0 as a public API. Mirrors
+            // A-C4R5-H1's flip in seekToLast0/seekForPrev0/prev0.
+            unsafe {
+                let state = &mut *(h.frs_iter as *mut crate::IteratorState);
+                state.allow_rewind = true;
+            }
             // SAFETY: frs_iter valid; needle pointer + len consistent.
             let status = unsafe {
                 frs_iterator_seek(
@@ -3456,6 +3497,18 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seekToFirst0<'local>(
                 throw_rocksdb(env, "RocksIterator.seekToFirst0: null handle");
                 return;
             };
+            // A-C5R2-NEW-H1: null-check frs_iter BEFORE the raw deref.
+            if h.frs_iter.is_null() {
+                throw_rocksdb(env, "RocksIterator.seekToFirst0: null frs_iter");
+                return;
+            }
+            // B-C4R10-H1: see seek0 — pre-set allow_rewind to bypass the
+            // D-C4R8-H1 forward-only-only guard. RocksIterator's
+            // seekToFirst() can legitimately follow next() calls.
+            unsafe {
+                let state = &mut *(h.frs_iter as *mut crate::IteratorState);
+                state.allow_rewind = true;
+            }
             // SAFETY: valid frs_iter; null + 0 means "seek to first".
             let status = unsafe { frs_iterator_seek(h.frs_iter, ptr::null(), 0) };
             if check_status(env, status, "RocksIterator.seekToFirst0") {
@@ -3504,6 +3557,13 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seekToLast0<'local>(
                 return;
             }
             state.cursor = state.rows.len() - 1;
+            // A-C4R5-H1: enable rewind-clone in frs_iterator_next. seekToLast0
+            // moves cursor to a position the subsequent prev0/next0 chain will
+            // re-enter; without this flag, fetch_into_handle's mem::take fast
+            // path would empty the slot and a rewind would return a stale-empty
+            // row (the original C-R22-NEW-H1 ABI bug, just via a different
+            // entry).
+            state.allow_rewind = true;
             // Pre-fetch the last row.
             let _ = fetch_into_handle(env, h, "RocksIterator.seekToLast0(prefetch)");
         },
@@ -3562,6 +3622,8 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seekForPrev0<'local>(
                 return;
             }
             state.cursor = upper - 1;
+            // A-C4R5-H1: enable rewind-clone (see seekToLast0).
+            state.allow_rewind = true;
             let _ = fetch_into_handle(env, h, "RocksIterator.seekForPrev0(prefetch)");
         },
     )
@@ -3631,6 +3693,8 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_prev0<'local>(
                 return;
             }
             state.cursor -= 2;
+            // A-C4R5-H1: enable rewind-clone (see seekToLast0).
+            state.allow_rewind = true;
             let _ = fetch_into_handle(env, h, "RocksIterator.prev0(prefetch)");
         },
     )

@@ -29,6 +29,10 @@ use arrow::array::{Array, BinaryArray, RecordBatch, UInt64Array, UInt8Array};
 use forst_rs_common::{get_fixed32, ForstError, ForstResult, OpType};
 use forst_rs_io::filesystem::RandomAccessFile;
 
+use std::sync::Arc;
+
+use crate::cache::{BlockCache, CacheEntry, CacheKey, CachePriority};
+
 use super::bloom_filter::Sbbf;
 use super::data_block::decode_data_block;
 use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
@@ -131,6 +135,25 @@ pub struct SstReaderImpl {
     #[allow(dead_code)] // Stored for future range-scan and compaction support.
     index_stats: Vec<BlockStats>,
     bloom_filter: Sbbf,
+    /// 2026-05-30 DECODED-BLOCK CACHE: optional shared L1 cache of DECODED data
+    /// blocks (`CacheEntry::DecodedBatch`), keyed by `(file_number, block_offset)`.
+    /// `read_data_block` checks it before reading+decompressing — eliminating the
+    /// repeated `serial_read_at` + `decode_data_block` + decompress cost that the
+    /// q9 prefix-iterator profile showed dominating (each join probe re-read and
+    /// re-decoded the same SST blocks). SSTs are write-once with globally-unique
+    /// file numbers, so cached decoded blocks are immutable — no invalidation
+    /// needed. `None` (the bare `open`) keeps the un-cached behavior for tests /
+    /// callers that do not pass a cache.
+    block_cache: Option<Arc<dyn BlockCache>>,
+    /// `db_id`-qualified file identity used as the cache key's file-number
+    /// component: `(db_id << 40) | (file_number & ((1<<40)-1))`. Qualifying by
+    /// `db_id` is REQUIRED because the block cache is now process-shared across
+    /// all DB instances — two instances each assign file number `1`, so an
+    /// un-qualified key would collide and serve one DB's block to another
+    /// (silent cross-DB corruption). `db_id < 2^24` (few instances) and
+    /// `file_number < 2^40` (≤ 1 T SSTs) in any real deployment, so the packed
+    /// id is collision-free. `0` when no cache is wired.
+    cache_file_id: u64,
 }
 
 /// R74-H1: read `buf.len()` bytes at `offset` and require ALL of them.
@@ -146,6 +169,15 @@ pub struct SstReaderImpl {
 ///
 /// The loop re-issues the read on partial fill; `n == 0` is treated as
 /// premature EOF and surfaced as `Corruption`.
+std::thread_local! {
+    /// FRS-NOZERO-BLOCKREAD (2026-06-01): per-thread reusable scratch for raw
+    /// SST data-block bytes, so `read_data_block` doesn't malloc (+ zero-fill) a
+    /// fresh buffer per block on the heavy-join prefix-scan hot path. Each engine
+    /// read thread keeps one buffer that grows to the largest block it has seen.
+    static BLOCK_READ_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn read_at_exact(file: &dyn RandomAccessFile, offset: u64, buf: &mut [u8]) -> ForstResult<()> {
     let mut filled: usize = 0;
     while filled < buf.len() {
@@ -243,7 +275,28 @@ impl SstReaderImpl {
             index_entries,
             index_stats,
             bloom_filter,
+            block_cache: None,
+            cache_file_id: 0,
         })
+    }
+
+    /// 2026-05-30 DECODED-BLOCK CACHE: attach the process-shared decoded-block
+    /// cache and the file's `db_id`-qualified identity (for the cache key).
+    /// Returns `self` for chaining at the `get_or_open_sst_reader` call site.
+    /// Without this, `read_data_block` reads + decompresses on every call (the
+    /// profiled prefix-iterator hot path). `db_id` qualification keeps the shared
+    /// cache collision-free across DB instances (see `cache_file_id`).
+    pub fn with_block_cache(
+        mut self,
+        cache: Arc<dyn BlockCache>,
+        db_id: u64,
+        file_number: u64,
+    ) -> Self {
+        const FILE_BITS: u32 = 40;
+        let qualified = (db_id << FILE_BITS) | (file_number & ((1u64 << FILE_BITS) - 1));
+        self.block_cache = Some(cache);
+        self.cache_file_id = qualified;
+        self
     }
 
     /// Returns a reference to the parsed footer.
@@ -275,6 +328,22 @@ impl SstReaderImpl {
     /// is cached at `open()` so this check costs no syscall on the
     /// hot lookup path.
     fn read_data_block(&self, block_offset: u64, block_size: u32) -> ForstResult<RecordBatch> {
+        // 2026-05-30 DECODED-BLOCK CACHE: serve a decoded block from the shared
+        // L1 cache when present — skips the `serial_read_at` + decompress +
+        // decode chain that dominated the q9 prefix-iterator profile. Cloning a
+        // `RecordBatch` is cheap (Arc-shared column buffers).
+        let cache_key = self
+            .block_cache
+            .as_ref()
+            .map(|_| CacheKey::new(self.cache_file_id, block_offset));
+        if let (Some(cache), Some(key)) = (self.block_cache.as_ref(), cache_key) {
+            if let Some(entry) = cache.get(&key) {
+                if let CacheEntry::DecodedBatch(batch) = entry.as_ref() {
+                    return Ok((**batch).clone());
+                }
+            }
+        }
+
         let block_end = block_offset
             .checked_add(block_size as u64)
             .ok_or_else(|| ForstError::corruption("SST data block offset+size overflow"))?;
@@ -284,9 +353,38 @@ impl SstReaderImpl {
                 block_offset, block_end, self.file_size
             )));
         }
-        let mut buf = vec![0u8; block_size as usize];
-        read_at_exact(self.file.as_ref(), block_offset, &mut buf)?;
-        decode_data_block(&buf)
+        // FRS-NOZERO-BLOCKREAD (2026-06-01): read the raw block into a REUSED
+        // thread-local scratch buffer instead of a fresh `vec![0u8; block_size]`
+        // per call. A native `sample` of the q4 heavy-join freeze showed the
+        // dominant on-CPU frames under the prefix-iterator were
+        // `_xzm_malloc_large_huge → _xzm_segment_group_clear_chunk` — i.e. a
+        // large heap allocation (+ its zero-fill) for EVERY block read, on every
+        // overlapping SST, on every probe, at the millions-of-blocks scale a
+        // heavy-join spilled-state scan touches. Reusing a per-thread buffer
+        // retains the capacity across calls so the allocation happens once per
+        // thread (not once per block), eliminating the `malloc_large_huge` churn.
+        // `decode_data_block` returns an OWNED `RecordBatch` (Arrow columns are
+        // copied out), so the scratch is free to be overwritten on the next call.
+        // `forbid(unsafe_code)` rules out `set_len`, so we keep the safe `resize`
+        // (the residual memset is dwarfed by the eliminated per-block alloc).
+        let batch = BLOCK_READ_SCRATCH.with(|cell| -> ForstResult<RecordBatch> {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.resize(block_size as usize, 0);
+            read_at_exact(self.file.as_ref(), block_offset, &mut buf)?;
+            decode_data_block(&buf)
+        })?;
+
+        // Populate the cache (best-effort) so repeat probes of this block —
+        // common in the streaming join's per-key prefix scans — hit the decoded
+        // entry instead of re-reading+re-decoding. SSTs are immutable, so the
+        // cached entry never goes stale.
+        if let (Some(cache), Some(key)) = (self.block_cache.as_ref(), cache_key) {
+            let arc = Arc::new(batch.clone());
+            let charge = CacheEntry::DecodedBatch(Arc::clone(&arc)).charge();
+            cache.insert(key, CacheEntry::DecodedBatch(arc), charge, CachePriority::Low);
+        }
+        Ok(batch)
     }
 
     /// Performs a point lookup for `key`.
@@ -481,6 +579,56 @@ impl SstReaderImpl {
     /// [`Self::read_block_at`].
     pub fn index_entry_count(&self) -> usize {
         self.index_entries.len()
+    }
+
+    /// FRS-PREFIX-SEEK: index of the first data block that could contain keys
+    /// `>= key`, via binary search over the sparse index (the same primitive
+    /// `get`/`get_versions` use). Returns `index_entry_count()` when `key` is
+    /// past the SST's last key (no candidate block → caller treats as EOF).
+    ///
+    /// Prefix/range scans MUST start streaming here rather than at block 0:
+    /// blocks before this index have `max_key < key` and cannot contribute,
+    /// so reading+decompressing them is pure waste. For a heavy-join state
+    /// scan over SST-backed state (q7 ckpt-on), starting at block 0 made each
+    /// per-record prefix scan O(blocks-before-prefix) → the dominant cost once
+    /// state flushed out of the memtable. Seeking makes it O(matching blocks).
+    pub fn first_block_ge(&self, key: &[u8]) -> usize {
+        search_index(&self.index_entries, key).unwrap_or(self.index_entries.len())
+    }
+
+    /// Decode-FREE prune for prefix/range scans: returns `false` when this SST
+    /// provably holds NO key in `[lower, upper)`, using ONLY the in-memory block
+    /// index (`last_key`) plus per-block stats (`min_key`) — no block read,
+    /// decompress, or Arrow decode.
+    ///
+    /// `search_index(lower)` finds the first block whose `last_key >= lower`;
+    /// every earlier block is entirely `< lower`. If that block's `min_key`
+    /// (smallest key in the block) is `>= upper`, then that block — and every
+    /// later block, which sorts higher — lies entirely at/above `upper`, so the
+    /// half-open range `[lower, upper)` is empty in this file.
+    ///
+    /// Motivation (profiled 2026-05-31, q4): a per-key join prefix scan opens a
+    /// streaming source over EVERY L0 SST whose coarse `[smallest,largest]`
+    /// range overlaps the prefix, then lazily decodes that source's first block
+    /// to discover it holds nothing for the prefix. With ~142 overlapping L0
+    /// SSTs and the key present in only a few, ~140 first-block
+    /// decompress+Arrow-decodes were pure waste per probe. This check skips
+    /// those sources before any decode. Conservative: if `upper` is unbounded
+    /// or per-block stats are unavailable, it returns `true` (no prune), so it
+    /// can only avoid provably-empty work — never change results.
+    pub fn may_contain_range(&self, lower: &[u8], upper: Option<&[u8]>) -> bool {
+        let Some(idx) = search_index(&self.index_entries, lower) else {
+            // `lower` is past the last block's `last_key` → no key `>= lower`.
+            return false;
+        };
+        if let Some(hi) = upper {
+            if let Some(stats) = self.index_stats.get(idx) {
+                if stats.min_key.as_slice() >= hi {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Reads and decodes the data block at `block_idx` (0-based). Returns the
@@ -708,6 +856,35 @@ mod tests {
             let key = format!("key_{:05}", i);
             assert!(reader.bloom_filter().check(key.as_bytes()));
         }
+    }
+
+    #[test]
+    fn test_may_contain_range_prunes_decode_free() {
+        // Keys key_00000..key_00199 across multiple blocks (block_size 4096).
+        let sst_data = write_test_sst(200);
+        let file = Box::new(MemRandomAccessFile { data: sst_data });
+        let reader = SstReaderImpl::open(file).unwrap();
+
+        // Present key → must NOT be pruned.
+        assert!(reader.may_contain_range(b"key_00050", Some(b"key_00051")));
+        assert!(reader.may_contain_range(b"key_00000", Some(b"key_00001")));
+        assert!(reader.may_contain_range(b"key_00199", Some(b"key_0019:"))); // last key
+
+        // Range entirely BELOW the first key (min_key >= upper) → pruned.
+        assert!(!reader.may_contain_range(b"aaa", Some(b"bbb")));
+
+        // Range entirely ABOVE the last key (search_index → None) → pruned.
+        assert!(!reader.may_contain_range(b"zzz", Some(b"zzzz")));
+        assert!(!reader.may_contain_range(b"key_99999", Some(b"key_99999\xff")));
+
+        // A gap WITHIN a block (matched block holds nearby keys, so min_key <
+        // upper) is NOT pruned — the prune is conservative and only fires when
+        // the matched block lies entirely at/above `upper`. Decoding is still
+        // required to confirm this narrow window is empty.
+        assert!(reader.may_contain_range(b"key_00050x", Some(b"key_00050y")));
+
+        // Unbounded upper → never pruned (conservative).
+        assert!(reader.may_contain_range(b"key_00050", None));
     }
 
     #[test]

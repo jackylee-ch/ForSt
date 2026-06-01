@@ -355,12 +355,15 @@ fn m5_delete_then_put_cycle() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn m5_get_pinned_small_value_returns_ok() {
+fn m5_get_pinned_small_value_returns_fallback() {
+    // C-R7-H1: frs_get_pinned now unconditionally returns FRS_STATUS_FALLBACK
+    // to close a memtable UAF window where the returned pointer could be
+    // invalidated by a concurrent flush / memtable freeze. Test updated to
+    // assert the new contract (mirrors the other 3 fallback cases below).
     unsafe {
         let db = open();
         let cf = default_cf(db);
 
-        // Write a small value (< 64 bytes) — should be inlined.
         let key = b"pinned_key";
         let value = b"hello_pinned";
         put(db, cf, key, value);
@@ -368,11 +371,13 @@ fn m5_get_pinned_small_value_returns_ok() {
         let mut out_ptr: *const u8 = ptr::null();
         let mut out_len: usize = 0;
         let rc = frs_get_pinned(db, cf, key.as_ptr(), key.len(), &mut out_ptr, &mut out_len);
-        assert_eq!(rc, FRS_STATUS_OK);
-        assert!(!out_ptr.is_null());
-        assert_eq!(out_len, value.len());
-        let got = slice::from_raw_parts(out_ptr, out_len);
-        assert_eq!(got, value);
+        assert_eq!(rc, FRS_STATUS_FALLBACK);
+        assert!(out_ptr.is_null());
+        assert_eq!(out_len, 0);
+
+        // Regular get must still return the value.
+        let got = get_copy(db, cf, key);
+        assert_eq!(got.as_deref(), Some(value.as_slice()));
 
         frs_cf_close(cf);
         frs_db_close(db);

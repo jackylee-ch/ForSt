@@ -58,6 +58,24 @@ pub struct WriteBatchEntry<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteBatch<'a> {
     entries: Vec<WriteBatchEntry<'a>>,
+    /// B-R12-NEW-H1 remainder: tracks whether all appended entries share a
+    /// single CF id. Updated incrementally per append so the engine's
+    /// `batch_write` can skip the `group_by_cf` `HashMap` allocation and the
+    /// per-CF index `Vec` indirection on the dominant single-CF FFI hot path
+    /// (every `frs_vectorized_batch_*` entry point writes to exactly one CF).
+    ///
+    /// * `None` means "no entries yet" (default) or "multi-CF observed since
+    ///   the first append" (the hint sticks at multi-CF once cleared).
+    /// * `Some(cf_id)` means "all entries so far are for cf_id".
+    /// * `Some(MULTI_CF_SENTINEL)` means "definitely multi-CF" (encoded as a
+    ///   reserved cf_id value via the `multi_cf` flag below, since
+    ///   `ColumnFamilyId` is just `u32`).
+    single_cf_hint: Option<ColumnFamilyId>,
+    /// True once a `put`/`delete`/`merge`/`single_delete` has appended an
+    /// entry whose `cf_id` differs from the running `single_cf_hint`. The
+    /// hint is then poisoned (no fast-path); the slow path's `group_by_cf`
+    /// HashMap is the authoritative grouping.
+    multi_cf: bool,
 }
 
 impl<'a> WriteBatch<'a> {
@@ -70,6 +88,8 @@ impl<'a> WriteBatch<'a> {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             entries: Vec::with_capacity(cap),
+            single_cf_hint: None,
+            multi_cf: false,
         }
     }
 
@@ -79,8 +99,10 @@ impl<'a> WriteBatch<'a> {
     /// happens here. The borrows must live until [`Self::into_entries`] is
     /// drained (typically the same FFI/engine call).
     pub fn put(&mut self, cf: &ColumnFamilyHandle, key: &'a [u8], value: &'a [u8]) -> &mut Self {
+        let cf_id = cf.id();
+        self.update_single_cf_hint(cf_id);
         self.entries.push(WriteBatchEntry {
-            cf_id: cf.id(),
+            cf_id,
             key: Cow::Borrowed(key),
             value: Some(Cow::Borrowed(value)),
             op_type: OpType::Put,
@@ -90,8 +112,10 @@ impl<'a> WriteBatch<'a> {
 
     /// Appends a Delete mutation, borrowing `key` from the caller.
     pub fn delete(&mut self, cf: &ColumnFamilyHandle, key: &'a [u8]) -> &mut Self {
+        let cf_id = cf.id();
+        self.update_single_cf_hint(cf_id);
         self.entries.push(WriteBatchEntry {
-            cf_id: cf.id(),
+            cf_id,
             key: Cow::Borrowed(key),
             value: None,
             op_type: OpType::Delete,
@@ -111,8 +135,10 @@ impl<'a> WriteBatch<'a> {
     /// next read. Use when the caller owns the write history (e.g.
     /// changelog producers, CDC sinks).
     pub fn single_delete(&mut self, cf: &ColumnFamilyHandle, key: &'a [u8]) -> &mut Self {
+        let cf_id = cf.id();
+        self.update_single_cf_hint(cf_id);
         self.entries.push(WriteBatchEntry {
-            cf_id: cf.id(),
+            cf_id,
             key: Cow::Borrowed(key),
             value: None,
             op_type: OpType::SingleDelete,
@@ -127,8 +153,10 @@ impl<'a> WriteBatch<'a> {
         key: &'a [u8],
         operand: &'a [u8],
     ) -> &mut Self {
+        let cf_id = cf.id();
+        self.update_single_cf_hint(cf_id);
         self.entries.push(WriteBatchEntry {
-            cf_id: cf.id(),
+            cf_id,
             key: Cow::Borrowed(key),
             value: Some(Cow::Borrowed(operand)),
             op_type: OpType::Merge,
@@ -147,13 +175,47 @@ impl<'a> WriteBatch<'a> {
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> &mut Self {
+        let cf_id = cf.id();
+        self.update_single_cf_hint(cf_id);
         self.entries.push(WriteBatchEntry {
-            cf_id: cf.id(),
+            cf_id,
             key: Cow::Owned(key),
             value: Some(Cow::Owned(value)),
             op_type: OpType::Put,
         });
         self
+    }
+
+    /// B-R12-NEW-H1 remainder: incrementally maintain the single-CF hint as
+    /// entries are appended. The hint sticks at multi-CF once cleared (a
+    /// subsequent same-cf append cannot rescue the hint because the existing
+    /// entries already came from multiple CFs).
+    #[inline]
+    fn update_single_cf_hint(&mut self, cf_id: ColumnFamilyId) {
+        if self.multi_cf {
+            return;
+        }
+        match self.single_cf_hint {
+            None => self.single_cf_hint = Some(cf_id),
+            Some(existing) => {
+                if existing != cf_id {
+                    self.multi_cf = true;
+                    self.single_cf_hint = None;
+                }
+            }
+        }
+    }
+
+    /// B-R12-NEW-H1 remainder: returns `Some(cf_id)` when every entry in the
+    /// batch targets the same CF. The FFI vectorized hot paths (`frs_vectorized_batch_put`,
+    /// `frs_vectorized_batch_delete`, `frs_vec_merge_append_batch`) all
+    /// write into one CF, so this returns `Some` on the dominant write path.
+    /// Engine `batch_write` uses this to skip the `group_by_cf` `HashMap`
+    /// allocation and the per-CF index `Vec` indirection — the row payload
+    /// is borrowed straight from `entries` instead of materialised through a
+    /// `Vec<usize>` group.
+    pub fn single_cf_hint(&self) -> Option<ColumnFamilyId> {
+        self.single_cf_hint
     }
 
     /// Returns the number of entries in the batch.
@@ -172,8 +234,16 @@ impl<'a> WriteBatch<'a> {
     }
 
     /// Clears all entries, keeping the allocated capacity.
+    ///
+    /// B-C5R3-NEW-H1: also reset the `single_cf_hint`/`multi_cf` tracking fields.
+    /// Pre-fix the cleared batch retained the prior hint, so a reuse pattern
+    /// (`clear(); put(cfB, ...)`) would still report `single_cf_hint = Some(cfA)`
+    /// from the prior writes, routing `batch_write_single_cf` against the wrong
+    /// CF (correctness: writes land in `cfA`'s memtable instead of `cfB`'s).
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.single_cf_hint = None;
+        self.multi_cf = false;
     }
 
     /// Groups entries by column family id, preserving per-cf insertion order.

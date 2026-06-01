@@ -94,14 +94,29 @@ pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64
     // would then become a live L0 in the checkpoint manifest. We treat
     // metadata-unavailable (`expected_size = None`) as best-effort and skip
     // the comparison, consistent with R75-M2's `cap_hint == 0` branch.
+    // 2026-05-30 WRITE-BACK CHECKPOINT FIX: await any in-flight async upload of
+    // `src` before reading it from the remote, so a write-back SST whose upload
+    // is still in flight is not read as a 404 (no-op on local / already-durable).
+    fs.await_upload(src)?;
     let expected_size: Option<u64> = fs.get_file_metadata(src).ok().map(|m| m.size);
     let mut reader = fs.open_sequential_file(src)?;
     if let Some(parent) = dst.parent() {
         fs.create_dir_all(parent)?;
     }
-    let tmp_path = sst_temp_path(dst);
+    // FRS-S3-CKPTBLOB (sibling of write_blob / flush.rs FRS-S3-SSTRENAME): on a
+    // local FS stage to a `.tmp` and atomically rename; on object stores there
+    // is no atomic rename (OpenDAL → Unsupported, which would FAIL the copy and
+    // thus a full checkpoint/restore on S3), so stream straight to the final
+    // path — multipart-complete-on-close is crash-atomic, CreateOrTruncate
+    // overwrites a stale orphan from a crashed prior attempt.
+    let atomic_rename = fs.supports_atomic_rename();
+    let (write_target, write_mode) = if atomic_rename {
+        (sst_temp_path(dst), WriteMode::CreateNew)
+    } else {
+        (dst.to_path_buf(), WriteMode::CreateOrTruncate)
+    };
     let result: ForstResult<u64> = (|| {
-        let mut writer = fs.open_writable_file(&tmp_path, WriteMode::CreateNew)?;
+        let mut writer = fs.open_writable_file(&write_target, write_mode)?;
         let mut buf = vec![0u8; 64 * 1024];
         let mut total = 0u64;
         loop {
@@ -129,13 +144,15 @@ pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64
     let total = match result {
         Ok(total) => total,
         Err(e) => {
-            let _ = fs.delete_file(&tmp_path);
+            let _ = fs.delete_file(&write_target);
             return Err(e);
         }
     };
-    if let Err(e) = fs.rename(&tmp_path, dst) {
-        let _ = fs.delete_file(&tmp_path);
-        return Err(e);
+    if atomic_rename {
+        if let Err(e) = fs.rename(&write_target, dst) {
+            let _ = fs.delete_file(&write_target);
+            return Err(e);
+        }
     }
     // R49-H3: fsync(parent_dir) so the rename's dirent change is durable.
     if let Some(parent) = dst.parent() {
@@ -161,16 +178,35 @@ pub fn copy_file(fs: &dyn FileSystem, src: &Path, dst: &Path) -> ForstResult<u64
 pub fn write_blob(fs: &dyn FileSystem, target_dir: &Path, blob: &[u8]) -> ForstResult<PathBuf> {
     fs.create_dir_all(target_dir)?;
     let final_path = target_dir.join(CHECKPOINT_BLOB_NAME);
-    let tmp_path = target_dir.join(format!(".{}.tmp", CHECKPOINT_BLOB_NAME));
-    {
-        let mut wf = fs.open_writable_file(&tmp_path, WriteMode::CreateNew)?;
+    // FRS-S3-CKPTBLOB: mirror the SST flush/compaction object-store path
+    // (FRS-S3-SSTRENAME in flush.rs). On a local FS, stage to a `.tmp` file and
+    // atomically `rename` into place. On object stores (S3/GCS/OSS/Azure) there
+    // is NO atomic rename — OpenDAL surfaces it as `Unsupported`, which the FFI
+    // mapped to NOT_SUPPORTED and FAILED EVERY incremental checkpoint (the Flink
+    // CheckpointCoordinator then aborted the job at the tolerable-failure
+    // threshold). For those backends stream the blob straight to its final key:
+    // an object-store multipart upload only publishes on a successful close()
+    // (CompleteMultipartUpload), so a mid-write crash leaves an incomplete
+    // upload that never becomes visible — crash-atomic without a rename.
+    // `CreateOrTruncate` overwrites a stale orphan blob from a crashed prior
+    // attempt at the same checkpoint id (mirrors FRS-S3-ORPHAN-FIX).
+    if fs.supports_atomic_rename() {
+        let tmp_path = target_dir.join(format!(".{}.tmp", CHECKPOINT_BLOB_NAME));
+        {
+            let mut wf = fs.open_writable_file(&tmp_path, WriteMode::CreateNew)?;
+            wf.append(blob)?;
+            wf.flush()?;
+            wf.sync()?;
+        }
+        if let Err(e) = fs.rename(&tmp_path, &final_path) {
+            let _ = fs.delete_file(&tmp_path);
+            return Err(e);
+        }
+    } else {
+        let mut wf = fs.open_writable_file(&final_path, WriteMode::CreateOrTruncate)?;
         wf.append(blob)?;
         wf.flush()?;
         wf.sync()?;
-    }
-    if let Err(e) = fs.rename(&tmp_path, &final_path) {
-        let _ = fs.delete_file(&tmp_path);
-        return Err(e);
     }
     // R49-H3: fsync the checkpoint directory so the blob's dirent change
     // (and any SST dirents from copy_live_ssts that ran earlier — R49-M1
@@ -233,6 +269,80 @@ pub fn read_blob(fs: &dyn FileSystem, target_dir: &Path) -> ForstResult<Vec<u8>>
     if offset != size {
         return Err(ForstError::corruption(format!(
             "checkpoint blob short read: expected {} bytes, got {} at {}",
+            size,
+            offset,
+            path.display()
+        )));
+    }
+    Ok(buf)
+}
+
+/// FRS-CKPT-NOFLUSH (2026-06-01): writes an arbitrary checkpoint artifact file
+/// (e.g. a per-CF memtable Arrow-IPC snapshot) atomically, mirroring
+/// [`write_blob`]'s tmp+rename (local FS) / stream-to-final (object store)
+/// crash-atomicity. Used by the checkpoint-without-flush path to persist the
+/// live memtable to S3 without folding it into an L0 SST.
+pub fn write_artifact_file(fs: &dyn FileSystem, path: &Path, bytes: &[u8]) -> ForstResult<()> {
+    if let Some(parent) = path.parent() {
+        fs.create_dir_all(parent)?;
+    }
+    if fs.supports_atomic_rename() {
+        let fname = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| ForstError::invalid_argument("artifact path has no file name"))?;
+        let tmp_path = path.with_file_name(format!(".{fname}.tmp"));
+        {
+            let mut wf = fs.open_writable_file(&tmp_path, WriteMode::CreateNew)?;
+            wf.append(bytes)?;
+            wf.flush()?;
+            wf.sync()?;
+        }
+        if let Err(e) = fs.rename(&tmp_path, path) {
+            let _ = fs.delete_file(&tmp_path);
+            return Err(e);
+        }
+    } else {
+        let mut wf = fs.open_writable_file(path, WriteMode::CreateOrTruncate)?;
+        wf.append(bytes)?;
+        wf.flush()?;
+        wf.sync()?;
+    }
+    Ok(())
+}
+
+/// Reads an artifact file written by [`write_artifact_file`]. Size-bounded by
+/// `MAX_CHECKPOINT_BLOB_SIZE` (same OOM guard as [`read_blob`]).
+pub fn read_artifact_file(fs: &dyn FileSystem, path: &Path) -> ForstResult<Vec<u8>> {
+    if !fs.file_exists(path)? {
+        return Err(ForstError::not_found(format!(
+            "checkpoint artifact not found at {}",
+            path.display()
+        )));
+    }
+    let meta = fs.get_file_metadata(path)?;
+    if meta.size > MAX_CHECKPOINT_BLOB_SIZE {
+        return Err(ForstError::corruption(format!(
+            "checkpoint artifact at {} reports size {} bytes, exceeds cap {} bytes",
+            path.display(),
+            meta.size,
+            MAX_CHECKPOINT_BLOB_SIZE
+        )));
+    }
+    let size = meta.size as usize;
+    let mut buf = vec![0u8; size];
+    let mut seq = fs.open_sequential_file(path)?;
+    let mut offset = 0usize;
+    while offset < size {
+        let n = seq.read(&mut buf[offset..])?;
+        if n == 0 {
+            break;
+        }
+        offset += n;
+    }
+    if offset != size {
+        return Err(ForstError::corruption(format!(
+            "checkpoint artifact short read: expected {} bytes, got {} at {}",
             size,
             offset,
             path.display()

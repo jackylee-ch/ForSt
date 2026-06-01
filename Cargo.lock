@@ -1160,6 +1160,7 @@ dependencies = [
  "forst-rs-io",
  "forst-rs-test-utils",
  "lz4_flex",
+ "rustc-hash 2.1.2",
  "tempfile",
  "xxhash-rust",
  "zstd",

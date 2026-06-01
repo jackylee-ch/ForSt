@@ -45,11 +45,20 @@ pub struct WriteControllerConfig {
 impl Default for WriteControllerConfig {
     fn default() -> Self {
         Self {
-            l0_slowdown_trigger: 20,
-            l0_stop_trigger: 36,
+            // FRS-S3-STALL: l0 + stall_timeout headroom widened so the stall
+            // path is rare and short on high-latency object stores (S3/OSS/BOS)
+            // where flush/compaction take network round-trips. On local FS these
+            // never bind (fast flush keeps L0 + imm counts low), so the bump is
+            // a no-op there. `max_write_buffer_number` here is the test/with_defaults
+            // fallback only — production wires it from `EngineOptions` (see
+            // `DbImpl::open`). stall_timeout stays < the ~50s Flink TaskManager
+            // heartbeat threshold (R24-M4) so a single stall can't trip the
+            // unresponsive-task watchdog.
+            l0_slowdown_trigger: 40,
+            l0_stop_trigger: 64,
             max_write_buffer_number: 3,
             slowdown_delay: Duration::from_micros(100),
-            stall_timeout: Duration::from_secs(30),
+            stall_timeout: Duration::from_secs(45),
         }
     }
 }
@@ -390,7 +399,7 @@ mod tests {
     #[test]
     fn test_config_accessor() {
         let wc = WriteController::with_defaults();
-        assert_eq!(wc.config().l0_stop_trigger, 36);
+        assert_eq!(wc.config().l0_stop_trigger, 64);
         assert_eq!(wc.config().max_write_buffer_number, 3);
     }
 

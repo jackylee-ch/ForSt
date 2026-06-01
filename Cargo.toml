@@ -57,7 +57,12 @@ arc-swap = "1"
 # Object-storage / unified I/O (S3, GCS, Azure, local FS, memory)
 # `layers-blocking` is required so OpendalFileSystem can serve sync FileSystem
 # trait calls from any thread (with or without an ambient tokio runtime).
-opendal = { version = "0.50", default-features = false, features = ["services-fs", "services-memory", "services-s3", "layers-blocking"] }
+# `executors-tokio` provides the tokio-backed Executor required by the
+# write-back `.write_with(...).concurrent(N)` multipart uploads — without it
+# opendal's default `()` executor PANICS ("concurrent tasks executed with no
+# executor has been enabled") on the first concurrent part, failing the SST
+# upload and surfacing as EngineIo on every later read of that SST.
+opendal = { version = "0.50", default-features = false, features = ["services-fs", "services-memory", "services-s3", "layers-blocking", "executors-tokio"] }
 
 # Compression
 lz4_flex = "0.11"

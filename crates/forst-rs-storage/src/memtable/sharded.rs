@@ -47,7 +47,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use arrow::array::{Array, BinaryArray, BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
+use arrow::array::{Array, BinaryArray, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use forst_rs_common::{ForstError, ForstResult, OpType};
 
@@ -232,16 +232,26 @@ impl ShardedMemTable {
         // active memtable, duplicating shards 0..i at identical seqs in
         // both M_old and M_new.
         //
-        // Fix: pre-materialise every per-shard sub-batch, then acquire
-        // every non-empty shard's write lock UP-FRONT in ascending
-        // shard-index order (same order `freeze()` walks, so the two
-        // operations either fully serialize or fail-fast — no deadlock).
-        // Once all guards are held we check `is_frozen()` on each; if
-        // ANY shard is frozen we drop all guards untouched and return
+        // Fix: collect the non-empty shard indices, then acquire every
+        // non-empty shard's write lock UP-FRONT in ascending shard-index
+        // order (same order `freeze()` walks, so the two operations
+        // either fully serialize or fail-fast — no deadlock). Once all
+        // guards are held we check `is_frozen()` on each; if ANY shard
+        // is frozen we drop all guards untouched and return
         // `FrozenMemTable`. Otherwise we perform every write while the
         // locks are still held, guaranteeing the batch is observed
         // atomically by `freeze()` (which is blocked on shard[0] for
         // the duration of our write).
+        //
+        // B-R12-NEW-H1: dispatch each shard's index slice directly via
+        // [`VectorizedMemTable::batch_insert_with_explicit_seqs_via_indices`]
+        // — no more per-shard `Vec<&[u8]>`/`Vec<Option<&[u8]>>`/`Vec<u8>`/
+        // `Vec<u64>` materialization. The pre-fix `PerShardBatch` struct
+        // allocated four small Vecs PER non-empty shard on the vectorized
+        // FFI write hot path, defeating the B5-H1 borrowed-slice promise
+        // at the shard layer. The new variant reads the same row payload
+        // from the engine-level `keys`/`values`/`op_types` slices via the
+        // already-computed `buckets[s]` index lists.
         //
         // Note: this serializes concurrent multi-shard batches against
         // each other on shard[0], but single-shard `put_with_seq` is
@@ -250,34 +260,20 @@ impl ShardedMemTable {
         // `put_with_seq`; the cost of this fix lands on cross-shard
         // batches, which were the only paths exposed to the torn-batch
         // race anyway.
-        struct PerShardBatch<'a> {
-            shard_idx: usize,
-            sub_keys: Vec<&'a [u8]>,
-            sub_values: Vec<Option<&'a [u8]>>,
-            sub_ops: Vec<u8>,
-            sub_seqs: Vec<u64>,
-        }
-        let mut prepared: Vec<PerShardBatch<'_>> = Vec::new();
-        for (shard_idx, indices) in buckets.iter().enumerate() {
-            if indices.is_empty() {
-                continue;
+        let mut non_empty: Vec<usize> = Vec::new();
+        for (shard_idx, bucket) in buckets.iter().enumerate() {
+            if !bucket.is_empty() {
+                non_empty.push(shard_idx);
             }
-            prepared.push(PerShardBatch {
-                shard_idx,
-                sub_keys: indices.iter().map(|&i| keys[i]).collect(),
-                sub_values: indices.iter().map(|&i| values[i]).collect(),
-                sub_ops: indices.iter().map(|&i| op_types[i]).collect(),
-                sub_seqs: indices.iter().map(|&i| base_seq + i as u64).collect(),
-            });
         }
 
         // Acquire all relevant shard locks in ascending order. Matches
         // `freeze()`'s acquisition order so the two operations cannot
         // form a circular wait.
         let mut guards: Vec<std::sync::RwLockWriteGuard<'_, VectorizedMemTable>> =
-            Vec::with_capacity(prepared.len());
-        for p in &prepared {
-            guards.push(self.shards[p.shard_idx].write().expect("lock poisoned"));
+            Vec::with_capacity(non_empty.len());
+        for &shard_idx in &non_empty {
+            guards.push(self.shards[shard_idx].write().expect("lock poisoned"));
         }
 
         // All guards held. Check frozen state on every shard; if any
@@ -289,8 +285,11 @@ impl ShardedMemTable {
         }
 
         // Perform writes while every lock is still held.
-        for (g, p) in guards.iter_mut().zip(prepared.iter()) {
-            g.batch_insert_with_explicit_seqs(&p.sub_keys, &p.sub_values, &p.sub_ops, &p.sub_seqs)?;
+        for (g, &shard_idx) in guards.iter_mut().zip(non_empty.iter()) {
+            let bucket = &buckets[shard_idx];
+            g.batch_insert_with_explicit_seqs_via_indices(
+                keys, values, op_types, bucket, base_seq,
+            )?;
         }
         Ok(count)
     }
@@ -411,33 +410,30 @@ impl ShardedMemTable {
         // shard release-then-reacquire window let `freeze()` interleave
         // and produce a torn batch that the engine-level retry then
         // duplicated.
-        struct PerShardArrowBatch<'a> {
+        //
+        // B-R13-NEW-H2: zero-copy multi-shard dispatch. Pre-fix this path
+        // built per-shard `Vec<&[u8]>` / `Vec<Option<&[u8]>>` / `Vec<u8>`
+        // / `Vec<u64>` intermediates from the Arrow columns, then dispatched
+        // into `batch_insert_with_explicit_seqs` — defeating the columnar
+        // zero-copy contract C1 promised. The new
+        // `batch_put_arrow_indices_with_explicit_seqs` reads directly from
+        // Arrow `BinaryArray::value(i)` / `is_null(i)` / `op_values[i]`
+        // at each scattered shard index. Only the per-shard `seqs` vector
+        // is materialised (small: one u64 per row in that shard).
+        struct PerShardArrowSlice<'a> {
             shard_idx: usize,
-            sub_keys: Vec<&'a [u8]>,
-            sub_values: Vec<Option<&'a [u8]>>,
-            sub_ops: Vec<u8>,
-            sub_seqs: Vec<u64>,
+            indices: &'a [usize],
+            seqs: Vec<u64>,
         }
-        let mut prepared: Vec<PerShardArrowBatch<'_>> = Vec::new();
+        let mut prepared: Vec<PerShardArrowSlice<'_>> = Vec::new();
         for (shard_idx, indices) in buckets.iter().enumerate() {
             if indices.is_empty() {
                 continue;
             }
-            prepared.push(PerShardArrowBatch {
+            prepared.push(PerShardArrowSlice {
                 shard_idx,
-                sub_keys: indices.iter().map(|&i| keys.value(i)).collect(),
-                sub_values: indices
-                    .iter()
-                    .map(|&i| {
-                        if values.is_null(i) {
-                            None
-                        } else {
-                            Some(values.value(i))
-                        }
-                    })
-                    .collect(),
-                sub_ops: indices.iter().map(|&i| op_values[i]).collect(),
-                sub_seqs: indices.iter().map(|&i| base_seq + i as u64).collect(),
+                indices: indices.as_slice(),
+                seqs: indices.iter().map(|&i| base_seq + i as u64).collect(),
             });
         }
 
@@ -452,7 +448,7 @@ impl ShardedMemTable {
             }
         }
         for (g, p) in guards.iter_mut().zip(prepared.iter()) {
-            g.batch_insert_with_explicit_seqs(&p.sub_keys, &p.sub_values, &p.sub_ops, &p.sub_seqs)?;
+            g.batch_put_arrow_indices_with_explicit_seqs(batch, p.indices, &p.seqs)?;
         }
         Ok(count)
     }
@@ -567,7 +563,16 @@ impl ShardedMemTable {
         let mut out: Vec<ScanRow> = Vec::new();
         for (k, mut versions) in combined {
             versions.sort_by_key(|(seq, _, _)| Reverse(*seq));
-            for (seq, v, op) in versions {
+            // C-C5R1-NEW-1: move `k` on the LAST version; clone only on
+            // preceding ones. For V versions this collapses V allocations
+            // to V-1 clones + 1 zero-cost move. V=1 (no rewrite history,
+            // steady-state common case) eliminates the per-row alloc.
+            let n = versions.len();
+            for (i, (seq, v, op)) in versions.into_iter().enumerate() {
+                if i + 1 == n {
+                    out.push((k, v, seq, op));
+                    break;
+                }
                 out.push((k.clone(), v, seq, op));
             }
         }
@@ -625,11 +630,55 @@ impl ShardedMemTable {
         // than the global `N log N` sort that the legacy path paid.
         let mut shard_snapshots: Vec<Vec<Arc<[u8]>>> = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
+            // FRS-READLOCK-SCAN (2026-06-01): use a READ lock and DO NOT merge on
+            // the scan path. `prefix_scan_keys` is `&self` and already enumerates
+            // BOTH the sorted_index range AND the unsorted_lookup filter, so the
+            // merge is a pure perf optimization, not a correctness requirement;
+            // the unsorted buffer is bounded by MAX_UNSORTED_MERGE_THRESHOLD
+            // (4096), so the unsorted filter is O(4096), not O(N). Mirrors
+            // `range_scan_cursor`, which already scans under a read lock.
+            //
+            // WHY: the prior `shard.write()` + `merge_if_dirty()` held a WRITE
+            // lock across a potentially-expensive merge (up to 4096 entries into
+            // a multi-million-entry BTree) on EVERY prefix scan. The old comment
+            // claimed "uncontended under single-threaded access", but with the
+            // MapStateCache bypassed (all reads routed to the engine) plus the
+            // background flush worker, a JFR/native profile of q9 at the memtable
+            // spill showed ~32 % of the Join thread in `RwLock::lock_contended`
+            // here — the heavy-join cap. A read lock with no merge holds the lock
+            // only for the O(log N + K) scan, eliminating the contention. The
+            // merge still happens on the INSERT path when the unsorted buffer
+            // exceeds the threshold, so sorted_index stays compact over time.
             let guard = shard.read().expect("lock poisoned");
             let mut keys = guard.prefix_scan_keys(lower, upper);
+            drop(guard);
             // The `prefix_index` fast path returns insertion-order; the
             // `sorted_index` fallback returns sorted. Sort unconditionally
             // here so the cursor's heap invariant holds in both cases.
+            keys.sort();
+            shard_snapshots.push(keys);
+        }
+        MemTierCursor::new(shard_snapshots)
+    }
+
+    /// B-R7-NEW-H1: range-bounded variant of [`Self::prefix_scan_cursor`].
+    ///
+    /// Mirrors `prefix_scan_cursor` but routes through
+    /// [`VectorizedMemTable::range_scan_keys`] which SKIPS the prefix-index
+    /// fast path — a general `[lower, upper)` range scan cannot reuse the
+    /// prefix-index shortcut because that shortcut ignores `upper` and only
+    /// activates when `lower` ends with `/`. Used by `DbImpl::scan_iter` to
+    /// build the lazy memtable tier source without eagerly materialising
+    /// the full range result up front (matching the prefix path's "first
+    /// row latency = O(num_shards)" guarantee).
+    pub fn range_scan_cursor(&self, lower: &[u8], upper: Option<&[u8]>) -> MemTierCursor {
+        let mut shard_snapshots: Vec<Vec<Arc<[u8]>>> = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            let guard = shard.read().expect("lock poisoned");
+            let mut keys = guard.range_scan_keys(lower, upper);
+            // `range_scan_keys` returns sorted from the sorted_index path,
+            // but may have merged unsorted entries — sort unconditionally so
+            // the cursor's heap invariant holds.
             keys.sort();
             shard_snapshots.push(keys);
         }
@@ -698,30 +747,42 @@ impl ShardedMemTable {
                 "MemTable must be frozen before flushing",
             ));
         }
-
-        // Collect (key, value, seq, op) from every shard.
-        type FlushRow = (Vec<u8>, Option<Vec<u8>>, u64, u8);
-        let mut all_rows: Vec<FlushRow> = Vec::new();
-        for shard in &self.shards {
-            let guard = shard.read().expect("lock poisoned");
-            // Re-use `collect_range_entries(&[], None, u64::MAX)` so we
-            // don't need to add new public APIs to VectorizedMemTable.
-            // Walk every visible row.
-            let rows = guard.collect_range_entries(&[], None, u64::MAX);
-            all_rows.reserve(rows.len());
-            for (k, v, seq, op) in rows {
-                all_rows.push((k, v, seq, op as u8));
-            }
+        // FRS-ARROW-OFFSET-FIX (2026-06-01): single-shard fast path. The general
+        // path below `concat_batches` the per-shard batches into ONE combined
+        // batch before sorting — which re-merges the byte-bounded per-shard
+        // batches back into a single >2 GiB batch and overflows the Arrow i32
+        // offset on a large (multi-GiB) memtable. With one shard the data is
+        // already globally (key ASC, seq DESC) sorted, so emit its byte-bounded
+        // batches directly (passing the REAL `batch_size`, not `usize::MAX`).
+        if self.shards.len() == 1 {
+            let guard = self.shards[0].read().expect("lock poisoned");
+            return guard.to_flush_batches(batch_size);
         }
 
-        // Sort by (key ASC, sequence DESC). This matches both the
-        // VectorizedMemTable::to_flush_batches contract and SstWriterImpl's
-        // input invariant.
-        all_rows.sort_by(|a, b| match a.0.cmp(&b.0) {
-            std::cmp::Ordering::Equal => b.2.cmp(&a.2),
-            other => other,
-        });
-
+        // B-R9-NEW-H1: per-shard zero-copy `to_flush_batches` followed by a
+        // bulk Arrow concat + lexicographic sort + take. The pre-fix path
+        // called `collect_range_entries` per shard which materialized every
+        // row as an owned `(Vec<u8>, Option<Vec<u8>>, u64, u8)` tuple, then
+        // sorted those tuples globally with `Vec<u8>` key compares, then
+        // ran a SECOND memcpy per row through `BinaryBuilder.append_value`.
+        // On a 100k-row memtable that was ~2N small allocations + N tuple
+        // allocations + an O(N log N) sort with heap-key compares + 2N
+        // memcpys on the flush hot path.
+        //
+        // The replacement:
+        //   1. Per-shard `VectorizedMemTable::to_flush_batches(usize::MAX)`
+        //      returns a single sorted `RecordBatch` per non-empty shard,
+        //      built via `BinaryBuilder` with one memcpy per row directly
+        //      from the columnar `key_data`/`value_data` Vecs (no owned
+        //      tuple intermediate).
+        //   2. `arrow::compute::concat_batches` glues per-shard batches
+        //      into one combined batch via bulk Arrow buffer concat.
+        //   3. `lexsort_to_indices((key ASC, seq DESC))` produces a global
+        //      ordering on Arrow's typed arrays (faster cache locality
+        //      than sorting `Vec<u8>` tuples).
+        //   4. `take` applies the indices to materialise the sorted batch.
+        //   5. `RecordBatch::slice` (zero-copy via Arrow buffer slicing)
+        //      chunks the result into `batch_size` pieces.
         let schema = std::sync::Arc::new(Schema::new(vec![
             Field::new("key", DataType::Binary, false),
             Field::new("value", DataType::Binary, true),
@@ -729,37 +790,180 @@ impl ShardedMemTable {
             Field::new("op_type", DataType::UInt8, false),
         ]));
 
+        let mut per_shard: Vec<RecordBatch> = Vec::new();
+        for shard in &self.shards {
+            let guard = shard.read().expect("lock poisoned");
+            // `usize::MAX` => one RecordBatch per shard containing every
+            // visible row (already sorted by (key ASC, seq DESC) within
+            // the shard).
+            let mut sb = guard.to_flush_batches(usize::MAX)?;
+            per_shard.append(&mut sb);
+        }
+
+        if per_shard.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Concat per-shard sorted batches. Arrow buffer concat is bulk
+        // memcpy across Arrow internals, not per-row.
+        let combined = arrow::compute::concat_batches(&schema, per_shard.iter())
+            .map_err(|e| ForstError::corruption(format!("concat_batches: {}", e)))?;
+
+        // Global lexicographic sort: (key ASC, sequence DESC). Matches the
+        // VectorizedMemTable::to_flush_batches contract and SstWriterImpl's
+        // input invariant.
+        let key_col = combined.column(0).clone();
+        let seq_col = combined.column(2).clone();
+        let sort_columns = vec![
+            arrow::compute::SortColumn {
+                values: key_col,
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            },
+            arrow::compute::SortColumn {
+                values: seq_col,
+                options: Some(arrow::compute::SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                }),
+            },
+        ];
+        let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
+            .map_err(|e| ForstError::corruption(format!("lexsort_to_indices: {}", e)))?;
+
+        // Apply indices via Arrow's vectorized `take` (zero-row-by-row work;
+        // internally just builds new offset arrays + memcpys data).
+        let sorted_arrays: Vec<std::sync::Arc<dyn Array>> = combined
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ForstError::corruption(format!("take: {}", e)))?;
+        let sorted = RecordBatch::try_new(schema.clone(), sorted_arrays)
+            .map_err(|e| ForstError::corruption(format!("RecordBatch::try_new: {}", e)))?;
+
+        // Chunk into `batch_size`-sized output batches via zero-copy slicing.
+        let total = sorted.num_rows();
         let mut batches = Vec::new();
-        let total = all_rows.len();
         let mut row_idx = 0;
         while row_idx < total {
-            let chunk_end = (row_idx + batch_size).min(total);
-            let mut key_builder = BinaryBuilder::new();
-            let mut value_builder = BinaryBuilder::new();
-            let mut seq_builder = UInt64Builder::new();
-            let mut op_builder = UInt8Builder::new();
+            let slice_len = (row_idx + batch_size).min(total) - row_idx;
+            batches.push(sorted.slice(row_idx, slice_len));
+            row_idx += slice_len;
+        }
+        Ok(batches)
+    }
 
-            for row in &all_rows[row_idx..chunk_end] {
-                key_builder.append_value(&row.0);
-                match &row.1 {
-                    Some(v) => value_builder.append_value(v),
-                    None => value_builder.append_null(),
-                }
-                seq_builder.append_value(row.2);
-                op_builder.append_value(row.3);
-            }
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    std::sync::Arc::new(key_builder.finish()),
-                    std::sync::Arc::new(value_builder.finish()),
-                    std::sync::Arc::new(seq_builder.finish()),
-                    std::sync::Arc::new(op_builder.finish()),
-                ],
-            )
-            .map_err(|e| ForstError::corruption(format!("Arrow error: {}", e)))?;
-            batches.push(batch);
-            row_idx = chunk_end;
+    /// FRS-CKPT-NOFLUSH (2026-06-01): serialise the LIVE sharded memtable to
+    /// globally-sorted Arrow `RecordBatch`es WITHOUT freezing it — the
+    /// cross-shard analogue of [`VectorizedMemTable::snapshot_batches`]. Each
+    /// shard merges its unsorted buffer (under its write lock) and emits its
+    /// rows; the per-shard batches are concat'd + globally lexsorted
+    /// (key ASC, seq DESC) exactly like [`Self::to_flush_batches`]. The memtable
+    /// stays live + writable. Used by the checkpoint-without-flush path so a
+    /// snapshot durably captures the memtable to an Arrow-IPC artifact while it
+    /// remains the resident, unfragmented read structure (avoiding the L0-SST
+    /// fan-out that collapses heavy joins under ckpt-ON).
+    pub fn snapshot_batches(&self, batch_size: usize) -> ForstResult<Vec<RecordBatch>> {
+        self.snapshot_batches_bounded(batch_size, None)
+    }
+
+    /// Streaming variant of [`Self::snapshot_batches_bounded`]: hands each batch
+    /// to `emit` and drops it before building the next. On the single-shard fast
+    /// path (the production default `memtable_shards = 1`) this streams a
+    /// multi-GB memtable to the caller's writer with peak memory of ONE batch,
+    /// avoiding the snapshot RAM doubling that OOM'd the TaskManager at large
+    /// `writebuffer.size`. The multi-shard path must concat+lexsort all shards
+    /// to globally sort, so it materializes the full set then emits each batch
+    /// (no streaming benefit there, but multi-shard is not the OOM case).
+    pub fn snapshot_batches_bounded_for_each<F: FnMut(RecordBatch) -> ForstResult<()>>(
+        &self,
+        batch_size: usize,
+        max_seq: Option<u64>,
+        mut emit: F,
+    ) -> ForstResult<()> {
+        if self.shards.len() == 1 {
+            let mut guard = self.shards[0].write().expect("lock poisoned");
+            return guard.snapshot_batches_bounded_for_each(batch_size, max_seq, emit);
+        }
+        // Multi-shard: global sort requires all shards materialized; emit each.
+        for b in self.snapshot_batches_bounded(batch_size, max_seq)? {
+            emit(b)?;
+        }
+        Ok(())
+    }
+
+    /// As [`Self::snapshot_batches`] but bounds entries to `sequence <= max_seq`
+    /// when `max_seq` is `Some` — the consistent checkpoint-without-flush cut.
+    pub fn snapshot_batches_bounded(
+        &self,
+        batch_size: usize,
+        max_seq: Option<u64>,
+    ) -> ForstResult<Vec<RecordBatch>> {
+        // FRS-ARROW-OFFSET-FIX (2026-06-01): single-shard fast path — skip the
+        // concat-into-one-batch (which overflows the Arrow i32 offset on a
+        // multi-GiB memtable). One shard is already globally sorted; emit its
+        // byte-bounded batches directly with the REAL `batch_size`.
+        if self.shards.len() == 1 {
+            let mut guard = self.shards[0].write().expect("lock poisoned");
+            return guard.snapshot_batches_bounded(batch_size, max_seq);
+        }
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
+            Field::new("sequence", DataType::UInt64, false),
+            Field::new("op_type", DataType::UInt8, false),
+        ]));
+
+        let mut per_shard: Vec<RecordBatch> = Vec::new();
+        for shard in &self.shards {
+            // Write lock: snapshot_batches merges the unsorted buffer in place.
+            let mut guard = shard.write().expect("lock poisoned");
+            let mut sb = guard.snapshot_batches_bounded(usize::MAX, max_seq)?;
+            per_shard.append(&mut sb);
+        }
+        if per_shard.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let combined = arrow::compute::concat_batches(&schema, per_shard.iter())
+            .map_err(|e| ForstError::corruption(format!("concat_batches: {}", e)))?;
+        let sort_columns = vec![
+            arrow::compute::SortColumn {
+                values: combined.column(0).clone(),
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            },
+            arrow::compute::SortColumn {
+                values: combined.column(2).clone(),
+                options: Some(arrow::compute::SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                }),
+            },
+        ];
+        let indices = arrow::compute::lexsort_to_indices(&sort_columns, None)
+            .map_err(|e| ForstError::corruption(format!("lexsort_to_indices: {}", e)))?;
+        let sorted_arrays: Vec<std::sync::Arc<dyn Array>> = combined
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ForstError::corruption(format!("take: {}", e)))?;
+        let sorted = RecordBatch::try_new(schema.clone(), sorted_arrays)
+            .map_err(|e| ForstError::corruption(format!("RecordBatch::try_new: {}", e)))?;
+
+        let total = sorted.num_rows();
+        let mut batches = Vec::new();
+        let mut row_idx = 0;
+        while row_idx < total {
+            let slice_len = (row_idx + batch_size).min(total) - row_idx;
+            batches.push(sorted.slice(row_idx, slice_len));
+            row_idx += slice_len;
         }
         Ok(batches)
     }
@@ -844,6 +1048,14 @@ impl MemTierCursor {
     /// Returns whether the cursor has any more pending keys.
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
+    }
+
+    /// FRS-ITER-DIAG: total number of snapshotted keys across all shards
+    /// (the upfront work this cursor materialised). Used only by the gated
+    /// `build_lazy_prefix_key_stream` diagnostic to attribute prefix-scan
+    /// cost to result size vs tier count.
+    pub fn snapshot_len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
     }
 
     /// Peeks at the next key (the lex-smallest across all shards) without

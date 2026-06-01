@@ -268,7 +268,14 @@ impl Default for EngineOptions {
             compression: CompressionType::Lz4,
             enable_statistics: true,
             db_path: String::new(),
-            memtable_shards: 16,
+            // FRS-MEMTABLE-SHARDS-DEFAULT (2026-05-28): default lowered from 16
+            // to 1. Flink keyed-state access is single-threaded per backend, so
+            // 16-way sharding gives no write-concurrency benefit but inflates
+            // every prefix scan's per-tier fan-out by 16× (cf. lib.rs:792 note).
+            // With the resident-flushed read path (Design A) every prefix scan
+            // now traverses many in-RAM memtables × per-tier shards; staying at
+            // 1 keeps that linear. Override per-run via `FRS_MEMTABLE_SHARDS`.
+            memtable_shards: 1,
             // B-Prod-P7 §6d defaults: 256 MiB block cache, 512 MiB WBM.
             block_cache_capacity_bytes: 256 * 1024 * 1024,
             write_buffer_manager_capacity_bytes: 512 * 1024 * 1024,

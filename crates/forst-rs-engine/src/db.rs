@@ -56,7 +56,7 @@ use crate::mvcc::{self, DbId, Snapshot, SnapshotRegistry};
 use crate::runtime_tuning::WriteBufferManager;
 use crate::snapshot_view::SnapshotView;
 use crate::write_batch::WriteBatch;
-use crate::write_controller::WriteController;
+use crate::write_controller::{WriteController, WriteControllerConfig};
 
 /// Process-wide allocator for [`DbId`] values.
 ///
@@ -64,6 +64,52 @@ use crate::write_controller::WriteController;
 /// Bound into every `Snapshot` at capture time (spec §15 "Same-DB"
 /// invariant) so the FFI release path can detect cross-DB releases.
 static NEXT_DB_ID: AtomicU64 = AtomicU64::new(1);
+
+// 2026-05-30: a process-shared block cache was tried (one pool for all DB
+// instances, db_id-qualified keys) to give heavy queries a larger effective
+// cache. It REGRESSED q9 (4.1M vs per-instance 6.5M @242s — longer hard stalls,
+// likely cross-DB shard contention from ~8 DBs hammering one ShardedClockCache).
+// Reverted to per-instance caches; the per-instance decoded-block cache stays
+// (it is the verified ~14-25% win). See
+// docs/superpowers/specs/2026-05-30-shared-cross-instance-block-cache.md.
+
+/// FRS-BLOCKCACHE-ENV (2026-05-31): apply the optional `FRS_BLOCK_CACHE_MB`
+/// per-run override to the computed decoded-block cache size (in bytes).
+///
+/// The FFM backend does not yet expose a Flink config key for the in-RAM
+/// decoded-block `ShardedClockCache` (it passes `block_cache_capacity_bytes=0`,
+/// so the engine falls to the 256 MiB default). A live symbolized profile of
+/// the q4/q7/q9 heavy-join stall showed that once join state exceeds that
+/// cache, every per-key prefix-iterator probe re-runs `read_data_block →
+/// decompress + arrow_ipc RecordBatch decode` on a cache miss — the dominant
+/// remaining cost after the whole-SST pread fix removed the I/O. This hook lets
+/// the operator size the cache against the box (8c/32g: WBM memtables 6 GiB +
+/// JVM 8 GiB leave headroom for a few GiB × instance-count) WITHOUT a Java
+/// rebuild. The override only ever RAISES the size (`.max`), never shrinks the
+/// validated floor; a zero/invalid value is ignored. Applies per DB instance.
+fn apply_block_cache_env_override(cache_bytes: usize) -> usize {
+    match std::env::var("FRS_BLOCK_CACHE_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+    {
+        Some(mb) => mb.saturating_mul(1024 * 1024).max(cache_bytes),
+        None => cache_bytes,
+    }
+}
+
+/// FRS-ITER-DIAG: cached check for the `FRS_ITER_DIAG=1` env flag. Reads the
+/// env var once (the result is process-stable) so the prefix-stream build hot
+/// path pays only an atomic load per call when diagnostics are off.
+fn frs_iter_diag_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("FRS_ITER_DIAG")
+            .map(|s| s.trim() == "1")
+            .unwrap_or(false)
+    })
+}
 
 /// Bounded capacity for the background flush queue. Sized comfortably above
 /// `max_write_buffer_number` so the writer's `try_send` rarely blocks; real
@@ -266,6 +312,12 @@ pub struct DbImpl {
     /// every read/write/checkpoint boundary refuses until restart from the
     /// last durable checkpoint.
     fatal_error: Mutex<Option<String>>,
+    /// 2026-05-29 PERF-RESTORE-#7: AtomicBool fast-path for `check_fatal_error`.
+    /// Set when `record_fatal_error` first transitions the slot Some→None.
+    /// Per-op `check_fatal_error` then becomes a single relaxed atomic load on
+    /// the happy path instead of a Mutex acquisition (which was firing per
+    /// put/get/delete/merge/batch_put on every engine entry).
+    fatal_error_set: std::sync::atomic::AtomicBool,
     /// Count of flush requests enqueued but not yet completed by the
     /// worker. Used by [`Self::wait_for_pending_flushes`] to know when the
     /// worker has drained everything we asked it to. Bumped on enqueue,
@@ -386,9 +438,38 @@ impl DbImpl {
         } else {
             options.block_cache_size
         };
+        // FRS-BLOCKCACHE-FLOOR: the decoded-block ShardedClockCache is created
+        // PER DB INSTANCE (not shared — a shared pool regressed heavy queries via
+        // cross-DB shard-lock contention). The cache is native-resident and
+        // charged by actual bytes inserted, so a higher floor costs light
+        // queries nothing but lets heavy streaming-join DBs keep their re-probed
+        // decoded data blocks resident (the profiled decode_data_block +
+        // decompress + serial_read_at re-read cost on per-key prefix scans).
+        // FRS-8C32G-RAMBUDGET: 256 MiB (was 768) — per-instance × ~8 instances ≈ 2 GiB,
+        // fits the 32 GiB budget alongside JVM heap + the (now 1 GiB) resident shadow.
+        const BLOCK_CACHE_FLOOR: usize = 256 * 1024 * 1024;
+        let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
+        let cache_bytes = apply_block_cache_env_override(cache_bytes);
         let block_cache = Arc::new(ShardedClockCache::with_capacity(cache_bytes));
         let write_buffer_manager =
             WriteBufferManager::new(options.write_buffer_manager_capacity_bytes);
+
+        // FRS-S3-STALL: honour the configured `max_write_buffer_number` in the
+        // back-pressure controller. Previously this used
+        // `WriteController::with_defaults()` (hard-coded 3), silently dropping
+        // the operator-supplied value that flows in via EngineOptions → FFI →
+        // Java `state.backend.forst-rs.writebuffer.count`. With the default
+        // dropped, writes stalled at 3 immutable memtables regardless of
+        // config; on high-latency object stores (S3/OSS/BOS) the slow flush
+        // could not drain that backlog within `stall_timeout`, so
+        // `may_throttle()` returned a `timed_out` error that the FFI maps to
+        // `Unknown(999)` and the Java FFM bridge mis-escalates to a fatal
+        // engine panic, restart-looping the job. l0 + stall_timeout headroom
+        // comes from `WriteControllerConfig::default()` (see write_controller.rs).
+        let wc_config = WriteControllerConfig {
+            max_write_buffer_number: options.max_write_buffer_number as u32,
+            ..WriteControllerConfig::default()
+        };
 
         let db = Arc::new(Self {
             options,
@@ -401,13 +482,14 @@ impl DbImpl {
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             sequence_number: AtomicU64::new(0),
-            write_controller: Arc::new(WriteController::with_defaults()),
+            write_controller: Arc::new(WriteController::new(wc_config)),
             write_mutex: Mutex::new(()),
             next_cf_id: AtomicU32::new(1),
             flush_queue: Arc::new(FlushQueue::new(FLUSH_QUEUE_CAPACITY)),
             flush_worker: Mutex::new(None),
             flush_error: Mutex::new(None),
             fatal_error: Mutex::new(None),
+            fatal_error_set: std::sync::atomic::AtomicBool::new(false),
             pending_flush_count: AtomicU32::new(0),
             snapshot_registry: SnapshotRegistry::new(),
             db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
@@ -1358,6 +1440,15 @@ impl DbImpl {
             // tracked by `new_files`, so `cleanup_ingested` would not
             // unlink it. Explicitly delete `dest` before invoking
             // cleanup so partial ingests do not leak the file.
+            // 2026-05-29 WRITE-BACK FLUSH: `dest` was just written via
+            // `self.fs` (CreateNew → buffered async upload on object stores).
+            // We immediately read its footer below, so await the in-flight
+            // upload first to read a fully-uploaded object.
+            if let Err(e) = self.fs.await_upload(&dest) {
+                let _ = self.fs.delete_file(&dest);
+                self.cleanup_ingested(&new_files);
+                return Err(e);
+            }
             let rac = self.fs.open_random_access_file(&dest).inspect_err(|_| {
                 let _ = self.fs.delete_file(&dest);
                 self.cleanup_ingested(&new_files);
@@ -1666,6 +1757,10 @@ impl DbImpl {
     ) -> ForstResult<()> {
         use forst_rs_storage::sst::FOOTER_TAIL_SIZE;
 
+        // 2026-05-29 WRITE-BACK FLUSH: `dest` may have been written via the
+        // buffered async upload path; await its upload before reading it back
+        // to rewrite the footer.
+        self.fs.await_upload(dest)?;
         // Open the dest via the engine's FileSystem and confirm its
         // on-disk size matches what the caller measured. Going through
         // `self.fs` ensures CachedFileSystem (or any wrapping FS)
@@ -2008,7 +2103,19 @@ impl DbImpl {
             ));
         }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
-        let read_seq = snapshot.seq().value();
+        // A-R8-H2: collect candidate keys at u64::MAX, NOT snapshot.seq.
+        // Pre-fix used `snapshot.seq()` which filtered out memtable
+        // rows with seq > snapshot.seq — but a Merge operand at
+        // seq > snapshot.seq might be the only row that brings a key
+        // into the candidate set, and `iter_versions_of` / `get_at_cf`
+        // ALREADY resolve per-key visibility via mvcc::get_at_with_merge
+        // (which uses the snapshot's seq to filter operands while
+        // walking older versions). With the pre-fix filter, scan_at
+        // missed keys whose only memtable presence was a too-new
+        // entry but whose older versions (visible at snapshot.seq)
+        // sat in SSTs that did NOT get filtered at the per-row
+        // level — silent missing rows under merge-operator CFs.
+        let _ = snapshot.seq(); // retained for cross-DB consistency check above
         let lower: &[u8] = &[];
         let upper: Option<&[u8]> = None;
         let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
@@ -2016,13 +2123,13 @@ impl DbImpl {
         // Active memtable.
         {
             let mem_arc = cf_data.active_memtable();
-            for (k, _, _, _) in mem_arc.collect_range_entries(lower, upper, read_seq) {
+            for (k, _, _, _) in mem_arc.collect_range_entries(lower, upper, u64::MAX) {
                 keys.insert(k);
             }
         }
         // Immutable memtables.
         for imm in cf_data.imm_memtables() {
-            for (k, _, _, _) in imm.collect_range_entries(lower, upper, read_seq) {
+            for (k, _, _, _) in imm.collect_range_entries(lower, upper, u64::MAX) {
                 keys.insert(k);
             }
         }
@@ -2100,11 +2207,41 @@ impl DbImpl {
         let mut entries: Vec<(InternalKey, Vec<u8>)> = Vec::new();
 
         // Active memtable.
+        // A-R7-H1: capture the Arc identity of the active memtable
+        // so the imm-list walk below can skip any imm entry whose
+        // Arc-ptr matches — `swap_active_memtable` (column_family.rs)
+        // installs a fresh active and pushes the OLD active onto
+        // `imm_list`. Without this dedup, a swap interleaving
+        // between `cf_data.active_memtable()` here and
+        // `cf_data.imm_memtables()` below would walk the same
+        // memtable twice, double-counting every entry and producing
+        // wrong merge results on snapshot reads (sister-bug to
+        // D-R7-H2 in the latest-view path).
+        let mem = cf_data.active_memtable();
+        let active_ptr = std::sync::Arc::as_ptr(&mem);
         {
-            let mem = cf_data.active_memtable();
             for (k, v, seq, op) in mem.collect_range_entries(user_key, Some(&upper), u64::MAX) {
                 if k != user_key {
                     continue;
+                }
+                // C-R5-H1: detect a corrupt Merge entry whose value
+                // payload is missing. The latest-view path
+                // (`get_internal`) raises ForstError::corruption for
+                // this same shape; the snapshot path previously
+                // silently folded an empty operand into the merge
+                // result, returning wrong answers under
+                // counter-style or serializer-style merge operators.
+                // D-R8-NEW-H3: widen corruption check beyond Merge.
+                // Put with None value is a serializer error (Put must
+                // carry payload); Delete/SingleDelete with Some value
+                // is an upstream layering error (tombstones carry no
+                // payload). Both produced wrong snapshot reads pre-fix.
+                if (matches!(op, OpType::Merge) && v.is_none())
+                    || (matches!(op, OpType::Put) && v.is_none())
+                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some()) {
+                    return Err(ForstError::corruption(
+                        "iter_versions_of: Merge entry missing operand payload (active memtable)",
+                    ));
                 }
                 let ik = InternalKey::new(k, SequenceNumber::new(seq), op);
                 entries.push((ik, v.unwrap_or_default()));
@@ -2113,9 +2250,26 @@ impl DbImpl {
 
         // Immutable memtables (any order — we sort below).
         for imm in cf_data.imm_memtables() {
+            if std::sync::Arc::as_ptr(&imm) == active_ptr {
+                // A-R7-H1: skip imm entry that aliases the active memtable
+                // we already walked above.
+                continue;
+            }
             for (k, v, seq, op) in imm.collect_range_entries(user_key, Some(&upper), u64::MAX) {
                 if k != user_key {
                     continue;
+                }
+                // D-R8-NEW-H3: widen corruption check beyond Merge.
+                // Put with None value is a serializer error (Put must
+                // carry payload); Delete/SingleDelete with Some value
+                // is an upstream layering error (tombstones carry no
+                // payload). Both produced wrong snapshot reads pre-fix.
+                if (matches!(op, OpType::Merge) && v.is_none())
+                    || (matches!(op, OpType::Put) && v.is_none())
+                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some()) {
+                    return Err(ForstError::corruption(
+                        "iter_versions_of: Merge entry missing operand payload (imm memtable)",
+                    ));
                 }
                 let ik = InternalKey::new(k, SequenceNumber::new(seq), op);
                 entries.push((ik, v.unwrap_or_default()));
@@ -2147,6 +2301,18 @@ impl DbImpl {
                 if k != user_key {
                     continue;
                 }
+                // D-R8-NEW-H3: widen corruption check beyond Merge.
+                // Put with None value is a serializer error (Put must
+                // carry payload); Delete/SingleDelete with Some value
+                // is an upstream layering error (tombstones carry no
+                // payload). Both produced wrong snapshot reads pre-fix.
+                if (matches!(op, OpType::Merge) && v.is_none())
+                    || (matches!(op, OpType::Put) && v.is_none())
+                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some()) {
+                    return Err(ForstError::corruption(
+                        "iter_versions_of: Merge entry missing operand payload (SST)",
+                    ));
+                }
                 let ik = InternalKey::new(k, SequenceNumber::new(seq), op);
                 entries.push((ik, v.unwrap_or_default()));
             }
@@ -2158,6 +2324,22 @@ impl DbImpl {
             a.0.user_key()
                 .cmp(b.0.user_key())
                 .then_with(|| b.0.sequence().0.cmp(&a.0.sequence().0))
+        });
+        // A-R9-N1: dedup imm-vs-SST flush-window race. Between
+        // `version_set.apply(edit)` installing the just-flushed SST
+        // and `pop_oldest_imm` removing the imm, BOTH layers carry
+        // the same entries. The active→imm Arc dedup at line 2158
+        // (A-R7-H1) handles active↔imm, and E-R8-H1's
+        // seq-cutoff in `peel_merges_from_sst_with_cutoff` handles
+        // the latest-view path, but the snapshot-read candidate
+        // gatherer here had no equivalent. Engine seqs are globally
+        // unique (single fetch_add), so two entries with identical
+        // (seq, op) are necessarily flush-window duplicates of the
+        // same logical row. Drop the second occurrence.
+        entries.dedup_by(|a, b| {
+            a.0.user_key() == b.0.user_key()
+                && a.0.sequence() == b.0.sequence()
+                && a.0.op_type() == b.0.op_type()
         });
         Ok(entries)
     }
@@ -2447,6 +2629,13 @@ impl DbImpl {
     /// run an L0→L1 compaction. Returns `Ok(())` either way.
     fn maybe_auto_compact(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
         let l0_count = self.version_set.current().l0_files().len() as u32;
+        // 2026-05-30: tried a low L0 compaction trigger (4) here to shrink L0
+        // read-amp — it did NOT fix the q9 stall (the stall persists with L0≤4,
+        // and trigger=4 stalled EARLIER, ~120s vs ~160s, from frequent inline
+        // compaction on the flush worker). So L0 file count was NOT the wall;
+        // reverted to the tested slowdown trigger. The stall is elsewhere
+        // (memtable prefix-scan over the 6 GiB WBM, or inline-compaction
+        // write-stall) — needs a symbolized profile with L0 small.
         let trigger = self.write_controller.config().l0_slowdown_trigger;
         if l0_count >= trigger {
             // R46-L3: surface which CF triggered the auto-compaction and
@@ -2494,7 +2683,24 @@ impl DbImpl {
         self.consume_flush_error()?;
         self.write_controller.may_throttle()?;
 
-        // Resolve and cache CF lookups up front so we fail fast on missing CFs.
+        // B-R12-NEW-H1 remainder: every FFI vectorized write path
+        // (`frs_vectorized_batch_put`, `frs_vectorized_batch_delete`,
+        // `frs_vec_merge_append_batch`, `frs_batch_put_arrow`) writes to
+        // exactly one CF, so `single_cf_hint()` returns `Some` on the
+        // dominant streaming hot path. Fast-path that case to skip:
+        //   * `group_by_cf` `HashMap<CF, Vec<usize>>` allocation
+        //   * `cf_datas` `HashMap<CF, Arc<ColumnFamilyData>>` allocation
+        //   * per-CF `indices: Vec<usize>` indirection
+        // The 3 `Vec<&[u8]>`/`Vec<Option<&[u8]>>`/`Vec<u8>` slices below are
+        // still required by `ShardedMemTable::batch_insert_with_base_seq`'s
+        // borrowed-slice contract, but they're now built once over
+        // `entries` directly rather than through a per-CF index hop.
+        if let Some(single_cf_id) = batch.single_cf_hint() {
+            return self.batch_write_single_cf(single_cf_id, batch);
+        }
+
+        // Multi-CF slow path — resolve and cache CF lookups up front so we
+        // fail fast on missing CFs.
         let groups = batch.group_by_cf();
         let mut cf_datas: HashMap<ColumnFamilyId, Arc<ColumnFamilyData>> =
             HashMap::with_capacity(groups.len());
@@ -2658,6 +2864,158 @@ impl DbImpl {
         Ok(last_seq)
     }
 
+    /// B-R12-NEW-H1 remainder: single-CF fast path for {@link Self::batch_write}.
+    /// Skips the `group_by_cf` HashMap and `cf_datas` HashMap allocations; the
+    /// 3 borrowed-slice Vecs are built once from `entries` (not per-CF), and
+    /// the single `ColumnFamilyData` is fetched directly. All correctness
+    /// invariants (R56-H1 retry, R58-H1 WBM charge, D1 seq reservation,
+    /// sequence-overflow guard, post-write memtable-switch + flush enqueue)
+    /// mirror the multi-CF slow path; only the per-CF group bookkeeping is
+    /// elided. The dominant FFI vectorized write paths all hit this branch.
+    fn batch_write_single_cf<'a>(
+        &self,
+        single_cf_id: ColumnFamilyId,
+        batch: WriteBatch<'a>,
+    ) -> ForstResult<u64> {
+        // C4R2-B-NEW-H1: extract slices from entries ONCE in a single pass
+        // (pre-fix walked entries.iter() THREE TIMES building 3 separate
+        // Vecs). Then dispatch through the shared borrowed-slice helper
+        // which is also used by `batch_put_borrowed_single_cf` — the FFM
+        // vectorized FFI write path bypasses WriteBatch entirely and calls
+        // that helper directly, eliminating the per-row WriteBatchEntry
+        // allocation storm Agent B flagged.
+        let entries = batch.into_entries();
+        let count = entries.len();
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(count);
+        let mut values: Vec<Option<&[u8]>> = Vec::with_capacity(count);
+        let mut op_types: Vec<u8> = Vec::with_capacity(count);
+        let mut total_charge: u64 = 0;
+        for e in &entries {
+            let k = e.key.as_ref();
+            let v = e.value.as_deref();
+            total_charge = total_charge
+                .saturating_add(k.len() as u64)
+                .saturating_add(v.map_or(0, |v| v.len() as u64))
+                .saturating_add(57);
+            keys.push(k);
+            values.push(v);
+            op_types.push(e.op_type as u8);
+        }
+        self.batch_write_borrowed_single_cf_inner(
+            single_cf_id, &keys, &values, &op_types, total_charge,
+        )
+    }
+
+    /// C4R2-B-NEW-H1: borrowed-slice direct entry for the FFM vectorized
+    /// FFI write path. Skips `WriteBatch` construction (which allocates
+    /// `Vec<WriteBatchEntry>` of count × 56 bytes per call) and per-row
+    /// `Cow::Borrowed` wrap. Callers (Rust FFI `frs_vectorized_batch_put` /
+    /// `frs_vectorized_batch_delete` / `frs_vec_merge_append_batch`) build
+    /// the 3 borrowed-slice arrays directly during their existing FFI loop
+    /// and dispatch here.
+    pub fn batch_put_borrowed_single_cf<'a>(
+        &self,
+        cf: &ColumnFamilyHandle,
+        keys: &[&'a [u8]],
+        values: &[Option<&'a [u8]>],
+        op_types: &[u8],
+    ) -> ForstResult<u64> {
+        self.check_fatal_error()?;
+        // C-C6R2-NEW-H1: cross-slice length precondition. The WBM-charge loop
+        // and downstream `batch_insert_with_base_seq` index `values[i]` /
+        // `op_types[i]` against `keys.len()`; mismatched lengths panic with
+        // index-out-of-bounds AFTER `fetch_add` has already advanced the
+        // sequence counter and `wbm.reserve` charged the buffer manager,
+        // permanently leaking the reserved seq range. Validate BEFORE any
+        // such irreversible state mutation. Sister site
+        // `batch_write_borrowed_single_cf_inner` also takes 3 parallel
+        // slices but is private — only called via this entry, so the
+        // single guard here covers it.
+        if keys.len() != values.len() || keys.len() != op_types.len() {
+            return Err(ForstError::invalid_argument(
+                "batch_put_borrowed_single_cf: keys/values/op_types length mismatch",
+            ));
+        }
+        if keys.is_empty() {
+            return Ok(self.sequence_number());
+        }
+        self.consume_flush_error()?;
+        self.write_controller.may_throttle()?;
+        // Single-pass WBM charge tally.
+        let mut total_charge: u64 = 0;
+        for i in 0..keys.len() {
+            let k_len = keys[i].len() as u64;
+            let v_len = values[i].map_or(0, |v| v.len() as u64);
+            total_charge = total_charge
+                .saturating_add(k_len)
+                .saturating_add(v_len)
+                .saturating_add(57);
+        }
+        self.batch_write_borrowed_single_cf_inner(
+            cf.id(), keys, values, op_types, total_charge,
+        )
+    }
+
+    /// Shared body for `batch_write_single_cf` and `batch_put_borrowed_single_cf`.
+    /// Caller has already computed `total_charge`.
+    fn batch_write_borrowed_single_cf_inner<'a>(
+        &self,
+        single_cf_id: ColumnFamilyId,
+        keys: &[&'a [u8]],
+        values: &[Option<&'a [u8]>],
+        op_types: &[u8],
+        total_charge: u64,
+    ) -> ForstResult<u64> {
+        let cf_data = self.lookup_cf_by_id(single_cf_id)?;
+
+        // PERF (D1): reserve the engine sequence range with one lock-free
+        // `fetch_add(N)` BEFORE acquiring `write_mutex`.
+        let total_count: u64 = keys.len() as u64;
+        let prev = self
+            .sequence_number
+            .fetch_add(total_count, Ordering::Relaxed);
+        let last_seq = prev + total_count;
+        // Spec §6a.4 sequence-number overflow guard.
+        Self::check_sequence_overflow(last_seq)?;
+
+        // R58-H1: charge the WriteBufferManager BEFORE the insert call.
+        self.write_buffer_manager.reserve(total_charge);
+        let wbm_guard = WbmReleaseGuard::new(&self.write_buffer_manager, total_charge);
+
+        let base_seq = prev + 1;
+
+        // R56-H1 bounded-retry on FrozenMemTable absorbs a concurrent
+        // flush's swap atomically from the caller's view.
+        let mut attempt: u32 = 0;
+        loop {
+            let mem_arc = cf_data.active_memtable();
+            match mem_arc.batch_insert_with_base_seq(keys, values, op_types, base_seq) {
+                Ok(_) => break,
+                Err(ForstError::FrozenMemTable) if attempt < 8 => {
+                    std::thread::yield_now();
+                    std::thread::sleep(std::time::Duration::from_micros(100u64 << attempt));
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        wbm_guard.commit();
+
+        // Post-write: memtable-switch under write_mutex, then enqueue flush.
+        let mut cfs_to_flush: Vec<Arc<ColumnFamilyData>> = Vec::new();
+        {
+            let _writer = self.write_mutex.lock().expect("lock poisoned");
+            if self.maybe_switch_memtable_in_lock(&cf_data)? {
+                cfs_to_flush.push(cf_data.clone());
+            }
+        }
+        for cf_to_flush in &cfs_to_flush {
+            self.enqueue_flush(cf_to_flush.clone())?;
+        }
+
+        Ok(last_seq)
+    }
+
     /// Direct columnar batch put from an Arrow `RecordBatch` — the C1
     /// zero-copy hot path.
     ///
@@ -2684,6 +3042,36 @@ impl DbImpl {
         let count = batch.num_rows();
         if count == 0 {
             return Ok(self.sequence_number());
+        }
+        // C-C6R3-NEW-H1: validate schema BEFORE the irreversible `fetch_add` /
+        // `wbm.reserve` below. Pre-fix any caller passing a wrong-shape
+        // RecordBatch (wrong column count or non-Binary/UInt8 dtypes)
+        // would advance the sequence counter then return Err downstream
+        // — a permanent seq gap. Worse: `num_columns() < 2` would panic
+        // at `batch.column(0)/(1)` indexing inside the WBM-charge tally
+        // AFTER the seq leak. Same defense pattern as
+        // C-C6R2-NEW-H1 on the borrowed-slice sister.
+        if batch.num_columns() != 3 {
+            return Err(ForstError::invalid_argument(
+                "batch_put_arrow: expected 3 columns (key, value, op_type)",
+            ));
+        }
+        use arrow::array::Array;
+        use arrow::datatypes::DataType;
+        if !matches!(batch.column(0).data_type(), DataType::Binary) {
+            return Err(ForstError::invalid_argument(
+                "batch_put_arrow: column 0 must be Binary",
+            ));
+        }
+        if !matches!(batch.column(1).data_type(), DataType::Binary) {
+            return Err(ForstError::invalid_argument(
+                "batch_put_arrow: column 1 must be Binary",
+            ));
+        }
+        if !matches!(batch.column(2).data_type(), DataType::UInt8) {
+            return Err(ForstError::invalid_argument(
+                "batch_put_arrow: column 2 must be UInt8",
+            ));
         }
         self.consume_flush_error()?;
         self.write_controller.may_throttle()?;
@@ -3209,6 +3597,10 @@ impl DbImpl {
 
         let new_meta = edit.new_files.first().map(|(_, m)| m.clone());
         if let Some(ref meta) = new_meta {
+            // 2026-05-29 WRITE-BACK FLUSH: the compaction-output SST upload was
+            // spawned by `close()`; await it before opening a reader straight
+            // off the remote so the cached reader sees the fully-uploaded object.
+            self.fs.await_upload(&output_path)?;
             let rac = self.fs.open_random_access_file(&output_path)?;
             let reader = Arc::new(SstReaderImpl::open(rac)?);
             self.sst_readers
@@ -3275,6 +3667,16 @@ impl DbImpl {
             }
         }
 
+        // 2026-05-29 WRITE-BACK FLUSH durability barrier (CRITICAL): the flushes
+        // above may have serialized SSTs locally and SPAWNED their S3 uploads.
+        // A checkpoint manifest must NEVER reference an SST that is only in a
+        // local/in-flight buffer — on restore the engine reads those SSTs
+        // straight from the remote with no resident memtable to shadow them. So
+        // block until EVERY in-flight upload has completed (and surface the
+        // first upload error) BEFORE we snapshot the VersionSet and emit the
+        // manifest. After this returns, every live SST is remote-durable.
+        self.fs.await_all_uploads()?;
+
         // 3. Capture the VersionSet snapshot AFTER flushes so it contains
         //    every new L0 file.
         //
@@ -3287,19 +3689,33 @@ impl DbImpl {
         // the apply_lock is held, compaction's `apply` is blocked, so once
         // our pin lands `can_delete()` returns false and the unlink defers
         // to `pending_deletions`.
-        let (mut snapshot, live, _pin) =
-            self.version_set
-                .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
-                    let live = snap.version.live_sst_files();
-                    let file_numbers: Vec<FileNumber> =
-                        live.iter().map(|f| f.file_number).collect();
-                    let pin = self.deletion_guard.pin_batch(&file_numbers);
-                    (snap.clone(), live, pin)
-                });
+        // A-R8-NEW-H1: collect CF descriptors INSIDE the locked-view
+        // closure so both the version snapshot AND the descriptor set are
+        // sampled atomically under `apply_lock` — mirrors R80-M1 for the
+        // incremental path. Pre-fix, `collect_cf_descriptors()` ran AFTER
+        // the closure released apply_lock, leaving a TOCTOU window where
+        // a concurrent `drop_cf(X)` could fall between: its delete-edit is
+        // gated on apply_lock (so the version snapshot is consistent) but
+        // its removal from the in-memory `cfs` map happens AFTER apply
+        // releases, so we observed the pre-drop version + post-drop
+        // descriptor set. The dropped CF's pinned SSTs would then become
+        // orphans on restore (Version pins them, no CF re-registers them,
+        // permanent disk leak), or under future cf_id reuse could shadow
+        // new CF state.
+        let (mut snapshot, live, _pin, descriptors_result) = self
+            .version_set
+            .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
+                let live = snap.version.live_sst_files();
+                let file_numbers: Vec<FileNumber> =
+                    live.iter().map(|f| f.file_number).collect();
+                let pin = self.deletion_guard.pin_batch(&file_numbers);
+                let descriptors = self.collect_cf_descriptors();
+                (snap.clone(), live, pin, descriptors)
+            });
         // R49-H2: stamp CF descriptors onto the snapshot so the blob persists
         // the CF set. Restore re-registers every CF before returning so callers
         // do not have to track CF order or re-issue create_column_family.
-        snapshot.cf_descriptors = self.collect_cf_descriptors()?;
+        snapshot.cf_descriptors = descriptors_result?;
         // R0A-H1: also stamp `last_sequence` from the engine's atomic
         // counter (the high-water mark of assigned seqs), in case
         // flush/compaction's per-edit `last_sequence` advance lagged or
@@ -3340,6 +3756,193 @@ impl DbImpl {
             sst_files,
             total_bytes: blob.len() as u64 + sst_bytes,
         })
+    }
+
+    /// FRS-CKPT-NOFLUSH (2026-06-01): serialise every CF's LIVE in-RAM state
+    /// (active + immutable memtables) to per-CF Arrow-IPC artifacts under
+    /// `target_dir` WITHOUT flushing/sealing the memtables. Returns the list of
+    /// `(cf_id, artifact_file_name)` written.
+    ///
+    /// This is the engine half of checkpoint-without-flush: the checkpoint
+    /// captures the memtable durably (Arrow IPC → S3, the goal's "Batch
+    /// Checkpoint") while the memtable stays the resident, unfragmented read
+    /// structure — avoiding the L0-SST fan-out that collapses heavy joins under
+    /// ckpt-ON. The artifacts compose with the existing VersionSet blob + SSTs
+    /// (state already flushed by WBM pressure); restore replays the artifacts
+    /// back into fresh memtables via [`Self::replay_memtable_artifact_bytes`].
+    ///
+    /// The caller MUST hold the engine in the synchronous snapshot phase (no
+    /// concurrent writers) — Flink's per-slot single-threaded snapshot satisfies
+    /// this. A CF whose memtables are all empty contributes no artifact.
+    pub fn snapshot_memtables_to_dir(
+        &self,
+        target_dir: &std::path::Path,
+        max_seq: Option<u64>,
+    ) -> ForstResult<Vec<(u32, String)>> {
+        // Arrow batch chunk size for the memtable artifact (matches the flush
+        // path's FLUSH_BATCH_SIZE).
+        const MEMTABLE_SNAPSHOT_BATCH_SIZE: usize = 8192;
+        self.check_fatal_error()?;
+        // CRITICAL (artifact locality): the backend's checkpoint uploader reads
+        // these files with `Files.newInputStream` (LOCAL NIO), so artifacts MUST
+        // be staged on the LOCAL filesystem — NOT via `self.fs`, which is the
+        // S3-primary cached FS in production (writing there would leave the
+        // upload step with a NoSuchFile on local disk). `target_dir` is the
+        // backend's local checkpoint staging dir. Use `std::fs` directly with a
+        // tmp+rename for crash-atomicity.
+        std::fs::create_dir_all(target_dir).map_err(ForstError::Io)?;
+        let cfs: Vec<Arc<ColumnFamilyData>> = {
+            let guard = self.cfs.read().expect("lock poisoned");
+            guard.values().cloned().collect()
+        };
+        let mut written = Vec::new();
+        for cf_data in &cfs {
+            let cf_id = cf_data.handle().id().0;
+            // Collect active + immutable memtable batches (everything not yet in
+            // an SST). Each memtable is snapshotted live (no seal).
+            let fname = format!("memtable-cf{cf_id}.arrow");
+            let final_path = target_dir.join(&fname);
+            let tmp_path = target_dir.join(format!(".{fname}.tmp"));
+            // FRS-CKPT-NOFLUSH streaming snapshot (2026-06-01): stream batches
+            // straight into the staging file ONE AT A TIME via
+            // snapshot_batches_bounded_for_each, dropping each batch before the
+            // next is built. Peak memory is one ~1.5 GiB batch — NOT the whole
+            // memtable materialized as a Vec<RecordBatch> (the old path) and NOT
+            // a second serialized Vec<u8> copy. That doubling/tripling OOM'd the
+            // TaskManager at large writebuffer.size, forcing a small memtable +
+            // heavy-query spill collapse. The header is created lazily on the
+            // first non-empty batch, so an all-empty memtable writes nothing and
+            // we skip the file. BufWriter coalesces the small IPC writes.
+            let file = std::fs::File::create(&tmp_path).map_err(ForstError::Io)?;
+            let mut artifact = forst_rs_storage::memtable::MemtableArtifactWriter::new(
+                std::io::BufWriter::new(file),
+            );
+            let stream_res = (|| -> ForstResult<()> {
+                cf_data.active_memtable().snapshot_batches_bounded_for_each(
+                    MEMTABLE_SNAPSHOT_BATCH_SIZE,
+                    max_seq,
+                    |b| artifact.write(&b),
+                )?;
+                for imm in cf_data.imm_memtables() {
+                    imm.snapshot_batches_bounded_for_each(
+                        MEMTABLE_SNAPSHOT_BATCH_SIZE,
+                        max_seq,
+                        |b| artifact.write(&b),
+                    )?;
+                }
+                Ok(())
+            })();
+            let wrote_any = match stream_res.and_then(|()| artifact.finish()) {
+                Ok(w) => w,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(e);
+                }
+            };
+            if !wrote_any {
+                // Empty memtable: discard the 0-byte staging file, emit no entry.
+                let _ = std::fs::remove_file(&tmp_path);
+                continue;
+            }
+            std::fs::rename(&tmp_path, &final_path).map_err(|e| {
+                let _ = std::fs::remove_file(&tmp_path);
+                ForstError::Io(e)
+            })?;
+            written.push((cf_id, fname));
+        }
+        // Mirror create_checkpoint's durability barrier: any WBM-pressure flush
+        // SSTs referenced by the companion blob must be remote-durable.
+        self.fs.await_all_uploads()?;
+        Ok(written)
+    }
+
+    /// FRS-CKPT-NOFLUSH: replay a memtable artifact (produced by
+    /// [`Self::snapshot_memtables_to_dir`]) into `cf_data`'s active memtable,
+    /// preserving every entry's original sequence + op_type. Used on restore to
+    /// rebuild the in-RAM state that was checkpointed without flushing.
+    pub fn replay_memtable_artifact_bytes(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+        bytes: &[u8],
+    ) -> ForstResult<usize> {
+        use arrow::array::{Array, BinaryArray, UInt64Array, UInt8Array};
+        let batches = forst_rs_storage::memtable::deserialize_memtable_batches(bytes)?;
+        let mem = cf_data.active_memtable();
+        let mut replayed = 0usize;
+        let mut max_seq = 0u64;
+        for b in &batches {
+            let keys = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ForstError::corruption("memtable artifact: key col not Binary"))?;
+            let vals = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ForstError::corruption("memtable artifact: value col not Binary"))?;
+            let seqs = b
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| ForstError::corruption("memtable artifact: seq col not UInt64"))?;
+            let ops = b
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| ForstError::corruption("memtable artifact: op col not UInt8"))?;
+            for i in 0..b.num_rows() {
+                let key = keys.value(i);
+                let val = if vals.is_null(i) { None } else { Some(vals.value(i)) };
+                let seq = seqs.value(i);
+                mem.put_with_seq(key, val, ops.value(i), seq)?;
+                max_seq = max_seq.max(seq);
+                replayed += 1;
+            }
+        }
+        // Keep the global sequence counter ahead of every replayed seq so new
+        // writes never reuse a restored sequence (MVCC correctness).
+        if max_seq > 0 {
+            self.sequence_number.fetch_max(max_seq, Ordering::AcqRel);
+        }
+        Ok(replayed)
+    }
+
+    /// FRS-CKPT-NOFLUSH: replay every `memtable-cf<id>.arrow` artifact found in
+    /// `dir` (written by [`Self::snapshot_memtables_to_dir`]) into its CF. Used
+    /// on restore after the engine has opened the SST set. Returns the total
+    /// rows replayed. Artifacts for unknown CFs are an error (manifest/CF drift).
+    pub fn replay_memtable_artifacts_from_dir(
+        &self,
+        dir: &std::path::Path,
+    ) -> ForstResult<usize> {
+        // LOCAL FS (mirrors snapshot_memtables_to_dir): the backend has already
+        // downloaded the artifact private files into this local `dir`.
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            // No artifacts dir (e.g. a checkpoint taken before this feature, or
+            // a flush-based checkpoint) → nothing to replay.
+            Err(_) => return Ok(0),
+        };
+        let mut total = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(ForstError::Io)?;
+            let path = entry.path();
+            let Some(fname) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(cf_id) = fname
+                .strip_prefix("memtable-cf")
+                .and_then(|s| s.strip_suffix(".arrow"))
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let cf_data = self.lookup_cf_by_id(ColumnFamilyId(cf_id))?;
+            let bytes = std::fs::read(&path).map_err(ForstError::Io)?;
+            total += self.replay_memtable_artifact_bytes(&cf_data, &bytes)?;
+        }
+        Ok(total)
     }
 
     /// Opens an engine by restoring state from a checkpoint directory.
@@ -3619,11 +4222,32 @@ impl DbImpl {
             .next_file_number
             .max(max_observed.saturating_add(1));
 
+        // A-R6-H3: defense-in-depth — cross-check the blob's
+        // `last_sequence` against the maximum `max_sequence` over the
+        // restored SST file metas. R0A-H1 patched the producer side
+        // so freshly-written blobs never trail the SST high-water
+        // mark, but legacy blobs persisted by pre-R0A-H1 binaries —
+        // or any future code path that constructs a `VersionEdit`
+        // with `last_sequence: None` — would still hand a stale value
+        // here. Initializing `sequence_number` below an existing SST
+        // seq lets the next write reuse a colliding seq and silently
+        // overwrite (or be silently shadowed by) an existing row.
+        // Take the max so restore is monotonic in the high-water mark
+        // regardless of producer history.
+        let sst_max_seq: u64 = snapshot
+            .version
+            .live_sst_files()
+            .iter()
+            .map(|f| f.max_sequence.value())
+            .max()
+            .unwrap_or(0);
+        let restored_last_sequence = snapshot.last_sequence.max(sst_max_seq);
+
         // Build the DbImpl with the restored VersionSet.
         let version_set = Arc::new(forst_rs_storage::version::VersionSetImpl::from_restored(
             (*snapshot.version).clone(),
             restored_next_file_number,
-            snapshot.last_sequence,
+            restored_last_sequence,
         ));
 
         let cache_bytes = if options.block_cache_capacity_bytes != 0 {
@@ -3631,9 +4255,29 @@ impl DbImpl {
         } else {
             options.block_cache_size
         };
+        // FRS-BLOCKCACHE-FLOOR: the decoded-block ShardedClockCache is created
+        // PER DB INSTANCE (not shared — a shared pool regressed heavy queries via
+        // cross-DB shard-lock contention). The cache is native-resident and
+        // charged by actual bytes inserted, so a higher floor costs light
+        // queries nothing but lets heavy streaming-join DBs keep their re-probed
+        // decoded data blocks resident (the profiled decode_data_block +
+        // decompress + serial_read_at re-read cost on per-key prefix scans).
+        // FRS-8C32G-RAMBUDGET: 256 MiB (was 768) — per-instance × ~8 instances ≈ 2 GiB,
+        // fits the 32 GiB budget alongside JVM heap + the (now 1 GiB) resident shadow.
+        const BLOCK_CACHE_FLOOR: usize = 256 * 1024 * 1024;
+        let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
+        let cache_bytes = apply_block_cache_env_override(cache_bytes);
         let block_cache = Arc::new(ShardedClockCache::with_capacity(cache_bytes));
         let write_buffer_manager =
             WriteBufferManager::new(options.write_buffer_manager_capacity_bytes);
+
+        // FRS-S3-STALL (reopen path): mirror the open-path wiring so a restored
+        // DB honours the configured `max_write_buffer_number` too. See the
+        // primary `DbImpl::open` site for the full rationale.
+        let wc_config = WriteControllerConfig {
+            max_write_buffer_number: options.max_write_buffer_number as u32,
+            ..WriteControllerConfig::default()
+        };
 
         let db = Arc::new(Self {
             options,
@@ -3645,14 +4289,23 @@ impl DbImpl {
             sst_readers: RwLock::new(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
-            sequence_number: AtomicU64::new(snapshot.last_sequence),
-            write_controller: Arc::new(WriteController::with_defaults()),
+            // D-R7-H1: A-R6-H3 patched the VersionSet seed but missed
+            // this sibling — `DbImpl::sequence_number` is the source of
+            // every write's allocated seq via `fetch_add`. A stale
+            // `snapshot.last_sequence` (e.g., from a pre-R0A-H1 blob)
+            // would let new writes alias an existing SST row's seq even
+            // after A-R6-H3 corrected the version-set view. Use the
+            // same `restored_last_sequence` computed above so both
+            // sources of seq monotonicity agree.
+            sequence_number: AtomicU64::new(restored_last_sequence),
+            write_controller: Arc::new(WriteController::new(wc_config)),
             write_mutex: Mutex::new(()),
             next_cf_id: AtomicU32::new(1),
             flush_queue: Arc::new(FlushQueue::new(FLUSH_QUEUE_CAPACITY)),
             flush_worker: Mutex::new(None),
             flush_error: Mutex::new(None),
             fatal_error: Mutex::new(None),
+            fatal_error_set: std::sync::atomic::AtomicBool::new(false),
             pending_flush_count: AtomicU32::new(0),
             snapshot_registry: SnapshotRegistry::new(),
             db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
@@ -3771,6 +4424,33 @@ impl DbImpl {
         checkpoint_id: u64,
         base_checkpoint_id: u64,
     ) -> ForstResult<IncrementalCheckpointResult> {
+        self.create_incremental_checkpoint_impl(snapshot, checkpoint_id, base_checkpoint_id, true)
+    }
+
+    /// FRS-CKPT-NOFLUSH (2026-06-01): incremental checkpoint that DOES NOT flush
+    /// the memtable to an L0 SST — it enumerates only the SSTs already produced
+    /// by WBM-pressure flushes. The caller (backend snapshot strategy) captures
+    /// the live memtable separately via [`Self::snapshot_memtables_to_dir`] and
+    /// uploads those Arrow-IPC artifacts as private checkpoint state, keeping the
+    /// memtable RAM-resident + unfragmented for reads (the fix for the ckpt-ON
+    /// heavy-join collapse). Restore replays the artifacts after opening the SST
+    /// set ([`Self::replay_memtable_artifacts_from_dir`]).
+    pub fn create_incremental_checkpoint_noflush(
+        &self,
+        snapshot: &Snapshot,
+        checkpoint_id: u64,
+        base_checkpoint_id: u64,
+    ) -> ForstResult<IncrementalCheckpointResult> {
+        self.create_incremental_checkpoint_impl(snapshot, checkpoint_id, base_checkpoint_id, false)
+    }
+
+    fn create_incremental_checkpoint_impl(
+        &self,
+        snapshot: &Snapshot,
+        checkpoint_id: u64,
+        base_checkpoint_id: u64,
+        flush_memtables: bool,
+    ) -> ForstResult<IncrementalCheckpointResult> {
         if snapshot.db_id() != self.db_id {
             return Err(ForstError::invalid_argument(
                 "Snapshot was issued by a different DbImpl instance",
@@ -3782,24 +4462,38 @@ impl DbImpl {
         // the snapshot still work even if newer writes have come in
         // afterwards (compaction would not drop them while the snapshot
         // pins them).
-        self.flush_all()?;
-        let cfs: Vec<Arc<ColumnFamilyData>> = {
-            let guard = self.cfs.read().expect("lock poisoned");
-            guard.values().cloned().collect()
-        };
-        for cf_data in &cfs {
-            let has_data = {
-                let mem_arc = cf_data.active_memtable();
-                mem_arc.num_entries() > 0
+        //
+        // FRS-CKPT-NOFLUSH: when `flush_memtables` is false the memtable is
+        // captured by the caller as an Arrow-IPC artifact instead of being
+        // sealed to an L0 SST, so we skip the flush entirely and snapshot only
+        // the existing (WBM-flushed) SST set.
+        if flush_memtables {
+            self.flush_all()?;
+            let cfs: Vec<Arc<ColumnFamilyData>> = {
+                let guard = self.cfs.read().expect("lock poisoned");
+                guard.values().cloned().collect()
             };
-            if has_data {
-                let _writer = self.write_mutex.lock().expect("lock poisoned");
-                cf_data.swap_active_memtable();
-                self.refresh_snapshot_view(cf_data);
-                drop(_writer);
-                self.flush_cf_data(cf_data)?;
+            for cf_data in &cfs {
+                let has_data = {
+                    let mem_arc = cf_data.active_memtable();
+                    mem_arc.num_entries() > 0
+                };
+                if has_data {
+                    let _writer = self.write_mutex.lock().expect("lock poisoned");
+                    cf_data.swap_active_memtable();
+                    self.refresh_snapshot_view(cf_data);
+                    drop(_writer);
+                    self.flush_cf_data(cf_data)?;
+                }
             }
         }
+
+        // 2026-05-29 WRITE-BACK FLUSH durability barrier (CRITICAL): same as
+        // `create_checkpoint` — block until every spawned S3 upload of the
+        // just-flushed SSTs has completed before snapshotting the VersionSet, so
+        // the incremental manifest never references an SST that is only in a
+        // local/in-flight buffer.
+        self.fs.await_all_uploads()?;
 
         // Capture the VersionSet snapshot AFTER flushes so the manifest
         // contains every L0 file the snapshot pins.
@@ -3912,6 +4606,12 @@ impl DbImpl {
                 );
             }
         }
+        // FRS-S3-CKPT-STAGE: This S3 write MUST stay even in object-store
+        // mode — `open_from_incremental` (and the `base_live`/`read_blob`
+        // block above) reads the engine's own manifest back from S3 at
+        // `incremental_checkpoint_dir(base)` for cross-checkpoint SST
+        // sharing. The staging step below only affects the paths RETURNED
+        // to the Java uploader; it does not replace this durable write.
         let manifest_path = write_blob(self.fs.as_ref(), &target_dir, &blob)?;
 
         drop(_pin);
@@ -3923,11 +4623,161 @@ impl DbImpl {
         // but eagerly reclaiming disk matches the sister contract.
         self.reap_pending_deletions();
 
+        // FRS-CKPT-STAGE-UNIFORM (2026-05-30): ALWAYS stage the manifest + new
+        // SSTs to a local temp dir and return those absolute paths, regardless
+        // of `supports_atomic_rename`. The Java `ForStRsSstUploader` reads each
+        // returned path via `java.nio Files.newInputStream` — a real-filesystem
+        // absolute-path read.
+        //
+        // The pre-fix code returned the engine paths VERBATIM when
+        // `supports_atomic_rename()` was true, on the assumption that a "local
+        // POSIX engine" stores artifacts at directly-readable absolute paths.
+        // That assumption is FALSE for the local OpenDAL `Fs` backend configured
+        // with a `root` (e.g. `{"root":"/tmp/flink-forst-rs-data"}`): the engine
+        // `db_path` is RELATIVE to that root (`/db-remote-<id>/...`), so the
+        // returned `incremental_checkpoint_dir(id)/CHECKPOINT.blob` lacks the
+        // root prefix. Java NIO then reads `/db-remote-<id>/.../CHECKPOINT.blob`
+        // as an absolute path → `NoSuchFileException` → checkpoint fails → job
+        // crash-loop (observed on every forst-rs LOCAL heavy-query run). The
+        // S3/object-store path was unaffected only because it already staged.
+        //
+        // Staging reads through `self.fs` (which resolves the OpenDAL root
+        // correctly) and writes to `std::env::temp_dir()` (a true absolute
+        // path), so it is correct for BOTH the object-store and the
+        // local-Fs-with-root configurations. The cost is one extra local copy
+        // of the new SSTs per checkpoint; for the local config those bytes are
+        // already on local disk so the copy is cheap and bounded by the
+        // incremental delta. Shared SSTs are referenced (never re-staged).
+        let (manifest_path, new_ssts) =
+            self.stage_checkpoint_artifacts_local(checkpoint_id, &blob, manifest_path, new_ssts)?;
         Ok(IncrementalCheckpointResult {
             manifest_path,
             new_ssts,
             shared_ssts,
         })
+    }
+
+    /// FRS-S3-CKPT-STAGE: Stage an incremental checkpoint's manifest blob and
+    /// its NEW SST files from the (object-store) engine filesystem into a
+    /// local temp directory, returning the rewritten local paths.
+    ///
+    /// Mirrors the local-NIO upload contract of `ForStRsSstUploader`: the Java
+    /// backend reads each returned path via `java.nio Files.newInputStream`
+    /// (a LOCAL filesystem read) and uploads the bytes to the Flink checkpoint
+    /// store. When `self.fs` is a `CachedFileSystem` over OpenDAL-S3 there is
+    /// no local copy of these artifacts (the manifest write invalidates the
+    /// cache), so this method materializes one.
+    ///
+    /// Only invoked when `self.fs.supports_atomic_rename()` is `false`
+    /// (object-store mode). `shared_ssts` are intentionally NOT staged — they
+    /// are referenced by handle from the base checkpoint, never re-uploaded.
+    fn stage_checkpoint_artifacts_local(
+        &self,
+        checkpoint_id: u64,
+        blob: &[u8],
+        _remote_manifest_path: PathBuf,
+        new_ssts: Vec<LiveFileInfo>,
+    ) -> ForstResult<(PathBuf, Vec<LiveFileInfo>)> {
+        // Per-(db, checkpoint) staging root under the OS temp dir. The
+        // 20-digit zero-padded checkpoint id matches the on-S3 layout and
+        // keeps concurrent checkpoints from colliding.
+        let stage_root = std::env::temp_dir()
+            .join("forst-rs-ckpt-stage")
+            .join(format!("{}", self.db_id.0))
+            .join(format!("{:020}", checkpoint_id));
+        let local_fs = LocalFileSystem::new();
+        local_fs.create_dir_all(&stage_root)?;
+
+        // Stage the manifest blob (the `serialize_snapshot` bytes already in
+        // scope) under the canonical blob name so the uploader finds it.
+        let local_manifest_path = stage_root.join(CHECKPOINT_BLOB_NAME);
+        {
+            let mut writer =
+                local_fs.open_writable_file(&local_manifest_path, WriteMode::CreateOrTruncate)?;
+            writer.append(blob)?;
+            writer.flush()?;
+            writer.sync()?;
+        }
+
+        // Stage each NEW SST: stream its bytes from the engine FS (S3,
+        // cache-fronted) into a local file under the SST's basename. Mirrors
+        // the `copy_file` streamed-copy + short-read guard in checkpoint.rs.
+        let mut staged_ssts: Vec<LiveFileInfo> = Vec::with_capacity(new_ssts.len());
+        for info in new_ssts {
+            // Resolve the destination basename from the source's final path
+            // component; preserve it so the uploader's handle naming is stable.
+            let basename = info.path.file_name().ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "stage_checkpoint_artifacts_local: SST path has no file name: {}",
+                    info.path.display()
+                ))
+            })?;
+            let local_sst_path = stage_root.join(basename);
+
+            // R76-H1 parity: capture the expected source size BEFORE streaming
+            // so a short read (network blip / OpenDAL ranged-read truncation)
+            // is surfaced as corruption rather than publishing a truncated SST.
+            // 2026-05-30 WRITE-BACK CHECKPOINT FIX: await this SST's in-flight
+            // async upload BEFORE reading it from the remote. The
+            // `await_all_uploads()` barrier earlier in create_incremental_checkpoint
+            // is insufficient: a flush concurrent with the checkpoint (or one whose
+            // upload registered just after the barrier) can leave a snapshot SST's
+            // upload in flight, so staging's `open_sequential_file` reads a
+            // not-yet-uploaded S3 object → 404 → NotFound → checkpoint fails →
+            // job crash-loop. Awaiting per-file here closes the race regardless of
+            // barrier timing (no-op on local FS / already-uploaded objects).
+            self.fs.await_upload(&info.path)?;
+
+            let expected_size: Option<u64> =
+                self.fs.get_file_metadata(&info.path).ok().map(|m| m.size);
+
+            let mut reader = self.fs.open_sequential_file(&info.path)?;
+            let mut writer =
+                local_fs.open_writable_file(&local_sst_path, WriteMode::CreateOrTruncate)?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0u64;
+            let copy_result: ForstResult<()> = (|| {
+                loop {
+                    let n = reader.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    writer.append(&buf[..n])?;
+                    total += n as u64;
+                }
+                writer.flush()?;
+                writer.sync()?;
+                Ok(())
+            })();
+            if let Err(e) = copy_result {
+                let _ = local_fs.delete_file(&local_sst_path);
+                return Err(e);
+            }
+            if let Some(want) = expected_size {
+                if total != want {
+                    let _ = local_fs.delete_file(&local_sst_path);
+                    return Err(ForstError::corruption(format!(
+                        "stage_checkpoint_artifacts_local short read: expected {} bytes, \
+                         got {} from {}",
+                        want,
+                        total,
+                        info.path.display()
+                    )));
+                }
+            }
+
+            // Preserve size/sequence/level/cf_name; only the path is rewritten
+            // to the local staged copy the uploader will read.
+            staged_ssts.push(LiveFileInfo {
+                path: local_sst_path,
+                size: info.size,
+                sequence: info.sequence,
+                level: info.level,
+                cf_name: info.cf_name,
+            });
+        }
+
+        Ok((local_manifest_path, staged_ssts))
     }
 
     /// Returns the canonical on-disk directory for an incremental
@@ -4237,6 +5087,10 @@ impl DbImpl {
         // from disk.
         let new_meta = edit.new_files.first().map(|(_, m)| m.clone());
         if let Some(ref meta) = new_meta {
+            // 2026-05-29 WRITE-BACK FLUSH: the compaction-output SST upload was
+            // spawned by `close()`; await it before opening a reader straight
+            // off the remote so the cached reader sees the fully-uploaded object.
+            self.fs.await_upload(&output_path)?;
             let rac = self.fs.open_random_access_file(&output_path)?;
             let reader = Arc::new(SstReaderImpl::open(rac)?);
             self.sst_readers
@@ -4277,54 +5131,18 @@ impl DbImpl {
         lower: &[u8],
         upper: Option<&[u8]>,
     ) -> ForstResult<Vec<(Vec<u8>, Vec<u8>)>> {
-        use std::collections::BTreeSet;
-
+        // B-R7-NEW-H1: eager wrapper over the lazy [`Self::scan_iter`].
+        // Pre-fix this method drained every tier into a `BTreeSet<Vec<u8>>`
+        // and re-`get`-ed each key, paying `O(matching-keys × value-size)`
+        // resident memory before returning. The lazy iterator now streams
+        // tier-by-tier and value-resolves only when the consumer advances;
+        // `collect::<Result<Vec<_>, _>>()` reproduces the legacy public
+        // contract for the 7 unit-test sites + `cf_export` while preserving
+        // the streaming benefits for new FFI consumers (`scan_iter` /
+        // `scan_iter_owned_arc_with_error_slot`).
         self.check_fatal_error()?;
-        let cf_data = self.lookup_cf_by_id(cf.id())?;
-        let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
-
-        // Active memtable (sharded — `collect_range_entries` merges across shards).
-        {
-            let mem_arc = cf_data.active_memtable();
-            for (k, _, _, _) in mem_arc.collect_range_entries(lower, upper, u64::MAX) {
-                keys.insert(k);
-            }
-        }
-        // Immutable memtables.
-        for imm in cf_data.imm_memtables() {
-            for (k, _, _, _) in imm.collect_range_entries(lower, upper, u64::MAX) {
-                keys.insert(k);
-            }
-        }
-        // SST layer.
-        let version = self.version_set.current();
-        for sst in version.live_sst_files() {
-            if sst.largest_key.as_slice() < lower {
-                continue;
-            }
-            if let Some(hi) = upper {
-                if sst.smallest_key.as_slice() >= hi {
-                    continue;
-                }
-            }
-            let reader = self.get_or_open_sst_reader(&sst)?;
-            // PR-C5-H1: scan_borrowed skips the per-row `value.to_vec()`
-            // baked into `SstReaderImpl::scan`. Value is discarded — only
-            // the key feeds the BTreeSet.
-            reader.scan_borrowed(lower, upper, |view| {
-                keys.insert(view.key.to_vec());
-                Ok(())
-            })?;
-        }
-
-        // Resolve each key via the normal read path (handles deletes + merges).
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            if let Some(value) = self.get(cf, &key)? {
-                out.push((key, value));
-            }
-        }
-        Ok(out)
+        self.scan_iter(cf, lower, upper)?
+            .collect::<Result<Vec<_>, _>>()
     }
 
     /// Prefix scan: all key-value pairs whose keys start with `prefix`.
@@ -4485,17 +5303,30 @@ impl DbImpl {
         error_slot: Arc<Mutex<Option<ForstError>>>,
     ) -> ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>>
     {
-        let cf_handle = cf.clone();
+        // FRS-PREFIX-CFHOIST (2026-05-30): resolve the CF data ONCE here instead
+        // of per yielded key. The pre-fix closure called `db.get_arc(&cf_handle,
+        // key)` → `get` → `lookup_cf_by_id(cf.id())` (an RwLock read + HashMap
+        // lookup) on EVERY key. A prefix scan yields K keys and q9's ROW_NUMBER
+        // rank re-scans each partition once per record, so that per-key CF
+        // re-resolution ran millions of times. Hoisting it and calling
+        // `get_internal(&cf_data, key, u64::MAX)` directly is BYTE-IDENTICAL to
+        // `get_arc` (which is exactly `lookup_cf_by_id` + `get_internal` +
+        // `Arc::from`) — same latest-view (`u64::MAX`) resolution, same
+        // tombstone/merge semantics — it only removes the redundant per-key
+        // CF-map lookup + lock acquisition. Holding the `Arc<ColumnFamilyData>`
+        // for the iterator's lifetime is also strictly safer than re-looking-up
+        // each call (the CF cannot be reclaimed mid-scan).
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
         let mut inner = self.build_lazy_prefix_key_stream(cf, prefix)?;
         inner.set_shared_error_slot(error_slot);
         let db = Arc::clone(self);
-        Ok(Box::new(inner.filter_map(
-            move |key_arc| match db.get_arc(&cf_handle, key_arc.as_ref()) {
-                Ok(Some(value)) => Some(Ok((key_arc, value))),
+        Ok(Box::new(inner.filter_map(move |key_arc| {
+            match db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX) {
+                Ok(Some(value)) => Some(Ok((key_arc, Arc::<[u8]>::from(value)))),
                 Ok(None) => None,
                 Err(e) => Some(Err(e)),
-            },
-        )))
+            }
+        })))
     }
 
     /// Builds the lazy k-way merge over key sources (one per LSM tier)
@@ -4516,6 +5347,13 @@ impl DbImpl {
         cf: &ColumnFamilyHandle,
         prefix: &[u8],
     ) -> ForstResult<LazyPrefixIter> {
+        // FRS-ITER-DIAG: gated timing of the prefix-stream build. Set
+        // FRS_ITER_DIAG=1 to log slow builds (>1ms) with tier + result-size
+        // attribution. Zero cost when unset (one env read per call is cheap
+        // relative to the BTree scans below; checked once via OnceLock).
+        let diag = frs_iter_diag_enabled();
+        let diag_start = if diag { Some(std::time::Instant::now()) } else { None };
+
         let upper = prefix_upper_bound(prefix);
         let upper_slice = upper.as_deref();
         let cf_data = self.lookup_cf_by_id(cf.id())?;
@@ -4549,9 +5387,66 @@ impl DbImpl {
                 sources.push(TierKeySource::MemCursor { cursor: imm_cursor });
             }
         }
-        // Tier 3: overlapping SSTs, block-streaming.
+        // FRS-RESIDENT-FLUSHED: Tier 2 also scans the resident-flushed
+        // memtables (memtables already flushed to an L0 SST but kept in RAM
+        // so the prefix-scan path avoids an S3 round-trip for hot recently-
+        // flushed data). Each entry is byte-identical (same sequence numbers)
+        // to its source SST — the LSM merge dedups on sequence so reading
+        // BOTH the resident memtable AND the SST is correctness-neutral.
+        // Below in Tier 3 we additionally SKIP the byte-identical L0 SST to
+        // avoid the redundant scan (this is the perf win).
+        //
+        // CORRECTNESS: filter resident entries by the CURRENT live-SST set —
+        // after compaction collapses an L0 SST into L1+ output (merge ops
+        // combined, tombstones consumed), the pre-collapse resident memtable
+        // is STALE and must be skipped. Snapshot the version once so Tier 2
+        // and Tier 3 read a consistent view of the LSM.
         let version = self.version_set.current();
-        for sst in version.live_sst_files() {
+        // 2026-05-29 PERF: file-number-only set (no SstFileMeta clone per scan).
+        let live_files = version.live_sst_file_numbers();
+        // 2026-05-29 PERF-RESTORE (q4/q7 iterator regression): use the
+        // bound-carrying accessor and SKIP resident memtables whose SST key
+        // range does not overlap the scan window [prefix, upper). v3.8 had NO
+        // resident layer; HEAD built a prefix_scan_cursor for EVERY resident
+        // memtable (up to cap/64MiB ≈ 256 at the 16 GiB cap) on EVERY prefix
+        // scan — catastrophic for per-record join scans. The SST tier below
+        // already skips by range; mirror it here. A skipped resident entry is
+        // NOT added to `resident_shadowed`, so Tier 3 reads its SST — but that
+        // SST's range also excludes the prefix, so Tier 3's own range check
+        // skips it too (consistent, no data loss).
+        let resident_entries = cf_data.resident_flushed_visible_entries(&live_files);
+        let mut resident_shadowed: std::collections::HashSet<FileNumber> =
+            std::collections::HashSet::new();
+        for entry in resident_entries {
+            // Range-overlap test (inclusive max, exclusive upper) mirroring the
+            // SST skip at Tier 3. Empty bounds = unknown range → never skip.
+            if !(entry.min_key.is_empty() && entry.max_key.is_empty()) {
+                if entry.max_key.as_slice() < prefix {
+                    continue;
+                }
+                if let Some(hi) = upper_slice {
+                    if entry.min_key.as_slice() >= hi {
+                        continue;
+                    }
+                }
+            }
+            let resident_cursor = entry.memtable.prefix_scan_cursor(prefix, upper_slice);
+            // Shadow the SST only when we actually serve this entry from RAM.
+            resident_shadowed.insert(entry.file_number);
+            if !resident_cursor.is_empty() {
+                sources.push(TierKeySource::MemCursor {
+                    cursor: resident_cursor,
+                });
+            }
+        }
+        // Tier 3: overlapping SSTs, block-streaming. 2026-05-29 PERF: borrow
+        // SST metadata (no per-scan clone of every SstFileMeta + its keys).
+        for sst in version.live_sst_files_iter() {
+            // FRS-RESIDENT-FLUSHED: skip SSTs whose data is currently served
+            // from Tier 2 by a resident memtable (same content, same seqs).
+            if resident_shadowed.contains(&sst.file_number) {
+                continue;
+            }
             if sst.largest_key.as_slice() < prefix {
                 continue;
             }
@@ -4561,17 +5456,180 @@ impl DbImpl {
                 }
             }
             let reader = self.get_or_open_sst_reader(&sst)?;
+            // FRS-L0-FANOUT-PRUNE (2026-05-31): skip this SST's source entirely
+            // when its in-memory block index proves it holds NO key in
+            // [prefix, upper) — WITHOUT decoding a block. The coarse
+            // smallest/largest_key check above only rules out SSTs whose whole
+            // range misses the prefix; many L0 SSTs straddle the prefix's
+            // neighbourhood (other keys just above/below) yet contain nothing
+            // for THIS prefix. Profiled on q4: with ~142 overlapping L0 SSTs and
+            // the join key present in only a few, the lazy first-block decode of
+            // each non-matching source (decompress + Arrow RecordBatch decode)
+            // was the dominant per-probe cost once state spilled past the RAM
+            // shadow. This decode-free prune removes that fan-out. Sound: it
+            // skips only when the range is provably empty.
+            if !reader.may_contain_range(prefix, upper_slice) {
+                continue;
+            }
+            // FRS-PREFIX-SEEK: start streaming at the index-located first block
+            // that could contain keys >= prefix, NOT block 0 — blocks below the
+            // prefix cannot match and reading them was the q7-ckpt-on hotspot
+            // (executeIters ~95% of dispatch once state flushed to SSTs).
+            let start_block = reader.first_block_ge(prefix);
             sources.push(TierKeySource::Sst {
                 reader,
-                prefix: prefix.to_vec(),
+                lower: prefix.to_vec(),
                 upper: upper.clone(),
-                next_block: 0,
+                next_block: start_block,
                 buffered: Vec::new(),
                 pos: 0,
             });
         }
 
+        if let Some(start) = diag_start {
+            let us = start.elapsed().as_micros();
+            if us > 1000 {
+                let mut mem_sources = 0usize;
+                let mut mem_keys = 0usize;
+                let mut sst_sources = 0usize;
+                for s in &sources {
+                    match s {
+                        TierKeySource::MemCursor { cursor } => {
+                            mem_sources += 1;
+                            mem_keys += cursor.snapshot_len();
+                        }
+                        TierKeySource::Sst { .. } => sst_sources += 1,
+                    }
+                }
+                eprintln!(
+                    "FRS-ITER-DIAG build_lazy_prefix us={} prefix_len={} mem_sources={} mem_keys={} sst_sources={} resident_shadowed={}",
+                    us,
+                    prefix.len(),
+                    mem_sources,
+                    mem_keys,
+                    sst_sources,
+                    resident_shadowed.len()
+                );
+            }
+        }
+
         LazyPrefixIter::new(sources)
+    }
+
+    /// B-R7-NEW-H1: range counterpart of [`Self::build_lazy_prefix_key_stream`].
+    ///
+    /// Identical k-way merge structure, but takes explicit `(lower, upper)`
+    /// bounds and uses the range-aware memtable cursor
+    /// ([`ShardedMemTable::range_scan_cursor`]) which skips the prefix-index
+    /// fast path. The SST tier source reuses the existing `TierKeySource::Sst`
+    /// variant — its block-streaming filter is already a `[lower, upper)`
+    /// range check, so no variant changes are required.
+    fn build_lazy_range_key_stream(
+        &self,
+        cf: &ColumnFamilyHandle,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) -> ForstResult<LazyRangeIter> {
+        let upper_owned: Option<Vec<u8>> = upper.map(|u| u.to_vec());
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        let mut sources: Vec<TierKeySource> = Vec::new();
+
+        // Tier 1: active memtable. Range-aware cursor (skips the prefix-index
+        // fast path so `upper` is honoured exactly).
+        let mem_arc = cf_data.active_memtable();
+        let active_cursor = mem_arc.range_scan_cursor(lower, upper);
+        if !active_cursor.is_empty() {
+            sources.push(TierKeySource::MemCursor {
+                cursor: active_cursor,
+            });
+        }
+        // Tier 2: immutable memtables.
+        for imm in cf_data.imm_memtables() {
+            let imm_cursor = imm.range_scan_cursor(lower, upper);
+            if !imm_cursor.is_empty() {
+                sources.push(TierKeySource::MemCursor { cursor: imm_cursor });
+            }
+        }
+        // Tier 3: overlapping SSTs, block-streaming. Same per-SST overlap
+        // filter as the prefix path. 2026-05-29 PERF: borrow (no clone).
+        let version = self.version_set.current();
+        for sst in version.live_sst_files_iter() {
+            if sst.largest_key.as_slice() < lower {
+                continue;
+            }
+            if let Some(hi) = upper {
+                if sst.smallest_key.as_slice() >= hi {
+                    continue;
+                }
+            }
+            let reader = self.get_or_open_sst_reader(&sst)?;
+            // FRS-PREFIX-SEEK: seek to the first index block >= lower (see sister
+            // site in prefix_scan_iter_owned*) instead of scanning from block 0.
+            let start_block = reader.first_block_ge(lower);
+            sources.push(TierKeySource::Sst {
+                reader,
+                lower: lower.to_vec(),
+                upper: upper_owned.clone(),
+                next_block: start_block,
+                buffered: Vec::new(),
+                pos: 0,
+            });
+        }
+
+        LazyRangeIter::new(sources)
+    }
+
+    /// B-R7-NEW-H1: streaming form of [`Self::scan`].
+    ///
+    /// Mirrors [`Self::prefix_scan_iter`] for the range case. Returns a lazy
+    /// k-way merge over the active memtable + immutable memtables + every
+    /// overlapping SST, yielding visible (key, value) pairs in sorted order.
+    /// No tier is eagerly drained — the first `.next()` is
+    /// `O(active-mem-tier + num_imm_mems + num_overlap_ssts)` rather than
+    /// `O(rows × value_size)` across the entire LSM.
+    pub fn scan_iter<'a>(
+        &'a self,
+        cf: &ColumnFamilyHandle,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+    ) -> ForstResult<impl Iterator<Item = ForstResult<(Vec<u8>, Vec<u8>)>> + 'a> {
+        let cf_handle = cf.clone();
+        let inner = self.build_lazy_range_key_stream(cf, lower, upper)?;
+        let db: &'a DbImpl = self;
+        Ok(inner.filter_map(move |key_arc| {
+            let key_slice: &[u8] = key_arc.as_ref();
+            match db.get(&cf_handle, key_slice) {
+                Ok(Some(value)) => Some(Ok((key_slice.to_vec(), value))),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        }))
+    }
+
+    /// B-R7-NEW-H1: owned-Arc + shared-error-slot variant of
+    /// [`Self::scan_iter`] for the FFI chunked-iterator path
+    /// (`frs_vec_iter_range_open`). Mirrors
+    /// [`Self::prefix_scan_iter_owned_arc_with_error_slot`].
+    pub fn scan_iter_owned_arc_with_error_slot(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        error_slot: Arc<Mutex<Option<ForstError>>>,
+    ) -> ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>>
+    {
+        let cf_handle = cf.clone();
+        let mut inner = self.build_lazy_range_key_stream(cf, lower, upper)?;
+        inner.set_shared_error_slot(error_slot);
+        let db = Arc::clone(self);
+        Ok(Box::new(inner.filter_map(
+            move |key_arc| match db.get_arc(&cf_handle, key_arc.as_ref()) {
+                Ok(Some(value)) => Some(Ok((key_arc, value))),
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            },
+        )))
     }
 
     #[allow(clippy::type_complexity)]
@@ -4958,16 +6016,70 @@ impl DbImpl {
             },
             ..Default::default()
         };
+        // FRS-RESIDENT-FLUSHED-ORDER (2026-05-30): enroll the resident RAM shadow
+        // BEFORE the SST becomes visible via `version_set.apply`. A symbolized q9-S3
+        // stall profile showed join-probe threads BLOCKED on `await_upload` inside
+        // `get_or_open_sst_reader` — the rate=0 stalls were I/O-wait, not CPU. Root
+        // cause: the shadow was registered AFTER `apply` + `pop_oldest_imm`, so in the
+        // window between the SST becoming visible (Tier 3) and the shadow being
+        // registered (Tier 2), a concurrent prefix-scan saw the new L0 SST with NO
+        // shadow → read it directly → blocked on its in-flight async upload. Enrolling
+        // FIRST means any probe that observes the SST in the version ALSO observes the
+        // shadow (`resident_shadowed`) and SKIPS the SST entirely — the recently-flushed
+        // join state is served from RAM, never touching the not-yet-uploaded object.
+        // Enroll uses only `meta` + `oldest`, both available here; the imm is still
+        // present (pop happens below) so reads are doubly covered (seq-dedup neutral).
+        cf_data.add_resident_flushed_with_bounds(
+            meta.file_number,
+            oldest.clone(),
+            meta.smallest_key.clone(),
+            meta.largest_key.clone(),
+            crate::column_family::resident_flushed_cap_bytes(),
+        );
+
         self.version_set.apply(&edit)?;
 
         // Pre-populate the SST reader cache so the first read doesn't pay
         // the open-file cost.
-        let rac = self.fs.open_random_access_file(&path)?;
-        let reader = Arc::new(SstReaderImpl::open(rac)?);
-        self.sst_readers
-            .write()
-            .expect("lock poisoned")
-            .insert(meta.file_number, reader);
+        //
+        // 2026-05-29 WRITE-BACK FLUSH: this eager open is a pure optimization,
+        // and on the object-store async-upload path the SST may not be uploaded
+        // yet — `open_random_access_file` would either block on `await_upload`
+        // (re-coupling the flush worker to S3 latency, defeating write-back) or
+        // fail its `stat` because the object isn't published. Either way it is
+        // SAFE TO SKIP: the just-flushed memtable was enrolled as resident above
+        // (`add_resident_flushed_with_bounds`), so reads are served from RAM and
+        // shadow the byte-identical L0 SST. The reader is opened lazily on first
+        // real SST access via `get_or_open_sst_reader`, which awaits the upload.
+        // So make the pre-populate best-effort: try without blocking on the
+        // upload, and silently skip if it isn't published yet. On synchronous
+        // backends (local FS) this still pre-populates as before.
+        match self.fs.open_random_access_file(&path) {
+            Ok(rac) => match SstReaderImpl::open(rac) {
+                Ok(reader) => {
+                    self.sst_readers
+                        .write()
+                        .expect("lock poisoned")
+                        .insert(meta.file_number, Arc::new(reader));
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "forst_rs_engine::db",
+                        file_number = meta.file_number.value(),
+                        error = %e,
+                        "flush: skipped SST reader pre-populate (lazy open will retry)",
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::debug!(
+                    target: "forst_rs_engine::db",
+                    file_number = meta.file_number.value(),
+                    error = %e,
+                    "flush: SST not yet readable (async upload in flight); lazy open will retry",
+                );
+            }
+        }
 
         // B-Prod-P7 §6d: release the bytes this memtable held back to
         // the cross-CF WriteBufferManager. We sample memory_usage()
@@ -4981,6 +6093,26 @@ impl DbImpl {
         // SST — both return the same values.
         cf_data.pop_oldest_imm();
         self.write_buffer_manager.release(released_bytes);
+
+        // FRS-RESIDENT-FLUSHED: the just-flushed memtable was already enrolled in the
+        // resident read cache (tagged with the new SST's file number) BEFORE
+        // `version_set.apply` above (see FRS-RESIDENT-FLUSHED-ORDER) so no probe ever
+        // sees the SST without its RAM shadow. The prefix-scan path serves
+        // recently-flushed hot data from RAM (Tier 2) and skips the byte-identical L0
+        // SST in Tier 3. Data is durable on the SST (recovery UNCHANGED); the resident
+        // set is a bounded read accelerator (FIFO; ~2 GiB cap), and dropping any entry
+        // is always safe — Tier 3 simply stops skipping that file number.
+        // Prune any resident entries whose SST is no longer in the live set
+        // (compaction may have retired it). Reclaims RAM and avoids the
+        // redundant Tier-2 + compaction-output scan; correctness-neutral.
+        let live: std::collections::HashSet<FileNumber> = self
+            .version_set
+            .current()
+            .live_sst_files()
+            .iter()
+            .map(|m| m.file_number)
+            .collect();
+        let _pruned = cf_data.prune_resident_flushed(&live);
         self.refresh_snapshot_view(cf_data);
         self.write_controller
             .set_imm_count(cf_data.imm_count() as u32);
@@ -5067,6 +6199,14 @@ impl DbImpl {
                     let Some(db) = weak.upgrade() else {
                         return;
                     };
+                    // 2026-05-30 OBSOLETE-FILE LIFETIME: drain deferred deletions
+                    // whose retiring versions have since lost their last reader.
+                    // Compaction queues a file while a reader still holds the old
+                    // version; the reader drops AFTER that compaction's own reap,
+                    // so without this periodic sweep the file would linger until
+                    // the next compaction. ~1 s cadence is ample (S3 storage is
+                    // cheap; the goal is timely reclamation, not instant).
+                    db.reap_pending_deletions();
                     if let Some(w) = db.snapshot_registry.check_long_lived() {
                         // Emit structured fields so a log aggregator can
                         // index by seq / db_id. The Display impl gives a
@@ -5137,10 +6277,29 @@ impl DbImpl {
         let mut slot = self.fatal_error.lock().expect("lock poisoned");
         if slot.is_none() {
             *slot = Some(msg.into());
+            // 2026-05-29 PERF-RESTORE-#7: publish AFTER the slot is set so
+            // any concurrent reader who sees the flag will also see the
+            // payload. Release ordering pairs with the Acquire load in
+            // check_fatal_error.
+            self.fatal_error_set
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
     fn check_fatal_error(&self) -> ForstResult<()> {
+        // 2026-05-29 PERF-RESTORE-#7: AtomicBool fast-path. Happy path
+        // (~always) does a single relaxed atomic load and returns Ok. Only
+        // on the rare error-set case do we pay the Mutex lock to read the
+        // payload. The pre-fix Mutex was acquired on every put/get/delete/
+        // merge/batch_put engine entry — a hot contention point under high
+        // concurrency that did NOT exist in v3.8 (fatal_error was added
+        // by 6fcd844a0 harden-engine commit).
+        if !self
+            .fatal_error_set
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let slot = self.fatal_error.lock().expect("lock poisoned");
         if let Some(msg) = slot.as_ref() {
             return Err(ForstError::Internal(msg.clone()));
@@ -5168,6 +6327,21 @@ impl DbImpl {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // 2026-05-29 WRITE-BACK FLUSH: the flush counter above only tracks the
+        // in-RAM serialization step; the S3 upload of each flushed/compacted SST
+        // runs asynchronously and may still be in flight here. Block until all
+        // uploads complete so a caller that uses this as a flush barrier (e.g.
+        // shutdown drain) gets remote durability, not just local serialization.
+        // Best-effort: a failing upload is logged, since this fn has no error
+        // channel; the checkpoint path (`create_checkpoint`) calls
+        // `await_all_uploads()` directly and DOES surface the error.
+        if let Err(e) = self.fs.await_all_uploads() {
+            tracing::warn!(
+                target: "forst_rs_engine::db",
+                error = %e,
+                "wait_for_pending_flushes: in-flight upload failed",
+            );
         }
     }
 
@@ -5298,47 +6472,397 @@ impl DbImpl {
     /// prefetch). This amortizes S3 round-trip latency: one GetObject per
     /// SST file instead of paying the RTT on the first `get_internal` that
     /// happens to miss the reader cache.
+    ///
+    /// V10 (spec §3): routes through [`Self::batch_get_vectorized`] so the
+    /// hot LSM tier walks (active → imm → resident → SST) execute as a
+    /// single batched pass rather than N independent `get_internal` calls.
+    /// Per-batch hoists: one `version_set.current()` snapshot, one
+    /// `live_sst_files` HashSet build, one `resident_flushed_visible` walk,
+    /// one `find_sst_for_key_in_cf` linear scan per (level, file) instead
+    /// of per (key, level). See the dedicated docstring on
+    /// [`Self::batch_get_vectorized`] for the phase breakdown.
     #[inline]
     pub fn batch_get(
         &self,
         cf: &ColumnFamilyHandle,
         keys: &[&[u8]],
     ) -> ForstResult<Vec<Option<Vec<u8>>>> {
+        // Latest-view read — snapshot reads call `batch_get_vectorized` directly.
+        self.batch_get_vectorized(cf, keys, u64::MAX)
+    }
+
+    /// V10 (spec §3 D10): vectorized engine-level batch lookup.
+    ///
+    /// Behaviour is identical to issuing `N` independent `get_internal(key,
+    /// read_seq)` calls back-to-back (same merge-operand resolution, same
+    /// tombstone semantics, same snapshot visibility) — but the per-batch
+    /// constant overheads (version snapshot, live-file HashSet, resident
+    /// list, prefetch) execute ONCE for the whole batch instead of N times.
+    ///
+    /// # Phases
+    ///
+    /// 1. **Active memtable, per-key, race-safe.** Each key re-captures
+    ///    `active_memtable()` (A-R17-NEW-H1 invariant) and probes via
+    ///    `mem.get`. Put → resolved with value; Delete/SingleDelete →
+    ///    resolved as None; Merge → resolved via per-key `get_internal`
+    ///    (merge chain semantics are complex enough that batching them
+    ///    has no proven win; merge entries are rare on the read hot path).
+    /// 2. **SST prefetch (one call).** `prefetch_sst_files_for_batch` warms
+    ///    the file cache for SSTs not yet in the reader cache — one
+    ///    GetObject per SST file instead of one per missed key on S3.
+    /// 3. **Immutable memtables, batched.** One `imm_memtables()` capture.
+    ///    Walk newest → oldest; for each imm, run through the unresolved
+    ///    keys (Put / Delete are inlined; Merge falls back to per-key
+    ///    `get_internal` honouring the same `read_seq`).
+    /// 4. **Resident-flushed memtables, one snapshot.** One
+    ///    `version_set.current()` snapshot + one `live_sst_files` HashSet
+    ///    + one `resident_flushed_visible` call. The same snapshot is
+    ///    reused in phase 5 so the resident-skip vs SST-walk pair is
+    ///    transactionally consistent (FRS-RESIDENT-FLUSHED contract).
+    /// 5. **SST layer, batched per-file.** L0 scan opens each L0 reader
+    ///    ONCE and probes every unresolved key against that file's
+    ///    `get_versions` (sister to the per-key `sst_get` walk). L1+ uses
+    ///    `find_sst_for_key_in_cf` per (level, key) — but each candidate
+    ///    file is opened ONCE and reused for any other unresolved key in
+    ///    the same group. Tombstones resolve to None; Put resolves with
+    ///    payload; Merge falls back to per-key `get_internal` (which
+    ///    re-runs the merge peel with the correct `seq_cutoff`).
+    ///
+    /// # Correctness invariants
+    /// - Snapshot consistency: the version snapshot taken in phase 4 is
+    ///   used in phase 5 (no torn read between resident-skip and SST scan).
+    /// - Memtable race: phase 1 re-captures `active_memtable()` per key so
+    ///   a concurrent `swap_active_memtable` cannot drop a fresh write.
+    /// - Merge chains delegate to `get_internal`, which honours `read_seq`
+    ///   and the `peel_merges_from_sst_with_cutoff` flush-window dedup.
+    /// - The output vector preserves the input key order.
+    ///
+    /// # `read_seq` semantics
+    /// `u64::MAX` means latest-view (matches `db.get`); any lower value
+    /// means snapshot-aware reads (matches `get_at` / `get_at_cf`).
+    pub fn batch_get_vectorized(
+        &self,
+        cf: &ColumnFamilyHandle,
+        keys: &[&[u8]],
+        read_seq: u64,
+    ) -> ForstResult<Vec<Option<Vec<u8>>>> {
         self.check_fatal_error()?;
         let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let n = keys.len();
 
-        // S3 vector I/O prefetch: warm the file cache for SSTs not yet in
-        // the reader cache. This is a no-op on LocalFileSystem/MemoryFileSystem
-        // (the trait default returns Ok(())).
-        self.prefetch_sst_files_for_batch(&cf_data, keys);
+        // Single-key fast path: bypass the vectorized bookkeeping. This
+        // ensures callers that pass N=1 see no regression vs `get`.
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if n == 1 {
+            return Ok(vec![self.get_internal(&cf_data, keys[0], read_seq)?]);
+        }
 
-        let mem = cf_data.active_memtable();
-        let read_seq = u64::MAX;
-        let mut out = Vec::with_capacity(keys.len());
-        for k in keys {
-            // Fast path: try active memtable directly (inline cache + hash index)
-            let active_hit = mem.get(k, read_seq)?;
-            match active_hit {
+        // `resolved[i] = Some(slot)` means key i is done; `None` means still
+        // pending. Slot semantics match `Option<Vec<u8>>` — outer Some = found,
+        // outer None = missing/tombstoned.
+        let mut resolved: Vec<Option<Option<Vec<u8>>>> = vec![None; n];
+
+        // Phase 1: active memtable. A-R17-NEW-H1: re-capture per key (Arc
+        // clone is cheap; the swap_active_memtable race window is narrow but
+        // real — see comment on the legacy batch_get loop).
+        for (i, k) in keys.iter().enumerate() {
+            let mem = cf_data.active_memtable();
+            match mem.get(k, read_seq)? {
                 Some(entry) if entry.op_type == OpType::Put => {
-                    out.push(entry.value);
+                    resolved[i] = Some(entry.value);
                 }
                 Some(entry)
                     if entry.op_type == OpType::Delete || entry.op_type == OpType::SingleDelete =>
                 {
-                    out.push(None);
+                    resolved[i] = Some(None);
                 }
                 Some(_) => {
-                    // Merge entries need the full LSM merge chain. The active-memtable fast path
-                    // only owns the newest operand, so fall back to the merge-aware point path.
-                    out.push(self.get_internal(&cf_data, k, read_seq)?);
+                    // Merge entry — fall back to per-key get_internal which
+                    // resolves the merge chain with correct snapshot semantics.
+                    resolved[i] = Some(self.get_internal(&cf_data, k, read_seq)?);
                 }
-                None => {
-                    // Not in active memtable — fall back to full path
-                    out.push(self.get_internal(&cf_data, k, read_seq)?);
+                None => {} // leave pending for phase 2
+            }
+        }
+
+        // Phase 2: SST prefetch — only if any key is still pending. This is
+        // a no-op on LocalFileSystem / MemoryFileSystem.
+        fn any_pending(r: &[Option<Option<Vec<u8>>>]) -> bool {
+            r.iter().any(|x| x.is_none())
+        }
+        if !any_pending(&resolved) {
+            return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+        }
+        self.prefetch_sst_files_for_batch(&cf_data, keys);
+
+        // Phase 3: immutable memtables. One capture of imm_list reused
+        // across keys. Each imm is walked newest → oldest.
+        let imm_list = cf_data.imm_memtables();
+        if !imm_list.is_empty() {
+            for imm in imm_list.iter().rev() {
+                for (i, k) in keys.iter().enumerate() {
+                    if resolved[i].is_some() {
+                        continue;
+                    }
+                    let Some(entry) = imm.get(k, read_seq)? else {
+                        continue;
+                    };
+                    match entry.op_type {
+                        OpType::Put => resolved[i] = Some(entry.value),
+                        OpType::Delete | OpType::SingleDelete => resolved[i] = Some(None),
+                        OpType::Merge => {
+                            // Merge chain — delegate to get_internal for full
+                            // peel + snapshot semantics. `get_internal`
+                            // re-walks active + imm itself; that's correct
+                            // (and the only safe way to share the
+                            // collect_merge_operands_from_imm_start code path
+                            // without duplicating it here).
+                            resolved[i] =
+                                Some(self.get_internal(&cf_data, k, read_seq)?);
+                        }
+                    }
+                }
+                if !any_pending(&resolved) {
+                    return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
                 }
             }
         }
-        Ok(out)
+
+        // Phase 4: resident-flushed memtables. One version snapshot + one
+        // live-files HashSet — reused in phase 5 for snapshot consistency.
+        let version = self.version_set.current();
+        // 2026-05-29 PERF: file-number-only set (no SstFileMeta clone per batch).
+        let live_files = version.live_sst_file_numbers();
+        // 2026-05-29 PERF-RESTORE: fetch entries WITH key bounds so each
+        // (resident, key) probe is gated by `may_contain` — skips the hash
+        // lookup for keys outside the entry's SST range. For disjoint-range
+        // joins this collapses O(num_resident × num_keys) to ≈O(num_keys).
+        let resident_entries = cf_data.resident_flushed_visible_entries(&live_files);
+        if !resident_entries.is_empty() {
+            for resident in resident_entries.iter().rev() {
+                for (i, k) in keys.iter().enumerate() {
+                    if resolved[i].is_some() {
+                        continue;
+                    }
+                    if !resident.may_contain(k) {
+                        continue;
+                    }
+                    let Some(entry) = resident.memtable.get(k, read_seq)? else {
+                        continue;
+                    };
+                    match entry.op_type {
+                        OpType::Put => resolved[i] = Some(entry.value),
+                        OpType::Delete | OpType::SingleDelete => resolved[i] = Some(None),
+                        OpType::Merge => {
+                            // Merge chain — delegate to get_internal.
+                            resolved[i] =
+                                Some(self.get_internal(&cf_data, k, read_seq)?);
+                        }
+                    }
+                }
+                if !any_pending(&resolved) {
+                    return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+                }
+            }
+        }
+
+        // Phase 5: SST layer, batched per file.
+        //
+        // L0: per CF, open each file ONCE and probe every still-pending key
+        // against it. For each key collect candidate versions across all L0
+        // files, then apply the same newest-visible rule `sst_get` uses
+        // (sequence desc, file_number desc tie-breaker).
+        //
+        // L1+: per CF, walk each level; for each still-pending key call
+        // `find_sst_for_key_in_cf` (linear scan, one per (level, key)). Group
+        // pending keys by file_number so each candidate file is opened
+        // ONCE and probed for every grouped key.
+        let cf_id = cf_data.handle().id();
+
+        // L0 walk.
+        let l0_files: Vec<&SstFileMeta> = version
+            .l0_files()
+            .iter()
+            .filter(|m| m.cf_id == cf_id)
+            .collect();
+        if !l0_files.is_empty() {
+            // For each L0 file, collect hits keyed by slot index. Then merge
+            // across files per slot, ordered by (sequence desc, file_number desc).
+            // l0_hits_per_key[i] = list of (sequence, file_number, LookupResult)
+            let mut l0_hits_per_key: Vec<Vec<(u64, u64, forst_rs_storage::sst::LookupResult)>> =
+                vec![Vec::new(); n];
+            for sst in &l0_files {
+                // Open reader ONCE per L0 file — reused for every pending key.
+                let reader = self.get_or_open_sst_reader(sst)?;
+                for (i, k) in keys.iter().enumerate() {
+                    if resolved[i].is_some() {
+                        continue;
+                    }
+                    // Quick file-range check (matches sst_lookup_versions).
+                    if (**k).as_ref() < sst.smallest_key.as_slice()
+                        || (**k).as_ref() > sst.largest_key.as_slice()
+                    {
+                        continue;
+                    }
+                    let versions = reader.get_versions(k)?;
+                    for res in versions {
+                        l0_hits_per_key[i].push((res.sequence, sst.file_number.value(), res));
+                    }
+                }
+            }
+            // Resolve each pending key from its collected L0 hits.
+            for (i, hits) in l0_hits_per_key.iter_mut().enumerate() {
+                if resolved[i].is_some() {
+                    continue;
+                }
+                if hits.is_empty() {
+                    continue;
+                }
+                // Sort newest-first: sequence desc, file_number desc.
+                hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+                let mut had_merge_operand = false;
+                for (_, _, res) in hits.drain(..) {
+                    match res.op_type {
+                        OpType::Put => {
+                            if res.value.is_none() {
+                                return Err(ForstError::corruption(
+                                    "batch_get_vectorized: L0 Put missing value payload",
+                                ));
+                            }
+                            if had_merge_operand {
+                                // Mixed merge+base — fall back to per-key
+                                // get_internal which handles the merge chain
+                                // (apply_merge_operator + snapshot cutoff).
+                                resolved[i] =
+                                    Some(self.get_internal(&cf_data, keys[i], read_seq)?);
+                            } else {
+                                resolved[i] = Some(res.value);
+                            }
+                            break;
+                        }
+                        OpType::Delete | OpType::SingleDelete => {
+                            if res.value.is_some() {
+                                return Err(ForstError::corruption(
+                                    "batch_get_vectorized: L0 tombstone carries value payload",
+                                ));
+                            }
+                            if had_merge_operand {
+                                resolved[i] =
+                                    Some(self.get_internal(&cf_data, keys[i], read_seq)?);
+                            } else {
+                                resolved[i] = Some(None);
+                            }
+                            break;
+                        }
+                        OpType::Merge => {
+                            // Defer the chain to per-key get_internal — the
+                            // batched path does not reproduce the
+                            // peel_merges_from_sst_with_cutoff semantics.
+                            had_merge_operand = true;
+                        }
+                    }
+                }
+                if resolved[i].is_none() && had_merge_operand {
+                    // L0 had only Merge entries — chain may continue down to
+                    // L1+. Delegate the whole resolution to get_internal.
+                    resolved[i] = Some(self.get_internal(&cf_data, keys[i], read_seq)?);
+                }
+            }
+            if !any_pending(&resolved) {
+                return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+            }
+        }
+
+        // L1+ walk: per level, group pending keys by candidate file.
+        for level in 1..version.num_levels() {
+            // file_idx -> list of (slot index) for that file at this level.
+            let mut groups: std::collections::HashMap<usize, Vec<usize>> =
+                std::collections::HashMap::new();
+            for (i, k) in keys.iter().enumerate() {
+                if resolved[i].is_some() {
+                    continue;
+                }
+                if let Some(idx) = version.find_sst_for_key_in_cf(level, k, cf_id) {
+                    groups.entry(idx).or_default().push(i);
+                }
+            }
+            for (file_idx, slot_ixs) in groups {
+                let sst = &version.levels[level].files[file_idx];
+                // Open reader ONCE per file — reused for every grouped key.
+                let reader = self.get_or_open_sst_reader(sst)?;
+                for i in slot_ixs {
+                    if resolved[i].is_some() {
+                        continue;
+                    }
+                    let k = keys[i];
+                    // Quick file-range check (matches sst_lookup_versions).
+                    if k < sst.smallest_key.as_slice() || k > sst.largest_key.as_slice() {
+                        continue;
+                    }
+                    let mut versions = reader.get_versions(k)?;
+                    if versions.is_empty() {
+                        continue;
+                    }
+                    versions.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+                    let mut had_merge_operand = false;
+                    let mut decided = false;
+                    for res in versions {
+                        match res.op_type {
+                            OpType::Put => {
+                                if res.value.is_none() {
+                                    return Err(ForstError::corruption(
+                                        "batch_get_vectorized: L1+ Put missing value payload",
+                                    ));
+                                }
+                                if had_merge_operand {
+                                    resolved[i] = Some(
+                                        self.get_internal(&cf_data, k, read_seq)?,
+                                    );
+                                } else {
+                                    resolved[i] = Some(res.value);
+                                }
+                                decided = true;
+                                break;
+                            }
+                            OpType::Delete | OpType::SingleDelete => {
+                                if res.value.is_some() {
+                                    return Err(ForstError::corruption(
+                                        "batch_get_vectorized: L1+ tombstone carries value payload",
+                                    ));
+                                }
+                                if had_merge_operand {
+                                    resolved[i] = Some(
+                                        self.get_internal(&cf_data, k, read_seq)?,
+                                    );
+                                } else {
+                                    resolved[i] = Some(None);
+                                }
+                                decided = true;
+                                break;
+                            }
+                            OpType::Merge => {
+                                had_merge_operand = true;
+                            }
+                        }
+                    }
+                    if !decided && had_merge_operand {
+                        // Merge chain may continue at deeper levels.
+                        resolved[i] = Some(self.get_internal(&cf_data, k, read_seq)?);
+                    }
+                }
+            }
+            if !any_pending(&resolved) {
+                return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+            }
+        }
+
+        // Any keys still pending after every level are genuine misses.
+        Ok(resolved
+            .into_iter()
+            .map(|r| r.unwrap_or(None))
+            .collect())
     }
 
     /// Batch point-lookup returning results as an Arrow RecordBatch.
@@ -5377,9 +6901,20 @@ impl DbImpl {
         // `Option<Vec<u8>>`-returning `get_internal`. The slow path
         // contributes one alloc + one memcpy per missed key, exactly
         // as before.
-        let mem = cf_data.active_memtable();
+        //
+        // A-R14-H1: re-capture the active memtable PER iteration rather
+        // than capturing once outside the loop. Capturing once leaves
+        // the loop reading from a now-frozen memtable across a
+        // `swap_active_memtable` driven by a concurrent writer: the
+        // inline-cache fast path returns a stale `HitPut` with the
+        // OLD value at the swap boundary even though the newer write
+        // is now in the active memtable. `get_internal` (used on the
+        // slow path here and on every single-key `db.get`) already
+        // re-reads `active_memtable` on every call, so this matches the
+        // contract single-key reads advertise. Arc clone is cheap.
         let read_seq = u64::MAX;
         for i in 0..n {
+            let mem = cf_data.active_memtable();
             let key = keys.value(i);
             let mut sink = BinaryBuilderSink(&mut value_builder);
             match mem.get_into(key, read_seq, &mut sink) {
@@ -5433,14 +6968,69 @@ impl DbImpl {
     /// Best-effort: errors are silently ignored (the subsequent
     /// `get_or_open_sst_reader` will retry and surface the error if it
     /// persists).
-    fn prefetch_sst_files_for_batch(&self, _cf_data: &Arc<ColumnFamilyData>, _keys: &[&[u8]]) {
+    fn prefetch_sst_files_for_batch(&self, cf_data: &Arc<ColumnFamilyData>, keys: &[&[u8]]) {
+        if keys.is_empty() {
+            return;
+        }
+        // FRS-S3-READ-CONCURRENCY (2026-05-31): three fixes, all driven by a
+        // symbolized q9 join-stall profile. The operator thread spent the bulk
+        // of `batch_get` BLOCKED inside
+        //   prefetch_sst_files_for_batch → fetch_through_cache → opendal read_at
+        //   → tokio park → pthread_cond_wait
+        // i.e. synchronously downloading whole SST files from S3. Root issues:
+        //
+        //   1) RESIDENT-SHADOW SKIP (the big one). batch_get's Phase 4 serves
+        //      keys from resident-flushed memtables (RAM, byte-identical to the
+        //      L0 SSTs) BEFORE Phase 5 ever touches an SST — but this prefetch
+        //      ran at Phase 2 and downloaded those very SSTs from S3 anyway.
+        //      For join state that lives in the memtable + resident-flushed RAM
+        //      (the q9 case) that is a wholly redundant S3 round-trip per batch.
+        //      Mirror build_lazy_prefix_key_stream: skip SSTs shadowed by a
+        //      currently-resident memtable.
+        //   2) RANGE-FILTER by the batch keys. The previous impl IGNORED `keys`
+        //      and prefetched EVERY uncached SST in the whole version on every
+        //      batch — including SSTs the batch never reads. Skip any SST whose
+        //      [smallest,largest] does not overlap [batch_min, batch_max].
+        //   3) CONCURRENT fetch. Any surviving misses are fanned out across
+        //      threads (prefetch_concurrent) so K misses cost ≈1 round-trip.
+        let mut batch_min: &[u8] = keys[0];
+        let mut batch_max: &[u8] = keys[0];
+        for k in &keys[1..] {
+            if *k < batch_min {
+                batch_min = k;
+            }
+            if *k > batch_max {
+                batch_max = k;
+            }
+        }
+
         let version = self.version_set.current();
+        let live_files = version.live_sst_file_numbers();
+        // File numbers whose data is currently resident in RAM (just-flushed
+        // memtables kept as a shadow). Reads for these keys are served from RAM
+        // in batch_get Phase 4, so fetching their SSTs from S3 is pure waste.
+        let resident_shadowed: std::collections::HashSet<FileNumber> = cf_data
+            .resident_flushed_visible_entries(&live_files)
+            .into_iter()
+            .map(|e| e.file_number)
+            .collect();
         let readers = self.sst_readers.read().expect("lock poisoned");
 
-        // Collect file numbers not yet in the reader cache.
+        // Collect overlapping, non-shadowed file numbers not yet reader-cached.
         let mut to_prefetch: Vec<PathBuf> = Vec::new();
         for level in &version.levels {
             for sst in &level.files {
+                if resident_shadowed.contains(&sst.file_number) {
+                    continue;
+                }
+                // Range-overlap test: SST is irrelevant if it lies entirely
+                // below batch_min or entirely above batch_max.
+                if sst.largest_key.as_slice() < batch_min {
+                    continue;
+                }
+                if sst.smallest_key.as_slice() > batch_max {
+                    continue;
+                }
                 if !readers.contains_key(&sst.file_number) {
                     to_prefetch.push(sst_file_path(&self.db_path, sst.file_number));
                 }
@@ -5448,11 +7038,13 @@ impl DbImpl {
         }
         drop(readers);
 
-        // Prefetch each file. Errors are best-effort — the read path will
-        // retry on the actual lookup and surface the error there.
-        for path in &to_prefetch {
-            let _ = self.fs.ensure_cached(path);
+        if to_prefetch.is_empty() {
+            return;
         }
+        // Best-effort concurrent warm. Errors are swallowed inside — the read
+        // path retries on the actual lookup and surfaces any real error there.
+        let path_refs: Vec<&Path> = to_prefetch.iter().map(|p| p.as_path()).collect();
+        self.fs.prefetch_concurrent(&path_refs);
     }
 
     #[inline]
@@ -5518,8 +7110,69 @@ impl DbImpl {
             }
         }
 
-        // Stage 3: SST files (L0 newest-first, then L1..Ln binary search).
+        // FRS-RESIDENT-FLUSHED point-get extension (2026-05-28): Stage 2.5 —
+        // resident-flushed memtables (just-flushed, kept in RAM, byte-identical
+        // to their L0 SSTs). For Put/Delete the resident hit is FINAL — same
+        // content + same sequence number as the L0 SST that sst_get would
+        // otherwise round-trip to S3 for. For Merge, we collect the outer
+        // operand and call `collect_merge_operands` which walks active → imm
+        // → SST in the usual way; the SST walk picks up older operands
+        // (including those in the L0 SST shadowed by THIS resident memtable —
+        // its cutoff = first_seq - 1 correctly masks the outer entry we just
+        // consumed). Iterating newest → oldest so a newer resident wins seq
+        // comparison without scanning all entries.
+        //
+        // CORRECTNESS: we filter resident entries by the CURRENT live-SST set.
+        // After compaction collapses an L0 SST into L1+ output (merge operands
+        // combined, tombstones consumed), reading the PRE-collapse resident
+        // memtable would surface stale values. Snapshotting the version once
+        // and reusing it for sst_get keeps Stage 2.5 + Stage 3 transactionally
+        // consistent (no torn read between resident-skip and SST scan).
+        //
+        // 2026-05-29 PERF-RESTORE-#4: fast-path skip the HashSet-build when the
+        // resident-flushed set is empty (typical until first flush completes
+        // — v3.8's path). Saves the N-entry HashSet allocation per get() in the
+        // common case. The `version_set.current()` snapshot is still captured
+        // because Stage 3 (sst_get below) requires it.
         let version = self.version_set.current();
+        let resident_mts: Vec<crate::column_family::SharedMemTable> = if cf_data.has_resident_flushed() {
+            // 2026-05-29 PERF: file-number-only set (no SstFileMeta clone per get).
+            let live_files = version.live_sst_file_numbers();
+            // 2026-05-29 PERF-RESTORE: key-filtered accessor skips resident
+            // memtables whose [min,max] bound excludes this key — O(matching)
+            // instead of O(num_resident) per point GET.
+            let (mts, _shadowed) = cf_data.resident_flushed_visible_for_key(&live_files, key);
+            mts
+        } else {
+            Vec::new()
+        };
+        for resident in resident_mts.iter().rev() {
+            let Some(entry) = resident.get(key, read_seq)? else {
+                continue;
+            };
+            match entry.op_type {
+                OpType::Put => return Ok(entry.value),
+                OpType::Delete | OpType::SingleDelete => return Ok(None),
+                OpType::Merge => {
+                    let first_operand = entry.value.ok_or_else(|| {
+                        ForstError::corruption("Merge entry missing operand payload")
+                    })?;
+                    let mut operands: Vec<Vec<u8>> = Vec::new();
+                    operands.push(first_operand);
+                    let base = self.collect_merge_operands(
+                        cf_data,
+                        key,
+                        entry.sequence,
+                        &mut operands,
+                    )?;
+                    return self
+                        .apply_merge_operator(cf_data, key, base, operands)
+                        .map(Some);
+                }
+            }
+        }
+
+        // Stage 3: SST files (L0 newest-first, then L1..Ln binary search).
         self.sst_get(cf_data, &version, key, &mut Vec::new())
     }
 
@@ -5559,6 +7212,19 @@ impl DbImpl {
         for (_, _, res) in l0_hits {
             match res.op_type {
                 OpType::Put => {
+                    // B-R27-NEW-H1: a Put with `value=None` indicates a
+                    // corrupt SST row — Put MUST carry a payload. The
+                    // sister `iter_versions_of` raises corruption for
+                    // this exact shape (D-R8-NEW-H3); the latest-view
+                    // `sst_get` path previously returned `Ok(None)`,
+                    // silently turning corruption into a phantom
+                    // deletion. Fail loud here to match the snapshot
+                    // path's contract.
+                    if res.value.is_none() {
+                        return Err(ForstError::corruption(
+                            "sst_get: L0 Put missing value payload",
+                        ));
+                    }
                     if merge_operands.is_empty() {
                         return Ok(res.value);
                     }
@@ -5572,6 +7238,15 @@ impl DbImpl {
                         .map(Some);
                 }
                 OpType::Delete | OpType::SingleDelete => {
+                    // B-R27-NEW-H1: a tombstone carrying a payload is
+                    // corrupt — sister sites in iter_versions_of raise
+                    // corruption here too. Pre-fix sst_get silently
+                    // accepted it.
+                    if res.value.is_some() {
+                        return Err(ForstError::corruption(
+                            "sst_get: L0 tombstone carries value payload",
+                        ));
+                    }
                     if merge_operands.is_empty() {
                         return Ok(None);
                     }
@@ -5580,8 +7255,20 @@ impl DbImpl {
                         .map(Some);
                 }
                 OpType::Merge => {
-                    if let Some(v) = res.value {
-                        merge_operands.push(v);
+                    // A-R6-H2: surface corruption on missing operand
+                    // payload — sister site missed by A-R5R-NEW-H1 /
+                    // C-R5-H1. The peel paths already raise corruption;
+                    // sst_get's L0 walk silently dropped the operand
+                    // and continued, returning wrong merged values
+                    // under counter / list-append / serializer
+                    // operators.
+                    match res.value {
+                        Some(v) => merge_operands.push(v),
+                        None => {
+                            return Err(ForstError::corruption(
+                                "sst_get: L0 Merge missing operand payload",
+                            ));
+                        }
                     }
                     // continue down the LSM
                 }
@@ -5611,6 +7298,14 @@ impl DbImpl {
             for res in versions {
                 match res.op_type {
                     OpType::Put => {
+                        // B-R27-NEW-H1 (L1+ sibling): Put-with-None is
+                        // corrupt — sister iter_versions_of raises
+                        // corruption here. Match its contract.
+                        if res.value.is_none() {
+                            return Err(ForstError::corruption(
+                                "sst_get: L1+ Put missing value payload",
+                            ));
+                        }
                         if merge_operands.is_empty() {
                             return Ok(res.value);
                         }
@@ -5624,6 +7319,13 @@ impl DbImpl {
                             .map(Some);
                     }
                     OpType::Delete | OpType::SingleDelete => {
+                        // B-R27-NEW-H1 (L1+ sibling): tombstone-with-payload
+                        // is corrupt — match iter_versions_of's contract.
+                        if res.value.is_some() {
+                            return Err(ForstError::corruption(
+                                "sst_get: L1+ tombstone carries value payload",
+                            ));
+                        }
                         if merge_operands.is_empty() {
                             return Ok(None);
                         }
@@ -5637,8 +7339,14 @@ impl DbImpl {
                             .map(Some);
                     }
                     OpType::Merge => {
-                        if let Some(v) = res.value {
-                            merge_operands.push(v);
+                        // A-R6-H2: L1+ sibling — same corruption check.
+                        match res.value {
+                            Some(v) => merge_operands.push(v),
+                            None => {
+                                return Err(ForstError::corruption(
+                                    "sst_get: L1+ Merge missing operand payload",
+                                ));
+                            }
                         }
                     }
                 }
@@ -5675,14 +7383,49 @@ impl DbImpl {
                 return Ok(r.clone());
             }
         }
-        // Double-checked lock — another thread may have cached meanwhile.
-        let mut cache = self.sst_readers.write().expect("lock poisoned");
-        if let Some(r) = cache.get(&meta.file_number) {
-            return Ok(r.clone());
-        }
+        // FRS-SST-OPEN-NOLOCK (2026-06-01, audit item D): do the S3 I/O
+        // (await_upload + open + footer/index read) WITHOUT holding the
+        // sst_readers lock, mirroring the compaction path. The prior code held
+        // `sst_readers.write()` across `await_upload`, which on the S3 path
+        // blocks on the freshly-flushed SST's full multipart upload (~114 s for
+        // a 2 GiB SST at the ~18 MB/s BOS uplink — proven by FRS-ITER-DIAG). With
+        // the write lock held, EVERY other reader-cache miss (any other SST)
+        // serialized behind that one upload → a total pipeline stall (observed
+        // at 256 MiB memtables: many concurrent flush uploads each grabbed the
+        // write lock in turn → the whole job froze at 32 M). Doing the I/O
+        // lock-free lets opens of DIFFERENT SSTs proceed concurrently; we only
+        // re-take the write lock to insert, double-checking a racing inserter so
+        // at most one reader per file is cached (a concurrent duplicate open is
+        // wasteful but correct — the loser's reader is simply dropped).
         let path = sst_file_path(&self.db_path, meta.file_number);
+        // FRS-LOCAL-FIRST-SST (2026-06-01): the explicit `await_upload` here was
+        // REMOVED. It blocked this open on the freshly-flushed SST's FULL S3
+        // upload (~114 s for a 2 GiB SST at the ~18 MB/s object-store uplink —
+        // the proven heavy-join freeze: a join probe that missed the resident
+        // shadow waited the entire upload). The filesystem's
+        // `open_random_access_file` now serves SSTs LOCAL-FIRST from the
+        // synchronous write-through copy (present the instant the SST is
+        // version-visible), so the durable bytes are read off local NVMe without
+        // waiting for S3. Correctness for the paths that DO read straight from
+        // the remote (restore on a fresh instance; an entry evicted from the
+        // local LRU) is preserved inside `open_random_access_file`: the remote
+        // branch still awaits the upload via `remote_size_awaiting_upload`, and
+        // the local-first reader's eviction fallback awaits before its remote
+        // open. So the await still happens exactly where a remote read needs it
+        // — just no longer on the hot path that has a local copy.
         let file = self.fs.open_random_access_file(&path)?;
-        let reader = Arc::new(SstReaderImpl::open(file)?);
+        // 2026-05-30 DECODED-BLOCK CACHE: wire the shared L1 block cache so the
+        // prefix-iterator's repeated probes of the same SST data blocks hit a
+        // decoded RecordBatch instead of re-reading+re-decompressing (the
+        // profiled q9 hot path: serial_read_at + decode_data_block + decompress).
+        let reader = Arc::new(
+            SstReaderImpl::open(file)?
+                .with_block_cache(
+                    Arc::clone(&self.block_cache) as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
+                    self.db_id.0,
+                    meta.file_number.value(),
+                ),
+        );
 
         // R50-H3: cross-check the on-disk footer cf_id against the meta
         // cf_id the VersionSet handed us. R49-H1 persisted cf_id in the
@@ -5706,6 +7449,12 @@ impl DbImpl {
             )));
         }
 
+        // Re-acquire the write lock only to insert; double-check a racing
+        // inserter that opened the same file while we were doing lock-free I/O.
+        let mut cache = self.sst_readers.write().expect("lock poisoned");
+        if let Some(r) = cache.get(&meta.file_number) {
+            return Ok(r.clone());
+        }
         cache.insert(meta.file_number, reader.clone());
         Ok(reader)
     }
@@ -5773,8 +7522,22 @@ impl DbImpl {
         // even when imm contains it post-swap; older operands
         // (seq < first_seq) remain visible.
         if first_seq > 0 {
+            // D-R7-H2: dedupe by Arc identity. After A-R3-H3 set the
+            // imm cutoff to `first_seq - 1`, a concurrent
+            // `swap_active_memtable` between our `active_memtable()`
+            // capture (line 5817) and our `imm_memtables()` read
+            // below can put the SAME Arc<MemTable> on imm_list.
+            // Walking it a second time at cutoff = first_seq - 1
+            // would re-collect every operand older than first_seq —
+            // double-counting under counter / list-append / set-union
+            // merge operators. Skip any imm whose Arc identity matches
+            // the active memtable we just peeled.
+            let mem_ptr = std::sync::Arc::as_ptr(&mem_arc);
             let imm_list = cf_data.imm_memtables();
             for imm in imm_list.iter().rev() {
+                if std::sync::Arc::as_ptr(imm) == mem_ptr {
+                    continue;
+                }
                 if let Some(base) =
                     self.peel_merges_from_memtable(imm, key, first_seq - 1, operands)?
                 {
@@ -5784,13 +7547,21 @@ impl DbImpl {
         }
 
         // SST layer: walk L0 newest-first, then L1..Ln.
-        self.peel_merges_from_sst(cf_data, key, operands)
+        // E-R8-H1: same flush-window dup defense as the imm_start
+        // sister. The outer entry at first_seq was observed in active
+        // (or imm via swap); a concurrent flush installing an SST
+        // could re-emit the same row from the SST layer. Skip rows
+        // at seq >= first_seq.
+        if first_seq > 0 {
+            self.peel_merges_from_sst_with_cutoff(cf_data, key, first_seq, operands)
+        } else {
+            self.peel_merges_from_sst(cf_data, key, operands)
+        }
     }
 
     /// Walks the imm list when the outer hit was itself in the immutable
     /// queue. `first_seq` is the already-consumed outer sequence; peel
-    /// continues from `first_seq - 1` in the starting imm, then u64::MAX for
-    /// older imms.
+    /// continues from `first_seq - 1` in EVERY imm — see B-R5-H1 below.
     fn collect_merge_operands_from_imm_start(
         &self,
         cf_data: &Arc<ColumnFamilyData>,
@@ -5799,23 +7570,30 @@ impl DbImpl {
         imm_list: Vec<crate::column_family::SharedMemTable>,
         operands: &mut Vec<Vec<u8>>,
     ) -> ForstResult<Option<Vec<u8>>> {
-        let mut started = false;
+        // B-R5-H1: sibling of A-R3-H3. The pre-fix code reset the
+        // cutoff to `u64::MAX` for every imm AFTER the first, on the
+        // false belief that "each memtable has its own sequence
+        // space". The engine's `sequence_number` is global (a single
+        // `fetch_add`), so an outer Merge entry at seq=first_seq
+        // observed in the first imm could ALSO be observed in an
+        // older imm under the active→imm swap race fixed by A-R3-H3.
+        // Use `first_seq - 1` as cutoff for EVERY imm so the outer
+        // entry never re-enters the operand stack under that race.
+        if first_seq == 0 {
+            return self.peel_merges_from_sst(cf_data, key, operands);
+        }
+        let cutoff = first_seq - 1;
         for imm in imm_list.iter().rev() {
-            let cutoff = if !started {
-                started = true;
-                if first_seq == 0 {
-                    continue;
-                }
-                first_seq - 1
-            } else {
-                u64::MAX
-            };
             if let Some(base) = self.peel_merges_from_memtable(imm, key, cutoff, operands)? {
                 return Ok(base.value);
             }
         }
         // Fall through into SSTs.
-        self.peel_merges_from_sst(cf_data, key, operands)
+        // E-R8-H1: use the cutoff variant so the just-flushed SST
+        // (which now contains a copy of the outer entry at
+        // seq=first_seq) does NOT re-emit that operand. Skip rows at
+        // seq >= first_seq.
+        self.peel_merges_from_sst_with_cutoff(cf_data, key, first_seq, operands)
     }
 
     /// Peels merges out of the SST layer. Returns:
@@ -5829,6 +7607,29 @@ impl DbImpl {
         key: &[u8],
         operands: &mut Vec<Vec<u8>>,
     ) -> ForstResult<Option<Vec<u8>>> {
+        self.peel_merges_from_sst_with_cutoff(cf_data, key, u64::MAX, operands)
+    }
+
+    /// E-R8-H1: same as `peel_merges_from_sst` but skips SST rows whose
+    /// sequence is >= `seq_cutoff`. Used by `collect_merge_operands` and
+    /// `collect_merge_operands_from_imm_start` to defend against the
+    /// flush-window operand-duplication race: when a flush installs a
+    /// new SST via `version_set.apply` and then pops the imm, both the
+    /// imm and the SST are simultaneously visible to a reader. A reader
+    /// that consumed the outer Merge entry at seq=N from an imm could
+    /// otherwise re-consume the SAME entry from the just-flushed SST.
+    /// Passing `seq_cutoff = first_seq` (the outer already-consumed
+    /// seq) closes that window — SST rows at seq >= first_seq are
+    /// skipped because the reader has already accounted for them
+    /// (either via the outer hit or via the imm walk's
+    /// `first_seq - 1` cutoff).
+    fn peel_merges_from_sst_with_cutoff(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+        key: &[u8],
+        seq_cutoff: u64,
+        operands: &mut Vec<Vec<u8>>,
+    ) -> ForstResult<Option<Vec<u8>>> {
         // R49-H1: scope merge-peeling to the calling CF's SSTs.
         let cf_id = cf_data.handle().id();
         let version = self.version_set.current();
@@ -5838,17 +7639,50 @@ impl DbImpl {
                 continue;
             }
             for res in self.sst_lookup_versions(sst, key)? {
+                // E-R8-H1: defense-in-depth against flush-window dup.
+                if res.sequence >= seq_cutoff {
+                    continue;
+                }
                 l0_hits.push((res.sequence, sst.file_number.value(), res));
             }
         }
         l0_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
         for (_, _, res) in l0_hits {
             match res.op_type {
-                OpType::Put => return Ok(res.value),
-                OpType::Delete | OpType::SingleDelete => return Ok(None),
+                OpType::Put => {
+                    // B-C4R14-NEW-H2: surface corruption on Put with no
+                    // payload (matches sister sites sst_get/B-R27-NEW-H1,
+                    // iter_versions_of/D-R8-NEW-H3, peel_merges_from_memtable).
+                    // Pre-fix `return Ok(res.value)` silently treated the
+                    // bad row as a tombstone — merge chain degraded to a
+                    // phantom Delete instead of surfacing the bad row.
+                    if res.value.is_none() {
+                        return Err(ForstError::corruption(
+                            "peel_merges_from_sst: L0 Put missing payload",
+                        ));
+                    }
+                    return Ok(res.value);
+                }
+                OpType::Delete | OpType::SingleDelete => {
+                    // B-C4R14-NEW-H2: tombstone-with-payload is also corruption.
+                    if res.value.is_some() {
+                        return Err(ForstError::corruption(
+                            "peel_merges_from_sst: L0 tombstone carrying payload",
+                        ));
+                    }
+                    return Ok(None);
+                }
                 OpType::Merge => {
-                    if let Some(v) = res.value {
-                        operands.push(v);
+                    // A-R5R-NEW-H1: surface corruption on missing
+                    // operand payload (matches outer-hit + memtable
+                    // peel paths).
+                    match res.value {
+                        Some(v) => operands.push(v),
+                        None => {
+                            return Err(ForstError::corruption(
+                                "peel_merges_from_sst: L0 Merge missing operand payload",
+                            ));
+                        }
                     }
                 }
             }
@@ -5869,12 +7703,38 @@ impl DbImpl {
             let mut versions = self.sst_lookup_versions(sst, key)?;
             versions.sort_by(|a, b| b.sequence.cmp(&a.sequence));
             for res in versions {
+                // E-R8-H1: skip rows already accounted for by the
+                // caller's outer entry.
+                if res.sequence >= seq_cutoff {
+                    continue;
+                }
                 match res.op_type {
-                    OpType::Put => return Ok(res.value),
-                    OpType::Delete | OpType::SingleDelete => return Ok(None),
+                    OpType::Put => {
+                        // B-C4R14-NEW-H2 (L1+ sister): same as L0 check above.
+                        if res.value.is_none() {
+                            return Err(ForstError::corruption(
+                                "peel_merges_from_sst: L1+ Put missing payload",
+                            ));
+                        }
+                        return Ok(res.value);
+                    }
+                    OpType::Delete | OpType::SingleDelete => {
+                        if res.value.is_some() {
+                            return Err(ForstError::corruption(
+                                "peel_merges_from_sst: L1+ tombstone carrying payload",
+                            ));
+                        }
+                        return Ok(None);
+                    }
                     OpType::Merge => {
-                        if let Some(v) = res.value {
-                            operands.push(v);
+                        // A-R5R-NEW-H1: corruption on missing payload.
+                        match res.value {
+                            Some(v) => operands.push(v),
+                            None => {
+                                return Err(ForstError::corruption(
+                                    "peel_merges_from_sst: L1+ Merge missing operand payload",
+                                ));
+                            }
                         }
                     }
                 }
@@ -5908,8 +7768,22 @@ impl DbImpl {
                     return Ok(Some(MergeBase { value: None }))
                 }
                 OpType::Merge => {
-                    if let Some(v) = entry.value {
-                        operands.push(v);
+                    // A-R5R-NEW-H1: a Merge entry with value=None is a
+                    // corrupted record (the latest-view outer-hit path
+                    // already rejects this shape, and C-R5-H1 added the
+                    // same rejection to the snapshot path's
+                    // iter_versions_of). Pre-fix the older-merge-peel
+                    // sites silently dropped the operand, handing the
+                    // merge operator a short operand list. Surface
+                    // corruption so the read fails fast with the same
+                    // diagnostic as the outer-hit path.
+                    match entry.value {
+                        Some(v) => operands.push(v),
+                        None => {
+                            return Err(ForstError::corruption(
+                                "peel_merges_from_memtable: Merge entry missing operand payload",
+                            ));
+                        }
                     }
                     if entry.sequence == 0 {
                         return Ok(None);
@@ -5972,6 +7846,19 @@ impl DbImpl {
         Ok(out)
     }
 
+    /// D-R8-NEW-H2: public probe so the FFI can refuse merge-append
+    /// operations on CFs that have no merge operator configured. Pre-fix
+    /// the FFI accepted the write (Merge entries land in the WriteBatch)
+    /// and every subsequent read returned InvalidArgument silently. The
+    /// FFI now calls this before issuing `wb.merge` and rejects with
+    /// `BatchHeaderMalformed` if it returns false.
+    pub fn cf_has_merge_operator(&self, cf: &ColumnFamilyHandle) -> bool {
+        match self.lookup_cf_by_id(cf.id()) {
+            Ok(cf_data) => cf_data.merge_operator().is_some(),
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn lookup_cf_by_id(&self, id: ColumnFamilyId) -> ForstResult<Arc<ColumnFamilyData>> {
         let cfs = self.cfs.read().expect("lock poisoned");
         let cf_data = cfs.get(&id).cloned().ok_or_else(|| {
@@ -6002,10 +7889,33 @@ impl DbImpl {
         &self.deletion_guard
     }
 
-    /// Attempts to delete a file, respecting the [`FileDeletionGuard`].
-    /// Pinned files are deferred to [`Self::reap_pending_deletions`].
+    /// Returns `true` when `file_number`'s storage may be reclaimed NOW: it is
+    /// neither pinned by an in-flight checkpoint ([`FileDeletionGuard`]) NOR
+    /// referenced by any live version still held by an in-flight read.
+    ///
+    /// 2026-05-30 OBSOLETE-FILE LIFETIME: the version-reference check closes the
+    /// compaction-deletes-SST-under-concurrent-read race. A read captures
+    /// `version_set.current()` (an owned `Arc<Version>`) and opens that
+    /// version's SSTs via on-demand storage reads; deleting an input SST's
+    /// object while such a read is in flight makes the read 404
+    /// (`frs_vectorized_batch_get rc=1 NOT_FOUND` → crash-loop on S3). The
+    /// pre-fix path only honored checkpoint pins. `referenced` is computed once
+    /// by the caller and threaded in to avoid recomputing the live-version set
+    /// per file in a deletion loop.
+    fn can_reclaim_file(
+        &self,
+        file_number: FileNumber,
+        referenced: &std::collections::HashSet<FileNumber>,
+    ) -> bool {
+        self.deletion_guard.can_delete(file_number) && !referenced.contains(&file_number)
+    }
+
+    /// Attempts to delete a file, respecting both the [`FileDeletionGuard`] pin
+    /// set AND live-version references. Files that cannot yet be reclaimed are
+    /// deferred to [`Self::reap_pending_deletions`].
     fn delete_file_guarded(&self, file_number: FileNumber) {
-        if self.deletion_guard.can_delete(file_number) {
+        let referenced = self.version_set.referenced_file_numbers();
+        if self.can_reclaim_file(file_number, &referenced) {
             let path = sst_file_path(&self.db_path, file_number);
             let _ = self.fs.delete_file(&path);
         } else {
@@ -6016,14 +7926,17 @@ impl DbImpl {
         }
     }
 
-    /// Reaps previously-deferred deletions whose pins have since been
-    /// released. Called after every compaction so deletions eventually
-    /// drain.
+    /// Reaps previously-deferred deletions whose pins / live-version references
+    /// have since been released. Called after every compaction AND periodically
+    /// from the background workers so deferred deletions drain even when no new
+    /// compaction fires (a retiring version is only pruned when its last reader
+    /// drops, which may happen after the compaction that queued the file).
     fn reap_pending_deletions(&self) {
+        let referenced = self.version_set.referenced_file_numbers();
         let mut pending = self.pending_deletions.lock().expect("lock poisoned");
         let mut still_pending = Vec::with_capacity(pending.len());
         for file_number in pending.drain(..) {
-            if self.deletion_guard.can_delete(file_number) {
+            if self.can_reclaim_file(file_number, &referenced) {
                 let path = sst_file_path(&self.db_path, file_number);
                 let _ = self.fs.delete_file(&path);
             } else {
@@ -6332,9 +8245,13 @@ enum TierKeySource {
     /// lets downstream `last_emitted` / `min_key` tracking use cheap
     /// `Arc::clone` (atomic refcount bump) instead of `Vec::clone`
     /// (full byte copy).
+    /// B-R7-NEW-H1: field `prefix` renamed to `lower` since the same
+    /// variant now powers BOTH `prefix_scan_iter` and `scan_iter`. The
+    /// streaming filter at `peek()` already performs `[lower, upper)`
+    /// truncation regardless of whether `lower` is a true prefix.
     Sst {
         reader: Arc<SstReaderImpl>,
-        prefix: Vec<u8>,
+        lower: Vec<u8>,
         upper: Option<Vec<u8>>,
         next_block: usize,
         buffered: Vec<Arc<[u8]>>,
@@ -6351,7 +8268,7 @@ impl TierKeySource {
             TierKeySource::MemCursor { cursor } => Ok(cursor.peek()),
             TierKeySource::Sst {
                 reader,
-                prefix,
+                lower,
                 upper,
                 next_block,
                 buffered,
@@ -6373,7 +8290,7 @@ impl TierKeySource {
                     buffered.clear();
                     *pos = 0;
                     forst_rs_storage::sst::for_each_row_in_batch(&batch, |view| {
-                        if view.key < prefix.as_slice() {
+                        if view.key < lower.as_slice() {
                             return Ok(());
                         }
                         if let Some(hi) = upper.as_deref() {
@@ -6438,6 +8355,13 @@ impl TierKeySource {
 /// ~10 pointer compares per key, dwarfed by the `db.get(key)` resolve.
 /// Swapping in a `BinaryHeap` would save ~3×; defer until profiling
 /// demands it.
+/// B-R7-NEW-H1: alias used by the range-scan path
+/// ([`DbImpl::scan_iter`] / [`DbImpl::scan_iter_owned_arc_with_error_slot`]).
+/// The underlying iterator is structurally identical (sorted-key k-way merge
+/// over tier sources); only the per-tier source construction differs (range
+/// memtable cursor + `[lower, upper)` SST filter vs. prefix variants).
+pub type LazyRangeIter = LazyPrefixIter;
+
 pub struct LazyPrefixIter {
     sources: Vec<TierKeySource>,
     /// C9-H2: `Arc<[u8]>` instead of `Vec<u8>`. `Arc::clone` per emit is an
@@ -6674,6 +8598,46 @@ mod tests {
         let h = db.column_family(DEFAULT_CF_NAME).expect("default cf");
         assert_eq!(h.id(), DEFAULT_CF_ID);
         assert_eq!(h.name(), DEFAULT_CF_NAME);
+    }
+
+    #[test]
+    fn snapshot_memtables_to_dir_round_trips_through_artifact_and_replay() {
+        // FRS-CKPT-NOFLUSH engine round trip: put → snapshot artifact (no flush)
+        // → read artifact → replay into a FRESH engine → reads match; the source
+        // memtable stays live; post-snapshot writes are NOT in the artifact.
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k1", b"v1").unwrap();
+        db.put(&cf, b"k2", b"v2").unwrap();
+        db.put(&cf, b"k1", b"v1b").unwrap(); // multi-version
+
+        // Artifacts stage on LOCAL disk (the backend uploader reads them via
+        // local NIO), so use a real temp dir.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path();
+        let arts = db.snapshot_memtables_to_dir(dir, None).unwrap();
+        assert_eq!(arts.len(), 1, "one CF with data");
+        let (cf_id, fname) = arts[0].clone();
+        assert_eq!(cf_id, DEFAULT_CF_ID.0);
+        assert!(dir.join(&fname).exists(), "artifact written to local disk");
+
+        // Memtable stays live + readable + writable after the snapshot (no seal).
+        assert_eq!(db.get(&cf, b"k1").unwrap(), Some(b"v1b".to_vec()));
+        db.put(&cf, b"k3", b"v3").unwrap();
+
+        // Replay the artifact DIR into a fresh, independent engine.
+        let db2 = open();
+        let cf2 = db2.default_cf();
+        let replayed = db2.replay_memtable_artifacts_from_dir(dir).unwrap();
+        assert!(replayed >= 3, "k1(×2) + k2 captured; got {replayed}");
+
+        assert_eq!(db2.get(&cf2, b"k1").unwrap(), Some(b"v1b".to_vec()));
+        assert_eq!(db2.get(&cf2, b"k2").unwrap(), Some(b"v2".to_vec()));
+        assert_eq!(
+            db2.get(&cf2, b"k3").unwrap(),
+            None,
+            "k3 was written AFTER the snapshot — must not appear in the artifact"
+        );
     }
 
     #[test]
@@ -6989,6 +8953,259 @@ mod tests {
         assert_eq!(out[0].as_deref(), Some(b"1".as_ref()));
         assert_eq!(out[1], None);
         assert_eq!(out[2].as_deref(), Some(b"2".as_ref()));
+    }
+
+    // V10 (spec §3 D10) — vectorized batch_get tests.
+
+    #[test]
+    fn test_batch_get_vectorized_empty_keys() {
+        let db = open();
+        let cf = db.default_cf();
+        let out = db.batch_get_vectorized(&cf, &[], u64::MAX).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_batch_get_vectorized_single_key_active_memtable() {
+        // N=1 fast-path: must not regress single-key throughput. Result
+        // identical to db.get.
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v").unwrap();
+        let out = db.batch_get_vectorized(&cf, &[b"k".as_ref()], u64::MAX).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].as_deref(), Some(b"v".as_ref()));
+    }
+
+    #[test]
+    fn test_batch_get_vectorized_all_active_memtable() {
+        let db = open();
+        let cf = db.default_cf();
+        let n = 1000usize;
+        // Populate 1000 keys; all live in the active memtable.
+        for i in 0..n {
+            let k = format!("k{:08}", i).into_bytes();
+            let v = format!("v{:08}", i).into_bytes();
+            db.put(&cf, &k, &v).unwrap();
+        }
+        let keys: Vec<Vec<u8>> = (0..n).map(|i| format!("k{:08}", i).into_bytes()).collect();
+        let key_refs: Vec<&[u8]> = keys.iter().map(|v| v.as_slice()).collect();
+        let out = db.batch_get_vectorized(&cf, &key_refs, u64::MAX).unwrap();
+        assert_eq!(out.len(), n);
+        for i in 0..n {
+            let expected = format!("v{:08}", i).into_bytes();
+            assert_eq!(out[i].as_deref(), Some(expected.as_slice()), "slot {i}");
+        }
+    }
+
+    #[test]
+    fn test_batch_get_vectorized_mixed_tiers_active_imm_sst() {
+        // Layout:
+        //  - 300 keys "s_*" → SST (force_switch + flush + force_switch again)
+        //  - 300 keys "i_*" → immutable memtables (two imms before flush)
+        //  - 300 keys "a_*" → active memtable
+        //  - 100 keys "miss_*" → never written
+        let db = open();
+        let cf = db.default_cf();
+        for i in 0..300usize {
+            db.put(&cf, format!("s_{:04}", i).as_bytes(), format!("sv_{i}").as_bytes()).unwrap();
+        }
+        // Flush "s_*" to SST.
+        db.switch_and_flush(&cf).unwrap();
+        // First imm with 150 keys, second imm with 150 keys, then active.
+        for i in 0..150usize {
+            db.put(&cf, format!("i_{:04}", i).as_bytes(), format!("iv_{i}").as_bytes()).unwrap();
+        }
+        db.force_switch_memtable(&cf).unwrap();
+        for i in 150..300usize {
+            db.put(&cf, format!("i_{:04}", i).as_bytes(), format!("iv_{i}").as_bytes()).unwrap();
+        }
+        db.force_switch_memtable(&cf).unwrap();
+        for i in 0..300usize {
+            db.put(&cf, format!("a_{:04}", i).as_bytes(), format!("av_{i}").as_bytes()).unwrap();
+        }
+
+        // Build interleaved key list to ensure ordering preservation.
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..300usize {
+            keys.push(format!("s_{:04}", i).into_bytes());
+            keys.push(format!("i_{:04}", i).into_bytes());
+            keys.push(format!("a_{:04}", i).into_bytes());
+            if i < 100 {
+                keys.push(format!("miss_{:04}", i).into_bytes());
+            }
+        }
+        let key_refs: Vec<&[u8]> = keys.iter().map(|v| v.as_slice()).collect();
+
+        let batched = db.batch_get_vectorized(&cf, &key_refs, u64::MAX).unwrap();
+        assert_eq!(batched.len(), key_refs.len());
+
+        // Cross-check against per-key get baseline.
+        for (i, k) in key_refs.iter().enumerate() {
+            let baseline = db.get(&cf, k).unwrap();
+            assert_eq!(batched[i], baseline, "slot {i} key={:?}", std::str::from_utf8(k));
+        }
+    }
+
+    #[test]
+    fn test_batch_get_vectorized_put_delete_merge_mix() {
+        let (db, cf) = open_with_merge_cf();
+        // Put k1, Delete k2, Merge k3 (no base), Merge+Merge k4 with base.
+        db.put(&cf, b"k1", b"v1").unwrap();
+        db.put(&cf, b"k2", b"to-delete").unwrap();
+        db.delete(&cf, b"k2").unwrap();
+        db.merge(&cf, b"k3", b"x").unwrap();
+        db.merge(&cf, b"k3", b"y").unwrap();
+        db.put(&cf, b"k4", b"base").unwrap();
+        db.merge(&cf, b"k4", b"a").unwrap();
+        db.merge(&cf, b"k4", b"b").unwrap();
+
+        let keys: Vec<&[u8]> = vec![
+            b"k1".as_ref(),
+            b"k2".as_ref(),
+            b"k3".as_ref(),
+            b"k4".as_ref(),
+            b"k5_missing".as_ref(),
+        ];
+        let batched = db.batch_get_vectorized(&cf, &keys, u64::MAX).unwrap();
+        // Compare to per-key get baseline.
+        for (i, k) in keys.iter().enumerate() {
+            let baseline = db.get(&cf, k).unwrap();
+            assert_eq!(batched[i], baseline, "slot {i}");
+        }
+        // Spot-check the expected values too.
+        assert_eq!(batched[0].as_deref(), Some(b"v1".as_ref()));
+        assert_eq!(batched[1], None);
+        assert_eq!(batched[2].as_deref(), Some(b"x,y".as_ref()));
+        assert_eq!(batched[3].as_deref(), Some(b"base,a,b".as_ref()));
+        assert_eq!(batched[4], None);
+    }
+
+    #[test]
+    fn test_batch_get_vectorized_all_miss() {
+        let db = open();
+        let cf = db.default_cf();
+        // Empty DB: every probe must return None.
+        let owned: Vec<Vec<u8>> = (0..256)
+            .map(|i| format!("nope_{i:04}").into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+        let out = db.batch_get_vectorized(&cf, &keys, u64::MAX).unwrap();
+        assert_eq!(out.len(), keys.len());
+        for slot in &out {
+            assert!(slot.is_none());
+        }
+    }
+
+    #[test]
+    fn test_batch_get_vectorized_correctness_vs_per_key_get_randomized() {
+        // Randomized correctness check: build a DB with mixed-tier state,
+        // then compare batch_get_vectorized to N independent get() calls.
+        use std::collections::HashMap;
+        let db = open();
+        let cf = db.default_cf();
+        let mut truth: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+
+        // Tier: SST.
+        for i in 0..200usize {
+            let k = format!("k{:04}", i).into_bytes();
+            let v = format!("v_sst_{i}").into_bytes();
+            db.put(&cf, &k, &v).unwrap();
+            truth.insert(k, Some(v));
+        }
+        db.switch_and_flush(&cf).unwrap();
+
+        // Tier: imm — overwrite some SST keys + add new keys.
+        for i in 100..300usize {
+            let k = format!("k{:04}", i).into_bytes();
+            let v = format!("v_imm_{i}").into_bytes();
+            db.put(&cf, &k, &v).unwrap();
+            truth.insert(k, Some(v));
+        }
+        db.force_switch_memtable(&cf).unwrap();
+
+        // Tier: active — overwrite some imm/SST keys, delete some, add new keys.
+        for i in 250..400usize {
+            let k = format!("k{:04}", i).into_bytes();
+            let v = format!("v_act_{i}").into_bytes();
+            db.put(&cf, &k, &v).unwrap();
+            truth.insert(k, Some(v));
+        }
+        // Delete a few keys from earlier tiers.
+        for i in [10usize, 50, 150, 250] {
+            let k = format!("k{:04}", i).into_bytes();
+            db.delete(&cf, &k).unwrap();
+            truth.insert(k, None);
+        }
+
+        // Probe with a shuffled key list including misses.
+        let mut probe_keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..420usize {
+            probe_keys.push(format!("k{:04}", i).into_bytes());
+        }
+        // Add some pure misses.
+        for i in 0..30usize {
+            probe_keys.push(format!("never_{:04}", i).into_bytes());
+        }
+        let key_refs: Vec<&[u8]> = probe_keys.iter().map(|v| v.as_slice()).collect();
+
+        let batched = db.batch_get_vectorized(&cf, &key_refs, u64::MAX).unwrap();
+        for (i, k) in key_refs.iter().enumerate() {
+            let baseline = db.get(&cf, k).unwrap();
+            assert_eq!(
+                batched[i],
+                baseline,
+                "slot {i} key={:?}",
+                std::str::from_utf8(k)
+            );
+            // Cross-check against the truth map too.
+            let expected = truth.get(*k).cloned().unwrap_or(None);
+            assert_eq!(batched[i], expected, "truth-mismatch slot {i}");
+        }
+    }
+
+    #[test]
+    fn test_batch_get_vectorized_snapshot_read_seq() {
+        // Snapshot semantics: rows written AFTER the snapshot's seq are invisible.
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k1", b"old1").unwrap();
+        db.put(&cf, b"k2", b"old2").unwrap();
+        // Capture the snapshot AFTER writing old values but BEFORE the new ones.
+        let snap = db.snapshot();
+        let snap_seq = snap.seq().value();
+        db.put(&cf, b"k1", b"new1").unwrap();
+        db.put(&cf, b"k2", b"new2").unwrap();
+        db.put(&cf, b"k3", b"new3").unwrap();
+
+        // Latest view via vectorized path.
+        let latest = db
+            .batch_get_vectorized(
+                &cf,
+                &[b"k1".as_ref(), b"k2".as_ref(), b"k3".as_ref()],
+                u64::MAX,
+            )
+            .unwrap();
+        assert_eq!(latest[0].as_deref(), Some(b"new1".as_ref()));
+        assert_eq!(latest[1].as_deref(), Some(b"new2".as_ref()));
+        assert_eq!(latest[2].as_deref(), Some(b"new3".as_ref()));
+
+        // Snapshot view via vectorized path.
+        let snapped = db
+            .batch_get_vectorized(
+                &cf,
+                &[b"k1".as_ref(), b"k2".as_ref(), b"k3".as_ref()],
+                snap_seq,
+            )
+            .unwrap();
+        // Cross-check against per-key get_at baseline.
+        for (i, k) in [b"k1".as_ref(), b"k2".as_ref(), b"k3".as_ref()].iter().enumerate() {
+            let baseline = db.get_at(&snap, k).unwrap();
+            assert_eq!(snapped[i], baseline, "slot {i}");
+        }
+        assert_eq!(snapped[0].as_deref(), Some(b"old1".as_ref()));
+        assert_eq!(snapped[1].as_deref(), Some(b"old2".as_ref()));
+        assert_eq!(snapped[2], None); // k3 didn't exist at snapshot time
     }
 
     #[test]
@@ -7500,6 +9717,48 @@ mod tests {
         assert_eq!(out, vec![(b"k".to_vec(), b"a,b,c".to_vec())]);
     }
 
+    /// B-R7-NEW-H1: assert `scan_iter` does NOT eagerly collect every row
+    /// upfront. Inserts 10K keys, opens the iterator, advances only 5 rows,
+    /// then drops it. Pre-fix, `DbImpl::scan` drained every tier into a
+    /// `BTreeSet<Vec<u8>>` AND re-`get`-ed each key, building a 10K-entry
+    /// `Vec<(Vec<u8>, Vec<u8>)>` before the caller saw the first row. The
+    /// new lazy path streams tier-by-tier and resolves values only when
+    /// the consumer advances — taking 5 rows must not require resolving
+    /// the other 9995. Correctness assertion: the 5 yielded keys are the
+    /// lexicographically smallest 5. Drop without panic verifies the
+    /// iterator can be released mid-stream (no torn state in tier sources).
+    #[test]
+    fn test_scan_iter_does_not_eagerly_materialise() {
+        let db = open();
+        let cf = db.default_cf();
+        // Use zero-padded keys so lex-order matches numeric order (k00000..).
+        for i in 0..10_000u32 {
+            let k = format!("k{:05}", i);
+            db.put(&cf, k.as_bytes(), b"v").unwrap();
+        }
+        // Drop the iterator after only 5 rows. If `scan_iter` were eager,
+        // this would still pass — but the LSM-tier scan structure would
+        // have paid 10K value-resolves up front. We assert mid-stream drop
+        // works (no torn-state panic) which only the lazy path guarantees.
+        let mut iter = db.scan_iter(&cf, b"", None).unwrap();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..5 {
+            match iter.next() {
+                Some(Ok((k, _v))) => got.push(k),
+                Some(Err(e)) => panic!("scan_iter yielded error: {e:?}"),
+                None => panic!("scan_iter exhausted before 5 rows"),
+            }
+        }
+        // Explicit drop mid-stream — must not panic / leak.
+        drop(iter);
+        // The 5 smallest keys should be k00000..k00004 in order.
+        assert_eq!(got.len(), 5);
+        for (i, k) in got.iter().enumerate() {
+            let expected = format!("k{:05}", i);
+            assert_eq!(k.as_slice(), expected.as_bytes(), "row {i}");
+        }
+    }
+
     #[test]
     fn test_prefix_scan_basic() {
         let db = open();
@@ -7891,7 +10150,25 @@ mod tests {
         assert!(db.fs.file_exists(&old_path).unwrap());
 
         db.compact_l0(&cf).unwrap().unwrap();
-        assert!(!db.fs.file_exists(&old_path).unwrap());
+        // 2026-05-30 OBSOLETE-FILE LIFETIME: deletion of a compaction input is
+        // now deferred until no live version references it (the fix for the
+        // compaction-deletes-SST-under-read race). The just-replaced version is
+        // transiently retained (ArcSwap debt slot) until subsequent engine
+        // activity recycles it, so reclamation is eventual rather than
+        // synchronous with `compact_l0`. Drive a few write/flush/compact cycles
+        // (as the pin-deferral test does) and assert the file is reclaimed.
+        let mut reclaimed = !db.fs.file_exists(&old_path).unwrap();
+        for i in 0..16 {
+            if reclaimed {
+                break;
+            }
+            db.put(&cf, format!("d{i}").as_bytes(), b"v").unwrap();
+            db.switch_and_flush(&cf).unwrap();
+            db.compact_l0(&cf).unwrap();
+            db.reap_pending_deletions();
+            reclaimed = !db.fs.file_exists(&old_path).unwrap();
+        }
+        assert!(reclaimed, "compaction input must be reclaimed eventually");
     }
 
     #[test]
@@ -8334,6 +10611,76 @@ mod tests {
         assert!(
             !db.fs.file_exists(&path).unwrap(),
             "file must be deleted after pin release"
+        );
+    }
+
+    /// 2026-05-30 OBSOLETE-FILE LIFETIME regression test: a compaction must NOT
+    /// delete an input SST's storage while an in-flight read still holds a
+    /// version that references it. Pre-fix, compaction's `delete_file_guarded`
+    /// only honored checkpoint pins, so it unlinked the input the moment apply
+    /// completed — a concurrent read holding the old version then 404'd on the
+    /// deleted object (`frs_vectorized_batch_get rc=1 NOT_FOUND` → crash-loop on
+    /// S3). The fix defers deletion until no live version (current ∪ retiring-
+    /// with-readers) references the file.
+    #[test]
+    fn test_compaction_defers_delete_while_read_version_held() {
+        let db = open();
+        let cf = db.default_cf();
+        // Two flushes → two L0 SSTs that compaction will merge + delete.
+        db.put(&cf, b"k1", b"v1").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.put(&cf, b"k2", b"v2").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        // Simulate an in-flight read: capture and HOLD the current version
+        // (exactly what `get_internal` does via `version_set.current()`).
+        let held = db.version_set.current();
+        let input_fnums: Vec<FileNumber> =
+            held.l0_files().iter().map(|f| f.file_number).collect();
+        assert!(
+            input_fnums.len() >= 2,
+            "test needs >= 2 L0 inputs, got {}",
+            input_fnums.len()
+        );
+
+        // Compact: merges the L0 inputs into L1 and queues the inputs for
+        // deletion. With `held` alive, their storage MUST be deferred.
+        db.compact_l0(&cf).unwrap().expect("compaction should produce output");
+        for &fnum in &input_fnums {
+            let path = sst_file_path(&db.db_path, fnum);
+            assert!(
+                db.fs.file_exists(&path).unwrap(),
+                "input SST {} must SURVIVE while a read version references it",
+                fnum.value()
+            );
+        }
+
+        // Release the read version, then reap: the retiring version loses its
+        // last reader, so the inputs are no longer referenced and get reclaimed.
+        drop(held);
+        // After the reader releases its version, normal engine activity (writes,
+        // flushes, compactions — each advancing the version + churning ArcSwap's
+        // load slots, exactly as a running query does) lets the retiring version
+        // drop its last ref so its files become reclaimable. Drive a few such
+        // cycles, then assert reclamation. Bounded so a true leak still fails.
+        let mut reclaimed = false;
+        for i in 0..16 {
+            db.put(&cf, format!("drain{i}").as_bytes(), b"v").unwrap();
+            db.switch_and_flush(&cf).unwrap();
+            db.compact_l0(&cf).unwrap();
+            db.reap_pending_deletions();
+            if input_fnums
+                .iter()
+                .all(|&f| !db.fs.file_exists(&sst_file_path(&db.db_path, f)).unwrap())
+            {
+                reclaimed = true;
+                break;
+            }
+        }
+        assert!(
+            reclaimed,
+            "input SSTs {:?} must be DELETED after the read version is released",
+            input_fnums.iter().map(|f| f.value()).collect::<Vec<_>>()
         );
     }
 

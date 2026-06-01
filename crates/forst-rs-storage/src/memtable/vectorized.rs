@@ -20,8 +20,12 @@
 //! flush, while a HashMap buffers recent unsorted writes before merge.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
+// 2026-05-29 PERF: FxHashMap replaces std HashMap (SipHash) for the hot
+// hash_index / unsorted_lookup / prefix_index. Profiling showed SipHash
+// (BuildHasher::hash_one + Hasher::write) was the #1 q4/q7 join hot path.
+use rustc_hash::FxHashMap as HashMap;
 
 use arrow::array::{Array, BinaryArray, BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -47,6 +51,38 @@ struct RowIndex {
 /// Maximum value size (bytes) that will be stored inline in the hash entry.
 /// Covers most Flink ValueState<Long/String/etc> payloads (≤64 bytes).
 const INLINE_THRESHOLD: usize = 256;
+
+/// 2026-05-30 PREFIX-SCAN QUADRATIC FIX: hard cap on the unsorted→sorted merge
+/// threshold. The threshold was `(sorted_count * unsorted_merge_ratio).max(1024)`
+/// — proportional to table size. `prefix_scan_keys` iterates the ENTIRE
+/// `unsorted_lookup` on every call (O(unsorted)), so on a large memtable the
+/// proportional threshold let `unsorted_lookup` grow into the millions, making
+/// each streaming-join prefix-scan probe O(memtable) → quadratic over the run
+/// (the q9 heavy-query stall). `merge_unsorted_to_sorted` is O(unsorted·log) and
+/// each entry merges exactly once, so capping the threshold does NOT add total
+/// write work — it just merges in smaller, more frequent batches, keeping
+/// `unsorted_lookup` bounded so prefix scans stay cheap. Point gets are
+/// unaffected (they hash-probe `unsorted_lookup` in O(1)).
+const MAX_UNSORTED_MERGE_THRESHOLD: usize = 4096;
+
+/// FRS-UNSORTED-FIXEDCAP (2026-06-01): the merge threshold is now a FIXED,
+/// small constant (default 256) instead of growing with the memtable. This
+/// caps the per-read `unsorted_lookup` linear scan (×16 shards) at a constant
+/// independent of memtable size — the q4/q9 heavy-join freeze was this scan
+/// ramping 1→5.6 ms/probe as the buffer grew toward 4096. Env-overridable
+/// (`FRS_UNSORTED_CAP`) for A/B sweeps without a rebuild; clamped to
+/// `[16, MAX_UNSORTED_MERGE_THRESHOLD]`. Read once via `OnceLock`.
+fn unsorted_merge_cap() -> usize {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("FRS_UNSORTED_CAP")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(16, MAX_UNSORTED_MERGE_THRESHOLD))
+            .unwrap_or(256)
+    })
+}
 
 /// Per-key entry in the hash index. For small values (≤ INLINE_THRESHOLD bytes),
 /// the latest version's value is stored inline to avoid dereferencing through
@@ -96,7 +132,15 @@ pub struct VectorizedMemTable {
 
     // -- Indexes --
     /// Sorted index: key -> list of RowIndex (multi-version, newest first after merge).
-    sorted_index: BTreeMap<Vec<u8>, Vec<RowIndex>>,
+    ///
+    /// FRS-SCAN-ARCKEY (2026-05-30): keys are `Arc<[u8]>` (was `Vec<u8>`) so the
+    /// prefix/range scan-cursor snapshot — rebuilt on EVERY prefix scan, and q9's
+    /// ROW_NUMBER rank re-scans the same partition once per record (~O(K²)) — does a
+    /// cheap `Arc::clone` (refcount bump) per matching key instead of
+    /// `Arc::<[u8]>::from(key.as_slice())` (heap alloc + memcpy of the key). Reads are
+    /// unchanged: `Arc<[u8]>: Borrow<[u8]>`, so `get`/`get_mut`/`range::<[u8],_>` still
+    /// probe by borrowed slice. Aligns with the "no heap copies / zero-copy" principle.
+    sorted_index: BTreeMap<Arc<[u8]>, Vec<RowIndex>>,
     /// Number of rows covered by the sorted index.
     sorted_count: u32,
 
@@ -129,10 +173,6 @@ pub struct VectorizedMemTable {
     ///   case (all values ≤64B inlined) — still within a 128 MiB memtable budget.
     hash_index: HashMap<Box<[u8]>, HashEntry>,
 
-    /// Prefix index for O(1) prefix scan. Maps prefix bytes → set of full keys
-    /// that share that prefix. The prefix is extracted as everything up to and
-    /// including the last '/' byte in the key. Keys without '/' are not indexed.
-    prefix_index: HashMap<Box<[u8]>, Vec<Arc<[u8]>>>,
 
     // -- State --
     /// Current sequence counter (incremented on each insert).
@@ -176,10 +216,14 @@ impl VectorizedMemTable {
             sorted_index: BTreeMap::new(),
             sorted_count: 0,
             unsorted_entries: Vec::with_capacity(INIT_ROWS_HINT),
-            unsorted_lookup: HashMap::with_capacity(INIT_ROWS_HINT),
+            // FxHashMap has no `with_capacity` (custom hasher) — use
+            // with_capacity_and_hasher with the default FxBuildHasher.
+            unsorted_lookup: HashMap::with_capacity_and_hasher(
+                INIT_ROWS_HINT,
+                Default::default(),
+            ),
             rowindex_vec_pool: Vec::new(),
-            hash_index: HashMap::with_capacity(INIT_ROWS_HINT),
-            prefix_index: HashMap::with_capacity(INIT_ROWS_HINT),
+            hash_index: HashMap::with_capacity_and_hasher(INIT_ROWS_HINT, Default::default()),
             next_sequence: 1,
             memory_used: 0,
             frozen: false,
@@ -304,16 +348,36 @@ impl VectorizedMemTable {
         // Persistent hash index: always append so get() is O(1).
         // Also maintain the inline value cache for the latest version.
         //
+        // B-R12-H1: capture whether this write IS the new latest BEFORE
+        // mutating the hash entry. Used below to gate the prefix_index
+        // update so a late-arriving lower-seq write does not stomp the
+        // prefix-index bucket — symmetric to B11-H1's inline-cache
+        // gate, but on the prefix-scan-visibility path.
+        let is_new_latest;
         if let Some(entry) = self.hash_index.get_mut(key) {
             entry.row_indices.push(row_index);
-            entry.latest_seq = seq;
-            entry.latest_op = op_type_byte;
-            if op_type_byte == OpType::Put as u8
-                && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-            {
-                entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
-            } else {
-                entry.inline_value = None; // tombstone or oversized
+            // B11-H1: only update the latest-seq cache when this write's
+            // seq is strictly newer than the cached one. The engine
+            // allocates seqs lock-free (D1) BEFORE acquiring the shard
+            // lock, so two concurrent same-shard writers can land in
+            // opposite seq order — without this gate, the late-arriving
+            // lower-seq write would unconditionally overwrite the
+            // already-cached higher-seq value, making `get(key,
+            // u64::MAX)` return the stale value PERSISTENTLY (until the
+            // next write to that key). `row_indices.push` is
+            // unconditional — every version stays in the columnar
+            // storage; only the inline-cache fast path needs the gate.
+            is_new_latest = seq > entry.latest_seq;
+            if is_new_latest {
+                entry.latest_seq = seq;
+                entry.latest_op = op_type_byte;
+                if op_type_byte == OpType::Put as u8
+                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                {
+                    entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
+                } else {
+                    entry.inline_value = None; // tombstone or oversized
+                }
             }
         } else {
             let inline_value = if op_type_byte == OpType::Put as u8
@@ -332,58 +396,38 @@ impl VectorizedMemTable {
                     latest_op: op_type_byte,
                 },
             );
+            is_new_latest = true; // first write, always wins
         }
 
-        // Prefix index: maintain mapping from prefix → full keys.
-        //
-        // C8-H2 fix: the gate on whether to re-add the key on Put used to be
-        // `hash_index.get(key).row_indices.len() <= 1` — i.e. "is this a
-        // logically new key in the hash index?". That fails the
-        // Put → Delete → Put-within-same-memtable resurrection case: the
-        // hash_index still has BOTH version rows (Put and Delete) so
-        // row_indices.len() == 2, the Put branch is skipped, BUT the Delete
-        // branch already removed the key from the prefix_index bucket. Result:
-        // the resurrected Put is invisible to `prefix_scan_iter*`.
-        //
-        // Correct gate: check actual presence in the prefix_index bucket. If
-        // the bucket is missing or the key is not in it, add it. Same idiom
-        // for the per-prefix `Box::from(prefix)` alloc-only-on-miss.
-        if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
-            let prefix = &key[..=last_slash];
-            if op_type == OpType::Delete || op_type == OpType::SingleDelete {
-                if let Some(keys) = self.prefix_index.get_mut(prefix) {
-                    keys.retain(|k| &**k != key);
-                }
-            } else if op_type == OpType::Put || op_type == OpType::Merge {
-                let needs_insert = self
-                    .prefix_index
-                    .get(prefix)
-                    .map(|v| !v.iter().any(|k| &**k == key))
-                    .unwrap_or(true);
-                if needs_insert {
-                    // PERF (C7-H2): `HashMap::entry(K)` consumes the key
-                    // unconditionally — for an existing-prefix hit the
-                    // `Box::from(prefix)` allocation would be wasted and
-                    // immediately dropped. Use the `get_mut`-then-`insert`
-                    // idiom so we only allocate the prefix `Box<[u8]>` when
-                    // the bucket is genuinely new. Hot on Q12 where many
-                    // rows share the same composite-key prefix.
-                    let key_arc = Arc::<[u8]>::from(key);
-                    if let Some(slot) = self.prefix_index.get_mut(prefix) {
-                        slot.push(key_arc);
-                    } else {
-                        self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
-                    }
-                }
-            }
-        }
+        // 2026-05-29 PERF: prefix_index maintenance REMOVED. The prefix-scan
+        // read fast path that consumed it was deleted by S3-MAPITER-FIX (see
+        // `prefix_scan_keys` — it now does a byte-range scan over sorted_index,
+        // never reading prefix_index). The maintenance was therefore pure
+        // dead-weight, AND its Put membership check (`v.iter().any(|k| ..)`)
+        // was an O(bucket) linear scan → O(N²) for N keys under one prefix —
+        // exactly the million-key streaming-join MapState pattern (q4/q7/q9/
+        // q15-q19). Eliminating it removes the dominant `batch_insert` cost
+        // for those queries. `is_new_latest` is still used above to gate the
+        // inline-value cache.
+        let _ = is_new_latest;
 
         // Update memory tracking (approximate).
         self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
 
         // Check if merge is needed.
-        let merge_threshold =
-            ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
+        //
+        // FRS-UNSORTED-FIXEDCAP (2026-06-01): the prior threshold grew with the
+        // memtable — `(sorted_count × ratio).clamp(1024, 4096)`. A live FRS-ITER-DIAG
+        // profile of q4 (cache-bypass, S3) showed `build_lazy_prefix_key_stream`
+        // spending 1–5.6 ms PER PROBE even when the prefix matched 0–1 keys and there
+        // were ZERO SST/resident tiers — because `prefix_scan_keys` linearly scans
+        // `unsorted_lookup` on EVERY read, ×16 shards, and the proportional threshold
+        // let that buffer grow 1024→4096 as the memtable filled. The Join thread
+        // (285K rec/s of probes) then saturated CPU and the source froze.
+        // A FIXED, small cap decouples the per-read scan from memtable size. The
+        // amortized WRITE cost is unchanged: a merge drains `cap` entries every `cap`
+        // inserts = O(log N)/insert regardless of `cap`. Env-tunable for A/B sweeps.
+        let merge_threshold = unsorted_merge_cap();
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -457,14 +501,33 @@ impl VectorizedMemTable {
     /// `Vec<u8>` for the sorted index — this is a one-time per-key conversion
     /// (no per-row alloc on the hot path) and `Box<[u8]> -> Vec<u8>` is a
     /// pointer/length copy without re-allocation.
+    /// FRS-PERF: drain the unsorted buffer into `sorted_index` only if it is
+    /// non-empty. Called on the prefix-scan path so `prefix_scan_keys` does an
+    /// O(log N + K) sorted-range scan instead of iterating the ENTIRE
+    /// `unsorted_lookup` HashMap on every call. Without this, q3's streaming
+    /// join (interleaved person writes → unsorted buffer, auction prefix-scans)
+    /// was O(reads × unsorted_size) ≈ O(N²) — the fix-#4 (`S3-MAPITER-FIX`)
+    /// regression that removed the prefix_index fast path and fell back to the
+    /// full-unsorted filter. Draining first keeps the scan cost proportional to
+    /// the result set, and the merge cost is amortized across writes.
+    #[inline]
+    pub fn merge_if_dirty(&mut self) {
+        if !self.unsorted_lookup.is_empty() {
+            self.merge_unsorted_to_sorted();
+        }
+    }
+
     pub fn merge_unsorted_to_sorted(&mut self) {
         // Cap pool size to avoid unbounded memory retention if a workload
         // produces a huge spike of unique keys then quiesces.
         const POOL_CAP: usize = 4096;
 
         for (key, mut indices) in self.unsorted_lookup.drain() {
-            let owned_key: Vec<u8> = key.into_vec();
-            match self.sorted_index.get_mut(&owned_key) {
+            // FRS-SCAN-ARCKEY: probe by borrowed slice (`&*key` : `&[u8]`); on insert
+            // convert the `Box<[u8]>` straight into `Arc<[u8]>` via `Arc::from`, which
+            // REUSES the box's heap allocation (no copy) — strictly cheaper than the
+            // prior `key.into_vec()` + owned-Vec insert.
+            match self.sorted_index.get_mut(&*key) {
                 Some(entry) => {
                     entry.append(&mut indices);
                     entry.sort_by_key(|idx| Reverse(idx.sequence));
@@ -476,7 +539,7 @@ impl VectorizedMemTable {
                 None => {
                     // Sort by sequence descending so newest is first.
                     indices.sort_by_key(|idx| Reverse(idx.sequence));
-                    self.sorted_index.insert(owned_key, indices);
+                    self.sorted_index.insert(Arc::from(key), indices);
                 }
             }
         }
@@ -509,7 +572,102 @@ impl VectorizedMemTable {
                 "MemTable must be frozen before flushing",
             ));
         }
+        self.build_sorted_batches(batch_size)
+    }
 
+    /// FRS-CKPT-NOFLUSH (2026-06-01): serialise the LIVE memtable's contents to
+    /// the same sorted Arrow `RecordBatch`es as [`to_flush_batches`], WITHOUT
+    /// freezing/sealing it — the memtable remains the active, writable, in-RAM
+    /// structure after the call.
+    ///
+    /// This is the engine primitive for checkpoint-without-flush: the
+    /// checkpoint serialises the memtable to an Arrow-IPC artifact for
+    /// durability while keeping the single unfragmented memtable resident for
+    /// reads (the ckpt-OFF fast path), instead of folding it into an L0 SST on
+    /// S3 (which fragments the memtable and forces the heavy-join decode tax —
+    /// the ckpt-ON collapse). It merges the unsorted insert buffer into the
+    /// sorted index first (idempotent, content-neutral — same logical state);
+    /// the caller MUST hold the memtable exclusively for the duration (Flink's
+    /// synchronous snapshot phase runs single-threaded per slot, so no
+    /// concurrent writer races this).
+    ///
+    /// Round-trips exactly with [`Self::batch_insert`] of the produced rows
+    /// (key, value, seq, op_type) into a fresh memtable — verified by
+    /// `snapshot_batches_round_trips_all_versions`.
+    pub fn snapshot_batches(&mut self, batch_size: usize) -> ForstResult<Vec<RecordBatch>> {
+        self.snapshot_batches_bounded(batch_size, None)
+    }
+
+    /// As [`Self::snapshot_batches`] but only includes entries with
+    /// `sequence <= max_seq` when `max_seq` is `Some` — the consistent
+    /// snapshot cut for checkpoint-without-flush (see
+    /// [`Self::build_sorted_batches_bounded`]).
+    pub fn snapshot_batches_bounded(
+        &mut self,
+        batch_size: usize,
+        max_seq: Option<u64>,
+    ) -> ForstResult<Vec<RecordBatch>> {
+        // Fold the unsorted buffer in so the serialisation sees every entry via
+        // the sorted index. Safe on a non-frozen memtable; leaves it writable.
+        self.merge_unsorted_to_sorted();
+        self.build_sorted_batches_bounded(batch_size, max_seq)
+    }
+
+    /// Streaming variant of [`Self::snapshot_batches_bounded`]: hands each sorted
+    /// batch to `emit` and drops it before building the next, so peak memory is
+    /// one batch rather than the whole memtable as a `Vec<RecordBatch>`. Used by
+    /// the checkpoint-without-flush snapshot to stream a multi-GB memtable to an
+    /// Arrow-IPC file without doubling RAM. Like `snapshot_batches_bounded`, it
+    /// folds the unsorted buffer in first and leaves the memtable writable.
+    pub fn snapshot_batches_bounded_for_each<F: FnMut(RecordBatch) -> ForstResult<()>>(
+        &mut self,
+        batch_size: usize,
+        max_seq: Option<u64>,
+        emit: F,
+    ) -> ForstResult<()> {
+        self.merge_unsorted_to_sorted();
+        self.for_each_sorted_batch_bounded(batch_size, max_seq, emit)
+    }
+
+    /// Shared batch builder for [`to_flush_batches`] / [`snapshot_batches`]:
+    /// emits rows from `sorted_index` in (key ASC, sequence DESC) order, all
+    /// versions per key. Requires the unsorted buffer to already be merged.
+    fn build_sorted_batches(&self, batch_size: usize) -> ForstResult<Vec<RecordBatch>> {
+        self.build_sorted_batches_bounded(batch_size, None)
+    }
+
+    /// Shared batch builder with an optional `max_seq` visibility bound: when
+    /// `Some(s)`, rows with `sequence > s` are SKIPPED. This gives a consistent
+    /// snapshot cut for checkpoint-without-flush — the async snapshot phase runs
+    /// after the engine snapshot pinned seq `s`, but the live memtable also holds
+    /// post-barrier writes (seq > s) belonging to the NEXT checkpoint; including
+    /// them would make the artifact inconsistent with the pinned SST set.
+    fn build_sorted_batches_bounded(
+        &self,
+        batch_size: usize,
+        max_seq: Option<u64>,
+    ) -> ForstResult<Vec<RecordBatch>> {
+        let mut batches = Vec::new();
+        self.for_each_sorted_batch_bounded(batch_size, max_seq, |b| {
+            batches.push(b);
+            Ok(())
+        })?;
+        Ok(batches)
+    }
+
+    /// FRS-CKPT-NOFLUSH streaming snapshot (2026-06-01): builds the same sorted
+    /// batches as [`Self::build_sorted_batches_bounded`] but hands each batch to
+    /// `emit` and DROPS it before building the next, so peak memory is one batch
+    /// (~`MAX_BATCH_BYTES`) rather than the whole memtable materialized as a
+    /// `Vec<RecordBatch>`. The checkpoint-without-flush snapshot uses this to
+    /// stream a multi-GB memtable to an Arrow-IPC file without doubling RAM
+    /// (the OOM that forced a small memtable + heavy-query spill collapse).
+    fn for_each_sorted_batch_bounded<F: FnMut(RecordBatch) -> ForstResult<()>>(
+        &self,
+        batch_size: usize,
+        max_seq: Option<u64>,
+        mut emit: F,
+    ) -> ForstResult<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("key", DataType::Binary, false),
             Field::new("value", DataType::Binary, true),
@@ -517,36 +675,63 @@ impl VectorizedMemTable {
             Field::new("op_type", DataType::UInt8, false),
         ]));
 
-        // Collect all rows in sorted order: key ASC, sequence DESC.
+        // Collect all rows in sorted order: key ASC, sequence DESC. Skip rows
+        // newer than `max_seq` (the pinned snapshot cut) when bounded.
         let mut sorted_rows: Vec<(u32, u64)> = Vec::new();
         for indices in self.sorted_index.values() {
             for idx in indices {
+                if let Some(s) = max_seq {
+                    if idx.sequence > s {
+                        continue;
+                    }
+                }
                 sorted_rows.push((idx.offset, idx.sequence));
             }
         }
 
         // Build batches.
-        let mut batches = Vec::new();
+        //
+        // FRS-ARROW-OFFSET-FIX (2026-06-01): Arrow `Binary` columns use i32
+        // value offsets, so ONE batch's key (or value) column cannot exceed
+        // 2 GiB of bytes — `BinaryBuilder::finish` panics with "byte array
+        // offset overflow" otherwise. With a large memtable (e.g. a 4 GiB
+        // writebuffer.size, or a single-shard memtable holding GiBs) and a
+        // `usize::MAX` `batch_size` (the flush/snapshot per-shard call), one
+        // batch would hold the whole shard and overflow — the q9 crash at the
+        // memtable spill. Split a batch when EITHER `batch_size` rows OR
+        // ~1.5 GiB of key+value bytes is reached (keeps each column < 1.5 GiB <
+        // 2 GiB). At least one row per batch always (a single >1.5 GiB row is
+        // not representable here, but MAX_VALUE_LEN bounds values well below).
+        const MAX_BATCH_BYTES: usize = 1_500_000_000;
         let mut row_idx = 0;
 
         while row_idx < sorted_rows.len() {
-            let chunk_end = (row_idx + batch_size).min(sorted_rows.len());
             let mut key_builder = BinaryBuilder::new();
             let mut value_builder = BinaryBuilder::new();
             let mut seq_builder = UInt64Builder::new();
             let mut op_builder = UInt8Builder::new();
+            let mut acc_bytes = 0usize;
+            let mut n = 0usize;
 
-            for &(offset, _seq) in &sorted_rows[row_idx..chunk_end] {
+            while row_idx < sorted_rows.len() && n < batch_size {
+                let (offset, _seq) = sorted_rows[row_idx];
                 let key = self.key_at(offset);
+                let vlen = self.value_at(offset).map_or(0, |v| v.len());
+                // Split BEFORE this row if it would push the batch over the
+                // byte cap — but always include at least one row.
+                if n > 0 && acc_bytes + key.len() + vlen > MAX_BATCH_BYTES {
+                    break;
+                }
                 key_builder.append_value(key);
-
                 match self.value_at(offset) {
                     Some(v) => value_builder.append_value(v),
                     None => value_builder.append_null(),
                 }
-
                 seq_builder.append_value(self.sequences[offset as usize]);
                 op_builder.append_value(self.op_types[offset as usize]);
+                acc_bytes += key.len() + vlen;
+                n += 1;
+                row_idx += 1;
             }
 
             let batch = RecordBatch::try_new(
@@ -560,11 +745,10 @@ impl VectorizedMemTable {
             )
             .map_err(|e| forst_rs_common::ForstError::corruption(format!("Arrow error: {}", e)))?;
 
-            batches.push(batch);
-            row_idx = chunk_end;
+            emit(batch)?;
         }
 
-        Ok(batches)
+        Ok(())
     }
 
     /// Collects all entries for keys in the `[lower, upper)` range as
@@ -583,19 +767,71 @@ impl VectorizedMemTable {
     /// but emits no per-row temporary `Vec<u8>` downstream.
     #[inline]
     pub fn prefix_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Arc<[u8]>> {
-        // Fast path: if lower ends with '/' and upper is the prefix_upper_bound,
-        // use the prefix_index for O(1) lookup.
-        if lower.last() == Some(&b'/') {
-            if let Some(keys) = self.prefix_index.get(lower) {
-                // Zero memory-copy on the hot path: each Arc::clone is an
-                // atomic refcount bump that shares the original key bytes
-                // owned by the prefix-index.
-                return keys.iter().map(Arc::clone).collect();
-            }
-            return Vec::new();
-        }
-        // Fallback: merge sorted_index range + unsorted_lookup filter (no temp BTreeMap)
+        // S3-MAPITER-FIX: the prefix_index fast path is UNSOUND for MapState
+        // iteration and has been removed.
+        //
+        // Root cause: `prefix_index` buckets each key under
+        // `key[..=last('/')]` (see the field doc + the insert path around
+        // L377). A Flink MapState composite key is
+        // `"k/" + serialize(K) + "/" + stateName + "/" + serialize(UK)`, and the
+        // iter prefix produced by `ForStRsMapStateV2.getIterPrefix` is
+        // `"k/" + serialize(K) + "/" + stateName + "/"` (ends in '/'). When the
+        // serialized user-key `serialize(UK)` contains a '/' (0x2f) byte — which
+        // is common for variable-length user keys such as the RowData records
+        // Nexmark q3's streaming-join MapState stores — the FULL key's LAST '/'
+        // falls INSIDE the user-key, so the key is bucketed under a LONGER
+        // prefix and is therefore ABSENT from the `prefix_index.get(iterPrefix)`
+        // bucket. The old fast path returned only that (incomplete) bucket, so a
+        // memtable-served prefix scan SILENTLY DROPPED every entry whose user-key
+        // contained '/', and returned a key set inconsistent with the SST tier.
+        //
+        // The SST tier (db.rs `TierKeySource::Sst`) and the immutable-memtable
+        // path correctly enumerate the byte-range `[lower, prefix_upper_bound)`,
+        // which returns every key starting with `lower`. The two tiers therefore
+        // DISAGREED: local benches kept data in the active memtable (buggy fast
+        // path → under-read), but on S3 the data is flushed to SSTs (correct
+        // byte-range → full set), surfacing the cross-tier inconsistency as a
+        // corrupt/mis-aligned iteration result and an EOFException when the
+        // RowData user-key serializer reads a wrongly-bounded byte region.
+        //
+        // The byte-range traversal below is provably correct (it is the same
+        // semantics the SST tier and `range_scan_keys` use) and keeps memtable
+        // scans consistent with every other tier. Cost is O(log N + K) over the
+        // sorted_index rather than O(1), which is acceptable: prefix scans are
+        // the MapState iteration path, not the point-lookup hot path.
+        //
+        // Merge sorted_index range + unsorted_lookup filter (no temp BTreeMap).
         let mut keys: Vec<Arc<[u8]>> = Vec::new();
+        // S3-MAPITER-FIX: when the caller passes `upper = None` we must still
+        // bound the scan to keys that START WITH `lower` (prefix semantics) —
+        // the removed fast path enforced this implicitly via the exact-prefix
+        // bucket lookup. A bare `[lower, Unbounded)` range would over-return
+        // every key sorted after the prefix. Derive the exclusive prefix upper
+        // bound from `lower` (increment the last non-0xff byte) so the prefix
+        // contract is preserved regardless of how the caller bounds the scan.
+        // The production caller (`build_lazy_prefix_key_stream`) already passes
+        // a concrete `prefix_upper_bound`, so this only tightens the `None` case.
+        let derived_upper: Option<Vec<u8>> = match upper {
+            Some(_) => None,
+            None => {
+                let mut hi = lower.to_vec();
+                while let Some(&last) = hi.last() {
+                    if last == 0xff {
+                        hi.pop();
+                    } else {
+                        let idx = hi.len() - 1;
+                        hi[idx] = last + 1;
+                        break;
+                    }
+                }
+                if hi.is_empty() {
+                    None
+                } else {
+                    Some(hi)
+                }
+            }
+        };
+        let effective_upper: Option<&[u8]> = upper.or(derived_upper.as_deref());
         // sorted_index is already sorted — range query is O(log N + K).
         // PR-C5-H2: range over `&[u8]` bounds directly. `BTreeMap<Vec<u8>, _>`
         // accepts borrowed slices via the `Borrow<[u8]>` impl on `Vec<u8>`,
@@ -603,6 +839,46 @@ impl VectorizedMemTable {
         // (hot on Q11/Q12 when MapStateCache is bypassed — one alloc pair
         // per prefix_scan_keys call).
         use std::ops::Bound;
+        let range_iter = match effective_upper {
+            Some(hi) => self
+                .sorted_index
+                .range::<[u8], _>((Bound::Included(lower), Bound::Excluded(hi))),
+            None => self
+                .sorted_index
+                .range::<[u8], _>((Bound::Included(lower), Bound::Unbounded)),
+        };
+        for (key, _) in range_iter {
+            // FRS-SCAN-ARCKEY: refcount bump, not heap alloc + memcpy (key is Arc<[u8]>).
+            keys.push(Arc::clone(key));
+        }
+        // Merge unsorted entries (already checked for prefix match)
+        let prev_len = keys.len();
+        for key in self.unsorted_lookup.keys() {
+            let k: &[u8] = key;
+            if k >= lower && effective_upper.is_none_or(|hi| k < hi) {
+                keys.push(Arc::<[u8]>::from(k));
+            }
+        }
+        // Only sort+dedup if we added unsorted entries
+        if keys.len() > prev_len {
+            keys.sort();
+            keys.dedup();
+        }
+        keys
+    }
+
+    /// B-R7-NEW-H1: range-bounded variant of [`Self::prefix_scan_keys`] used
+    /// by the lazy range-scan path (`DbImpl::scan_iter`). Identical to
+    /// `prefix_scan_keys` for the sorted_index + unsorted_lookup paths, but
+    /// SKIPS the `prefix_index` fast path entirely — a general `[lower, upper)`
+    /// range scan cannot reuse the prefix-index shortcut because that shortcut
+    /// keys on `lower` ending with `/` and returns ALL keys with that prefix
+    /// without honouring `upper`. For range semantics we must always traverse
+    /// the sorted_index range so the `upper` bound is enforced exactly.
+    #[inline]
+    pub fn range_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Arc<[u8]>> {
+        use std::ops::Bound;
+        let mut keys: Vec<Arc<[u8]>> = Vec::new();
         let range_iter = match upper {
             Some(hi) => self
                 .sorted_index
@@ -612,9 +888,9 @@ impl VectorizedMemTable {
                 .range::<[u8], _>((Bound::Included(lower), Bound::Unbounded)),
         };
         for (key, _) in range_iter {
-            keys.push(Arc::<[u8]>::from(key.as_slice()));
+            // FRS-SCAN-ARCKEY: refcount bump, not heap alloc + memcpy (key is Arc<[u8]>).
+            keys.push(Arc::clone(key));
         }
-        // Merge unsorted entries (already checked for prefix match)
         let prev_len = keys.len();
         for key in self.unsorted_lookup.keys() {
             let k: &[u8] = key;
@@ -622,7 +898,6 @@ impl VectorizedMemTable {
                 keys.push(Arc::<[u8]>::from(k));
             }
         }
-        // Only sort+dedup if we added unsorted entries
         if keys.len() > prev_len {
             keys.sort();
             keys.dedup();
@@ -648,7 +923,8 @@ impl VectorizedMemTable {
         // into the sorted index yet.
         let mut combined: BTreeMap<&[u8], Vec<RowIndex>> = BTreeMap::new();
         for (k, idxs) in self.sorted_index.iter() {
-            combined.insert(k.as_slice(), idxs.clone());
+            // FRS-SCAN-ARCKEY: `k` is `&Arc<[u8]>`; deref to `&[u8]` for the temp map.
+            combined.insert(&**k, idxs.clone());
         }
         for (k, idxs) in self.unsorted_lookup.iter() {
             // PERF (B2): `k` is `Box<[u8]>` — deref to `&[u8]` directly.
@@ -968,16 +1244,25 @@ impl VectorizedMemTable {
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
+            // B-R12-H1: capture `is_new_latest` for prefix_index gate.
+            let is_new_latest;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
-                entry.latest_seq = seq;
-                entry.latest_op = op_types[i];
-                if op_types[i] == OpType::Put as u8
-                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
-                } else {
-                    entry.inline_value = None;
+                // B11-H1: gate cache mutation on seq monotonicity to
+                // defend against out-of-order seq allocation under
+                // D1's lock-free seq allocation. See put_with_seq for
+                // detailed rationale.
+                is_new_latest = seq > entry.latest_seq;
+                if is_new_latest {
+                    entry.latest_seq = seq;
+                    entry.latest_op = op_types[i];
+                    if op_types[i] == OpType::Put as u8
+                        && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                    {
+                        entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
+                    } else {
+                        entry.inline_value = None;
+                    }
                 }
             } else {
                 let inline_value = if op_types[i] == OpType::Put as u8
@@ -996,6 +1281,7 @@ impl VectorizedMemTable {
                         latest_op: op_types[i],
                     },
                 );
+                is_new_latest = true;
             }
 
             // Prefix index: maintain mapping from prefix → full keys.
@@ -1005,43 +1291,17 @@ impl VectorizedMemTable {
             // the per-shard O(log N + K) sorted_index merge). Replicate the
             // single-write maintenance block here.
             //
-            // C8-H2 fix: switch the Put gate from `was_new_key` (a hash_index
-            // signal) to a real presence check against the prefix_index bucket
-            // so a Put → Delete → Put-within-same-memtable resurrection still
-            // re-adds the key to the prefix_index. Without this fix the second
-            // Put silently vanishes from `prefix_scan_iter*`.
-            if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
-                let prefix = &key[..=last_slash];
-                if op_type == OpType::Delete || op_type == OpType::SingleDelete {
-                    if let Some(keys) = self.prefix_index.get_mut(prefix) {
-                        keys.retain(|k| &**k != key);
-                    }
-                } else if op_type == OpType::Put || op_type == OpType::Merge {
-                    let needs_insert = self
-                        .prefix_index
-                        .get(prefix)
-                        .map(|v| !v.iter().any(|k| &**k == key))
-                        .unwrap_or(true);
-                    if needs_insert {
-                        // PERF (C7-H2): get_mut-then-insert so a same-prefix
-                        // burst (e.g. all rows in this batch share `ns/`) only
-                        // pays the `Box::from(prefix)` allocation once.
-                        let key_arc = Arc::<[u8]>::from(key);
-                        if let Some(slot) = self.prefix_index.get_mut(prefix) {
-                            slot.push(key_arc);
-                        } else {
-                            self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
-                        }
-                    }
-                }
-            }
+            // 2026-05-29 PERF: prefix_index maintenance REMOVED here too (see the
+            // batch_insert site above) — the O(N²) dead-weight on the join
+            // insert hot path. `is_new_latest` still gates the inline cache.
+            let _ = is_new_latest;
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
 
         // Check merge threshold.
         let merge_threshold =
-            ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
+            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -1143,16 +1403,25 @@ impl VectorizedMemTable {
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
+            // B-R12-H1: capture `is_new_latest` for prefix_index gate.
+            let is_new_latest;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
-                entry.latest_seq = seq;
-                entry.latest_op = op_types[i];
-                if op_types[i] == OpType::Put as u8
-                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
-                } else {
-                    entry.inline_value = None;
+                // B11-H1: gate cache mutation on seq monotonicity to
+                // defend against out-of-order seq allocation under
+                // D1's lock-free seq allocation. See put_with_seq for
+                // detailed rationale.
+                is_new_latest = seq > entry.latest_seq;
+                if is_new_latest {
+                    entry.latest_seq = seq;
+                    entry.latest_op = op_types[i];
+                    if op_types[i] == OpType::Put as u8
+                        && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                    {
+                        entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
+                    } else {
+                        entry.inline_value = None;
+                    }
                 }
             } else {
                 let inline_value = if op_types[i] == OpType::Put as u8
@@ -1171,45 +1440,170 @@ impl VectorizedMemTable {
                         latest_op: op_types[i],
                     },
                 );
+                is_new_latest = true;
             }
 
-            // Prefix index: PR-B7-H3 — replicate single-write maintenance so
-            // the prefix-index fast path in `prefix_scan_keys` activates after
-            // sharded engine batches too (the per-shard sub-batches reach the
-            // memtable through this variant).
-            //
-            // C8-H2 fix: gate the Put add on actual prefix_index bucket
-            // membership (not on a hash_index-derived flag) so a
-            // Put → Delete → Put-within-same-memtable sequence still
-            // re-registers the resurrected key.
-            if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
-                let prefix = &key[..=last_slash];
-                if op_type == OpType::Delete || op_type == OpType::SingleDelete {
-                    if let Some(keys) = self.prefix_index.get_mut(prefix) {
-                        keys.retain(|k| &**k != key);
-                    }
-                } else if op_type == OpType::Put || op_type == OpType::Merge {
-                    let needs_insert = self
-                        .prefix_index
-                        .get(prefix)
-                        .map(|v| !v.iter().any(|k| &**k == key))
-                        .unwrap_or(true);
-                    if needs_insert {
-                        let key_arc = Arc::<[u8]>::from(key);
-                        if let Some(slot) = self.prefix_index.get_mut(prefix) {
-                            slot.push(key_arc);
-                        } else {
-                            self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
-                        }
-                    }
-                }
-            }
+            // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight
+            // on the sharded-batch insert path; see batch_insert site).
+            let _ = is_new_latest;
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
 
         let merge_threshold =
-            ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
+            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
+        if self.unsorted_entries.len() > merge_threshold {
+            self.merge_unsorted_to_sorted();
+        }
+        Ok(count)
+    }
+
+    /// B-R12-NEW-H1: indexed variant of [`Self::batch_insert_with_explicit_seqs`]
+    /// that reads the row payload from `keys[indices[i]]`/`values[indices[i]]`/
+    /// `op_types[indices[i]]` and derives the per-row seq as
+    /// `base_seq + indices[i] as u64`. This is the contract used by the
+    /// per-shard dispatch in [`crate::memtable::ShardedMemTable`]: the caller
+    /// reserves a global seq range with one `fetch_add(N)`, partitions row
+    /// indices by shard, and dispatches each shard's index slice WITHOUT
+    /// re-materialising the per-shard `Vec<&[u8]>` / `Vec<Option<&[u8]>>` /
+    /// `Vec<u8>` / `Vec<u64>` intermediates the pre-fix `PerShardBatch` struct
+    /// allocated.
+    ///
+    /// All preconditions and semantics match `batch_insert_with_explicit_seqs`
+    /// except the row payload is sourced via `keys[indices[i]]` etc. and seqs
+    /// are derived from `base_seq + indices[i]`.
+    pub fn batch_insert_with_explicit_seqs_via_indices(
+        &mut self,
+        keys: &[&[u8]],
+        values: &[Option<&[u8]>],
+        op_types: &[u8],
+        indices: &[usize],
+        base_seq: u64,
+    ) -> ForstResult<usize> {
+        if self.frozen {
+            return Err(forst_rs_common::ForstError::FrozenMemTable);
+        }
+        if keys.len() != values.len() || keys.len() != op_types.len() {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "batch_insert_with_explicit_seqs_via_indices: keys/values/op_types must have the same length",
+            ));
+        }
+        let count = indices.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        // Validate every op_type byte (atomic — rejects the whole batch on first invalid byte).
+        for (k, &idx) in indices.iter().enumerate() {
+            if idx >= op_types.len() {
+                return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                    "batch_insert_with_explicit_seqs_via_indices: indices[{}]={} out of bounds (len={})",
+                    k, idx, op_types.len()
+                )));
+            }
+            let b = op_types[idx];
+            if OpType::from_u8(b).is_none() {
+                return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                    "batch_insert_with_explicit_seqs_via_indices: invalid op_type byte {} at indices[{}]={} (expected 0=Delete, 1=Put, 2=Merge, 7=SingleDelete)",
+                    b, k, idx
+                )));
+            }
+        }
+
+        // Bump next_sequence to one past the highest seq we'll write.
+        // seqs are derived as base_seq + indices[i]; the max is base_seq + max(indices).
+        let max_idx = *indices.iter().max().expect("count > 0");
+        let max_seq = base_seq + max_idx as u64;
+        if self.next_sequence <= max_seq {
+            self.next_sequence = max_seq + 1;
+        }
+        let base_offset = self.sequences.len() as u32;
+
+        for (k, &idx) in indices.iter().enumerate() {
+            let key = keys[idx];
+            let value = values[idx];
+            let seq = base_seq + idx as u64;
+            let row_offset = base_offset + k as u32;
+
+            self.key_data.extend_from_slice(key);
+            self.key_offsets.push(self.key_data.len() as u32);
+
+            match value {
+                Some(v) => {
+                    self.value_data.extend_from_slice(v);
+                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_nulls.push(false);
+                }
+                None => {
+                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_nulls.push(true);
+                }
+            }
+
+            self.sequences.push(seq);
+            self.op_types.push(op_types[idx]);
+            let op_type = OpType::from_u8(op_types[idx])
+                .expect("op_type byte was validated above the loop");
+            let row_index = RowIndex {
+                offset: row_offset,
+                sequence: seq,
+                op_type,
+            };
+
+            self.unsorted_entries.push(row_offset);
+            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
+                slot.push(row_index);
+            } else {
+                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
+                slot.push(row_index);
+                self.unsorted_lookup.insert(Box::from(key), slot);
+            }
+
+            // Persistent hash index: always append so get() is O(1).
+            // B-R12-H1: capture `is_new_latest` for prefix_index gate.
+            let is_new_latest;
+            if let Some(entry) = self.hash_index.get_mut(key) {
+                entry.row_indices.push(row_index);
+                // B11-H1: gate cache mutation on seq monotonicity.
+                is_new_latest = seq > entry.latest_seq;
+                if is_new_latest {
+                    entry.latest_seq = seq;
+                    entry.latest_op = op_types[idx];
+                    if op_types[idx] == OpType::Put as u8
+                        && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                    {
+                        entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
+                    } else {
+                        entry.inline_value = None;
+                    }
+                }
+            } else {
+                let inline_value = if op_types[idx] == OpType::Put as u8
+                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                {
+                    value.map(|v| v.to_vec().into_boxed_slice())
+                } else {
+                    None
+                };
+                self.hash_index.insert(
+                    Box::from(key),
+                    HashEntry {
+                        row_indices: vec![row_index],
+                        inline_value,
+                        latest_seq: seq,
+                        latest_op: op_types[idx],
+                    },
+                );
+                is_new_latest = true;
+            }
+
+            // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight).
+            let _ = is_new_latest;
+
+            self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
+        }
+
+        let merge_threshold =
+            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -1265,6 +1659,193 @@ impl VectorizedMemTable {
     /// partial column mutation).
     ///
     /// Returns the number of rows inserted (= `batch.num_rows()`).
+    /// B-R13-NEW-H2: zero-copy multi-shard dispatch. Reads keys / values /
+    /// ops directly from the Arrow columns at the supplied `indices`
+    /// (non-contiguous, e.g. when sharding scatters rows across shards) and
+    /// applies each row's explicit `seqs[i]`.
+    ///
+    /// Pre-fix the multi-shard path in `ShardedMemTable::batch_put_arrow_with_base_seq`
+    /// decomposed the Arrow columns into per-shard `Vec<&[u8]>`/
+    /// `Vec<Option<&[u8]>>`/`Vec<u8>`/`Vec<u64>` intermediates before
+    /// dispatching into `batch_insert_with_explicit_seqs` — defeating the
+    /// columnar zero-copy contract. This path keeps the Arrow buffers as
+    /// the source of truth and reads via `value_offsets()`/`value_data()`
+    /// directly. Per-row writes into `key_data` / `value_data` are
+    /// unavoidable when the source rows are non-contiguous; the savings are
+    /// the 4 per-shard Vec allocations + the per-row pointer-deref chain.
+    pub fn batch_put_arrow_indices_with_explicit_seqs(
+        &mut self,
+        batch: &RecordBatch,
+        indices: &[usize],
+        seqs: &[u64],
+    ) -> ForstResult<usize> {
+        if self.frozen {
+            return Err(forst_rs_common::ForstError::FrozenMemTable);
+        }
+        if indices.len() != seqs.len() {
+            return Err(forst_rs_common::ForstError::invalid_argument(
+                "batch_put_arrow_indices_with_explicit_seqs: indices.len() != seqs.len()",
+            ));
+        }
+        let count = indices.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        if batch.num_columns() != 3 {
+            return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                "batch_put_arrow_indices: expected 3 columns; got {}",
+                batch.num_columns()
+            )));
+        }
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                forst_rs_common::ForstError::invalid_argument(
+                    "batch_put_arrow_indices: column 0 must be BinaryArray (key)",
+                )
+            })?;
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| {
+                forst_rs_common::ForstError::invalid_argument(
+                    "batch_put_arrow_indices: column 1 must be BinaryArray (value)",
+                )
+            })?;
+        let ops = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt8Array>()
+            .ok_or_else(|| {
+                forst_rs_common::ForstError::invalid_argument(
+                    "batch_put_arrow_indices: column 2 must be UInt8Array (op_type)",
+                )
+            })?;
+        let op_values: &[u8] = ops.values();
+        // Validate op_types at the sparse indices.
+        for (k, &i) in indices.iter().enumerate() {
+            if i >= ops.len() {
+                return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                    "batch_put_arrow_indices: index[{}]={} out of bounds (len={})",
+                    k,
+                    i,
+                    ops.len()
+                )));
+            }
+            if OpType::from_u8(op_values[i]).is_none() {
+                return Err(forst_rs_common::ForstError::invalid_argument(format!(
+                    "batch_put_arrow_indices: invalid op_type byte {} at source row {}",
+                    op_values[i], i
+                )));
+            }
+        }
+
+        let max_seq = *seqs.iter().max().expect("count > 0");
+        if self.next_sequence <= max_seq {
+            self.next_sequence = max_seq + 1;
+        }
+        let base_offset = self.sequences.len() as u32;
+
+        for k in 0..count {
+            let i = indices[k];
+            let seq = seqs[k];
+            let row_offset = base_offset + k as u32;
+            let key = keys.value(i);
+            let op_byte = op_values[i];
+            let op_type = OpType::from_u8(op_byte)
+                .expect("op_type byte validated above");
+            let value_opt: Option<&[u8]> = if values.is_null(i) {
+                None
+            } else {
+                Some(values.value(i))
+            };
+
+            // Columnar extends (per-row but reading directly from Arrow accessors).
+            self.key_data.extend_from_slice(key);
+            self.key_offsets.push(self.key_data.len() as u32);
+            match value_opt {
+                Some(v) => {
+                    self.value_data.extend_from_slice(v);
+                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_nulls.push(false);
+                }
+                None => {
+                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_nulls.push(true);
+                }
+            }
+            self.sequences.push(seq);
+            self.op_types.push(op_byte);
+
+            let row_index = RowIndex {
+                offset: row_offset,
+                sequence: seq,
+                op_type,
+            };
+            self.unsorted_entries.push(row_offset);
+            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
+                slot.push(row_index);
+            } else {
+                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
+                slot.push(row_index);
+                self.unsorted_lookup.insert(Box::from(key), slot);
+            }
+
+            // hash_index + inline-cache (B11-H1 gated)
+            let is_new_latest;
+            if let Some(entry) = self.hash_index.get_mut(key) {
+                entry.row_indices.push(row_index);
+                is_new_latest = seq > entry.latest_seq;
+                if is_new_latest {
+                    entry.latest_seq = seq;
+                    entry.latest_op = op_byte;
+                    if op_byte == OpType::Put as u8
+                        && value_opt.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                    {
+                        entry.inline_value = value_opt.map(|v| v.to_vec().into_boxed_slice());
+                    } else {
+                        entry.inline_value = None;
+                    }
+                }
+            } else {
+                let inline_value = if op_byte == OpType::Put as u8
+                    && value_opt.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                {
+                    value_opt.map(|v| v.to_vec().into_boxed_slice())
+                } else {
+                    None
+                };
+                self.hash_index.insert(
+                    Box::from(key),
+                    HashEntry {
+                        row_indices: vec![row_index],
+                        inline_value,
+                        latest_seq: seq,
+                        latest_op: op_byte,
+                    },
+                );
+                is_new_latest = true;
+            }
+
+            // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight).
+            let _ = is_new_latest;
+
+            self.memory_used += key.len()
+                + value_opt.map(|v| v.len()).unwrap_or(0)
+                + 8 + 1 + 48;
+        }
+
+        let merge_threshold =
+            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
+        if self.unsorted_entries.len() > merge_threshold {
+            self.merge_unsorted_to_sorted();
+        }
+        Ok(count)
+    }
+
     pub fn batch_put_arrow_with_base_seq(
         &mut self,
         batch: &RecordBatch,
@@ -1434,16 +2015,22 @@ impl VectorizedMemTable {
             } else {
                 Some(values.value(i))
             };
+            let is_new_latest;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
-                entry.latest_seq = seq;
-                entry.latest_op = op_values[i];
-                if op_values[i] == OpType::Put as u8
-                    && val_bytes.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    entry.inline_value = val_bytes.map(|v| v.to_vec().into_boxed_slice());
-                } else {
-                    entry.inline_value = None;
+                // B11-H1: gate cache mutation on seq monotonicity.
+                // See put_with_seq for detailed rationale.
+                is_new_latest = seq > entry.latest_seq;
+                if is_new_latest {
+                    entry.latest_seq = seq;
+                    entry.latest_op = op_values[i];
+                    if op_values[i] == OpType::Put as u8
+                        && val_bytes.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
+                    {
+                        entry.inline_value = val_bytes.map(|v| v.to_vec().into_boxed_slice());
+                    } else {
+                        entry.inline_value = None;
+                    }
                 }
             } else {
                 let inline_value = if op_values[i] == OpType::Put as u8
@@ -1462,40 +2049,12 @@ impl VectorizedMemTable {
                         latest_op: op_values[i],
                     },
                 );
+                is_new_latest = true;
             }
 
-            // Prefix index: PR-B7-H3 — the FFM zero-copy Arrow batch-write
-            // hot path (Q12 / batchedPutArrow) is the primary reason C6-H3
-            // exists. Without this maintenance block the fast path in
-            // `prefix_scan_keys` always missed and silently fell back to the
-            // sorted_index merge — dead code in production.
-            //
-            // C8-H2 fix: gate Put add on prefix_index bucket membership so
-            // Put → Delete → Put-within-same-memtable resurrection re-adds
-            // the key. The previous `was_new_key` flag was a hash_index
-            // signal that does not match the prefix_index lifecycle.
-            if let Some(last_slash) = key.iter().rposition(|&b| b == b'/') {
-                let prefix = &key[..=last_slash];
-                if op_type == OpType::Delete || op_type == OpType::SingleDelete {
-                    if let Some(keys) = self.prefix_index.get_mut(prefix) {
-                        keys.retain(|k| &**k != key);
-                    }
-                } else if op_type == OpType::Put || op_type == OpType::Merge {
-                    let needs_insert = self
-                        .prefix_index
-                        .get(prefix)
-                        .map(|v| !v.iter().any(|k| &**k == key))
-                        .unwrap_or(true);
-                    if needs_insert {
-                        let key_arc = Arc::<[u8]>::from(key);
-                        if let Some(slot) = self.prefix_index.get_mut(prefix) {
-                            slot.push(key_arc);
-                        } else {
-                            self.prefix_index.insert(Box::from(prefix), vec![key_arc]);
-                        }
-                    }
-                }
-            }
+            // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight
+            // on the Arrow zero-copy batch-write path; see batch_insert site).
+            let _ = is_new_latest;
 
             // Approximate memory accounting matching put()/batch_insert().
             let v_len = if values.is_null(i) {
@@ -1508,7 +2067,7 @@ impl VectorizedMemTable {
 
         // 6. Merge threshold (same logic as batch_insert).
         let merge_threshold =
-            ((self.sorted_count as f64) * self.config.unsorted_merge_ratio).max(1024.0) as usize;
+            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -1578,11 +2137,105 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_batches_bounded_excludes_newer_seqs() {
+        use arrow::array::UInt64Array;
+        // Entries at seq 1,2,5,8. A bound of 5 must include only seq <= 5.
+        let mut mt = VectorizedMemTable::new(test_config());
+        mt.batch_insert_with_explicit_seqs(
+            &[b"a", b"b", b"c", b"d"],
+            &[Some(b"1".as_ref()), Some(b"2".as_ref()), Some(b"5".as_ref()), Some(b"8".as_ref())],
+            &[1u8, 1u8, 1u8, 1u8],
+            &[1u64, 2u64, 5u64, 8u64],
+        )
+        .unwrap();
+        let bounded = mt.snapshot_batches_bounded(64, Some(5)).expect("bounded");
+        let mut seqs = Vec::new();
+        for b in &bounded {
+            let s = b.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                seqs.push(s.value(i));
+            }
+        }
+        seqs.sort_unstable();
+        assert_eq!(seqs, vec![1, 2, 5], "seq 8 (> bound) must be excluded");
+        // Unbounded includes all four.
+        let all = mt.snapshot_batches_bounded(64, None).expect("unbounded");
+        let total: usize = all.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
     fn test_new_memtable_empty() {
         let mt = VectorizedMemTable::new(test_config());
         assert_eq!(mt.num_entries(), 0);
         assert_eq!(mt.memory_usage(), 0);
         assert!(!mt.is_frozen());
+    }
+
+    #[test]
+    fn snapshot_batches_round_trips_all_versions_and_keeps_memtable_live() {
+        use arrow::array::UInt8Array;
+        // Source memtable: multi-version key (k1 @seq1=Put, @seq5=Put), a
+        // tombstone (k2 @seq3=Delete, value None), a plain key (k3 @seq2=Put),
+        // and some entries left in the UNSORTED buffer (no freeze) to prove
+        // snapshot_batches merges them.
+        let mut src = VectorizedMemTable::new(test_config());
+        src.batch_insert_with_explicit_seqs(
+            &[b"k1", b"k3", b"k1"],
+            &[Some(b"v1a".as_ref()), Some(b"v3".as_ref()), Some(b"v1b".as_ref())],
+            &[1u8, 1u8, 1u8], // Put, Put, Put
+            &[1u64, 2u64, 5u64],
+        )
+        .unwrap();
+        // Tombstone for k2, inserted separately so it lands in the unsorted zone.
+        src.batch_insert_with_explicit_seqs(&[b"k2"], &[None], &[0u8], &[3u64]).unwrap();
+
+        // Snapshot the LIVE memtable (must NOT require freeze).
+        assert!(!src.is_frozen());
+        let batches = src.snapshot_batches(4).expect("snapshot_batches");
+
+        // The memtable must remain live + writable + readable after snapshot.
+        assert!(!src.is_frozen(), "snapshot_batches must not seal the memtable");
+        src.put(b"k4", Some(b"v4"), 1).expect("memtable still writable after snapshot");
+        assert!(src.get(b"k1", 100).unwrap().is_some(), "reads still work after snapshot");
+
+        // Replay the batches into a fresh memtable via explicit seqs.
+        let mut dst = VectorizedMemTable::new(test_config());
+        let mut total_rows = 0;
+        for b in &batches {
+            let keys = b.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            let vals = b.column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
+            let seqs = b.column(2).as_any().downcast_ref::<arrow::array::UInt64Array>().unwrap();
+            let ops = b.column(3).as_any().downcast_ref::<UInt8Array>().unwrap();
+            for i in 0..b.num_rows() {
+                let k = keys.value(i).to_vec();
+                let v: Option<Vec<u8>> = if vals.is_null(i) { None } else { Some(vals.value(i).to_vec()) };
+                dst.batch_insert_with_explicit_seqs(
+                    &[k.as_slice()],
+                    &[v.as_deref()],
+                    &[ops.value(i)],
+                    &[seqs.value(i)],
+                )
+                .unwrap();
+                total_rows += 1;
+            }
+        }
+        assert!(total_rows >= 4, "expected >=4 rows serialised (k1×2, k2, k3)");
+
+        // Multi-version visibility must be byte-identical between src and dst at
+        // every interesting read sequence (snapshot reads resolve newest <= seq).
+        for &rs in &[0u64, 1, 2, 3, 4, 5, 100] {
+            for key in [b"k1".as_ref(), b"k2".as_ref(), b"k3".as_ref()] {
+                let a = src.get(key, rs).unwrap().map(|r| (r.value.clone(), r.op_type));
+                let b = dst.get(key, rs).unwrap().map(|r| (r.value.clone(), r.op_type));
+                assert_eq!(a, b, "mismatch key={:?} read_seq={}", key, rs);
+            }
+        }
+        // Spot-check the actual resolved values.
+        assert_eq!(src.get(b"k1", 1).unwrap().unwrap().value.as_deref(), Some(b"v1a".as_ref()));
+        assert_eq!(dst.get(b"k1", 5).unwrap().unwrap().value.as_deref(), Some(b"v1b".as_ref()));
+        // k2 tombstone at seq>=3 resolves to a Delete.
+        assert_eq!(dst.get(b"k2", 3).unwrap().unwrap().op_type, OpType::Delete);
     }
 
     #[test]
@@ -2245,9 +2898,17 @@ mod tests {
         let ops = vec![0u8; 1000];
 
         mt.batch_insert(&key_refs, &val_refs, &ops).unwrap();
-        // All 1000 should be in unsorted_lookup (no merge yet).
-        assert_eq!(mt.unsorted_lookup.len(), 1000);
-        assert_eq!(mt.sorted_count, 0);
+        // FRS-UNSORTED-FIXEDCAP: with the fixed merge cap (default 256), the
+        // 1000-key batch crosses the cap and merges into `sorted_index`, so we
+        // no longer assert "all in unsorted_lookup / sorted_count==0". The real
+        // invariant — every one of the 1000 unique keys round-trips through
+        // batch_insert + (now also) merge + get — is asserted below, with the
+        // total live key count split across both tiers.
+        assert_eq!(
+            mt.unsorted_lookup.len() + mt.sorted_count as usize,
+            1000,
+            "all 1000 unique keys must be live across unsorted+sorted"
+        );
 
         for i in 0..1000u32 {
             let key = format!("uniq_{:06}", i);
@@ -2262,25 +2923,29 @@ mod tests {
     #[test]
     fn test_b2_unsorted_lookup_repeated_keys_no_realloc() {
         let mut mt = VectorizedMemTable::new(test_config());
-        // 100 distinct keys, each updated 10 times — `get_mut` path on every
-        // update after the first.
+        // FRS-UNSORTED-FIXEDCAP: 20 distinct keys × 10 rounds = 200 inserts,
+        // kept under the default merge cap (256) so NO merge fires and the
+        // in-`unsorted_lookup` multi-version `get_mut`-same-slot path is
+        // exercised exactly as before. (Above the cap, versions are correctly
+        // drained into `sorted_index` — covered by the merge tests + the
+        // final `get()` latest-version assertion here.)
         for round in 0..10u32 {
-            for i in 0..100u32 {
+            for i in 0..20u32 {
                 let k = format!("rep_{:03}", i);
                 let v = format!("v{:02}_r{}", i, round);
                 mt.put(k.as_bytes(), Some(v.as_bytes()), 1).unwrap();
             }
         }
-        // 1000 inserts but only 100 distinct keys in the lookup.
-        assert_eq!(mt.unsorted_lookup.len(), 100);
+        // 200 inserts but only 20 distinct keys in the lookup.
+        assert_eq!(mt.unsorted_lookup.len(), 20);
         // Each lookup slot should hold all 10 versions.
-        for i in 0..100u32 {
+        for i in 0..20u32 {
             let k = format!("rep_{:03}", i);
             let slot = mt.unsorted_lookup.get(k.as_bytes()).unwrap();
             assert_eq!(slot.len(), 10, "key {} should have 10 versions", k);
         }
         // Latest version must come back from get().
-        for i in 0..100u32 {
+        for i in 0..20u32 {
             let k = format!("rep_{:03}", i);
             let expected = format!("v{:02}_r9", i);
             let r = mt.get(k.as_bytes(), u64::MAX).unwrap().unwrap();
@@ -2881,118 +3546,6 @@ mod tests {
         assert_eq!(r.sequence, 1);
     }
 
-    // === PR-B7-H3: prefix_index population on batch-insert paths ===
-
-    /// Batch-inserts with composite-key pattern `prefix/X` must populate the
-    /// `prefix_index` so the C6-H3 fast path in `prefix_scan_keys` actually
-    /// activates. Pre-fix, the 3 batch paths skipped prefix_index maintenance
-    /// entirely — the fast path was dead code on Q12's batch-write hot path.
-    #[test]
-    fn batch_insert_populates_prefix_index_for_slash_terminated_prefixes() {
-        // --- variant 1: batch_insert_with_base_seq (default sharding path) ---
-        let mut mt = VectorizedMemTable::new(test_config());
-        let keys_owned: Vec<Vec<u8>> = (0..256)
-            .map(|i| format!("prefix/{:04}", i).into_bytes())
-            .collect();
-        let vals_owned: Vec<Vec<u8>> = (0..256u32).map(|i| i.to_le_bytes().to_vec()).collect();
-        let key_refs: Vec<&[u8]> = keys_owned.iter().map(|k| k.as_slice()).collect();
-        let val_refs: Vec<Option<&[u8]>> = vals_owned.iter().map(|v| Some(v.as_slice())).collect();
-        let ops: Vec<u8> = vec![OpType::Put as u8; 256];
-
-        let inserted = mt
-            .batch_insert_with_base_seq(&key_refs, &val_refs, &ops, 1)
-            .unwrap();
-        assert_eq!(inserted, 256);
-
-        // FAST PATH ASSERTION: prefix_index must have a single bucket keyed by
-        // `prefix/` containing all 256 keys.
-        let bucket = mt
-            .prefix_index
-            .get(b"prefix/".as_slice())
-            .expect("prefix_index must contain `prefix/` after batch insert");
-        assert_eq!(
-            bucket.len(),
-            256,
-            "all 256 batch-inserted keys must be registered in prefix_index"
-        );
-
-        // Behavioural: prefix_scan_keys hits the fast path (lower ends with `/`)
-        // and returns exactly the 256 keys (Arc::clone, no byte-copy).
-        let scan_keys = mt.prefix_scan_keys(b"prefix/", None);
-        assert_eq!(scan_keys.len(), 256, "fast-path scan must return all keys");
-
-        // --- variant 2: batch_insert_with_explicit_seqs (sharded engine path) ---
-        let mut mt2 = VectorizedMemTable::new(test_config());
-        let seqs: Vec<u64> = (1..=256u64).collect();
-        mt2.batch_insert_with_explicit_seqs(&key_refs, &val_refs, &ops, &seqs)
-            .unwrap();
-        let bucket2 = mt2
-            .prefix_index
-            .get(b"prefix/".as_slice())
-            .expect("explicit-seqs path must also populate prefix_index");
-        assert_eq!(bucket2.len(), 256);
-        assert_eq!(mt2.prefix_scan_keys(b"prefix/", None).len(), 256);
-
-        // --- variant 3: batch_put_arrow_with_base_seq (FFM zero-copy path) ---
-        let mut mt3 = VectorizedMemTable::new(test_config());
-        let mut kb = BinaryBuilder::new();
-        let mut vb = BinaryBuilder::new();
-        let mut ob = UInt8Builder::new();
-        for i in 0..256 {
-            kb.append_value(&keys_owned[i]);
-            vb.append_value(&vals_owned[i]);
-            ob.append_value(OpType::Put as u8);
-        }
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("key", DataType::Binary, false),
-            Field::new("value", DataType::Binary, true),
-            Field::new("op_type", DataType::UInt8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(kb.finish()),
-                Arc::new(vb.finish()),
-                Arc::new(ob.finish()),
-            ],
-        )
-        .unwrap();
-        mt3.batch_put_arrow_with_base_seq(&batch, 1).unwrap();
-        let bucket3 = mt3
-            .prefix_index
-            .get(b"prefix/".as_slice())
-            .expect("arrow batch path must also populate prefix_index");
-        assert_eq!(bucket3.len(), 256);
-        assert_eq!(mt3.prefix_scan_keys(b"prefix/", None).len(), 256);
-
-        // --- de-dup check: re-inserting the same keys must NOT double-count.
-        // (Mirrors the single-write `is_new_key` gate so updates to an existing
-        // composite key don't grow the bucket.)
-        mt.batch_insert_with_base_seq(&key_refs, &val_refs, &ops, 1000)
-            .unwrap();
-        let bucket_after_update = mt.prefix_index.get(b"prefix/".as_slice()).unwrap();
-        assert_eq!(
-            bucket_after_update.len(),
-            256,
-            "re-inserting existing keys must not duplicate prefix_index entries"
-        );
-
-        // --- mixed-prefix sanity: a second prefix must produce a second bucket.
-        let mixed_keys_owned: Vec<Vec<u8>> = (0..4)
-            .map(|i| format!("other/{}", i).into_bytes())
-            .collect();
-        let mixed_key_refs: Vec<&[u8]> = mixed_keys_owned.iter().map(|k| k.as_slice()).collect();
-        let mixed_vals: Vec<Option<&[u8]>> = vec![Some(b"x".as_slice()); 4];
-        let mixed_ops: Vec<u8> = vec![OpType::Put as u8; 4];
-        mt.batch_insert_with_base_seq(&mixed_key_refs, &mixed_vals, &mixed_ops, 2000)
-            .unwrap();
-        assert_eq!(mt.prefix_index.get(b"other/".as_slice()).unwrap().len(), 4);
-        // Original bucket still 256, untouched.
-        assert_eq!(
-            mt.prefix_index.get(b"prefix/".as_slice()).unwrap().len(),
-            256
-        );
-    }
 
     /// C8-H2 regression test: Put → Delete → Put-within-same-memtable must
     /// re-register the key in the prefix_index. Before the fix the second
@@ -3062,6 +3615,60 @@ mod tests {
             keys4.iter().any(|k| &**k == key),
             "batch_put_arrow_with_base_seq Put→Delete→Put must leave key visible; got {:?}",
             keys4
+        );
+    }
+
+    /// S3-MAPITER-FIX regression: a MapState composite key whose serialized
+    /// user-key contains a '/' (0x2f) byte must still be returned by a prefix
+    /// scan over the state prefix. The removed `prefix_index` fast path bucketed
+    /// by the LAST '/' in the full key, so such a key landed in a deeper bucket
+    /// and was silently dropped from `prefix_scan_keys(state_prefix)` — making
+    /// the active-memtable scan disagree with the SST tier (which uses the
+    /// correct `[prefix, prefix_upper_bound)` byte-range) and surfacing on S3 as
+    /// a corrupt / EOFException MapState iteration.
+    #[test]
+    fn prefix_scan_returns_keys_with_slash_inside_user_key() {
+        let mut mt = VectorizedMemTable::new(test_config());
+        // Composite key layout mirrors ForStRsMapStateV2:
+        //   "k/" + serialize(K) + "/" + stateName + "/" + serialize(UK)
+        // where serialize(UK) contains an embedded '/' (0x2f).
+        let prefix: &[u8] = b"k/KEY/join-records/";
+        let key_plain: &[u8] = b"k/KEY/join-records/userA"; // no '/' in UK
+        let key_with_slash: &[u8] = b"k/KEY/join-records/user/B"; // '/' inside UK
+        let key_two_slashes: &[u8] = b"k/KEY/join-records/a/b/c"; // multiple '/'
+
+        mt.put(key_plain, Some(b"1"), OpType::Put as u8).unwrap();
+        mt.put(key_with_slash, Some(b"1"), OpType::Put as u8).unwrap();
+        mt.put(key_two_slashes, Some(b"1"), OpType::Put as u8)
+            .unwrap();
+
+        let keys = mt.prefix_scan_keys(prefix, None);
+        assert!(
+            keys.iter().any(|k| &**k == key_plain),
+            "plain UK key must be visible; got {:?}",
+            keys
+        );
+        assert!(
+            keys.iter().any(|k| &**k == key_with_slash),
+            "UK-with-embedded-slash key must be visible (S3-MAPITER-FIX); got {:?}",
+            keys
+        );
+        assert!(
+            keys.iter().any(|k| &**k == key_two_slashes),
+            "UK-with-multiple-slashes key must be visible (S3-MAPITER-FIX); got {:?}",
+            keys
+        );
+        assert_eq!(keys.len(), 3, "exactly the 3 prefixed keys; got {:?}", keys);
+
+        // A foreign key under a different state prefix must NOT leak in.
+        mt.put(b"k/KEY/other-state/x", Some(b"1"), OpType::Put as u8)
+            .unwrap();
+        let keys2 = mt.prefix_scan_keys(prefix, None);
+        assert_eq!(
+            keys2.len(),
+            3,
+            "foreign-prefix key must be excluded; got {:?}",
+            keys2
         );
     }
 

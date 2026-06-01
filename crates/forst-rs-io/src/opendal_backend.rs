@@ -52,17 +52,19 @@
 //! paths are rejected with [`ForstError::invalid_argument`]. Directory
 //! operations append a trailing `/` to satisfy OpenDAL's convention.
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use std::time::Duration;
 
 use bytes::Buf;
 use forst_rs_common::error::{ForstError, ForstResult};
 use opendal::layers::{BlockingLayer, RetryLayer};
-use opendal::{ErrorKind as OdErrorKind, Metakey, Operator};
+use opendal::{ErrorKind as OdErrorKind, Executor, Metakey, Operator};
 use tokio::runtime::{Handle, Runtime};
+use tokio::sync::Semaphore;
 
 use crate::filesystem::{
     FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile, WriteMode,
@@ -161,10 +163,49 @@ fn path_str<'a>(path: &'a Path, context: &str) -> ForstResult<&'a str> {
 /// or one of the convenience constructors ([`OpendalFileSystem::memory`],
 /// [`OpendalFileSystem::local`], [`OpendalFileSystem::s3`]) to build one
 /// from common settings.
+/// 2026-05-29 WRITE-BACK FLUSH: outcome of one async upload, broadcast to ALL
+/// awaiters. `Result<(), String>` (not `ForstResult`) because the value must be
+/// `Clone` to fan out through a `watch` channel and `ForstError` is not `Clone`.
+/// Upload failures are only ever Io/corruption (never NotFound), so collapsing
+/// the error to a string and re-wrapping as `ForstError::Io` in `await_upload`
+/// loses no semantically-meaningful classification.
+type UploadOutcome = Result<(), String>;
+
+/// 2026-05-29 WRITE-BACK FLUSH: registry of in-flight asynchronous SST/MANIFEST
+/// uploads, keyed by the object path.
+///
+/// 2026-05-29 RACE FIX: previously stored a single-consume `JoinHandle`, which
+/// `await_upload` would `remove()` then join OUTSIDE the lock. Under concurrent
+/// readers (parallelism ≥ 2) a second `await_upload(P)` arriving after the
+/// `remove` but before the join completed found NO handle, returned `Ok(())`
+/// early, and read the S3 object that the first awaiter's upload had NOT yet
+/// finished writing → `NotFound` → fatal `frs_vectorized_batch_get rc=1`. Now a
+/// `watch::Receiver` whose value transitions `None → Some(outcome)` when the
+/// spawned upload task completes; EVERY awaiter clones the receiver and blocks
+/// until the outcome is published, so no awaiter can race ahead of the upload.
+type PendingUploads =
+    Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<UploadOutcome>>>>>;
+
+/// 2026-05-29 WRITE-BACK FLUSH: cap on concurrent in-flight buffered uploads.
+/// Each spawned upload acquires one permit before touching S3 and releases it
+/// on completion, providing backpressure so a slow S3 endpoint cannot let an
+/// unbounded number of serialized SSTs accumulate in memory (each in-flight
+/// upload holds its whole buffered SST plus ~`S3_WRITE_CONCURRENCY *
+/// S3_WRITE_CHUNK_BYTES` of multipart parts). 8 concurrent SST uploads bounds
+/// resident upload memory at roughly `8 * (SST_size + 128 MiB)`.
+const MAX_INFLIGHT_UPLOADS: usize = 8;
+
 pub struct OpendalFileSystem {
     op: Operator,
     rt: RuntimeHandle,
     name: String,
+    /// 2026-05-29 WRITE-BACK FLUSH: in-flight async upload registry. Shared
+    /// (cloned) into every [`OpendalWritableFile`] so the writer can register
+    /// its spawned upload, and consulted by `await_upload`/`await_all_uploads`.
+    pending: PendingUploads,
+    /// 2026-05-29 WRITE-BACK FLUSH: backpressure semaphore limiting concurrent
+    /// in-flight buffered uploads to [`MAX_INFLIGHT_UPLOADS`].
+    upload_sem: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for OpendalFileSystem {
@@ -276,7 +317,13 @@ impl OpendalFileSystem {
         // multiplicative behaviour is the actual semantics, and the
         // wording here now matches.
         let op = op.layer(default_retry_layer());
-        Ok(Self { op, rt, name })
+        Ok(Self {
+            op,
+            rt,
+            name,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
+        })
     }
 
     /// Wraps an existing [`opendal::Operator`] WITHOUT attaching the
@@ -289,7 +336,13 @@ impl OpendalFileSystem {
     pub fn with_operator_no_retry(op: Operator) -> ForstResult<Self> {
         let rt = RuntimeHandle::acquire()?;
         let name = format!("OpendalFileSystem({})", op.info().scheme().into_static());
-        Ok(Self { op, rt, name })
+        Ok(Self {
+            op,
+            rt,
+            name,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
+        })
     }
 
     /// Constructs an OpenDAL filesystem backed by the in-memory service.
@@ -484,8 +537,78 @@ impl SequentialFile for OpendalSequentialFile {
 /// every positioned read. `size` is cached from a single `stat` at open.
 pub struct OpendalRandomAccessFile {
     op: opendal::BlockingOperator,
+    /// Async operator clone used by [`read_ranges`] to issue concurrent
+    /// ranged GETs on the bridged runtime. Cheap to clone (an `Arc`
+    /// internally).
+    ///
+    /// [`read_ranges`]: RandomAccessFile::read_ranges
+    op_async: opendal::Operator,
+    /// Runtime handle to drive concurrent reads to completion. Cloned from
+    /// the backend's `RuntimeHandle`; `Send`/`Sync`.
+    handle: Handle,
     path: String,
     size: u64,
+}
+
+/// Per-range short-read window for the async ranged-GET helper. Mirrors the
+/// constant in `read_at`: large single ranged GETs are exactly where
+/// OpenDAL 0.50.2 / non-AWS S3 (BOS) truncate the tail, so we stitch 4 MiB
+/// windows back together.
+const READ_WINDOW: u64 = 4 * 1024 * 1024;
+/// Bounded empty-reply retries before declaring corruption (mirrors `read_at`).
+const MAX_EMPTY_RETRIES: u32 = 16;
+/// Max number of ranged GETs in flight at once. Capped to avoid exhausting
+/// the S3 endpoint / connection pool — the Nexmark harness already competes
+/// for that pool.
+const READ_RANGES_CONCURRENCY: usize = 8;
+
+/// Reads `[offset, offset+len)` fully from `op_async` at `path`, applying the
+/// same windowed short-read loop + bounded empty-retry guard as the
+/// synchronous `read_at`. Returns the bytes actually read (EOF-shortened if
+/// the range runs past `size`). `size` is the cached object length.
+async fn read_range_async(
+    op_async: &opendal::Operator,
+    path: &str,
+    size: u64,
+    offset: u64,
+    len: usize,
+) -> ForstResult<Vec<u8>> {
+    if offset >= size || len == 0 {
+        return Ok(Vec::new());
+    }
+    let want = u64::try_from(len).unwrap_or(u64::MAX);
+    let end = offset.saturating_add(want).min(size);
+    let mut out: Vec<u8> = Vec::with_capacity(len.min((end - offset) as usize));
+    let mut cur = offset;
+    let mut empty_retries: u32 = 0;
+    while cur < end && (out.len() as u64) < (end - offset) {
+        let win_end = cur.saturating_add(READ_WINDOW).min(end);
+        let mut buffer = op_async
+            .read_with(path)
+            .range(cur..win_end)
+            .await
+            .map_err(|e| map_opendal_err(e, &format!("OpenDAL ranged read: {path}")))?;
+        let got = buffer.len();
+        if got == 0 {
+            empty_retries += 1;
+            if empty_retries > MAX_EMPTY_RETRIES {
+                return Err(ForstError::corruption(format!(
+                    "OpenDAL ranged read returned 0 bytes for {cur}..{end} of {path} \
+                     (size {size}) after {MAX_EMPTY_RETRIES} retries"
+                )));
+            }
+            continue;
+        }
+        empty_retries = 0;
+        // Clamp to the requested window so we never overshoot `end`.
+        let remaining = (end - cur) as usize;
+        let take = got.min(remaining);
+        let start = out.len();
+        out.resize(start + take, 0u8);
+        buffer.copy_to_slice(&mut out[start..start + take]);
+        cur = cur.saturating_add(take as u64);
+    }
+    Ok(out)
 }
 
 impl RandomAccessFile for OpendalRandomAccessFile {
@@ -495,20 +618,124 @@ impl RandomAccessFile for OpendalRandomAccessFile {
         }
         let want = u64::try_from(buf.len()).unwrap_or(u64::MAX);
         let end = offset.saturating_add(want).min(self.size);
-        let mut buffer = self
-            .op
-            .read_with(&self.path)
-            .range(offset..end)
-            .call()
-            .map_err(|e| map_opendal_err(e, &format!("OpenDAL ranged read: {}", self.path)))?;
-        // `opendal::Buffer` may be non-contiguous (a sequence of `Bytes`
-        // chunks). Going through `to_vec()` would force a contiguous copy
-        // into a fresh `Vec`, then a second copy into the caller's slice.
-        // `Buf::copy_to_slice` streams chunk-by-chunk directly into `buf` —
-        // one memcpy per chunk, no intermediate `Vec` allocation.
-        let n = buffer.len().min(buf.len());
-        buffer.copy_to_slice(&mut buf[..n]);
-        Ok(n)
+        // FRS-S3-SHORTREAD-FIX: LOOP until the requested [offset, end) range is
+        // fully read. A single `read_with().range().call()` on OpenDAL 0.50.2
+        // can return a SHORT (or transiently empty) `Buffer` for the tail of a
+        // large multipart object even though the object's `content_length`
+        // covers the whole range — the bytes ARE on S3, OpenDAL just hands them
+        // back in incomplete pieces. The pre-fix single-shot return truncated
+        // SSTs by tens of KB (dropping the trailing footer magic), surfacing as
+        // `Corruption("...short read")` / "missing trailing magic" and crashing
+        // q4/q7-style large-join-state reads. Each ranged GET that makes
+        // progress advances `cur`; a genuinely empty reply is retried a bounded
+        // number of times before we give up (so a real backend failure errors
+        // rather than silently truncating, and we never spin forever).
+        let mut filled: usize = 0;
+        let mut cur = offset;
+        let mut empty_retries: u32 = 0;
+        // `READ_WINDOW` / `MAX_EMPTY_RETRIES`: file-level consts shared with the
+        // async `read_range_async` helper so the serial and concurrent paths
+        // apply byte-identical windowing + empty-retry semantics.
+        while cur < end && filled < buf.len() {
+            let win_end = cur.saturating_add(READ_WINDOW).min(end);
+            let mut buffer = self
+                .op
+                .read_with(&self.path)
+                .range(cur..win_end)
+                .call()
+                .map_err(|e| map_opendal_err(e, &format!("OpenDAL ranged read: {}", self.path)))?;
+            let got = buffer.len();
+            if got == 0 {
+                empty_retries += 1;
+                if empty_retries > MAX_EMPTY_RETRIES {
+                    return Err(ForstError::corruption(format!(
+                        "OpenDAL ranged read returned 0 bytes for {cur}..{end} of {} \
+                         (size {}) after {MAX_EMPTY_RETRIES} retries",
+                        self.path, self.size
+                    )));
+                }
+                continue;
+            }
+            empty_retries = 0;
+            // `opendal::Buffer` may be non-contiguous; `copy_to_slice` streams
+            // chunk-by-chunk directly into `buf` with no intermediate Vec.
+            let n = got.min(buf.len() - filled);
+            buffer.copy_to_slice(&mut buf[filled..filled + n]);
+            filled += n;
+            cur = cur.saturating_add(n as u64);
+        }
+        Ok(filled)
+    }
+
+    /// Issues every range as a concurrent ranged GET on the bridged runtime,
+    /// capped at [`READ_RANGES_CONCURRENCY`] in flight. Returns one `Vec` per
+    /// range in input order, byte-identical to looping `read_at` serially.
+    fn read_ranges(&self, ranges: &[(u64, usize)]) -> ForstResult<Vec<Vec<u8>>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ranges.len() == 1 {
+            // Single range: no concurrency to win; reuse the helper directly.
+            let (off, len) = ranges[0];
+            let op_async = self.op_async.clone();
+            let path = self.path.clone();
+            let size = self.size;
+            let v = self
+                .handle
+                .block_on(async move { read_range_async(&op_async, &path, size, off, len).await })?;
+            return Ok(vec![v]);
+        }
+
+        // Spawn one task per range, tagged with its index so we can restore
+        // input order after `buffer_unordered`-style completion. We bound the
+        // number in flight via `buffered`-style chunking using a JoinSet plus
+        // an index→slot map; capping at READ_RANGES_CONCURRENCY avoids
+        // overwhelming the S3 connection pool.
+        let op_async = self.op_async.clone();
+        let path = self.path.clone();
+        let size = self.size;
+        let ranges = ranges.to_vec();
+
+        self.handle.block_on(async move {
+            let mut results: Vec<Option<Vec<u8>>> = vec![None; ranges.len()];
+            let mut join: tokio::task::JoinSet<(usize, ForstResult<Vec<u8>>)> =
+                tokio::task::JoinSet::new();
+            let mut next = 0usize;
+            // Prime the pipeline up to the concurrency cap.
+            while next < ranges.len() && join.len() < READ_RANGES_CONCURRENCY {
+                let (off, len) = ranges[next];
+                let idx = next;
+                let op_async = op_async.clone();
+                let path = path.clone();
+                join.spawn(async move {
+                    let r = read_range_async(&op_async, &path, size, off, len).await;
+                    (idx, r)
+                });
+                next += 1;
+            }
+            while let Some(joined) = join.join_next().await {
+                let (idx, r) = joined.map_err(|e| {
+                    ForstError::Io(std::io::Error::other(format!(
+                        "OpenDAL read_ranges task join: {e}"
+                    )))
+                })?;
+                results[idx] = Some(r?);
+                // Refill the pipeline to keep up to the cap in flight.
+                if next < ranges.len() {
+                    let (off, len) = ranges[next];
+                    let idx = next;
+                    let op_async = op_async.clone();
+                    let path = path.clone();
+                    join.spawn(async move {
+                        let r = read_range_async(&op_async, &path, size, off, len).await;
+                        (idx, r)
+                    });
+                    next += 1;
+                }
+            }
+            // Every slot must be filled (one task per index, all joined).
+            Ok(results.into_iter().map(|o| o.unwrap_or_default()).collect())
+        })
     }
 
     fn file_size(&self) -> ForstResult<u64> {
@@ -520,12 +747,76 @@ impl RandomAccessFile for OpendalRandomAccessFile {
 // WritableFile — streaming OpenDAL writer
 // ---------------------------------------------------------------------------
 
-/// A writable file that streams bytes to OpenDAL's blocking writer.
+/// FRS-S3-MULTIPART: minimum/target multipart part size. S3 requires parts
+/// in [5 MiB, 5 GiB]; 8 MiB amortizes per-request overhead while keeping
+/// per-part memory bounded under the concurrency factor below.
+const MULTIPART_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+/// FRS-S3-MULTIPART: number of part uploads dispatched concurrently per SST.
+/// Object stores scale write throughput with request concurrency, so an SST
+/// flush/compaction-output upload that was previously one-part-at-a-time now
+/// fans out this many parts in parallel. Bounded so per-writer peak memory is
+/// ~`MULTIPART_CHUNK_BYTES * WRITE_CONCURRENCY`.
+const WRITE_CONCURRENCY: usize = 4;
+
+/// 2026-05-29 FRS-S3-FLUSH-CONCURRENT: multipart params for the BUFFERED
+/// object-store write path (the active SST flush/compaction-output path).
+/// 16 MiB parts (vs OpenDAL's 5 MiB default) cut per-request overhead; 8-way
+/// concurrency (vs default 1 = sequential) is the throughput lever. Research
+/// (Velox 10 MiB sequential; AWS guidance 16-64 MiB / 8-16 concurrent;
+/// OpenDAL #5929) lands on 16 MiB × 8 as the throughput/memory sweet spot.
+/// Peak in-flight part memory ≈ 8 × 16 MiB = 128 MiB per concurrent SST write.
+const S3_WRITE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+const S3_WRITE_CONCURRENCY: usize = 8;
+
+/// The underlying OpenDAL writer driving an [`OpendalWritableFile`].
+///
+/// FRS-S3-MULTIPART: object-store CreateNew/CreateOrTruncate writes use the
+/// **async** [`opendal::Writer`] driven via `block_on`, because only the async
+/// builder exposes `.concurrent()` for parallel multipart part-uploads (the
+/// blocking builder in opendal 0.50 has no concurrency knob, and the
+/// `BlockingLayer` would `block_on` each `write()` individually, serializing
+/// parts). Local-FS / append-mode writes keep the proven blocking writer.
+enum WriterKind {
+    /// Async writer (object-store multipart); driven via the runtime handle.
+    Async(opendal::Writer),
+    /// Blocking writer (local FS, memory, or append mode) — self-driving.
+    Blocking(opendal::BlockingWriter),
+    /// FRS-S3-MULTIPART-TRUNC-FIX: object-store CreateNew/CreateOrTruncate
+    /// path. Buffers the whole object in memory, then on close does a SINGLE
+    /// `op.write(path, buf)` and VERIFIES the stored `content_length` equals
+    /// what we wrote. The previous streaming `.chunk()` multipart `Writer`
+    /// dropped the final part on `close()` against non-AWS S3 (BOS),
+    /// truncating SSTs (`"missing trailing magic"` → engine CORRUPTION/PANIC
+    /// on read-back) on the q4/q7/q9 heavy-join large-SST path. A single
+    /// buffered write is far more robust, and the post-write stat-verify turns
+    /// any residual truncation into a hard error (the SST is never published
+    /// with a bad footer) instead of silent data corruption. Memory is bounded
+    /// by the SST size (`target_file_size_base`, default 64 MiB).
+    Buffered {
+        op: opendal::Operator,
+        buf: Vec<u8>,
+    },
+}
+
+/// A writable file that streams bytes to OpenDAL.
 pub struct OpendalWritableFile {
     path: String,
-    writer: Option<opendal::BlockingWriter>,
+    writer: Option<WriterKind>,
+    /// Runtime handle used to drive the async writer's `write`/`close` to
+    /// completion. Cloned from the backend's [`RuntimeHandle`]. Cheap to hold
+    /// (a tokio `Handle` is an `Arc` internally) and `Send`/`Sync` so the
+    /// writable file can move across flush/compaction worker threads.
+    handle: Handle,
     bytes_written: u64,
     closed: bool,
+    /// 2026-05-29 WRITE-BACK FLUSH: shared registry of in-flight async uploads.
+    /// `Some` only for the buffered object-store path; the spawned upload+verify
+    /// JoinHandle is registered here on close so `await_upload`/`await_all_uploads`
+    /// can later block on it. `None` for blocking/append paths (synchronous).
+    pending: Option<PendingUploads>,
+    /// 2026-05-29 WRITE-BACK FLUSH: backpressure semaphore (clone of the
+    /// backend's). The spawned upload acquires a permit before touching S3.
+    upload_sem: Option<Arc<Semaphore>>,
 }
 
 impl WritableFile for OpendalWritableFile {
@@ -539,9 +830,36 @@ impl WritableFile for OpendalWritableFile {
         let writer = self.writer.as_mut().ok_or_else(|| {
             ForstError::invalid_argument(format!("OpenDAL writer missing: {}", self.path))
         })?;
-        writer
-            .write(data.to_vec())
-            .map_err(|e| map_opendal_err(e, &format!("OpenDAL streaming write: {}", self.path)))?;
+        // FRS-S3-MULTIPART-TRUNC-FIX: the buffered object-store path just
+        // accumulates bytes in memory; the single write + verify happens on
+        // close. Handle it before the Buffer materialization the streaming
+        // paths need.
+        if let WriterKind::Buffered { buf: acc, .. } = writer {
+            acc.extend_from_slice(data);
+            self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
+            return Ok(());
+        }
+        // B-C5R1-NEW-H5: skip the `to_vec()` materialization. OpenDAL's
+        // `write` accepts anything `Into<opendal::Buffer>`; `Buffer::from`
+        // takes a `Bytes` which can be built directly via
+        // `Bytes::copy_from_slice` (one heap alloc + one memcpy vs the
+        // prior `Vec::from(slice)` which copies into a fresh Vec then
+        // `Buffer::from(Vec)` re-allocs a Bytes from it).
+        let buf = opendal::Buffer::from(bytes::Bytes::copy_from_slice(data));
+        match writer {
+            // FRS-S3-MULTIPART: drive the async writer to completion on the
+            // runtime handle. The async writer buffers `MULTIPART_CHUNK_BYTES`
+            // parts and dispatches up to `WRITE_CONCURRENCY` part-uploads in
+            // parallel; `block_on` keeps the synchronous WritableFile contract.
+            WriterKind::Async(w) => self
+                .handle
+                .block_on(w.write(buf))
+                .map_err(|e| map_opendal_err(e, &format!("OpenDAL async write: {}", self.path)))?,
+            WriterKind::Blocking(w) => w
+                .write(buf)
+                .map_err(|e| map_opendal_err(e, &format!("OpenDAL streaming write: {}", self.path)))?,
+            WriterKind::Buffered { .. } => unreachable!("handled above"),
+        }
         self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
         Ok(())
     }
@@ -564,10 +882,174 @@ impl OpendalWritableFile {
         if self.closed {
             return Ok(());
         }
-        if let Some(mut writer) = self.writer.take() {
-            writer
-                .close()
-                .map_err(|e| map_opendal_err(e, &format!("OpenDAL close writer: {}", self.path)))?;
+        if let Some(writer) = self.writer.take() {
+            // FRS-S3-MULTIPART: `close()` is what publishes the object — for the
+            // async multipart writer it issues CompleteMultipartUpload, so the
+            // object only becomes visible on success (preserving the
+            // crash-atomic-on-close contract the SST-rename fix relies on).
+            match writer {
+                WriterKind::Async(mut w) => self.handle.block_on(w.close()).map_err(|e| {
+                    map_opendal_err(e, &format!("OpenDAL async close writer: {}", self.path))
+                })?,
+                WriterKind::Blocking(mut w) => w
+                    .close()
+                    .map_err(|e| map_opendal_err(e, &format!("OpenDAL close writer: {}", self.path)))?,
+                // FRS-S3-MULTIPART-TRUNC-FIX + 2026-05-29 WRITE-BACK FLUSH:
+                // buffered write + verify, SPAWNED so the flush worker returns on
+                // the LOCAL serialization rather than blocking on S3
+                // CompleteMultipartUpload. The immutable memtable + WriteBufferManager
+                // budget free as soon as `close_writer` returns; the actual S3
+                // upload runs on the bridged runtime off the critical path.
+                //
+                // Safety: Design A "resident-flushed memtables" keep the just-flushed
+                // memtable in RAM and the read path shadows the byte-identical L0 SST
+                // from RAM, so reads served while this upload is in flight never touch
+                // the not-yet-uploaded S3 object. The only paths that read an SST
+                // directly from S3 (`get_or_open_sst_reader`, compaction inputs) call
+                // `await_upload` first, and the checkpoint barrier / shutdown call
+                // `await_all_uploads`, so a checkpoint can never reference a
+                // non-uploaded SST.
+                WriterKind::Buffered { op, buf } => {
+                    let expected = buf.len() as u64;
+                    let p = self.path.clone();
+                    match (self.pending.as_ref(), self.upload_sem.as_ref()) {
+                        (Some(pending), Some(sem)) => {
+                            let op = op.clone();
+                            let sem = sem.clone();
+                            let path_for_task = p.clone();
+                            // 2026-05-29 FRS-S3-FLUSH-CONCURRENT: `write_with` provides
+                            // the WHOLE buffer up front (no streaming `.chunk()` "final
+                            // part dropped on close" truncation bug), with
+                            // `.concurrent(8).chunk(16 MiB)` fanning parts out 8-way.
+                            // The verify-stat catches any truncation as a hard error so
+                            // a truncated SST is NEVER published + read back.
+                            // 2026-05-29 RACE FIX: broadcast the upload outcome over a
+                            // `watch` channel so EVERY `await_upload`/`await_all_uploads`
+                            // caller blocks until the upload truly completes (see
+                            // `PendingUploads`). The spawned task drives the upload on the
+                            // bridged runtime and publishes `Some(outcome)` on finish; the
+                            // receiver is registered for awaiters.
+                            let (tx, rx) =
+                                tokio::sync::watch::channel::<Option<UploadOutcome>>(None);
+                            self.handle.spawn(async move {
+                                let outcome: UploadOutcome = async {
+                                    // Backpressure: hold a permit for the whole upload so
+                                    // at most MAX_INFLIGHT_UPLOADS SSTs are resident at
+                                    // once under a slow S3 endpoint.
+                                    let _permit = sem.acquire().await.map_err(|e| {
+                                        format!(
+                                            "OpenDAL upload semaphore closed: {path_for_task}: {e}"
+                                        )
+                                    })?;
+                                    op.write_with(&path_for_task, buf)
+                                        // `executors-tokio`-backed Executor: required for
+                                        // `.concurrent()` or opendal's default `()` executor
+                                        // panics. We are inside `handle.spawn`, so
+                                        // TokioExecutor's `tokio::task::spawn` finds this
+                                        // runtime.
+                                        .executor(Executor::new())
+                                        .concurrent(S3_WRITE_CONCURRENCY)
+                                        .chunk(S3_WRITE_CHUNK_BYTES)
+                                        .await
+                                        .map_err(|e| {
+                                            map_opendal_err(
+                                                e,
+                                                &format!("OpenDAL buffered write: {path_for_task}"),
+                                            )
+                                            .to_string()
+                                        })?;
+                                    let meta = op.stat(&path_for_task).await.map_err(|e| {
+                                        map_opendal_err(
+                                            e,
+                                            &format!(
+                                                "OpenDAL buffered write verify-stat: {path_for_task}"
+                                            ),
+                                        )
+                                        .to_string()
+                                    })?;
+                                    let stored = meta.content_length();
+                                    if stored != expected {
+                                        return Err(format!(
+                                            "OpenDAL buffered write truncated: wrote {expected} \
+                                             bytes but stored object is {stored} bytes for \
+                                             {path_for_task}"
+                                        ));
+                                    }
+                                    Ok(())
+                                }
+                                .await;
+                                // Publish to all awaiters. Ignore send error (no receivers
+                                // left — the FS was dropped — which is benign on shutdown).
+                                let _ = tx.send(Some(outcome));
+                            });
+                            // Register the receiver so a later await can block on it. If a
+                            // prior upload to the SAME path is still pending (path reuse),
+                            // await it first to preserve last-writer-wins ordering.
+                            let prior = pending
+                                .lock()
+                                .expect("upload registry poisoned")
+                                .insert(p.clone(), rx);
+                            if let Some(mut prior_rx) = prior {
+                                // Drain the superseded upload so its outcome is observed
+                                // before we return (the new write supersedes it on S3).
+                                let prior_outcome = self.handle.block_on(async move {
+                                    match prior_rx.wait_for(|v| v.is_some()).await {
+                                        Ok(g) => g.clone().unwrap_or(Ok(())),
+                                        // Sender dropped without publishing (task aborted on
+                                        // shutdown) — treat as benign for a superseded write.
+                                        Err(_) => Ok(()),
+                                    }
+                                });
+                                if let Err(msg) = prior_outcome {
+                                    return Err(ForstError::Io(std::io::Error::other(format!(
+                                        "OpenDAL prior upload {}: {msg}",
+                                        self.path
+                                    ))));
+                                }
+                            }
+                        }
+                        // No registry (defensive): fall back to a synchronous
+                        // buffered write + verify so durability is never lost.
+                        _ => {
+                            self.handle
+                                .block_on(async {
+                                    op.write_with(&p, buf)
+                                        // See above: Executor required for `.concurrent()`.
+                                        // Inside `handle.block_on`, so the tokio runtime
+                                        // context is present for TokioExecutor.
+                                        .executor(Executor::new())
+                                        .concurrent(S3_WRITE_CONCURRENCY)
+                                        .chunk(S3_WRITE_CHUNK_BYTES)
+                                        .await
+                                })
+                                .map_err(|e| {
+                                    map_opendal_err(
+                                        e,
+                                        &format!("OpenDAL buffered write: {}", self.path),
+                                    )
+                                })?;
+                            let meta =
+                                self.handle.block_on(async { op.stat(&p).await }).map_err(|e| {
+                                    map_opendal_err(
+                                        e,
+                                        &format!(
+                                            "OpenDAL buffered write verify-stat: {}",
+                                            self.path
+                                        ),
+                                    )
+                                })?;
+                            let stored = meta.content_length();
+                            if stored != expected {
+                                return Err(ForstError::corruption(format!(
+                                    "OpenDAL buffered write truncated: wrote {expected} bytes but \
+                                     stored object is {stored} bytes for {}",
+                                    self.path
+                                )));
+                            }
+                        }
+                    }
+                }
+            };
         }
         self.closed = true;
         Ok(())
@@ -613,6 +1095,8 @@ impl FileSystem for OpendalFileSystem {
         let blocking = self.blocking_op()?;
         Ok(Box::new(OpendalRandomAccessFile {
             op: blocking,
+            op_async: self.op.clone(),
+            handle: self.rt.handle(),
             path: p.to_string(),
             size,
         }))
@@ -625,6 +1109,15 @@ impl FileSystem for OpendalFileSystem {
     ) -> ForstResult<Box<dyn WritableFile>> {
         let p = path_str(path, "open_writable_file")?;
         let blocking = self.blocking_op()?;
+
+        // 2026-05-30 WRITE-BACK VISIBILITY RACE FIX: a prior write to THIS path may
+        // still have an async upload (buffered write-back close) in flight — its
+        // `sync()`/`close()` returns before the spawned upload lands on the backend.
+        // Re-opening the path now (Append must read the full existing object;
+        // CreateNew must see an accurate `exists`; CreateOrTruncate must not race a
+        // late upload overwriting our truncate) requires that upload to have
+        // completed first. `await_upload` is a cheap no-op when nothing is pending.
+        self.await_upload(path)?;
 
         let exists = match self.block_on(self.op.exists(p)) {
             Ok(v) => v,
@@ -655,34 +1148,92 @@ impl FileSystem for OpendalFileSystem {
         } else {
             0
         };
-        let writer = blocking
-            .writer_with(p)
-            .append(append)
-            .call()
-            .map_err(|e| map_opendal_err(e, &format!("open_writable_file writer: {p}")))?;
+        // FRS-S3-MULTIPART: object-store CreateNew/CreateOrTruncate writes use
+        // the async writer with concurrent multipart part-uploads. Append mode
+        // (WAL) and local-FS/memory backends keep the proven blocking writer
+        // (multipart concurrency is meaningless for append, and local FS gains
+        // nothing from it — this also keeps the local test suite on the
+        // unchanged code path).
+        let use_buffered_object_store = !append && self.op.info().scheme() != opendal::Scheme::Fs;
+        // 2026-05-29 WRITE-BACK FLUSH: only the buffered object-store path is
+        // eligible for asynchronous upload; carry the registry + semaphore into
+        // the writer for that case. Blocking/append (WAL) paths stay synchronous
+        // (None), so the WAL is durable on `sync()`.
+        let (file_pending, file_sem) = if use_buffered_object_store {
+            (Some(self.pending.clone()), Some(self.upload_sem.clone()))
+        } else {
+            (None, None)
+        };
+        let writer_kind = if use_buffered_object_store {
+            // FRS-S3-MULTIPART-TRUNC-FIX: object-store CreateNew/CreateOrTruncate
+            // writes BUFFER the whole object then do a single `op.write` + a
+            // post-write size-verify on close (see `WriterKind::Buffered` +
+            // `close_writer`). The previous streaming `.chunk(MULTIPART_CHUNK_BYTES)`
+            // async `Writer` dropped the final multipart part on `close()`
+            // against non-AWS S3 (BOS) for large (>8 MiB) SSTs, truncating the
+            // SST footer ("missing trailing magic") → engine CORRUPTION/PANIC on
+            // read-back of q4/q7/q9 large join-state. A single buffered write is
+            // robust and the verify makes any residual truncation a hard error
+            // rather than silent corruption. Memory is bounded by the SST size
+            // (`target_file_size_base`, default 64 MiB).
+            WriterKind::Buffered {
+                op: self.op.clone(),
+                buf: Vec::new(),
+            }
+        } else {
+            let w = blocking
+                .writer_with(p)
+                .append(append)
+                .call()
+                .map_err(|e| map_opendal_err(e, &format!("open_writable_file writer: {p}")))?;
+            WriterKind::Blocking(w)
+        };
 
         Ok(Box::new(OpendalWritableFile {
             path: p.to_string(),
-            writer: Some(writer),
+            writer: Some(writer_kind),
+            handle: self.rt.handle(),
             bytes_written: initial_size,
             closed: false,
+            pending: file_pending,
+            upload_sem: file_sem,
         }))
     }
 
     fn file_exists(&self, path: &Path) -> ForstResult<bool> {
         let p = path_str(path, "file_exists")?;
         match self.block_on(self.op.exists(p)) {
-            Ok(b) => Ok(b),
-            Err(e) if e.kind() == OdErrorKind::NotFound => Ok(false),
-            Err(e) => Err(map_opendal_err(e, &format!("file_exists: {p}"))),
+            Ok(true) => Ok(true),
+            // 2026-05-30 WRITE-BACK VISIBILITY RACE FIX: a `false`/NotFound here may
+            // mean the object's async upload (write-back close) has not yet landed
+            // on the backend — `sync()`/`close()` returns BEFORE the spawned upload
+            // completes. Await any in-flight upload for this exact path (a cheap
+            // no-op when none is registered) and retry once, so a stat that races a
+            // just-written object sees it. Closes the same NotFound surface as the
+            // cached_fs `remote_size_awaiting_upload` retry, at the raw backend.
+            Ok(false) | Err(_) => {
+                self.await_upload(path)?;
+                match self.block_on(self.op.exists(p)) {
+                    Ok(b) => Ok(b),
+                    Err(e) if e.kind() == OdErrorKind::NotFound => Ok(false),
+                    Err(e) => Err(map_opendal_err(e, &format!("file_exists: {p}"))),
+                }
+            }
         }
     }
 
     fn get_file_metadata(&self, path: &Path) -> ForstResult<FileMetadata> {
         let p = path_str(path, "get_file_metadata")?;
-        let meta = self
-            .block_on(self.op.stat(p))
-            .map_err(|e| map_opendal_err(e, &format!("get_file_metadata: {p}")))?;
+        let meta = match self.block_on(self.op.stat(p)) {
+            Ok(m) => m,
+            // WRITE-BACK VISIBILITY RACE FIX (see `file_exists`): await any in-flight
+            // async upload of this path then retry once before surfacing the error.
+            Err(_) => {
+                self.await_upload(path)?;
+                self.block_on(self.op.stat(p))
+                    .map_err(|e| map_opendal_err(e, &format!("get_file_metadata: {p}")))?
+            }
+        };
         Ok(FileMetadata {
             path: PathBuf::from(p),
             size: meta.content_length(),
@@ -733,6 +1284,20 @@ impl FileSystem for OpendalFileSystem {
     }
 
     fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+        // FRS-S3-DIRMARKER: Object stores (S3/GCS/Azure/OSS/Memory) have no real
+        // directories — the path hierarchy is implicit and auto-created on the first
+        // object write. OpenDAL emulates a directory via `create_dir`, which PUTs a
+        // zero-byte trailing-slash "marker" object. Some S3-compatible services
+        // (notably Baidu BOS) REJECT that marker PUT with HTTP 400 InvalidArgument,
+        // which surfaced as `frs_db_open_remote_with_options (status=IO)` on the first
+        // keyed-state DB open (the engine calls create_dir_all on the db path before
+        // any real write). Only the local `Fs` backend needs a real mkdir; for every
+        // other scheme this is a correct no-op — the subsequent object writes create
+        // the hierarchy. (Confirmed: a plain object PUT to the same prefix succeeds
+        // while the directory-marker PUT 400s.)
+        if self.op.info().scheme() != opendal::Scheme::Fs {
+            return Ok(());
+        }
         let raw = path_str(dir, "create_dir_all")?;
         let dir_str: String = if raw.ends_with('/') {
             raw.to_string()
@@ -790,6 +1355,14 @@ impl FileSystem for OpendalFileSystem {
         }
     }
 
+    /// FRS-S3-SSTRENAME: object stores have no atomic server-side rename, so
+    /// the SST/MANIFEST write paths must stream straight to the final key
+    /// rather than staging to `.tmp` + rename. Only the local `Fs` scheme
+    /// keeps the temp→rename convention. See `FileSystem::supports_atomic_rename`.
+    fn supports_atomic_rename(&self) -> bool {
+        self.op.info().scheme() == opendal::Scheme::Fs
+    }
+
     fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
         let s = path_str(src, "rename src")?;
         let d = path_str(dst, "rename dst")?;
@@ -805,10 +1378,103 @@ impl FileSystem for OpendalFileSystem {
         }
     }
 
+    /// 2026-05-29 WRITE-BACK FLUSH: block until the in-flight async upload of
+    /// `path` (if any) has completed, propagating its error. CLONES the broadcast
+    /// `watch` receiver and waits for the published outcome, so any number of
+    /// concurrent readers awaiting the SAME path all block until the single
+    /// upload truly finishes (the consume-once `JoinHandle` it replaced let a
+    /// second awaiter race ahead and read a not-yet-uploaded object → NotFound).
+    /// No pending entry → `Ok(())` (written synchronously, already completed, or
+    /// never async).
+    fn await_upload(&self, path: &Path) -> ForstResult<()> {
+        let p = path_str(path, "await_upload")?;
+        // 2026-05-29 RACE FIX: CLONE the receiver (do not remove) so concurrent
+        // awaiters all block on the SAME upload completion instead of one of them
+        // racing ahead with no handle. The receiver stays registered until the
+        // outcome is observed below, then is removed to bound the map.
+        let rx = {
+            let pending = self.pending.lock().expect("upload registry poisoned");
+            pending.get(p).cloned()
+        };
+        let Some(mut rx) = rx else {
+            // No pending entry: written synchronously, already completed + removed,
+            // or never async. The object is durable.
+            return Ok(());
+        };
+        let outcome = self.block_on(async move {
+            match rx.wait_for(|v| v.is_some()).await {
+                Ok(g) => g.clone().unwrap_or(Ok(())),
+                // Sender dropped without publishing — only happens if the upload
+                // task was aborted (FS drop / shutdown). Surface as an error so a
+                // read never proceeds against a possibly-absent object.
+                Err(_) => Err(format!("await_upload {p}: upload task dropped before completion")),
+            }
+        });
+        // Completed: drop the entry so the map does not grow unbounded. A late
+        // awaiter that missed it returns Ok (object is durable by now).
+        self.pending.lock().expect("upload registry poisoned").remove(p);
+        outcome.map_err(|msg| ForstError::Io(std::io::Error::other(msg)))
+    }
+
+    /// 2026-05-29 WRITE-BACK FLUSH: durability barrier. Drains EVERY in-flight
+    /// upload handle and blocks on all of them, then returns the FIRST error
+    /// observed. We await all handles before returning so no task is left
+    /// dangling even on the error path (a checkpoint that aborts on one bad
+    /// upload must still not leave others racing in the background). This is the
+    /// guarantee that a checkpoint never references an SST that is only in a
+    /// local/in-flight buffer.
+    fn await_all_uploads(&self) -> ForstResult<()> {
+        // 2026-05-29 RACE FIX: drain all receivers and wait for each outcome via
+        // the broadcast `watch` channel (see `await_upload`). Draining is safe
+        // here because this is the barrier — no concurrent reader should be
+        // mid-`await_upload` for the same path at a checkpoint/shutdown boundary,
+        // and even if one is, it holds its own cloned receiver.
+        let receivers: Vec<tokio::sync::watch::Receiver<Option<UploadOutcome>>> = {
+            let mut pending = self.pending.lock().expect("upload registry poisoned");
+            pending.drain().map(|(_, rx)| rx).collect()
+        };
+        let mut first_err: Option<ForstError> = None;
+        for mut rx in receivers {
+            let outcome = self.block_on(async move {
+                match rx.wait_for(|v| v.is_some()).await {
+                    Ok(g) => g.clone().unwrap_or(Ok(())),
+                    Err(_) => Ok(()),
+                }
+            });
+            if let Err(msg) = outcome {
+                if first_err.is_none() {
+                    first_err = Some(ForstError::Io(std::io::Error::other(msg)));
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
     fn name(&self) -> &str {
         // The cached name was materialized at construction from
         // `op.info().scheme()` (which returns a `Scheme` enum, not `&str`).
         &self.name
+    }
+}
+
+impl Drop for OpendalFileSystem {
+    /// 2026-05-29 WRITE-BACK FLUSH: best-effort drain of any in-flight uploads on
+    /// clean shutdown so no SST upload is lost. We never panic in `Drop`; a
+    /// failed upload is logged. The engine's `DbImpl` close path calls
+    /// `await_all_uploads` explicitly BEFORE the filesystem is dropped (the
+    /// surfacing point for errors); this is the backstop for any handle that
+    /// was registered after that barrier.
+    fn drop(&mut self) {
+        if let Err(e) = self.await_all_uploads() {
+            tracing::warn!(
+                target: "forst_rs_io::opendal_backend",
+                error = %e,
+                "OpendalFileSystem dropped with a failing in-flight upload",
+            );
+        }
     }
 }
 
@@ -903,6 +1569,11 @@ mod tests {
         assert_eq!(w.file_size().unwrap(), payload.len() as u64);
         drop(w);
 
+        // 2026-05-29 WRITE-BACK FLUSH: the memory backend is a non-Fs scheme, so
+        // the buffered write is uploaded asynchronously; await it before
+        // reading back (mirrors the engine's await-before-read guards).
+        fs.await_upload(path).expect("await_upload");
+
         // Sequential read
         let mut r = fs.open_sequential_file(path).expect("open sequential");
         let mut buf = vec![0u8; payload.len() + 16];
@@ -965,6 +1636,8 @@ mod tests {
             w.append(format!("payload-{i}").as_bytes()).expect("append");
             w.sync().expect("sync");
         }
+        // WRITE-BACK FLUSH: await all async uploads before listing.
+        fs.await_all_uploads().expect("await_all_uploads");
 
         let entries = fs
             .list_dir(Path::new("listing"))
@@ -999,6 +1672,8 @@ mod tests {
         w.append(b"transient").expect("append");
         w.sync().expect("sync");
         drop(w);
+        // WRITE-BACK FLUSH: await the async upload so the object is published.
+        fs.await_upload(path).expect("await_upload");
 
         assert!(
             fs.file_exists(path).unwrap(),
@@ -1029,6 +1704,8 @@ mod tests {
         w.append(b"first").unwrap();
         w.sync().unwrap();
         drop(w);
+        // WRITE-BACK FLUSH: await the async upload so the object is published.
+        fs.await_upload(path).expect("await_upload");
 
         let err = match fs.open_writable_file(path, WriteMode::CreateNew) {
             Err(e) => e,
@@ -1136,6 +1813,8 @@ mod tests {
             w.append(payload).expect("append");
             w.sync().expect("sync");
             drop(w);
+            // WRITE-BACK FLUSH: await the async upload before read-back.
+            fs.await_upload(path).expect("await_upload");
 
             let mut r = fs.open_sequential_file(path).expect("open sequential");
             let mut buf = vec![0u8; payload.len()];
@@ -1197,6 +1876,8 @@ mod tests {
             w.append(payload).unwrap();
             w.sync().unwrap();
         }
+        // WRITE-BACK FLUSH: await the async upload so the source is published.
+        fs.await_upload(src).expect("await_upload");
         assert!(fs.file_exists(src).unwrap());
         assert!(!fs.file_exists(dst).unwrap());
 
@@ -1254,6 +1935,8 @@ mod tests {
             w.append(&payload).expect("append");
             w.sync().expect("sync");
         }
+        // WRITE-BACK FLUSH: await the async upload before read-back.
+        fs.await_upload(path).expect("await_upload");
 
         // Sequential read covers the full object through the streaming reader.
         {
@@ -1292,5 +1975,166 @@ mod tests {
         let mut chunk = [0u8; 32];
         let n = rar.read_at(SIZE as u64, &mut chunk).expect("read_at eof");
         assert_eq!(n, 0);
+    }
+
+    /// `read_ranges` (concurrent OpenDAL override) must return byte-identical
+    /// results to N serial `read_at` calls — including an EOF-shortened tail
+    /// range and a fully-past-EOF range. Uses > READ_RANGES_CONCURRENCY (8)
+    /// ranges so the pipeline-refill path is exercised.
+    #[test]
+    fn read_ranges_matches_serial_read_at() {
+        use std::path::Path;
+
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+        let path = Path::new("ranges/payload.bin");
+
+        const SIZE: usize = 200_000;
+        let mut payload = Vec::with_capacity(SIZE);
+        let mut state: u32 = 0x1234_5678;
+        while payload.len() < SIZE {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            payload.extend_from_slice(&state.to_le_bytes());
+        }
+        payload.truncate(SIZE);
+
+        {
+            let mut w = fs
+                .open_writable_file(path, WriteMode::CreateOrTruncate)
+                .expect("open writable");
+            w.append(&payload).expect("append");
+            w.sync().expect("sync");
+        }
+        // WRITE-BACK FLUSH: await the async upload before read-back.
+        fs.await_upload(path).expect("await_upload");
+
+        let rar = fs.open_random_access_file(path).expect("open random");
+
+        // 11 ranges: contiguous chunks, an unaligned offset, a tail that runs
+        // past EOF (shortened), and a fully-past-EOF range (empty).
+        let ranges: Vec<(u64, usize)> = vec![
+            (0, 4096),
+            (4096, 4096),
+            (8192, 4096),
+            (12_288, 4096),
+            (16_384, 4096),
+            (20_480, 4096),
+            (24_576, 4096),
+            (28_672, 4096),
+            (32_768, 4096),
+            (12_345, 7_891),
+            ((SIZE - 100) as u64, 4096),  // shortened to 100 bytes
+            (SIZE as u64, 512),           // fully past EOF -> empty
+        ];
+
+        let concurrent = rar.read_ranges(&ranges).expect("read_ranges");
+        assert_eq!(concurrent.len(), ranges.len());
+
+        for (i, &(off, len)) in ranges.iter().enumerate() {
+            // Serial reference via repeated read_at with the short-read loop.
+            let mut serial = vec![0u8; len];
+            let mut filled = 0;
+            while filled < len {
+                let n = rar
+                    .read_at(off + filled as u64, &mut serial[filled..])
+                    .expect("read_at");
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            serial.truncate(filled);
+
+            assert_eq!(
+                concurrent[i], serial,
+                "concurrent range {i} (off={off} len={len}) differs from serial"
+            );
+
+            // And both must match the source payload slice.
+            let end = (off as usize + len).min(SIZE);
+            let expected = if off as usize >= SIZE {
+                &[][..]
+            } else {
+                &payload[off as usize..end]
+            };
+            assert_eq!(concurrent[i], expected, "range {i} differs from source");
+        }
+    }
+
+    // --- 2026-05-29 WRITE-BACK FLUSH async upload --------------------------
+
+    /// The memory backend's scheme is NOT `Fs`, so a CreateOrTruncate write
+    /// goes through the buffered async upload path. After `await_upload`, the
+    /// object must exist on the remote with byte-identical contents.
+    #[test]
+    fn test_async_upload_await_then_read_back() {
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+        let path = Path::new("sst/000007.sst");
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+
+        let mut w = fs
+            .open_writable_file(path, WriteMode::CreateOrTruncate)
+            .expect("open writable");
+        w.append(&payload).expect("append");
+        // close (sync) SPAWNS the upload and returns immediately.
+        w.sync().expect("sync");
+        drop(w);
+
+        // The durability barrier: block until the spawned upload completes.
+        fs.await_upload(path).expect("await_upload");
+
+        // Object must now exist and be byte-identical.
+        assert!(fs.file_exists(path).expect("file_exists"));
+        let rar = fs.open_random_access_file(path).expect("open random");
+        assert_eq!(rar.file_size().unwrap(), payload.len() as u64);
+        let mut got = vec![0u8; payload.len()];
+        let mut filled = 0;
+        while filled < got.len() {
+            let n = rar.read_at(filled as u64, &mut got[filled..]).expect("read_at");
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        got.truncate(filled);
+        assert_eq!(got, payload, "read-back bytes differ from written payload");
+
+        // await_upload is idempotent: a second call (no pending entry) is Ok.
+        fs.await_upload(path).expect("await_upload idempotent");
+    }
+
+    /// `await_all_uploads` must drain every in-flight upload across multiple
+    /// objects and make them all readable.
+    #[test]
+    fn test_async_upload_await_all() {
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+        let mut payloads = Vec::new();
+        for n in 0..5u32 {
+            let path = PathBuf::from(format!("sst/{n:06}.sst"));
+            let payload: Vec<u8> = (0..50_000u32).map(|i| ((i + n) % 211) as u8).collect();
+            let mut w = fs
+                .open_writable_file(&path, WriteMode::CreateOrTruncate)
+                .expect("open writable");
+            w.append(&payload).expect("append");
+            w.sync().expect("sync");
+            payloads.push((path, payload));
+        }
+
+        // Durability barrier for ALL uploads.
+        fs.await_all_uploads().expect("await_all_uploads");
+
+        for (path, payload) in &payloads {
+            assert!(fs.file_exists(path).expect("file_exists"));
+            let rar = fs.open_random_access_file(path).expect("open random");
+            assert_eq!(rar.file_size().unwrap(), payload.len() as u64);
+            let mut got = vec![0u8; payload.len()];
+            let n = rar.read_at(0, &mut got).expect("read_at");
+            got.truncate(n);
+            assert_eq!(&got, payload, "object {} differs", path.display());
+        }
+
+        // Idempotent: nothing left pending.
+        fs.await_all_uploads().expect("await_all_uploads idempotent");
     }
 }

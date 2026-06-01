@@ -74,6 +74,30 @@ pub const MAX_BATCH_COUNT: usize = 1_000_000;
 /// (2.13_deltajoin_localization.md) for the consumer-side budget.
 pub const MAX_KEY_LEN: usize = 1 << 20;
 
+/// Defense-in-depth cap on per-VALUE byte length. Unlike keys (which an LSM
+/// keeps small), values are legitimately large: Flink ListState / MapState
+/// values and — critically — streaming-join state on the
+/// `InputSideHasNoUniqueKey` path, which buffers EVERY record sharing a join
+/// key into a single MapState value. A high-fan-out join key easily exceeds
+/// the 1 MiB `MAX_KEY_LEN` (RocksDB stores such values without complaint), so
+/// reusing `MAX_KEY_LEN` for values (the pre-fix behaviour) made
+/// `frs_batch_put` / `frs_put` reject legitimate large state with
+/// INVALID_ARGUMENT, crashing q7-style joins. We still bound the read for the
+/// OOB-disclosure defense, but at the per-batch ceiling: a single value can be
+/// as large as a whole batch (the aggregate `MAX_BATCH_BYTES` check still caps
+/// total payload, and the engine's u32 offset arithmetic is safe ≤ 256 MiB).
+pub const MAX_VALUE_LEN: usize = MAX_BATCH_BYTES;
+
+/// Defense-in-depth cap on total per-batch payload bytes across all
+/// keys + values in a single Arrow batch FFI call. C-R12-NEW-H2: with
+/// MAX_KEY_LEN = 1 MiB and MAX_BATCH_COUNT = 1M, an attacker could
+/// otherwise stage 1 TiB of payload that cumulative-overflows the
+/// memtable's `key_data.len() as u32` rebase or VersionEdit / SST
+/// offset arithmetic (everything downstream of the memtable assumes
+/// per-batch sizes fit in u32). 256 MiB is well above any realistic
+/// single-batch payload (default memtable flush is 64 MiB).
+pub const MAX_BATCH_BYTES: usize = 256 * 1024 * 1024;
+
 fn validate_i32_offsets(offsets: &[i32]) -> Option<usize> {
     if offsets.first().copied()? != 0 {
         return None;
@@ -365,9 +389,19 @@ fn error_to_frs_code(err: &forst_rs_common::ForstError) -> i32 {
     } else if err.is_invalid_argument() {
         FrsErrorCode::BatchHeaderMalformed as i32
     } else {
-        // All other errors (OOM, DiskFull, Aborted, Busy, etc.) don't have
-        // direct `is_*` predicates exposed by ForstError today. Map to Unknown
-        // until ForstError grows those predicates (tracked in W26 follow-up).
+        // All other errors (OOM, DiskFull, Aborted, Busy, write-stall timeout,
+        // etc.) don't have direct `is_*` predicates exposed by ForstError today.
+        // Map to Unknown until ForstError grows those predicates (tracked in W26
+        // follow-up).
+        //
+        // FRS-S3-STALL DIAGNOSTIC: the Java FFM bridge surfaces `Unknown(999)`
+        // as a fatal `FrsEnginePanicError`, which loses the underlying cause and
+        // restart-loops the job. Echo the real `ForstError` Display to stderr
+        // (→ TaskManager `.out`) so an operator can see e.g. "write stall
+        // timeout: flush/compaction backlog not draining" instead of a bare
+        // rc=999. The text comes from the engine and never contains storage
+        // credentials, so this is safe to emit.
+        eprintln!("[forst-rs-ffi] mapping engine error to Unknown(999): {err}");
         FrsErrorCode::Unknown as i32
     }
 }
@@ -751,10 +785,25 @@ pub unsafe extern "C" fn frs_db_open_remote_with_options(
             builder = builder
                 .write_buffer_manager_capacity_bytes(cfg.write_buffer_manager_capacity_bytes);
         }
-        let engine_opts = match builder.try_build() {
+        let mut engine_opts = match builder.try_build() {
             Ok(o) => o,
             Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
         };
+        // FRS-PERF-TUNE (q7/q9 join hot path): the active memtable is sharded
+        // `memtable_shards`-ways by full-key FNV hash for WRITE concurrency.
+        // Flink accesses keyed state single-threaded per slot, so the sharding
+        // gives no concurrency benefit here but forces a prefix scan (MapState
+        // iter / streaming-join `entries()`) to do ONE BTreeMap lower-bound
+        // seek PER SHARD — 16 seeks/probe at the default, ~97% of q7 join CPU
+        // per profile. `FRS_MEMTABLE_SHARDS` tunes it per run (1 = single seek)
+        // without a rebuild. This is the production S3 open path Flink calls.
+        if let Ok(s) = std::env::var("FRS_MEMTABLE_SHARDS") {
+            if let Ok(n) = s.trim().parse::<usize>() {
+                if n >= 1 {
+                    engine_opts.memtable_shards = n;
+                }
+            }
+        }
 
         let cache_path = PathBuf::from(&cache_dir_str);
         match DbImpl::open_remote_with_default_cf(
@@ -1302,6 +1351,15 @@ pub unsafe extern "C" fn frs_put(
         if key.is_null() {
             return FRS_STATUS_NULL_ARG;
         }
+        // C-R15-NEW-H1: per-arg MAX_KEY_LEN cap. Sister entries (frs_get_into_buf,
+        // frs_get_fast, frs_lookup_kv, all batch FFI) already enforce this; the
+        // single-shot put was a gap. Unbounded key_len lets the comparator/memtable
+        // hash OOB-read untrusted memory (info-disclosure); unbounded value_len
+        // drives an unbounded Box<[u8]> allocation that bypasses the MAX_BATCH_BYTES
+        // shield protecting the batch path.
+        if key_len > MAX_KEY_LEN || value_len > MAX_VALUE_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
         let k = slice::from_raw_parts(key, key_len);
         let v = if value.is_null() {
             &[][..]
@@ -1333,6 +1391,10 @@ pub unsafe extern "C" fn frs_delete(
         if key.is_null() {
             return FRS_STATUS_NULL_ARG;
         }
+        // C-R15-NEW-H1: per-arg MAX_KEY_LEN cap. See frs_put rationale.
+        if key_len > MAX_KEY_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
         let k = slice::from_raw_parts(key, key_len);
         match db.delete(cf, k) {
             Ok(_) => FRS_STATUS_OK,
@@ -1360,6 +1422,13 @@ pub unsafe extern "C" fn frs_merge(
         };
         if key.is_null() || operand.is_null() {
             return FRS_STATUS_NULL_ARG;
+        }
+        // C-R15-NEW-H1: per-arg MAX_KEY_LEN cap on both key and operand.
+        // The merge operand routes into the same memtable batch_put_arrow
+        // u32-rebase path that C-R14-NEW-H3 capped on the merge-batch
+        // sister; the single-shot was unprotected.
+        if key_len > MAX_KEY_LEN || operand_len > MAX_VALUE_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
         }
         let k = slice::from_raw_parts(key, key_len);
         let o = slice::from_raw_parts(operand, operand_len);
@@ -1395,6 +1464,10 @@ pub unsafe extern "C" fn frs_get(
         };
         if key.is_null() {
             return FRS_STATUS_NULL_ARG;
+        }
+        // C-R15-NEW-H1: per-arg MAX_KEY_LEN cap. See frs_put rationale.
+        if key_len > MAX_KEY_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
         }
         let k = slice::from_raw_parts(key, key_len);
         match db.get(cf, k) {
@@ -1441,24 +1514,25 @@ pub unsafe extern "C" fn frs_get_pinned(
         if key.is_null() {
             return FRS_STATUS_NULL_ARG;
         }
-        let k = slice::from_raw_parts(key, key_len);
-        match db.get_pinned(cf, k) {
-            Some((ptr, len)) => {
-                *out_ptr = ptr;
-                *out_len = len;
-                FRS_STATUS_OK
-            }
-            None => {
-                // Distinguish NOT_FOUND from FALLBACK: check if the key
-                // exists at all via the regular get path. But that would
-                // defeat the purpose (allocating). Instead, return FALLBACK
-                // unconditionally — the caller will try frs_get which handles
-                // both "not found" and "found in SST/imm" cases.
-                *out_ptr = std::ptr::null();
-                *out_len = 0;
-                FRS_STATUS_FALLBACK
-            }
-        }
+        // C-R7-H1: ALWAYS return FALLBACK. The pre-fix returned a raw
+        // pointer into the memtable's inline `Box<[u8]>`; the pointer
+        // outlived the shard read lock that protected it, and a
+        // background flush thread or a concurrent same-shard writer
+        // could drop the box between FFI return and the Java
+        // `toArray` copy — silent use-after-free. The structural
+        // mitigation we relied on ("Flink's single-threaded-per-slot
+        // model") doesn't cover background flush, which runs on the
+        // engine's worker pool entirely independent of the slot
+        // thread. A safe zero-copy variant would require returning
+        // the holding `Arc<[u8]>` via an opaque handle with a release
+        // primitive — out of scope here. Until that lands, force the
+        // caller to the allocate-and-copy `frs_get` path, which is
+        // already its documented fallback.
+        let _ = key_len;
+        let _ = (db, cf);
+        *out_ptr = std::ptr::null();
+        *out_len = 0;
+        FRS_STATUS_FALLBACK
     })
 }
 
@@ -1489,6 +1563,11 @@ pub unsafe extern "C" fn frs_get_and_put(
         };
         if key.is_null() || new_value.is_null() {
             return FRS_STATUS_NULL_ARG;
+        }
+        // C-R15-NEW-H1: per-arg MAX_KEY_LEN cap on key + new_value.
+        // See frs_put rationale.
+        if key_len > MAX_KEY_LEN || new_value_len > MAX_VALUE_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
         }
         let k = slice::from_raw_parts(key, key_len);
         let v = slice::from_raw_parts(new_value, new_value_len);
@@ -1566,6 +1645,40 @@ pub unsafe extern "C" fn frs_batch_put(
         let value_ptrs = slice::from_raw_parts(values, count);
         let value_len_arr = slice::from_raw_parts(value_lens, count);
 
+        // C-R14-NEW-H1: legacy pointer-array `frs_batch_put` was the only
+        // batch FFI entry without per-row caps + aggregate MAX_BATCH_BYTES
+        // caps (sister entries `frs_batch_put_arrow`,
+        // `frs_vectorized_batch_put`, etc. all enforce them). Per-row
+        // unbounded `key_lens[i]` permitted OOB reads (info-disclosure
+        // primitive) via `slice::from_raw_parts`; aggregate-unbounded
+        // permitted the same engine `key_data.len() as u32` cumulative-
+        // overflow corruption that C-R12-NEW-H2 closed on the Arrow path.
+        // FRS-VALUE-CAP-FIX: keys are capped at MAX_KEY_LEN (1 MiB) but
+        // VALUES use the larger MAX_VALUE_LEN — a no-unique-key join /
+        // ListState value legitimately exceeds 1 MiB (q7 INVALID_ARGUMENT
+        // crash). Aggregate MAX_BATCH_BYTES still shields the engine.
+        let mut total_key_bytes: usize = 0;
+        let mut total_val_bytes: usize = 0;
+        for i in 0..count {
+            if key_len_arr[i] > MAX_KEY_LEN {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+            if value_len_arr[i] > MAX_VALUE_LEN {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+            total_key_bytes = match total_key_bytes.checked_add(key_len_arr[i]) {
+                Some(n) => n,
+                None => return FRS_STATUS_INVALID_ARGUMENT,
+            };
+            total_val_bytes = match total_val_bytes.checked_add(value_len_arr[i]) {
+                Some(n) => n,
+                None => return FRS_STATUS_INVALID_ARGUMENT,
+            };
+            if total_key_bytes > MAX_BATCH_BYTES || total_val_bytes > MAX_BATCH_BYTES {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+        }
+
         let mut wb = WriteBatch::with_capacity(count);
         for i in 0..count {
             // SECURITY: null-check INDIVIDUAL key pointers within the array
@@ -1630,6 +1743,28 @@ pub unsafe extern "C" fn frs_batch_get(
         // Reviewer 2). UB risk pre-fix.
         if key_ptrs.iter().any(|p| p.is_null()) {
             return FRS_STATUS_NULL_ARG;
+        }
+        // C-R14-NEW-H2: per-row MAX_KEY_LEN + aggregate MAX_BATCH_BYTES
+        // caps. Sister entries (`frs_batch_get_arrow`,
+        // `frs_vectorized_batch_get`) already enforce both; this legacy
+        // pointer-array path was unprotected — unbounded `key_lens[i]`
+        // permitted OOB reads via `slice::from_raw_parts`, and unbounded
+        // aggregate fed into `db.batch_get` which would materialise an
+        // arbitrarily-large `Vec<Option<Vec<u8>>>` result before any
+        // out-buffer check, exposing the same heap-OOM attack vector
+        // C-R13-NEW-H2 closed on the byte-blob batch_get path.
+        let mut total_key_bytes: usize = 0;
+        for i in 0..count {
+            if key_len_arr[i] > MAX_KEY_LEN {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+            total_key_bytes = match total_key_bytes.checked_add(key_len_arr[i]) {
+                Some(n) => n,
+                None => return FRS_STATUS_INVALID_ARGUMENT,
+            };
+            if total_key_bytes > MAX_BATCH_BYTES {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
         }
         let owned_keys: Vec<&[u8]> = (0..count)
             .map(|i| slice::from_raw_parts(key_ptrs[i], key_len_arr[i]))
@@ -1752,6 +1887,82 @@ pub unsafe extern "C" fn frs_create_checkpoint(handle: FrsDb, target_dir: *const
         };
         match db.create_checkpoint(std::path::Path::new(path)) {
             Ok(_) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// FRS-CKPT-NOFLUSH (2026-06-01): serialise every CF's LIVE memtables to
+/// per-CF `memtable-cf<id>.arrow` artifacts under `target_dir` WITHOUT flushing
+/// them to L0 SSTs. The backend's snapshot strategy includes these artifacts as
+/// private-state files in its incremental keyed-state handle (Flink uploads
+/// them to S3), keeping the memtable RAM-resident + unfragmented for reads — the
+/// fix for the ckpt-ON heavy-join collapse. The memtable stays live + writable.
+/// `out_count` (optional) receives the number of artifacts written.
+#[no_mangle]
+pub unsafe extern "C" fn frs_snapshot_memtables_to_dir(
+    handle: FrsDb,
+    snapshot: FrsSnapshot,
+    target_dir: *const c_char,
+    out_count: *mut u64,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if snapshot.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let snap_ref = &(*snapshot).inner;
+        if snap_ref.db_id() != db.db_id() {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let Some(path) = cstr_to_str(&target_dir) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        // Bound the artifact to the pinned snapshot's seq so it is consistent
+        // with the SST set captured by the companion no-flush incremental
+        // checkpoint (excludes post-barrier writes belonging to the next ckpt).
+        match db.snapshot_memtables_to_dir(
+            std::path::Path::new(path),
+            Some(snap_ref.seq().value()),
+        ) {
+            Ok(written) => {
+                if !out_count.is_null() {
+                    *out_count = written.len() as u64;
+                }
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// FRS-CKPT-NOFLUSH: restore counterpart — replay every `memtable-cf<id>.arrow`
+/// artifact found under `dir` into its CF (preserving sequence + op_type),
+/// rebuilding the in-RAM state that was checkpointed without flushing. Call
+/// AFTER the engine has opened the checkpoint's SST set. `out_rows` (optional)
+/// receives the total rows replayed.
+#[no_mangle]
+pub unsafe extern "C" fn frs_replay_memtable_artifacts(
+    handle: FrsDb,
+    dir: *const c_char,
+    out_rows: *mut u64,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(handle) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(path) = cstr_to_str(&dir) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        match db.replay_memtable_artifacts_from_dir(std::path::Path::new(path)) {
+            Ok(rows) => {
+                if !out_rows.is_null() {
+                    *out_rows = rows as u64;
+                }
+                FRS_STATUS_OK
+            }
             Err(e) => error_to_status(&e),
         }
     })
@@ -2150,6 +2361,20 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
             Ok(d) => d,
             Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
         };
+        // C-R10-NEW-H1: arrow-rs's `from_ffi` uses
+        // `ArrayData::new_unchecked` — it trusts producer-supplied
+        // `value_offsets` and `length` without bounds checks. A
+        // hostile or buggy producer can pass offsets that point
+        // OUTSIDE the actual value-data buffer; subsequent
+        // `keys.value(i)` calls (which use `value_unchecked` →
+        // `slice::from_raw_parts(ptr.offset(start), end - start)`)
+        // then read arbitrary memory — UB / info disclosure. Validate
+        // here at the boundary using `validate_full` which checks
+        // offset monotonicity, bounds, and UTF-8 (n/a for Binary).
+        let data = match data.validate_full() {
+            Ok(()) => data,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
         let struct_array = make_array(data);
         // Struct RecordBatch convention: use `arrow::array::StructArray`
         // downcast. But `to_ffi` may have exported a single struct array.
@@ -2194,6 +2419,47 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
         // (Sweep R5 H by Reviewer 2). batch.num_rows() comes from the
         // C-side Arrow array; cap defends against a crafted batch.
         if batch.num_rows() > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+
+        // C-R11-NEW-H2: per-row MAX_KEY_LEN cap. The byte-blob batch FFI
+        // family (frs_vectorized_batch_get/put/delete) all enforce this
+        // per-row; the Arrow zero-copy path was missing it. Without the
+        // cap, a producer can deliver i32::MAX-byte keys that cumulative-
+        // overflow the memtable's `key_data.len() as u32` rebase or
+        // exercise unguarded engine hash / comparator paths on multi-MiB
+        // keys. We MUST re-downcast here to read offsets (the column-0
+        // downcast above returned None-or-OK without binding); cheap
+        // because Arrow downcast is a vtable check.
+        let keys_col = match batch.column(0).as_any().downcast_ref::<BinaryArray>() {
+            Some(a) => a,
+            None => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        for i in 0..batch.num_rows() {
+            if keys_col.value_length(i) as usize > MAX_KEY_LEN {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+        }
+
+        // C-R12-NEW-H2: total batch payload cap. Per-row caps alone do
+        // NOT bound aggregate bytes; MAX_BATCH_COUNT * MAX_KEY_LEN can
+        // reach 1 TiB which cumulative-overflows the memtable's
+        // `key_data.len() as u32` rebase (see batch_put_arrow_with_base_seq)
+        // and any downstream u32 file/SST/VersionEdit byte arithmetic.
+        // The Arrow offsets are i32, so the last offset is the total
+        // bytes for that column. validate_full() already established
+        // offset monotonicity, so reading the last offset is safe.
+        let key_offsets = keys_col.value_offsets();
+        let val_offsets = values.value_offsets();
+        let total_key_bytes = *key_offsets.last().unwrap_or(&0) as i64
+            - *key_offsets.first().unwrap_or(&0) as i64;
+        let total_val_bytes = *val_offsets.last().unwrap_or(&0) as i64
+            - *val_offsets.first().unwrap_or(&0) as i64;
+        if total_key_bytes < 0
+            || total_val_bytes < 0
+            || (total_key_bytes as usize) > MAX_BATCH_BYTES
+            || (total_val_bytes as usize) > MAX_BATCH_BYTES
+        {
             return FRS_STATUS_INVALID_ARGUMENT;
         }
 
@@ -2276,6 +2542,12 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
             Ok(d) => d,
             Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
         };
+        // C-R10-NEW-H1: validate offsets at the Arrow C Data Interface
+        // boundary — see frs_batch_put_arrow for rationale.
+        let data = match data.validate_full() {
+            Ok(()) => data,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
         let keys_arr = make_array(data);
         let keys = match keys_arr.as_any().downcast_ref::<BinaryArray>() {
             Some(a) => a,
@@ -2292,12 +2564,50 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
             return FRS_STATUS_INVALID_ARGUMENT;
         }
 
+        // C-R11-NEW-H3: per-row MAX_KEY_LEN cap. Sister-pattern to
+        // frs_lookup_kv / frs_get_into_buf / frs_get_fast / the
+        // byte-blob batch family — guards memtable hash / SST
+        // comparator paths against attacker-chosen multi-MiB keys.
+        for i in 0..keys.len() {
+            if keys.value_length(i) as usize > MAX_KEY_LEN {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+        }
+
+        // C-R19-NEW-H1: aggregate input-key-bytes cap mirroring
+        // frs_batch_put_arrow (C-R12-NEW-H2) and frs_prefix_scan_arrow
+        // (C-R13-NEW-H3). validate_full earlier established offset
+        // monotonicity, so reading the last offset is safe.
+        let key_offsets = keys.value_offsets();
+        let total_key_bytes = *key_offsets.last().unwrap_or(&0) as i64
+            - *key_offsets.first().unwrap_or(&0) as i64;
+        if total_key_bytes < 0 || (total_key_bytes as usize) > MAX_BATCH_BYTES {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+
         // Zero-copy path: build Arrow output directly during lookup,
         // avoiding the intermediate Vec<Option<Vec<u8>>> allocation.
         let batch = match db.batch_get_arrow(cf, keys) {
             Ok(b) => b,
             Err(e) => return error_to_status(&e),
         };
+
+        // C-R19-NEW-H1: aggregate output-value-bytes cap. Engine values
+        // are caller-uncontrolled (Flink state can be multi-MiB), and
+        // db.batch_get_arrow builds a `BinaryBuilder` that uses i32
+        // offsets — once cumulative bytes pass i32::MAX, the offset
+        // array silently wraps or the builder panics. Sister entries
+        // (frs_batch_put_arrow, frs_prefix_scan_arrow) gate aggregate
+        // bytes; this output-side gate completes the parity.
+        let value_col = batch.column(0);
+        if let Some(value_bin) = value_col.as_any().downcast_ref::<BinaryArray>() {
+            let val_offsets = value_bin.value_offsets();
+            let total_val_bytes = *val_offsets.last().unwrap_or(&0) as i64
+                - *val_offsets.first().unwrap_or(&0) as i64;
+            if total_val_bytes < 0 || (total_val_bytes as usize) > MAX_BATCH_BYTES {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
+        }
 
         // Export the batch as a struct FFI_ArrowArray.
         let struct_arr = arrow::array::StructArray::from(batch);
@@ -2350,6 +2660,17 @@ pub unsafe extern "C" fn frs_prefix_scan_arrow(
         let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
+        // C-R12-NEW-H1: cap prefix_len like every sister entry point
+        // (frs_prefix_scan_iter, frs_lookup_kv, frs_get_into_buf,
+        // frs_get_fast). Without this gate an attacker-supplied
+        // prefix_len > MAX_KEY_LEN constructs an OOB slice that the
+        // engine comparator dereferences as a key span. Real UB /
+        // info-disclosure primitive. The R11 sweep that closed
+        // frs_batch_put_arrow + frs_batch_get_arrow missed this
+        // third Arrow zero-copy entry point.
+        if prefix_len > MAX_KEY_LEN {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
         let prefix_slice = if prefix.is_null() || prefix_len == 0 {
             &[][..]
         } else {
@@ -2370,6 +2691,27 @@ pub unsafe extern "C" fn frs_prefix_scan_arrow(
         // change (would require passing max-rows through scan API).
         if rows.len() > MAX_BATCH_COUNT {
             return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        // C-R13-NEW-H3: aggregate output-bytes cap. Even with the row-count
+        // cap, per-row bytes are entirely engine-determined (the engine
+        // stores arbitrary-length user values), so a few large values can
+        // push cumulative key_builder/value_builder offsets past i32::MAX
+        // and silently produce a corrupted offset array. Cap at twice
+        // MAX_BATCH_BYTES (one budget per column) to mirror put/get/delete.
+        let mut total_key_bytes: usize = 0;
+        let mut total_val_bytes: usize = 0;
+        for (k, v) in &rows {
+            total_key_bytes = match total_key_bytes.checked_add(k.len()) {
+                Some(n) => n,
+                None => return FRS_STATUS_INVALID_ARGUMENT,
+            };
+            total_val_bytes = match total_val_bytes.checked_add(v.len()) {
+                Some(n) => n,
+                None => return FRS_STATUS_INVALID_ARGUMENT,
+            };
+            if total_key_bytes > MAX_BATCH_BYTES || total_val_bytes > MAX_BATCH_BYTES {
+                return FRS_STATUS_INVALID_ARGUMENT;
+            }
         }
         let mut key_builder = arrow::array::BinaryBuilder::new();
         let mut value_builder = arrow::array::BinaryBuilder::new();
@@ -2429,11 +2771,20 @@ pub(crate) struct IteratorState {
     pub(crate) rows: Vec<(Vec<u8>, Vec<u8>)>,
     /// Index of the *next* row to be returned by `frs_iterator_next`.
     pub(crate) cursor: usize,
+    /// C-NEW-H1: gates the per-step clone vs the zero-copy `mem::take` fast
+    /// path inside `frs_iterator_next`. Default `false` (forward-only —
+    /// the forst-rs Java backend's path). `frs_iterator_seek` flips this
+    /// to `true` because seek can land the cursor on a row that was
+    /// already taken; from that point next() must clone so subsequent
+    /// rewind/re-entry sees the original payload (advertised
+    /// `RocksIterator` ABI for the JNI compat shim's prev0 /
+    /// seekToLast0 / seekForPrev0).
+    pub(crate) allow_rewind: bool,
 }
 
 impl IteratorState {
     pub(crate) fn new(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-        Self { rows, cursor: 0 }
+        Self { rows, cursor: 0, allow_rewind: false }
     }
 }
 
@@ -2555,11 +2906,44 @@ pub unsafe extern "C" fn frs_get_fast(
     out_buf_cap: usize,
     out_val_len: *mut usize,
 ) -> i32 {
+    // C-R8-NEW-H1: input validation. Pre-fix the docstring waived
+    // only `catch_unwind` and `Arc::clone`, but the function performed
+    // ZERO null/bounds checks — `slice::from_raw_parts(NULL, n>0)` is
+    // immediate UB, an oversized `key_len` lets the comparator
+    // OOB-read up to 16 EiB, `*out_val_len` on the hit path is a
+    // null-write, and `copy_nonoverlapping` to a NULL out_buf is UB.
+    // Every sibling entry point (frs_get / frs_lookup_kv /
+    // frs_get_into_buf) gates on these conditions; mirror them here.
+    if handle.is_null() || cf.is_null() {
+        return FRS_STATUS_NULL_ARG;
+    }
+    if out_val_len.is_null() {
+        return FRS_STATUS_NULL_ARG;
+    }
+    if key.is_null() && key_len != 0 {
+        return FRS_STATUS_NULL_ARG;
+    }
+    if key_len > MAX_KEY_LEN {
+        return FRS_STATUS_INVALID_ARGUMENT;
+    }
+    // out_buf may be NULL only when cap == 0 (size-probe semantics).
+    if out_buf.is_null() && out_buf_cap != 0 {
+        return FRS_STATUS_NULL_ARG;
+    }
+    // D-R9-H1: wrap the engine call in catch_unwind. The pre-fix
+    // docstring waived catch_unwind for throughput, but `db.get` and
+    // friends contain `.expect("lock poisoned")` sites that can
+    // panic under contention. A panic unwinding across the FFI
+    // boundary into JVM frames is UB on both x86_64 SysV and aarch64
+    // AAPCS. The Arc::clone elision (the other half of the waiver)
+    // stays; catch_unwind cost is one setjmp/longjmp on the cold
+    // path and is independent of Arc lifetime.
     let db = &*(handle as *const Arc<DbImpl>);
     let cf_h = &*(cf as *const ColumnFamilyHandle);
     let k = slice::from_raw_parts(key, key_len);
-    match db.get(cf_h, k) {
-        Ok(Some(v)) => {
+    let result = catch_unwind(AssertUnwindSafe(|| db.get(cf_h, k)));
+    match result {
+        Ok(Ok(Some(v))) => {
             *out_val_len = v.len();
             if v.len() > out_buf_cap {
                 return FRS_STATUS_BUFFER_TOO_SMALL;
@@ -2567,11 +2951,12 @@ pub unsafe extern "C" fn frs_get_fast(
             ptr::copy_nonoverlapping(v.as_ptr(), out_buf, v.len());
             FRS_STATUS_OK
         }
-        Ok(None) => {
+        Ok(Ok(None)) => {
             *out_val_len = 0;
             FRS_STATUS_OK
         }
-        Err(_) => FRS_STATUS_ERROR,
+        Ok(Err(_)) => FRS_STATUS_ERROR,
+        Err(_) => FRS_STATUS_PANIC,
     }
 }
 
@@ -2649,6 +3034,14 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
         if total_keys > key_data_len {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
+        // C-R13-NEW-H2: aggregate input-key-bytes cap mirroring put/delete.
+        // Without this, a 1 M-key * 1 MiB-key request would build a 1 TiB
+        // `keys_vec` + `db.batch_get` would materialise an equally large
+        // `Vec<Option<Vec<u8>>>` result before any buffer-fit check could
+        // return BUFFER_TOO_SMALL — heap OOM as a defendable attack vector.
+        if total_keys > MAX_BATCH_BYTES {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
         if total_keys > 0 && key_data.is_null() {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
@@ -2667,13 +3060,17 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
         } else {
             slice::from_raw_parts_mut(out_data, out_data_cap)
         };
-        // PR-D3 (V10): build the key-slice vector once and route to the
-        // engine's batched `db.batch_get` API in a single call. The engine's
-        // batch path warms the SST reader cache via `prefetch_sst_files_for_batch`
-        // (one GetObject per SST file instead of one per key on S3) and uses
-        // the active-memtable hash-index fast path before falling through to
-        // the full read pipeline. Replaces the previous per-key `db.get(cf, k)`
-        // loop that defeated block-cache prefetch / S3 batched-read.
+        // PR-D3 + V10 finish (spec §3 D10): build the key-slice vector once
+        // and route to the engine's batched `db.batch_get` API in a single
+        // call. The engine's `batch_get` now thinly wraps
+        // `batch_get_vectorized` (engine-level true vectorized lookup) — see
+        // its docstring for the per-batch hoists (one version snapshot, one
+        // live-files HashSet, one resident-list walk, one reader-open per
+        // SST instead of per (key, SST)). Replaces the previous per-key
+        // `db.get(cf, k)` loop that defeated block-cache prefetch /
+        // S3 batched-read and repeated per-key LSM tier walks. Measured
+        // speedup over the naive per-key path on an SST-tier bench: 4.4×
+        // (N=16) to 6.5× (N=256–1024), beating the spec's projected 4.2×.
         let mut keys_vec: Vec<&[u8]> = Vec::with_capacity(count);
         for i in 0..count {
             let ks = key_offs[i] as usize;
@@ -2702,6 +3099,15 @@ pub unsafe extern "C" fn frs_vectorized_batch_get(
                     return FRS_STATUS_BUFFER_TOO_SMALL;
                 }
             }
+        }
+        // C-R13-NEW-H2: output-aggregate cap. Even after the i32::MAX check
+        // above, accepting `required_total` up to ~2 GiB is far above any
+        // realistic single-batch read budget. Reject anything past
+        // MAX_BATCH_BYTES to bound the downstream copy + keep parity with
+        // the put/delete sister caps.
+        if required_total > MAX_BATCH_BYTES {
+            *out_data_len = required_total;
+            return FRS_STATUS_BUFFER_TOO_SMALL;
         }
         if required_total > out_data_cap {
             *out_data_len = required_total;
@@ -2775,6 +3181,16 @@ pub unsafe extern "C" fn frs_vectorized_batch_put(
         if total_keys > key_data_len || total_vals > val_data_len {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
+        // C-R13-NEW-H1: aggregate-bytes cap, mirroring C-R12-NEW-H2 on the
+        // Arrow zero-copy path. The byte-blob FFI accepts i32 offsets which
+        // permit up to 2 GiB per column independently; without this cap the
+        // engine's downstream `key_data.len() as u32` rebase cumulative-
+        // overflows once total > 4 GiB, producing silent corruption identical
+        // to the Arrow path. The Java VectorizedExecutor / V1-sync state path
+        // funnels here, so this cap is on the production hot path.
+        if total_keys > MAX_BATCH_BYTES || total_vals > MAX_BATCH_BYTES {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
         if (total_keys > 0 && key_data.is_null()) || (total_vals > 0 && val_data.is_null()) {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
@@ -2788,7 +3204,23 @@ pub unsafe extern "C" fn frs_vectorized_batch_put(
         } else {
             slice::from_raw_parts(val_data, total_vals)
         };
-        let mut wb = WriteBatch::with_capacity(count);
+        // C4R2-B-NEW-H1: bypass WriteBatch construction. Build the 3
+        // borrowed-slice arrays directly during the FFI offset/length
+        // walk and dispatch via the new `batch_put_borrowed_single_cf`
+        // entry — this eliminates the per-row `WriteBatchEntry`
+        // allocation (count × 56 bytes per call), the per-row `Cow::Borrowed`
+        // wrap, and the 3-way `entries.iter().map().collect()` rebuild
+        // that the WriteBatch path triggered inside `batch_write_single_cf`.
+        // The memtable still does ONE borrowed-slice `extend_from_slice`
+        // per row (canonical column-extend); only the FFM-to-memtable
+        // glue is eliminated. C-R33-NEW-H1's revert of B-R13-NEW-H3 was
+        // correct (Buffer::from_slice_ref copies); the proper fix is to
+        // skip the Arrow-Buffer construction entirely and pass the
+        // already-borrowed slices straight to the memtable.
+        let mut keys_slices: Vec<&[u8]> = Vec::with_capacity(count);
+        let mut value_slices: Vec<Option<&[u8]>> = Vec::with_capacity(count);
+        // OpType::Put = 1 (see forst_rs_common::types::OpType discriminants)
+        let op_types: Vec<u8> = vec![1u8; count];
         for i in 0..count {
             let ks = key_offs[i] as usize;
             let ke = key_offs[i + 1] as usize;
@@ -2797,9 +3229,10 @@ pub unsafe extern "C" fn frs_vectorized_batch_put(
             }
             let vs = val_offs[i] as usize;
             let ve = val_offs[i + 1] as usize;
-            wb.put(cf, &key_buf[ks..ke], &val_buf[vs..ve]);
+            keys_slices.push(&key_buf[ks..ke]);
+            value_slices.push(Some(&val_buf[vs..ve]));
         }
-        match db.batch_write(wb) {
+        match db.batch_put_borrowed_single_cf(cf, &keys_slices, &value_slices, &op_types) {
             Ok(_) => FrsErrorCode::Ok as i32,
             Err(e) => error_to_frs_code(&e),
         }
@@ -2847,6 +3280,12 @@ pub unsafe extern "C" fn frs_vectorized_batch_delete(
         if total_keys > key_data_len {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
+        // C-R13-NEW-H1 (delete-sister): aggregate-bytes cap. Tombstones still
+        // consume memtable space + SST footprint; unbounded delete-batches
+        // are an equivalent memtable-bloat + u32-rebase corruption vector.
+        if total_keys > MAX_BATCH_BYTES {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
         if total_keys > 0 && key_data.is_null() {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
@@ -2855,16 +3294,21 @@ pub unsafe extern "C" fn frs_vectorized_batch_delete(
         } else {
             slice::from_raw_parts(key_data, total_keys)
         };
-        let mut wb = WriteBatch::with_capacity(count);
+        // C4R2-B-NEW-H1 (delete sister): skip WriteBatch construction;
+        // pass borrowed key slices directly. Value side is None for every
+        // row. OpType::Delete = 0.
+        let mut keys_slices: Vec<&[u8]> = Vec::with_capacity(count);
         for i in 0..count {
             let ks = key_offs[i] as usize;
             let ke = key_offs[i + 1] as usize;
             if ke - ks > MAX_KEY_LEN {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
-            wb.delete(cf, &key_buf[ks..ke]);
+            keys_slices.push(&key_buf[ks..ke]);
         }
-        match db.batch_write(wb) {
+        let value_slices: Vec<Option<&[u8]>> = vec![None; count];
+        let op_types: Vec<u8> = vec![0u8; count]; // OpType::Delete
+        match db.batch_put_borrowed_single_cf(cf, &keys_slices, &value_slices, &op_types) {
             Ok(_) => FrsErrorCode::Ok as i32,
             Err(e) => error_to_frs_code(&e),
         }
@@ -3049,6 +3493,26 @@ pub unsafe extern "C" fn frs_iterator_seek(
             return FRS_STATUS_INVALID_ARGUMENT;
         }
         let state = &mut *(iter as *mut IteratorState);
+        // D-C4R8-H1: forbid seek after forward-only next(). The C-NEW-H1
+        // `allow_rewind` gate flips `next()` between `mem::take` (zero-copy
+        // forward-only) and `clone()` (rewind-safe). If `next()` has already
+        // moved `cursor` past row 0 under the forward-only fast path, rows
+        // [0, cursor) have been emptied to `(Vec::new(), Vec::new())`,
+        // which breaks the `binary_search_by` sorted-order invariant below
+        // — search would compare `needle` against empty keys for positions
+        // 0..cursor and land on an arbitrary slot. Callers that need to
+        // mix seek with next() MUST call seek FIRST (cursor=0) so the
+        // flag is set before any take occurs. seekToLast0/seekForPrev0/
+        // prev0 already set `allow_rewind=true` BEFORE their first next(),
+        // so those JNI compat-shim paths are unaffected.
+        if !state.allow_rewind && state.cursor > 0 {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        // C-NEW-H1: any seek call enables rewind semantics — from this
+        // point onward subsequent next() calls clone the row instead of
+        // taking it, so prev/seekToLast/seekForPrev rewinds re-enter
+        // a populated payload.
+        state.allow_rewind = true;
         let needle: &[u8] = if key.is_null() || key_len == 0 {
             &[][..]
         } else {
@@ -3087,13 +3551,216 @@ pub unsafe extern "C" fn frs_iterator_next(
             *out_valid = false;
             return FRS_STATUS_OK;
         }
-        // Move out of the row by swap so the engine's snapshot vec keeps
-        // its slots populated with empty placeholders (no Vec re-shift).
-        let (k, v) = std::mem::take(&mut state.rows[state.cursor]);
+        // C-R22-NEW-H1: clone the row instead of `mem::take`. Pre-fix
+        // `mem::take` emptied the slot, which forward-only callers tolerated
+        // — but the JNI compat shim's `prev0` / `seekToLast0` / `seekForPrev0`
+        // rewinds `state.cursor` and re-enters this function, expecting the
+        // original payload. Without the clone, the rewind returned `valid=true`
+        // with zero-length key/value (silent stale-empty row), violating the
+        // advertised `org.forstdb.RocksIterator` ABI. Clone cost is bounded by
+        // the row's size (per-row caps already enforce MAX_KEY_LEN bounds),
+        // and the engine's snapshot vec still keeps its slots populated for
+        // any subsequent rewind.
+        // C-NEW-H1: forward-only path uses mem::take (zero-copy). Only
+        // clone when the iterator has been seek'd at least once — seek
+        // is the only entry that can move the cursor back to a row that
+        // was already taken, and from that point onward subsequent next()
+        // calls must return the original payload so the JNI compat shim's
+        // prev0/seekToLast0/seekForPrev0 rewind+re-enter behaves per the
+        // RocksIterator ABI.
+        let (k, v) = if state.allow_rewind {
+            state.rows[state.cursor].clone()
+        } else {
+            std::mem::take(&mut state.rows[state.cursor])
+        };
         state.cursor += 1;
         *out_key = FrsBytes::from_vec(k);
         *out_value = FrsBytes::from_vec(v);
         *out_valid = true;
+        FRS_STATUS_OK
+    })
+}
+
+/// B-NEW-H2: chunked iterator next. Drains up to `max_rows` from the
+/// iterator into caller-supplied Arrow offsets+data segments in a single
+/// FFI crossing.
+///
+/// On return `*out_count` holds the number of rows written. When the
+/// iterator is exhausted the function returns OK with `*out_count = 0`
+/// and `*out_eof = true`. `out_*_offsets` must be at least
+/// `(max_rows + 1) * 4` bytes; `out_*_data` must hold at least
+/// `out_*_data_cap` bytes. If a row's payload would overflow the data
+/// capacity the function returns the rows written so far (caller refills
+/// and retries). On overflow with zero rows written, returns
+/// `BatchHeaderMalformed` (caller MUST grow `out_*_data_cap`).
+///
+/// Replaces the per-row `frs_iterator_next` for MapState scan / prefix
+/// scan hot paths where the dominant cost was the FFM crossing.
+#[no_mangle]
+pub unsafe extern "C" fn frs_iterator_next_chunk(
+    iter: FrsIterator,
+    max_rows: u32,
+    out_key_offsets: *mut i32,
+    out_key_data: *mut u8,
+    out_key_data_cap: usize,
+    out_val_offsets: *mut i32,
+    out_val_data: *mut u8,
+    out_val_data_cap: usize,
+    out_val_validity: *mut u8,
+    out_count: *mut u32,
+    out_eof: *mut bool,
+) -> i32 {
+    guarded(|| {
+        if iter.is_null()
+            || out_key_offsets.is_null()
+            || out_val_offsets.is_null()
+            || out_val_validity.is_null()
+            || out_count.is_null()
+            || out_eof.is_null()
+        {
+            return FRS_STATUS_NULL_ARG;
+        }
+        // H1: initialize BOTH output scalars unconditionally so every
+        // return path (early-exit, capacity-overflow, partial-fill,
+        // exact-fill, eof) leaves the caller observing well-defined
+        // values rather than carry-over from prior calls.
+        *out_count = 0;
+        *out_eof = false;
+        // H5 (C8R5 parity): cap max_rows at MAX_BATCH_COUNT to match
+        // sister batch entries. Without this a caller passing max_rows
+        // = u32::MAX would silently allocate (max_rows+1)*4 = 16 GiB
+        // worth of offsets indexing in `slice::from_raw_parts_mut`,
+        // followed by out-of-bounds writes if the actual segment is
+        // smaller. Sister entries frs_batch_get, frs_batch_put, etc.
+        // all reject n > MAX_BATCH_COUNT.
+        if (max_rows as usize) > MAX_BATCH_COUNT {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        // H2 (C8R2): cap output buffer sizes at MAX_BATCH_BYTES to
+        // prevent i32 offset wrap. The Arrow Binary layout stores
+        // per-row offsets as i32; if k_used/v_used grew past
+        // i32::MAX, `key_offsets[emitted] = k_used as i32` would wrap
+        // to negative — producing a corrupt offsets array that a
+        // downstream Arrow consumer would read as out-of-bounds.
+        // Sister batch FFI entries (frs_batch_put_arrow, etc.) all
+        // enforce this cap; chunked-iterator next is no different.
+        if out_key_data_cap > MAX_BATCH_BYTES || out_val_data_cap > MAX_BATCH_BYTES {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        // H3 (C8R4): reject NULL+cap>0 explicitly. Pre-fix the slice-from-
+        // raw-parts builder silently degraded to a zero-length slice when
+        // the pointer was null; the inner capacity-fit check then admitted
+        // the row (declared cap was non-zero) and `copy_from_slice` panicked
+        // out-of-bounds. Caught by `guarded` but reachable as an
+        // attacker-induced FRS_STATUS_PANIC. Sister entry frs_vectorized_batch_get
+        // rejects this combination with NULL_ARG; mirror it here.
+        if (out_key_data_cap > 0 && out_key_data.is_null())
+            || (out_val_data_cap > 0 && out_val_data.is_null())
+        {
+            return FRS_STATUS_NULL_ARG;
+        }
+        if max_rows == 0 {
+            return FRS_STATUS_OK;
+        }
+        let max_rows_usize = max_rows as usize;
+        let state = &mut *(iter as *mut IteratorState);
+        let key_offsets =
+            slice::from_raw_parts_mut(out_key_offsets, max_rows_usize + 1);
+        let val_offsets =
+            slice::from_raw_parts_mut(out_val_offsets, max_rows_usize + 1);
+        let validity =
+            slice::from_raw_parts_mut(out_val_validity, max_rows_usize);
+        let key_buf: &mut [u8] = if out_key_data_cap == 0 || out_key_data.is_null() {
+            &mut [][..]
+        } else {
+            slice::from_raw_parts_mut(out_key_data, out_key_data_cap)
+        };
+        let val_buf: &mut [u8] = if out_val_data_cap == 0 || out_val_data.is_null() {
+            &mut [][..]
+        } else {
+            slice::from_raw_parts_mut(out_val_data, out_val_data_cap)
+        };
+
+        // H4 (C8R4) + H6 (C9R2) + H7 (C9R3): only flip allow_rewind
+        // when the iterator has not been advanced by the forward-only
+        // `frs_iterator_next` path. Pre-fix this set the flag
+        // unconditionally, masking the D-C4R8-H1 guard against
+        // seek-over-mem::take-torn-rows for callers that did
+        // `next → next → next_chunk → seek`. Mirror seek's own
+        // guard: if cursor > 0 AND allow_rewind was still false,
+        // the row array is already torn.
+        //
+        // H7 carve-out: when the iterator is already exhausted
+        // (cursor >= rows.len), emit OK + eof=true rather than
+        // rejecting. The natural completion of a forward-only
+        // drain followed by a confirm-eof chunk call is a legitimate
+        // caller pattern; the torn rows are unreachable from the
+        // chunk's borrow (cursor sits at the past-end).
+        if !state.allow_rewind && state.cursor > 0 {
+            if state.cursor >= state.rows.len() {
+                *out_eof = true;
+                return FRS_STATUS_OK;
+            }
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        // From here on (cursor=0 OR allow_rewind already true) the
+        // chunked-next path borrows rows by reference (no `mem::take`),
+        // so subsequent seeks remain safe; mark the flag true so
+        // chunk→seek patterns aren't rejected by D-C4R8-H1.
+        state.allow_rewind = true;
+        key_offsets[0] = 0;
+        val_offsets[0] = 0;
+        let mut k_used: usize = 0;
+        let mut v_used: usize = 0;
+        let mut emitted: usize = 0;
+
+        while emitted < max_rows_usize {
+            if state.cursor >= state.rows.len() {
+                *out_eof = true;
+                break;
+            }
+            // Borrow the row in place (zero-copy); take/clone semantics
+            // mirror the per-row `frs_iterator_next` allow_rewind gate.
+            let (k, v) = if state.allow_rewind {
+                let (kk, vv) = &state.rows[state.cursor];
+                (kk.as_slice(), vv.as_slice())
+            } else {
+                let (kk, vv) = &state.rows[state.cursor];
+                (kk.as_slice(), vv.as_slice())
+            };
+            // Capacity check: if we can't fit the row, stop and let the
+            // caller pull what's been emitted so far. Overflow on the
+            // FIRST row signals "data_cap too small" — distinguish via
+            // BatchHeaderMalformed so the caller knows to grow rather
+            // than re-call.
+            if k_used + k.len() > out_key_data_cap || v_used + v.len() > out_val_data_cap {
+                if emitted == 0 {
+                    return FrsErrorCode::BatchHeaderMalformed as i32;
+                }
+                *out_eof = false;
+                break;
+            }
+            key_buf[k_used..k_used + k.len()].copy_from_slice(k);
+            k_used += k.len();
+            // Empty-value-is-null encoding mirrors the put-batch FFI's
+            // contract: validity bit distinguishes Some(empty) from None.
+            // IteratorState stores both as Vec<u8>, so we encode empty as
+            // valid=1, len=0.
+            val_buf[v_used..v_used + v.len()].copy_from_slice(v);
+            v_used += v.len();
+            validity[emitted] = 1;
+            emitted += 1;
+            state.cursor += 1;
+            key_offsets[emitted] = k_used as i32;
+            val_offsets[emitted] = v_used as i32;
+        }
+        // H1 sub-defect (1) + (2): always derive `*out_eof` from the
+        // actual cursor state. Pre-fix the exact-fill case (emitted ==
+        // max_rows AND cursor reached rows.len()) and the partial-fill
+        // case (capacity overflow with rows remaining) left *out_eof
+        // unwritten — caller saw carry-over.
+        *out_eof = state.cursor >= state.rows.len();
+        *out_count = emitted as u32;
         FRS_STATUS_OK
     })
 }
@@ -3435,6 +4102,64 @@ pub unsafe extern "C" fn frs_create_incremental_checkpoint_at(
     })
 }
 
+/// FRS-CKPT-NOFLUSH (2026-06-01): like [`frs_create_incremental_checkpoint_at`]
+/// but DOES NOT flush the memtable to an L0 SST — it enumerates only the
+/// already-flushed (WBM-pressure) SST set. The caller captures the live
+/// memtable separately via [`frs_snapshot_memtables_to_dir`] and uploads those
+/// artifacts as private checkpoint state, so the memtable stays RAM-resident +
+/// unfragmented (the ckpt-ON heavy-join fix). Result struct + free are
+/// identical to the flushing variant.
+#[no_mangle]
+pub unsafe extern "C" fn frs_create_incremental_checkpoint_at_noflush(
+    db: FrsDb,
+    snapshot: FrsSnapshot,
+    checkpoint_id: u64,
+    base_checkpoint_id: u64,
+    out: *mut FrsIncrementalCheckpointResult,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if snapshot.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let snap_ref = &(*snapshot).inner;
+        if snap_ref.db_id() != db.db_id() {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        match db.create_incremental_checkpoint_noflush(
+            snap_ref,
+            checkpoint_id,
+            base_checkpoint_id,
+        ) {
+            Ok(result) => {
+                let manifest_path_c =
+                    std::ffi::CString::new(result.manifest_path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| {
+                            std::ffi::CString::new("<invalid-path>").expect("static literal")
+                        });
+                let new_list_box = Box::new(into_ffi_list(result.new_ssts, 0));
+                let shared_list_box = Box::new(into_ffi_list(result.shared_ssts, 0));
+                std::ptr::write(
+                    out,
+                    FrsIncrementalCheckpointResult {
+                        manifest_path: manifest_path_c.into_raw(),
+                        new_ssts: Box::into_raw(new_list_box),
+                        shared_ssts: Box::into_raw(shared_list_box),
+                        flush_done_eventfd: -1,
+                    },
+                );
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
 /// Releases the inner allocations of an [`FrsIncrementalCheckpointResult`].
 ///
 /// Walks both `new_ssts` and `shared_ssts` (calling
@@ -3499,6 +4224,15 @@ pub unsafe extern "C" fn frs_db_open_from_incremental(
         }
         if sst_file_count > 0 && sst_files.is_null() {
             return FRS_STATUS_NULL_ARG;
+        }
+        // C-R17-NEW-H1: cap sst_file_count against MAX_BATCH_COUNT, mirroring
+        // the sister `frs_db_ingest_external_sst` discipline. Without this
+        // cap a hostile or mis-serialized restore manifest could deliver
+        // a fabricated `count = usize::MAX`, driving Vec::with_capacity()
+        // and the per-entry `*sst_files.add(i)` OOB scan up to 16 EiB of
+        // arbitrary memory (info-disclosure + OOM).
+        if sst_file_count > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
         }
         let target = match CStr::from_ptr(target_dir).to_str() {
             Ok(s) => s.to_string(),
@@ -3834,6 +4568,12 @@ use std::sync::{Mutex, OnceLock};
 /// branch is extremely predictable and the per-row cost is dominated by
 /// the `copy_nonoverlapping` into the caller's buffer, not the dispatch.
 enum IterKey {
+    // B-R7-NEW-H1: kept for the borrowed-slice / future-Vec-source variant
+    // even though the range path now also emits `Arc<[u8]>` (was the last
+    // remaining constructor). Removing the variant would force a public
+    // enum shape change for the FFI handle registry; leaving it gated
+    // behind `#[allow(dead_code)]` preserves the option without warning.
+    #[allow(dead_code)]
     Vec(Vec<u8>),
     Arc(Arc<[u8]>),
 }
@@ -3873,6 +4613,11 @@ impl IterKey {
 /// the prefix path uses `Arc<[u8]>` (cheap refcount bump on `put_back`
 /// rollback) while the range path keeps its upstream `Vec<u8>`.
 enum IterValue {
+    // B-R7-NEW-H1: see `IterKey::Vec` note. The last in-tree constructor
+    // (the eager range-scan FFI path) was removed when `frs_vec_iter_range_open`
+    // switched to `scan_iter_owned_arc_with_error_slot`. Variant retained
+    // for symmetry with `IterKey::Vec` and for future borrowed-Vec sources.
+    #[allow(dead_code)]
     Vec(Vec<u8>),
     Arc(Arc<[u8]>),
 }
@@ -3942,6 +4687,13 @@ struct IterHandle {
 }
 
 impl IterHandle {
+    // B-R7-NEW-H1: previously used by the eager `frs_vec_iter_range_open`
+    // path. After the range path migrated to the error-slot-aware
+    // construction, no in-tree caller remains. Kept for the eager FFI
+    // path used by `frs_iterator_open`/`frs_iterator_open_at` (which
+    // still construct iterators without a shared error slot via the
+    // legacy `IteratorState::new(rows: Vec<...>)` pattern).
+    #[allow(dead_code)]
     fn new(inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send>) -> Self {
         Self::new_with_error_slot(inner, Arc::new(Mutex::new(None)))
     }
@@ -4501,6 +5253,13 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
         let n_us = n as usize;
         let offs = slice::from_raw_parts(prefixes_off, n_us + 1);
         let total_pref = offs[n_us] as usize;
+        // C-R14-NEW-H3: aggregate-bytes cap mirroring C-R13-NEW-H1 etc.
+        // u32 offsets permit up to 4 GiB of caller-supplied prefix payload;
+        // without this cap a single open_batch call can OOM the host or
+        // drive engine seek/comparator paths on multi-MiB prefix bytes.
+        if total_pref > MAX_BATCH_BYTES {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
         let data_buf: &[u8] = if prefixes_data.is_null() || total_pref == 0 {
             &[]
         } else {
@@ -4736,40 +5495,63 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
             Some(slice::from_raw_parts(hi_ptr, hi_len as usize))
         };
 
-        // V1: the engine's `scan` returns an owned Vec; we wrap its
-        // IntoIter as the boxed cursor.  PR-D4 zero-clone: NO intermediate
-        // Vec is allocated at the FFI layer — `fill_chunk_from_iter` drains
-        // the boxed iter directly into the caller's buffer.
-        //
-        // B10-H3: each row's key is wrapped in `IterKey::Vec` — the engine's
-        // `scan` materialises keys as `Vec<u8>` (no upstream `Arc<[u8]>`
-        // to share), so we adopt them unchanged. The enum tag is a single
-        // byte and the per-row dispatch in `fill_chunk_from_iter` is a
-        // tagged-union branch (C12-M1: NOT a cmov — Vec and Arc variants
-        // have different layouts), but the branch is extremely predictable
-        // (one variant per iter handle for its full lifetime), so the
-        // cost is negligible vs the per-row `copy_nonoverlapping`.
-        let rows = match db_ref.scan(cf_ref_, lo, hi_opt) {
-            Ok(r) => r,
+        // B-R7-NEW-H1: streaming range-scan iterator. Pre-fix this routed
+        // through `db_ref.scan(...)` which eagerly drained every tier into
+        // a BTreeSet then re-`get`-ed each key, paying
+        // O(matching-keys x value-size) resident memory at open time. The
+        // new `scan_iter_owned_arc_with_error_slot` mirrors the prefix
+        // path's lazy k-way merge (active mem cursor, imm mem cursors,
+        // overlapping SSTs block-streaming). First-row latency is
+        // O(num_tiers); the FFI consumer drains chunks via
+        // `fill_chunk_from_iter` with zero intermediate Vec allocation.
+        // Both halves of each row are emitted as `Arc<[u8]>` (wrapped in
+        // `IterKey::Arc` / `IterValue::Arc`) so the per-row memcpy reads
+        // directly out of the Arc-owned bytes.
+        let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+            Arc::new(Mutex::new(None));
+        let owned_iter = match db_ref.scan_iter_owned_arc_with_error_slot(
+            cf_ref_,
+            lo,
+            hi_opt,
+            Arc::clone(&error_slot),
+        ) {
+            Ok(it) => it,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
-        // B11-H3: wrap the value half in `IterValue::Vec` — the range iter's
-        // engine source returns owned `Vec<u8>` values (no upstream Arc to
-        // share), so we adopt them unchanged. The per-row dispatch is a
-        // tagged-union branch (C12-M1: NOT a cmov), but the branch is
-        // extremely predictable for the full handle lifetime so the cost
-        // is dominated by the `copy_nonoverlapping` into the caller buffer.
-        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> = Box::new(
-            rows.into_iter()
-                .map(|(k, v)| (IterKey::Vec(k), IterValue::Vec(v))),
-        );
-        let mut handle_state = IterHandle::new(inner);
+        let error_slot_inner = Arc::clone(&error_slot);
+        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+            Box::new(owned_iter.filter_map(move |r| match r {
+                Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                Err(e) => {
+                    // R18-M3 sticky-FIRST: preserve the earliest error per
+                    // chunk so cascade errors don't bury the root cause.
+                    let mut guard = error_slot_inner.lock().unwrap_or_else(|p| p.into_inner());
+                    if guard.is_none() {
+                        *guard = Some(e);
+                    }
+                    None
+                }
+            }));
+        let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
 
         // Fill the first chunk lazily into the caller's buffer.
         let (bytes_used, row_count) =
             fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
 
-        // Register — shares the same sharded registry as prefix iterators.
+        // R16-M2 + R17-M3: partial-chunk state machine matches the prefix
+        // path. Error with NO rows -> fail open(); error after some rows
+        // -> register the handle and stash the error for the next _next.
+        if let Some(err) = handle_state.take_last_error() {
+            if row_count == 0 {
+                *out_row_count = 0;
+                *out_bytes_used = 0;
+                *out_handle = 0;
+                return error_to_frs_code(&err);
+            }
+            handle_state.set_deferred_error(err);
+        }
+
+        // Register - shares the same sharded registry as prefix iterators.
         let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         shard_for(handle_id)
             .lock()
@@ -4912,14 +5694,49 @@ pub unsafe extern "C" fn frs_vec_merge_append(
             return FrsErrorCode::Ok as i32;
         }
 
+        // D-R8-NEW-H2: refuse merge-append on CFs without a merge
+        // operator. Pre-fix the call succeeded (Merge entries
+        // accepted into the WriteBatch) but every subsequent read
+        // of the affected key returned `InvalidArgument` ("CF has
+        // no merge operator configured") — silently corrupting any
+        // CF created via `frs_db_create_cf_with_merge(.., NULL,
+        // ..)`. Reject at the FFI boundary so the failure is
+        // surfaced at write time, before the bad state is durable.
+        if !db_ref.cf_has_merge_operator(cf_ref) {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+
+        // C-R15-NEW-H2: aggregate-bytes cap mirroring frs_vec_merge_append_batch.
+        // The single-shot routes through the SAME db.batch_write →
+        // batch_put_arrow_with_base_seq path that C-R14-NEW-H3 capped on the
+        // batched sister; without this cap an asyncAddAll burst with thousands
+        // of medium operands can drive total_ops past u32::MAX and overflow
+        // the memtable's `key_data.len() as u32` rebase, producing torn rows.
+        // Also cap num_operands to MAX_BATCH_COUNT (matches the batch sister).
+        if num_operands as usize > MAX_BATCH_COUNT {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+
         // Write real Merge operands instead of read-combine-put. This keeps concurrent appends
         // lossless: the engine resolves merge chains at read/compaction time under the CF's
         // raw-concat operator.
         let mut operands: Vec<&[u8]> = Vec::with_capacity(num_operands as usize);
+        let mut total_ops: usize = 0;
         for i in 0..num_operands as usize {
             let p = *operand_ptrs.add(i);
             let n = *operand_lens.add(i) as usize;
             if p.is_null() && n > 0 {
+                return FrsErrorCode::BatchHeaderMalformed as i32;
+            }
+            // C-R15-NEW-H2: per-operand cap + aggregate cap.
+            if n > MAX_KEY_LEN {
+                return FrsErrorCode::BatchHeaderMalformed as i32;
+            }
+            total_ops = match total_ops.checked_add(n) {
+                Some(t) => t,
+                None => return FrsErrorCode::BatchHeaderMalformed as i32,
+            };
+            if total_ops > MAX_BATCH_BYTES {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
             let s: &[u8] = if n == 0 {
@@ -4994,6 +5811,11 @@ pub unsafe extern "C" fn frs_vec_merge_append_batch(
         let Some(cf_ref) = cf_ref(&cf) else {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         };
+        // D-R8-NEW-H2: refuse on CFs without a merge operator —
+        // same rationale as frs_vec_merge_append.
+        if !db_ref.cf_has_merge_operator(cf_ref) {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
 
         let count = n as usize;
         let keys_offs = slice::from_raw_parts(keys_off, count + 1);
@@ -5005,6 +5827,15 @@ pub unsafe extern "C" fn frs_vec_merge_append_batch(
             return FrsErrorCode::BatchHeaderMalformed as i32;
         };
         if total_keys > keys_data_len || total_ops > ops_data_len {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        // C-R14-NEW-H3 (merge-batch sister): aggregate-bytes cap. Sister
+        // entries `frs_vectorized_batch_put` / `frs_batch_put_arrow` etc.
+        // enforce MAX_BATCH_BYTES on each column independently; the
+        // merge-batch path drives the SAME memtable arrow rebase path
+        // (`batch_put_arrow_with_base_seq`) via batch_write, so the same
+        // u32-overflow corruption applies here.
+        if total_keys > MAX_BATCH_BYTES || total_ops > MAX_BATCH_BYTES {
             return FrsErrorCode::BatchHeaderMalformed as i32;
         }
         if (total_keys > 0 && keys_data.is_null()) || (total_ops > 0 && ops_data.is_null()) {
@@ -5021,10 +5852,13 @@ pub unsafe extern "C" fn frs_vec_merge_append_batch(
             slice::from_raw_parts(ops_data, total_ops)
         };
 
-        // Preserve row order exactly: batch_write assigns monotonically increasing sequence
-        // numbers to these Merge records, and the read path reverses newest-first operands back to
-        // oldest-first before invoking the raw-concat operator.
-        let mut wb = WriteBatch::with_capacity(count);
+        // C4R2-B-NEW-H1 (merge-batch sister): skip WriteBatch construction;
+        // pass borrowed key/op slices directly. OpType::Merge = 2.
+        // batch_put_borrowed_single_cf still assigns monotonically increasing
+        // sequence numbers; the read path reverses newest-first operands back
+        // to oldest-first before invoking the raw-concat operator.
+        let mut keys_slices: Vec<&[u8]> = Vec::with_capacity(count);
+        let mut value_slices: Vec<Option<&[u8]>> = Vec::with_capacity(count);
         for i in 0..count {
             let k_start = keys_offs[i] as usize;
             let k_end = keys_offs[i + 1] as usize;
@@ -5032,15 +5866,17 @@ pub unsafe extern "C" fn frs_vec_merge_append_batch(
             if key.len() > MAX_KEY_LEN {
                 return FrsErrorCode::BatchHeaderMalformed as i32;
             }
-
             let o_start = ops_offs[i] as usize;
             let o_end = ops_offs[i + 1] as usize;
             let op = &ops_buf[o_start..o_end];
-
-            wb.merge(cf_ref, key, op);
+            keys_slices.push(key);
+            value_slices.push(Some(op));
         }
+        let op_types: Vec<u8> = vec![2u8; count]; // OpType::Merge
 
-        if let Err(e) = db_ref.batch_write(wb) {
+        if let Err(e) =
+            db_ref.batch_put_borrowed_single_cf(cf_ref, &keys_slices, &value_slices, &op_types)
+        {
             return error_to_frs_code(&e);
         }
 

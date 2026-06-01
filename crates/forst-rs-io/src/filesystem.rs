@@ -86,6 +86,38 @@ pub trait RandomAccessFile: Send + Sync {
     /// reached end-of-file.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize>;
 
+    /// Reads multiple `(offset, len)` ranges and returns one `Vec<u8>` per
+    /// range, in the same order as `ranges`.
+    ///
+    /// The default implementation loops serially over [`read_at`], applying
+    /// the short-read loop per range so a truncated/empty backend reply does
+    /// not silently shorten a range. Backends that own an async runtime
+    /// (e.g. OpenDAL/S3) override this to issue the ranges CONCURRENTLY,
+    /// which collapses a cold N-chunk scan from N sequential round-trips into
+    /// ~ceil(N/concurrency) batches. Each returned `Vec` is truncated to the
+    /// number of bytes actually read (EOF-shortened ranges are shorter than
+    /// requested), exactly matching what repeated `read_at` calls would yield.
+    ///
+    /// [`read_at`]: RandomAccessFile::read_at
+    fn read_ranges(&self, ranges: &[(u64, usize)]) -> ForstResult<Vec<Vec<u8>>> {
+        ranges
+            .iter()
+            .map(|&(off, len)| {
+                let mut b = vec![0u8; len];
+                let mut filled = 0;
+                while filled < len {
+                    let n = self.read_at(off + filled as u64, &mut b[filled..])?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                b.truncate(filled);
+                Ok(b)
+            })
+            .collect()
+    }
+
     /// Returns the total file size in bytes.
     fn file_size(&self) -> ForstResult<u64>;
 }
@@ -160,6 +192,26 @@ pub trait FileSystem: Send + Sync {
     /// and SST file rotation).
     fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()>;
 
+    /// Whether this filesystem provides an atomic [`Self::rename`].
+    ///
+    /// Local POSIX filesystems do (`rename(2)` is atomic within a mount), so
+    /// the SST/MANIFEST write paths stage to a `.tmp` file and rename into
+    /// place for crash-atomic publication. **Object stores (S3/GCS/OSS/Azure)
+    /// have no server-side rename** — OpenDAL surfaces it as `Unsupported`, and
+    /// a copy+delete emulation is *not* atomic (it can expose two objects or
+    /// orphan the source). For those backends this returns `false`, and the
+    /// write paths instead stream the SST straight to its final key: an
+    /// object-store multipart upload only publishes the object on a successful
+    /// `close()` (CompleteMultipartUpload), so a mid-write crash leaves an
+    /// incomplete upload that never becomes visible — crash-atomic without a
+    /// rename. Mirrors how ForSt's native engine writes to disaggregated
+    /// storage.
+    ///
+    /// Default `true` so POSIX-style backends need not override.
+    fn supports_atomic_rename(&self) -> bool {
+        true
+    }
+
     /// R49-H3: fsync the directory at `dir` so any prior `rename()` /
     /// create / unlink of a file inside it survives a power-loss event.
     /// POSIX requires this for the directory entry change to be durable
@@ -192,6 +244,41 @@ pub trait FileSystem: Send + Sync {
     ///
     /// The default implementation is a no-op that always succeeds.
     fn ensure_cached(&self, _path: &Path) -> ForstResult<()> {
+        Ok(())
+    }
+
+    /// FRS-S3-READ-CONCURRENCY (2026-05-31): best-effort warm the cache for
+    /// `paths`, fetching cache MISSES CONCURRENTLY when the backend supports it.
+    ///
+    /// Caching/object-store backends override this to fan the per-file fetches
+    /// out across threads so K misses cost ≈1 round-trip instead of K serial
+    /// ones (the q9 join-stall hot path — see `CachedFileSystem`). The default
+    /// is a serial loop over [`ensure_cached`](Self::ensure_cached), which is a
+    /// no-op for local/in-memory filesystems.
+    fn prefetch_concurrent(&self, paths: &[&Path]) {
+        for p in paths {
+            let _ = self.ensure_cached(p);
+        }
+    }
+
+    /// 2026-05-29 WRITE-BACK FLUSH: block until any in-flight asynchronous
+    /// upload of `path` has completed (and propagate its error). Backends that
+    /// upload writes asynchronously (object-store / S3 write-back) override
+    /// this so a reader that needs `path` from the remote first waits for the
+    /// upload to finish — the correctness guard that lets the flush hot path
+    /// return on the local write and upload to S3 off the critical path.
+    ///
+    /// Default no-op: local/memory backends write synchronously, nothing to
+    /// await.
+    fn await_upload(&self, _path: &Path) -> ForstResult<()> {
+        Ok(())
+    }
+
+    /// 2026-05-29 WRITE-BACK FLUSH: block until ALL in-flight asynchronous
+    /// uploads have completed (and propagate the first error). Used at the
+    /// checkpoint barrier and on shutdown to establish remote durability of
+    /// every flushed/compacted SST. Default no-op.
+    fn await_all_uploads(&self) -> ForstResult<()> {
         Ok(())
     }
 }

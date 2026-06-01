@@ -31,6 +31,11 @@ lz4_flex = { workspace = true }
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
 arc-swap = { workspace = true }
+# 2026-05-29 PERF: FxHashMap (fast non-crypto hasher) for the vectorized
+# memtable's hot hash_index/unsorted_lookup/prefix_index. Profiling q4/q7
+# showed Rust's default SipHash (BuildHasher::hash_one + Hasher::write)
+# dominated join CPU (~588/sample). FxHash is ~5-10× faster for short keys.
+rustc-hash = "2.1"
 
 [dev-dependencies]
 forst-rs-test-utils = { workspace = true }

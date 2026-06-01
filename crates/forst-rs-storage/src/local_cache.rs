@@ -50,6 +50,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -58,6 +59,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug)]
 struct Entry {
     bytes: u64,
+    /// Generation of this key's most-recent LRU push. An `lru` deque entry
+    /// `(key, g)` is the LIVE recency reference iff `entries[key].gen == g`;
+    /// any older `(key, g')` left in the deque is stale and skipped on
+    /// eviction. This makes `touch` O(1) (stamp + push, no scan/remove).
+    gen: u64,
 }
 
 /// LRU file-cache backed by `cache_dir` on the local filesystem.
@@ -69,16 +75,102 @@ pub struct LocalCache {
     cache_dir: PathBuf,
     capacity_bytes: u64,
     inner: Mutex<Inner>,
+    /// Cache-hit counter (lock-free). A "hit" is a `get` that returns
+    /// `Some(_)`. Sized to validate the concurrent-read fix on S3 — a low
+    /// hit rate means cold scans dominate and concurrency pays off.
+    hits: AtomicU64,
+    /// Cache-miss counter: a `get` that returns `None`.
+    misses: AtomicU64,
+    /// Total `get` calls; used to throttle periodic stats logging.
+    gets: AtomicU64,
 }
 
 #[derive(Default)]
 struct Inner {
     /// Map of logical key -> entry metadata.
     entries: HashMap<String, Entry>,
-    /// LRU order (front = oldest, back = most-recently-used).
-    lru: VecDeque<String>,
+    /// LRU order as generation-stamped references (front = oldest,
+    /// back = most-recently-used). May contain STALE refs whose `gen` no
+    /// longer matches `entries[key].gen` (superseded by a later touch or a
+    /// removed entry); these are skipped on eviction and dropped by
+    /// `compact`. Lazy stamping keeps `touch` O(1).
+    lru: VecDeque<(String, u64)>,
     /// Sum of `entries[*].bytes`. Updated atomically with the map.
     current_bytes: u64,
+    /// Monotonic generation counter; each push takes `next_gen()`.
+    gen_counter: u64,
+    /// Approximate count of stale `lru` refs, used only to decide WHEN to
+    /// compact (correctness never depends on its accuracy — the `gen`
+    /// comparison is authoritative).
+    stale: usize,
+}
+
+impl Inner {
+    fn next_gen(&mut self) -> u64 {
+        self.gen_counter = self.gen_counter.wrapping_add(1);
+        self.gen_counter
+    }
+
+    /// Marks `key` most-recently-used in O(1): stamp a fresh generation on
+    /// the entry and push `(key, gen)`. The entry's previous `lru` ref
+    /// becomes stale (skipped on eviction). Caller holds the lock and has
+    /// confirmed membership.
+    fn touch_lru(&mut self, key: &str) {
+        let g = self.next_gen();
+        let present = if let Some(e) = self.entries.get_mut(key) {
+            e.gen = g;
+            true
+        } else {
+            false
+        };
+        if present {
+            self.stale += 1; // the prior (key, old_gen) ref is now stale
+            self.lru.push_back((key.to_string(), g));
+            self.maybe_compact();
+        }
+    }
+
+    /// Records that `key`'s current `lru` ref just became stale (the entry was
+    /// removed or its bytes superseded by a fresh push). O(1) — no scan; the
+    /// stale ref is reclaimed lazily on eviction/compaction.
+    fn mark_stale(&mut self) {
+        self.stale += 1;
+        self.maybe_compact();
+    }
+
+    /// Rebuilds `lru` keeping only the live ref per key (preserving order)
+    /// when stale refs dominate, bounding deque growth to ~one ref per entry.
+    /// Amortized O(1) per touch (runs at most every ~N touches).
+    fn maybe_compact(&mut self) {
+        if self.stale > 64 && self.stale.saturating_mul(2) > self.lru.len() {
+            let mut fresh = VecDeque::with_capacity(self.entries.len());
+            for (k, g) in std::mem::take(&mut self.lru) {
+                if self.entries.get(&k).is_some_and(|e| e.gen == g) {
+                    fresh.push_back((k, g));
+                }
+            }
+            self.lru = fresh;
+            self.stale = 0;
+        }
+    }
+}
+
+/// Positional read (`pread`) of `buf.len()` bytes at `offset` from `file`,
+/// without disturbing any file cursor. Returns the bytes read (may be short
+/// at EOF). On Unix this is a single `pread(2)`; elsewhere it falls back to a
+/// seek+read (acceptable: the cache is only used on Unix targets in practice).
+#[cfg(unix)]
+fn pread(file: &fs::File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+    file.read_at(buf, offset)
+}
+
+#[cfg(not(unix))]
+fn pread(file: &fs::File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file.try_clone()?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read(buf)
 }
 
 impl LocalCache {
@@ -113,8 +205,9 @@ impl LocalCache {
             }
             let key = unsanitize_key(&file_name);
             let bytes = meta.len();
-            inner.entries.insert(key.clone(), Entry { bytes });
-            inner.lru.push_back(key);
+            let g = inner.next_gen();
+            inner.entries.insert(key.clone(), Entry { bytes, gen: g });
+            inner.lru.push_back((key, g));
             inner.current_bytes = inner.current_bytes.saturating_add(bytes);
         }
 
@@ -122,7 +215,40 @@ impl LocalCache {
             cache_dir,
             capacity_bytes,
             inner: Mutex::new(inner),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            gets: AtomicU64::new(0),
         })
+    }
+
+    /// Returns `(hits, misses)` observed by [`get`](Self::get) so far.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Records a hit/miss and emits a periodic `FRS-CACHE-STATS` line every
+    /// 100k gets. Lock-free; called on every `get`.
+    fn record_get(&self, hit: bool) {
+        if hit {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        let n = self.gets.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 100_000 == 0 {
+            let hits = self.hits.load(Ordering::Relaxed);
+            let misses = self.misses.load(Ordering::Relaxed);
+            let total = hits + misses;
+            let rate = if total == 0 {
+                0.0
+            } else {
+                (hits as f64 / total as f64) * 100.0
+            };
+            eprintln!("FRS-CACHE-STATS: hits={hits} misses={misses} hit_rate={rate:.1}%");
+        }
     }
 
     /// Returns the cache directory.
@@ -166,6 +292,20 @@ impl LocalCache {
             .contains_key(key)
     }
 
+    /// FRS-LOCAL-FIRST-SST (2026-06-01): the byte length of the cached entry
+    /// for `key`, or `None` on a miss. Used by the local-first SST read path to
+    /// size a `RandomAccessFile` over the write-through copy WITHOUT a remote
+    /// `await_upload` round-trip. Does NOT bump the LRU (it is a metadata-only
+    /// probe issued at reader-open time, not a data access).
+    pub fn entry_size(&self, key: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .expect("local cache mutex poisoned")
+            .entries
+            .get(key)
+            .map(|e| e.bytes)
+    }
+
     /// Reads the cached bytes for `key`. Returns `Ok(None)` on miss.
     /// On hit, marks `key` as most-recently-used.
     pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
@@ -174,32 +314,99 @@ impl LocalCache {
         let on_disk = {
             let mut inner = self.inner.lock().expect("local cache mutex poisoned");
             if !inner.entries.contains_key(key) {
+                self.record_get(false);
                 return Ok(None);
             }
-            // Move key to back of LRU (most-recently-used).
-            if let Some(pos) = inner.lru.iter().position(|k| k == key) {
-                inner.lru.remove(pos);
-            }
-            inner.lru.push_back(key.to_string());
+            inner.touch_lru(key);
             self.path_for(key)
         };
 
         match fs::read(&on_disk) {
-            Ok(bytes) => Ok(Some(bytes)),
+            Ok(bytes) => {
+                self.record_get(true);
+                Ok(Some(bytes))
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.record_get(false);
                 // The metadata says we have it but the file is gone — surface
                 // as a miss rather than an error so callers can re-fetch.
-                let mut inner = self.inner.lock().expect("local cache mutex poisoned");
-                if let Some(entry) = inner.entries.remove(key) {
-                    inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
-                }
-                if let Some(pos) = inner.lru.iter().position(|k| k == key) {
-                    inner.lru.remove(pos);
-                }
+                self.drop_entry(key);
                 Ok(None)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Removes `key` from the in-memory metadata (map + LRU), decrementing the
+    /// byte accounting. Used when an on-disk file vanished underneath a cached
+    /// entry so the next access re-fetches rather than serving a phantom hit.
+    fn drop_entry(&self, key: &str) {
+        let mut inner = self.inner.lock().expect("local cache mutex poisoned");
+        if let Some(entry) = inner.entries.remove(key) {
+            inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
+            // The entry's live lru ref is now stale; reclaimed lazily (O(1)).
+            inner.mark_stale();
+        }
+    }
+
+    /// Reads exactly the `[offset, offset+len)` sub-range of the cached file
+    /// for `key` WITHOUT materializing the whole file — a positional `pread`.
+    ///
+    /// This is the rocksdb-parity read primitive for the heavy-join hot path.
+    /// A data-block read needs ~16 KiB; [`get`](Self::get) would `fs::read` the
+    /// entire (up to 64 MiB whole-SST / 1 MiB chunk) cached file to slice out
+    /// those 16 KiB — a 64×+ read amplification (in-kernel memcpy + heap alloc)
+    /// paid per block, per overlapping SST, per probe. `get_range` reads only
+    /// the bytes asked for.
+    ///
+    /// Returns `Ok(None)` on a cache miss (caller re-fetches), bumping the LRU
+    /// on a hit exactly like `get`. Sound ONLY for write-once files (SSTs): a
+    /// fixed `(key, offset)` maps to immutable bytes, so a positional read is
+    /// always consistent. The returned vec may be SHORTER than `len` if the
+    /// file ends before `offset+len`; the caller validates the length and
+    /// falls back on a short read (defends against a poisoned/truncated entry).
+    pub fn get_range(&self, key: &str, offset: u64, len: usize) -> io::Result<Option<Vec<u8>>> {
+        if len == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // Critical section: membership check + LRU bump. The pread happens
+        // AFTER the guard is released (mirrors `get`) so disk I/O never
+        // serializes concurrent readers on the single cache mutex.
+        let on_disk = {
+            let mut inner = self.inner.lock().expect("local cache mutex poisoned");
+            if !inner.entries.contains_key(key) {
+                self.record_get(false);
+                return Ok(None);
+            }
+            inner.touch_lru(key);
+            self.path_for(key)
+        };
+
+        let file = match OpenOptions::new().read(true).open(&on_disk) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Metadata says present but the file is gone — treat as a miss
+                // and drop the stale entry so the caller re-fetches (mirrors
+                // `get`'s NotFound handling).
+                self.record_get(false);
+                self.drop_entry(key);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut buf = vec![0u8; len];
+        let mut filled = 0usize;
+        while filled < len {
+            let n = pread(&file, offset + filled as u64, &mut buf[filled..])?;
+            if n == 0 {
+                break; // EOF before len — short read, caller validates.
+            }
+            filled += n;
+        }
+        buf.truncate(filled);
+        self.record_get(true);
+        Ok(Some(buf))
     }
 
     /// Writes `data` into the cache under `key`. Evicts oldest entries
@@ -225,43 +432,81 @@ impl LocalCache {
             return Err(e);
         }
         drop(tmp);
-        if let Err(e) = fs::rename(&tmp_path, &path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        OpenOptions::new()
-            .read(true)
-            .open(&self.cache_dir)
-            .and_then(|dir| dir.sync_all())?;
 
-        // Compute eviction set under the lock after the atomic rename has published the bytes.
+        // A-R11-H2: hold the bookkeeping mutex across the rename AND
+        // the in-memory accounting update so concurrent same-key
+        // writers cannot interleave on-disk + accounting in opposite
+        // orders. Pre-fix, T1 (size 10) and T2 (size 20) could rename
+        // in order T2→T1 (T1's rename atomic-replaces T2's content)
+        // while serializing on the mutex in order T1→T2 — leaving the
+        // on-disk content from T1 (10 bytes) but accounting reporting
+        // 20 bytes, which then mis-sizes eviction decisions and yields
+        // short SST reads at the storage layer. The dir.sync_all is
+        // also moved inside the mutex so a failure there cannot leak
+        // a published-but-unaccounted file (orphan only at fsync
+        // failure; map-and-disk both rolled back).
         let to_evict = {
             let mut inner = self.inner.lock().expect("local cache mutex poisoned");
 
+            if let Err(e) = fs::rename(&tmp_path, &path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+            if let Err(e) = OpenOptions::new()
+                .read(true)
+                .open(&self.cache_dir)
+                .and_then(|dir| dir.sync_all())
+            {
+                // D-R12-H2: the rename above atomically REPLACED any
+                // existing file at `path`. If we now remove the new
+                // file, the OLD file backing any prior entries[key] is
+                // also gone — so we must drop that accounting too.
+                // Pre-fix removed only the disk file, leaving an
+                // accounting entry that pointed at a NotFound path —
+                // subsequent reads through the cache would see an
+                // entries-hit but disk-miss, returning corruption.
+                let _ = fs::remove_file(&path);
+                if let Some(prev) = inner.entries.remove(key) {
+                    inner.current_bytes = inner.current_bytes.saturating_sub(prev.bytes);
+                    inner.mark_stale();
+                }
+                return Err(e);
+            }
+
             // If the key already exists, treat the put as an update: free
             // the old bytes from the accounting before deciding evictions.
+            // Its stale lru ref is reclaimed lazily (no O(N) scan).
             if let Some(prev) = inner.entries.remove(key) {
                 inner.current_bytes = inner.current_bytes.saturating_sub(prev.bytes);
-                if let Some(pos) = inner.lru.iter().position(|k| k == key) {
-                    inner.lru.remove(pos);
-                }
+                inner.mark_stale();
             }
 
             let mut evict = Vec::new();
             while inner.current_bytes.saturating_add(new_bytes) > self.capacity_bytes {
-                let Some(victim) = inner.lru.pop_front() else {
+                let Some((victim, g)) = inner.lru.pop_front() else {
                     break;
                 };
-                if let Some(entry) = inner.entries.remove(&victim) {
-                    inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
-                    evict.push(victim);
+                // Evict only if this is the LIVE recency ref; a stale ref
+                // (superseded/removed) is skipped (its entry is gone or has a
+                // newer ref later in the deque).
+                match inner.entries.get(&victim) {
+                    Some(e) if e.gen == g => {
+                        let bytes = e.bytes;
+                        inner.entries.remove(&victim);
+                        inner.current_bytes = inner.current_bytes.saturating_sub(bytes);
+                        evict.push(victim);
+                    }
+                    _ => {
+                        inner.stale = inner.stale.saturating_sub(1);
+                    }
                 }
             }
 
+            let g = inner.next_gen();
             inner
                 .entries
-                .insert(key.to_string(), Entry { bytes: new_bytes });
-            inner.lru.push_back(key.to_string());
+                .insert(key.to_string(), Entry { bytes: new_bytes, gen: g });
+            inner.lru.push_back((key.to_string(), g));
             inner.current_bytes = inner.current_bytes.saturating_add(new_bytes);
             evict
         };
@@ -280,17 +525,26 @@ impl LocalCache {
     /// Removes `key` from the cache (both in-memory and on-disk).
     /// Returns `Ok(true)` if the entry existed.
     pub fn invalidate(&self, key: &str) -> io::Result<bool> {
-        let path = {
-            let mut inner = self.inner.lock().expect("local cache mutex poisoned");
-            let Some(entry) = inner.entries.remove(key) else {
-                return Ok(false);
-            };
-            inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
-            if let Some(pos) = inner.lru.iter().position(|k| k == key) {
-                inner.lru.remove(pos);
-            }
-            self.path_for(key)
+        // A-R12-H2: hold the mutex across the fs::remove_file so a
+        // concurrent put(key, new_data) cannot atomic-rename into the
+        // path between our entries.remove() and our remove_file().
+        // Pre-fix sequence:
+        //   T1 invalidate(K): mutex → remove entries[K] → release mutex
+        //   T2 put(K, new):   mutex → rename tmp→K → entries[K] = new → release
+        //   T1 invalidate(K): fs::remove_file(K) DELETES T2's just-published file
+        // Result: T2's caller observes put-OK with on-disk file MISSING.
+        // Holding the lock across the unlink serializes the (in-memory,
+        // on-disk) pair atomically. Note: on Unix, unlink does not block
+        // open file handles, so a concurrent reader that already opened
+        // the file before this lock acquisition still sees consistent
+        // bytes; only the path-name binding flips.
+        let mut inner = self.inner.lock().expect("local cache mutex poisoned");
+        let Some(entry) = inner.entries.remove(key) else {
+            return Ok(false);
         };
+        inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
+        inner.mark_stale(); // entry's lru ref is now stale; reclaimed lazily
+        let path = self.path_for(key);
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
@@ -396,6 +650,45 @@ mod tests {
     }
 
     #[test]
+    fn get_range_preads_exact_subrange() {
+        let (_tmp, cache) = fresh_cache(4096);
+        let payload: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        assert!(cache.put("/db/00000007.sst", &payload).unwrap());
+
+        // Middle sub-range.
+        let mid = cache
+            .get_range("/db/00000007.sst", 100, 50)
+            .expect("get_range")
+            .expect("hit");
+        assert_eq!(mid, &payload[100..150]);
+
+        // Zero-length read is an empty hit (no file touch needed).
+        let empty = cache.get_range("/db/00000007.sst", 0, 0).expect("get_range");
+        assert_eq!(empty, Some(Vec::new()));
+
+        // Read clamped at EOF returns a SHORT vec (caller validates length and
+        // falls back); it must not error or over-read.
+        let tail = cache
+            .get_range("/db/00000007.sst", 990, 50)
+            .expect("get_range")
+            .expect("hit");
+        assert_eq!(tail, &payload[990..1000]);
+
+        // Miss → None.
+        assert!(cache
+            .get_range("/db/nope.sst", 0, 10)
+            .expect("get_range")
+            .is_none());
+
+        // get_range bumps the LRU like get (full-range read equals get).
+        let full = cache
+            .get_range("/db/00000007.sst", 0, payload.len())
+            .expect("get_range")
+            .expect("hit");
+        assert_eq!(full, payload);
+    }
+
+    #[test]
     fn put_evicts_oldest_when_capacity_exceeded() {
         // Capacity for two 100-byte entries; insert a third and the
         // oldest must be evicted.
@@ -435,6 +728,43 @@ mod tests {
             "/b was oldest after get and must be evicted"
         );
         assert!(cache.contains("/c"));
+    }
+
+    #[test]
+    fn lazy_lru_picks_true_victim_after_many_retouches_and_bounds_deque() {
+        // Generation-stamped lazy LRU: many re-touches push stale refs into
+        // the deque; eviction must still pick the genuine LRU victim, and the
+        // deque must stay bounded via compaction.
+        let (_tmp, cache) = fresh_cache(300);
+        let block = vec![0x5Au8; 100];
+        assert!(cache.put("/a", &block).unwrap());
+        assert!(cache.put("/b", &block).unwrap());
+        assert!(cache.put("/c", &block).unwrap()); // full: a,b,c
+
+        // Hammer /a and /c (hundreds of touches → hundreds of stale refs and a
+        // compaction). /b is never touched → it is the true LRU victim.
+        for _ in 0..500 {
+            assert!(cache.get("/a").unwrap().is_some());
+            assert!(cache.get("/c").unwrap().is_some());
+        }
+        // Insert /d → must evict /b (the untouched, genuinely-oldest entry).
+        assert!(cache.put("/d", &block).unwrap());
+        assert!(cache.contains("/a"), "/a heavily touched, must survive");
+        assert!(cache.contains("/c"), "/c heavily touched, must survive");
+        assert!(cache.contains("/d"));
+        assert!(!cache.contains("/b"), "/b never touched → true LRU victim");
+        assert_eq!(cache.current_bytes(), 300);
+
+        // Deque must be compacted to ~one ref per live entry, not 1000+ stale.
+        {
+            let inner = cache.inner.lock().unwrap();
+            assert!(
+                inner.lru.len() <= inner.entries.len() + 64,
+                "lru deque must stay bounded (got {} for {} entries)",
+                inner.lru.len(),
+                inner.entries.len()
+            );
+        }
     }
 
     #[test]

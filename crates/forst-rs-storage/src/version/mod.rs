@@ -255,6 +255,29 @@ impl Version {
             .collect()
     }
 
+    /// 2026-05-29 PERF: borrow all live SST metadata without cloning. The
+    /// read hot paths (get_internal, batch_get_vectorized,
+    /// build_lazy_prefix_key_stream) called `live_sst_files()` PER op, which
+    /// clones every `SstFileMeta` (incl. its `smallest_key`/`largest_key`
+    /// `Vec<u8>`) into a fresh Vec — a per-scan/per-get allocation storm that
+    /// the q7 write-back profile showed dominating (live_sst_files 67 +
+    /// the G1 GC frames evacuating those clones). Iterate borrowed instead.
+    pub fn live_sst_files_iter(&self) -> impl Iterator<Item = &SstFileMeta> {
+        self.levels.iter().flat_map(|level| level.files.iter())
+    }
+
+    /// 2026-05-29 PERF: collect just the live SST file numbers (no metadata
+    /// clone). The resident-flushed shadow filter only needs the file-number
+    /// set; cloning full `SstFileMeta` to then `.map(|m| m.file_number)` and
+    /// discard the rest was pure waste on every read.
+    pub fn live_sst_file_numbers(&self) -> std::collections::HashSet<FileNumber> {
+        self.levels
+            .iter()
+            .flat_map(|level| level.files.iter())
+            .map(|m| m.file_number)
+            .collect()
+    }
+
     /// Find the index of the SST file that may contain the given key at the
     /// specified level (binary search by key range for levels >= 1).
     ///
@@ -400,6 +423,18 @@ pub struct VersionSetImpl {
     /// Serializes `apply()` so the (load, edit, store) sequence is atomic
     /// across concurrent writers (flush and compaction can both call apply).
     apply_lock: std::sync::Mutex<()>,
+    /// 2026-05-30 OBSOLETE-FILE LIFETIME: every version replaced by `apply` is
+    /// retained here until no reader still holds it (`Arc::strong_count == 1`,
+    /// i.e. only this Vec references it). A read captures `current()` (an owned
+    /// `Arc<Version>` via `load_full`) and walks/opens that version's SSTs via
+    /// on-demand reads; if a concurrent compaction deletes one of those SSTs'
+    /// storage before the read finishes, the read 404s. The engine consults
+    /// [`referenced_file_numbers`] before deleting a compaction-input SST so a
+    /// file is reclaimed only once NO live version (current ∪ retiring-with-
+    /// readers) references it. Pruned on every `apply` and on every query.
+    /// Conservative: a transient extra ref (e.g. ArcSwap reclamation) only keeps
+    /// a file slightly longer, never deletes one a reader still holds.
+    retiring: std::sync::Mutex<Vec<Arc<Version>>>,
 }
 
 impl VersionSetImpl {
@@ -410,6 +445,7 @@ impl VersionSetImpl {
             next_file_number: AtomicU64::new(1),
             last_sequence: AtomicU64::new(0),
             apply_lock: std::sync::Mutex::new(()),
+            retiring: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -420,6 +456,7 @@ impl VersionSetImpl {
             next_file_number: AtomicU64::new(next_file_number),
             last_sequence: AtomicU64::new(last_sequence),
             apply_lock: std::sync::Mutex::new(()),
+            retiring: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -468,7 +505,47 @@ impl VersionSetImpl {
 
         let new_arc = Arc::new(new_version);
         self.current.store(new_arc.clone());
+        // 2026-05-30 OBSOLETE-FILE LIFETIME: retain the just-replaced version
+        // until no reader holds it, so the engine can defer deleting any SST
+        // still referenced by an in-flight read (see `retiring` /
+        // `referenced_file_numbers`). Prune dead entries first (only this Vec
+        // holds them → strong_count == 1), then record `old`. `old` is our
+        // own `load_full` Arc; after the `store` above ArcSwap no longer holds
+        // it as current, so strong_count == 1 + (live readers).
+        {
+            let mut retiring = self.retiring.lock().expect("retiring lock poisoned");
+            retiring.retain(|v| Arc::strong_count(v) > 1);
+            retiring.push(old);
+        }
         Ok(new_arc)
+    }
+
+    /// 2026-05-30 OBSOLETE-FILE LIFETIME: the set of SST file numbers still
+    /// referenced by ANY live version — the current version plus every retiring
+    /// version a reader is still holding. The engine consults this before
+    /// reclaiming a compaction-input SST's storage: a file in this set must NOT
+    /// be deleted (a reader may still open it on demand). Prunes dead retiring
+    /// versions as a side effect so the set stays tight in a busy system.
+    pub fn referenced_file_numbers(&self) -> HashSet<FileNumber> {
+        // `load_full` (NOT `load`): a `load()` Guard parks the value in an
+        // ArcSwap hazard slot, which keeps PREVIOUSLY-replaced versions alive
+        // and makes `Arc::strong_count` below over-report readers. With
+        // load_full everywhere, a replaced version's strong count reflects only
+        // genuine reader holds, so the `retain` prune is reliable.
+        let mut referenced: HashSet<FileNumber> = self
+            .current
+            .load_full()
+            .live_sst_files_iter()
+            .map(|f| f.file_number)
+            .collect();
+        let mut retiring = self.retiring.lock().expect("retiring lock poisoned");
+        retiring.retain(|v| Arc::strong_count(v) > 1);
+        for v in retiring.iter() {
+            for f in v.live_sst_files_iter() {
+                referenced.insert(f.file_number);
+            }
+        }
+        referenced
     }
 
     /// Atomically take a snapshot of the current state.
