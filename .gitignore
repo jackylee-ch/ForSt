@@ -10,3 +10,6 @@
 /findings.md
 /progress.md
 /task_plan.md
+
+# Stray run/snapshot logs must never be committed (may capture substituted S3 secrets)
+docs/superpowers/specs/*.log
