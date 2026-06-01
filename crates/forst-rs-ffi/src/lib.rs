@@ -361,6 +361,20 @@ fn guarded<F: FnOnce() -> i32>(f: F) -> i32 {
     }
 }
 
+/// FRS-PROBE-DIAG (2026-06-02): whether per-probe open timing is enabled, read
+/// once from `FRS_PROBE_DIAG`. Used to diagnose the q7 ckpt-ON join throughput
+/// collapse (~100/s past ~21M records) by splitting `frs_vec_iter_prefix_open`
+/// latency into BUILD (merge construction / reader opens) vs FILL (get_arc
+/// drain). Zero cost when unset.
+fn probe_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FRS_PROBE_DIAG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 /// Like [`guarded`] but for the vectorized batch FFI functions. On panic,
 /// returns `FrsErrorCode::PanicCaught as i32` (900) — a Fail-process code
 /// per spec §4, distinct from the legacy `FRS_STATUS_PANIC` (5) used by
@@ -4923,6 +4937,17 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         // boxed the iter as `Box<dyn Iterator>` which erased the
         // `LazyPrefixIter` type — its `take_last_error()` was unreachable
         // and tier peek errors were silently dropped.
+        // FRS-PROBE-DIAG (2026-06-02): split the per-probe open cost into BUILD
+        // (k-way-merge construction = reader opens + tier cursors) vs FILL (first
+        // chunk drain = get_arc per key). Gated by FRS_PROBE_DIAG=1; logs only
+        // probes slower than 5ms so it pinpoints the q7 ~100/s stall's cost
+        // without flooding. Zero overhead when unset.
+        let probe_diag = probe_diag_enabled();
+        let probe_t0 = if probe_diag {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
             Arc::new(Mutex::new(None));
         let owned_iter = match db_ref.prefix_scan_iter_owned_arc_with_error_slot(
@@ -4933,6 +4958,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             Ok(it) => it,
             Err(_) => return FrsErrorCode::EngineIo as i32,
         };
+        let probe_build_us = probe_t0.map(|t| t.elapsed().as_micros());
         // R16-M2: replace the bare `r.ok()` (which silently dropped engine
         // errors) with an error-tap closure that records each `Err(_)` in
         // the IterHandle's shared error slot. The FFI consumer drains the
@@ -4970,6 +4996,17 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         // Fill the first chunk lazily into the caller's buffer.
         let (bytes_used, row_count) =
             fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
+
+        if let (Some(t0), Some(build_us)) = (probe_t0, probe_build_us) {
+            let total_us = t0.elapsed().as_micros();
+            if total_us > 5000 {
+                let fill_us = total_us.saturating_sub(build_us);
+                eprintln!(
+                    "FRS-PROBE-DIAG slow open: total_us={} build_us={} fill_us={} rows={} prefix_len={}",
+                    total_us, build_us, fill_us, row_count, prefix_len
+                );
+            }
+        }
 
         // R16-M2 + R17-M3: surface any error captured during the first chunk
         // fill. The partial-chunk state machine has two branches:
