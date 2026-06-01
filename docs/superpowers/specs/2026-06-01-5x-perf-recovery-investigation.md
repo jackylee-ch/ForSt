@@ -151,6 +151,25 @@ Per-engine RAM ≈ ≤512 MiB memtable + 1 GiB resident shadow + 512 MiB block c
 across slots on the 12 GiB TM. Validated by `scripts/validate-q7.sh` (runs q7 to completion, reports
 wall time vs the 941 s rocksdb baseline). Zero engine-code risk — pure config.
 
+### CORRECTION — the drain is CPU-bound, NOT I/O (block cache hit ≈ 100%)
+The first tuned run printed `FRS-CACHE-STATS: hits=… misses=~21k hit_rate=99.9–100.0%` continuously.
+So the decoded-block cache was **already saturated at the 256 MiB default** — the join-probe drain's
+repeat block reads are RAM hits, not disk I/O. This **disproves drill-down 3's "tiny cache thrashes"
+sub-hypothesis** and means:
+- The block-cache bump was pointless (reverted to default).
+- The drain cost is **CPU**: `get_arc` walking ~16 resident tiers per key (the `resident_shadowed=16`
+  signal). The write-buffer bump (256 MiB ⇒ ~4 tiers) is still the right lever — but it attacks
+  per-`get_arc` CPU, not I/O. The deeper CPU fix is the value-carrying merge (drop the second
+  traversal entirely).
+
+### Measurement note — use `scripts/measure-completion.sh`, not the nexmark metric reporter
+The nexmark `Benchmark` CPU-metric monitor is broken on this box (`Current Cores=0 (0 TMs)` for the
+whole run even though the TM is alive — cache stats flowing). `scripts/measure-completion.sh`
+(built 2026-05-29 for exactly this) ignores the metric client and polls the Flink JM REST for the
+job's FINISHED wall-clock `duration` + verifies the source emitted 100 M records. My hand-rolled
+`validate-q7.sh` reinvented this badly (and used the broken monitor) — removed. Tuned q7 is being
+re-measured via `QUERY=q7 CONFIG=forst-rs-ffm-local measure-completion.sh`.
+
 ### Honest scale check
 rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
 collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
