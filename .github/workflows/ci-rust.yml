@@ -32,7 +32,9 @@ env:
   # `rustc interrupted by SIGILL` on the MSRV / S3-integration jobs. Override RUSTFLAGS to a
   # fixed, universally-supported x86-64 baseline for CI (correctness, not perf); this takes
   # precedence over the config.toml target rustflags. Local + production keep `native`.
-  RUSTFLAGS: -C target-cpu=x86-64-v2
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
+jobs:
   fmt-check:
     name: Format Check
     runs-on: ubuntu-latest
