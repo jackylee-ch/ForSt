@@ -24,10 +24,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use arc_swap::ArcSwap;
+use forst_rs_common::types::FileNumber;
 use forst_rs_common::{CfOptions, ColumnFamilyId};
 use forst_rs_storage::memtable::{MemTableConfig, ShardedMemTable};
 use forst_rs_storage::merge_operator::MergeOperator;
-use forst_rs_common::types::FileNumber;
 
 /// FRS-RESIDENT-FLUSHED: bytes cap for the resident-flushed-memtable read cache.
 ///
@@ -621,7 +621,8 @@ impl ColumnFamilyData {
         // (an AtomicUsize counter mirroring the Vec length) requires extra
         // bookkeeping in add/prune and is not worth the complexity. The lock
         // is held only for a single empty-check.
-        !self.resident_flushed
+        !self
+            .resident_flushed
             .read()
             .expect("lock poisoned")
             .is_empty()

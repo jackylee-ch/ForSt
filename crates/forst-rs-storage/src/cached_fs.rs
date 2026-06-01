@@ -874,7 +874,9 @@ impl RangeCachedRandomAccessFile {
         let mut buf = vec![0u8; chunk_len];
         let mut off = 0usize;
         while off < chunk_len {
-            let n = self.remote.read_at(chunk_start + off as u64, &mut buf[off..])?;
+            let n = self
+                .remote
+                .read_at(chunk_start + off as u64, &mut buf[off..])?;
             if n == 0 {
                 break;
             }
@@ -946,7 +948,11 @@ impl RangeCachedRandomAccessFile {
                 return Err(ForstError::corruption(format!(
                     "RangeCachedRandomAccessFile short read: expected {} bytes for chunk {} of {} \
                      (file_size {}), got {}",
-                    want, chunk_idx, self.path_key, self.file_size, bytes.len()
+                    want,
+                    chunk_idx,
+                    self.path_key,
+                    self.file_size,
+                    bytes.len()
                 )));
             }
             let key = format!("{}#c{}", self.path_key, chunk_idx);
@@ -987,9 +993,7 @@ impl RandomAccessFile for RangeCachedRandomAccessFile {
         if offset >= self.file_size || buf.is_empty() {
             return Ok(0);
         }
-        let end = offset
-            .saturating_add(buf.len() as u64)
-            .min(self.file_size);
+        let end = offset.saturating_add(buf.len() as u64).min(self.file_size);
         let total = (end - offset) as usize;
 
         // FRS-WHOLE-SST-PREAD (2026-05-31): if the whole SST is resident in the
@@ -1272,7 +1276,10 @@ mod tests {
         // file_size delegates to the inner writer (sanity check of the
         // wrapper's delegation while the writer is still open).
         let mut w2 = fs
-            .open_writable_file(&PathBuf::from("/db/00000043.sst"), WriteMode::CreateOrTruncate)
+            .open_writable_file(
+                &PathBuf::from("/db/00000043.sst"),
+                WriteMode::CreateOrTruncate,
+            )
             .unwrap();
         w2.append(b"abcde").unwrap();
         assert_eq!(w2.file_size().unwrap(), 5);
@@ -1317,7 +1324,11 @@ mod tests {
             let off = off as usize;
             let expect = (size.saturating_sub(off)).min(len);
             assert_eq!(n, expect, "read_at({off},{len}) returned wrong count");
-            assert_eq!(&buf[..n], &data[off..off + n], "bytes mismatch at off {off}");
+            assert_eq!(
+                &buf[..n],
+                &data[off..off + n],
+                "bytes mismatch at off {off}"
+            );
         };
 
         // Within one chunk, spanning two chunks, spanning all three, the short
@@ -1546,6 +1557,9 @@ mod tests {
         let mut whole = vec![0u8; SIZE];
         let n3 = r3.read_at(0, &mut whole).unwrap();
         assert_eq!(n3, SIZE);
-        assert_eq!(whole, payload, "whole-file concurrent read differs from source");
+        assert_eq!(
+            whole, payload,
+            "whole-file concurrent read differs from source"
+        );
     }
 }

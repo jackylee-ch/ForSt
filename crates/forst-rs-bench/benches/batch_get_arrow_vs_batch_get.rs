@@ -110,7 +110,8 @@ fn bench_batch_get_sst_tier(c: &mut Criterion) {
         // Flush every 512 keys so we end up with ~8 L0 SSTs.
         for chunk in pool.chunks(512) {
             for k in chunk {
-                db.put(&cf, k.as_slice(), b"value-payload-16b").expect("put");
+                db.put(&cf, k.as_slice(), b"value-payload-16b")
+                    .expect("put");
             }
             db.switch_and_flush(&cf).expect("switch_and_flush");
         }
@@ -155,5 +156,9 @@ fn bench_batch_get_sst_tier(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_batch_get_arrow_vs_batch_get, bench_batch_get_sst_tier);
+criterion_group!(
+    benches,
+    bench_batch_get_arrow_vs_batch_get,
+    bench_batch_get_sst_tier
+);
 criterion_main!(benches);

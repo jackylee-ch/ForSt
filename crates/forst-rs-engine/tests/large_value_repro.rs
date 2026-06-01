@@ -93,7 +93,10 @@ fn large_value_single_big_batch() {
     db.flush_all().expect("flush_all");
 
     for (i, (k, v)) in stored.iter().enumerate() {
-        let got = db.get(&cf, k).unwrap().unwrap_or_else(|| panic!("missing i={i}"));
+        let got = db
+            .get(&cf, k)
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing i={i}"));
         assert_eq!(got.len(), v.len(), "len mismatch i={i}");
         assert!(got == *v, "bytes mismatch i={i}");
     }
@@ -140,7 +143,11 @@ fn large_value_concurrent_object_store_stress() {
             Err(_) => errs.push("thread PANICKED".to_string()),
         }
     }
-    assert!(errs.is_empty(), "concurrent large-value writes failed:\n{}", errs.join("\n"));
+    assert!(
+        errs.is_empty(),
+        "concurrent large-value writes failed:\n{}",
+        errs.join("\n")
+    );
 
     db.flush_all().expect("flush_all");
 
@@ -155,7 +162,11 @@ fn large_value_concurrent_object_store_stress() {
                 .unwrap_or_else(|e| panic!("get t={t} i={i}: {e:?}"))
                 .unwrap_or_else(|| panic!("MISSING t={t} i={i}"));
             assert_eq!(got.len(), sz, "len mismatch t={t} i={i}");
-            assert_eq!(got[0], ((t * 31 + i) as u8).wrapping_add(1), "byte mismatch t={t} i={i}");
+            assert_eq!(
+                got[0],
+                ((t * 31 + i) as u8).wrapping_add(1),
+                "byte mismatch t={t} i={i}"
+            );
         }
     }
 }
@@ -194,8 +205,9 @@ fn large_value_opendal_object_store_flush_restart() {
         for (i, (k, v)) in stored.iter().enumerate() {
             let mut wb = WriteBatch::new();
             wb.put(&cf, k, v);
-            db.batch_write(wb)
-                .unwrap_or_else(|e| panic!("object-store batch_write i={i} len={}: {e:?}", v.len()));
+            db.batch_write(wb).unwrap_or_else(|e| {
+                panic!("object-store batch_write i={i} len={}: {e:?}", v.len())
+            });
         }
         db.flush_all().expect("object-store flush_all");
 
@@ -208,7 +220,12 @@ fn large_value_opendal_object_store_flush_restart() {
             let got = db
                 .get(&cf, k)
                 .unwrap_or_else(|e| panic!("SAME-INSTANCE get i={i}: {e:?}"))
-                .unwrap_or_else(|| panic!("SAME-INSTANCE value MISSING after flush i={i} len={}", v.len()));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "SAME-INSTANCE value MISSING after flush i={i} len={}",
+                        v.len()
+                    )
+                });
             assert_eq!(
                 got.len(),
                 v.len(),
@@ -216,7 +233,11 @@ fn large_value_opendal_object_store_flush_restart() {
                 got.len(),
                 v.len()
             );
-            assert!(got == *v, "SAME-INSTANCE value BYTES mismatch i={i} len={}", v.len());
+            assert!(
+                got == *v,
+                "SAME-INSTANCE value BYTES mismatch i={i} len={}",
+                v.len()
+            );
         }
         drop(db);
     }

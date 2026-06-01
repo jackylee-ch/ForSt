@@ -22,8 +22,8 @@ pub mod sharded;
 pub mod vectorized;
 
 pub use artifact::{
-    deserialize_memtable_batches, serialize_memtable_batches,
-    serialize_memtable_batches_to_writer, MemtableArtifactWriter,
+    deserialize_memtable_batches, serialize_memtable_batches, serialize_memtable_batches_to_writer,
+    MemtableArtifactWriter,
 };
 pub use sharded::{ShardedMemTable, DEFAULT_SHARD_COUNT, MAX_SHARD_COUNT};
 pub use vectorized::VectorizedMemTable;

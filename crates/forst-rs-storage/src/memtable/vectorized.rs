@@ -173,7 +173,6 @@ pub struct VectorizedMemTable {
     ///   case (all values ≤64B inlined) — still within a 128 MiB memtable budget.
     hash_index: HashMap<Box<[u8]>, HashEntry>,
 
-
     // -- State --
     /// Current sequence counter (incremented on each insert).
     next_sequence: u64,
@@ -218,10 +217,7 @@ impl VectorizedMemTable {
             unsorted_entries: Vec::with_capacity(INIT_ROWS_HINT),
             // FxHashMap has no `with_capacity` (custom hasher) — use
             // with_capacity_and_hasher with the default FxBuildHasher.
-            unsorted_lookup: HashMap::with_capacity_and_hasher(
-                INIT_ROWS_HINT,
-                Default::default(),
-            ),
+            unsorted_lookup: HashMap::with_capacity_and_hasher(INIT_ROWS_HINT, Default::default()),
             rowindex_vec_pool: Vec::new(),
             hash_index: HashMap::with_capacity_and_hasher(INIT_ROWS_HINT, Default::default()),
             next_sequence: 1,
@@ -1300,8 +1296,7 @@ impl VectorizedMemTable {
         }
 
         // Check merge threshold.
-        let merge_threshold =
-            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
+        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -1450,8 +1445,7 @@ impl VectorizedMemTable {
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
 
-        let merge_threshold =
-            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
+        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -1541,8 +1535,8 @@ impl VectorizedMemTable {
 
             self.sequences.push(seq);
             self.op_types.push(op_types[idx]);
-            let op_type = OpType::from_u8(op_types[idx])
-                .expect("op_type byte was validated above the loop");
+            let op_type =
+                OpType::from_u8(op_types[idx]).expect("op_type byte was validated above the loop");
             let row_index = RowIndex {
                 offset: row_offset,
                 sequence: seq,
@@ -1602,8 +1596,7 @@ impl VectorizedMemTable {
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
 
-        let merge_threshold =
-            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
+        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -1755,8 +1748,7 @@ impl VectorizedMemTable {
             let row_offset = base_offset + k as u32;
             let key = keys.value(i);
             let op_byte = op_values[i];
-            let op_type = OpType::from_u8(op_byte)
-                .expect("op_type byte validated above");
+            let op_type = OpType::from_u8(op_byte).expect("op_type byte validated above");
             let value_opt: Option<&[u8]> = if values.is_null(i) {
                 None
             } else {
@@ -1833,13 +1825,10 @@ impl VectorizedMemTable {
             // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight).
             let _ = is_new_latest;
 
-            self.memory_used += key.len()
-                + value_opt.map(|v| v.len()).unwrap_or(0)
-                + 8 + 1 + 48;
+            self.memory_used += key.len() + value_opt.map(|v| v.len()).unwrap_or(0) + 8 + 1 + 48;
         }
 
-        let merge_threshold =
-            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
+        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -2066,8 +2055,7 @@ impl VectorizedMemTable {
         }
 
         // 6. Merge threshold (same logic as batch_insert).
-        let merge_threshold =
-            unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
+        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
         if self.unsorted_entries.len() > merge_threshold {
             self.merge_unsorted_to_sorted();
         }
@@ -2143,7 +2131,12 @@ mod tests {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.batch_insert_with_explicit_seqs(
             &[b"a", b"b", b"c", b"d"],
-            &[Some(b"1".as_ref()), Some(b"2".as_ref()), Some(b"5".as_ref()), Some(b"8".as_ref())],
+            &[
+                Some(b"1".as_ref()),
+                Some(b"2".as_ref()),
+                Some(b"5".as_ref()),
+                Some(b"8".as_ref()),
+            ],
             &[1u8, 1u8, 1u8, 1u8],
             &[1u64, 2u64, 5u64, 8u64],
         )
@@ -2182,22 +2175,34 @@ mod tests {
         let mut src = VectorizedMemTable::new(test_config());
         src.batch_insert_with_explicit_seqs(
             &[b"k1", b"k3", b"k1"],
-            &[Some(b"v1a".as_ref()), Some(b"v3".as_ref()), Some(b"v1b".as_ref())],
+            &[
+                Some(b"v1a".as_ref()),
+                Some(b"v3".as_ref()),
+                Some(b"v1b".as_ref()),
+            ],
             &[1u8, 1u8, 1u8], // Put, Put, Put
             &[1u64, 2u64, 5u64],
         )
         .unwrap();
         // Tombstone for k2, inserted separately so it lands in the unsorted zone.
-        src.batch_insert_with_explicit_seqs(&[b"k2"], &[None], &[0u8], &[3u64]).unwrap();
+        src.batch_insert_with_explicit_seqs(&[b"k2"], &[None], &[0u8], &[3u64])
+            .unwrap();
 
         // Snapshot the LIVE memtable (must NOT require freeze).
         assert!(!src.is_frozen());
         let batches = src.snapshot_batches(4).expect("snapshot_batches");
 
         // The memtable must remain live + writable + readable after snapshot.
-        assert!(!src.is_frozen(), "snapshot_batches must not seal the memtable");
-        src.put(b"k4", Some(b"v4"), 1).expect("memtable still writable after snapshot");
-        assert!(src.get(b"k1", 100).unwrap().is_some(), "reads still work after snapshot");
+        assert!(
+            !src.is_frozen(),
+            "snapshot_batches must not seal the memtable"
+        );
+        src.put(b"k4", Some(b"v4"), 1)
+            .expect("memtable still writable after snapshot");
+        assert!(
+            src.get(b"k1", 100).unwrap().is_some(),
+            "reads still work after snapshot"
+        );
 
         // Replay the batches into a fresh memtable via explicit seqs.
         let mut dst = VectorizedMemTable::new(test_config());
@@ -2205,11 +2210,19 @@ mod tests {
         for b in &batches {
             let keys = b.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
             let vals = b.column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
-            let seqs = b.column(2).as_any().downcast_ref::<arrow::array::UInt64Array>().unwrap();
+            let seqs = b
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+                .unwrap();
             let ops = b.column(3).as_any().downcast_ref::<UInt8Array>().unwrap();
             for i in 0..b.num_rows() {
                 let k = keys.value(i).to_vec();
-                let v: Option<Vec<u8>> = if vals.is_null(i) { None } else { Some(vals.value(i).to_vec()) };
+                let v: Option<Vec<u8>> = if vals.is_null(i) {
+                    None
+                } else {
+                    Some(vals.value(i).to_vec())
+                };
                 dst.batch_insert_with_explicit_seqs(
                     &[k.as_slice()],
                     &[v.as_deref()],
@@ -2220,20 +2233,35 @@ mod tests {
                 total_rows += 1;
             }
         }
-        assert!(total_rows >= 4, "expected >=4 rows serialised (k1×2, k2, k3)");
+        assert!(
+            total_rows >= 4,
+            "expected >=4 rows serialised (k1×2, k2, k3)"
+        );
 
         // Multi-version visibility must be byte-identical between src and dst at
         // every interesting read sequence (snapshot reads resolve newest <= seq).
         for &rs in &[0u64, 1, 2, 3, 4, 5, 100] {
             for key in [b"k1".as_ref(), b"k2".as_ref(), b"k3".as_ref()] {
-                let a = src.get(key, rs).unwrap().map(|r| (r.value.clone(), r.op_type));
-                let b = dst.get(key, rs).unwrap().map(|r| (r.value.clone(), r.op_type));
+                let a = src
+                    .get(key, rs)
+                    .unwrap()
+                    .map(|r| (r.value.clone(), r.op_type));
+                let b = dst
+                    .get(key, rs)
+                    .unwrap()
+                    .map(|r| (r.value.clone(), r.op_type));
                 assert_eq!(a, b, "mismatch key={:?} read_seq={}", key, rs);
             }
         }
         // Spot-check the actual resolved values.
-        assert_eq!(src.get(b"k1", 1).unwrap().unwrap().value.as_deref(), Some(b"v1a".as_ref()));
-        assert_eq!(dst.get(b"k1", 5).unwrap().unwrap().value.as_deref(), Some(b"v1b".as_ref()));
+        assert_eq!(
+            src.get(b"k1", 1).unwrap().unwrap().value.as_deref(),
+            Some(b"v1a".as_ref())
+        );
+        assert_eq!(
+            dst.get(b"k1", 5).unwrap().unwrap().value.as_deref(),
+            Some(b"v1b".as_ref())
+        );
         // k2 tombstone at seq>=3 resolves to a Delete.
         assert_eq!(dst.get(b"k2", 3).unwrap().unwrap().op_type, OpType::Delete);
     }
@@ -3546,7 +3574,6 @@ mod tests {
         assert_eq!(r.sequence, 1);
     }
 
-
     /// C8-H2 regression test: Put → Delete → Put-within-same-memtable must
     /// re-register the key in the prefix_index. Before the fix the second
     /// Put's `was_new_key` was false (the hash_index still had both prior
@@ -3638,7 +3665,8 @@ mod tests {
         let key_two_slashes: &[u8] = b"k/KEY/join-records/a/b/c"; // multiple '/'
 
         mt.put(key_plain, Some(b"1"), OpType::Put as u8).unwrap();
-        mt.put(key_with_slash, Some(b"1"), OpType::Put as u8).unwrap();
+        mt.put(key_with_slash, Some(b"1"), OpType::Put as u8)
+            .unwrap();
         mt.put(key_two_slashes, Some(b"1"), OpType::Put as u8)
             .unwrap();
 

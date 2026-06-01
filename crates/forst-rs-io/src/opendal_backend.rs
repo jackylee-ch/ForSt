@@ -680,9 +680,9 @@ impl RandomAccessFile for OpendalRandomAccessFile {
             let op_async = self.op_async.clone();
             let path = self.path.clone();
             let size = self.size;
-            let v = self
-                .handle
-                .block_on(async move { read_range_async(&op_async, &path, size, off, len).await })?;
+            let v = self.handle.block_on(async move {
+                read_range_async(&op_async, &path, size, off, len).await
+            })?;
             return Ok(vec![v]);
         }
 
@@ -792,10 +792,7 @@ enum WriterKind {
     /// any residual truncation into a hard error (the SST is never published
     /// with a bad footer) instead of silent data corruption. Memory is bounded
     /// by the SST size (`target_file_size_base`, default 64 MiB).
-    Buffered {
-        op: opendal::Operator,
-        buf: Vec<u8>,
-    },
+    Buffered { op: opendal::Operator, buf: Vec<u8> },
 }
 
 /// A writable file that streams bytes to OpenDAL.
@@ -855,9 +852,9 @@ impl WritableFile for OpendalWritableFile {
                 .handle
                 .block_on(w.write(buf))
                 .map_err(|e| map_opendal_err(e, &format!("OpenDAL async write: {}", self.path)))?,
-            WriterKind::Blocking(w) => w
-                .write(buf)
-                .map_err(|e| map_opendal_err(e, &format!("OpenDAL streaming write: {}", self.path)))?,
+            WriterKind::Blocking(w) => w.write(buf).map_err(|e| {
+                map_opendal_err(e, &format!("OpenDAL streaming write: {}", self.path))
+            })?,
             WriterKind::Buffered { .. } => unreachable!("handled above"),
         }
         self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
@@ -891,9 +888,9 @@ impl OpendalWritableFile {
                 WriterKind::Async(mut w) => self.handle.block_on(w.close()).map_err(|e| {
                     map_opendal_err(e, &format!("OpenDAL async close writer: {}", self.path))
                 })?,
-                WriterKind::Blocking(mut w) => w
-                    .close()
-                    .map_err(|e| map_opendal_err(e, &format!("OpenDAL close writer: {}", self.path)))?,
+                WriterKind::Blocking(mut w) => w.close().map_err(|e| {
+                    map_opendal_err(e, &format!("OpenDAL close writer: {}", self.path))
+                })?,
                 // FRS-S3-MULTIPART-TRUNC-FIX + 2026-05-29 WRITE-BACK FLUSH:
                 // buffered write + verify, SPAWNED so the flush worker returns on
                 // the LOCAL serialization rather than blocking on S3
@@ -1029,15 +1026,17 @@ impl OpendalWritableFile {
                                     )
                                 })?;
                             let meta =
-                                self.handle.block_on(async { op.stat(&p).await }).map_err(|e| {
-                                    map_opendal_err(
-                                        e,
-                                        &format!(
-                                            "OpenDAL buffered write verify-stat: {}",
-                                            self.path
-                                        ),
-                                    )
-                                })?;
+                                self.handle
+                                    .block_on(async { op.stat(&p).await })
+                                    .map_err(|e| {
+                                        map_opendal_err(
+                                            e,
+                                            &format!(
+                                                "OpenDAL buffered write verify-stat: {}",
+                                                self.path
+                                            ),
+                                        )
+                                    })?;
                             let stored = meta.content_length();
                             if stored != expected {
                                 return Err(ForstError::corruption(format!(
@@ -1407,12 +1406,17 @@ impl FileSystem for OpendalFileSystem {
                 // Sender dropped without publishing — only happens if the upload
                 // task was aborted (FS drop / shutdown). Surface as an error so a
                 // read never proceeds against a possibly-absent object.
-                Err(_) => Err(format!("await_upload {p}: upload task dropped before completion")),
+                Err(_) => Err(format!(
+                    "await_upload {p}: upload task dropped before completion"
+                )),
             }
         });
         // Completed: drop the entry so the map does not grow unbounded. A late
         // awaiter that missed it returns Ok (object is durable by now).
-        self.pending.lock().expect("upload registry poisoned").remove(p);
+        self.pending
+            .lock()
+            .expect("upload registry poisoned")
+            .remove(p);
         outcome.map_err(|msg| ForstError::Io(std::io::Error::other(msg)))
     }
 
@@ -2024,8 +2028,8 @@ mod tests {
             (28_672, 4096),
             (32_768, 4096),
             (12_345, 7_891),
-            ((SIZE - 100) as u64, 4096),  // shortened to 100 bytes
-            (SIZE as u64, 512),           // fully past EOF -> empty
+            ((SIZE - 100) as u64, 4096), // shortened to 100 bytes
+            (SIZE as u64, 512),          // fully past EOF -> empty
         ];
 
         let concurrent = rar.read_ranges(&ranges).expect("read_ranges");
@@ -2091,7 +2095,9 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         let mut filled = 0;
         while filled < got.len() {
-            let n = rar.read_at(filled as u64, &mut got[filled..]).expect("read_at");
+            let n = rar
+                .read_at(filled as u64, &mut got[filled..])
+                .expect("read_at");
             if n == 0 {
                 break;
             }
@@ -2135,6 +2141,7 @@ mod tests {
         }
 
         // Idempotent: nothing left pending.
-        fs.await_all_uploads().expect("await_all_uploads idempotent");
+        fs.await_all_uploads()
+            .expect("await_all_uploads idempotent");
     }
 }

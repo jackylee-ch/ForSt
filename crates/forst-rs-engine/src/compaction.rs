@@ -223,9 +223,7 @@ impl CompactionJob {
         //                        with a deletion-only VersionEdit
         //   * `Err(e)`         — writer/flush/sync throw; caller cleans up the tmp file
         let write_outcome: ForstResult<Option<SstFileInfo>> = (|| {
-            let mut wf = self
-                .fs
-                .open_writable_file(&write_path, write_mode)?;
+            let mut wf = self.fs.open_writable_file(&write_path, write_mode)?;
             // R49-H1: stamp this compaction's cf_id onto the writer options so
             // the resulting SST footer + SstFileMeta carry CF identity.
             let mut writer_opts = self.writer_options.clone();
@@ -628,10 +626,7 @@ impl CompactionJob {
                 // key (newest-first, across its input SSTs + memtables).
                 // Keys living in SST files outside this compaction's
                 // input set are unaffected by elision.
-                if versions.len() == 2
-                    && versions[1].op_type == OpType::Put
-                    && self.is_bottommost
-                {
+                if versions.len() == 2 && versions[1].op_type == OpType::Put && self.is_bottommost {
                     // A-R6-H1: drop-both elision REQUIRES `is_bottommost`.
                     // Pre-fix the elision ran on any compaction whose input
                     // view happened to contain exactly {SD, Put}, but
@@ -765,12 +760,7 @@ impl CompactionJob {
                         // terminal Delete. The bottommost compaction
                         // will eventually do the collapse safely.
                         for v in versions {
-                            writer.add(
-                                &v.key,
-                                v.value.as_deref(),
-                                v.sequence,
-                                v.op_type as u8,
-                            )?;
+                            writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
                             *emitted += 1;
                         }
                     } else {
@@ -787,12 +777,7 @@ impl CompactionJob {
                         // no intermediate snapshot can land below it.
                         let _ = reversed;
                         for v in versions {
-                            writer.add(
-                                &v.key,
-                                v.value.as_deref(),
-                                v.sequence,
-                                v.op_type as u8,
-                            )?;
+                            writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
                             *emitted += 1;
                         }
                     }
@@ -818,7 +803,8 @@ impl CompactionJob {
                              contains an un-folded Merge chain for key {:?} (len={}); the LSM \
                              reclamation invariant cannot be satisfied. The CF was likely \
                              re-opened without re-registering its merge operator.",
-                            &newest.key, versions.len()
+                            &newest.key,
+                            versions.len()
                         )));
                     }
                     let _ = stop_on_delete;

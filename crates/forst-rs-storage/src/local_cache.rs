@@ -503,9 +503,13 @@ impl LocalCache {
             }
 
             let g = inner.next_gen();
-            inner
-                .entries
-                .insert(key.to_string(), Entry { bytes: new_bytes, gen: g });
+            inner.entries.insert(
+                key.to_string(),
+                Entry {
+                    bytes: new_bytes,
+                    gen: g,
+                },
+            );
             inner.lru.push_back((key.to_string(), g));
             inner.current_bytes = inner.current_bytes.saturating_add(new_bytes);
             evict
@@ -663,7 +667,9 @@ mod tests {
         assert_eq!(mid, &payload[100..150]);
 
         // Zero-length read is an empty hit (no file touch needed).
-        let empty = cache.get_range("/db/00000007.sst", 0, 0).expect("get_range");
+        let empty = cache
+            .get_range("/db/00000007.sst", 0, 0)
+            .expect("get_range");
         assert_eq!(empty, Some(Vec::new()));
 
         // Read clamped at EOF returns a SHORT vec (caller validates length and

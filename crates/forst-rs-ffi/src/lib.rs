@@ -1923,10 +1923,8 @@ pub unsafe extern "C" fn frs_snapshot_memtables_to_dir(
         // Bound the artifact to the pinned snapshot's seq so it is consistent
         // with the SST set captured by the companion no-flush incremental
         // checkpoint (excludes post-barrier writes belonging to the next ckpt).
-        match db.snapshot_memtables_to_dir(
-            std::path::Path::new(path),
-            Some(snap_ref.seq().value()),
-        ) {
+        match db.snapshot_memtables_to_dir(std::path::Path::new(path), Some(snap_ref.seq().value()))
+        {
             Ok(written) => {
                 if !out_count.is_null() {
                     *out_count = written.len() as u64;
@@ -2451,10 +2449,10 @@ pub unsafe extern "C" fn frs_batch_put_arrow(
         // offset monotonicity, so reading the last offset is safe.
         let key_offsets = keys_col.value_offsets();
         let val_offsets = values.value_offsets();
-        let total_key_bytes = *key_offsets.last().unwrap_or(&0) as i64
-            - *key_offsets.first().unwrap_or(&0) as i64;
-        let total_val_bytes = *val_offsets.last().unwrap_or(&0) as i64
-            - *val_offsets.first().unwrap_or(&0) as i64;
+        let total_key_bytes =
+            *key_offsets.last().unwrap_or(&0) as i64 - *key_offsets.first().unwrap_or(&0) as i64;
+        let total_val_bytes =
+            *val_offsets.last().unwrap_or(&0) as i64 - *val_offsets.first().unwrap_or(&0) as i64;
         if total_key_bytes < 0
             || total_val_bytes < 0
             || (total_key_bytes as usize) > MAX_BATCH_BYTES
@@ -2579,8 +2577,8 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
         // (C-R13-NEW-H3). validate_full earlier established offset
         // monotonicity, so reading the last offset is safe.
         let key_offsets = keys.value_offsets();
-        let total_key_bytes = *key_offsets.last().unwrap_or(&0) as i64
-            - *key_offsets.first().unwrap_or(&0) as i64;
+        let total_key_bytes =
+            *key_offsets.last().unwrap_or(&0) as i64 - *key_offsets.first().unwrap_or(&0) as i64;
         if total_key_bytes < 0 || (total_key_bytes as usize) > MAX_BATCH_BYTES {
             return FRS_STATUS_INVALID_ARGUMENT;
         }
@@ -2784,7 +2782,11 @@ pub(crate) struct IteratorState {
 
 impl IteratorState {
     pub(crate) fn new(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-        Self { rows, cursor: 0, allow_rewind: false }
+        Self {
+            rows,
+            cursor: 0,
+            allow_rewind: false,
+        }
     }
 }
 
@@ -3664,12 +3666,9 @@ pub unsafe extern "C" fn frs_iterator_next_chunk(
         }
         let max_rows_usize = max_rows as usize;
         let state = &mut *(iter as *mut IteratorState);
-        let key_offsets =
-            slice::from_raw_parts_mut(out_key_offsets, max_rows_usize + 1);
-        let val_offsets =
-            slice::from_raw_parts_mut(out_val_offsets, max_rows_usize + 1);
-        let validity =
-            slice::from_raw_parts_mut(out_val_validity, max_rows_usize);
+        let key_offsets = slice::from_raw_parts_mut(out_key_offsets, max_rows_usize + 1);
+        let val_offsets = slice::from_raw_parts_mut(out_val_offsets, max_rows_usize + 1);
+        let validity = slice::from_raw_parts_mut(out_val_validity, max_rows_usize);
         let key_buf: &mut [u8] = if out_key_data_cap == 0 || out_key_data.is_null() {
             &mut [][..]
         } else {
@@ -4131,11 +4130,8 @@ pub unsafe extern "C" fn frs_create_incremental_checkpoint_at_noflush(
         if snap_ref.db_id() != db.db_id() {
             return FRS_STATUS_INVALID_ARGUMENT;
         }
-        match db.create_incremental_checkpoint_noflush(
-            snap_ref,
-            checkpoint_id,
-            base_checkpoint_id,
-        ) {
+        match db.create_incremental_checkpoint_noflush(snap_ref, checkpoint_id, base_checkpoint_id)
+        {
             Ok(result) => {
                 let manifest_path_c =
                     std::ffi::CString::new(result.manifest_path.to_string_lossy().into_owned())

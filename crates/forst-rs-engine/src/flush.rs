@@ -178,9 +178,7 @@ impl FlushJob {
         // on next restart. Mirrors the same wrapper in `compaction.rs` so all SST-write sites
         // share one tmp-leak-safe contract.
         let info_result: ForstResult<SstFileInfo> = (|| {
-            let mut writable = self
-                .fs
-                .open_writable_file(&write_path, write_mode)?;
+            let mut writable = self.fs.open_writable_file(&write_path, write_mode)?;
             let writer_inner = SstWriterImpl::with_options(self.options.clone());
             let mut writer = writer_inner.streaming(&mut *writable);
 

@@ -382,7 +382,12 @@ impl SstReaderImpl {
         if let (Some(cache), Some(key)) = (self.block_cache.as_ref(), cache_key) {
             let arc = Arc::new(batch.clone());
             let charge = CacheEntry::DecodedBatch(Arc::clone(&arc)).charge();
-            cache.insert(key, CacheEntry::DecodedBatch(arc), charge, CachePriority::Low);
+            cache.insert(
+                key,
+                CacheEntry::DecodedBatch(arc),
+                charge,
+                CachePriority::Low,
+            );
         }
         Ok(batch)
     }

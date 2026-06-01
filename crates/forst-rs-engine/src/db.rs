@@ -2238,7 +2238,8 @@ impl DbImpl {
                 // payload). Both produced wrong snapshot reads pre-fix.
                 if (matches!(op, OpType::Merge) && v.is_none())
                     || (matches!(op, OpType::Put) && v.is_none())
-                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some()) {
+                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some())
+                {
                     return Err(ForstError::corruption(
                         "iter_versions_of: Merge entry missing operand payload (active memtable)",
                     ));
@@ -2266,7 +2267,8 @@ impl DbImpl {
                 // payload). Both produced wrong snapshot reads pre-fix.
                 if (matches!(op, OpType::Merge) && v.is_none())
                     || (matches!(op, OpType::Put) && v.is_none())
-                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some()) {
+                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some())
+                {
                     return Err(ForstError::corruption(
                         "iter_versions_of: Merge entry missing operand payload (imm memtable)",
                     ));
@@ -2308,7 +2310,8 @@ impl DbImpl {
                 // payload). Both produced wrong snapshot reads pre-fix.
                 if (matches!(op, OpType::Merge) && v.is_none())
                     || (matches!(op, OpType::Put) && v.is_none())
-                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some()) {
+                    || (matches!(op, OpType::Delete | OpType::SingleDelete) && v.is_some())
+                {
                     return Err(ForstError::corruption(
                         "iter_versions_of: Merge entry missing operand payload (SST)",
                     ));
@@ -2902,7 +2905,11 @@ impl DbImpl {
             op_types.push(e.op_type as u8);
         }
         self.batch_write_borrowed_single_cf_inner(
-            single_cf_id, &keys, &values, &op_types, total_charge,
+            single_cf_id,
+            &keys,
+            &values,
+            &op_types,
+            total_charge,
         )
     }
 
@@ -2951,9 +2958,7 @@ impl DbImpl {
                 .saturating_add(v_len)
                 .saturating_add(57);
         }
-        self.batch_write_borrowed_single_cf_inner(
-            cf.id(), keys, values, op_types, total_charge,
-        )
+        self.batch_write_borrowed_single_cf_inner(cf.id(), keys, values, op_types, total_charge)
     }
 
     /// Shared body for `batch_write_single_cf` and `batch_put_borrowed_single_cf`.
@@ -3706,8 +3711,7 @@ impl DbImpl {
             .version_set
             .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
                 let live = snap.version.live_sst_files();
-                let file_numbers: Vec<FileNumber> =
-                    live.iter().map(|f| f.file_number).collect();
+                let file_numbers: Vec<FileNumber> = live.iter().map(|f| f.file_number).collect();
                 let pin = self.deletion_guard.pin_batch(&file_numbers);
                 let descriptors = self.collect_cf_descriptors();
                 (snap.clone(), live, pin, descriptors)
@@ -3818,11 +3822,13 @@ impl DbImpl {
                 std::io::BufWriter::new(file),
             );
             let stream_res = (|| -> ForstResult<()> {
-                cf_data.active_memtable().snapshot_batches_bounded_for_each(
-                    MEMTABLE_SNAPSHOT_BATCH_SIZE,
-                    max_seq,
-                    |b| artifact.write(&b),
-                )?;
+                cf_data
+                    .active_memtable()
+                    .snapshot_batches_bounded_for_each(
+                        MEMTABLE_SNAPSHOT_BATCH_SIZE,
+                        max_seq,
+                        |b| artifact.write(&b),
+                    )?;
                 for imm in cf_data.imm_memtables() {
                     imm.snapshot_batches_bounded_for_each(
                         MEMTABLE_SNAPSHOT_BATCH_SIZE,
@@ -3893,7 +3899,11 @@ impl DbImpl {
                 .ok_or_else(|| ForstError::corruption("memtable artifact: op col not UInt8"))?;
             for i in 0..b.num_rows() {
                 let key = keys.value(i);
-                let val = if vals.is_null(i) { None } else { Some(vals.value(i)) };
+                let val = if vals.is_null(i) {
+                    None
+                } else {
+                    Some(vals.value(i))
+                };
                 let seq = seqs.value(i);
                 mem.put_with_seq(key, val, ops.value(i), seq)?;
                 max_seq = max_seq.max(seq);
@@ -3912,10 +3922,7 @@ impl DbImpl {
     /// `dir` (written by [`Self::snapshot_memtables_to_dir`]) into its CF. Used
     /// on restore after the engine has opened the SST set. Returns the total
     /// rows replayed. Artifacts for unknown CFs are an error (manifest/CF drift).
-    pub fn replay_memtable_artifacts_from_dir(
-        &self,
-        dir: &std::path::Path,
-    ) -> ForstResult<usize> {
+    pub fn replay_memtable_artifacts_from_dir(&self, dir: &std::path::Path) -> ForstResult<usize> {
         // LOCAL FS (mirrors snapshot_memtables_to_dir): the backend has already
         // downloaded the artifact private files into this local `dir`.
         let entries = match std::fs::read_dir(dir) {
@@ -5320,13 +5327,13 @@ impl DbImpl {
         let mut inner = self.build_lazy_prefix_key_stream(cf, prefix)?;
         inner.set_shared_error_slot(error_slot);
         let db = Arc::clone(self);
-        Ok(Box::new(inner.filter_map(move |key_arc| {
-            match db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX) {
+        Ok(Box::new(inner.filter_map(
+            move |key_arc| match db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX) {
                 Ok(Some(value)) => Some(Ok((key_arc, Arc::<[u8]>::from(value)))),
                 Ok(None) => None,
                 Err(e) => Some(Err(e)),
-            }
-        })))
+            },
+        )))
     }
 
     /// Builds the lazy k-way merge over key sources (one per LSM tier)
@@ -5352,7 +5359,11 @@ impl DbImpl {
         // attribution. Zero cost when unset (one env read per call is cheap
         // relative to the BTree scans below; checked once via OnceLock).
         let diag = frs_iter_diag_enabled();
-        let diag_start = if diag { Some(std::time::Instant::now()) } else { None };
+        let diag_start = if diag {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let upper = prefix_upper_bound(prefix);
         let upper_slice = upper.as_deref();
@@ -6619,8 +6630,7 @@ impl DbImpl {
                             // (and the only safe way to share the
                             // collect_merge_operands_from_imm_start code path
                             // without duplicating it here).
-                            resolved[i] =
-                                Some(self.get_internal(&cf_data, k, read_seq)?);
+                            resolved[i] = Some(self.get_internal(&cf_data, k, read_seq)?);
                         }
                     }
                 }
@@ -6657,8 +6667,7 @@ impl DbImpl {
                         OpType::Delete | OpType::SingleDelete => resolved[i] = Some(None),
                         OpType::Merge => {
                             // Merge chain — delegate to get_internal.
-                            resolved[i] =
-                                Some(self.get_internal(&cf_data, k, read_seq)?);
+                            resolved[i] = Some(self.get_internal(&cf_data, k, read_seq)?);
                         }
                     }
                 }
@@ -6735,8 +6744,7 @@ impl DbImpl {
                                 // Mixed merge+base — fall back to per-key
                                 // get_internal which handles the merge chain
                                 // (apply_merge_operator + snapshot cutoff).
-                                resolved[i] =
-                                    Some(self.get_internal(&cf_data, keys[i], read_seq)?);
+                                resolved[i] = Some(self.get_internal(&cf_data, keys[i], read_seq)?);
                             } else {
                                 resolved[i] = Some(res.value);
                             }
@@ -6749,8 +6757,7 @@ impl DbImpl {
                                 ));
                             }
                             if had_merge_operand {
-                                resolved[i] =
-                                    Some(self.get_internal(&cf_data, keys[i], read_seq)?);
+                                resolved[i] = Some(self.get_internal(&cf_data, keys[i], read_seq)?);
                             } else {
                                 resolved[i] = Some(None);
                             }
@@ -6817,9 +6824,7 @@ impl DbImpl {
                                     ));
                                 }
                                 if had_merge_operand {
-                                    resolved[i] = Some(
-                                        self.get_internal(&cf_data, k, read_seq)?,
-                                    );
+                                    resolved[i] = Some(self.get_internal(&cf_data, k, read_seq)?);
                                 } else {
                                     resolved[i] = Some(res.value);
                                 }
@@ -6833,9 +6838,7 @@ impl DbImpl {
                                     ));
                                 }
                                 if had_merge_operand {
-                                    resolved[i] = Some(
-                                        self.get_internal(&cf_data, k, read_seq)?,
-                                    );
+                                    resolved[i] = Some(self.get_internal(&cf_data, k, read_seq)?);
                                 } else {
                                     resolved[i] = Some(None);
                                 }
@@ -6859,10 +6862,7 @@ impl DbImpl {
         }
 
         // Any keys still pending after every level are genuine misses.
-        Ok(resolved
-            .into_iter()
-            .map(|r| r.unwrap_or(None))
-            .collect())
+        Ok(resolved.into_iter().map(|r| r.unwrap_or(None)).collect())
     }
 
     /// Batch point-lookup returning results as an Arrow RecordBatch.
@@ -7135,17 +7135,18 @@ impl DbImpl {
         // common case. The `version_set.current()` snapshot is still captured
         // because Stage 3 (sst_get below) requires it.
         let version = self.version_set.current();
-        let resident_mts: Vec<crate::column_family::SharedMemTable> = if cf_data.has_resident_flushed() {
-            // 2026-05-29 PERF: file-number-only set (no SstFileMeta clone per get).
-            let live_files = version.live_sst_file_numbers();
-            // 2026-05-29 PERF-RESTORE: key-filtered accessor skips resident
-            // memtables whose [min,max] bound excludes this key — O(matching)
-            // instead of O(num_resident) per point GET.
-            let (mts, _shadowed) = cf_data.resident_flushed_visible_for_key(&live_files, key);
-            mts
-        } else {
-            Vec::new()
-        };
+        let resident_mts: Vec<crate::column_family::SharedMemTable> =
+            if cf_data.has_resident_flushed() {
+                // 2026-05-29 PERF: file-number-only set (no SstFileMeta clone per get).
+                let live_files = version.live_sst_file_numbers();
+                // 2026-05-29 PERF-RESTORE: key-filtered accessor skips resident
+                // memtables whose [min,max] bound excludes this key — O(matching)
+                // instead of O(num_resident) per point GET.
+                let (mts, _shadowed) = cf_data.resident_flushed_visible_for_key(&live_files, key);
+                mts
+            } else {
+                Vec::new()
+            };
         for resident in resident_mts.iter().rev() {
             let Some(entry) = resident.get(key, read_seq)? else {
                 continue;
@@ -7159,12 +7160,8 @@ impl DbImpl {
                     })?;
                     let mut operands: Vec<Vec<u8>> = Vec::new();
                     operands.push(first_operand);
-                    let base = self.collect_merge_operands(
-                        cf_data,
-                        key,
-                        entry.sequence,
-                        &mut operands,
-                    )?;
+                    let base =
+                        self.collect_merge_operands(cf_data, key, entry.sequence, &mut operands)?;
                     return self
                         .apply_merge_operator(cf_data, key, base, operands)
                         .map(Some);
@@ -7418,14 +7415,12 @@ impl DbImpl {
         // prefix-iterator's repeated probes of the same SST data blocks hit a
         // decoded RecordBatch instead of re-reading+re-decompressing (the
         // profiled q9 hot path: serial_read_at + decode_data_block + decompress).
-        let reader = Arc::new(
-            SstReaderImpl::open(file)?
-                .with_block_cache(
-                    Arc::clone(&self.block_cache) as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
-                    self.db_id.0,
-                    meta.file_number.value(),
-                ),
-        );
+        let reader = Arc::new(SstReaderImpl::open(file)?.with_block_cache(
+            Arc::clone(&self.block_cache)
+                as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
+            self.db_id.0,
+            meta.file_number.value(),
+        ));
 
         // R50-H3: cross-check the on-disk footer cf_id against the meta
         // cf_id the VersionSet handed us. R49-H1 persisted cf_id in the
@@ -8972,7 +8967,9 @@ mod tests {
         let db = open();
         let cf = db.default_cf();
         db.put(&cf, b"k", b"v").unwrap();
-        let out = db.batch_get_vectorized(&cf, &[b"k".as_ref()], u64::MAX).unwrap();
+        let out = db
+            .batch_get_vectorized(&cf, &[b"k".as_ref()], u64::MAX)
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].as_deref(), Some(b"v".as_ref()));
     }
@@ -9008,21 +9005,41 @@ mod tests {
         let db = open();
         let cf = db.default_cf();
         for i in 0..300usize {
-            db.put(&cf, format!("s_{:04}", i).as_bytes(), format!("sv_{i}").as_bytes()).unwrap();
+            db.put(
+                &cf,
+                format!("s_{:04}", i).as_bytes(),
+                format!("sv_{i}").as_bytes(),
+            )
+            .unwrap();
         }
         // Flush "s_*" to SST.
         db.switch_and_flush(&cf).unwrap();
         // First imm with 150 keys, second imm with 150 keys, then active.
         for i in 0..150usize {
-            db.put(&cf, format!("i_{:04}", i).as_bytes(), format!("iv_{i}").as_bytes()).unwrap();
+            db.put(
+                &cf,
+                format!("i_{:04}", i).as_bytes(),
+                format!("iv_{i}").as_bytes(),
+            )
+            .unwrap();
         }
         db.force_switch_memtable(&cf).unwrap();
         for i in 150..300usize {
-            db.put(&cf, format!("i_{:04}", i).as_bytes(), format!("iv_{i}").as_bytes()).unwrap();
+            db.put(
+                &cf,
+                format!("i_{:04}", i).as_bytes(),
+                format!("iv_{i}").as_bytes(),
+            )
+            .unwrap();
         }
         db.force_switch_memtable(&cf).unwrap();
         for i in 0..300usize {
-            db.put(&cf, format!("a_{:04}", i).as_bytes(), format!("av_{i}").as_bytes()).unwrap();
+            db.put(
+                &cf,
+                format!("a_{:04}", i).as_bytes(),
+                format!("av_{i}").as_bytes(),
+            )
+            .unwrap();
         }
 
         // Build interleaved key list to ensure ordering preservation.
@@ -9043,7 +9060,12 @@ mod tests {
         // Cross-check against per-key get baseline.
         for (i, k) in key_refs.iter().enumerate() {
             let baseline = db.get(&cf, k).unwrap();
-            assert_eq!(batched[i], baseline, "slot {i} key={:?}", std::str::from_utf8(k));
+            assert_eq!(
+                batched[i],
+                baseline,
+                "slot {i} key={:?}",
+                std::str::from_utf8(k)
+            );
         }
     }
 
@@ -9199,7 +9221,10 @@ mod tests {
             )
             .unwrap();
         // Cross-check against per-key get_at baseline.
-        for (i, k) in [b"k1".as_ref(), b"k2".as_ref(), b"k3".as_ref()].iter().enumerate() {
+        for (i, k) in [b"k1".as_ref(), b"k2".as_ref(), b"k3".as_ref()]
+            .iter()
+            .enumerate()
+        {
             let baseline = db.get_at(&snap, k).unwrap();
             assert_eq!(snapped[i], baseline, "slot {i}");
         }
@@ -10635,8 +10660,7 @@ mod tests {
         // Simulate an in-flight read: capture and HOLD the current version
         // (exactly what `get_internal` does via `version_set.current()`).
         let held = db.version_set.current();
-        let input_fnums: Vec<FileNumber> =
-            held.l0_files().iter().map(|f| f.file_number).collect();
+        let input_fnums: Vec<FileNumber> = held.l0_files().iter().map(|f| f.file_number).collect();
         assert!(
             input_fnums.len() >= 2,
             "test needs >= 2 L0 inputs, got {}",
@@ -10645,7 +10669,9 @@ mod tests {
 
         // Compact: merges the L0 inputs into L1 and queues the inputs for
         // deletion. With `held` alive, their storage MUST be deferred.
-        db.compact_l0(&cf).unwrap().expect("compaction should produce output");
+        db.compact_l0(&cf)
+            .unwrap()
+            .expect("compaction should produce output");
         for &fnum in &input_fnums {
             let path = sst_file_path(&db.db_path, fnum);
             assert!(

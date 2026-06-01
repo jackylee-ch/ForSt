@@ -47,7 +47,9 @@ pub fn serialize_memtable_batches(batches: &[RecordBatch]) -> ForstResult<Vec<u8
     let schema = batches[0].schema();
     let mut buf = Vec::new();
     let mut writer = StreamWriter::try_new(&mut buf, &schema).map_err(|e| {
-        ForstError::corruption(format!("memtable artifact StreamWriter creation failed: {e}"))
+        ForstError::corruption(format!(
+            "memtable artifact StreamWriter creation failed: {e}"
+        ))
     })?;
     for b in batches {
         writer
@@ -82,7 +84,9 @@ pub fn serialize_memtable_batches_to_writer<W: std::io::Write>(
     };
     let schema = first.schema();
     let mut sw = StreamWriter::try_new(writer, &schema).map_err(|e| {
-        ForstError::corruption(format!("memtable artifact StreamWriter creation failed: {e}"))
+        ForstError::corruption(format!(
+            "memtable artifact StreamWriter creation failed: {e}"
+        ))
     })?;
     sw.write(&first)
         .map_err(|e| ForstError::corruption(format!("memtable artifact write failed: {e}")))?;
@@ -98,9 +102,9 @@ pub fn serialize_memtable_batches_to_writer<W: std::io::Write>(
     // the caller only flushes on drop, which swallows I/O errors (e.g. ENOSPC)
     // and could leave a truncated artifact to be renamed into place. into_inner
     // returns the already-finished writer; surface any flush error here.
-    let mut inner = sw.into_inner().map_err(|e| {
-        ForstError::corruption(format!("memtable artifact into_inner failed: {e}"))
-    })?;
+    let mut inner = sw
+        .into_inner()
+        .map_err(|e| ForstError::corruption(format!("memtable artifact into_inner failed: {e}")))?;
     inner.flush().map_err(ForstError::Io)?;
     Ok(())
 }
@@ -176,7 +180,9 @@ pub fn deserialize_memtable_batches(bytes: &[u8]) -> ForstResult<Vec<RecordBatch
     }
     let cursor = Cursor::new(bytes);
     let reader = StreamReader::try_new(cursor, None).map_err(|e| {
-        ForstError::corruption(format!("memtable artifact StreamReader creation failed: {e}"))
+        ForstError::corruption(format!(
+            "memtable artifact StreamReader creation failed: {e}"
+        ))
     })?;
     let mut batches = Vec::new();
     for b in reader {
