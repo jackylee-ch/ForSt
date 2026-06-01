@@ -22,6 +22,8 @@
 // comments cross-reference private/in-module items that don't resolve as intra-doc links under
 // the strict rustdoc gate. These are doc-rendering cosmetics, not code issues.
 #![allow(rustdoc::broken_intra_doc_links)]
+// Workspace-wide ForstError is intentionally large; see forst-rs-common rationale.
+#![allow(clippy::result_large_err)]
 
 pub mod async_io;
 pub mod filesystem;

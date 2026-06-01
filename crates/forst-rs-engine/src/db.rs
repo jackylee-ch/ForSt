@@ -6812,7 +6812,7 @@ impl DbImpl {
                     if versions.is_empty() {
                         continue;
                     }
-                    versions.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+                    versions.sort_by_key(|x| std::cmp::Reverse(x.sequence));
                     let mut had_merge_operand = false;
                     let mut decided = false;
                     for res in versions {
@@ -7293,7 +7293,7 @@ impl DbImpl {
             };
             let sst = &version.levels[level].files[idx];
             let mut versions = self.sst_lookup_versions(sst, key)?;
-            versions.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+            versions.sort_by_key(|x| std::cmp::Reverse(x.sequence));
             for res in versions {
                 match res.op_type {
                     OpType::Put => {
@@ -7698,7 +7698,7 @@ impl DbImpl {
             };
             let sst = &version.levels[level].files[idx];
             let mut versions = self.sst_lookup_versions(sst, key)?;
-            versions.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+            versions.sort_by_key(|x| std::cmp::Reverse(x.sequence));
             for res in versions {
                 // E-R8-H1: skip rows already accounted for by the
                 // caller's outer entry.

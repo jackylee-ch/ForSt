@@ -18,6 +18,10 @@
 //! used across all ForSt-RS crates.
 
 #![forbid(unsafe_code)]
+// ForstError is an intentionally rich (>128 B) error type shared across the workspace; boxing
+// every Result<_, ForstError> to satisfy clippy::result_large_err would be a pervasive
+// signature churn for no real benefit (errors are the cold path). Allow it crate-wide.
+#![allow(clippy::result_large_err)]
 
 pub mod arena;
 pub mod checksum;

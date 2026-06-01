@@ -24,6 +24,8 @@
 // Doc comments cross-reference private internals (documented via --document-private-items);
 // such links don't resolve under the strict rustdoc gate (doc-rendering cosmetics only).
 #![allow(rustdoc::broken_intra_doc_links)]
+// Workspace-wide ForstError is intentionally large; see forst-rs-common rationale.
+#![allow(clippy::result_large_err)]
 
 pub mod cache;
 pub mod cached_fs;

@@ -566,7 +566,7 @@ impl SstReaderImpl {
             }
         }
 
-        out.sort_by(|a, b| b.sequence.cmp(&a.sequence));
+        out.sort_by_key(|x| std::cmp::Reverse(x.sequence));
         Ok(out)
     }
 

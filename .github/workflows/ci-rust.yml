@@ -26,8 +26,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-
-jobs:
+  # CI portability: `.cargo/config.toml` sets `-C target-cpu=native` for local/production
+  # builds (AVX2/NEON perf). GitHub's hosted-runner fleet is CPU-heterogeneous, so
+  # native codegen can emit instructions that fault on a different runner — the recurring
+  # `rustc interrupted by SIGILL` on the MSRV / S3-integration jobs. Override RUSTFLAGS to a
+  # fixed, universally-supported x86-64 baseline for CI (correctness, not perf); this takes
+  # precedence over the config.toml target rustflags. Local + production keep `native`.
+  RUSTFLAGS: -C target-cpu=x86-64-v2
   fmt-check:
     name: Format Check
     runs-on: ubuntu-latest
