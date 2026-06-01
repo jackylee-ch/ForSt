@@ -1,0 +1,121 @@
+// Copyright 2026 The ForSt-RS Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Join-probe prefix-iterator OPEN microbench.
+//!
+//! Reproduces the q7/q9/q16/q20 hot path the jstack profiler flagged
+//! (`VectorizedExecutor.executeIters → ForStRsDBIterRequest.openVecIterIntoBuf
+//! → frsVecIterPrefixOpen`, 61/85 executor samples): a streaming join issues
+//! ONE prefix scan per incoming record to find the matching records under the
+//! join key. Each scan OPENS a fresh prefix iterator = a lazy k-way merge over
+//! (active memtable + immutable memtables + resident-flushed memtables + every
+//! overlapping L0 SST).
+//!
+//! The adversarial-but-realistic shape: records arrive round-robin across many
+//! join keys and the engine flushes periodically (checkpoint cadence). Each
+//! flushed SST therefore spans the FULL join-key range, so the coarse
+//! smallest/largest_key range-skip in `build_lazy_prefix_key_stream` CANNOT
+//! prune any SST — every probe must consider every SST + resident memtable.
+//! This isolates the per-open bookkeeping cost (live-SST-set build, resident
+//! visible-entry clone, per-source seek) as a function of LSM depth.
+
+use std::sync::Arc;
+
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use forst_rs_bench::open_in_memory;
+use forst_rs_engine::DbImpl;
+
+/// Join-key namespace prefix for join key `jk`: 8-byte big-endian so prefixes
+/// sort in the same order as the keys, mirroring the Flink composite-key
+/// layout `[keygroup][namespace][user-key]`.
+fn ns_prefix(jk: u32) -> [u8; 8] {
+    let mut p = [0u8; 8];
+    p[..4].copy_from_slice(&jk.to_be_bytes());
+    p
+}
+
+/// Full state key: `[join-key BE][entry-id BE]`.
+fn state_key(jk: u32, entry: u32) -> [u8; 8] {
+    let mut k = [0u8; 8];
+    k[..4].copy_from_slice(&jk.to_be_bytes());
+    k[4..].copy_from_slice(&entry.to_be_bytes());
+    k
+}
+
+/// Builds an engine whose join state is spread across `num_ssts` flushed L0
+/// SSTs, **each spanning the full join-key range** (so the coarse range-skip
+/// can't prune any of them — the adversarial long-running-join case).
+///
+/// One round = one full pass writing entry `r` to EVERY join key, then a
+/// flush. So round `r` produces SST `r` covering keys `[0 .. num_keys)`, and a
+/// probe for any join key finds one matching entry in every SST. `num_ssts`
+/// rounds → `num_ssts` overlapping SSTs.
+fn build_db(num_keys: u32, num_ssts: u32) -> Arc<DbImpl> {
+    // 64 MiB buffer: large enough that only our explicit flushes cut SSTs.
+    let db = open_in_memory(64 * 1024 * 1024);
+    let cf = db.default_cf();
+    let val = vec![0xCDu8; 64];
+
+    for round in 0..num_ssts {
+        for jk in 0..num_keys {
+            db.put(&cf, &state_key(jk, round), &val).expect("put");
+        }
+        // Each full pass becomes one SST spanning the entire join-key range.
+        db.flush_cf(&cf).expect("flush");
+    }
+    db
+}
+
+/// Measures the cost of OPENING a prefix iterator (+ draining its few entries),
+/// which is exactly what a join probe does per record. We rotate the probed
+/// join key each iteration to defeat any per-key caching and to average over
+/// the key space.
+fn bench_join_probe_open(c: &mut Criterion) {
+    let num_keys = 4096u32;
+
+    let mut group = c.benchmark_group("join_probe_open");
+    // Sweep LSM depth: 1 SST (best case, fits one) → 128 SSTs (deep L0 fan-out
+    // like a long-running join between checkpoints/compactions). Each SST spans
+    // the full join-key range, so coarse range-skip cannot prune.
+    for &num_ssts in &[1u32, 8, 32, 64, 128] {
+        let db = build_db(num_keys, num_ssts);
+        let cf = db.default_cf();
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("ssts_{}", num_ssts)),
+            &num_ssts,
+            |b, &_n| {
+                let mut jk = 0u32;
+                b.iter(|| {
+                    let prefix = ns_prefix(jk % num_keys);
+                    // OPEN + drain — the join-probe unit of work.
+                    let iter = db
+                        .prefix_scan_iter_owned_arc(&cf, &prefix)
+                        .expect("open prefix iter");
+                    let mut n = 0usize;
+                    for item in iter {
+                        let (_k, _v) = item.expect("iter item");
+                        n += 1;
+                    }
+                    jk = jk.wrapping_add(1);
+                    black_box(n);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_join_probe_open);
+criterion_main!(benches);

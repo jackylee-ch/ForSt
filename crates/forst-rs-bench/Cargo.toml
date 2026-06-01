@@ -94,3 +94,7 @@ required-features = ["s3-it"]
 [[bench]]
 name = "component_microbench"
 harness = false
+
+[[bench]]
+name = "join_probe_open"
+harness = false
