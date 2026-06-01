@@ -8335,12 +8335,29 @@ impl TierKeySource {
                     let batch = reader.read_block_at(block_idx)?;
                     buffered.clear();
                     *pos = 0;
+                    // 2026-06-02 q7 SECOND-wall FIX: upper-bound early termination.
+                    // SST rows are key-ASC, so once we see a key >= upper, NO later
+                    // row (this block or any later block) can fall in [lower, upper)
+                    // — stop scanning instead of reading the rest of the SST. The
+                    // pre-fix code skipped `>= upper` rows but kept reading
+                    // subsequent blocks, so an EMPTY prefix probe (a join key with no
+                    // matching records, with data for other keys after it) walked the
+                    // whole SST tail: measured 46 ms/probe returning 0 rows over 1 SST
+                    // source — the q7 ckpt-ON ~100/s join-throughput collapse.
+                    let mut hit_upper = false;
                     forst_rs_storage::sst::for_each_row_in_batch(&batch, |view| {
+                        if hit_upper {
+                            // Already past the upper bound; remaining rows in this
+                            // block are all >= upper (ASC). Cheap skip; we mark the
+                            // source exhausted after the block.
+                            return Ok(());
+                        }
                         if view.key < lower.as_slice() {
                             return Ok(());
                         }
                         if let Some(hi) = upper.as_deref() {
                             if view.key >= hi {
+                                hit_upper = true;
                                 return Ok(());
                             }
                         }
@@ -8362,8 +8379,17 @@ impl TierKeySource {
                         }
                         Ok(())
                     })?;
+                    if hit_upper {
+                        // No later block can contain an in-range key — mark this SST
+                        // source drained. Any keys buffered BEFORE the upper bound in
+                        // this block are still returned by the `*pos < buffered.len()`
+                        // fast path on the next loop iteration; once they drain, the
+                        // EOF check returns None.
+                        *next_block = reader.index_entry_count();
+                    }
                     // Loop: if this block was entirely out-of-range or
-                    // contained no rows, peek the next block.
+                    // contained no rows, peek the next block (unless we just
+                    // hit the upper bound, in which case next_block == EOF).
                 }
             }
         }
@@ -10705,6 +10731,84 @@ mod tests {
                 awaited
             );
         }
+    }
+
+    /// 2026-06-02 q7 SECOND-wall regression: an EMPTY prefix scan over an SST
+    /// whose key range STRADDLES the prefix (data for earlier + later
+    /// namespaces, none for the probed one) must STOP as soon as the scan
+    /// passes the prefix's upper bound — NOT read every block to EOF. SST rows
+    /// are key-ASC, so once a key >= upper is seen, no later key can be in
+    /// [prefix, upper). The pre-fix peek skipped `>= upper` rows but kept
+    /// reading subsequent blocks, so an empty join probe scanned the entire SST
+    /// tail (measured: 46 ms/probe, rows=0 → the q7 ~100/s collapse).
+    #[test]
+    fn test_empty_prefix_scan_stops_at_upper_bound() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        {
+            let db = open_in_shared_fs("/db", fs.clone());
+            let cf = db.default_cf();
+            // Namespaces p000..p099 with a GAP at p050. ~1 KiB values so the data
+            // spans many 64 KiB SST blocks (the tail after the gap is many blocks).
+            let val = vec![0xEEu8; 1024];
+            for ns in 0..100u32 {
+                if ns == 50 {
+                    continue; // p050 is the empty probed prefix
+                }
+                for i in 0..20u32 {
+                    let k = format!("p{:03}_{:05}", ns, i);
+                    db.put(&cf, k.as_bytes(), &val).unwrap();
+                }
+            }
+            db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
+        } // drop db1: its resident-flushed RAM shadow is released.
+
+        // Restore fresh from the checkpoint: no resident memtables, so the prefix
+        // scan must read from the SST — the cold q7 regime (state spilled past the
+        // RAM shadow) where this bug bites.
+        let opts = EngineOptions {
+            db_path: "/ckpt".to_string(),
+            ..EngineOptions::default()
+        };
+        let db = DbImpl::open_from_checkpoint(opts, fs).unwrap();
+        let cf = db.default_cf();
+
+        // Sanity: a single straddling SST with many blocks.
+        let version = db.version_set.current();
+        let ssts: Vec<_> = version.live_sst_files_iter().collect();
+        assert_eq!(ssts.len(), 1, "expected exactly one flushed SST");
+        let reader = db.get_or_open_sst_reader(ssts[0]).unwrap();
+        let total_blocks = reader.index_entry_count();
+        assert!(
+            total_blocks >= 8,
+            "test precondition: SST should span many blocks, got {}",
+            total_blocks
+        );
+        let blocks_before = reader.blocks_read();
+
+        // Probe the EMPTY prefix p050_. Range = [p050_, p050`] ; all p051..p099
+        // keys are >= upper. The scan must not walk the whole tail.
+        let iter = db
+            .prefix_scan_iter_owned_arc(&cf, b"p050_")
+            .expect("open prefix iter");
+        let mut n = 0usize;
+        for item in iter {
+            item.expect("iter item");
+            n += 1;
+        }
+        assert_eq!(n, 0, "p050 prefix is empty");
+
+        let blocks_during_scan = reader.blocks_read() - blocks_before;
+        // With the upper-bound early-termination, the scan reads ~1 block (the
+        // one first_block_ge lands on) and stops. Without it, it reads the whole
+        // tail (p051..p099 ≈ many blocks). Allow a small slack.
+        assert!(
+            blocks_during_scan <= 3,
+            "empty prefix scan read {} blocks (of {} total) — it walked past the \
+             upper bound to EOF instead of stopping (q7 ~100/s join collapse)",
+            blocks_during_scan,
+            total_blocks
+        );
     }
 
     #[test]

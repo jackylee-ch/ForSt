@@ -154,6 +154,11 @@ pub struct SstReaderImpl {
     /// `file_number < 2^40` (≤ 1 T SSTs) in any real deployment, so the packed
     /// id is collision-free. `0` when no cache is wired.
     cache_file_id: u64,
+    /// 2026-06-02: count of `read_block_at` calls served by this reader. Used by
+    /// diagnostics and by the prefix-scan upper-bound-early-termination test to
+    /// prove an empty/tail prefix scan does NOT read the whole SST tail. Relaxed
+    /// — a monotone counter with no cross-thread ordering requirement.
+    blocks_read: std::sync::atomic::AtomicU64,
 }
 
 // R74-H1: the read-fully helper (a `read_at` loop that requires all `buf.len()` bytes and
@@ -268,6 +273,7 @@ impl SstReaderImpl {
             bloom_filter,
             block_cache: None,
             cache_file_id: 0,
+            blocks_read: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -577,6 +583,12 @@ impl SstReaderImpl {
         self.index_entries.len()
     }
 
+    /// 2026-06-02: number of `read_block_at` calls served so far (diagnostics +
+    /// prefix-scan early-termination test).
+    pub fn blocks_read(&self) -> u64 {
+        self.blocks_read.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// FRS-PREFIX-SEEK: index of the first data block that could contain keys
     /// `>= key`, via binary search over the sparse index (the same primitive
     /// `get`/`get_versions` use). Returns `index_entry_count()` when `key` is
@@ -637,6 +649,8 @@ impl SstReaderImpl {
     /// returned `RecordBatch` directly via [`for_each_row_in_batch`] (which
     /// yields zero-copy [`RowView`]s borrowing from the batch buffers).
     pub fn read_block_at(&self, block_idx: usize) -> ForstResult<RecordBatch> {
+        self.blocks_read
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let entry = self.index_entries.get(block_idx).ok_or_else(|| {
             ForstError::invalid_argument(format!(
                 "SST block index {} out of range (have {} blocks)",
