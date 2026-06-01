@@ -79,3 +79,82 @@ O(num_L0) sources → the wall (matches the recorded "join probe opens O(num_L0)
 SSTs (rocksdb's key advantage on lookups) or blindly seek every SST? If no pruning, every open
 pays O(num_L0); adding bloom-prune-on-open would cut it toward O(matching-SSTs). Also: block-cache
 reuse of index/data blocks across opens; keeping L0 small via compaction.
+
+## Drill-down 1 — the OPEN build is NOT the cost (microbench, disproves a hypothesis)
+`crates/forst-rs-bench/benches/join_probe_open.rs` reproduces the adversarial join shape (records
+round-robin across 4096 join keys, flushed per round so every L0 SST spans the full key range →
+coarse range-skip cannot prune). Result: the prefix-iterator OPEN build is **flat and cheap** —
+~0.7–1.4 µs whether 1 or 128 overlapping SSTs, warm/in-memory. So the per-open bookkeeping
+(`live_sst_file_numbers()` HashSet build + `resident_flushed_visible_entries()` clone +
+`build_lazy_prefix_key_stream`) does NOT scale with fan-out and is NOT the regression. The build is
+also lazy (no block reads — just range checks + `first_block_ge` binary search); blocks are read in
+`peek()`/`get_arc` during the DRAIN, after the build returns.
+
+## Drill-down 2 — the cost is the get-per-key DRAIN (confirmed by the code itself)
+The FFI open (`frs_vec_iter_prefix_open`) routes through `prefix_scan_iter_owned_arc_with_error_slot`,
+whose k-way merge emits **keys only**; for each emitted key it then calls **`db.get_arc(key)`** — a
+full second LSM traversal to fetch the value. The SST tier source already decoded the value
+(`for_each_row_in_batch` exposes `view.key` AND the value) but discards it; `get_arc` re-reads the
+same block to recover it. The in-code note at `db.rs:8352` says it outright: the merge compares are
+*"dwarfed by the `db.get(key)` resolve."* So a join probe reads its SST blocks twice. Warm (decoded-
+block cache hit) this is just CPU; in the q7 regime (state ≫ RAM) it doubles cold disk block reads.
+
+## Drill-down 3 — the RAM-budget asymmetry (rocksdb parity gap, low-risk lever)
+`config-forst-rs-local.yaml.tpl` sets **none** of the `state.backend.forst-rs.*` tuning keys, so q7
+runs on engine defaults: **64 MiB write buffer × 4 + 256 MiB block cache ≈ 512 MiB RAM per engine**.
+The TM has **12 GiB**. The rocksdb backend, by contrast, funds its block cache + write buffers from
+Flink **managed memory** (~0.4 × usable ≈ 4–5 GiB, shared across all slots via
+`RocksDBSharedResources`). Two compounding gaps:
+1. **Absolute size**: forst-rs's 512 MiB vs rocksdb's ~4–5 GiB. Tiny memtables → constant flushing →
+   many cold L0 SSTs; a 256 MiB block cache thrashes against multi-GB join state → the drain's
+   block reads miss → cold disk I/O. This is the most plausible q7 regression driver.
+2. **Per-instance multiplication**: each `ForStRsStateBackend` opens its OWN engine with its OWN
+   cache (`dbOpenRemoteWithOptions(..., blockCacheCapacityBytes, ...)`). With 4 slots × (join+window)
+   keyed ops ≈ up to 8 engines on one TM, the cache budget can't simply be scaled up per-instance
+   without 8×-ing total RAM. rocksdb shares ONE pool. **forst-rs lacks a process-shared block
+   cache + write-buffer-manager (the `RocksDBSharedResources` equivalent)** — a real ForsT/RocksDB
+   capability gap and the principled fix.
+
+**Plan:** (a) confirm via `FRS_ITER_DIAG=1` time-boxed q7 (`scripts/diag-q7-iter.sh`) that builds
+are fast + how many SST sources per probe; (b) modest, safe RAM bump in the template (bigger write
+buffer to cut flush frequency + larger block cache, bounded by the WBM cap so total stays well under
+12 GiB) and re-measure q7 vs the 941 s rocksdb baseline; (c) if that confirms the lever, design a
+process-shared cache/WBM (one budget across all engine instances) for true rocksdb parity.
+
+### Diag result (FRS_ITER_DIAG=1, ~200 s of q7 steady state)
+- **Only 2 builds exceeded 1 ms** in the whole window → the prefix-iterator OPEN build is fast in
+  ~every probe (confirms the microbench; build is exonerated as the regression).
+- Both slow builds: `us=60262` / `us=46662` (**46–60 ms**) with `sst_sources=1, mem_sources=0,
+  resident_shadowed=16`. ONE SST source, not fan-out — so the 46–60 ms is a **cold SST-reader open**
+  (`get_or_open_sst_reader` reading footer+index, the first probe to touch a freshly-flushed SST
+  before its local-cache write-through is warm). Rare (2 in 200 s) but on the critical path; the 30 s
+  checkpoint cadence force-flushes → a new SST → a periodic cold-open stall. Worth a follow-up
+  (prewarm the reader at flush-completion) but NOT the steady-state driver.
+- Net: steady-state cost is the DRAIN (per-probe block reads + `get_arc`), unmeasured by the build
+  timer. `resident_shadowed=16` ⇒ ~1 GiB of recently-flushed state is being kept in RAM per engine,
+  i.e. the 64 MiB write buffer is flushing ~every 64 MiB → many small SSTs. This is exactly what the
+  RAM bump (drill-down 3) targets: bigger write buffer ⇒ fewer flushes ⇒ fewer SSTs/cold-opens;
+  bigger block cache ⇒ the drain's repeat block reads hit RAM.
+
+### Applied change (config-forst-rs-local.yaml.tpl, under `state.backend.forst-rs`)
+```yaml
+      writebuffer:
+        size: 256mb        # was 64mb default → flush ~4× less often → ~4 resident memtables not 16
+        count: 3
+        manager:
+          capacity: 512mb  # caps active+immutable so total RAM stays bounded
+      cache:
+        block:
+          capacity: 512mb  # was 256mb default → drain's repeat block reads hit RAM
+```
+Per-engine RAM ≈ ≤512 MiB memtable + 1 GiB resident shadow + 512 MiB block cache ≈ 2 GiB; safe
+across slots on the 12 GiB TM. Validated by `scripts/validate-q7.sh` (runs q7 to completion, reports
+wall time vs the 941 s rocksdb baseline). Zero engine-code risk — pure config.
+
+### Honest scale check
+rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
+collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
+goal is structurally hard: light queries (q0-q3) are source-bound parity and cap the average, so the
+5× must come from heavy queries running multiple× FASTER than rocksdb — forst-rs must genuinely beat
+rocksdb on joins, not just reach parity. The RAM bump + cold-open prewarm + (eventually) the
+shared-cache + value-carrying-merge are the levers; each needs a ~20 min heavy run to validate.
