@@ -241,6 +241,21 @@ the deeper question is why a LOCAL (file://) cache-miss read is slow at all — 
 should read local NVMe directly, not await an upload (independent engine win, aligns with the
 no-per-record/no-copy I/O mandate).
 
+### SECOND wall — cache size was NOT it (2026-06-02 update)
+Bumping `cache-capacity-mb` 1024→65536 moved the wall only marginally (~21M→~23M) and q7 still
+collapses to ~100/s and does not finish (ran to MAXSEC). So the local SST-cache size is not the
+cause. A **jstack of the live stalled job** shows: join thread sits in `frsVecIterPrefixOpen` (the
+FFM downcall into Rust), block-cache hit rate still **99.9%** (not block-decode), most other threads
+parked. jstack can't see into native code, so the Rust side is blocking on something Java stacks
+can't resolve. Leading hypothesis (consistent with the 46–60 ms cold reader-opens seen via
+FRS_ITER_DIAG + the 30 s ckpt force-flush minting L0 SSTs): **slow OpenDAL local I/O (~3 MB/s
+measured for the ~1 GB checkpoint copy) starves compaction → L0 SSTs accumulate unbounded → each
+join probe opens ever more overlapping SST readers → ~100/s collapse.** NEXT STEP (deliberate, not a
+blind run): add native timing inside `frs_vec_iter_prefix_open` to split build vs drain vs
+reader-open, and instrument the OpenDAL file-backend write/read latency — the root may be a
+pathologically slow OpenDAL local path (independent engine win; aligns with the no-per-record/
+no-copy I/O mandate). The checkpoint fix (#1) stands as a validated, banked win regardless.
+
 ### Honest scale check
 rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
 collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
