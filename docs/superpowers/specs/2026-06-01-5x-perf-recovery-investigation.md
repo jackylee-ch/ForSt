@@ -219,6 +219,28 @@ join itself runs at 270–370K/s (rocksdb-competitive) between checkpoints. Diag
 found + to fix: `diag-ckpt-long-q7.sh` latched onto the nexmark **warmup** job id (canceled after
 120 s) instead of the measurement job — track the job whose source emits the most records instead.
 
+## ✅ FIX #1 LANDED + VALIDATED (2026-06-02) — checkpoint↔compaction decoupled
+Commit `a76a52f8a` (engine). create_incremental_checkpoint_impl now awaits only its pinned
+version's SST uploads (per-file `await_upload` over `live_sst_files`, after the snapshot+pin); the
+blanket `await_all_uploads()` was removed there AND from `wait_for_pending_flushes` (now flush-
+counter-only; shutdown durability moved to an explicit await in `DbImpl::drop`). TDD:
+`test_incremental_checkpoint_awaits_only_referenced_ssts` (RED await_all_count=2 → GREEN 0); full
+engine suite 256/256.
+**Validated on q7 (clean measurement job):** checkpoint 3 — the one that was **332 s** — now
+completes in **1157 ms** at 1.16 GB (ckpts 1–3 all ~1.1–1.3 s). The 332 s freeze is GONE (~286×).
+
+## SECOND wall exposed (2026-06-02) — local SST cache cap = 1 GB
+With the checkpoint freeze fixed, q7 STILL doesn't finish: throughput collapses to ~100/s at a hard,
+reproducible ceiling of **~21M records** (identical before and after fix #1 → independent
+bottleneck the freeze was masking). Correlation: ckpt3 state = 1.16 GB right at the wall, and
+`state.backend.forst-rs.storage.cache-capacity-mb` defaults to **1024 MB**. Hypothesis: state
+crosses the 1 GB local NVMe SST cache → reads hit the eviction-fallback open (which awaits the slow
+OpenDAL open) → collapse. Mirrors the recorded q9-collapse (fixed there with a large cache).
+ACTION: bumped `cache-capacity-mb: 65536` in the local template; re-validating q7. If confirmed,
+the deeper question is why a LOCAL (file://) cache-miss read is slow at all — the eviction-fallback
+should read local NVMe directly, not await an upload (independent engine win, aligns with the
+no-per-record/no-copy I/O mandate).
+
 ### Honest scale check
 rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
 collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
