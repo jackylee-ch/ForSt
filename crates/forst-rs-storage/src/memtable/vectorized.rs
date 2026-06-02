@@ -112,11 +112,13 @@ struct HashEntry {
 /// Range scans still use the sorted BTreeMap + unsorted zone.
 pub struct VectorizedMemTable {
     // -- Columnar storage (append-only) --
-    /// Key bytes, concatenated.
-    key_data: Vec<u8>,
-    /// End-offsets into `key_data` for each row. Row i spans
-    /// `key_offsets[i]..key_offsets[i+1]`.
-    key_offsets: Vec<u32>,
+    /// Key bytes, in a NON-MOVING segmented arena (lock-free-memtable P3
+    /// foundation): chunks never move, so a per-row `ByteSpan` stays valid
+    /// under concurrent appends. Replaces the prior `key_data: Vec<u8>` +
+    /// `key_offsets` (a `Vec` realloc moved bytes, dangling reader offsets).
+    key_arena: super::arena::SegmentedBytes,
+    /// Per-row key span into `key_arena` (one entry per row, indexed by row offset).
+    key_spans: Vec<super::arena::ByteSpan>,
 
     /// Value bytes, concatenated.
     value_data: Vec<u8>,
@@ -199,14 +201,12 @@ impl VectorizedMemTable {
         const INIT_CAPACITY_BYTES: usize = 64 * 1024;
         const INIT_ROWS_HINT: usize = 1024;
 
-        let mut key_offsets = Vec::with_capacity(INIT_ROWS_HINT + 1);
-        key_offsets.push(0); // sentinel
         let mut value_offsets = Vec::with_capacity(INIT_ROWS_HINT + 1);
         value_offsets.push(0); // sentinel
 
         Self {
-            key_data: Vec::with_capacity(INIT_CAPACITY_BYTES),
-            key_offsets,
+            key_arena: super::arena::SegmentedBytes::with_chunk_capacity(INIT_CAPACITY_BYTES),
+            key_spans: Vec::with_capacity(INIT_ROWS_HINT),
             value_data: Vec::with_capacity(INIT_CAPACITY_BYTES),
             value_offsets,
             value_nulls: Vec::with_capacity(INIT_ROWS_HINT),
@@ -301,9 +301,8 @@ impl VectorizedMemTable {
 
         let row_offset = self.sequences.len() as u32;
 
-        // Append key.
-        self.key_data.extend_from_slice(key);
-        self.key_offsets.push(self.key_data.len() as u32);
+        // Append key into the non-moving arena; record its span.
+        self.key_spans.push(self.key_arena.append(key));
 
         // Append value.
         match value {
@@ -473,9 +472,7 @@ impl VectorizedMemTable {
     /// Retrieves the key bytes for a given row offset.
     /// Used by get() (Task 3) and to_flush_batches() (Task 5).
     fn key_at(&self, offset: u32) -> &[u8] {
-        let start = self.key_offsets[offset as usize] as usize;
-        let end = self.key_offsets[offset as usize + 1] as usize;
-        &self.key_data[start..end]
+        self.key_arena.get(self.key_spans[offset as usize])
     }
 
     /// Retrieves the value bytes for a given row offset. Returns `None` for tombstones.
@@ -1197,8 +1194,7 @@ impl VectorizedMemTable {
             let row_offset = base_offset + i as u32;
 
             // Append key.
-            self.key_data.extend_from_slice(key);
-            self.key_offsets.push(self.key_data.len() as u32);
+            self.key_spans.push(self.key_arena.append(key));
 
             // Append value.
             match value {
@@ -1362,8 +1358,7 @@ impl VectorizedMemTable {
             let seq = seqs[i];
             let row_offset = base_offset + i as u32;
 
-            self.key_data.extend_from_slice(key);
-            self.key_offsets.push(self.key_data.len() as u32);
+            self.key_spans.push(self.key_arena.append(key));
 
             match value {
                 Some(v) => {
@@ -1518,8 +1513,7 @@ impl VectorizedMemTable {
             let seq = base_seq + idx as u64;
             let row_offset = base_offset + k as u32;
 
-            self.key_data.extend_from_slice(key);
-            self.key_offsets.push(self.key_data.len() as u32);
+            self.key_spans.push(self.key_arena.append(key));
 
             match value {
                 Some(v) => {
@@ -1756,8 +1750,7 @@ impl VectorizedMemTable {
             };
 
             // Columnar extends (per-row but reading directly from Arrow accessors).
-            self.key_data.extend_from_slice(key);
-            self.key_offsets.push(self.key_data.len() as u32);
+            self.key_spans.push(self.key_arena.append(key));
             match value_opt {
                 Some(v) => {
                     self.value_data.extend_from_slice(v);
@@ -1921,25 +1914,19 @@ impl VectorizedMemTable {
         }
         let base_offset = self.sequences.len() as u32;
 
-        // 1. key_data: single memcpy of the concatenated key bytes.
-        //    Arrow BinaryArray stores values back-to-back in `value_data` and
-        //    indexes them via `value_offsets[i]..value_offsets[i+1]`. We
-        //    rebase those offsets onto our running `key_data.len()`.
+        // 1. keys: append each row's bytes into the NON-MOVING arena and record
+        //    its span. (Per-row append rather than one memcpy: the arena keeps
+        //    each row contiguous + non-moving so reader spans stay valid under
+        //    concurrent appends. The Arrow BinaryArray slice may not start at
+        //    offset zero, so each row is sliced via its own [i..i+1] bounds.)
         let key_value_buf: &[u8] = keys.value_data();
         let key_offsets_arr = keys.value_offsets(); // OffsetBuffer<i32>
-        let key_data_base = self.key_data.len() as u32;
-        // The Arrow BinaryArray slice may not start at offset zero; the first
-        // element of value_offsets is the start of the slice. Anchor on it.
-        let key_slice_start = key_offsets_arr[0] as usize;
-        let key_slice_end = key_offsets_arr[count] as usize;
-        self.key_data
-            .extend_from_slice(&key_value_buf[key_slice_start..key_slice_end]);
-        self.key_offsets.reserve(count);
-        // Append offsets [1..=count], rebased so that offset[i+1] - offset[i]
-        // gives the same byte length as the source row.
-        for i in 1..=count {
-            let rebased = key_data_base + (key_offsets_arr[i] as u32 - key_offsets_arr[0] as u32);
-            self.key_offsets.push(rebased);
+        self.key_spans.reserve(count);
+        for i in 0..count {
+            let s = key_offsets_arr[i] as usize;
+            let e = key_offsets_arr[i + 1] as usize;
+            self.key_spans
+                .push(self.key_arena.append(&key_value_buf[s..e]));
         }
 
         // 2. value_data + value_offsets + value_nulls.
@@ -2840,7 +2827,7 @@ mod tests {
         // key_offsets and value_offsets start with [0] sentinel (len=1);
         // sequences starts empty.
         assert_eq!(mt.sequences.len(), 0);
-        assert_eq!(mt.key_offsets.len(), 1, "no key offsets pushed");
+        assert_eq!(mt.key_spans.len(), 0, "no key spans pushed");
         assert_eq!(mt.value_offsets.len(), 1, "no value offsets pushed");
     }
 
@@ -2864,7 +2851,7 @@ mod tests {
         );
         // Atomic rejection: no rows inserted (sentinel preserved).
         assert_eq!(mt.sequences.len(), 0);
-        assert_eq!(mt.key_offsets.len(), 1, "key_offsets sentinel preserved");
+        assert_eq!(mt.key_spans.len(), 0, "no key spans on rejected insert");
     }
 
     #[test]
@@ -3225,7 +3212,7 @@ mod tests {
         );
         // No partial state.
         assert_eq!(mt.sequences.len(), 0);
-        assert_eq!(mt.key_offsets.len(), 1);
+        assert_eq!(mt.key_spans.len(), 0);
         assert_eq!(mt.value_offsets.len(), 1);
     }
 
