@@ -8716,6 +8716,100 @@ mod tests {
         );
     }
 
+    /// FRS-CKPT-NOFLUSH combined restore round-trip (2026-06-02): proves the
+    /// foundation the Java no-flush-checkpoint wiring depends on — a no-flush
+    /// incremental checkpoint references ONLY the flushed SSTs (via the manifest)
+    /// while the LIVE memtable is captured as a separate Arrow-IPC artifact; on
+    /// restore, `open_from_incremental` (SSTs) + `replay_memtable_artifacts_from_dir`
+    /// (memtable) together reconstruct ALL data. Without this, switching the
+    /// checkpoint to the no-flush variant (which stops minting an L0 SST every
+    /// 30 s — the q7 ckpt-ON throughput decay) would silently lose the live
+    /// memtable on restore. Uses LocalFileSystem + a temp dir because
+    /// open_from_incremental hardlinks SSTs and snapshot_memtables_to_dir stages
+    /// artifacts on the local FS.
+    #[test]
+    fn test_noflush_checkpoint_combined_restore_round_trip() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("db");
+        let art_dir = tmp.path().join("artifacts");
+        let restore_dir = tmp.path().join("restored");
+
+        let manifest_path;
+        let sst_files: Vec<String>;
+        {
+            let fs: Arc<dyn FileSystem> = Arc::new(forst_rs_io::LocalFileSystem::new());
+            let opts = EngineOptions {
+                db_path: db_path.to_string_lossy().to_string(),
+                ..EngineOptions::default()
+            };
+            let db = DbImpl::open_with_fs(opts, fs).unwrap();
+            let cf = db.default_cf();
+
+            // SST-resident data: write then SEAL to an SST.
+            for i in 0..50u32 {
+                let k = format!("sst_{:04}", i);
+                db.put(&cf, k.as_bytes(), b"sstval").unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap();
+
+            // Memtable-resident data: stays in the LIVE active memtable (no flush).
+            for i in 0..50u32 {
+                let k = format!("mem_{:04}", i);
+                db.put(&cf, k.as_bytes(), b"memval").unwrap();
+            }
+
+            let snap = db.snapshot();
+            // No-flush checkpoint: manifest references the flushed SST only.
+            let result = db
+                .create_incremental_checkpoint_noflush(&snap, 1, 0)
+                .unwrap();
+            assert!(
+                !result.new_ssts.is_empty(),
+                "the sealed SST should be referenced by the no-flush checkpoint"
+            );
+            // Capture the live memtable separately as an artifact.
+            let arts = db.snapshot_memtables_to_dir(&art_dir, None).unwrap();
+            assert_eq!(arts.len(), 1, "one CF with live memtable data");
+
+            manifest_path = result.manifest_path.to_string_lossy().to_string();
+            sst_files = result
+                .new_ssts
+                .iter()
+                .chain(result.shared_ssts.iter())
+                .map(|f| f.path.to_string_lossy().to_string())
+                .collect();
+        } // drop db1
+
+        // Restore: SSTs via open_from_incremental, memtable via artifact replay.
+        let db2 = DbImpl::open_from_incremental(
+            &restore_dir.to_string_lossy(),
+            &manifest_path,
+            &sst_files,
+        )
+        .unwrap();
+        let replayed = db2.replay_memtable_artifacts_from_dir(&art_dir).unwrap();
+        assert_eq!(replayed, 50, "all 50 live-memtable entries replayed");
+
+        let cf2 = db2.default_cf();
+        // Both the flushed-SST data AND the live-memtable data must be present.
+        for i in 0..50u32 {
+            let sk = format!("sst_{:04}", i);
+            assert_eq!(
+                db2.get(&cf2, sk.as_bytes()).unwrap().as_deref(),
+                Some(&b"sstval"[..]),
+                "SST-resident key {} lost on no-flush restore",
+                sk
+            );
+            let mk = format!("mem_{:04}", i);
+            assert_eq!(
+                db2.get(&cf2, mk.as_bytes()).unwrap().as_deref(),
+                Some(&b"memval"[..]),
+                "live-memtable key {} lost on no-flush restore (artifact replay gap)",
+                mk
+            );
+        }
+    }
+
     #[test]
     fn test_default_cf_accessor() {
         let db = open();
