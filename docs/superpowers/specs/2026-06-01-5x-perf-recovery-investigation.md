@@ -308,6 +308,33 @@ L0 SST every 30 s. This should flatten the throughput decay. Restore-sensitive (
 memtable artifact) → a focused TDD+restore-test session. Secondary: an L0-file-count compaction trigger
 (compaction is currently size-only) to bound fan-out; and the OpenDAL local I/O speed.
 
+## No-flush checkpoint — foundation PROVEN, Java wiring scoped (2026-06-02)
+The next lever for the q7 throughput decay is the no-flush checkpoint (stop minting an L0 SST every
+30 s; capture the live memtable as an Arrow-IPC artifact instead). Status:
+- **Engine + FFI: complete.** `create_incremental_checkpoint_noflush`, `snapshot_memtables_to_dir`,
+  `open_from_incremental`, `replay_memtable_artifacts_from_dir` all exist; FFI exports + **Java
+  `ForStRsLinker` bindings exist** (`frs_snapshot_memtables_to_dir`, `frs_replay_memtable_artifacts`,
+  `createIncrementalCheckpointAtNoflush`).
+- **Foundation PROVEN (commit `9590ff91b`):** `test_noflush_checkpoint_combined_restore_round_trip`
+  — 50 SST-resident + 50 live-memtable keys → no-flush checkpoint + memtable artifact →
+  `open_from_incremental` + `replay_memtable_artifacts_from_dir` → all 100 keys restored. The
+  data-loss-sensitive combined restore is verified; neither tier is lost.
+
+**Remaining: Java wiring (3 sites + 1 design decision).** Review-gated — this is the redesign the
+user set up brainstorming for.
+1. `ForStRsSnapshotStrategy.asyncSnapshot` (line ~660): swap `createIncrementalCheckpointAt` →
+   `createIncrementalCheckpointAtNoflush`; after it, call `snapshotMemtablesToDir(db, stagingDir,
+   snapshotSeq)` and upload the per-CF `memtable-cf<id>.arrow` artifacts.
+2. **Design decision**: how the memtable artifact rides in the checkpoint handle. Cleanest fit is a
+   **private-state entry** in the `IncrementalRemoteKeyedStateHandle` (alongside SST private state),
+   so it is exclusive to this checkpoint (the live memtable is NOT shared/incremental across
+   checkpoints — it is re-captured each time; that re-upload cost is the known no-flush tradeoff vs
+   the L0-fan-out it removes — measure it).
+3. `ForStRsRestoreOperation` (line ~75/260): after `dbOpenFromIncremental` (SSTs), download the
+   artifact private-state and call `replayMemtableArtifacts(dir)`.
+Then: Java snapshot+restore roundtrip test, build+deploy dylib, re-validate q7 (expect the
+throughput decay to flatten — fewer L0 SSTs minted per checkpoint).
+
 ### Honest scale check
 rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
 collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
