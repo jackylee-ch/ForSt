@@ -144,6 +144,73 @@ pub fn decode_data_block(data: &[u8]) -> ForstResult<RecordBatch> {
     Ok(batch)
 }
 
+/// FRS-ZEROCOPY (2026-06-02): zero-copy decode of an uncompressed data block.
+///
+/// Takes the block as an Arrow [`Buffer`] (shared, ref-counted allocation) and
+/// returns a [`RecordBatch`] whose column arrays SLICE that buffer — no
+/// per-column copy, unlike [`decode_data_block`] (which deserializes through an
+/// owned `Vec`). For uncompressed blocks the IPC payload is sliced zero-copy
+/// from `block`; arrow's [`StreamDecoder`] keeps the array data zero-copy when
+/// the payload is suitably aligned (it falls back to a copy only on
+/// misalignment, so correctness never depends on alignment). Compressed blocks
+/// must decompress into a fresh buffer first (no zero-copy possible), so this
+/// is the win path only for `CompressionType::None` SSTs.
+pub fn decode_data_block_zerocopy(block: &arrow::buffer::Buffer) -> ForstResult<RecordBatch> {
+    use arrow::ipc::reader::StreamDecoder;
+
+    let data = block.as_slice();
+    if data.len() < BLOCK_HEADER_SIZE {
+        return Err(ForstError::corruption(format!(
+            "data block too short for header: expected at least {} bytes, got {}",
+            BLOCK_HEADER_SIZE,
+            data.len()
+        )));
+    }
+    let header = BlockHeader::decode(data)?;
+    let payload_start = BLOCK_HEADER_SIZE;
+    let payload_end = payload_start + header.compressed_size as usize;
+    if data.len() < payload_end {
+        return Err(ForstError::corruption(format!(
+            "data block truncated: header says {} compressed bytes, but only {} available",
+            header.compressed_size,
+            data.len() - BLOCK_HEADER_SIZE
+        )));
+    }
+    let payload = &data[payload_start..payload_end];
+    let actual_checksum = mask_crc(crc32c(payload));
+    if actual_checksum != header.checksum {
+        return Err(ForstError::corruption(format!(
+            "data block checksum mismatch: expected 0x{:08X}, got 0x{:08X}",
+            header.checksum, actual_checksum
+        )));
+    }
+
+    // Obtain the IPC stream as an aligned Arrow Buffer. Uncompressed → a
+    // zero-copy slice that shares `block`'s allocation; compressed → a fresh
+    // owned buffer (one decompress copy, then zero-copy column views over it).
+    let mut ipc_buf: arrow::buffer::Buffer = if header.compression == CompressionType::None {
+        block.slice_with_length(payload_start, header.compressed_size as usize)
+    } else {
+        let ipc = decompress(
+            payload,
+            header.compression,
+            header.uncompressed_size as usize,
+        )?;
+        arrow::buffer::Buffer::from_vec(ipc)
+    };
+
+    let mut decoder = StreamDecoder::new();
+    match decoder
+        .decode(&mut ipc_buf)
+        .map_err(|e| ForstError::corruption(format!("Arrow IPC zero-copy decode failed: {e}")))?
+    {
+        Some(batch) => Ok(batch),
+        None => Err(ForstError::corruption(
+            "Arrow IPC stream contains no complete record batch",
+        )),
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -333,6 +400,85 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("too short"), "unexpected error: {err_msg}");
+    }
+
+    #[test]
+    fn zerocopy_decode_roundtrips_and_aliases_input_buffer() {
+        use arrow::buffer::Buffer;
+        // Large binary values so the value buffer is a substantial, easily
+        // located slice (and so a copy vs zero-copy is unambiguous).
+        let val: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let batch = make_test_batch(
+            vec![b"key-aaaa", b"key-bbbb", b"key-cccc"],
+            vec![
+                Some(val.as_slice()),
+                Some(val.as_slice()),
+                Some(val.as_slice()),
+            ],
+            vec![11, 22, 33],
+            vec![0, 1, 0],
+        );
+        let encoded = encode_data_block(&batch, CompressionType::None).unwrap();
+        let block = Buffer::from_vec(encoded);
+
+        let decoded = decode_data_block_zerocopy(&block).unwrap();
+
+        // Correctness: identical to the copying decoder.
+        assert_eq!(decoded.num_rows(), 3);
+        assert_eq!(decoded.num_columns(), 4);
+        let keys = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(keys.value(0), b"key-aaaa");
+        assert_eq!(keys.value(2), b"key-cccc");
+        let values = decoded
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(values.value(0), val.as_slice());
+        assert_eq!(values.value(2), val.as_slice());
+        let seqs = decoded
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(seqs.value(1), 22);
+
+        // Zero-copy: the value column's bytes must alias the input block buffer
+        // (no per-column copy). value_data() is the contiguous value buffer.
+        let vptr = values.value_data().as_ptr() as usize;
+        let lo = block.as_ptr() as usize;
+        let hi = lo + block.len();
+        assert!(
+            vptr >= lo && vptr < hi,
+            "zero-copy violated: value data ptr {vptr:#x} not within input block [{lo:#x}, {hi:#x})"
+        );
+    }
+
+    #[test]
+    fn zerocopy_decode_matches_copying_decode_lz4() {
+        use arrow::buffer::Buffer;
+        // Compressed path: must still decode correctly (one decompress copy,
+        // then zero-copy column views over the decompressed buffer).
+        let batch = make_test_batch(
+            vec![b"z1", b"z2"],
+            vec![Some(b"vv1"), Some(b"vv2")],
+            vec![7, 8],
+            vec![0, 1],
+        );
+        let encoded = encode_data_block(&batch, CompressionType::Lz4).unwrap();
+        let block = Buffer::from_vec(encoded);
+        let decoded = decode_data_block_zerocopy(&block).unwrap();
+        let keys = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(keys.value(0), b"z1");
+        assert_eq!(keys.value(1), b"z2");
     }
 
     #[test]
