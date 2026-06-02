@@ -120,10 +120,16 @@ pub struct VectorizedMemTable {
     /// Per-row key span into `key_arena` (one entry per row, indexed by row offset).
     key_spans: Vec<super::arena::ByteSpan>,
 
-    /// Value bytes, concatenated.
-    value_data: Vec<u8>,
-    /// End-offsets into `value_data`.
-    value_offsets: Vec<u32>,
+    /// Value bytes, in a NON-MOVING segmented arena (mirrors `key_arena`):
+    /// chunks never move, so a per-row `ByteSpan` stays valid under concurrent
+    /// appends. Replaces the prior `value_data: Vec<u8>` + `value_offsets` (a
+    /// `Vec` realloc moved bytes, dangling a concurrent reader's offset).
+    value_arena: super::arena::SegmentedBytes,
+    /// Per-row value span into `value_arena` (one entry per row, indexed by row
+    /// offset). Null (tombstone) rows store a zero-length sentinel span;
+    /// `value_nulls` is the source of truth for null-ness (a non-null
+    /// zero-length value is distinct and also valid).
+    value_spans: Vec<super::arena::ByteSpan>,
     /// Tracks which rows have null (tombstone) values.
     value_nulls: Vec<bool>,
 
@@ -201,14 +207,11 @@ impl VectorizedMemTable {
         const INIT_CAPACITY_BYTES: usize = 64 * 1024;
         const INIT_ROWS_HINT: usize = 1024;
 
-        let mut value_offsets = Vec::with_capacity(INIT_ROWS_HINT + 1);
-        value_offsets.push(0); // sentinel
-
         Self {
             key_arena: super::arena::SegmentedBytes::with_chunk_capacity(INIT_CAPACITY_BYTES),
             key_spans: Vec::with_capacity(INIT_ROWS_HINT),
-            value_data: Vec::with_capacity(INIT_CAPACITY_BYTES),
-            value_offsets,
+            value_arena: super::arena::SegmentedBytes::with_chunk_capacity(INIT_CAPACITY_BYTES),
+            value_spans: Vec::with_capacity(INIT_ROWS_HINT),
             value_nulls: Vec::with_capacity(INIT_ROWS_HINT),
             sequences: Vec::with_capacity(INIT_ROWS_HINT),
             op_types: Vec::with_capacity(INIT_ROWS_HINT),
@@ -307,12 +310,12 @@ impl VectorizedMemTable {
         // Append value.
         match value {
             Some(v) => {
-                self.value_data.extend_from_slice(v);
-                self.value_offsets.push(self.value_data.len() as u32);
+                self.value_spans.push(self.value_arena.append(v));
                 self.value_nulls.push(false);
             }
             None => {
-                self.value_offsets.push(self.value_data.len() as u32);
+                self.value_spans
+                    .push(super::arena::ByteSpan::default());
                 self.value_nulls.push(true);
             }
         }
@@ -481,9 +484,7 @@ impl VectorizedMemTable {
         if self.value_nulls[offset as usize] {
             return None;
         }
-        let start = self.value_offsets[offset as usize] as usize;
-        let end = self.value_offsets[offset as usize + 1] as usize;
-        Some(&self.value_data[start..end])
+        Some(self.value_arena.get(self.value_spans[offset as usize]))
     }
 
     /// Merges all unsorted entries into the sorted BTreeMap index.
@@ -989,8 +990,8 @@ impl VectorizedMemTable {
 
     /// Borrowed-value point lookup: like [`Self::get`] but returns a
     /// [`GetBorrowedResult`] whose `value` field borrows from this
-    /// memtable's own storage (`inline_value` cache or `value_data`
-    /// columnar buffer) instead of allocating a fresh `Vec<u8>` per
+    /// memtable's own storage (`inline_value` cache or the `value_arena`
+    /// columnar arena) instead of allocating a fresh `Vec<u8>` per
     /// call.
     ///
     /// PR-B7-H2: this is the zero-extra-alloc point-lookup primitive
@@ -1034,7 +1035,7 @@ impl VectorizedMemTable {
         }
 
         // Slow path: MVCC snapshot read or no inline cache. The
-        // columnar `value_data: Vec<u8>` lives in `&self`, so we can
+        // columnar `value_arena` lives in `&self`, so we can
         // still return a borrowed view without allocating.
         let result = self.find_latest_borrowed(&entry.row_indices, read_sequence);
         Ok(result)
@@ -1199,12 +1200,11 @@ impl VectorizedMemTable {
             // Append value.
             match value {
                 Some(v) => {
-                    self.value_data.extend_from_slice(v);
-                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_spans.push(self.value_arena.append(v));
                     self.value_nulls.push(false);
                 }
                 None => {
-                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_spans.push(super::arena::ByteSpan::default());
                     self.value_nulls.push(true);
                 }
             }
@@ -1362,12 +1362,11 @@ impl VectorizedMemTable {
 
             match value {
                 Some(v) => {
-                    self.value_data.extend_from_slice(v);
-                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_spans.push(self.value_arena.append(v));
                     self.value_nulls.push(false);
                 }
                 None => {
-                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_spans.push(super::arena::ByteSpan::default());
                     self.value_nulls.push(true);
                 }
             }
@@ -1517,12 +1516,11 @@ impl VectorizedMemTable {
 
             match value {
                 Some(v) => {
-                    self.value_data.extend_from_slice(v);
-                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_spans.push(self.value_arena.append(v));
                     self.value_nulls.push(false);
                 }
                 None => {
-                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_spans.push(super::arena::ByteSpan::default());
                     self.value_nulls.push(true);
                 }
             }
@@ -1621,14 +1619,15 @@ impl VectorizedMemTable {
     ///
     /// This path appends the batch's three columns (`key: Binary`,
     /// `value: Binary nullable`, `op_type: UInt8`) directly into the
-    /// memtable's column buffers via slice-copy:
+    /// memtable's column storage:
     ///
-    /// - `key_data` / `value_data` get a single `extend_from_slice` of the
-    ///   underlying Arrow `value_data` buffer (concatenated key bytes / value
-    ///   bytes), so the per-row payload is one memcpy total.
-    /// - `key_offsets` / `value_offsets` are extended with rebased offsets
-    ///   from the Arrow `value_offsets` array.
-    /// - `value_nulls` mirrors the Arrow null bitmap.
+    /// - `key_arena` / `value_arena` get a per-row `append` of each row's
+    ///   bytes sliced from the underlying Arrow value buffer, recording a
+    ///   non-moving `ByteSpan` per row into `key_spans` / `value_spans`. The
+    ///   arena keeps each row contiguous and never moves it, so reader spans
+    ///   stay valid under concurrent appends.
+    /// - `value_nulls` mirrors the Arrow null bitmap; null rows store a
+    ///   zero-length sentinel span.
     /// - `sequences` is filled with `base_seq..base_seq+count`.
     /// - `op_types` is a single `extend_from_slice` of the Arrow `UInt8Array`
     ///   value buffer.
@@ -1657,7 +1656,7 @@ impl VectorizedMemTable {
     /// dispatching into `batch_insert_with_explicit_seqs` — defeating the
     /// columnar zero-copy contract. This path keeps the Arrow buffers as
     /// the source of truth and reads via `value_offsets()`/`value_data()`
-    /// directly. Per-row writes into `key_data` / `value_data` are
+    /// directly. Per-row appends into `key_arena` / `value_arena` are
     /// unavoidable when the source rows are non-contiguous; the savings are
     /// the 4 per-shard Vec allocations + the per-row pointer-deref chain.
     pub fn batch_put_arrow_indices_with_explicit_seqs(
@@ -1753,12 +1752,11 @@ impl VectorizedMemTable {
             self.key_spans.push(self.key_arena.append(key));
             match value_opt {
                 Some(v) => {
-                    self.value_data.extend_from_slice(v);
-                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_spans.push(self.value_arena.append(v));
                     self.value_nulls.push(false);
                 }
                 None => {
-                    self.value_offsets.push(self.value_data.len() as u32);
+                    self.value_spans.push(super::arena::ByteSpan::default());
                     self.value_nulls.push(true);
                 }
             }
@@ -1929,25 +1927,26 @@ impl VectorizedMemTable {
                 .push(self.key_arena.append(&key_value_buf[s..e]));
         }
 
-        // 2. value_data + value_offsets + value_nulls.
+        // 2. values: append each row's bytes into the NON-MOVING arena and
+        //    record its span (mirrors the key path above — non-moving chunks
+        //    keep reader spans valid under concurrent appends). Null rows store
+        //    a zero-length sentinel span; `value_nulls` stays the source of
+        //    truth for null-ness so `value_at` skips `get` on those rows.
         let val_value_buf: &[u8] = values.value_data();
         let val_offsets_arr = values.value_offsets();
-        let val_data_base = self.value_data.len() as u32;
-        let val_slice_start = val_offsets_arr[0] as usize;
-        let val_slice_end = val_offsets_arr[count] as usize;
-        self.value_data
-            .extend_from_slice(&val_value_buf[val_slice_start..val_slice_end]);
-        self.value_offsets.reserve(count);
+        self.value_spans.reserve(count);
         self.value_nulls.reserve(count);
         for i in 0..count {
-            // Always push the rebased end-offset — value_data has been extended
-            // with the FULL concatenated buffer, including the zero-length
-            // slots that null rows occupy. value_at() consults value_nulls so
-            // the offset for a null row is meaningless but valid.
-            let rebased =
-                val_data_base + (val_offsets_arr[i + 1] as u32 - val_offsets_arr[0] as u32);
-            self.value_offsets.push(rebased);
-            self.value_nulls.push(values.is_null(i));
+            if values.is_null(i) {
+                self.value_spans.push(super::arena::ByteSpan::default());
+                self.value_nulls.push(true);
+            } else {
+                let s = val_offsets_arr[i] as usize;
+                let e = val_offsets_arr[i + 1] as usize;
+                self.value_spans
+                    .push(self.value_arena.append(&val_value_buf[s..e]));
+                self.value_nulls.push(false);
+            }
         }
 
         // 3. sequences: monotonically increasing from base_seq.
@@ -2072,7 +2071,7 @@ impl VectorizedMemTable {
     /// Borrowed-value sibling of [`Self::find_latest`].
     ///
     /// PR-B7-H2: same selection logic, but constructs a
-    /// [`GetBorrowedResult`] whose `value` borrows from `self.value_data`
+    /// [`GetBorrowedResult`] whose `value` borrows from `self.value_arena`
     /// (the columnar payload buffer) via `value_at()`. No per-key
     /// allocation. Used by [`Self::get_borrowed`] for the MVCC-snapshot
     /// and oversized-Put paths where the inline cache is unavailable.
@@ -2824,11 +2823,11 @@ mod tests {
             );
         }
         // Sanity: state is unchanged after rejection (no rows inserted).
-        // key_offsets and value_offsets start with [0] sentinel (len=1);
-        // sequences starts empty.
+        // key_spans / value_spans are per-row (one entry per inserted row),
+        // so both are empty when nothing was inserted; sequences too.
         assert_eq!(mt.sequences.len(), 0);
         assert_eq!(mt.key_spans.len(), 0, "no key spans pushed");
-        assert_eq!(mt.value_offsets.len(), 1, "no value offsets pushed");
+        assert_eq!(mt.value_spans.len(), 0, "no value spans pushed");
     }
 
     /// Regression test for Sweep R13 H (Reviewer 1): batch_insert validates
@@ -3213,7 +3212,7 @@ mod tests {
         // No partial state.
         assert_eq!(mt.sequences.len(), 0);
         assert_eq!(mt.key_spans.len(), 0);
-        assert_eq!(mt.value_offsets.len(), 1);
+        assert_eq!(mt.value_spans.len(), 0);
     }
 
     /// Frozen memtable rejects batch_put_arrow.

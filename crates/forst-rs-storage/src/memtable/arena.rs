@@ -35,7 +35,13 @@
 
 /// A handle to a contiguous run of bytes within a [`SegmentedBytes`] arena.
 /// Stable for the arena's lifetime (chunks never move).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// The [`Default`] value (`chunk: 0, offset: 0, len: 0`) is the zero-length
+/// sentinel stored for memtable null/tombstone rows. The memtable's
+/// `value_nulls` bitmap — not the span — is the source of truth for null-ness;
+/// callers check it and skip `get` for null rows, so `get` is never invoked on
+/// a sentinel (which would otherwise index a possibly-absent chunk 0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ByteSpan {
     /// Index of the owning chunk.
     pub chunk: u32,
