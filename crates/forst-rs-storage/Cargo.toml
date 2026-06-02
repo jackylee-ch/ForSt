@@ -31,6 +31,7 @@ lz4_flex = { workspace = true }
 zstd = { workspace = true }
 xxhash-rust = { workspace = true }
 arc-swap = { workspace = true }
+crossbeam-skiplist = { workspace = true }
 # 2026-05-29 PERF: FxHashMap (fast non-crypto hasher) for the vectorized
 # memtable's hot hash_index/unsorted_lookup/prefix_index. Profiling q4/q7
 # showed Rust's default SipHash (BuildHasher::hash_one + Hasher::write)

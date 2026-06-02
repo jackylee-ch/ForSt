@@ -19,12 +19,10 @@
 //! A BTreeMap sorted index enables ordered iteration for range scans and
 //! flush, while a HashMap buffers recent unsorted writes before merge.
 
-use std::cmp::Reverse;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 // 2026-05-29 PERF: FxHashMap replaces std HashMap (SipHash) for the hot
-// hash_index / unsorted_lookup / prefix_index. Profiling showed SipHash
-// (BuildHasher::hash_one + Hasher::write) was the #1 q4/q7 join hot path.
+// hash_index. Profiling showed SipHash (BuildHasher::hash_one +
+// Hasher::write) was the #1 q4/q7 join hot path.
 use rustc_hash::FxHashMap as HashMap;
 
 use arrow::array::{Array, BinaryArray, BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
@@ -48,41 +46,73 @@ struct RowIndex {
     op_type: OpType,
 }
 
+/// Composite ordered-index key for the lock-free `SkipMap` (lock-free-memtable
+/// P3 phase 2). Each stored version of a user key is its own immutable skiplist
+/// entry — `SkipMap` cannot mutate a value in place, so a per-key version list
+/// is expressed as multiple `InternalKey` entries instead.
+///
+/// Ordering is **user key ASCending, then sequence DESCending**, so a forward
+/// skiplist traversal yields keys in ascending order with each key's newest
+/// version first — exactly the (key ASC, seq DESC) order the flush builder and
+/// range scans require. Keeping `user_key` and `sequence` as SEPARATE fields
+/// (rather than a packed `user_key||seq` byte string) means the user-key
+/// comparison is pure lexicographic with no suffix-interleaving hazard between
+/// a key and another key that has it as a prefix.
+#[derive(Clone, Debug)]
+struct InternalKey {
+    /// User key bytes. `Arc<[u8]>` so cloning an `InternalKey` (e.g. building a
+    /// range bound, or returning scan keys) is a refcount bump, not a copy —
+    /// preserving the FRS-SCAN-ARCKEY zero-copy-key property.
+    user_key: Arc<[u8]>,
+    /// Sequence number; compared descending so newest-first within a key.
+    sequence: u64,
+}
+
+impl InternalKey {
+    #[inline]
+    fn new(user_key: Arc<[u8]>, sequence: u64) -> Self {
+        InternalKey { user_key, sequence }
+    }
+
+    /// Lower bound (inclusive) covering ALL versions of `user_key`: sequence
+    /// `u64::MAX` is the smallest `InternalKey` for a given user key (seq sorts
+    /// descending), so a range starting here includes every version.
+    #[inline]
+    fn range_start(user_key: Arc<[u8]>) -> Self {
+        InternalKey {
+            user_key,
+            sequence: u64::MAX,
+        }
+    }
+}
+
+impl PartialEq for InternalKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.sequence == other.sequence && self.user_key == other.user_key
+    }
+}
+impl Eq for InternalKey {}
+
+impl Ord for InternalKey {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // user key ASC, then sequence DESC (newest version first within a key).
+        self.user_key
+            .cmp(&other.user_key)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+impl PartialOrd for InternalKey {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Maximum value size (bytes) that will be stored inline in the hash entry.
 /// Covers most Flink ValueState<Long/String/etc> payloads (≤64 bytes).
 const INLINE_THRESHOLD: usize = 256;
-
-/// 2026-05-30 PREFIX-SCAN QUADRATIC FIX: hard cap on the unsorted→sorted merge
-/// threshold. The threshold was `(sorted_count * unsorted_merge_ratio).max(1024)`
-/// — proportional to table size. `prefix_scan_keys` iterates the ENTIRE
-/// `unsorted_lookup` on every call (O(unsorted)), so on a large memtable the
-/// proportional threshold let `unsorted_lookup` grow into the millions, making
-/// each streaming-join prefix-scan probe O(memtable) → quadratic over the run
-/// (the q9 heavy-query stall). `merge_unsorted_to_sorted` is O(unsorted·log) and
-/// each entry merges exactly once, so capping the threshold does NOT add total
-/// write work — it just merges in smaller, more frequent batches, keeping
-/// `unsorted_lookup` bounded so prefix scans stay cheap. Point gets are
-/// unaffected (they hash-probe `unsorted_lookup` in O(1)).
-const MAX_UNSORTED_MERGE_THRESHOLD: usize = 4096;
-
-/// FRS-UNSORTED-FIXEDCAP (2026-06-01): the merge threshold is now a FIXED,
-/// small constant (default 256) instead of growing with the memtable. This
-/// caps the per-read `unsorted_lookup` linear scan (×16 shards) at a constant
-/// independent of memtable size — the q4/q9 heavy-join freeze was this scan
-/// ramping 1→5.6 ms/probe as the buffer grew toward 4096. Env-overridable
-/// (`FRS_UNSORTED_CAP`) for A/B sweeps without a rebuild; clamped to
-/// `[16, MAX_UNSORTED_MERGE_THRESHOLD]`. Read once via `OnceLock`.
-fn unsorted_merge_cap() -> usize {
-    use std::sync::OnceLock;
-    static CAP: OnceLock<usize> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("FRS_UNSORTED_CAP")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .map(|v| v.clamp(16, MAX_UNSORTED_MERGE_THRESHOLD))
-            .unwrap_or(256)
-    })
-}
 
 /// Per-key entry in the hash index. For small values (≤ INLINE_THRESHOLD bytes),
 /// the latest version's value is stored inline to avoid dereferencing through
@@ -148,23 +178,18 @@ pub struct VectorizedMemTable {
     /// `Arc::<[u8]>::from(key.as_slice())` (heap alloc + memcpy of the key). Reads are
     /// unchanged: `Arc<[u8]>: Borrow<[u8]>`, so `get`/`get_mut`/`range::<[u8],_>` still
     /// probe by borrowed slice. Aligns with the "no heap copies / zero-copy" principle.
-    sorted_index: BTreeMap<Arc<[u8]>, Vec<RowIndex>>,
-    /// Number of rows covered by the sorted index.
-    sorted_count: u32,
-
-    /// Unsorted buffer: row offsets not yet merged into sorted_index.
-    unsorted_entries: Vec<u32>,
-    /// Unsorted lookup: key -> list of RowIndex for quick point lookups.
-    ///
-    /// PERF (B2): keyed by `Box<[u8]>` rather than `Vec<u8>` — saves 8 bytes
-    /// per entry (no `cap` field) and uses a right-sized allocation instead of
-    /// the `to_vec()` over-alloc + realloc pattern. The hot path uses
-    /// `get_mut`-then-`insert` rather than `entry()` so collisions on the
-    /// same key (e.g. per-key aggregations) skip the key-allocation entirely.
-    unsorted_lookup: HashMap<Box<[u8]>, Vec<RowIndex>>,
-    /// Pool of recycled `Vec<RowIndex>` allocations released by the merge step.
-    /// PERF (B2): avoids re-allocating the per-key index list on every put.
-    rowindex_vec_pool: Vec<Vec<RowIndex>>,
+    /// Lock-free ordered index (lock-free-memtable P3 phase 2). Each stored
+    /// version of a user key is its own immutable [`SkipMap`] entry keyed by
+    /// [`InternalKey`] (user key ASC, sequence DESC) → its [`RowIndex`]. A
+    /// forward traversal yields rows in (key ASC, seq DESC) order — the flush /
+    /// range-scan order — and a prefix/range scan is an O(log N + K) skiplist
+    /// range query. This replaces the prior `sorted_index: BTreeMap` +
+    /// `unsorted_lookup: HashMap` + the unsorted→sorted merge machinery: the
+    /// skiplist is ALWAYS sorted, so there is no unsorted zone to linear-scan
+    /// on reads (the O(N) empty-prefix-probe cost that hurt heavy joins) and no
+    /// merge step. `SkipMap::insert`/`range` take `&self`, so phase 3 can drop
+    /// the per-shard `RwLock` without changing this structure.
+    index: crossbeam_skiplist::SkipMap<InternalKey, RowIndex>,
 
     /// Persistent hash index for O(1) point lookups. Maps user_key to a
     /// [`HashEntry`] containing ALL RowIndex entries for that key (across both
@@ -215,13 +240,9 @@ impl VectorizedMemTable {
             value_nulls: Vec::with_capacity(INIT_ROWS_HINT),
             sequences: Vec::with_capacity(INIT_ROWS_HINT),
             op_types: Vec::with_capacity(INIT_ROWS_HINT),
-            sorted_index: BTreeMap::new(),
-            sorted_count: 0,
-            unsorted_entries: Vec::with_capacity(INIT_ROWS_HINT),
+            index: crossbeam_skiplist::SkipMap::new(),
             // FxHashMap has no `with_capacity` (custom hasher) — use
             // with_capacity_and_hasher with the default FxBuildHasher.
-            unsorted_lookup: HashMap::with_capacity_and_hasher(INIT_ROWS_HINT, Default::default()),
-            rowindex_vec_pool: Vec::new(),
             hash_index: HashMap::with_capacity_and_hasher(INIT_ROWS_HINT, Default::default()),
             next_sequence: 1,
             memory_used: 0,
@@ -334,14 +355,7 @@ impl VectorizedMemTable {
         // so the `key.to_vec()`/`Box::from` cost is paid only when the key is
         // genuinely new (the `entry()` API consumes the key unconditionally).
         // For per-key aggregations this saves an allocation per repeat.
-        self.unsorted_entries.push(row_offset);
-        if let Some(slot) = self.unsorted_lookup.get_mut(key) {
-            slot.push(row_index);
-        } else {
-            let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
-            slot.push(row_index);
-            self.unsorted_lookup.insert(Box::from(key), slot);
-        }
+        self.index_insert(key, row_index);
 
         // Persistent hash index: always append so get() is O(1).
         // Also maintain the inline value cache for the latest version.
@@ -412,23 +426,8 @@ impl VectorizedMemTable {
         // Update memory tracking (approximate).
         self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
 
-        // Check if merge is needed.
-        //
-        // FRS-UNSORTED-FIXEDCAP (2026-06-01): the prior threshold grew with the
-        // memtable — `(sorted_count × ratio).clamp(1024, 4096)`. A live FRS-ITER-DIAG
-        // profile of q4 (cache-bypass, S3) showed `build_lazy_prefix_key_stream`
-        // spending 1–5.6 ms PER PROBE even when the prefix matched 0–1 keys and there
-        // were ZERO SST/resident tiers — because `prefix_scan_keys` linearly scans
-        // `unsorted_lookup` on EVERY read, ×16 shards, and the proportional threshold
-        // let that buffer grow 1024→4096 as the memtable filled. The Join thread
-        // (285K rec/s of probes) then saturated CPU and the source froze.
-        // A FIXED, small cap decouples the per-read scan from memtable size. The
-        // amortized WRITE cost is unchanged: a merge drains `cap` entries every `cap`
-        // inserts = O(log N)/insert regardless of `cap`. Env-tunable for A/B sweeps.
-        let merge_threshold = unsorted_merge_cap();
-        if self.unsorted_entries.len() > merge_threshold {
-            self.merge_unsorted_to_sorted();
-        }
+        // No unsorted→sorted merge: the lock-free `index` skiplist is always
+        // sorted, so every write is immediately scan-visible in O(log N).
 
         Ok(seq)
     }
@@ -487,67 +486,37 @@ impl VectorizedMemTable {
         Some(self.value_arena.get(self.value_spans[offset as usize]))
     }
 
-    /// Merges all unsorted entries into the sorted BTreeMap index.
-    ///
-    /// PERF (B2): drained `Vec<RowIndex>` allocations are recycled into
-    /// `rowindex_vec_pool` so subsequent `put()` calls re-use them instead of
-    /// allocating fresh ones. The `Box<[u8]>` keys are converted into
-    /// `Vec<u8>` for the sorted index — this is a one-time per-key conversion
-    /// (no per-row alloc on the hot path) and `Box<[u8]> -> Vec<u8>` is a
-    /// pointer/length copy without re-allocation.
-    /// FRS-PERF: drain the unsorted buffer into `sorted_index` only if it is
-    /// non-empty. Called on the prefix-scan path so `prefix_scan_keys` does an
-    /// O(log N + K) sorted-range scan instead of iterating the ENTIRE
-    /// `unsorted_lookup` HashMap on every call. Without this, q3's streaming
-    /// join (interleaved person writes → unsorted buffer, auction prefix-scans)
-    /// was O(reads × unsorted_size) ≈ O(N²) — the fix-#4 (`S3-MAPITER-FIX`)
-    /// regression that removed the prefix_index fast path and fell back to the
-    /// full-unsorted filter. Draining first keeps the scan cost proportional to
-    /// the result set, and the merge cost is amortized across writes.
+    /// Inserts one row version into the lock-free ordered index (lock-free
+    /// P3 phase 2). Each version is its own immutable [`SkipMap`] entry keyed by
+    /// [`InternalKey`] (user key ASC, seq DESC); `SkipMap::insert` takes `&self`
+    /// so this is callable without `&mut`. Two versions of the same user key
+    /// have distinct sequences → distinct keys → both retained (multi-version),
+    /// matching the prior per-key `Vec<RowIndex>` behaviour.
     #[inline]
-    pub fn merge_if_dirty(&mut self) {
-        if !self.unsorted_lookup.is_empty() {
-            self.merge_unsorted_to_sorted();
-        }
+    fn index_insert(&self, user_key: &[u8], row: RowIndex) {
+        self.index
+            .insert(InternalKey::new(Arc::from(user_key), row.sequence), row);
     }
 
-    pub fn merge_unsorted_to_sorted(&mut self) {
-        // Cap pool size to avoid unbounded memory retention if a workload
-        // produces a huge spike of unique keys then quiesces.
-        const POOL_CAP: usize = 4096;
+    /// No-op retained for API compatibility: the lock-free `index` skiplist is
+    /// always sorted, so there is no unsorted zone to drain. Callers on the
+    /// prefix-scan / freeze / snapshot paths used to invoke this to make the
+    /// scan see recent writes; with the skiplist every write is immediately
+    /// scan-visible, so nothing is required here.
+    #[inline]
+    pub fn merge_if_dirty(&mut self) {}
 
-        for (key, mut indices) in self.unsorted_lookup.drain() {
-            // FRS-SCAN-ARCKEY: probe by borrowed slice (`&*key` : `&[u8]`); on insert
-            // convert the `Box<[u8]>` straight into `Arc<[u8]>` via `Arc::from`, which
-            // REUSES the box's heap allocation (no copy) — strictly cheaper than the
-            // prior `key.into_vec()` + owned-Vec insert.
-            match self.sorted_index.get_mut(&*key) {
-                Some(entry) => {
-                    entry.append(&mut indices);
-                    entry.sort_by_key(|idx| Reverse(idx.sequence));
-                    // `indices` is now empty — return it to the pool.
-                    if self.rowindex_vec_pool.len() < POOL_CAP {
-                        self.rowindex_vec_pool.push(indices);
-                    }
-                }
-                None => {
-                    // Sort by sequence descending so newest is first.
-                    indices.sort_by_key(|idx| Reverse(idx.sequence));
-                    self.sorted_index.insert(Arc::from(key), indices);
-                }
-            }
-        }
-        self.sorted_count += self.unsorted_entries.len() as u32;
-        self.unsorted_entries.clear();
-    }
+    /// No-op retained for API compatibility (see [`Self::merge_if_dirty`]). The
+    /// skiplist replaces the prior unsorted→sorted merge entirely.
+    #[inline]
+    pub fn merge_unsorted_to_sorted(&mut self) {}
 
     /// Freezes this MemTable, making it immutable.
     ///
-    /// Before freezing, all unsorted data is merged into the sorted index.
-    /// After freezing, `put()` and `batch_insert()` will return an error.
+    /// After freezing, `put()` and `batch_insert()` will return an error. The
+    /// `index` skiplist is already fully sorted, so no merge is needed.
     pub fn freeze(&mut self) {
         if !self.frozen {
-            self.merge_unsorted_to_sorted();
             self.frozen = true;
         }
     }
@@ -669,18 +638,19 @@ impl VectorizedMemTable {
             Field::new("op_type", DataType::UInt8, false),
         ]));
 
-        // Collect all rows in sorted order: key ASC, sequence DESC. Skip rows
-        // newer than `max_seq` (the pinned snapshot cut) when bounded.
+        // Collect all rows in sorted order: key ASC, sequence DESC. The `index`
+        // skiplist iterates in exactly that order (InternalKey ordering), one
+        // entry per version. Skip rows newer than `max_seq` (the pinned
+        // snapshot cut) when bounded.
         let mut sorted_rows: Vec<(u32, u64)> = Vec::new();
-        for indices in self.sorted_index.values() {
-            for idx in indices {
-                if let Some(s) = max_seq {
-                    if idx.sequence > s {
-                        continue;
-                    }
+        for entry in self.index.iter() {
+            let idx = entry.value();
+            if let Some(s) = max_seq {
+                if idx.sequence > s {
+                    continue;
                 }
-                sorted_rows.push((idx.offset, idx.sequence));
             }
+            sorted_rows.push((idx.offset, idx.sequence));
         }
 
         // Build batches.
@@ -826,39 +796,39 @@ impl VectorizedMemTable {
             }
         };
         let effective_upper: Option<&[u8]> = upper.or(derived_upper.as_deref());
-        // sorted_index is already sorted — range query is O(log N + K).
-        // PR-C5-H2: range over `&[u8]` bounds directly. `BTreeMap<Vec<u8>, _>`
-        // accepts borrowed slices via the `Borrow<[u8]>` impl on `Vec<u8>`,
-        // so we avoid the `lower.to_vec()..hi.to_vec()` allocations entirely
-        // (hot on Q11/Q12 when MapStateCache is bypassed — one alloc pair
-        // per prefix_scan_keys call).
+        self.collect_distinct_keys_in_range(lower, effective_upper, &mut keys);
+        keys
+    }
+
+    /// Shared helper for [`Self::prefix_scan_keys`] / [`Self::range_scan_keys`]:
+    /// appends the DISTINCT user keys in `[lower, upper)` to `keys`, in
+    /// ascending order. The `index` skiplist iterates (user key ASC, seq DESC),
+    /// so consecutive entries for the same user key collapse to one output key
+    /// — no post-scan sort/dedup needed. Each emitted key is an `Arc::clone`
+    /// (refcount bump, no byte copy) of the skiplist node's `user_key`,
+    /// preserving the FRS-SCAN-ARCKEY zero-copy-key property. Constructing the
+    /// two range-bound keys costs one `Arc` per scan, not per key.
+    #[inline]
+    fn collect_distinct_keys_in_range(
+        &self,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        keys: &mut Vec<Arc<[u8]>>,
+    ) {
         use std::ops::Bound;
-        let range_iter = match effective_upper {
-            Some(hi) => self
-                .sorted_index
-                .range::<[u8], _>((Bound::Included(lower), Bound::Excluded(hi))),
-            None => self
-                .sorted_index
-                .range::<[u8], _>((Bound::Included(lower), Bound::Unbounded)),
+        let start = InternalKey::range_start(Arc::from(lower));
+        let end = match upper {
+            Some(hi) => Bound::Excluded(InternalKey::range_start(Arc::from(hi))),
+            None => Bound::Unbounded,
         };
-        for (key, _) in range_iter {
-            // FRS-SCAN-ARCKEY: refcount bump, not heap alloc + memcpy (key is Arc<[u8]>).
-            keys.push(Arc::clone(key));
-        }
-        // Merge unsorted entries (already checked for prefix match)
-        let prev_len = keys.len();
-        for key in self.unsorted_lookup.keys() {
-            let k: &[u8] = key;
-            if k >= lower && effective_upper.is_none_or(|hi| k < hi) {
-                keys.push(Arc::<[u8]>::from(k));
+        let mut last: Option<Arc<[u8]>> = None;
+        for entry in self.index.range((Bound::Included(start), end)) {
+            let uk = &entry.key().user_key;
+            if last.as_deref() != Some(&**uk) {
+                keys.push(Arc::clone(uk));
+                last = Some(Arc::clone(uk));
             }
         }
-        // Only sort+dedup if we added unsorted entries
-        if keys.len() > prev_len {
-            keys.sort();
-            keys.dedup();
-        }
-        keys
     }
 
     /// B-R7-NEW-H1: range-bounded variant of [`Self::prefix_scan_keys`] used
@@ -871,31 +841,9 @@ impl VectorizedMemTable {
     /// the sorted_index range so the `upper` bound is enforced exactly.
     #[inline]
     pub fn range_scan_keys(&self, lower: &[u8], upper: Option<&[u8]>) -> Vec<Arc<[u8]>> {
-        use std::ops::Bound;
+        // Range semantics: honour `upper` exactly (no prefix derivation).
         let mut keys: Vec<Arc<[u8]>> = Vec::new();
-        let range_iter = match upper {
-            Some(hi) => self
-                .sorted_index
-                .range::<[u8], _>((Bound::Included(lower), Bound::Excluded(hi))),
-            None => self
-                .sorted_index
-                .range::<[u8], _>((Bound::Included(lower), Bound::Unbounded)),
-        };
-        for (key, _) in range_iter {
-            // FRS-SCAN-ARCKEY: refcount bump, not heap alloc + memcpy (key is Arc<[u8]>).
-            keys.push(Arc::clone(key));
-        }
-        let prev_len = keys.len();
-        for key in self.unsorted_lookup.keys() {
-            let k: &[u8] = key;
-            if k >= lower && upper.is_none_or(|hi| k < hi) {
-                keys.push(Arc::<[u8]>::from(k));
-            }
-        }
-        if keys.len() > prev_len {
-            keys.sort();
-            keys.dedup();
-        }
+        self.collect_distinct_keys_in_range(lower, upper, &mut keys);
         keys
     }
 
@@ -910,41 +858,30 @@ impl VectorizedMemTable {
         upper: Option<&[u8]>,
         read_sequence: u64,
     ) -> Vec<ScanRow> {
-        use std::collections::BTreeMap;
+        use std::ops::Bound;
 
-        // Merge sorted + unsorted into a temporary BTreeMap so callers see a
-        // single consistent ordering even when writes have not been folded
-        // into the sorted index yet.
-        let mut combined: BTreeMap<&[u8], Vec<RowIndex>> = BTreeMap::new();
-        for (k, idxs) in self.sorted_index.iter() {
-            // FRS-SCAN-ARCKEY: `k` is `&Arc<[u8]>`; deref to `&[u8]` for the temp map.
-            combined.insert(&**k, idxs.clone());
-        }
-        for (k, idxs) in self.unsorted_lookup.iter() {
-            // PERF (B2): `k` is `Box<[u8]>` — deref to `&[u8]` directly.
-            combined
-                .entry(&**k)
-                .and_modify(|v| v.extend_from_slice(idxs))
-                .or_insert_with(|| idxs.clone());
-        }
-
-        let mut out = Vec::new();
-        let range: Box<dyn Iterator<Item = (&&[u8], &Vec<RowIndex>)>> = match upper {
-            Some(hi) => Box::new(combined.range(lower..hi)),
-            None => Box::new(combined.range(lower..)),
+        // The `index` skiplist iterates [lower, upper) in (key ASC, seq DESC)
+        // order with one entry per version — exactly the order this returns —
+        // so no temporary merge/sort is needed. Emit each version visible at
+        // `read_sequence`.
+        let start = InternalKey::range_start(Arc::from(lower));
+        let end = match upper {
+            Some(hi) => Bound::Excluded(InternalKey::range_start(Arc::from(hi))),
+            None => Bound::Unbounded,
         };
-
-        for (key, indices) in range {
-            // Sort by sequence DESC so the freshest version is first.
-            let mut sorted = indices.clone();
-            sorted.sort_by_key(|idx| std::cmp::Reverse(idx.sequence));
-            for idx in sorted {
-                if idx.sequence > read_sequence {
-                    continue;
-                }
-                let v = self.value_at(idx.offset).map(|s| s.to_vec());
-                out.push((key.to_vec(), v, idx.sequence, idx.op_type));
+        let mut out = Vec::new();
+        for entry in self.index.range((Bound::Included(start), end)) {
+            let idx = entry.value();
+            if idx.sequence > read_sequence {
+                continue;
             }
+            let v = self.value_at(idx.offset).map(|s| s.to_vec());
+            out.push((
+                entry.key().user_key.to_vec(),
+                v,
+                idx.sequence,
+                idx.op_type,
+            ));
         }
         out
     }
@@ -1225,14 +1162,7 @@ impl VectorizedMemTable {
             // skips the `Box::from(key)` allocation when the same key appears
             // multiple times within a single batch (a common state-update
             // pattern in streaming workloads).
-            self.unsorted_entries.push(row_offset);
-            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
-                slot.push(row_index);
-            } else {
-                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
-                slot.push(row_index);
-                self.unsorted_lookup.insert(Box::from(key), slot);
-            }
+            self.index_insert(key, row_index);
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
@@ -1292,10 +1222,7 @@ impl VectorizedMemTable {
         }
 
         // Check merge threshold.
-        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
-        if self.unsorted_entries.len() > merge_threshold {
-            self.merge_unsorted_to_sorted();
-        }
+        // No unsorted→sorted merge: the lock-free `index` skiplist is always sorted.
 
         Ok(count)
     }
@@ -1381,14 +1308,7 @@ impl VectorizedMemTable {
                 op_type,
             };
 
-            self.unsorted_entries.push(row_offset);
-            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
-                slot.push(row_index);
-            } else {
-                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
-                slot.push(row_index);
-                self.unsorted_lookup.insert(Box::from(key), slot);
-            }
+            self.index_insert(key, row_index);
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
@@ -1439,10 +1359,7 @@ impl VectorizedMemTable {
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
 
-        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
-        if self.unsorted_entries.len() > merge_threshold {
-            self.merge_unsorted_to_sorted();
-        }
+        // No unsorted→sorted merge: the lock-free `index` skiplist is always sorted.
         Ok(count)
     }
 
@@ -1535,14 +1452,7 @@ impl VectorizedMemTable {
                 op_type,
             };
 
-            self.unsorted_entries.push(row_offset);
-            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
-                slot.push(row_index);
-            } else {
-                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
-                slot.push(row_index);
-                self.unsorted_lookup.insert(Box::from(key), slot);
-            }
+            self.index_insert(key, row_index);
 
             // Persistent hash index: always append so get() is O(1).
             // B-R12-H1: capture `is_new_latest` for prefix_index gate.
@@ -1588,10 +1498,7 @@ impl VectorizedMemTable {
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
 
-        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
-        if self.unsorted_entries.len() > merge_threshold {
-            self.merge_unsorted_to_sorted();
-        }
+        // No unsorted→sorted merge: the lock-free `index` skiplist is always sorted.
         Ok(count)
     }
 
@@ -1768,14 +1675,7 @@ impl VectorizedMemTable {
                 sequence: seq,
                 op_type,
             };
-            self.unsorted_entries.push(row_offset);
-            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
-                slot.push(row_index);
-            } else {
-                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
-                slot.push(row_index);
-                self.unsorted_lookup.insert(Box::from(key), slot);
-            }
+            self.index_insert(key, row_index);
 
             // hash_index + inline-cache (B11-H1 gated)
             let is_new_latest;
@@ -1819,10 +1719,7 @@ impl VectorizedMemTable {
             self.memory_used += key.len() + value_opt.map(|v| v.len()).unwrap_or(0) + 8 + 1 + 48;
         }
 
-        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
-        if self.unsorted_entries.len() > merge_threshold {
-            self.merge_unsorted_to_sorted();
-        }
+        // No unsorted→sorted merge: the lock-free `index` skiplist is always sorted.
         Ok(count)
     }
 
@@ -1958,10 +1855,8 @@ impl VectorizedMemTable {
         // 4. op_types: single memcpy of the validated UInt8 buffer.
         self.op_types.extend_from_slice(op_values);
 
-        // 5. unsorted_lookup + unsorted_entries: per-row hash + insert.
-        //    Hot path uses `get_mut` so repeated keys within the batch don't
-        //    re-allocate the Box<[u8]> key.
-        self.unsorted_entries.reserve(count);
+        // 5. ordered index + hash index: per-row insert. The skiplist insert
+        //    keeps each version sorted-visible immediately (no merge step).
         for i in 0..count {
             let row_offset = base_offset + i as u32;
             let seq = base_seq + i as u64;
@@ -1974,14 +1869,7 @@ impl VectorizedMemTable {
                 sequence: seq,
                 op_type,
             };
-            self.unsorted_entries.push(row_offset);
-            if let Some(slot) = self.unsorted_lookup.get_mut(key) {
-                slot.push(row_index);
-            } else {
-                let mut slot = self.rowindex_vec_pool.pop().unwrap_or_default();
-                slot.push(row_index);
-                self.unsorted_lookup.insert(Box::from(key), slot);
-            }
+            self.index_insert(key, row_index);
 
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
@@ -2041,10 +1929,7 @@ impl VectorizedMemTable {
         }
 
         // 6. Merge threshold (same logic as batch_insert).
-        let merge_threshold = unsorted_merge_cap(); // FRS-UNSORTED-FIXEDCAP: see put()
-        if self.unsorted_entries.len() > merge_threshold {
-            self.merge_unsorted_to_sorted();
-        }
+        // No unsorted→sorted merge: the lock-free `index` skiplist is always sorted.
 
         Ok(count)
     }
@@ -2108,6 +1993,48 @@ mod tests {
             max_size: 1024 * 1024, // 1MB
             unsorted_merge_ratio: 0.25,
         }
+    }
+
+    #[test]
+    fn internal_key_orders_user_key_asc_then_seq_desc() {
+        let ik = |k: &[u8], s: u64| InternalKey::new(Arc::from(k), s);
+
+        // Different user keys: ordered purely lexicographically, regardless of seq.
+        assert!(ik(b"a", 0) < ik(b"b", u64::MAX));
+        assert!(ik(b"a", u64::MAX) < ik(b"b", 0));
+        // A key is ordered before another key that has it as a strict prefix
+        // (pure lexicographic on the user_key field — no packed-suffix hazard).
+        assert!(ik(b"abc", 0) < ik(b"abcd", u64::MAX));
+        assert!(ik(b"abc", u64::MAX) < ik(b"abcd", 0));
+
+        // Same user key: HIGHER sequence sorts FIRST (newest version first).
+        assert!(ik(b"k", 9) < ik(b"k", 8));
+        assert!(ik(b"k", u64::MAX) < ik(b"k", 0));
+
+        // range_start is the smallest InternalKey for its user key, so a forward
+        // range from it includes every version of that key (incl. seq 0).
+        assert!(InternalKey::range_start(Arc::from(b"k".as_slice())) <= ik(b"k", u64::MAX));
+        assert!(InternalKey::range_start(Arc::from(b"k".as_slice())) < ik(b"k", 0));
+
+        // Equality requires both fields to match.
+        assert_eq!(ik(b"k", 5), ik(b"k", 5));
+        assert_ne!(ik(b"k", 5), ik(b"k", 6));
+
+        // A full sort of mixed entries yields the (key ASC, seq DESC) order a
+        // forward skiplist traversal must produce for flush.
+        let mut v = vec![ik(b"b", 1), ik(b"a", 1), ik(b"a", 3), ik(b"b", 9), ik(b"a", 2)];
+        v.sort();
+        let got: Vec<(&[u8], u64)> = v.iter().map(|i| (&*i.user_key, i.sequence)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"a".as_slice(), 3),
+                (b"a".as_slice(), 2),
+                (b"a".as_slice(), 1),
+                (b"b".as_slice(), 9),
+                (b"b".as_slice(), 1),
+            ]
+        );
     }
 
     #[test]
@@ -2304,23 +2231,21 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_unsorted_to_sorted() {
+    fn put_makes_keys_immediately_sorted_visible() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"c", Some(b"3"), 1).unwrap();
         mt.put(b"a", Some(b"1"), 1).unwrap();
         mt.put(b"b", Some(b"2"), 1).unwrap();
 
-        assert_eq!(mt.unsorted_entries.len(), 3);
-        assert_eq!(mt.sorted_count, 0);
+        // The lock-free `index` skiplist is always sorted — every write is
+        // immediately scan-visible in ascending order, with NO merge step.
+        let keys = mt.range_scan_keys(b"", None);
+        let got: Vec<&[u8]> = keys.iter().map(|k| &**k).collect();
+        assert_eq!(got, vec![b"a".as_slice(), b"b", b"c"]);
 
+        // merge_unsorted_to_sorted is now a no-op and changes nothing.
         mt.merge_unsorted_to_sorted();
-
-        assert_eq!(mt.unsorted_entries.len(), 0);
-        assert_eq!(mt.sorted_count, 3);
-        // Keys should be in BTreeMap
-        assert!(mt.sorted_index.contains_key(b"a".as_slice()));
-        assert!(mt.sorted_index.contains_key(b"b".as_slice()));
-        assert!(mt.sorted_index.contains_key(b"c".as_slice()));
+        assert_eq!(mt.range_scan_keys(b"", None).len(), 3);
     }
 
     #[test]
@@ -2329,13 +2254,13 @@ mod tests {
         mt.put(b"key", Some(b"v1"), 1).unwrap(); // seq=1
         mt.put(b"key", Some(b"v2"), 1).unwrap(); // seq=2
 
-        mt.merge_unsorted_to_sorted();
-
-        let indices = mt.sorted_index.get(b"key".as_slice()).unwrap();
-        assert_eq!(indices.len(), 2);
-        // Newest first
-        assert_eq!(indices[0].sequence, 2);
-        assert_eq!(indices[1].sequence, 1);
+        // Both versions retained; a range scan returns them newest-first
+        // (key ASC, seq DESC) directly from the skiplist — no merge needed.
+        let rows = mt.collect_range_entries(b"", None, u64::MAX);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, b"key");
+        assert_eq!(rows[0].2, 2); // newest sequence first
+        assert_eq!(rows[1].2, 1);
     }
 
     #[test]
@@ -2629,14 +2554,17 @@ mod tests {
     }
 
     #[test]
-    fn test_freeze_merges_unsorted() {
+    fn test_freeze_keeps_keys_sorted_visible() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"c", Some(b"3"), 1).unwrap();
         mt.put(b"a", Some(b"1"), 1).unwrap();
-        assert!(!mt.unsorted_entries.is_empty());
+        // Keys are sorted-visible before AND after freeze (skiplist is always
+        // sorted; freeze adds no merge).
+        assert_eq!(mt.range_scan_keys(b"", None).len(), 2);
         mt.freeze();
-        assert!(mt.unsorted_entries.is_empty());
-        assert!(mt.sorted_index.contains_key(b"a".as_slice()));
+        let keys = mt.range_scan_keys(b"", None);
+        let got: Vec<&[u8]> = keys.iter().map(|k| &**k).collect();
+        assert_eq!(got, vec![b"a".as_slice(), b"c"]);
     }
 
     #[test]
@@ -2912,16 +2840,12 @@ mod tests {
         let ops = vec![0u8; 1000];
 
         mt.batch_insert(&key_refs, &val_refs, &ops).unwrap();
-        // FRS-UNSORTED-FIXEDCAP: with the fixed merge cap (default 256), the
-        // 1000-key batch crosses the cap and merges into `sorted_index`, so we
-        // no longer assert "all in unsorted_lookup / sorted_count==0". The real
-        // invariant — every one of the 1000 unique keys round-trips through
-        // batch_insert + (now also) merge + get — is asserted below, with the
-        // total live key count split across both tiers.
+        // The real invariant: every one of the 1000 unique keys is live and
+        // sorted-visible in the skiplist index, and round-trips through get().
         assert_eq!(
-            mt.unsorted_lookup.len() + mt.sorted_count as usize,
+            mt.range_scan_keys(b"", None).len(),
             1000,
-            "all 1000 unique keys must be live across unsorted+sorted"
+            "all 1000 unique keys must be sorted-visible in the index"
         );
 
         for i in 0..1000u32 {
@@ -2932,17 +2856,13 @@ mod tests {
         }
     }
 
-    /// Repeated keys exercise the `get_mut`-hits-existing-slot path AND
-    /// confirm multi-version semantics still work.
+    /// Repeated keys confirm multi-version semantics: N writes to the same key
+    /// retain all N versions in the skiplist (one entry per version), and
+    /// `get()` returns the latest.
     #[test]
-    fn test_b2_unsorted_lookup_repeated_keys_no_realloc() {
+    fn test_repeated_keys_retain_all_versions() {
         let mut mt = VectorizedMemTable::new(test_config());
-        // FRS-UNSORTED-FIXEDCAP: 20 distinct keys × 10 rounds = 200 inserts,
-        // kept under the default merge cap (256) so NO merge fires and the
-        // in-`unsorted_lookup` multi-version `get_mut`-same-slot path is
-        // exercised exactly as before. (Above the cap, versions are correctly
-        // drained into `sorted_index` — covered by the merge tests + the
-        // final `get()` latest-version assertion here.)
+        // 20 distinct keys × 10 rounds = 200 inserts = 200 versions.
         for round in 0..10u32 {
             for i in 0..20u32 {
                 let k = format!("rep_{:03}", i);
@@ -2950,13 +2870,15 @@ mod tests {
                 mt.put(k.as_bytes(), Some(v.as_bytes()), 1).unwrap();
             }
         }
-        // 200 inserts but only 20 distinct keys in the lookup.
-        assert_eq!(mt.unsorted_lookup.len(), 20);
-        // Each lookup slot should hold all 10 versions.
+        // 20 distinct keys, each with 10 versions → 200 rows across the range.
+        assert_eq!(mt.range_scan_keys(b"", None).len(), 20);
+        assert_eq!(mt.collect_range_entries(b"", None, u64::MAX).len(), 200);
+        // Each key's versions are present and newest-first within the key.
         for i in 0..20u32 {
             let k = format!("rep_{:03}", i);
-            let slot = mt.unsorted_lookup.get(k.as_bytes()).unwrap();
-            assert_eq!(slot.len(), 10, "key {} should have 10 versions", k);
+            let rows = mt.collect_range_entries(k.as_bytes(), None, u64::MAX);
+            let kvers: Vec<&ScanRow> = rows.iter().filter(|r| r.0 == k.as_bytes()).collect();
+            assert_eq!(kvers.len(), 10, "key {} should have 10 versions", k);
         }
         // Latest version must come back from get().
         for i in 0..20u32 {
@@ -2967,77 +2889,24 @@ mod tests {
         }
     }
 
-    /// Merge → re-fill cycle should recycle Vec<RowIndex> allocations into
-    /// the pool. Verifies the pool grows after a merge and shrinks back as
-    /// new puts consume it.
-    #[test]
-    fn test_b2_rowindex_vec_pool_recycle_round_trip() {
-        let mut mt = VectorizedMemTable::new(test_config());
-        for i in 0..50u32 {
-            let k = format!("k_{:03}", i);
-            mt.put(k.as_bytes(), Some(b"v"), 1).unwrap();
-        }
-        assert_eq!(mt.unsorted_lookup.len(), 50);
-        assert_eq!(mt.rowindex_vec_pool.len(), 0);
-
-        // Force merge; all 50 keys are first-time-seen so they go into
-        // sorted_index via insert (NOT append) → no Vec recycled yet.
-        mt.merge_unsorted_to_sorted();
-        assert_eq!(mt.unsorted_lookup.len(), 0);
-        assert_eq!(mt.sorted_count, 50);
-        assert_eq!(
-            mt.rowindex_vec_pool.len(),
-            0,
-            "first merge inserts into sorted_index, no recycled vecs"
-        );
-
-        // Re-write the SAME 50 keys + then merge again → these collide with
-        // existing sorted_index entries, so the unsorted Vecs are appended &
-        // recycled into the pool.
-        for i in 0..50u32 {
-            let k = format!("k_{:03}", i);
-            mt.put(k.as_bytes(), Some(b"v2"), 1).unwrap();
-        }
-        mt.merge_unsorted_to_sorted();
-        assert_eq!(
-            mt.rowindex_vec_pool.len(),
-            50,
-            "second merge collides on every key — all 50 vecs recycled"
-        );
-
-        // Next put should consume from the pool.
-        let pool_before = mt.rowindex_vec_pool.len();
-        mt.put(b"new_key", Some(b"vv"), 1).unwrap();
-        assert_eq!(
-            mt.rowindex_vec_pool.len(),
-            pool_before - 1,
-            "put on a brand-new key should pop one Vec from the pool"
-        );
-
-        // Correctness sanity after recycling.
-        let r = mt.get(b"new_key", u64::MAX).unwrap().unwrap();
-        assert_eq!(r.value, Some(b"vv".to_vec()));
-    }
-
-    /// Multi-version semantics survive a merge cycle with the new
-    /// Box<[u8]> -> Vec<u8> key conversion.
+    /// Multi-version MVCC: re-writing the same key keeps every version sorted
+    /// (key ASC, seq DESC) in the skiplist, and snapshot reads at each
+    /// sequence boundary see the right version.
     // TODO(mvcc-snapshot-read): same root cause as test_get_respects_read_sequence.
     #[test]
     #[ignore = "pre-existing MVCC inline-value bug; tracked separately"]
-    fn test_b2_merge_preserves_multi_version_after_box_to_vec() {
+    fn test_multi_version_mvcc_snapshot_reads() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"k", Some(b"v1"), 1).unwrap(); // seq=1
         mt.put(b"k", Some(b"v2"), 1).unwrap(); // seq=2
-        mt.merge_unsorted_to_sorted();
-        mt.put(b"k", Some(b"v3"), 1).unwrap(); // seq=3 (post-merge)
-        mt.merge_unsorted_to_sorted();
+        mt.put(b"k", Some(b"v3"), 1).unwrap(); // seq=3
 
-        let entries = mt.sorted_index.get(b"k".as_slice()).unwrap();
-        assert_eq!(entries.len(), 3);
+        let rows = mt.collect_range_entries(b"k", None, u64::MAX);
+        assert_eq!(rows.len(), 3);
         // Sorted DESC by sequence.
-        assert_eq!(entries[0].sequence, 3);
-        assert_eq!(entries[1].sequence, 2);
-        assert_eq!(entries[2].sequence, 1);
+        assert_eq!(rows[0].2, 3);
+        assert_eq!(rows[1].2, 2);
+        assert_eq!(rows[2].2, 1);
 
         // Read at each sequence boundary.
         assert_eq!(
@@ -3318,14 +3187,14 @@ mod tests {
 
     // === Hash index O(1) point lookup tests ===
 
-    /// Validates that the hash_index gives correct results after
-    /// merge_unsorted_to_sorted — the key property that makes this an
-    /// improvement over the old get() which fell back to BTreeMap.
+    /// Validates that the hash_index gives correct point-lookup results for a
+    /// large key set, and that the skiplist index holds every key sorted —
+    /// the two indexes stay consistent.
     #[test]
-    fn test_hash_index_point_lookup_survives_merge() {
+    fn test_hash_index_point_lookup_consistent_with_index() {
         let mut mt = VectorizedMemTable::new(MemTableConfig {
             max_size: 64 * 1024 * 1024,
-            unsorted_merge_ratio: 1024.0, // suppress auto-merge
+            unsorted_merge_ratio: 1024.0,
         });
         // Insert 10k keys.
         for i in 0..10_000u32 {
@@ -3333,10 +3202,8 @@ mod tests {
             let v = format!("hv_{:06}", i);
             mt.put(k.as_bytes(), Some(v.as_bytes()), 1).unwrap();
         }
-        // Force merge — moves everything from unsorted_lookup to sorted_index.
-        mt.merge_unsorted_to_sorted();
-        assert!(mt.unsorted_lookup.is_empty());
-        assert_eq!(mt.sorted_count, 10_000);
+        // All 10k keys are sorted-visible in the skiplist index.
+        assert_eq!(mt.range_scan_keys(b"", None).len(), 10_000);
 
         // hash_index must still serve all 10k keys at O(1).
         for i in 0..10_000u32 {

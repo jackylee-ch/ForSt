@@ -53,6 +53,11 @@ arrow = { version = "54", features = ["ffi"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "fs", "sync", "macros"] }
 tracing = "0.1"
 arc-swap = "1"
+# Lock-free ordered index for the memtable (lock-free track P3 phase 2):
+# crossbeam-skiplist provides a concurrent, lock-free SkipMap with
+# crossbeam-epoch reclamation — the RocksDB InlineSkipList analogue that lets
+# reads traverse and writes insert without a shared lock.
+crossbeam-skiplist = "0.1"
 
 # Object-storage / unified I/O (S3, GCS, Azure, local FS, memory)
 # `layers-blocking` is required so OpendalFileSystem can serve sync FileSystem
