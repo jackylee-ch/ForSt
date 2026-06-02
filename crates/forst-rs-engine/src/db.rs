@@ -294,7 +294,11 @@ pub struct DbImpl {
     version_set: Arc<VersionSetImpl>,
     /// Open SST readers keyed by file number. Installed after flush /
     /// compaction and dropped after files are deleted from the Version.
-    sst_readers: RwLock<HashMap<FileNumber, Arc<SstReaderImpl>>>,
+    // FRS-LOCKFREE (2026-06-02): lock-free read view. Reads (the hot per-block
+    // path) `.load()` an `Arc<HashMap>` with no lock; writers publish a new map
+    // via `.rcu()` (clone-on-write; inserts/removes are rare — once per SST
+    // open / compaction-retire). Removes the RwLock read on every block read.
+    sst_readers: arc_swap::ArcSwap<HashMap<FileNumber, Arc<SstReaderImpl>>>,
     /// Tracks SST files pinned by active checkpoints so concurrent
     /// compactions do not delete them prematurely.
     deletion_guard: Arc<FileDeletionGuard>,
@@ -506,7 +510,7 @@ impl DbImpl {
             cfs: RwLock::new(HashMap::new()),
             cf_name_to_id: RwLock::new(HashMap::new()),
             version_set: Arc::new(VersionSetImpl::new()),
-            sst_readers: RwLock::new(HashMap::new()),
+            sst_readers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             sequence_number: AtomicU64::new(0),
@@ -1270,10 +1274,13 @@ impl DbImpl {
             match self.version_set.apply(&edit) {
                 Ok(_) => {
                     {
-                        let mut cache = self.sst_readers.write().expect("lock poisoned");
-                        for (_, file_number) in &deleted_files {
-                            cache.remove(file_number);
-                        }
+                        self.sst_readers.rcu(|cur| {
+                            let mut next = (**cur).clone();
+                            for (_, file_number) in &deleted_files {
+                                next.remove(file_number);
+                            }
+                            std::sync::Arc::new(next)
+                        });
                     }
                     for (_, file_number) in &deleted_files {
                         self.delete_file_guarded(*file_number);
@@ -1613,7 +1620,7 @@ impl DbImpl {
         // read path retry via `get_or_open_sst_reader` on first
         // access. This is safe because that helper opens lazily and
         // caches on success.
-        let mut readers_map = self.sst_readers.write().expect("lock poisoned");
+        let mut readers_map = (**self.sst_readers.load()).clone();
         for (file_number, dest, _meta) in &new_files {
             match self.fs.open_random_access_file(dest) {
                 Ok(rac) => match SstReaderImpl::open(rac) {
@@ -1639,7 +1646,7 @@ impl DbImpl {
                 }
             }
         }
-        drop(readers_map);
+        self.sst_readers.store(std::sync::Arc::new(readers_map));
 
         // (H-R4-2: the engine seq bump moved BEFORE `version_set.apply`
         // above, so this position is now a no-op. Keeping the call here
@@ -3636,17 +3643,20 @@ impl DbImpl {
             self.fs.await_upload(&output_path)?;
             let rac = self.fs.open_random_access_file(&output_path)?;
             let reader = Arc::new(SstReaderImpl::open(rac)?);
-            self.sst_readers
-                .write()
-                .expect("lock poisoned")
-                .insert(meta.file_number, reader);
+            let inserted = reader;
+            self.sst_readers.rcu(|cur| {
+                let mut next = (**cur).clone();
+                next.insert(meta.file_number, std::sync::Arc::clone(&inserted));
+                std::sync::Arc::new(next)
+            });
         }
-        {
-            let mut cache = self.sst_readers.write().expect("lock poisoned");
+        self.sst_readers.rcu(|cur| {
+            let mut next = (**cur).clone();
             for (_, file_number) in &edit.deleted_files {
-                cache.remove(file_number);
+                next.remove(file_number);
             }
-        }
+            std::sync::Arc::new(next)
+        });
         // R32-H2: route deletions through `delete_file_guarded` so any
         // outstanding pins (e.g. an in-flight `create_checkpoint` or
         // `create_incremental_checkpoint`) defer the unlink to
@@ -4321,7 +4331,7 @@ impl DbImpl {
             cfs: RwLock::new(HashMap::new()),
             cf_name_to_id: RwLock::new(HashMap::new()),
             version_set,
-            sst_readers: RwLock::new(HashMap::new()),
+            sst_readers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             // D-R7-H1: A-R6-H3 patched the VersionSet seed but missed
@@ -5151,17 +5161,20 @@ impl DbImpl {
             self.fs.await_upload(&output_path)?;
             let rac = self.fs.open_random_access_file(&output_path)?;
             let reader = Arc::new(SstReaderImpl::open(rac)?);
-            self.sst_readers
-                .write()
-                .expect("lock poisoned")
-                .insert(meta.file_number, reader);
+            let inserted = reader;
+            self.sst_readers.rcu(|cur| {
+                let mut next = (**cur).clone();
+                next.insert(meta.file_number, std::sync::Arc::clone(&inserted));
+                std::sync::Arc::new(next)
+            });
         }
-        {
-            let mut cache = self.sst_readers.write().expect("lock poisoned");
+        self.sst_readers.rcu(|cur| {
+            let mut next = (**cur).clone();
             for (_, file_number) in &edit.deleted_files {
-                cache.remove(file_number);
+                next.remove(file_number);
             }
-        }
+            std::sync::Arc::new(next)
+        });
         for (_, file_number) in &edit.deleted_files {
             self.delete_file_guarded(*file_number);
         }
@@ -6165,10 +6178,12 @@ impl DbImpl {
         match self.fs.open_random_access_file(&path) {
             Ok(rac) => match SstReaderImpl::open(rac) {
                 Ok(reader) => {
-                    self.sst_readers
-                        .write()
-                        .expect("lock poisoned")
-                        .insert(meta.file_number, Arc::new(reader));
+                    let inserted = Arc::new(reader);
+                    self.sst_readers.rcu(|cur| {
+                        let mut next = (**cur).clone();
+                        next.insert(meta.file_number, std::sync::Arc::clone(&inserted));
+                        std::sync::Arc::new(next)
+                    });
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -7112,7 +7127,7 @@ impl DbImpl {
             .into_iter()
             .map(|e| e.file_number)
             .collect();
-        let readers = self.sst_readers.read().expect("lock poisoned");
+        let readers = self.sst_readers.load();
 
         // Collect overlapping, non-shadowed file numbers not yet reader-cached.
         let mut to_prefetch: Vec<PathBuf> = Vec::new();
@@ -7473,7 +7488,7 @@ impl DbImpl {
 
     fn get_or_open_sst_reader(&self, meta: &SstFileMeta) -> ForstResult<Arc<SstReaderImpl>> {
         {
-            let cache = self.sst_readers.read().expect("lock poisoned");
+            let cache = self.sst_readers.load();
             if let Some(r) = cache.get(&meta.file_number) {
                 return Ok(r.clone());
             }
@@ -7544,12 +7559,22 @@ impl DbImpl {
 
         // Re-acquire the write lock only to insert; double-check a racing
         // inserter that opened the same file while we were doing lock-free I/O.
-        let mut cache = self.sst_readers.write().expect("lock poisoned");
-        if let Some(r) = cache.get(&meta.file_number) {
-            return Ok(r.clone());
-        }
-        cache.insert(meta.file_number, reader.clone());
-        Ok(reader)
+        // FRS-LOCKFREE: RCU insert with double-check — a racing inserter may have
+        // cached the same file while we did the lock-free open. The closure is
+        // pure (clone-mutate-publish) and safe to re-run on CAS retry; `resolved`
+        // ends as the winning reader (ours, or the racer's).
+        let mut resolved = reader.clone();
+        self.sst_readers.rcu(|cur| {
+            if let Some(existing) = cur.get(&meta.file_number) {
+                resolved = existing.clone();
+                std::sync::Arc::clone(cur)
+            } else {
+                let mut next = (**cur).clone();
+                next.insert(meta.file_number, std::sync::Arc::clone(&reader));
+                std::sync::Arc::new(next)
+            }
+        });
+        Ok(resolved)
     }
 
     fn apply_merge_operator(
@@ -9874,8 +9899,11 @@ mod tests {
         let meta = db.version_set.current().l0_files()[0].clone();
         assert_eq!(meta.cf_id, DEFAULT_CF_ID);
         {
-            let mut readers = db.sst_readers.write().unwrap();
-            readers.remove(&meta.file_number);
+            db.sst_readers.rcu(|cur| {
+                let mut next = (**cur).clone();
+                next.remove(&meta.file_number);
+                std::sync::Arc::new(next)
+            });
         }
         let mut forged = meta.clone();
         forged.cf_id = ColumnFamilyId(0xDEAD_BEEF);
