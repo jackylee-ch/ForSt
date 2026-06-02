@@ -5413,14 +5413,20 @@ impl DbImpl {
                 cursor: active_cursor,
             });
         }
+        // FRS-ITER-DIAG (2026-06-02): tier sub-split — active vs immutable-loop
+        // vs resident, plus n_imm count, to localize the empty-probe prep cost.
+        let active_us: u128 = diag_start.map(|s| s.elapsed().as_micros()).unwrap_or(0);
+        let mut n_imm: usize = 0;
         // Tier 2: immutable memtables. Same C9-H1 treatment: lazy
         // per-shard cursor instead of eager global sort.
         for imm in cf_data.imm_memtables() {
+            n_imm += 1;
             let imm_cursor = imm.prefix_scan_cursor(prefix, upper_slice);
             if !imm_cursor.is_empty() {
                 sources.push(TierKeySource::MemCursor { cursor: imm_cursor });
             }
         }
+        let imm_done_us: u128 = diag_start.map(|s| s.elapsed().as_micros()).unwrap_or(0);
         // FRS-RESIDENT-FLUSHED: Tier 2 also scans the resident-flushed
         // memtables (memtables already flushed to an L0 SST but kept in RAM
         // so the prefix-scan path avoids an S3 round-trip for hot recently-
@@ -5473,6 +5479,14 @@ impl DbImpl {
                 });
             }
         }
+        // FRS-ITER-DIAG sub-phase split (2026-06-02): capture how much of the
+        // build is the memtable/resident-tier prep vs the Tier-3 SST loop, and
+        // within the SST loop how much is `get_or_open_sst_reader` (cold index +
+        // bloom decode on freshly-minted SSTs). Diagnoses whether the q7
+        // empty-probe build cost is resident-cursor work or SST reader opens.
+        let prep_us: u128 = diag_start.map(|s| s.elapsed().as_micros()).unwrap_or(0);
+        let mut sst_open_us: u128 = 0;
+        let mut sst_considered: usize = 0;
         // Tier 3: overlapping SSTs, block-streaming. 2026-05-29 PERF: borrow
         // SST metadata (no per-scan clone of every SstFileMeta + its keys).
         for sst in version.live_sst_files_iter() {
@@ -5489,7 +5503,17 @@ impl DbImpl {
                     continue;
                 }
             }
-            let reader = self.get_or_open_sst_reader(sst)?;
+            if diag {
+                sst_considered += 1;
+            }
+            let reader = if diag {
+                let o = std::time::Instant::now();
+                let r = self.get_or_open_sst_reader(sst)?;
+                sst_open_us += o.elapsed().as_micros();
+                r
+            } else {
+                self.get_or_open_sst_reader(sst)?
+            };
             // FRS-L0-FANOUT-PRUNE (2026-05-31): skip this SST's source entirely
             // when its in-memory block index proves it holds NO key in
             // [prefix, upper) — WITHOUT decoding a block. The coarse
@@ -5547,9 +5571,18 @@ impl DbImpl {
                     true
                 };
             if us > 1000 || new_peak {
+                let imm_us = imm_done_us.saturating_sub(active_us);
+                let resident_us = prep_us.saturating_sub(imm_done_us);
                 eprintln!(
-                    "FRS-ITER-DIAG build_lazy_prefix us={} prefix_len={} mem_sources={} mem_keys={} sst_sources={} resident_shadowed={} new_peak={}",
+                    "FRS-ITER-DIAG build_lazy_prefix us={} prep_us={} active_us={} imm_us={} resident_us={} n_imm={} sst_open_us={} sst_considered={} prefix_len={} mem_sources={} mem_keys={} sst_sources={} resident_shadowed={} new_peak={}",
                     us,
+                    prep_us,
+                    active_us,
+                    imm_us,
+                    resident_us,
+                    n_imm,
+                    sst_open_us,
+                    sst_considered,
                     prefix.len(),
                     mem_sources,
                     mem_keys,
