@@ -51,7 +51,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Per-entry bookkeeping. `bytes` is the on-disk size; the LRU position
@@ -83,6 +83,71 @@ pub struct LocalCache {
     misses: AtomicU64,
     /// Total `get` calls; used to throttle periodic stats logging.
     gets: AtomicU64,
+    /// FRS-FDCACHE: bounded cache of OPEN read file handles keyed by logical
+    /// cache key. The q7 sampled profile showed ~35% of the heavy-join hot
+    /// thread in the `open()` syscall — `get_range` opened+closed the cache
+    /// file on EVERY block read. SST cache files are write-once-immutable, so a
+    /// retained read fd always returns consistent bytes; reusing it across the
+    /// many block reads of one SST removes the per-block open/close syscalls.
+    /// Purged on entry eviction / overwrite / invalidation so a cached fd never
+    /// outlives (or aliases a new inode of) its on-disk file.
+    fd_cache: Mutex<FdCache>,
+    /// Count of ACTUAL `open()` calls made by `get_range` (a cache miss). A
+    /// low value relative to block reads validates the fd-cache hit rate.
+    fd_opens: AtomicU64,
+}
+
+/// Bounded FIFO cache of open read file handles. `order` records insertion
+/// order; stale refs (for keys since removed) are skipped on eviction. No
+/// per-hit reorder — the working set (a handful of hot SSTs) sits well under
+/// `cap`, so FIFO aging is sufficient and keeps `get` O(1) lock-free of churn.
+struct FdCache {
+    map: HashMap<String, Arc<fs::File>>,
+    order: VecDeque<String>,
+    cap: usize,
+}
+
+impl FdCache {
+    fn new(cap: usize) -> Self {
+        FdCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Returns a clone of the cached handle for `key`, if present.
+    fn get(&self, key: &str) -> Option<Arc<fs::File>> {
+        self.map.get(key).cloned()
+    }
+
+    /// Inserts `file` under `key`, evicting the oldest live handle if at
+    /// capacity. If another thread already inserted `key` (open race), the
+    /// EXISTING handle is kept and returned so all readers share one fd.
+    fn insert(&mut self, key: String, file: Arc<fs::File>) -> Arc<fs::File> {
+        if let Some(existing) = self.map.get(&key) {
+            return existing.clone();
+        }
+        while self.map.len() >= self.cap {
+            match self.order.pop_front() {
+                Some(old) => {
+                    // Skip stale order refs (key already removed).
+                    if self.map.remove(&old).is_some() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        self.map.insert(key.clone(), Arc::clone(&file));
+        self.order.push_back(key);
+        file
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.map.remove(key);
+        // Leave the (now stale) `order` ref; it is reclaimed lazily on evict.
+    }
 }
 
 #[derive(Default)]
@@ -218,7 +283,48 @@ impl LocalCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             gets: AtomicU64::new(0),
+            // 512 open fds: ample for the hot working set (a handful of
+            // overlapping SSTs) while staying well under the JVM's raised fd
+            // limit. Evicted FIFO; stale entries purged on removal.
+            fd_cache: Mutex::new(FdCache::new(512)),
+            fd_opens: AtomicU64::new(0),
         })
+    }
+
+    /// FRS-FDCACHE: returns a shared open read handle for `key`, opening (and
+    /// caching) the file on a miss. Returns `Ok(None)` if the on-disk file is
+    /// gone (caller treats as a cache miss). The open happens OUTSIDE the
+    /// `inner` lock so disk I/O never serializes concurrent readers.
+    fn get_or_open_fd(&self, key: &str, on_disk: &Path) -> io::Result<Option<Arc<fs::File>>> {
+        if let Some(f) = self
+            .fd_cache
+            .lock()
+            .expect("fd cache mutex poisoned")
+            .get(key)
+        {
+            return Ok(Some(f));
+        }
+        let file = match OpenOptions::new().read(true).open(on_disk) {
+            Ok(f) => Arc::new(f),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        self.fd_opens.fetch_add(1, Ordering::Relaxed);
+        let arc = self
+            .fd_cache
+            .lock()
+            .expect("fd cache mutex poisoned")
+            .insert(key.to_string(), file);
+        Ok(Some(arc))
+    }
+
+    /// FRS-FDCACHE: drop any cached open handle for `key`. Called whenever the
+    /// on-disk file is removed or replaced so a stale fd is never reused.
+    fn purge_fd(&self, key: &str) {
+        self.fd_cache
+            .lock()
+            .expect("fd cache mutex poisoned")
+            .remove(key);
     }
 
     /// Returns `(hits, misses)` observed by [`get`](Self::get) so far.
@@ -292,6 +398,32 @@ impl LocalCache {
             .contains_key(key)
     }
 
+    /// FRS-FDCACHE: number of ACTUAL `open()` syscalls made by `get_range`
+    /// (cache misses). A low value relative to block reads confirms the fd
+    /// cache is eliminating the per-block open/close that dominated the q7
+    /// sampled profile.
+    pub fn fd_opens(&self) -> u64 {
+        self.fd_opens.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn fd_cache_len(&self) -> usize {
+        self.fd_cache
+            .lock()
+            .expect("fd cache mutex poisoned")
+            .map
+            .len()
+    }
+
+    #[cfg(test)]
+    fn fd_cache_contains(&self, key: &str) -> bool {
+        self.fd_cache
+            .lock()
+            .expect("fd cache mutex poisoned")
+            .map
+            .contains_key(key)
+    }
+
     /// FRS-LOCAL-FIRST-SST (2026-06-01): the byte length of the cached entry
     /// for `key`, or `None` on a miss. Used by the local-first SST read path to
     /// size a `RandomAccessFile` over the write-through copy WITHOUT a remote
@@ -341,12 +473,16 @@ impl LocalCache {
     /// byte accounting. Used when an on-disk file vanished underneath a cached
     /// entry so the next access re-fetches rather than serving a phantom hit.
     fn drop_entry(&self, key: &str) {
-        let mut inner = self.inner.lock().expect("local cache mutex poisoned");
-        if let Some(entry) = inner.entries.remove(key) {
-            inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
-            // The entry's live lru ref is now stale; reclaimed lazily (O(1)).
-            inner.mark_stale();
+        {
+            let mut inner = self.inner.lock().expect("local cache mutex poisoned");
+            if let Some(entry) = inner.entries.remove(key) {
+                inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
+                // The entry's live lru ref is now stale; reclaimed lazily (O(1)).
+                inner.mark_stale();
+            }
         }
+        // FRS-FDCACHE: the on-disk file is being removed — purge any cached fd.
+        self.purge_fd(key);
     }
 
     /// Reads exactly the `[offset, offset+len)` sub-range of the cached file
@@ -382,9 +518,10 @@ impl LocalCache {
             self.path_for(key)
         };
 
-        let file = match OpenOptions::new().read(true).open(&on_disk) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+        // FRS-FDCACHE: reuse a cached open handle (no open()/close() per block).
+        let file = match self.get_or_open_fd(key, &on_disk)? {
+            Some(f) => f,
+            None => {
                 // Metadata says present but the file is gone — treat as a miss
                 // and drop the stale entry so the caller re-fetches (mirrors
                 // `get`'s NotFound handling).
@@ -392,7 +529,6 @@ impl LocalCache {
                 self.drop_entry(key);
                 return Ok(None);
             }
-            Err(e) => return Err(e),
         };
 
         let mut buf = vec![0u8; len];
@@ -515,12 +651,19 @@ impl LocalCache {
             evict
         };
 
+        // FRS-FDCACHE: the rename above replaced `key`'s file with a NEW inode;
+        // any cached fd points at the old inode and must be dropped so the next
+        // read opens the fresh file (correctness, not just fd hygiene).
+        self.purge_fd(key);
+
         // Best-effort unlink of evicted files. Errors are logged but not
         // propagated: a stale file on disk just wastes a few bytes until
         // the next cache restart drops it.
         for victim in to_evict {
             let path = self.path_for(&victim);
             let _ = fs::remove_file(&path);
+            // Purge the evicted entry's fd so the OS handle is released.
+            self.purge_fd(&victim);
         }
 
         Ok(true)
@@ -549,11 +692,16 @@ impl LocalCache {
         inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes);
         inner.mark_stale(); // entry's lru ref is now stale; reclaimed lazily
         let path = self.path_for(key);
-        match fs::remove_file(&path) {
+        let result = match fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
             Err(e) => Err(e),
-        }
+        };
+        drop(inner);
+        // FRS-FDCACHE: file removed — purge any cached fd (after releasing the
+        // inner lock so the fd-cache lock is never taken while holding `inner`).
+        self.purge_fd(key);
+        result
     }
 
     fn path_for(&self, key: &str) -> PathBuf {
@@ -692,6 +840,64 @@ mod tests {
             .expect("get_range")
             .expect("hit");
         assert_eq!(full, payload);
+    }
+
+    #[test]
+    fn get_range_reuses_cached_fd_no_reopen_per_block() {
+        // FRS-FDCACHE: the q7 sampled profile showed ~35% of the hot thread in
+        // the open() syscall — LocalCache::get_range opened+closed the cache
+        // file on EVERY block read. With an fd cache, repeated block reads of
+        // the SAME (immutable) SST cache file must reuse one open File handle.
+        let (_tmp, cache) = fresh_cache(8192);
+        let payload: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        assert!(cache.put("/db/00000009.sst", &payload).unwrap());
+
+        let r0 = cache.get_range("/db/00000009.sst", 0, 64).unwrap().unwrap();
+        assert_eq!(r0, &payload[0..64]);
+        assert_eq!(cache.fd_opens(), 1, "first get_range opens the file once");
+
+        // Many subsequent block reads of the same key must NOT re-open.
+        for off in [64u64, 128, 256, 512, 1024, 2048] {
+            let r = cache
+                .get_range("/db/00000009.sst", off, 64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(r, &payload[off as usize..off as usize + 64]);
+        }
+        assert_eq!(
+            cache.fd_opens(),
+            1,
+            "repeated block reads of the same key reuse the cached fd (no re-open)"
+        );
+
+        // A different key opens its own fd exactly once.
+        let p2 = vec![7u8; 256];
+        assert!(cache.put("/db/0000000a.sst", &p2).unwrap());
+        let _ = cache.get_range("/db/0000000a.sst", 0, 16).unwrap().unwrap();
+        assert_eq!(cache.fd_opens(), 2, "a new key opens its own fd once");
+    }
+
+    #[test]
+    fn evicting_an_entry_purges_its_cached_fd() {
+        // The fd cache must not outlive the on-disk entry: when an entry is
+        // evicted (file deleted), its cached fd must be dropped so the OS fd is
+        // released and never reused for a stale path.
+        let (_tmp, cache) = fresh_cache(220);
+        let a = vec![0xAAu8; 100];
+        let b = vec![0xBBu8; 100];
+        let c = vec![0xCCu8; 100];
+        assert!(cache.put("/db/a.sst", &a).unwrap());
+        let _ = cache.get_range("/db/a.sst", 0, 10).unwrap().unwrap();
+        assert_eq!(cache.fd_cache_len(), 1, "fd cached after a read");
+
+        assert!(cache.put("/db/b.sst", &b).unwrap());
+        // Inserting c evicts the oldest (a) — its fd must be purged.
+        assert!(cache.put("/db/c.sst", &c).unwrap());
+        assert!(!cache.contains("/db/a.sst"), "a was evicted");
+        assert!(
+            !cache.fd_cache_contains("/db/a.sst"),
+            "evicted entry's fd must be purged from the fd cache"
+        );
     }
 
     #[test]
