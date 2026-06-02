@@ -98,6 +98,25 @@ fn apply_block_cache_env_override(cache_bytes: usize) -> usize {
     }
 }
 
+/// FRS-SST-COMPRESSION env override (perf experiment, 2026-06-02): force the
+/// SST block compression via `FRS_SST_COMPRESSION=none|lz4|zstd`. A differential
+/// q7 profile showed LZ4 `decompress` is ~43% of the heavy-join prefix-iter CPU
+/// in the decay regime (block reads re-decompress + re-decode Arrow per probe).
+/// This knob lets us measure uncompressed blocks (the prerequisite for the
+/// zero-copy mmap'd Arrow read path) WITHOUT changing the default (S3-bound
+/// queries still want LZ4 to cut transfer bytes). Unset = keep configured value.
+fn apply_compression_env_override(
+    compression: forst_rs_common::CompressionType,
+) -> forst_rs_common::CompressionType {
+    use forst_rs_common::CompressionType;
+    match std::env::var("FRS_SST_COMPRESSION").ok().as_deref() {
+        Some("none") | Some("None") | Some("NONE") => CompressionType::None,
+        Some("lz4") | Some("Lz4") | Some("LZ4") => CompressionType::Lz4,
+        Some("zstd") | Some("Zstd") | Some("ZSTD") => CompressionType::Zstd,
+        _ => compression,
+    }
+}
+
 /// FRS-ITER-DIAG: cached check for the `FRS_ITER_DIAG=1` env flag. Reads the
 /// env var once (the result is process-stable) so the prefix-stream build hot
 /// path pays only an atomic load per call when diagnostics are off.
@@ -423,6 +442,15 @@ impl DbImpl {
         if !options.db_path.is_empty() {
             fs.create_dir_all(&db_path)?;
         }
+
+        // FRS-SST-COMPRESSION perf knob (2026-06-02): allow forcing block
+        // compression via env without changing the default. See
+        // `apply_compression_env_override`.
+        let options = {
+            let mut o = options;
+            o.compression = apply_compression_env_override(o.compression);
+            o
+        };
 
         // B-Prod-P7 §6d runtime tuning hooks. The new
         // `block_cache_capacity_bytes` field takes precedence; when it is
