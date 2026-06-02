@@ -34,7 +34,7 @@ use std::sync::Arc;
 use crate::cache::{BlockCache, CacheEntry, CacheKey, CachePriority};
 
 use super::bloom_filter::Sbbf;
-use super::data_block::decode_data_block;
+use super::data_block::decode_data_block_zerocopy;
 use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
 use super::schema::{FILE_HEADER_SIZE, SST_MAGIC};
 use super::sparse_index::{decode_index, search_index, BlockStats, SparseIndexEntry};
@@ -163,17 +163,6 @@ pub struct SstReaderImpl {
 
 // R74-H1: the read-fully helper (a `read_at` loop that requires all `buf.len()` bytes and
 // treats a mid-file short read as `Corruption`) is documented at its own definition below.
-// This is a plain `//` comment, not `///`, because the next item is a `thread_local!` macro
-// invocation, which cannot carry a doc comment (rustc unused_doc_comments).
-std::thread_local! {
-    /// FRS-NOZERO-BLOCKREAD (2026-06-01): per-thread reusable scratch for raw
-    /// SST data-block bytes, so `read_data_block` doesn't malloc (+ zero-fill) a
-    /// fresh buffer per block on the heavy-join prefix-scan hot path. Each engine
-    /// read thread keeps one buffer that grows to the largest block it has seen.
-    static BLOCK_READ_SCRATCH: std::cell::RefCell<Vec<u8>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
 fn read_at_exact(file: &dyn RandomAccessFile, offset: u64, buf: &mut [u8]) -> ForstResult<()> {
     let mut filled: usize = 0;
     while filled < buf.len() {
@@ -350,27 +339,26 @@ impl SstReaderImpl {
                 block_offset, block_end, self.file_size
             )));
         }
-        // FRS-NOZERO-BLOCKREAD (2026-06-01): read the raw block into a REUSED
-        // thread-local scratch buffer instead of a fresh `vec![0u8; block_size]`
-        // per call. A native `sample` of the q4 heavy-join freeze showed the
-        // dominant on-CPU frames under the prefix-iterator were
-        // `_xzm_malloc_large_huge → _xzm_segment_group_clear_chunk` — i.e. a
-        // large heap allocation (+ its zero-fill) for EVERY block read, on every
-        // overlapping SST, on every probe, at the millions-of-blocks scale a
-        // heavy-join spilled-state scan touches. Reusing a per-thread buffer
-        // retains the capacity across calls so the allocation happens once per
-        // thread (not once per block), eliminating the `malloc_large_huge` churn.
-        // `decode_data_block` returns an OWNED `RecordBatch` (Arrow columns are
-        // copied out), so the scratch is free to be overwritten on the next call.
-        // `forbid(unsafe_code)` rules out `set_len`, so we keep the safe `resize`
-        // (the residual memset is dwarfed by the eliminated per-block alloc).
-        let batch = BLOCK_READ_SCRATCH.with(|cell| -> ForstResult<RecordBatch> {
-            let mut buf = cell.borrow_mut();
-            buf.clear();
-            buf.resize(block_size as usize, 0);
-            read_at_exact(self.file.as_ref(), block_offset, &mut buf)?;
-            decode_data_block(&buf)
-        })?;
+        // FRS-ZEROCOPY (2026-06-02): read the raw block into a fresh Arrow
+        // `Buffer` and decode ZERO-COPY via `decode_data_block_zerocopy` — the
+        // returned `RecordBatch` columns SLICE the block buffer instead of being
+        // copied out (the per-column copy that `decode_data_block`/`StreamReader`
+        // pays). A differential q7 profile showed Arrow decode + decompress is
+        // ~70% of the heavy-join prefix-iter CPU once state spills to SSTs; for
+        // `CompressionType::None` SSTs this path skips the column copy entirely
+        // (verified zero-copy in data_block tests). The block `Buffer` is kept
+        // alive by the batch (and the decoded-block cache below) — sound because
+        // SST blocks are immutable. This supersedes the FRS-NOZERO scratch-reuse
+        // path: that reused one thread-local buffer but still paid a full column
+        // copy in `StreamReader`; zero-copy trades the reused scratch for no copy,
+        // a net win for the large blocks the prefix-iterator re-probes. (The Vec
+        // alloc backs the live `Buffer`, so it is used productively, not churned;
+        // `forbid(unsafe_code)` keeps the safe zero-fill, dwarfed by the saved
+        // column copy.)
+        let mut raw = vec![0u8; block_size as usize];
+        read_at_exact(self.file.as_ref(), block_offset, &mut raw)?;
+        let block_buf = arrow::buffer::Buffer::from_vec(raw);
+        let batch = decode_data_block_zerocopy(&block_buf)?;
 
         // Populate the cache (best-effort) so repeat probes of this block —
         // common in the streaming join's per-key prefix scans — hit the decoded
