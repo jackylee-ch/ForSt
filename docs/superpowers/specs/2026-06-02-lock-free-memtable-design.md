@@ -116,6 +116,67 @@ Arrow columnar layout the rest of the engine (zero-copy reads, flush) depends on
   preserving refactors validated by the existing suite) de-risk before the concurrency switch in phase 3.
 - **`crossbeam-skiplist` / `crossbeam-epoch` deps** — add to the workspace (verify availability/licensing).
 
+## Implementation status (2026-06-02)
+
+- **Phase 1 — segmented non-moving arena: DONE.** `arena.rs` `SegmentedBytes` (e004fa3e7); KEY columns
+  → arena (060693d84); VALUE columns → arena (b44ec2b76). `ByteSpan{chunk,offset,len}` per row; null/
+  tombstone rows store a zero-length `ByteSpan::default()` sentinel gated by `value_nulls`.
+- **Phase 2 — `crossbeam-skiplist` ordered index: DONE (e2fc210a2).** `sorted_index` BTreeMap +
+  `unsorted_lookup` + `unsorted_entries` + `sorted_count` + `rowindex_vec_pool` + the merge machinery all
+  replaced by one `SkipMap<InternalKey, RowIndex>` (`InternalKey{user_key:Arc<[u8]>, sequence}`, ordered
+  user-key ASC / seq DESC via a custom `Ord` — separate fields, no packed-key prefix hazard, pinned by a
+  unit test). `merge_if_dirty`/`merge_unsorted_to_sorted` are now no-ops kept for API compat; `freeze` no
+  longer merges. Point reads still use `hash_index` (unchanged). This already removed BOTH the unsorted
+  linear-scan wall AND (with the no-op merge) the write-lock-during-prefix-scan contention that the prior
+  cursor took (the documented ~32% `lock_contended` motivation). Suite: storage 339 + engine 258 green.
+- **Phase 3 — remove the `RwLock`: NOT STARTED (design fork below).**
+- **Phases 4–5** — deferred (depend on 3).
+
+## Phase 3 design fork (the lock-free read/write switch) — DECISION REQUIRED BEFORE CODING
+
+The shard `RwLock` lives at `ShardedMemTable` (`Vec<RwLock<VectorizedMemTable>>`). To drop it, every
+`VectorizedMemTable` write must be `&self`-safe (concurrent). Today writes mutate, per row: `key_arena`/
+`value_arena` (`SegmentedBytes`, `&mut append`), `key_spans`/`value_spans`/`value_nulls`/`sequences`/
+`op_types` (`Vec::push`), `hash_index` (`FxHashMap`), `next_sequence`, `memory_used`. The `index` SkipMap
+is already `&self`. Two viable approaches, with a real correctness/perf tradeoff:
+
+### A — Skiplist-only (SAFE, no `unsafe`, but changes point-read complexity)
+Store the full row IN the SkipMap node: `SkipMap<InternalKey, RowVal>` where `RowVal { value:
+Option<Arc<[u8]>>, op_type }` (seq is in the key). Then **delete** `hash_index` AND all columnar storage
+(`*_arena`, `*_spans`, `value_nulls`, `sequences`, `op_types`) — the skiplist is the single source for
+point reads, range reads, and flush.
+- **Point read** = `index.lower_bound(Included(InternalKey{user_key, read_seq}))`; the first entry is the
+  newest version with `seq ≤ read_seq` (within a user key, higher seq sorts first, so `read_seq` lands
+  at-or-after the newer-than-read_seq versions). O(log N), lock-free.
+- **Writes** = `index.insert` (`&self`) + atomic `next_sequence`/`memory_used`. No other shared mutation →
+  `RwLock` drops out cleanly; no `unsafe`, no concurrent arena, no concurrent hashmap.
+- **Flush** = iterate `index` (already done) reading value from the node.
+- **Risk:** point reads become **O(log N)** vs today's O(1) `hash_index`. With no-flush mode keeping a
+  multi-GB resident memtable, that is ~log2(10s of millions) ≈ 25 variable-length key comparisons per
+  point get — a possible regression on point-read-heavy queries (the memory flags hash_index O(1) as hot).
+  Mitigatable by keeping a small **concurrent** point cache, but that reintroduces approach B's hard part.
+
+### B — Keep O(1) point reads (concurrent `hash_index` + concurrent arena) — FASTER, but `unsafe`/dep-heavy
+Make each mutated structure concurrent: (1) `SegmentedBytes` → lock-free `&self` append (atomic
+bump-pointer + CAS chunk publish over `UnsafeCell<[u8]>` chunks, `unsafe impl Sync`); (2) the 5 columnar
+`Vec`s → a concurrent append-only typed column (atomic row-offset claim, non-moving segments) — or fold
+the per-row data into the SkipMap node and keep columns only for flush; (3) `hash_index` → a concurrent
+map (`dashmap`, or a second `SkipMap`, or sharded) with a concurrency-safe inline-value cache.
+- **Pros:** preserves O(1) point reads + the inline-value fast path; true RocksDB-grade parallelism.
+- **Cons:** hand-rolled `unsafe` lock-free arena (silent-corruption failure mode — the worst outcome for a
+  storage engine), `crossbeam-epoch` reclamation, a new concurrent-map dependency, and the most code. The
+  dominant correctness hazard; must be gated by N-writer/M-reader stress + (ideally) `loom` tests.
+
+### Recommendation
+**Gate phase 3 on a measurement first.** Phase 2 already removed the two documented memtable lock costs
+(unsorted scan + write-lock-during-scan), so the *marginal* benefit of dropping the brief per-op
+`RwLock` — under Flink's one-writer-per-slot model with `shards=1` — is now **unmeasured**. Before
+investing in the high-risk approach B, run the post-phase-2 stack and check whether `RwLock` time is still
+material in the join hot path (instrument-before-build, per project discipline). If it is: prefer **A**
+unless a point-read microbench shows the O(log N) regression is real, in which case do **B** with the
+arena built as an isolated, stress-tested primitive first. Either way, phase 3 is a from-scratch
+concurrent change and must NOT be rushed in with the perf benefit unverified.
+
 ## Relationship to other specs
 
 - Composes with [zero-copy Arrow SST](2026-06-02-zero-copy-arrow-sst-format.md): flush wraps arena chunks
