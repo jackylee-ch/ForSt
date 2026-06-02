@@ -17,6 +17,7 @@
 //! This module provides the [`crate::memtable::VectorizedMemTable`] implementation based on a hybrid
 //! Sorted Run Array + BTreeMap index architecture (design doc 2.3).
 
+pub mod arena;
 pub mod artifact;
 pub mod sharded;
 pub mod vectorized;
