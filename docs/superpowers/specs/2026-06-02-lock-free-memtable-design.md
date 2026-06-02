@@ -172,10 +172,33 @@ map (`dashmap`, or a second `SkipMap`, or sharded) with a concurrency-safe inlin
 (unsorted scan + write-lock-during-scan), so the *marginal* benefit of dropping the brief per-op
 `RwLock` — under Flink's one-writer-per-slot model with `shards=1` — is now **unmeasured**. Before
 investing in the high-risk approach B, run the post-phase-2 stack and check whether `RwLock` time is still
-material in the join hot path (instrument-before-build, per project discipline). If it is: prefer **A**
-unless a point-read microbench shows the O(log N) regression is real, in which case do **B** with the
-arena built as an isolated, stress-tested primitive first. Either way, phase 3 is a from-scratch
-concurrent change and must NOT be rushed in with the perf benefit unverified.
+material in the join hot path (instrument-before-build, per project discipline). Falsifiable threshold:
+**lock-contention share < 5% of the join hot thread → permanently backlog phase 3, build neither A nor B.**
+
+### MEASURED 2026-06-02 — VERDICT: PHASE 3 PERMANENTLY BACKLOGGED (build neither A nor B)
+`scripts/prof-q9-lockshare.sh` profiled a q9 heavy-join LOCAL at steady state (measurement job healthy at
+**750K rec/s, 15M source rows**) via macOS `sample` of the TaskManager (symboled HEAD dylib `be52702b7`).
+Join thread `Join[24] -> Calc[25]` (20200 samples / 30s):
+- **`std::sys::sync::rwlock::RwLock::lock_contended` ≈ 0.7–0.8% per join subtask** (168/149/137/129 samples
+  across the 4 subtasks, /20200) — **down from the documented ~32% pre-phase-2.**
+- **Prefix-scan iteration ≈ 66%** (`frs_vec_iter_prefix_open` 13448 → `LazyPrefixIter::next` 12584) — the
+  real bottleneck. The phase-2 `SkipMap` (`crossbeam_skiplist` 1316) is on this scan path and cheap.
+- **Point-gets ≈ 0%** (`get_borrowed`/`hash_index` absent from the hot path) — q9 is scan-dominated.
+
+**Conclusions:**
+1. Phase 2's mechanism claim is **VERIFIED**: it crushed memtable lock contention ~32% → ~0.8% (killed the
+   unsorted-scan wall + the write-lock-during-prefix-scan; the residual `RwLock` is uncontended).
+2. **0.8% << 5% threshold → phase 3 (remove `RwLock`) is shelved.** Its entire upside is recovering that
+   ~0.8%, which cannot justify a from-scratch concurrent rewrite with a silent-corruption failure mode.
+   Phase 2 captured the realizable lock-free benefit. **Do not build A or B.**
+3. The A/B fork is moot, but for the record: q9 being scan-dominated with ~0 point-gets means approach A
+   (skiplist-only, O(log N) point reads) would NOT have regressed it — the O(1) `hash_index` isn't on the
+   hot path. (A point-read-heavy query could differ; not measured because phase 3 is shelved.)
+4. **Next perf lever is the prefix-scan iterator (66%)** — `LazyPrefixIter`/`frs_vec_iter_prefix_open`
+   (the join-probe over memtable+SST tiers), NOT lock-freedom. That is where future heavy-query effort
+   belongs.
+
+Phases 4–5 (ArcSwap flush, drop write_mutex) depended on phase 3 and are therefore also shelved.
 
 ## Relationship to other specs
 
