@@ -335,6 +335,37 @@ user set up brainstorming for.
 Then: Java snapshot+restore roundtrip test, build+deploy dylib, re-validate q7 (expect the
 throughput decay to flatten — fewer L0 SSTs minted per checkpoint).
 
+## No-flush checkpoint — TURNKEY (restore DONE; only snapshot-side emission left)
+Deeper investigation (2026-06-02) found the **restore half is already implemented**:
+`ForStRsRestoreOperation` (lines ~15-18, 61-66) already recognizes `memtable-cf*.arrow` private-state
+entries, downloads them, and calls `replayMemtableArtifacts` ("FRS-CKPT-NOFLUSH: download the memtable
+artifacts locally and replay"). So the ONLY gap is the **snapshot side emitting those artifacts** —
+a single-file change in `ForStRsSnapshotStrategy.asyncSnapshot`.
+
+**Exact wiring (single file):**
+1. Flag: `private static final boolean NO_FLUSH_CHECKPOINT = Boolean.getBoolean("forst.rs.checkpoint.noflush");`
+   (default OFF → flushing path unchanged; NexMark config opts in via `-Dforst.rs.checkpoint.noflush=true`).
+2. **Capture BEFORE the checkpoint call (MVCC ordering — critical):** if NO_FLUSH, create a local staging
+   dir and call `linker.snapshotMemtablesToDir(db, resources.getSnapshot(), stagingDir)` *before*
+   `createIncrementalCheckpointAtNoflush`. Memtable-FIRST so a concurrent WBM flush in the window lands
+   the data in BOTH the artifact and a newly-enumerated SST (seq-dedup handles the dup — proven by the
+   engine round-trip test); SST-enum-first could lose data flushed-then-dropped in the window.
+3. Switch the checkpoint call (line ~660): `if (NO_FLUSH_CHECKPOINT) linker.createIncrementalCheckpointAtNoflush(...)
+   else linker.createIncrementalCheckpointAt(...)`.
+4. Upload each `stagingDir/memtable-cf<id>.arrow` via `trackedUpload(path, factory, EXCLUSIVE, tracker)`
+   (mirror the manifest upload), join the futures, and add `HandleAndLocalPath.of(handle, "memtable-cf<id>.arrow")`
+   into `privateStateEntries` (line ~869) — the restore side splits these out by the `memtable-cf*.arrow`
+   localPath. Delete the staging dir after the joins complete (whenComplete / CloseableRegistry).
+5. **TDD gate (already-present harness):** `SnapshotRestoreEndToEndTest` seeds keys into the LIVE memtable
+   then snapshots+restores. Run it with `-Dforst.rs.checkpoint.noflush=true`: RED first if artifacts aren't
+   emitted (memtable data lost on restore) → GREEN once emission is wired. Then build+deploy dylib, re-run
+   q7 (expect the throughput decay to flatten — far fewer L0 SSTs minted per checkpoint).
+
+**Foundation proven (commit `9590ff91b`):** `test_noflush_checkpoint_combined_restore_round_trip` —
+no-flush ckpt (SSTs) + memtable artifact → `open_from_incremental` + `replay` → all 100 keys restored.
+Deferred from execution only to avoid writing the async-upload/staging-lifecycle code while context-
+saturated (checkpoint data-loss risk); it is a clean single-file change on verified ground.
+
 ### Honest scale check
 rocksdb q7 = 941 s (106 K/s); forst-rs ≈ >1200 s (<83 K/s) ⇒ a **~1.3× regression**, not a 10×
 collapse (the watchdog "timeout" is >1200 s, but the job was progressing). Reaching the 5× TOTAL
