@@ -335,8 +335,7 @@ impl VectorizedMemTable {
                 self.value_nulls.push(false);
             }
             None => {
-                self.value_spans
-                    .push(super::arena::ByteSpan::default());
+                self.value_spans.push(super::arena::ByteSpan::default());
                 self.value_nulls.push(true);
             }
         }
@@ -876,12 +875,7 @@ impl VectorizedMemTable {
                 continue;
             }
             let v = self.value_at(idx.offset).map(|s| s.to_vec());
-            out.push((
-                entry.key().user_key.to_vec(),
-                v,
-                idx.sequence,
-                idx.op_type,
-            ));
+            out.push((entry.key().user_key.to_vec(), v, idx.sequence, idx.op_type));
         }
         out
     }
@@ -2022,7 +2016,13 @@ mod tests {
 
         // A full sort of mixed entries yields the (key ASC, seq DESC) order a
         // forward skiplist traversal must produce for flush.
-        let mut v = vec![ik(b"b", 1), ik(b"a", 1), ik(b"a", 3), ik(b"b", 9), ik(b"a", 2)];
+        let mut v = [
+            ik(b"b", 1),
+            ik(b"a", 1),
+            ik(b"a", 3),
+            ik(b"b", 9),
+            ik(b"a", 2),
+        ];
         v.sort();
         let got: Vec<(&[u8], u64)> = v.iter().map(|i| (&*i.user_key, i.sequence)).collect();
         assert_eq!(
