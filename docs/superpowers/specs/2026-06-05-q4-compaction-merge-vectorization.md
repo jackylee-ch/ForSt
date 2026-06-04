@@ -95,7 +95,11 @@ Every engine-side q4 lever has now been attributed and tested with data:
   ns/byte is CONTENTION between the compaction thread and the 78 %-engine-CPU pipeline for CPU/mem-bandwidth,
   × write-amp volume. **Lever B (faster merge) refuted** (already fast). **Lever A (reduce write-amp)
   refuted** (bounding L1 adds net work; full cascade −8 %).
-- ⇒ q4's residual gap is **live resource contention + write-amp on a single shared machine**, which this
+- **Memory-footprint lever REFUTED** (config A/B, same machine): block cache 4 GB→1 GB + resident shadow
+  2 GB→512 MB gave 65.28 M vs 64.57 M events (+1 %, noise). So the live contention is NOT memory-bandwidth/
+  footprint — it is **CPU-structural** (the compaction thread + the pipeline's per-record state ops
+  competing for cores). That also refutes the "streaming-merge → less memory traffic" rationale.
+- ⇒ q4's residual gap is **live CPU-structural contention + write-amp on a single shared machine**, which this
   project's heritage independently documents as **machine-bound on this dev Mac** ("the binding q0–q22 3× is
   NOT validly reproducible on this Mac for write/checkpoint-heavy queries — must run on the co-located cloud
   box"; dev-Mac S3 uplink 10 MB/s; swap-poisons after many runs). **2–3× q4 is not achievable via engine
