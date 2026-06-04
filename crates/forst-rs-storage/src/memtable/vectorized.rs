@@ -58,29 +58,40 @@ struct RowIndex {
 /// (rather than a packed `user_key||seq` byte string) means the user-key
 /// comparison is pure lexicographic with no suffix-interleaving hazard between
 /// a key and another key that has it as a prefix.
+/// Inline-or-heap key byte buffer for [`InternalKey`]. 48 bytes live INLINE in
+/// the B-tree node (NexMark join keys are ~36 B); larger keys spill to a single
+/// heap allocation. FRS-MEMTABLE-INLINE-KEY (2026-06-04): replaces the prior
+/// `Arc<[u8]>`, whose per-entry heap allocation was the q4 memory wall — `vmmap`
+/// pinned ~137 M live small allocations (≈ 32 GiB, fragmentation + malloc-lock
+/// contention) dominated by these index keys (the key bytes are ALSO packed in
+/// `key_arena`, so the `Arc` was a pure duplicate). Inline storage removes the
+/// alloc entirely for the common case.
+type KeyBuf = smallvec::SmallVec<[u8; 48]>;
+
 #[derive(Clone, Debug)]
 struct InternalKey {
-    /// User key bytes. `Arc<[u8]>` so cloning an `InternalKey` (e.g. building a
-    /// range bound, or returning scan keys) is a refcount bump, not a copy —
-    /// preserving the FRS-SCAN-ARCKEY zero-copy-key property.
-    user_key: Arc<[u8]>,
+    /// User key bytes, inline for ≤ 48 B (no per-entry heap allocation).
+    user_key: KeyBuf,
     /// Sequence number; compared descending so newest-first within a key.
     sequence: u64,
 }
 
 impl InternalKey {
     #[inline]
-    fn new(user_key: Arc<[u8]>, sequence: u64) -> Self {
-        InternalKey { user_key, sequence }
+    fn new(user_key: &[u8], sequence: u64) -> Self {
+        InternalKey {
+            user_key: KeyBuf::from_slice(user_key),
+            sequence,
+        }
     }
 
     /// Lower bound (inclusive) covering ALL versions of `user_key`: sequence
     /// `u64::MAX` is the smallest `InternalKey` for a given user key (seq sorts
     /// descending), so a range starting here includes every version.
     #[inline]
-    fn range_start(user_key: Arc<[u8]>) -> Self {
+    fn range_start(user_key: &[u8]) -> Self {
         InternalKey {
-            user_key,
+            user_key: KeyBuf::from_slice(user_key),
             sequence: u64::MAX,
         }
     }
@@ -119,11 +130,23 @@ const INLINE_THRESHOLD: usize = 256;
 /// the columnar value storage on point lookups.
 #[derive(Clone)]
 struct HashEntry {
-    /// Row indices of all versions of this key (oldest first).
-    row_indices: Vec<RowIndex>,
-    /// Latest version's value inlined if ≤ INLINE_THRESHOLD bytes.
-    /// None if the latest value exceeds the threshold or is a deletion tombstone.
-    inline_value: Option<Box<[u8]>>,
+    /// Row indices of all versions of this key (oldest first). FRS-MEMTABLE-INLINE-KEY
+    /// (2026-06-04): `SmallVec<[_; 4]>` inlines the common case (most keys have 1–4
+    /// versions in a single memtable) → no per-key heap allocation for the version
+    /// list, cutting another slice of the ~34M live allocations vmmap pinned. Spills
+    /// to the heap only for hot keys with >4 versions.
+    row_indices: smallvec::SmallVec<[RowIndex; 4]>,
+    /// FRS-MEMTABLE-INLINE-KEY (2026-06-04): row offset of the latest version in
+    /// the columnar `value_arena`, replacing the prior `inline_value: Option<Box<[u8]>>`
+    /// cache. The value bytes already live in `value_arena` (non-moving chunks), so the
+    /// `Box` was a per-key DUPLICATE + a per-write `to_vec()` copy + an allocation. The
+    /// fast-path `get` now reads `value_at(latest_offset)` directly — zero duplicate,
+    /// zero alloc, serves ANY value size (no `INLINE_THRESHOLD` cliff), and the
+    /// `get_pinned_ptr` pointer is now STABLE across overwrites (the arena never moves,
+    /// unlike the old `Box` that realloc'd). Tombstone/null is detected via the row's
+    /// `value_nulls` (so `value_at` returns `None`); `latest_op` distinguishes
+    /// Put/Delete/Merge for fast-path eligibility.
+    latest_offset: u32,
     /// Latest version's sequence number (for fast-path eligibility check).
     latest_seq: u64,
     /// Latest version's op_type byte (for tombstone detection on fast path).
@@ -178,18 +201,25 @@ pub struct VectorizedMemTable {
     /// `Arc::<[u8]>::from(key.as_slice())` (heap alloc + memcpy of the key). Reads are
     /// unchanged: `Arc<[u8]>: Borrow<[u8]>`, so `get`/`get_mut`/`range::<[u8],_>` still
     /// probe by borrowed slice. Aligns with the "no heap copies / zero-copy" principle.
-    /// Lock-free ordered index (lock-free-memtable P3 phase 2). Each stored
-    /// version of a user key is its own immutable [`SkipMap`] entry keyed by
-    /// [`InternalKey`] (user key ASC, sequence DESC) → its [`RowIndex`]. A
-    /// forward traversal yields rows in (key ASC, seq DESC) order — the flush /
-    /// range-scan order — and a prefix/range scan is an O(log N + K) skiplist
-    /// range query. This replaces the prior `sorted_index: BTreeMap` +
-    /// `unsorted_lookup: HashMap` + the unsorted→sorted merge machinery: the
-    /// skiplist is ALWAYS sorted, so there is no unsorted zone to linear-scan
-    /// on reads (the O(N) empty-prefix-probe cost that hurt heavy joins) and no
-    /// merge step. `SkipMap::insert`/`range` take `&self`, so phase 3 can drop
-    /// the per-shard `RwLock` without changing this structure.
-    index: crossbeam_skiplist::SkipMap<InternalKey, RowIndex>,
+    /// Ordered index. Each stored version of a user key is its own entry keyed by
+    /// [`InternalKey`] (user key ASC, sequence DESC) → its [`RowIndex`]. A forward
+    /// traversal yields rows in (key ASC, seq DESC) order — the flush / range-scan
+    /// order — and a prefix/range scan is an O(log N + K) range query.
+    ///
+    /// FRS-MEMTABLE-CACHE (2026-06-03): reverted from `crossbeam_skiplist::SkipMap`
+    /// back to `std::BTreeMap`. ROOT CAUSE (q4 profile): the SkipMap heap-allocates
+    /// every node separately, so its nodes are scattered across the heap; as the
+    /// memtable grows past the CPU cache, each O(log N) `search_bound` seek becomes
+    /// cache-miss-bound — the q4/q7/q9 interval-join decay (181K→7K rec/s; while the
+    /// memtable is small forst-rs even BEAT RocksDB at 268K vs 237K). A `BTreeMap`'s
+    /// B-tree nodes are contiguous with high fan-out → far fewer cache lines touched
+    /// per seek, matching RocksDB's arena-skiplist cache behaviour. The `SkipMap`'s
+    /// only advantage was `&self` insert (an unrealized "phase-3 drop-the-RwLock"
+    /// goal); the index is ALWAYS accessed under the per-shard `RwLock` and Flink
+    /// keyed-state access is single-threaded per slot (lib.rs note), so moving inserts
+    /// to `&mut self`/`write()` loses no real concurrency. (A bespoke arena skiplist
+    /// is the follow-on for ultimate perf; BTreeMap first validates the cache fix.)
+    index: std::collections::BTreeMap<InternalKey, RowIndex>,
 
     /// Persistent hash index for O(1) point lookups. Maps user_key to a
     /// [`HashEntry`] containing ALL RowIndex entries for that key (across both
@@ -204,7 +234,11 @@ pub struct VectorizedMemTable {
     /// + 16 bytes per version (RowIndex) + up to 64 bytes inline value.
     ///   For 1M keys with avg 32-byte keys and 1 version each: ~112 MB worst
     ///   case (all values ≤64B inlined) — still within a 128 MiB memtable budget.
-    hash_index: HashMap<Box<[u8]>, HashEntry>,
+    // FRS-MEMTABLE-INLINE-KEY (2026-06-04): key is an inline `KeyBuf`
+    // (`SmallVec<[u8;48]>`) instead of `Box<[u8]>` — no per-unique-key heap
+    // allocation for the key bytes. `SmallVec: Borrow<[u8]>` with slice-consistent
+    // `Hash`, so `get(&[u8])` lookups need no probe-key copy.
+    hash_index: HashMap<KeyBuf, HashEntry>,
 
     // -- State --
     /// Current sequence counter (incremented on each insert).
@@ -240,7 +274,7 @@ impl VectorizedMemTable {
             value_nulls: Vec::with_capacity(INIT_ROWS_HINT),
             sequences: Vec::with_capacity(INIT_ROWS_HINT),
             op_types: Vec::with_capacity(INIT_ROWS_HINT),
-            index: crossbeam_skiplist::SkipMap::new(),
+            index: std::collections::BTreeMap::new(),
             // FxHashMap has no `with_capacity` (custom hasher) — use
             // with_capacity_and_hasher with the default FxBuildHasher.
             hash_index: HashMap::with_capacity_and_hasher(INIT_ROWS_HINT, Default::default()),
@@ -382,27 +416,14 @@ impl VectorizedMemTable {
             if is_new_latest {
                 entry.latest_seq = seq;
                 entry.latest_op = op_type_byte;
-                if op_type_byte == OpType::Put as u8
-                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
-                } else {
-                    entry.inline_value = None; // tombstone or oversized
-                }
+                entry.latest_offset = row_offset; // value lives in value_arena[row_offset]
             }
         } else {
-            let inline_value = if op_type_byte == OpType::Put as u8
-                && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-            {
-                value.map(|v| v.to_vec().into_boxed_slice())
-            } else {
-                None
-            };
             self.hash_index.insert(
-                Box::from(key),
+                KeyBuf::from_slice(key),
                 HashEntry {
-                    row_indices: vec![row_index],
-                    inline_value,
+                    row_indices: smallvec::smallvec![row_index],
+                    latest_offset: row_offset,
                     latest_seq: seq,
                     latest_op: op_type_byte,
                 },
@@ -492,9 +513,9 @@ impl VectorizedMemTable {
     /// have distinct sequences → distinct keys → both retained (multi-version),
     /// matching the prior per-key `Vec<RowIndex>` behaviour.
     #[inline]
-    fn index_insert(&self, user_key: &[u8], row: RowIndex) {
+    fn index_insert(&mut self, user_key: &[u8], row: RowIndex) {
         self.index
-            .insert(InternalKey::new(Arc::from(user_key), row.sequence), row);
+            .insert(InternalKey::new(user_key, row.sequence), row);
     }
 
     /// No-op retained for API compatibility: the lock-free `index` skiplist is
@@ -642,8 +663,7 @@ impl VectorizedMemTable {
         // entry per version. Skip rows newer than `max_seq` (the pinned
         // snapshot cut) when bounded.
         let mut sorted_rows: Vec<(u32, u64)> = Vec::new();
-        for entry in self.index.iter() {
-            let idx = entry.value();
+        for (_k, idx) in self.index.iter() {
             if let Some(s) = max_seq {
                 if idx.sequence > s {
                     continue;
@@ -815,17 +835,22 @@ impl VectorizedMemTable {
         keys: &mut Vec<Arc<[u8]>>,
     ) {
         use std::ops::Bound;
-        let start = InternalKey::range_start(Arc::from(lower));
+        let start = InternalKey::range_start(lower);
         let end = match upper {
-            Some(hi) => Bound::Excluded(InternalKey::range_start(Arc::from(hi))),
+            Some(hi) => Bound::Excluded(InternalKey::range_start(hi)),
             None => Bound::Unbounded,
         };
         let mut last: Option<Arc<[u8]>> = None;
-        for entry in self.index.range((Bound::Included(start), end)) {
-            let uk = &entry.key().user_key;
-            if last.as_deref() != Some(&**uk) {
-                keys.push(Arc::clone(uk));
-                last = Some(Arc::clone(uk));
+        for (k, _idx) in self.index.range((Bound::Included(start), end)) {
+            // FRS-MEMTABLE-INLINE-KEY: the index key is now inline (`KeyBuf`), so
+            // materialise the returned `Arc<[u8]>` once per DISTINCT key (one copy,
+            // then a refcount bump for `last`). The per-entry HELD `Arc` alloc is
+            // gone; this transient per-scan copy is bounded by distinct-keys-in-range.
+            let uk: &[u8] = &k.user_key;
+            if last.as_deref() != Some(uk) {
+                let arc: Arc<[u8]> = Arc::from(uk);
+                keys.push(Arc::clone(&arc));
+                last = Some(arc);
             }
         }
     }
@@ -863,19 +888,18 @@ impl VectorizedMemTable {
         // order with one entry per version — exactly the order this returns —
         // so no temporary merge/sort is needed. Emit each version visible at
         // `read_sequence`.
-        let start = InternalKey::range_start(Arc::from(lower));
+        let start = InternalKey::range_start(lower);
         let end = match upper {
-            Some(hi) => Bound::Excluded(InternalKey::range_start(Arc::from(hi))),
+            Some(hi) => Bound::Excluded(InternalKey::range_start(hi)),
             None => Bound::Unbounded,
         };
         let mut out = Vec::new();
-        for entry in self.index.range((Bound::Included(start), end)) {
-            let idx = entry.value();
+        for (k, idx) in self.index.range((Bound::Included(start), end)) {
             if idx.sequence > read_sequence {
                 continue;
             }
             let v = self.value_at(idx.offset).map(|s| s.to_vec());
-            out.push((entry.key().user_key.to_vec(), v, idx.sequence, idx.op_type));
+            out.push((k.user_key.to_vec(), v, idx.sequence, idx.op_type));
         }
         out
     }
@@ -899,24 +923,88 @@ impl VectorizedMemTable {
         };
 
         // Fast path: caller wants the latest version (read_sequence >= latest_seq)
-        // and we have the inline cache populated (small Put value).
-        if entry.latest_seq <= read_sequence {
-            if let Some(ref inlined) = entry.inline_value {
-                // inline_value is only set for Put ops with value ≤ INLINE_THRESHOLD.
-                let op_type = OpType::from_u8(entry.latest_op).unwrap_or(OpType::Put);
-                return Ok(Some(GetResult {
-                    value: Some(inlined.to_vec()),
-                    sequence: entry.latest_seq,
-                    op_type,
-                }));
-            }
-            // No inline cache — fall through to columnar path.
-            // (tombstone, oversized value, or Merge op)
+        // and it is a Put — serve its value straight from the columnar `value_arena`
+        // via `latest_offset` (no inline duplicate; any size). Tombstone/Merge fall
+        // through to the columnar MVCC path, preserving the prior behaviour.
+        if entry.latest_seq <= read_sequence && entry.latest_op == OpType::Put as u8 {
+            let off = entry.latest_offset;
+            let seq = entry.latest_seq;
+            let value = self.value_at(off).map(|s| s.to_vec());
+            return Ok(Some(GetResult {
+                value,
+                sequence: seq,
+                op_type: OpType::Put,
+            }));
         }
 
-        // Slow path: MVCC snapshot read or no inline cache available.
+        // Slow path: MVCC snapshot read, tombstone, or Merge.
         let result = self.find_latest(&entry.row_indices, read_sequence);
         Ok(result)
+    }
+
+    /// FRS-MERGE-PERF (2026-06-03): single-pass merge-operand collection for
+    /// `key`, replacing the engine peel path's O(N²) "N× `get(key, cutoff)`"
+    /// loop. The old path called [`Self::get`] once per operand, and each
+    /// `get` → [`Self::find_latest`] scans the key's whole `row_indices`
+    /// version list — so a hot key with N merge operands (e.g. a window-join's
+    /// list-valued state) cost N × O(N) = O(N²) per read, which spun
+    /// `vectorizedBatchGet` for >180 s and killed the TaskManager (q5
+    /// WindowJoin; symbolized sample: 100 % CPU in
+    /// `collect_merge_operands → peel_merges_from_memtable → get`).
+    ///
+    /// This collects every `Merge` operand with `seq <= cutoff`, NEWEST-FIRST,
+    /// into `operands`, in ONE pass over `row_indices` (+ one O(K log K) sort of
+    /// the visible versions), stopping at the highest-seq `Put`/`Delete` base.
+    ///
+    /// Returns:
+    ///   * `Ok(Some(Some(v)))` — a `Put` base (value `v`) terminates the chain.
+    ///   * `Ok(Some(None))`    — a `Delete`/`SingleDelete` base terminates it.
+    ///   * `Ok(None)`          — no terminal in THIS memtable; the operands
+    ///                           collected so far stand and the caller continues
+    ///                           to older tiers (imm / SST) for the base.
+    pub fn collect_merge_operands(
+        &self,
+        key: &[u8],
+        cutoff: u64,
+        operands: &mut Vec<Vec<u8>>,
+    ) -> ForstResult<Option<Option<Vec<u8>>>> {
+        let entry = match self.hash_index.get(key) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        // One pass: gather the versions visible at `cutoff`, then sort
+        // newest-first (seq DESC). `row_indices` is not maintained sorted
+        // (find_latest scans it), so sort defensively rather than assume order.
+        let mut versions: Vec<&RowIndex> = entry
+            .row_indices
+            .iter()
+            .filter(|ri| ri.sequence <= cutoff)
+            .collect();
+        if versions.is_empty() {
+            return Ok(None);
+        }
+        versions.sort_unstable_by(|a, b| b.sequence.cmp(&a.sequence));
+        for ri in versions {
+            match ri.op_type {
+                OpType::Put => {
+                    // Put terminates the chain with its value as the base.
+                    return Ok(Some(self.value_at(ri.offset).map(|v| v.to_vec())));
+                }
+                OpType::Delete | OpType::SingleDelete => {
+                    return Ok(Some(None));
+                }
+                OpType::Merge => match self.value_at(ri.offset) {
+                    Some(v) => operands.push(v.to_vec()),
+                    None => {
+                        return Err(forst_rs_common::ForstError::corruption(
+                            "collect_merge_operands: Merge entry missing operand payload",
+                        ));
+                    }
+                },
+            }
+        }
+        // Exhausted every visible version without a terminal — continue older tiers.
+        Ok(None)
     }
 
     /// Borrowed-value point lookup: like [`Self::get`] but returns a
@@ -951,18 +1039,19 @@ impl VectorizedMemTable {
             None => return Ok(None),
         };
 
-        // Fast path: latest version visible AND inline cache populated.
-        if entry.latest_seq <= read_sequence {
-            if let Some(ref inlined) = entry.inline_value {
-                let op_type = OpType::from_u8(entry.latest_op).unwrap_or(OpType::Put);
+        // Fast path: latest version visible AND it is a Put — borrow its value
+        // straight from the columnar `value_arena` via `latest_offset` (no inline
+        // duplicate). Tombstone/Merge fall through to the columnar MVCC path.
+        if entry.latest_seq <= read_sequence && entry.latest_op == OpType::Put as u8 {
+            let off = entry.latest_offset;
+            let seq = entry.latest_seq;
+            if let Some(bytes) = self.value_at(off) {
                 return Ok(Some(GetBorrowedResult {
-                    value: Some(MemtableValueRef::Inline(inlined.as_ref())),
-                    sequence: entry.latest_seq,
-                    op_type,
+                    value: Some(MemtableValueRef::Inline(bytes)),
+                    sequence: seq,
+                    op_type: OpType::Put,
                 }));
             }
-            // No inline cache — fall through to columnar path (still
-            // borrowed via `find_latest_borrowed`).
         }
 
         // Slow path: MVCC snapshot read or no inline cache. The
@@ -990,12 +1079,14 @@ impl VectorizedMemTable {
     ///   the duration of a single record processing.
     pub fn get_pinned_ptr(&self, key: &[u8]) -> Option<(*const u8, usize)> {
         let entry = self.hash_index.get(key)?;
-        // Only serve from inline cache for Put ops (not Delete/Merge).
+        // Only serve for Put ops (not Delete/Merge).
         if entry.latest_op != OpType::Put as u8 {
             return None;
         }
-        let inlined = entry.inline_value.as_ref()?;
-        Some((inlined.as_ptr(), inlined.len()))
+        // Pointer into `value_arena` (non-moving chunks → stable across overwrites,
+        // unlike the prior `Box` that realloc'd on a same-key overwrite).
+        let bytes = self.value_at(entry.latest_offset)?;
+        Some((bytes.as_ptr(), bytes.len()))
     }
 
     /// Sink-aware point lookup that writes directly into a [`ValueSink`]
@@ -1037,14 +1128,12 @@ impl VectorizedMemTable {
             }
             OpType::Merge => SinkGetOutcome::NeedsFullPath,
             OpType::Put => {
-                if let Some(ref inlined) = entry.inline_value {
-                    // Zero-extra-alloc fast path: borrow the inline
-                    // bytes into the sink directly.
-                    sink.append_borrowed(inlined.as_ref());
+                // Zero-extra-alloc fast path: borrow the latest value straight from
+                // the columnar `value_arena` (any size — no INLINE_THRESHOLD cliff).
+                if let Some(bytes) = self.value_at(entry.latest_offset) {
+                    sink.append_borrowed(bytes);
                     SinkGetOutcome::HitPut
                 } else {
-                    // Oversized Put — value lives in columnar storage,
-                    // which needs the materialising read path.
                     SinkGetOutcome::NeedsFullPath
                 }
             }
@@ -1153,7 +1242,7 @@ impl VectorizedMemTable {
             };
 
             // PERF (B2): same `get_mut` THEN `insert` pattern as `put()` —
-            // skips the `Box::from(key)` allocation when the same key appears
+            // skips the `KeyBuf::from_slice(key)` allocation when the same key appears
             // multiple times within a single batch (a common state-update
             // pattern in streaming workloads).
             self.index_insert(key, row_index);
@@ -1172,27 +1261,14 @@ impl VectorizedMemTable {
                 if is_new_latest {
                     entry.latest_seq = seq;
                     entry.latest_op = op_types[i];
-                    if op_types[i] == OpType::Put as u8
-                        && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                    {
-                        entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
-                    } else {
-                        entry.inline_value = None;
-                    }
+                    entry.latest_offset = row_offset;
                 }
             } else {
-                let inline_value = if op_types[i] == OpType::Put as u8
-                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    value.map(|v| v.to_vec().into_boxed_slice())
-                } else {
-                    None
-                };
                 self.hash_index.insert(
-                    Box::from(key),
+                    KeyBuf::from_slice(key),
                     HashEntry {
-                        row_indices: vec![row_index],
-                        inline_value,
+                        row_indices: smallvec::smallvec![row_index],
+                        latest_offset: row_offset,
                         latest_seq: seq,
                         latest_op: op_types[i],
                     },
@@ -1318,27 +1394,14 @@ impl VectorizedMemTable {
                 if is_new_latest {
                     entry.latest_seq = seq;
                     entry.latest_op = op_types[i];
-                    if op_types[i] == OpType::Put as u8
-                        && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                    {
-                        entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
-                    } else {
-                        entry.inline_value = None;
-                    }
+                    entry.latest_offset = row_offset;
                 }
             } else {
-                let inline_value = if op_types[i] == OpType::Put as u8
-                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    value.map(|v| v.to_vec().into_boxed_slice())
-                } else {
-                    None
-                };
                 self.hash_index.insert(
-                    Box::from(key),
+                    KeyBuf::from_slice(key),
                     HashEntry {
-                        row_indices: vec![row_index],
-                        inline_value,
+                        row_indices: smallvec::smallvec![row_index],
+                        latest_offset: row_offset,
                         latest_seq: seq,
                         latest_op: op_types[i],
                     },
@@ -1458,27 +1521,14 @@ impl VectorizedMemTable {
                 if is_new_latest {
                     entry.latest_seq = seq;
                     entry.latest_op = op_types[idx];
-                    if op_types[idx] == OpType::Put as u8
-                        && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                    {
-                        entry.inline_value = value.map(|v| v.to_vec().into_boxed_slice());
-                    } else {
-                        entry.inline_value = None;
-                    }
+                    entry.latest_offset = row_offset;
                 }
             } else {
-                let inline_value = if op_types[idx] == OpType::Put as u8
-                    && value.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    value.map(|v| v.to_vec().into_boxed_slice())
-                } else {
-                    None
-                };
                 self.hash_index.insert(
-                    Box::from(key),
+                    KeyBuf::from_slice(key),
                     HashEntry {
-                        row_indices: vec![row_index],
-                        inline_value,
+                        row_indices: smallvec::smallvec![row_index],
+                        latest_offset: row_offset,
                         latest_seq: seq,
                         latest_op: op_types[idx],
                     },
@@ -1679,27 +1729,14 @@ impl VectorizedMemTable {
                 if is_new_latest {
                     entry.latest_seq = seq;
                     entry.latest_op = op_byte;
-                    if op_byte == OpType::Put as u8
-                        && value_opt.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                    {
-                        entry.inline_value = value_opt.map(|v| v.to_vec().into_boxed_slice());
-                    } else {
-                        entry.inline_value = None;
-                    }
+                    entry.latest_offset = row_offset;
                 }
             } else {
-                let inline_value = if op_byte == OpType::Put as u8
-                    && value_opt.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    value_opt.map(|v| v.to_vec().into_boxed_slice())
-                } else {
-                    None
-                };
                 self.hash_index.insert(
-                    Box::from(key),
+                    KeyBuf::from_slice(key),
                     HashEntry {
-                        row_indices: vec![row_index],
-                        inline_value,
+                        row_indices: smallvec::smallvec![row_index],
+                        latest_offset: row_offset,
                         latest_seq: seq,
                         latest_op: op_byte,
                     },
@@ -1865,13 +1902,9 @@ impl VectorizedMemTable {
             };
             self.index_insert(key, row_index);
 
-            // Persistent hash index: always append so get() is O(1).
-            // Maintain inline value cache for the latest version.
-            let val_bytes: Option<&[u8]> = if values.is_null(i) {
-                None
-            } else {
-                Some(values.value(i))
-            };
+            // Persistent hash index: always append so get() is O(1). The latest
+            // version's value lives in `value_arena[row_offset]`; the hash entry
+            // tracks `latest_offset` (no inline duplicate).
             let is_new_latest;
             if let Some(entry) = self.hash_index.get_mut(key) {
                 entry.row_indices.push(row_index);
@@ -1881,27 +1914,14 @@ impl VectorizedMemTable {
                 if is_new_latest {
                     entry.latest_seq = seq;
                     entry.latest_op = op_values[i];
-                    if op_values[i] == OpType::Put as u8
-                        && val_bytes.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                    {
-                        entry.inline_value = val_bytes.map(|v| v.to_vec().into_boxed_slice());
-                    } else {
-                        entry.inline_value = None;
-                    }
+                    entry.latest_offset = row_offset;
                 }
             } else {
-                let inline_value = if op_values[i] == OpType::Put as u8
-                    && val_bytes.is_some_and(|v| v.len() <= INLINE_THRESHOLD)
-                {
-                    val_bytes.map(|v| v.to_vec().into_boxed_slice())
-                } else {
-                    None
-                };
                 self.hash_index.insert(
-                    Box::from(key),
+                    KeyBuf::from_slice(key),
                     HashEntry {
-                        row_indices: vec![row_index],
-                        inline_value,
+                        row_indices: smallvec::smallvec![row_index],
+                        latest_offset: row_offset,
                         latest_seq: seq,
                         latest_op: op_values[i],
                     },
@@ -1991,7 +2011,7 @@ mod tests {
 
     #[test]
     fn internal_key_orders_user_key_asc_then_seq_desc() {
-        let ik = |k: &[u8], s: u64| InternalKey::new(Arc::from(k), s);
+        let ik = |k: &[u8], s: u64| InternalKey::new(k, s);
 
         // Different user keys: ordered purely lexicographically, regardless of seq.
         assert!(ik(b"a", 0) < ik(b"b", u64::MAX));
@@ -2007,8 +2027,8 @@ mod tests {
 
         // range_start is the smallest InternalKey for its user key, so a forward
         // range from it includes every version of that key (incl. seq 0).
-        assert!(InternalKey::range_start(Arc::from(b"k".as_slice())) <= ik(b"k", u64::MAX));
-        assert!(InternalKey::range_start(Arc::from(b"k".as_slice())) < ik(b"k", 0));
+        assert!(InternalKey::range_start(b"k".as_slice()) <= ik(b"k", u64::MAX));
+        assert!(InternalKey::range_start(b"k".as_slice()) < ik(b"k", 0));
 
         // Equality requires both fields to match.
         assert_eq!(ik(b"k", 5), ik(b"k", 5));
@@ -3300,128 +3320,86 @@ mod tests {
         }
     }
 
-    // === Inline value storage tests ===
+    // === Latest-value fast-path tests (FRS-MEMTABLE-INLINE-KEY) ===
+    // The hash entry no longer caches an inline `Box<[u8]>`; it stores the latest
+    // version's `value_arena` row offset and `get()` reads the value from the arena.
+    // These assert the OBSERVABLE behaviour via `get()` (black-box) rather than the
+    // internal field — and cover that the old INLINE_THRESHOLD cliff is gone (any
+    // value size served correctly through the same fast path).
 
-    /// Small values (≤ INLINE_THRESHOLD) are served from the hash entry's
-    /// inline cache without touching the columnar value storage.
     #[test]
-    fn test_inline_value_small_values_served_from_hash() {
+    fn test_latest_value_small_served() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"k", Some(b"small"), 1).unwrap(); // OpType::Put = 1
         let r = mt.get(b"k", u64::MAX).unwrap().unwrap();
         assert_eq!(r.value, Some(b"small".to_vec()));
         assert_eq!(r.op_type, OpType::Put);
-
-        // Verify the inline_value is populated in the hash entry.
-        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
-        assert!(entry.inline_value.is_some());
-        assert_eq!(entry.inline_value.as_deref(), Some(b"small".as_slice()));
     }
 
-    /// Large values (> INLINE_THRESHOLD) fall through to the columnar path.
     #[test]
-    fn test_inline_value_large_values_fall_through() {
+    fn test_latest_value_large_served() {
+        // Values larger than the OLD INLINE_THRESHOLD are now served by the SAME
+        // fast path (read from value_arena via latest_offset) — no cliff.
         let mut mt = VectorizedMemTable::new(test_config());
-        let large = vec![0u8; INLINE_THRESHOLD + 1]; // > INLINE_THRESHOLD
+        let large = vec![7u8; INLINE_THRESHOLD + 1024];
         mt.put(b"k2", Some(&large), 1).unwrap();
         let r = mt.get(b"k2", u64::MAX).unwrap().unwrap();
-        assert_eq!(r.value, Some(large.clone()));
-
-        // Verify inline_value is NOT populated.
-        let entry = mt.hash_index.get(b"k2".as_slice()).unwrap();
-        assert!(entry.inline_value.is_none());
+        assert_eq!(r.value, Some(large));
     }
 
-    /// Exactly INLINE_THRESHOLD bytes should be inlined.
     #[test]
-    fn test_inline_value_boundary_at_threshold() {
+    fn test_latest_value_at_and_over_threshold_both_served() {
         let mut mt = VectorizedMemTable::new(test_config());
         let exact = vec![42u8; INLINE_THRESHOLD];
         mt.put(b"exact", Some(&exact), 1).unwrap();
-        let entry = mt.hash_index.get(b"exact".as_slice()).unwrap();
-        assert!(
-            entry.inline_value.is_some(),
-            "INLINE_THRESHOLD bytes should be inlined"
-        );
+        assert_eq!(mt.get(b"exact", u64::MAX).unwrap().unwrap().value, Some(exact));
 
         let over = vec![42u8; INLINE_THRESHOLD + 1];
         mt.put(b"over", Some(&over), 1).unwrap();
-        let entry = mt.hash_index.get(b"over".as_slice()).unwrap();
-        assert!(
-            entry.inline_value.is_none(),
-            "INLINE_THRESHOLD+1 bytes should NOT be inlined"
-        );
+        assert_eq!(mt.get(b"over", u64::MAX).unwrap().unwrap().value, Some(over));
     }
 
-    /// Overwriting a key updates the inline cache to the new value.
     #[test]
-    fn test_inline_value_overwrite_updates_cache() {
+    fn test_latest_value_overwrite() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"k", Some(b"v1"), 1).unwrap();
         mt.put(b"k", Some(b"v2"), 1).unwrap();
-
         let r = mt.get(b"k", u64::MAX).unwrap().unwrap();
         assert_eq!(r.value, Some(b"v2".to_vec()));
-
-        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
-        assert_eq!(entry.inline_value.as_deref(), Some(b"v2".as_slice()));
-        assert_eq!(entry.latest_seq, 2);
+        assert_eq!(r.sequence, 2);
     }
 
-    /// Deleting a key clears the inline cache (tombstone).
     #[test]
-    fn test_inline_value_delete_clears_cache() {
+    fn test_latest_value_delete_tombstone() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"k", Some(b"val"), 1).unwrap();
-        // Verify inline is set.
-        assert!(mt
-            .hash_index
-            .get(b"k".as_slice())
-            .unwrap()
-            .inline_value
-            .is_some());
-
-        // Delete clears inline.
         mt.put(b"k", None, 0).unwrap(); // OpType::Delete = 0
-        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
-        assert!(entry.inline_value.is_none());
-        assert_eq!(entry.latest_op, 0);
+        let r = mt.get(b"k", u64::MAX).unwrap().unwrap();
+        assert_eq!(r.value, None);
+        assert_eq!(r.op_type, OpType::Delete);
     }
 
-    /// Overwriting a small value with a large value clears the inline cache.
     #[test]
-    fn test_inline_value_small_to_large_clears_cache() {
+    fn test_latest_value_small_to_large_overwrite() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"k", Some(b"small"), 1).unwrap();
-        assert!(mt
-            .hash_index
-            .get(b"k".as_slice())
-            .unwrap()
-            .inline_value
-            .is_some());
-
         let large = vec![0u8; INLINE_THRESHOLD + 1];
         mt.put(b"k", Some(&large), 1).unwrap();
-        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
-        assert!(entry.inline_value.is_none());
-
-        // But get() still returns the correct value via columnar path.
         let r = mt.get(b"k", u64::MAX).unwrap().unwrap();
         assert_eq!(r.value, Some(large));
     }
 
-    /// MVCC snapshot reads bypass the inline cache and use the columnar path.
     #[test]
-    fn test_inline_value_mvcc_snapshot_bypasses_cache() {
+    fn test_latest_value_mvcc_snapshot_reads_older_version() {
         let mut mt = VectorizedMemTable::new(test_config());
         mt.put(b"k", Some(b"v1"), 1).unwrap(); // seq=1
         mt.put(b"k", Some(b"v2"), 1).unwrap(); // seq=2
 
-        // Inline cache has v2 (latest).
-        let entry = mt.hash_index.get(b"k".as_slice()).unwrap();
-        assert_eq!(entry.inline_value.as_deref(), Some(b"v2".as_slice()));
+        // Current read sees v2.
+        assert_eq!(mt.get(b"k", u64::MAX).unwrap().unwrap().value, Some(b"v2".to_vec()));
 
-        // Snapshot read at seq=1 must return v1 (not the cached v2).
+        // Snapshot read at seq=1 must return v1 (fast path is gated on latest_seq
+        // <= read_sequence, so seq=1 < latest_seq=2 falls to the columnar MVCC path).
         let r = mt.get(b"k", 1).unwrap().unwrap();
         assert_eq!(r.value, Some(b"v1".to_vec()));
         assert_eq!(r.sequence, 1);

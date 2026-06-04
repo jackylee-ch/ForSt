@@ -32,6 +32,8 @@ use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
 
+use crate::sst::kv_block::KvBlock;
+
 /// Cache key — uniquely identifies a block within an SST file.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CacheKey {
@@ -71,9 +73,15 @@ pub enum CacheEntry {
     /// Used for Index Block, Filter Block, etc.
     RawBlock(Arc<Vec<u8>>),
 
-    /// Decoded Arrow RecordBatch.
+    /// Decoded Arrow RecordBatch (v1 data block).
     /// Used for Data Blocks — already decompressed and decoded to columnar format.
     DecodedBatch(Arc<RecordBatch>),
+
+    /// Decoded v2 KV data block (C / [`crate::sst::kv_block::KvBlock`]).
+    /// Holds the decompressed KV payload; rows are read by a pointer-walk with
+    /// no Arrow array build. The cache key/charge machinery is identical to
+    /// [`CacheEntry::DecodedBatch`].
+    DecodedKv(Arc<KvBlock>),
 }
 
 impl CacheEntry {
@@ -89,6 +97,8 @@ impl CacheEntry {
                     .map(|col| col.get_array_memory_size())
                     .sum::<usize>()
             }
+            // The decompressed KV payload is the dominant allocation.
+            CacheEntry::DecodedKv(kv) => kv.payload_len(),
         }
     }
 }

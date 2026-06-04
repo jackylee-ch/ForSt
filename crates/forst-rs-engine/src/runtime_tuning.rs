@@ -31,7 +31,45 @@
 //!   (matches RocksDB's default `allow_stall = false` behaviour).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// FRS-GLOBAL-WBM-BUDGET (2026-06-03): process-wide running sum of memtable bytes
+/// across ALL `DbImpl` instances that opted into the global budget. A Flink
+/// TaskManager runs many keyed-state DBs (q4 ≈ 16: join ×p + agg/rank ×p), each a
+/// separate engine with its own per-CF `WriteBufferManager`. The per-instance cap
+/// (512 MiB) × ~16 = ~8 GiB of memtables — unbounded by Flink's managed memory and
+/// (with the resident shadow) a dominant slice of the RSS bloat that forces OS
+/// memory compression and decays heavy-query throughput. RocksDB avoids this by
+/// SHARING one WriteBufferManager across the slot, sized from managed memory. This
+/// is the engine half of that fix: a process-global memtable budget so the TOTAL
+/// across instances cannot scale with instance count. The per-instance cap stays as
+/// a secondary bound (no single instance hoards), and over-budget only ever TRIGGERS
+/// A FLUSH (always correctness-safe) — so the writing instance flushing its own
+/// actively-growing memtable reduces the global sum back under budget.
+static GLOBAL_WBM_USED: AtomicU64 = AtomicU64::new(0);
+
+/// Process-global memtable budget in bytes. Default 2 GiB (fits within a typical
+/// Flink managed-memory fraction alongside the block cache + resident shadow);
+/// override via `FRS_WBM_TOTAL_MB`; `0` disables the global bound (per-instance cap
+/// only). Sized once on first read.
+fn global_wbm_cap_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        match std::env::var("FRS_WBM_TOTAL_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            Some(mb) => mb.saturating_mul(1024 * 1024),
+            None => 2 * 1024 * 1024 * 1024,
+        }
+    })
+}
+
+/// Test-only: current process-global memtable byte total.
+#[cfg(test)]
+pub fn global_wbm_used_bytes() -> u64 {
+    GLOBAL_WBM_USED.load(Ordering::Relaxed)
+}
 
 /// Cross-CF memtable budget tracker (spec §6d "WriteBufferManager").
 ///
@@ -47,21 +85,42 @@ use std::sync::Arc;
 /// uniformly and let the config decide whether the cap fires.
 #[derive(Debug)]
 pub struct WriteBufferManager {
-    /// Configured cross-CF cap in bytes. `0` = unbounded.
+    /// Configured per-instance cross-CF cap in bytes. `0` = unbounded.
     capacity: u64,
     /// Running sum of bytes reserved across all CF memtables. Updated via
     /// `Relaxed` atomics — the cap check is advisory (writers don't block
     /// on the running sum), so the only ordering requirement is that
     /// `current_bytes()` eventually reflects committed reservations.
     current: AtomicU64,
+    /// FRS-GLOBAL-WBM-BUDGET: when `true`, reservations also charge the
+    /// process-global [`GLOBAL_WBM_USED`] sum and `over_budget()` additionally
+    /// fires when that global sum exceeds [`global_wbm_cap_bytes`]. Enabled by the
+    /// engine open path (`new_global`); `false` for the bare `new` used by tests
+    /// and standalone callers (keeps their per-instance semantics + test isolation).
+    use_global: bool,
 }
 
 impl WriteBufferManager {
-    /// Creates a new manager with the given capacity. `0` = unbounded.
+    /// Creates a new per-instance manager with the given capacity. `0` =
+    /// unbounded. Does NOT participate in the process-global budget.
     pub fn new(capacity_bytes: u64) -> Arc<Self> {
         Arc::new(Self {
             capacity: capacity_bytes,
             current: AtomicU64::new(0),
+            use_global: false,
+        })
+    }
+
+    /// FRS-GLOBAL-WBM-BUDGET: like [`Self::new`] but also enrolls this manager in
+    /// the PROCESS-GLOBAL memtable budget. `local_capacity_bytes` stays the
+    /// per-instance secondary bound; the global cap ([`global_wbm_cap_bytes`])
+    /// bounds the TOTAL across all instances so memtable RAM cannot scale with
+    /// instance count. The engine open path uses this.
+    pub fn new_global(local_capacity_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            capacity: local_capacity_bytes,
+            current: AtomicU64::new(0),
+            use_global: true,
         })
     }
 
@@ -94,6 +153,9 @@ impl WriteBufferManager {
             // Wraparound — pin to u64::MAX for the next observer.
             self.current.store(u64::MAX, Ordering::Relaxed);
         }
+        if self.use_global {
+            GLOBAL_WBM_USED.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     /// Releases `n` bytes from the cross-CF budget. Saturates at `0`
@@ -103,27 +165,64 @@ impl WriteBufferManager {
     pub fn release(&self, n: u64) {
         // Saturating subtract via CAS loop — `fetch_sub` would wrap on
         // an over-release, masking the bug as a multi-EiB running sum.
-        loop {
-            let cur = self.current.load(Ordering::Relaxed);
-            let next = cur.saturating_sub(n);
-            if self
-                .current
-                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                break;
-            }
+        saturating_sub_atomic(&self.current, n);
+        if self.use_global {
+            saturating_sub_atomic(&GLOBAL_WBM_USED, n);
         }
     }
 
-    /// Returns `true` when the running sum exceeds the configured cap.
-    /// Always `false` when capacity is `0` (unbounded).
+    /// Returns `true` when EITHER the per-instance running sum exceeds the
+    /// per-instance cap, OR (in global mode) the process-global memtable sum
+    /// exceeds the global budget. Always `false` for an unbounded per-instance
+    /// manager not in global mode.
+    ///
+    /// Over-budget is advisory: the caller's only response is to TRIGGER A FLUSH
+    /// of its own memtable, which is always correctness-safe and reduces both
+    /// sums. So a global-over condition makes the next writer to ANY enrolled
+    /// instance flush — collectively bounding the total to the global budget.
     #[inline]
     pub fn over_budget(&self) -> bool {
-        if self.capacity == 0 {
-            return false;
+        if self.capacity != 0 && self.current_bytes() > self.capacity {
+            return true;
         }
-        self.current_bytes() > self.capacity
+        if self.use_global {
+            let cap = global_wbm_cap_bytes();
+            if cap != 0 && GLOBAL_WBM_USED.load(Ordering::Relaxed) > cap {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Saturating subtract on an `AtomicU64` via CAS loop — `fetch_sub` would wrap on
+/// an over-release, masking the bug as a multi-EiB running sum.
+#[inline]
+fn saturating_sub_atomic(a: &AtomicU64, n: u64) {
+    loop {
+        let cur = a.load(Ordering::Relaxed);
+        let next = cur.saturating_sub(n);
+        if a.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+impl Drop for WriteBufferManager {
+    fn drop(&mut self) {
+        // FRS-GLOBAL-WBM-BUDGET: on engine teardown, release this instance's
+        // still-charged memtable bytes from the process-global sum so a dropped
+        // DB does not leave a permanent phantom charge (which would over-trigger
+        // flushes on the surviving instances). Per-instance `current` is the
+        // authoritative residual; releasing it is idempotent (saturating).
+        if self.use_global {
+            let residual = self.current.load(Ordering::Relaxed);
+            if residual != 0 {
+                saturating_sub_atomic(&GLOBAL_WBM_USED, residual);
+            }
+        }
     }
 }
 
@@ -136,6 +235,42 @@ mod tests {
         let wbm = WriteBufferManager::new(0);
         wbm.reserve(u64::MAX / 2);
         assert!(!wbm.over_budget());
+    }
+
+    #[test]
+    fn global_budget_fires_across_instances_and_releases() {
+        // FRS-GLOBAL-WBM-BUDGET: two engines sharing the process-global memtable
+        // budget. Each has an UNBOUNDED per-instance cap (0) so ONLY the global
+        // bound can fire — proving the cross-instance budget works.
+        let cap = global_wbm_cap_bytes();
+        if cap == 0 {
+            return; // global bound disabled in this environment → nothing to assert
+        }
+        let a = WriteBufferManager::new_global(0);
+        let b = WriteBufferManager::new_global(0);
+        // Each reserves the FULL global cap, so the combined sum is unambiguously
+        // over budget even under concurrent test noise (other tests can only ADD
+        // to the global sum, never push it below our 2×cap contribution).
+        a.reserve(cap);
+        b.reserve(cap);
+        assert!(
+            a.over_budget(),
+            "global over-budget must fire on A (global sum >> cap)"
+        );
+        assert!(
+            b.over_budget(),
+            "global over-budget must fire on B (global sum >> cap)"
+        );
+        // A NON-global manager with a huge local cap must ignore the global sum
+        // (the budget is strictly opt-in).
+        let local_only = WriteBufferManager::new(u64::MAX);
+        assert!(
+            !local_only.over_budget(),
+            "non-global manager must ignore the process-global sum"
+        );
+        // Release returns our contribution to the global sum (and Drop would too).
+        a.release(cap);
+        b.release(cap);
     }
 
     #[test]

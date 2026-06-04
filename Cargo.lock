@@ -1172,6 +1172,7 @@ dependencies = [
  "forst-rs-test-utils",
  "lz4_flex",
  "rustc-hash 2.1.2",
+ "smallvec",
  "tempfile",
  "xxhash-rust",
  "zstd",

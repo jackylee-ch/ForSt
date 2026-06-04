@@ -132,6 +132,12 @@ pub struct SstWriterImpl {
     /// Last added key for debug-mode sorted-order invariant check.
     last_added_key: Option<Bytes>,
     key_hashes: Vec<u64>,
+    /// C (2026-06-04): per-instance override for the v2 KV block-format flag.
+    /// `None` (production default) defers to [`super::kv_block::sst_write_kv_format`]
+    /// (the `FRS_SST_KV_BLOCK_FORMAT` env gate); tests set it explicitly via
+    /// [`SstWriterImpl::force_kv_block_format`] to exercise both formats
+    /// deterministically in one process.
+    kv_format_override: Option<bool>,
 }
 
 impl Default for SstWriterImpl {
@@ -173,7 +179,15 @@ impl SstWriterImpl {
             finished: false,
             last_added_key: None,
             key_hashes: Vec::new(),
+            kv_format_override: None,
         }
+    }
+
+    /// Forces the data-block format for this writer instance, bypassing the
+    /// `FRS_SST_KV_BLOCK_FORMAT` env gate. `true` = v2 KV, `false` = v1 Arrow.
+    /// Intended for tests that must produce both formats deterministically.
+    pub fn force_kv_block_format(&mut self, on: bool) {
+        self.kv_format_override = Some(on);
     }
 
     /// Adds a single key-value entry. Entries MUST be added in sorted order
@@ -498,7 +512,17 @@ impl SstWriterImpl {
         )
         .map_err(|e| ForstError::corruption(format!("failed to build RecordBatch: {e}")))?;
 
-        let block_bytes = encode_data_block(&batch, self.options.compression)?;
+        // C (2026-06-04): emit a v2 KV block when the write flag is set, else
+        // the v1 Arrow-IPC block. The reader dispatches per-block on the header
+        // `block_type` byte, so flipping this mid-life is safe.
+        let use_kv = self
+            .kv_format_override
+            .unwrap_or_else(super::kv_block::sst_write_kv_format);
+        let block_bytes = if use_kv {
+            super::kv_block::encode_kv_data_block(&batch, self.options.compression)?
+        } else {
+            encode_data_block(&batch, self.options.compression)?
+        };
         let block_offset = self.bytes_written;
         let block_size = block_bytes.len() as u32;
 
@@ -571,6 +595,15 @@ pub struct StreamingSstWriter<'a, W: WritableFile + ?Sized> {
 }
 
 impl<'a, W: WritableFile + ?Sized> StreamingSstWriter<'a, W> {
+    /// FRS-LEVELED-COMPACTION (2026-06-04): running estimated on-disk size of
+    /// the SST written so far (bytes already flushed to the sink + the
+    /// in-flight uncompressed data block). The compaction split loop polls
+    /// this at user-key boundaries to decide when to roll to the next output
+    /// file. Mirrors [`SstWriterImpl::estimated_size`].
+    pub fn estimated_size(&self) -> u64 {
+        self.inner.estimated_size()
+    }
+
     /// Adds a single key-value entry, streaming any completed data block
     /// directly into the sink.
     pub fn add(

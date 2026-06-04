@@ -20,8 +20,8 @@
 //! creating/opening a column family. [`ColumnFamilyData`] holds the per-CF
 //! mutable state (active memtable, immutable list, cached snapshot view).
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use arc_swap::ArcSwap;
 use forst_rs_common::types::FileNumber;
@@ -82,6 +82,78 @@ pub fn resident_flushed_cap_bytes() -> usize {
         Some(mb) => mb.saturating_mul(1024 * 1024),
         None => DEFAULT_RESIDENT_FLUSHED_CAP_BYTES,
     }
+}
+
+/// FRS-GLOBAL-SHADOW-BUDGET (2026-06-03): the per-CF cap above bounds ONE column
+/// family, but a Flink TaskManager runs MANY keyed-state DB instances (q4 ≈ 16:
+/// interval-join ×p + aggregation/rank ×p), each a separate `DbImpl` with its own
+/// resident-flushed shadow. At 1 GiB/CF × ~16 that is ~16 GiB of RAM shadow — the
+/// dominant slice of the ~22 GiB native over-allocation that pushes the TM RSS past
+/// physical RAM, triggers OS memory compression/swap, and collapses heavy-query
+/// throughput (proven: q4 RSS 34 GiB for 1.6 GiB of on-disk state). RocksDB avoids
+/// this by sharing ONE WriteBufferManager + block cache across the whole slot, sized
+/// from Flink's *managed memory* (`getSharedMemoryResourceForSlot`). This is the
+/// engine-side half of that fix: a PROCESS-GLOBAL byte budget for the resident
+/// shadow, shared across every `DbImpl`, so the total cannot scale with instance
+/// count. Eviction is FIFO per-CF and CORRECTNESS-SAFE (an evicted entry's data
+/// still lives on its durable SST — Tier 3 reads it), so the budget is a pure RAM
+/// bound: mis-accounting can only over-evict (slower reads), never lose data.
+///
+/// Default 2 GiB (fits alongside the JVM heap + WBM + block cache within a typical
+/// managed-memory budget); override with `FRS_RESIDENT_SHADOW_TOTAL_MB` (0/unset →
+/// default). Sized once on first read.
+fn global_resident_shadow_cap_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        match std::env::var("FRS_RESIDENT_SHADOW_TOTAL_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)
+        {
+            Some(mb) => mb.saturating_mul(1024 * 1024),
+            None => 2 * 1024 * 1024 * 1024,
+        }
+    })
+}
+
+/// Process-global running total of resident-shadow bytes across ALL `DbImpl`
+/// instances. Charged on enroll, released on every eviction/prune. `Relaxed` is
+/// sufficient — it is a soft RAM bound, not a correctness invariant.
+static GLOBAL_RESIDENT_SHADOW_USED: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn global_shadow_charge(bytes: usize) {
+    GLOBAL_RESIDENT_SHADOW_USED.fetch_add(bytes, Ordering::Relaxed);
+}
+
+#[inline]
+fn global_shadow_release(bytes: usize) {
+    // saturating: never underflow if accounting drifts (e.g. a CF dropped its
+    // whole resident Vec without per-entry release — safe, just over-counts).
+    let mut cur = GLOBAL_RESIDENT_SHADOW_USED.load(Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_sub(bytes);
+        match GLOBAL_RESIDENT_SHADOW_USED.compare_exchange_weak(
+            cur,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
+#[inline]
+fn global_shadow_over_budget() -> bool {
+    GLOBAL_RESIDENT_SHADOW_USED.load(Ordering::Relaxed) > global_resident_shadow_cap_bytes()
+}
+
+/// Test-only: current global resident-shadow byte total.
+#[cfg(test)]
+pub fn global_resident_shadow_used_bytes() -> usize {
+    GLOBAL_RESIDENT_SHADOW_USED.load(Ordering::Relaxed)
 }
 
 use crate::compaction_filter::CompactionFilter;
@@ -676,6 +748,7 @@ impl ColumnFamilyData {
         if cap_bytes == 0 {
             return;
         }
+        let new_bytes = memtable.memory_usage();
         let mut guard = self.resident_flushed.write().expect("lock poisoned");
         guard.push(ResidentEntry {
             file_number,
@@ -683,11 +756,25 @@ impl ColumnFamilyData {
             min_key,
             max_key,
         });
-        // FIFO eviction: drop oldest while total > cap.
+        global_shadow_charge(new_bytes);
+        // FIFO eviction: drop oldest while THIS CF exceeds the per-CF cap.
         let mut total: usize = guard.iter().map(|e| e.memtable.memory_usage()).sum();
         while total > cap_bytes && !guard.is_empty() {
             let evicted = guard.remove(0);
-            total = total.saturating_sub(evicted.memtable.memory_usage());
+            let b = evicted.memtable.memory_usage();
+            total = total.saturating_sub(b);
+            global_shadow_release(b);
+        }
+        // FRS-GLOBAL-SHADOW-BUDGET: also evict THIS CF's oldest while the
+        // PROCESS-WIDE resident-shadow total exceeds the global budget — so the
+        // sum across all ~16 DB instances cannot balloon past the managed-memory
+        // budget (the q4 RSS-bloat / compression root cause). Keep ≥1 entry (the
+        // just-flushed hot tail) so a single CF never starves itself; the budget
+        // converges as every CF sheds its oldest under global pressure. Eviction
+        // is correctness-safe (data is durable on the SST; Tier 3 reads it).
+        while global_shadow_over_budget() && guard.len() > 1 {
+            let evicted = guard.remove(0);
+            global_shadow_release(evicted.memtable.memory_usage());
         }
     }
 
@@ -703,7 +790,18 @@ impl ColumnFamilyData {
     ) -> usize {
         let mut guard = self.resident_flushed.write().expect("lock poisoned");
         let before = guard.len();
-        guard.retain(|e| live_files.contains(&e.file_number));
+        // Release the global budget for each entry we drop (FRS-GLOBAL-SHADOW-BUDGET).
+        let mut released: usize = 0;
+        guard.retain(|e| {
+            let keep = live_files.contains(&e.file_number);
+            if !keep {
+                released = released.saturating_add(e.memtable.memory_usage());
+            }
+            keep
+        });
+        if released > 0 {
+            global_shadow_release(released);
+        }
         before - guard.len()
     }
 
@@ -949,6 +1047,57 @@ mod tests {
         assert!(!shadow.contains(&FileNumber(10)), "oldest must be evicted");
         assert!(shadow.contains(&FileNumber(11)));
         assert!(shadow.contains(&FileNumber(12)));
+    }
+
+    #[test]
+    fn test_global_resident_shadow_budget_charge_release() {
+        // FRS-GLOBAL-SHADOW-BUDGET: enrolling a resident memtable charges the
+        // PROCESS-GLOBAL budget (shared across all DbImpl instances so the total
+        // resident-shadow RAM cannot scale with instance count); pruning releases
+        // it. Verifies the accounting round-trips (charge on add, release on prune)
+        // with no leak/underflow — the invariant the slot-wide RAM bound rests on.
+        let handle = ColumnFamilyHandle::new(ColumnFamilyId(7), "g");
+        let data = ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
+
+        // Large memtables (~256 KiB+ each) so this CF's contribution to the shared
+        // global counter dwarfs any concurrent test's tiny (64-byte) entries.
+        let big = |seq: u64| -> SharedMemTable {
+            let mt = Arc::new(ShardedMemTable::new(1, MemTableConfig::default()));
+            let val = vec![0u8; 256];
+            for i in 0..1000u64 {
+                let key = format!("k{:08}-{}", i, seq).into_bytes();
+                mt.put_with_seq(&key, Some(&val), 1, seq * 1_000_000 + i).unwrap();
+            }
+            mt
+        };
+        let m1 = big(1);
+        let m2 = big(2);
+        let m3 = big(3);
+        let one = m1.memory_usage();
+        assert!(one > 100_000, "expected a large memtable for a robust signal, got {one}");
+
+        let used_before = global_resident_shadow_used_bytes();
+        // Per-CF cap generous (no per-CF FIFO evict); global default 2 GiB >> 3×one
+        // (no global evict) → all three stay resident and charged.
+        let cap = one * 10;
+        data.add_resident_flushed(FileNumber(70), m1, cap);
+        data.add_resident_flushed(FileNumber(71), m2, cap);
+        data.add_resident_flushed(FileNumber(72), m3, cap);
+        let used_after_add = global_resident_shadow_used_bytes();
+        assert!(
+            used_after_add >= used_before + 2 * one,
+            "global budget must be CHARGED on enroll (before={used_before}, after={used_after_add}, one={one})"
+        );
+
+        // Prune all (empty live set) → release the charge.
+        let empty: std::collections::HashSet<FileNumber> = std::collections::HashSet::new();
+        let pruned = data.prune_resident_flushed(&empty);
+        assert_eq!(pruned, 3);
+        let used_after_prune = global_resident_shadow_used_bytes();
+        assert!(
+            used_after_add.saturating_sub(used_after_prune) >= 2 * one,
+            "prune must RELEASE the charge (after_add={used_after_add}, after_prune={used_after_prune}, one={one})"
+        );
     }
 
     #[test]

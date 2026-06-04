@@ -155,7 +155,28 @@ pub fn decode_data_block(data: &[u8]) -> ForstResult<RecordBatch> {
 /// misalignment, so correctness never depends on alignment). Compressed blocks
 /// must decompress into a fresh buffer first (no zero-copy possible), so this
 /// is the win path only for `CompressionType::None` SSTs.
-pub fn decode_data_block_zerocopy(block: &arrow::buffer::Buffer) -> ForstResult<RecordBatch> {
+/// FRS-SST-SKIP-READ-CKSUM (B1, 2026-06-04): whether the SST READ path should
+/// verify each block's crc32c. Default = `true` (verify — the safe default).
+/// `FRS_SST_SKIP_READ_CHECKSUM=1` disables it for trusted local storage, trading
+/// silent in-bounds bit-rot detection (structural corruption is still caught by the
+/// Arrow decode) for the ~10% of heavy-join read-path CPU the per-read crc32c cost.
+/// Cached on first read (the env cannot change at runtime); reversible by unsetting
+/// the env. Write-time checksums are ALWAYS computed regardless of this flag.
+pub fn sst_read_verify_checksum() -> bool {
+    use std::sync::OnceLock;
+    static VERIFY: OnceLock<bool> = OnceLock::new();
+    *VERIFY.get_or_init(|| {
+        !matches!(
+            std::env::var("FRS_SST_SKIP_READ_CHECKSUM").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+pub fn decode_data_block_zerocopy(
+    block: &arrow::buffer::Buffer,
+    verify_checksum: bool,
+) -> ForstResult<RecordBatch> {
     use arrow::ipc::reader::StreamDecoder;
 
     let data = block.as_slice();
@@ -177,12 +198,22 @@ pub fn decode_data_block_zerocopy(block: &arrow::buffer::Buffer) -> ForstResult<
         )));
     }
     let payload = &data[payload_start..payload_end];
-    let actual_checksum = mask_crc(crc32c(payload));
-    if actual_checksum != header.checksum {
-        return Err(ForstError::corruption(format!(
-            "data block checksum mismatch: expected 0x{:08X}, got 0x{:08X}",
-            header.checksum, actual_checksum
-        )));
+    // FRS-SST-SKIP-READ-CKSUM (B1, 2026-06-04): the per-read crc32c over the whole
+    // block was ~10% of the heavy-join read-path CPU (re-validating each cache-miss
+    // read of data we wrote + that already passed crc on write). When the caller
+    // disables verification (trusted local storage; `FRS_SST_SKIP_READ_CHECKSUM=1`)
+    // we skip it. The Arrow IPC decode below STILL validates structure/offsets, so
+    // a structurally-corrupt block is still rejected — only silent in-bounds bit-rot
+    // goes undetected, which is the explicit, reversible trade this flag makes. The
+    // truncation/header checks above always run.
+    if verify_checksum {
+        let actual_checksum = mask_crc(crc32c(payload));
+        if actual_checksum != header.checksum {
+            return Err(ForstError::corruption(format!(
+                "data block checksum mismatch: expected 0x{:08X}, got 0x{:08X}",
+                header.checksum, actual_checksum
+            )));
+        }
     }
 
     // Obtain the IPC stream as an aligned Arrow Buffer. Uncompressed → a
@@ -378,6 +409,46 @@ mod tests {
         );
     }
 
+    /// FRS-SST-SKIP-READ-CKSUM (B1): `verify_checksum=false` must SKIP the crc32c
+    /// (decoding a block whose stored checksum is wrong but whose payload is intact),
+    /// while `verify_checksum=true` still rejects it. Both modes decode a valid block.
+    #[test]
+    fn zerocopy_decode_checksum_gate() {
+        let batch = make_test_batch(
+            vec![b"k1", b"k2"],
+            vec![Some(b"v1"), Some(b"v2")],
+            vec![1, 2],
+            vec![0, 0],
+        );
+        let encoded = encode_data_block(&batch, CompressionType::None).unwrap();
+
+        // Valid block: both verify modes decode correctly.
+        let ok_block = arrow::buffer::Buffer::from_vec(encoded.clone());
+        assert_eq!(
+            decode_data_block_zerocopy(&ok_block, true).unwrap().num_rows(),
+            2
+        );
+        assert_eq!(
+            decode_data_block_zerocopy(&ok_block, false).unwrap().num_rows(),
+            2
+        );
+
+        // Corrupt ONLY the stored checksum (byte 12) — payload stays valid.
+        let mut corrupt = encoded.clone();
+        corrupt[12] ^= 0xFF;
+        let bad_block = arrow::buffer::Buffer::from_vec(corrupt);
+
+        // verify=true → checksum mismatch rejected.
+        let err = decode_data_block_zerocopy(&bad_block, true);
+        assert!(err.is_err(), "verify=true must reject a corrupt-checksum block");
+        assert!(format!("{}", err.unwrap_err()).contains("checksum mismatch"));
+
+        // verify=false → checksum skipped; the intact payload decodes correctly.
+        let decoded = decode_data_block_zerocopy(&bad_block, false)
+            .expect("verify=false must skip the checksum and decode the intact payload");
+        assert_eq!(decoded.num_rows(), 2);
+    }
+
     #[test]
     fn test_decode_truncated_data() {
         let batch = make_test_batch(vec![b"key"], vec![Some(b"val")], vec![1], vec![0]);
@@ -421,7 +492,7 @@ mod tests {
         let encoded = encode_data_block(&batch, CompressionType::None).unwrap();
         let block = Buffer::from_vec(encoded);
 
-        let decoded = decode_data_block_zerocopy(&block).unwrap();
+        let decoded = decode_data_block_zerocopy(&block, true).unwrap();
 
         // Correctness: identical to the copying decoder.
         assert_eq!(decoded.num_rows(), 3);
@@ -471,7 +542,7 @@ mod tests {
         );
         let encoded = encode_data_block(&batch, CompressionType::Lz4).unwrap();
         let block = Buffer::from_vec(encoded);
-        let decoded = decode_data_block_zerocopy(&block).unwrap();
+        let decoded = decode_data_block_zerocopy(&block, true).unwrap();
         let keys = decoded
             .column(0)
             .as_any()

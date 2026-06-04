@@ -49,8 +49,8 @@ use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::compaction_filter::CompactionFilter;
 use crate::file_deletion_guard::FileDeletionGuard;
 use crate::flush::{
-    sst_file_path, FlushExecutor, FlushJob, FlushQueue, FlushRequest, SST_TMP_PREFIX,
-    SST_TMP_SUFFIX,
+    sst_file_path, CompactionExecutor, CompactionQueue, CompactionRequest, FlushExecutor,
+    FlushJob, FlushQueue, FlushRequest, SST_TMP_PREFIX, SST_TMP_SUFFIX,
 };
 use crate::mvcc::{self, DbId, Snapshot, SnapshotRegistry};
 use crate::runtime_tuning::WriteBufferManager;
@@ -98,6 +98,25 @@ fn apply_block_cache_env_override(cache_bytes: usize) -> usize {
     }
 }
 
+/// FRS-BLOCK-SIZE env override (q4 read-amp experiment, 2026-06-03): force the
+/// SST data-block size (in KiB) via `FRS_BLOCK_SIZE_KB` without a rebuild. The
+/// default is 64 KiB; q4's interval-join probes scatter across keys, so each
+/// ~1-key prefix scan / point read `pread`s + LZ4-decompresses a whole 64 KiB
+/// block for one key — heavy read amplification (the dominant `pread` cost in
+/// the q4 decay profile). RocksDB uses 4-16 KiB blocks. Smaller blocks cut the
+/// bytes read + decompressed per scattered access (at the cost of a larger
+/// index). Bounded to [`MIN_BLOCK_SIZE`, `MAX_BLOCK_SIZE`] by config validation.
+fn apply_block_size_env_override(block_size: usize) -> usize {
+    match std::env::var("FRS_BLOCK_SIZE_KB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&kb| kb > 0)
+    {
+        Some(kb) => kb.saturating_mul(1024),
+        None => block_size,
+    }
+}
+
 /// FRS-SST-COMPRESSION env override (perf experiment, 2026-06-02): force the
 /// SST block compression via `FRS_SST_COMPRESSION=none|lz4|zstd`. A differential
 /// q7 profile showed LZ4 `decompress` is ~43% of the heavy-join prefix-iter CPU
@@ -135,6 +154,9 @@ fn frs_iter_diag_enabled() -> bool {
 /// backpressure is handled by [`WriteController::set_imm_count`] which
 /// stalls writers when imm count >= the configured cap.
 const FLUSH_QUEUE_CAPACITY: usize = 64;
+/// FRS-COMPACT-BG: bounded capacity for the background compaction queue.
+/// Per-CF dedup (`compaction_queued`) keeps the queue tiny in practice.
+const COMPACTION_QUEUE_CAPACITY: usize = 64;
 
 /// Cadence at which the snapshot-age ticker polls
 /// [`SnapshotRegistry::check_long_lived`] (spec §6a.3). One second is
@@ -324,6 +346,18 @@ pub struct DbImpl {
     /// Handle to the background flush worker thread. `Some` while the
     /// engine is alive; taken and joined in [`Drop`] for clean shutdown.
     flush_worker: Mutex<Option<JoinHandle<()>>>,
+    /// FRS-COMPACT-BG: background L0→L1 compaction queue + worker, mirroring
+    /// the flush worker. The flush worker enqueues a compaction request and
+    /// returns immediately instead of compacting inline, so a large
+    /// compaction never blocks flushes (the q11/q4 read-amp decay fix).
+    compaction_queue: Arc<CompactionQueue>,
+    compaction_worker: Mutex<Option<JoinHandle<()>>>,
+    /// Per-CF enqueue-time dedup: a CF whose id is in this set already has a
+    /// compaction queued or running, so re-triggers are dropped (the queue
+    /// holds at most one entry per CF). Cleared at the START of
+    /// `run_compaction` so a re-trigger during a compaction re-queues for the
+    /// next round.
+    compaction_queued: Mutex<std::collections::HashSet<forst_rs_common::ColumnFamilyId>>,
     /// Most recent error from a background flush. Surfaced to the next
     /// writer that calls [`Self::write_single`] / [`Self::batch_write`] so
     /// the application learns about flush failures even though the failing
@@ -402,6 +436,16 @@ pub struct DbImpl {
     /// `deleted_files` entry still exists in the current version and
     /// returns retry-able `ForstError::Busy` otherwise (R44-L2).
     compaction_mutex: Mutex<()>,
+    /// FRS-L0-SHORTCIRCUIT (2026-06-03): diagnostic counter — number of L0 SST
+    /// data-block reads performed during point `get`s inside [`Self::sst_get`].
+    /// The L0 walk now visits files newest-first and STOPS at the first
+    /// Put/Delete base, so an overwrite key present in every L0 SST costs ONE
+    /// block read instead of O(L0). This was the q11/q4 read-amplification
+    /// decay (hot ValueState key Put-overwritten every record → present in
+    /// every L0 SST → bloom can't skip it → the old code read all ~40 blocks
+    /// and discarded 39). Read by the regression test that pins the
+    /// short-circuit and by perf diagnostics.
+    l0_point_get_block_reads: AtomicU64,
 }
 
 impl DbImpl {
@@ -453,6 +497,7 @@ impl DbImpl {
         let options = {
             let mut o = options;
             o.compression = apply_compression_env_override(o.compression);
+            o.block_size = apply_block_size_env_override(o.block_size);
             o
         };
 
@@ -483,8 +528,12 @@ impl DbImpl {
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
         let block_cache = Arc::new(ShardedClockCache::with_capacity(cache_bytes));
+        // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
+        // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
+        // shared-WriteBufferManager model), not 512 MiB × instance-count. The
+        // configured capacity stays the per-instance secondary bound.
         let write_buffer_manager =
-            WriteBufferManager::new(options.write_buffer_manager_capacity_bytes);
+            WriteBufferManager::new_global(options.write_buffer_manager_capacity_bytes);
 
         // FRS-S3-STALL: honour the configured `max_write_buffer_number` in the
         // back-pressure controller. Previously this used
@@ -519,6 +568,9 @@ impl DbImpl {
             next_cf_id: AtomicU32::new(1),
             flush_queue: Arc::new(FlushQueue::new(FLUSH_QUEUE_CAPACITY)),
             flush_worker: Mutex::new(None),
+            compaction_queue: Arc::new(CompactionQueue::new(COMPACTION_QUEUE_CAPACITY)),
+            compaction_worker: Mutex::new(None),
+            compaction_queued: Mutex::new(std::collections::HashSet::new()),
             flush_error: Mutex::new(None),
             fatal_error: Mutex::new(None),
             fatal_error_set: std::sync::atomic::AtomicBool::new(false),
@@ -530,10 +582,12 @@ impl DbImpl {
             snapshot_age_worker: Mutex::new(None),
             snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_mutex: Mutex::new(()),
+            l0_point_get_block_reads: AtomicU64::new(0),
         });
 
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
         Self::spawn_flush_worker(&db);
+        Self::spawn_compaction_worker(&db);
         Self::spawn_snapshot_age_worker(&db);
         Ok(db)
     }
@@ -1995,6 +2049,17 @@ impl DbImpl {
         &self.block_cache
     }
 
+    /// FRS-L0-SHORTCIRCUIT (2026-06-03): cumulative count of L0 SST data-block
+    /// reads performed during point `get`s (see [`Self::sst_get`] and the
+    /// `l0_point_get_block_reads` field). A monotonically-increasing diagnostic
+    /// the regression test snapshots before/after a `get` to assert that a hot
+    /// overwrite key present in N L0 SSTs is resolved with ONE block read
+    /// (newest-first short-circuit), not N.
+    pub fn l0_point_get_block_reads(&self) -> u64 {
+        self.l0_point_get_block_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Returns the cross-CF [`WriteBufferManager`] (B-Prod-P7, spec §6d).
     /// The writer hot path consults this to decide whether to trigger a
     /// flush after a reservation pushes the running sum past the
@@ -2667,14 +2732,18 @@ impl DbImpl {
     /// run an L0→L1 compaction. Returns `Ok(())` either way.
     fn maybe_auto_compact(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
         let l0_count = self.version_set.current().l0_files().len() as u32;
-        // 2026-05-30: tried a low L0 compaction trigger (4) here to shrink L0
-        // read-amp — it did NOT fix the q9 stall (the stall persists with L0≤4,
-        // and trigger=4 stalled EARLIER, ~120s vs ~160s, from frequent inline
-        // compaction on the flush worker). So L0 file count was NOT the wall;
-        // reverted to the tested slowdown trigger. The stall is elsewhere
-        // (memtable prefix-scan over the 6 GiB WBM, or inline-compaction
-        // write-stall) — needs a symbolized profile with L0 small.
-        let trigger = self.write_controller.config().l0_slowdown_trigger;
+        // FRS-COMPACT-BG (2026-06-03): use the dedicated LOW
+        // `l0_compaction_trigger` (default 4), NOT `l0_slowdown_trigger` (40).
+        // Keeping L0 shallow cuts the per-point-read SST scan count
+        // (`get_arc → sst_get`) that drives the q4/q11 decay. The 2026-05-30
+        // note below rejected trigger=4 ONLY because compaction then ran
+        // INLINE on the flush worker (stalled flushes); compaction now runs on
+        // the dedicated background worker (`enqueue_compaction`), so a low
+        // trigger keeps L0 shallow WITHOUT stalling the flush path.
+        // [historical: "2026-05-30: tried a low L0 compaction trigger (4)…it
+        //  stalled EARLIER from frequent INLINE compaction on the flush worker"
+        //  — that inline coupling is exactly what FRS-COMPACT-BG removed.]
+        let trigger = self.write_controller.config().l0_compaction_trigger;
         if l0_count >= trigger {
             // R46-L3: surface which CF triggered the auto-compaction and
             // how many engine-global L0 files are about to be absorbed.
@@ -2700,9 +2769,16 @@ impl DbImpl {
                 l0_count,
                 trigger,
                 other_non_default_cfs = ?other_cf_names,
-                "maybe_auto_compact: triggering L0→L1 compaction"
+                "maybe_auto_compact: enqueueing background L0→L1 compaction"
             );
-            self.compact_l0_for_cf(cf_data)?;
+            // FRS-COMPACT-BG: ENQUEUE to the background compaction worker
+            // instead of compacting INLINE on the flush worker. Inline
+            // compaction blocked subsequent flushes → memtables backed up
+            // (write-stall) + L0 stayed deep → point reads scanned a growing
+            // L0 → throughput decay (q11 665K→37K rec/s). The flush worker now
+            // returns immediately; the "forst-rs-compact" thread keeps L0
+            // shallow concurrently. Errors surface via the flush_error slot.
+            self.enqueue_compaction(cf_data.clone());
         }
         Ok(())
     }
@@ -3509,15 +3585,29 @@ impl DbImpl {
         // cf_id filter, an inter-level compaction could pull SSTs from other
         // CFs into this CF's output, silently merging key streams across CFs.
         let cf_id = cf_data.handle().id();
-        let src_files: Vec<SstFileMeta> = version.levels[level_idx]
+        // FRS-LEVELED-COMPACTION (2026-06-04): bounded input picking. Pick a
+        // SINGLE source file from `level` (the smallest-key one — files are
+        // sorted by smallest_key) plus the next-level files its range
+        // overlaps, instead of rewriting the WHOLE level into the next on
+        // every compaction (the write-amp source that let compaction fall
+        // behind → L0 backup → read-amp + write-stall). The picked file is
+        // consumed (removed from `level`) by this compaction's VersionEdit, so
+        // successive invocations naturally rotate through the level's key
+        // space; the background worker re-triggers while the level stays
+        // over-target. Combined with the multi-file split output, each Ln→Ln+1
+        // compaction now touches O(1 src + its overlap) bytes, not O(level).
+        let all_src: Vec<SstFileMeta> = version.levels[level_idx]
             .files
             .iter()
             .filter(|f| f.cf_id == cf_id)
             .cloned()
             .collect();
-        if src_files.is_empty() {
+        if all_src.is_empty() {
             return Ok(None);
         }
+        // `apply_edit` keeps each level sorted by smallest_key, so `all_src[0]`
+        // is the lowest-key file for this CF — a deterministic, rotating pick.
+        let src_files: Vec<SstFileMeta> = vec![all_src[0].clone()];
         let next_level = level_idx + 1;
         if next_level >= version.num_levels() {
             // Can't go deeper — the engine is at max depth. Treat as no-op.
@@ -3589,12 +3679,20 @@ impl DbImpl {
         // can read the compacted latest state, so they do not require
         // preserving the pre-compaction history below this horizon.
         let min_active_snapshot = self.snapshot_registry.min_active();
+        // FRS-LEVELED-COMPACTION: split this Ln→Ln+1 output into ~target-sized
+        // SSTs so the destination level holds MULTIPLE non-overlapping files.
+        let target_file_size = self.options.target_file_size_base as u64;
+        let total_input_bytes: u64 = inputs.iter().map(|(_, m, _)| m.file_size).sum();
+        let additional_outputs =
+            self.alloc_compaction_output_slots(total_input_bytes, target_file_size);
         let job = CompactionJob {
             cf_id: cf_data.handle().id(),
             inputs,
             output_level: next_level as u32,
             output_file_number,
             output_path: output_path.clone(),
+            additional_outputs,
+            target_file_size,
             writer_options,
             fs: self.fs.clone(),
             merge_operator: cf_data.merge_operator().cloned(),
@@ -3608,40 +3706,40 @@ impl DbImpl {
         };
         // R44-H1 / R44-L2: apply may return `Busy` if a stale-edit slipped
         // past the compaction_mutex (defense-in-depth). On reject, remove
-        // the orphaned output SST so it doesn't leak.
+        // EVERY orphaned output SST so they don't leak.
         if let Err(e) = self.version_set.apply(&edit) {
-            // R45-L1: this unlink intentionally bypasses
-            // `delete_file_guarded`. The output file was freshly minted
-            // for this compaction and the `apply` call failed BEFORE the
-            // file was installed into any Version, so no checkpoint, no
-            // reader, and no concurrent compaction can have observed —
-            // let alone pinned — `output_file_number`. The guard's
-            // pin-count for it must be zero; assert it in debug builds
-            // so any future regression (e.g. someone pinning before
-            // apply) trips the test suite loudly.
-            debug_assert!(
-                self.deletion_guard.can_delete(output_file_number),
-                "orphan-delete bypass for L→L+1 output {} is unsafe: file is pinned",
-                output_file_number.value()
-            );
-            if let Err(rm_err) = self.fs.delete_file(&output_path) {
-                tracing::warn!(
-                    target: "forst_rs_engine::compaction",
-                    file_number = output_file_number.value(),
-                    error = %rm_err,
-                    "failed to remove orphaned L→L+1 compaction output after stale-edit reject"
+            // R45-L1 (multi-file): each output file was freshly minted for this
+            // compaction and `apply` failed BEFORE installation, so no
+            // checkpoint / reader / sibling compaction can have observed — let
+            // alone pinned — any of them. The guard's pin-count for each must
+            // be zero; assert in debug builds.
+            for (_, meta) in &edit.new_files {
+                debug_assert!(
+                    self.deletion_guard.can_delete(meta.file_number),
+                    "orphan-delete bypass for L→L+1 output {} is unsafe: file is pinned",
+                    meta.file_number.value()
                 );
+                let p = compaction_output_path(&self.db_path, meta.file_number);
+                if let Err(rm_err) = self.fs.delete_file(&p) {
+                    tracing::warn!(
+                        target: "forst_rs_engine::compaction",
+                        file_number = meta.file_number.value(),
+                        error = %rm_err,
+                        "failed to remove orphaned L→L+1 compaction output after stale-edit reject"
+                    );
+                }
             }
             return Err(e);
         }
 
         let new_meta = edit.new_files.first().map(|(_, m)| m.clone());
-        if let Some(ref meta) = new_meta {
+        for (_, meta) in &edit.new_files {
             // 2026-05-29 WRITE-BACK FLUSH: the compaction-output SST upload was
             // spawned by `close()`; await it before opening a reader straight
             // off the remote so the cached reader sees the fully-uploaded object.
-            self.fs.await_upload(&output_path)?;
-            let rac = self.fs.open_random_access_file(&output_path)?;
+            let p = compaction_output_path(&self.db_path, meta.file_number);
+            self.fs.await_upload(&p)?;
+            let rac = self.fs.open_random_access_file(&p)?;
             let reader = Arc::new(SstReaderImpl::open(rac)?);
             let inserted = reader;
             self.sst_readers.rcu(|cur| {
@@ -4313,8 +4411,12 @@ impl DbImpl {
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
         let block_cache = Arc::new(ShardedClockCache::with_capacity(cache_bytes));
+        // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
+        // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
+        // shared-WriteBufferManager model), not 512 MiB × instance-count. The
+        // configured capacity stays the per-instance secondary bound.
         let write_buffer_manager =
-            WriteBufferManager::new(options.write_buffer_manager_capacity_bytes);
+            WriteBufferManager::new_global(options.write_buffer_manager_capacity_bytes);
 
         // FRS-S3-STALL (reopen path): mirror the open-path wiring so a restored
         // DB honours the configured `max_write_buffer_number` too. See the
@@ -4348,6 +4450,9 @@ impl DbImpl {
             next_cf_id: AtomicU32::new(1),
             flush_queue: Arc::new(FlushQueue::new(FLUSH_QUEUE_CAPACITY)),
             flush_worker: Mutex::new(None),
+            compaction_queue: Arc::new(CompactionQueue::new(COMPACTION_QUEUE_CAPACITY)),
+            compaction_worker: Mutex::new(None),
+            compaction_queued: Mutex::new(std::collections::HashSet::new()),
             flush_error: Mutex::new(None),
             fatal_error: Mutex::new(None),
             fatal_error_set: std::sync::atomic::AtomicBool::new(false),
@@ -4359,6 +4464,7 @@ impl DbImpl {
             snapshot_age_worker: Mutex::new(None),
             snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_mutex: Mutex::new(()),
+            l0_point_get_block_reads: AtomicU64::new(0),
         });
 
         let default_desc = if let Some(cf) = snapshot
@@ -4446,6 +4552,7 @@ impl DbImpl {
         }
 
         Self::spawn_flush_worker(&db);
+        Self::spawn_compaction_worker(&db);
         Self::spawn_snapshot_age_worker(&db);
         Ok(db)
     }
@@ -5010,6 +5117,34 @@ impl DbImpl {
         Self::open_from_checkpoint_with_default_cf(options, fs, default_desc)
     }
 
+    /// FRS-LEVELED-COMPACTION (2026-06-04): pre-allocate the ADDITIONAL output
+    /// slots a [`CompactionJob`] may roll into when splitting its output into
+    /// ~`target` SSTs. File-number allocation lives in the VersionSet, so the
+    /// caller mints them here; the job uses as many as the input size requires
+    /// and leaves the rest unused (consumed from the monotonic allocator but no
+    /// on-disk file is created — nothing to clean up). Count = floor(bytes /
+    /// target) + 2 margin, capped, so combined with the job's uncapped final
+    /// slot we never run out. Returns empty when splitting is disabled.
+    fn alloc_compaction_output_slots(
+        &self,
+        total_input_bytes: u64,
+        target: u64,
+    ) -> Vec<(FileNumber, std::path::PathBuf)> {
+        if target == 0 {
+            return Vec::new();
+        }
+        let additional = ((total_input_bytes / target) as usize)
+            .saturating_add(2)
+            .min(4096);
+        (0..additional)
+            .map(|_| {
+                let n = self.version_set.allocate_file_number();
+                let p = compaction_output_path(&self.db_path, n);
+                (n, p)
+            })
+            .collect()
+    }
+
     fn compact_l0_for_cf(
         &self,
         cf_data: &Arc<ColumnFamilyData>,
@@ -5097,12 +5232,22 @@ impl DbImpl {
         // otherwise no-snapshot L0 rollups retain every latest version
         // and fail to drop bottommost tombstones or collapse merges.
         let min_active_snapshot = self.snapshot_registry.min_active();
+        // FRS-LEVELED-COMPACTION: split the L0→L1 output into ~target-sized
+        // SSTs so L1 holds MULTIPLE non-overlapping files — a later Ln→Ln+1
+        // compaction can then pick a bounded SUBSET instead of rewriting the
+        // whole level (the write-amp source). target=0 ⇒ single-file legacy.
+        let target_file_size = self.options.target_file_size_base as u64;
+        let total_input_bytes: u64 = inputs.iter().map(|(_, m, _)| m.file_size).sum();
+        let additional_outputs =
+            self.alloc_compaction_output_slots(total_input_bytes, target_file_size);
         let job = CompactionJob {
             cf_id: cf_data.handle().id(),
             inputs,
             output_level: 1,
             output_file_number,
             output_path: output_path.clone(),
+            additional_outputs,
+            target_file_size,
             writer_options,
             fs: self.fs.clone(),
             merge_operator: cf_data.merge_operator().cloned(),
@@ -5123,48 +5268,48 @@ impl DbImpl {
         // case the staged output SST is orphaned on disk — delete it so
         // we don't leak a file that no Version references.
         if let Err(e) = self.version_set.apply(&edit) {
-            // Best-effort cleanup of the orphaned compaction output. The
-            // file is not referenced by any Version (apply failed before
-            // installation), so it is safe to remove without going through
-            // delete_file_guarded.
+            // Best-effort cleanup of EVERY orphaned compaction output. None are
+            // referenced by any Version (apply failed before installation), so
+            // they are safe to remove without going through delete_file_guarded.
             //
-            // R45-L1: this bypass of `delete_file_guarded` is sound because
-            // `output_file_number` was just allocated for this compaction
-            // job and never installed into a Version — no checkpoint /
-            // reader / sibling compaction can have observed it, so the
-            // deletion guard's pin count for it must be zero. Debug
-            // builds assert this invariant; release builds rely on the
-            // documented allocation+install ordering.
-            debug_assert!(
-                self.deletion_guard.can_delete(output_file_number),
-                "orphan-delete bypass for L0→L1 output {} is unsafe: file is pinned",
-                output_file_number.value()
-            );
-            if let Err(rm_err) = self.fs.delete_file(&output_path) {
-                tracing::warn!(
-                    target: "forst_rs_engine::compaction",
-                    file_number = output_file_number.value(),
-                    error = %rm_err,
-                    "failed to remove orphaned L0→L1 compaction output after stale-edit reject"
+            // R45-L1 (multi-file): every output file number was just allocated
+            // for this job and never installed into a Version — no checkpoint /
+            // reader / sibling compaction can have observed any of them, so the
+            // deletion guard's pin count for each must be zero.
+            for (_, meta) in &edit.new_files {
+                debug_assert!(
+                    self.deletion_guard.can_delete(meta.file_number),
+                    "orphan-delete bypass for L0→L1 output {} is unsafe: file is pinned",
+                    meta.file_number.value()
                 );
+                let p = compaction_output_path(&self.db_path, meta.file_number);
+                if let Err(rm_err) = self.fs.delete_file(&p) {
+                    tracing::warn!(
+                        target: "forst_rs_engine::compaction",
+                        file_number = meta.file_number.value(),
+                        error = %rm_err,
+                        "failed to remove orphaned L0→L1 compaction output after stale-edit reject"
+                    );
+                }
             }
             return Err(e);
         }
 
-        // Open the new reader, prune deleted readers, and delete stale files
-        // from disk.
+        // Open a reader for EVERY new output file, prune deleted readers, and
+        // delete stale files from disk.
         let new_meta = edit.new_files.first().map(|(_, m)| m.clone());
-        if let Some(ref meta) = new_meta {
+        for (_, meta) in &edit.new_files {
             // 2026-05-29 WRITE-BACK FLUSH: the compaction-output SST upload was
             // spawned by `close()`; await it before opening a reader straight
             // off the remote so the cached reader sees the fully-uploaded object.
-            self.fs.await_upload(&output_path)?;
-            let rac = self.fs.open_random_access_file(&output_path)?;
+            let p = compaction_output_path(&self.db_path, meta.file_number);
+            self.fs.await_upload(&p)?;
+            let rac = self.fs.open_random_access_file(&p)?;
             let reader = Arc::new(SstReaderImpl::open(rac)?);
-            let inserted = reader;
+            let fnum = meta.file_number;
             self.sst_readers.rcu(|cur| {
                 let mut next = (**cur).clone();
-                next.insert(meta.file_number, std::sync::Arc::clone(&inserted));
+                next.insert(fnum, std::sync::Arc::clone(&reader));
                 std::sync::Arc::new(next)
             });
         }
@@ -5498,6 +5643,10 @@ impl DbImpl {
         let resident_entries = cf_data.resident_flushed_visible_entries(&live_files);
         let mut resident_shadowed: std::collections::HashSet<FileNumber> =
             std::collections::HashSet::new();
+        // FRS-RESIDENT-BLOOM-SKIP (2026-06-03): snapshot the SST reader cache once so
+        // each resident entry can consult its source SST's decode-free index/bloom
+        // prune (`may_contain_range`) BEFORE paying the O(log N) memtable BTreeMap seek.
+        let readers_snapshot = self.sst_readers.load();
         for entry in resident_entries {
             // Range-overlap test (inclusive max, exclusive upper) mirroring the
             // SST skip at Tier 3. Empty bounds = unknown range → never skip.
@@ -5509,6 +5658,26 @@ impl DbImpl {
                     if entry.min_key.as_slice() >= hi {
                         continue;
                     }
+                }
+            }
+            // FRS-RESIDENT-BLOOM-SKIP: the #1 q4/q7/q9 decay cost (symbolized profile:
+            // `btree::search::find_lower_bound_index`) is the per-probe BTreeMap
+            // lower-bound seek over the resident-shadow memtables — and `FRS_ITER_DIAG`
+            // showed most return ZERO keys (a coarse min/max-bounds overlap is far too
+            // permissive for a 36-byte join prefix). Unlike RocksDB's flushed L0 SSTs,
+            // a resident memtable has no bloom/index gate, so it pays the full seek even
+            // when the prefix is absent — that gap is exactly why forst-rs decays while
+            // RocksDB stays flat. The resident memtable is BYTE-IDENTICAL to its source
+            // SST (same seqs), so the SST reader's `may_contain_range` (the SAME
+            // decode-free sparse-index + bloom prune the Tier-3 SST loop trusts) is a
+            // SOUND gate: when it proves the prefix range empty, the key is absent from
+            // BOTH the resident copy and the SST, so we skip the seek AND keep the SST
+            // shadowed (Tier 3 correctly skips it too — no data is missed). Falls back to
+            // seeking when the reader isn't cached yet (e.g. async-upload window).
+            if let Some(reader) = readers_snapshot.get(&entry.file_number) {
+                if !reader.may_contain_range(prefix, upper_slice) {
+                    resident_shadowed.insert(entry.file_number);
+                    continue;
                 }
             }
             let resident_cursor = entry.memtable.prefix_scan_cursor(prefix, upper_slice);
@@ -5530,19 +5699,19 @@ impl DbImpl {
         let mut sst_considered: usize = 0;
         // Tier 3: overlapping SSTs, block-streaming. 2026-05-29 PERF: borrow
         // SST metadata (no per-scan clone of every SstFileMeta + its keys).
-        for sst in version.live_sst_files_iter() {
+        // FRS-PERLEVEL-SCAN (2026-06-04): locate the overlapping SSTs per level
+        // via a binary-search-bounded walk instead of a flat O(total_files)
+        // range check over `live_sst_files_iter()`. The locator applies the
+        // SAME overlap predicate (`largest_key >= prefix && smallest_key <
+        // upper`), so the considered file set is byte-for-byte identical — it
+        // just bounds each level's scan to the files that start before `upper`.
+        let mut overlapping_ssts: Vec<&forst_rs_storage::version::SstFileMeta> = Vec::new();
+        version.overlapping_ssts_in_range(prefix, upper_slice, &mut overlapping_ssts);
+        for sst in overlapping_ssts {
             // FRS-RESIDENT-FLUSHED: skip SSTs whose data is currently served
             // from Tier 2 by a resident memtable (same content, same seqs).
             if resident_shadowed.contains(&sst.file_number) {
                 continue;
-            }
-            if sst.largest_key.as_slice() < prefix {
-                continue;
-            }
-            if let Some(hi) = upper_slice {
-                if sst.smallest_key.as_slice() >= hi {
-                    continue;
-                }
             }
             if diag {
                 sst_considered += 1;
@@ -5675,15 +5844,11 @@ impl DbImpl {
         // Tier 3: overlapping SSTs, block-streaming. Same per-SST overlap
         // filter as the prefix path. 2026-05-29 PERF: borrow (no clone).
         let version = self.version_set.current();
-        for sst in version.live_sst_files_iter() {
-            if sst.largest_key.as_slice() < lower {
-                continue;
-            }
-            if let Some(hi) = upper {
-                if sst.smallest_key.as_slice() >= hi {
-                    continue;
-                }
-            }
+        // FRS-PERLEVEL-SCAN (2026-06-04): per-level binary-search-bounded
+        // overlap location (identical file set to the flat range check).
+        let mut overlapping_ssts: Vec<&forst_rs_storage::version::SstFileMeta> = Vec::new();
+        version.overlapping_ssts_in_range(lower, upper, &mut overlapping_ssts);
+        for sst in overlapping_ssts {
             let reader = self.get_or_open_sst_reader(sst)?;
             // FRS-PREFIX-SEEK: seek to the first index block >= lower (see sister
             // site in prefix_scan_iter_owned*) instead of scanning from block 0.
@@ -6289,6 +6454,34 @@ impl DbImpl {
         *db.flush_worker.lock().expect("lock poisoned") = Some(handle);
     }
 
+    /// FRS-COMPACT-BG: spawns the background compaction worker thread.
+    /// Mirrors [`Self::spawn_flush_worker`]. The worker drains the compaction
+    /// queue and runs L0→L1 compaction off the flush worker's stack so a
+    /// large compaction never blocks flushes. Errors route into the same
+    /// `flush_error` slot so the next writer surfaces them.
+    fn spawn_compaction_worker(db: &Arc<Self>) {
+        let rx = match db.compaction_queue.take_receiver() {
+            Some(rx) => rx,
+            None => {
+                debug_assert!(false, "compaction worker spawned more than once");
+                return;
+            }
+        };
+        let weak: Weak<DbImpl> = Arc::downgrade(db);
+        let weak_for_err = Weak::clone(&weak);
+        let handle = std::thread::Builder::new()
+            .name("forst-rs-compact".to_string())
+            .spawn(move || {
+                crate::flush::compaction_loop(rx, weak, move |err| {
+                    if let Some(db) = weak_for_err.upgrade() {
+                        db.record_flush_error(err);
+                    }
+                });
+            })
+            .expect("failed to spawn compaction worker thread");
+        *db.compaction_worker.lock().expect("lock poisoned") = Some(handle);
+    }
+
     /// Spawns the background snapshot-age ticker (spec §6a.3).
     ///
     /// The ticker runs at [`SNAPSHOT_AGE_TICK_MS`] cadence and emits a
@@ -6369,6 +6562,28 @@ impl DbImpl {
                 self.pending_flush_count.fetch_sub(1, Ordering::AcqRel);
                 Err(e)
             }
+        }
+    }
+
+    /// FRS-COMPACT-BG: non-blocking, per-CF-deduped enqueue of an L0→L1
+    /// compaction. Called by the flush worker (`maybe_auto_compact`) instead
+    /// of compacting inline. If a compaction for this CF is already queued or
+    /// running, the trigger is dropped (the queue holds ≤1 entry per CF).
+    fn enqueue_compaction(&self, cf_data: Arc<ColumnFamilyData>) {
+        let cf_id = cf_data.handle().id();
+        {
+            let mut q = self.compaction_queued.lock().expect("lock poisoned");
+            if !q.insert(cf_id) {
+                return; // already queued/running for this CF
+            }
+        }
+        if self
+            .compaction_queue
+            .enqueue(CompactionRequest { cf_data })
+            .is_err()
+        {
+            // engine shutting down — clear the flag we just set.
+            self.compaction_queued.lock().expect("lock poisoned").remove(&cf_id);
         }
     }
 
@@ -7286,6 +7501,63 @@ impl DbImpl {
         self.sst_get(cf_data, &version, key, &mut Vec::new())
     }
 
+    /// FRS-L0-SHORTCIRCUIT (2026-06-03): consumes one SST `LookupResult` during
+    /// [`Self::sst_get`]'s L0 walk. Returns `Break(value)` when a Put/Delete base
+    /// is reached (the value, with any accumulated merge operands applied) — the
+    /// caller stops walking older L0 SSTs; `Continue` when a Merge operand was
+    /// pushed and the walk must proceed to the next-older version. The arms are
+    /// the proven B-R27-NEW-H1 / A-R6-H2 corruption-checking logic, factored out
+    /// so the newest-first short-circuit and the overlap fallback share one path.
+    fn sst_get_consume_l0(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+        key: &[u8],
+        res: forst_rs_storage::sst::LookupResult,
+        merge_operands: &mut Vec<Vec<u8>>,
+    ) -> ForstResult<std::ops::ControlFlow<Option<Vec<u8>>>> {
+        use std::ops::ControlFlow;
+        match res.op_type {
+            OpType::Put => {
+                // B-R27-NEW-H1: a Put with `value=None` is a corrupt SST row —
+                // Put MUST carry a payload. Fail loud (sister `iter_versions_of`
+                // raises corruption for this exact shape).
+                if res.value.is_none() {
+                    return Err(ForstError::corruption(
+                        "sst_get: L0 Put missing value payload",
+                    ));
+                }
+                if merge_operands.is_empty() {
+                    return Ok(ControlFlow::Break(res.value));
+                }
+                self.apply_merge_operator(cf_data, key, res.value, std::mem::take(merge_operands))
+                    .map(|v| ControlFlow::Break(Some(v)))
+            }
+            OpType::Delete | OpType::SingleDelete => {
+                // B-R27-NEW-H1: a tombstone carrying a payload is corrupt.
+                if res.value.is_some() {
+                    return Err(ForstError::corruption(
+                        "sst_get: L0 tombstone carries value payload",
+                    ));
+                }
+                if merge_operands.is_empty() {
+                    return Ok(ControlFlow::Break(None));
+                }
+                self.apply_merge_operator(cf_data, key, None, std::mem::take(merge_operands))
+                    .map(|v| ControlFlow::Break(Some(v)))
+            }
+            OpType::Merge => match res.value {
+                // A-R6-H2: surface corruption on a missing operand payload.
+                Some(v) => {
+                    merge_operands.push(v);
+                    Ok(ControlFlow::Continue(()))
+                }
+                None => Err(ForstError::corruption(
+                    "sst_get: L0 Merge missing operand payload",
+                )),
+            },
+        }
+    }
+
     /// Searches the SST layers for `key`. Returns the resolved user value
     /// (None for missing / tombstoned) — including full merge chains that
     /// start in the SST layer.
@@ -7304,83 +7576,77 @@ impl DbImpl {
         merge_operands: &mut Vec<Vec<u8>>,
     ) -> ForstResult<Option<Vec<u8>>> {
         let cf_id = cf_data.handle().id();
-        // L0: files may overlap and the Version keeps them ordered for
-        // metadata search, not chronology. Collect every matching row, then
-        // apply the same newest-visible rule readers use inside a single SST:
-        // sequence desc, file_number desc as a tie-breaker.
-        let mut l0_hits = Vec::new();
-        for sst in version.l0_files() {
-            // R49-H1: skip SSTs from other CFs.
-            if sst.cf_id != cf_id {
-                continue;
-            }
-            for res in self.sst_lookup_versions(sst, key)? {
-                l0_hits.push((res.sequence, sst.file_number.value(), res));
-            }
-        }
-        l0_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-        for (_, _, res) in l0_hits {
-            match res.op_type {
-                OpType::Put => {
-                    // B-R27-NEW-H1: a Put with `value=None` indicates a
-                    // corrupt SST row — Put MUST carry a payload. The
-                    // sister `iter_versions_of` raises corruption for
-                    // this exact shape (D-R8-NEW-H3); the latest-view
-                    // `sst_get` path previously returned `Ok(None)`,
-                    // silently turning corruption into a phantom
-                    // deletion. Fail loud here to match the snapshot
-                    // path's contract.
-                    if res.value.is_none() {
-                        return Err(ForstError::corruption(
-                            "sst_get: L0 Put missing value payload",
-                        ));
-                    }
-                    if merge_operands.is_empty() {
-                        return Ok(res.value);
-                    }
-                    return self
-                        .apply_merge_operator(
-                            cf_data,
-                            key,
-                            res.value,
-                            std::mem::take(merge_operands),
-                        )
-                        .map(Some);
+        use std::ops::ControlFlow;
+
+        // L0 read with NEWEST-FIRST short-circuit (FRS-L0-SHORTCIRCUIT 2026-06-03).
+        //
+        // L0 files are stored sorted by smallest_key (Version::apply_edit), not
+        // by recency. Under the single-worker SEQUENTIAL flush each new L0 SST
+        // carries a strictly higher sequence range than the previous one
+        // (compaction output goes to L1, never L0), so per-CF the L0 files have
+        // DISJOINT, descending [min_sequence, max_sequence] ranges. Sorting them
+        // by max_sequence DESC therefore reproduces the EXACT global newest-first
+        // order the old code obtained by collecting every row and sorting by
+        // (sequence desc, file desc) — but now files are read lazily and we STOP
+        // at the first Put/Delete base. For a hot ValueState key Put-overwritten
+        // on every record (present in EVERY L0 SST, so the per-SST bloom filter
+        // cannot skip any), this turns O(L0) data-block reads into ONE — the
+        // q11/q4 read-amplification decay once the working set spills past the
+        // resident RAM shadow.
+        let mut l0: Vec<&SstFileMeta> =
+            version.l0_files().iter().filter(|s| s.cf_id == cf_id).collect();
+        l0.sort_by(|a, b| {
+            b.max_sequence
+                .cmp(&a.max_sequence)
+                .then_with(|| b.file_number.value().cmp(&a.file_number.value()))
+        });
+        // The disjoint-range property is the correctness premise of the
+        // file-ordered short-circuit. The only way L0 ranges can overlap is
+        // externally-ingested SSTs landing in L0 with non-monotonic sequences;
+        // if that is ever observed we fall back to the read-all + global-sort
+        // walk, which is correct regardless of file ordering.
+        let l0_disjoint = l0
+            .windows(2)
+            .all(|w| w[0].min_sequence > w[1].max_sequence);
+
+        if l0_disjoint {
+            // Newest-first lazy walk: a Put/Delete base resolves the read and we
+            // never open the older L0 SSTs; a Merge accumulates and continues.
+            for sst in &l0 {
+                let versions = self.sst_lookup_versions(sst, key)?;
+                if versions.is_empty() {
+                    continue; // bloom miss / range miss — no data block read
                 }
-                OpType::Delete | OpType::SingleDelete => {
-                    // B-R27-NEW-H1: a tombstone carrying a payload is
-                    // corrupt — sister sites in iter_versions_of raise
-                    // corruption here too. Pre-fix sst_get silently
-                    // accepted it.
-                    if res.value.is_some() {
-                        return Err(ForstError::corruption(
-                            "sst_get: L0 tombstone carries value payload",
-                        ));
+                self.l0_point_get_block_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for res in versions {
+                    if let ControlFlow::Break(v) =
+                        self.sst_get_consume_l0(cf_data, key, res, merge_operands)?
+                    {
+                        return Ok(v);
                     }
-                    if merge_operands.is_empty() {
-                        return Ok(None);
-                    }
-                    return self
-                        .apply_merge_operator(cf_data, key, None, std::mem::take(merge_operands))
-                        .map(Some);
                 }
-                OpType::Merge => {
-                    // A-R6-H2: surface corruption on missing operand
-                    // payload — sister site missed by A-R5R-NEW-H1 /
-                    // C-R5-H1. The peel paths already raise corruption;
-                    // sst_get's L0 walk silently dropped the operand
-                    // and continued, returning wrong merged values
-                    // under counter / list-append / serializer
-                    // operators.
-                    match res.value {
-                        Some(v) => merge_operands.push(v),
-                        None => {
-                            return Err(ForstError::corruption(
-                                "sst_get: L0 Merge missing operand payload",
-                            ));
-                        }
-                    }
-                    // continue down the LSM
+            }
+        } else {
+            // Overlap fallback (ingested SSTs): collect every matching row across
+            // L0, sort globally by (sequence desc, file desc), then walk.
+            let mut l0_hits = Vec::new();
+            for sst in &l0 {
+                let versions = self.sst_lookup_versions(sst, key)?;
+                if !versions.is_empty() {
+                    self.l0_point_get_block_reads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                for res in versions {
+                    l0_hits.push((res.sequence, sst.file_number.value(), res));
+                }
+            }
+            l0_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+            for (_, _, res) in l0_hits {
+                if let ControlFlow::Break(v) =
+                    self.sst_get_consume_l0(cf_data, key, res, merge_operands)?
+                {
+                    return Ok(v);
                 }
             }
         }
@@ -7876,39 +8142,19 @@ impl DbImpl {
         start_cutoff: u64,
         operands: &mut Vec<Vec<u8>>,
     ) -> ForstResult<Option<MergeBase>> {
-        let mut cutoff = start_cutoff;
-        loop {
-            let hit = mem_arc.get(key, cutoff)?;
-            let Some(entry) = hit else { return Ok(None) };
-            match entry.op_type {
-                OpType::Put => return Ok(Some(MergeBase { value: entry.value })),
-                OpType::Delete | OpType::SingleDelete => {
-                    return Ok(Some(MergeBase { value: None }))
-                }
-                OpType::Merge => {
-                    // A-R5R-NEW-H1: a Merge entry with value=None is a
-                    // corrupted record (the latest-view outer-hit path
-                    // already rejects this shape, and C-R5-H1 added the
-                    // same rejection to the snapshot path's
-                    // iter_versions_of). Pre-fix the older-merge-peel
-                    // sites silently dropped the operand, handing the
-                    // merge operator a short operand list. Surface
-                    // corruption so the read fails fast with the same
-                    // diagnostic as the outer-hit path.
-                    match entry.value {
-                        Some(v) => operands.push(v),
-                        None => {
-                            return Err(ForstError::corruption(
-                                "peel_merges_from_memtable: Merge entry missing operand payload",
-                            ));
-                        }
-                    }
-                    if entry.sequence == 0 {
-                        return Ok(None);
-                    }
-                    cutoff = entry.sequence - 1;
-                }
-            }
+        // FRS-MERGE-PERF (2026-06-03): single O(N log N)-pass collection over the
+        // key's version list. The prior loop called `mem_arc.get(key, cutoff)`
+        // once per operand, and each `get` scans the key's whole `row_indices`
+        // (find_latest) — so a hot key with N merge operands cost N × O(N) =
+        // O(N²) per read. That spun `vectorizedBatchGet` >180s on q5's
+        // WindowJoin list-valued state and killed the TaskManager (symbolized
+        // sample: 100 % CPU in collect_merge_operands → peel_merges_from_memtable
+        // → ShardedMemTable::get). The new `collect_merge_operands` takes the
+        // shard lock ONCE and folds the chain in one pass. The Merge-with-no-
+        // payload corruption guard (A-R5R-NEW-H1) moved into that method.
+        match mem_arc.collect_merge_operands(key, start_cutoff, operands)? {
+            Some(value) => Ok(Some(MergeBase { value })),
+            None => Ok(None),
         }
     }
 
@@ -8232,6 +8478,23 @@ impl FlushExecutor for DbImpl {
     }
 }
 
+/// FRS-COMPACT-BG: bridges the background compaction worker into the engine.
+impl CompactionExecutor for DbImpl {
+    fn run_compaction(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
+        // Clear the per-CF dedup flag FIRST so a trigger that arrives WHILE
+        // this compaction runs re-queues for the next round (no missed
+        // compaction). `compact_l0_for_cf` re-reads the current L0 set under
+        // `compaction_mutex`, so back-to-back runs pick disjoint inputs and
+        // a no-op (nothing to compact) is harmless.
+        self.compaction_queued
+            .lock()
+            .expect("lock poisoned")
+            .remove(&cf_data.handle().id());
+        self.compact_l0_for_cf(cf_data)?;
+        Ok(())
+    }
+}
+
 /// Drains pending flushes and joins the worker thread on shutdown so no
 /// data is lost. We never panic in `Drop` (would abort the process under
 /// double-panic) — instead we log and continue. The Mutex around the
@@ -8279,6 +8542,36 @@ impl Drop for DbImpl {
             if let Err(e) = h.join() {
                 eprintln!("forst-rs: flush worker panicked during shutdown: {:?}", e);
             }
+        }
+
+        // 3b. FRS-COMPACT-BG: shut down the background compaction worker AFTER
+        //     the flush worker joins (so any compaction the flush worker
+        //     enqueued during the final drain is accepted), then join it.
+        //     Best-effort: queued-but-unstarted compactions are NOT awaited —
+        //     the data is already durable in the L0 SSTs; L0 staying slightly
+        //     deep at shutdown is harmless.
+        self.compaction_queue = Arc::new(CompactionQueue::new(1));
+        let compact_handle = self
+            .compaction_worker
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        if let Some(h) = compact_handle {
+            if let Err(e) = h.join() {
+                eprintln!(
+                    "forst-rs: compaction worker panicked during shutdown: {:?}",
+                    e
+                );
+            }
+        }
+        // A final compaction may have produced an SST upload after install;
+        // drain it for remote durability (cheap no-op if nothing pending).
+        if let Err(e) = self.fs.await_all_uploads() {
+            tracing::warn!(
+                target: "forst_rs_engine::db",
+                error = %e,
+                "DbImpl::drop: compaction upload drain failed during shutdown",
+            );
         }
 
         // 4. Signal the snapshot-age ticker to stop. The worker checks
@@ -8417,7 +8710,6 @@ impl TierKeySource {
                     // Range-skip empty blocks before paying decompression.
                     let block_idx = *next_block;
                     *next_block += 1;
-                    let batch = reader.read_block_at(block_idx)?;
                     buffered.clear();
                     *pos = 0;
                     // 2026-06-02 q7 SECOND-wall FIX: upper-bound early termination.
@@ -8430,7 +8722,7 @@ impl TierKeySource {
                     // whole SST tail: measured 46 ms/probe returning 0 rows over 1 SST
                     // source — the q7 ckpt-ON ~100/s join-throughput collapse.
                     let mut hit_upper = false;
-                    forst_rs_storage::sst::for_each_row_in_batch(&batch, |view| {
+                    reader.for_each_row_in_block(block_idx, |view| {
                         if hit_upper {
                             // Already past the upper bound; remaining rows in this
                             // block are all >= upper (ASC). Cheap skip; we mark the
@@ -8753,6 +9045,140 @@ mod tests {
     }
 
     // --- bring-up ---
+
+    /// FRS-L0-SHORTCIRCUIT (2026-06-03): a hot key Put-overwritten on every
+    /// flush lands in EVERY L0 SST (the bloom filter cannot skip any of them
+    /// because the key genuinely IS present), so the L0 point-read walk must
+    /// stop at the NEWEST SST's Put base — one block read — instead of reading
+    /// all N L0 SSTs and discarding the N-1 stale versions. The old walk paid
+    /// O(L0) per point read, which is the q11/q4 read-amplification decay as L0
+    /// grew. Asserts both correctness (newest value wins) and the O(1) read.
+    #[test]
+    fn test_l0_point_get_short_circuits_at_newest_base() {
+        let db = open();
+        let cf = db.default_cf();
+
+        // N below the l0_compaction_trigger (40) so background compaction does
+        // not collapse the L0 files out from under us. Each put+flush mints one
+        // L0 SST containing "hot" (disjoint, ascending sequence ranges).
+        const N: usize = 8;
+        for i in 0..N {
+            db.put(&cf, b"hot", format!("v{i}").as_bytes()).unwrap();
+            // Seal the active memtable to immutable, then flush it: flush_cf
+            // alone only drains the imm queue, and `put` lands in the ACTIVE
+            // memtable (never sealed), so without the switch nothing flushes.
+            db.force_switch_memtable(&cf).unwrap();
+            db.flush_cf(&cf).unwrap();
+        }
+
+        // Exercise the SST L0 walk DIRECTLY: get_internal's Stage 2.5 resident
+        // RAM-shadow would otherwise serve "hot" from the just-flushed decoded
+        // memtable and never touch sst_get. The L0 read amplification under
+        // test lives entirely in sst_get (Stage 3), which is what q11/q4 hit
+        // once their working set spills past the resident shadow cap.
+        let cf_data = db.lookup_cf_by_id(cf.id()).unwrap();
+        let version = db.version_set.current();
+        let layout: Vec<usize> = (0..version.num_levels())
+            .map(|l| version.levels[l].files.iter().filter(|s| s.cf_id == cf.id()).count())
+            .collect();
+        assert!(
+            version.l0_files().iter().filter(|s| s.cf_id == cf.id()).count() >= N,
+            "expected at least {N} L0 SSTs each holding 'hot'; per-level layout = {layout:?}"
+        );
+
+        let before = db.l0_point_get_block_reads();
+        let mut operands = Vec::new();
+        let got = db.sst_get(&cf_data, &version, b"hot", &mut operands).unwrap();
+        let reads = db.l0_point_get_block_reads() - before;
+
+        assert_eq!(
+            got,
+            Some(format!("v{}", N - 1).as_bytes().to_vec()),
+            "point read must return the newest overwrite"
+        );
+        assert_eq!(
+            reads, 1,
+            "a hot key present in {N} L0 SSTs must resolve with ONE L0 block \
+             read via the newest-first short-circuit, but read {reads}"
+        );
+    }
+
+    /// FRS-LEVELED-COMPACTION (2026-06-04): an L0→L1 compaction whose merged
+    /// output exceeds `target_file_size_base` must SPLIT into multiple
+    /// non-overlapping L1 SSTs (rolled at user-key boundaries) — AND every key
+    /// must survive the split (no key dropped/duplicated across a file
+    /// boundary), the files must stay non-overlapping + sorted, and a full
+    /// range scan must return all keys. This is the core write-amp lever:
+    /// multiple files per level let a later compaction rewrite a SUBSET.
+    #[test]
+    fn test_leveled_compaction_splits_output_preserves_all_keys() {
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            // Force aggressive splitting: roll a new SST every ~4 KiB (the
+            // minimum allowed target) with small blocks so estimated_size
+            // crosses the threshold often.
+            target_file_size_base: 4096,
+            block_size: 512,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = DbImpl::open_with_fs(opts, fs).expect("open");
+        let cf = db.default_cf();
+
+        const N: usize = 2000;
+        let val = |i: usize| format!("value-{i:06}-paddingpaddingpaddingpadding");
+        let key = |i: usize| format!("key{i:06}");
+        for i in 0..N {
+            db.put(&cf, key(i).as_bytes(), val(i).as_bytes()).unwrap();
+        }
+        db.force_switch_memtable(&cf).unwrap();
+        db.flush_cf(&cf).unwrap();
+        db.compact_l0(&cf).unwrap();
+
+        let version = db.version_set.current();
+        let l1: Vec<&forst_rs_storage::version::SstFileMeta> = version.levels[1]
+            .files
+            .iter()
+            .filter(|s| s.cf_id == cf.id())
+            .collect();
+        assert!(
+            l1.len() > 1,
+            "leveled compaction must SPLIT L0→L1 into multiple SSTs at \
+             target_file_size_base=4096, but produced {} file(s)",
+            l1.len()
+        );
+        // Files must be non-overlapping and sorted by smallest_key.
+        for w in l1.windows(2) {
+            assert!(
+                w[0].largest_key < w[1].smallest_key,
+                "split L1 files overlap: [{:?}..{:?}] vs [{:?}..]",
+                w[0].smallest_key,
+                w[0].largest_key,
+                w[1].smallest_key
+            );
+        }
+        // CORRECTNESS: every key reads back exactly (no boundary loss).
+        for i in 0..N {
+            let got = db.get(&cf, key(i).as_bytes()).unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(val(i).as_bytes()),
+                "key {i} lost or wrong value after split compaction"
+            );
+        }
+        // Full scan returns every key exactly once, in order.
+        let all = db.scan(&cf, b"", None).unwrap();
+        assert_eq!(
+            all.len(),
+            N,
+            "post-split scan returned {} rows, expected {N}",
+            all.len()
+        );
+        for (i, (k, v)) in all.iter().enumerate() {
+            assert_eq!(k.as_slice(), key(i).as_bytes(), "scan key order wrong at {i}");
+            assert_eq!(v.as_slice(), val(i).as_bytes(), "scan value wrong at {i}");
+        }
+    }
 
     #[test]
     fn test_open_creates_default_cf() {

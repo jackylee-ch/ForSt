@@ -51,6 +51,24 @@ pub struct CompactionJob {
     pub output_level: u32,
     pub output_file_number: FileNumber,
     pub output_path: PathBuf,
+    /// FRS-LEVELED-COMPACTION (2026-06-04): additional pre-allocated output
+    /// slots `(file_number, path)` for splitting the compaction output into
+    /// multiple ~`target_file_size` SSTs. Empty ⇒ single-file output (the
+    /// legacy behaviour). The caller (db.rs) allocates these from the
+    /// VersionSet (file-number allocation lives there) sized to
+    /// `ceil(total_input_bytes / target_file_size) + margin`; the job uses as
+    /// many as splitting requires and silently leaves the rest unused (the
+    /// file numbers are consumed from the monotonic allocator but no on-disk
+    /// file is created for them, so there is nothing to clean up).
+    pub additional_outputs: Vec<(FileNumber, PathBuf)>,
+    /// FRS-LEVELED-COMPACTION: roll to the next output slot once the in-flight
+    /// SST's estimated size reaches this many bytes, splitting ONLY at
+    /// user-key boundaries so every version of a key lands in exactly one
+    /// file (point-get / scan correctness). `0` disables splitting — the
+    /// output is a single file, byte-for-byte the legacy behaviour. The
+    /// final available slot is uncapped, so the job can never run out of
+    /// slots (worst case the last file is larger than target).
+    pub target_file_size: u64,
     pub writer_options: SstWriterOptions,
     pub fs: Arc<dyn FileSystem>,
     pub merge_operator: Option<Arc<dyn MergeOperator>>,
@@ -178,27 +196,15 @@ impl CompactionJob {
         // sparse-index sections (proportional to block count, not byte
         // count). No full-SST `Vec<u8>` is allocated.
 
-        // Open the temp file up front so the streaming writer has a sink.
-        // R39-L1: shared with FlushJob::temp_path via flush::sst_temp_path so
-        // the restore orphan-scan reverses the SAME naming convention used
-        // by both writers.
-        // FRS-S3-SSTRENAME: object stores have no atomic rename, so stream the
+        // FRS-S3-SSTRENAME: object stores have no atomic rename, so stream each
         // compacted SST straight to its final key (multipart upload publishes
         // atomically on close). Local FS keeps the temp→rename convention for
         // crash-atomic publication. Mirrors the flush.rs branch.
         let atomic_rename = self.fs.supports_atomic_rename();
-        let write_path = if atomic_rename {
-            sst_temp_path(&self.output_path)
-        } else {
-            self.output_path.clone()
-        };
-        // FRS-S3-ORPHAN-FIX (sister to flush.rs): on object stores the
-        // compaction output streams to its FINAL path. After a crash +
-        // restart (esp. with checkpointing off) the output file number can
-        // collide with a stale orphan from the failed attempt, making
-        // `CreateNew` fail "already exists" and crash-looping the job. The
-        // colliding object is necessarily that orphan, so overwrite it; the
-        // local-FS temp-path branch keeps `CreateNew`.
+        // FRS-S3-ORPHAN-FIX (sister to flush.rs): on object stores the output
+        // streams to its FINAL path; a stale orphan from a crashed attempt with
+        // the same file number is overwritten (CreateOrTruncate). Local FS keeps
+        // CreateNew on the temp path for crash-atomic publication.
         let write_mode = if atomic_rename {
             forst_rs_io::WriteMode::CreateNew
         } else {
@@ -208,177 +214,201 @@ impl CompactionJob {
             self.fs.create_dir_all(parent)?;
         }
 
-        // R40-M1: wrap the writer/flush/sync block in a closure so any `?`-propagated error from
-        // `emit_key_versions`, `writer.finish`, `wf.flush`, or `wf.sync` triggers a best-effort
-        // delete of the staging tmp file before we propagate. The pre-existing R38-H1 fix only
-        // covered the post-block `fs.rename` failure; an earlier writer-flow throw would leave
-        // `.<num>.sst.tmp` orphaned in-process until the restore orphan-scan picked it up on
-        // next restart. Mirrors the same wrapper in `flush.rs` so all SST-write sites share one
-        // tmp-leak-safe contract.
-        //
-        // Closure returns:
-        //   * `Ok(Some(info))` — wrote ≥ 1 row, ready to rename into place
-        //   * `Ok(None)`       — zero-emit (bottommost tombstones); inner branch already
-        //                        best-effort-deleted the tmp file and the caller short-circuits
-        //                        with a deletion-only VersionEdit
-        //   * `Err(e)`         — writer/flush/sync throw; caller cleans up the tmp file
-        let write_outcome: ForstResult<Option<SstFileInfo>> = (|| {
-            let mut wf = self.fs.open_writable_file(&write_path, write_mode)?;
-            // R49-H1: stamp this compaction's cf_id onto the writer options so
-            // the resulting SST footer + SstFileMeta carry CF identity.
-            let mut writer_opts = self.writer_options.clone();
-            writer_opts.cf_id = self.cf_id;
-            let writer_inner = SstWriterImpl::with_options(writer_opts);
-            let mut writer = writer_inner.streaming(&mut *wf);
+        // FRS-LEVELED-COMPACTION (2026-06-04): output slots — slot 0 is the
+        // primary (output_file_number/output_path), followed by any caller-
+        // pre-allocated additional slots. The output is split into multiple
+        // ~`target_file_size` SSTs, rolling to the next slot ONLY at a user-key
+        // boundary so every version of a key lands in exactly one file
+        // (point-get / scan correctness). The final available slot is uncapped,
+        // so we can never run out of slots — worst case the last file exceeds
+        // target. `target_file_size == 0` ⇒ single file (legacy behaviour).
+        let mut slots: Vec<(FileNumber, PathBuf)> =
+            Vec::with_capacity(1 + self.additional_outputs.len());
+        slots.push((self.output_file_number, self.output_path.clone()));
+        slots.extend(self.additional_outputs.iter().cloned());
+        let target = self.target_file_size;
 
-            let mut i = 0;
-            let mut emitted = 0u64;
+        // R40-M1 (multi-file): each produced entry is a finished, published SST
+        // `(file_number, info)`. Any `?` error inside the writer flow propagates
+        // after a best-effort tmp cleanup of the in-flight file; files already
+        // published from earlier slots are referenced in the returned
+        // VersionEdit's `new_files`, which the caller deletes on a failed apply
+        // (and the restore orphan-scan sweeps any residue on restart).
+        let write_outcome: ForstResult<Vec<(FileNumber, SstFileInfo)>> = (|| {
+            let mut produced: Vec<(FileNumber, SstFileInfo)> = Vec::new();
+            let mut i = 0usize;
+            let mut slot_idx = 0usize;
             while i < all.len() {
-                let key_end = {
-                    let key = &all[i].key;
-                    let mut j = i + 1;
-                    while j < all.len() && all[j].key == *key {
-                        j += 1;
+                let last_slot = slot_idx + 1 >= slots.len();
+                let (cur_fnum, cur_path) = slots[slot_idx].clone();
+                let write_path = if atomic_rename {
+                    sst_temp_path(&cur_path)
+                } else {
+                    cur_path.clone()
+                };
+                // Write ONE output file in its own scope so the streaming
+                // writer's borrow of `wf` is released before we roll slots.
+                let (_file_emitted, info_opt): (u64, Option<SstFileInfo>) = {
+                    let mut wf = self.fs.open_writable_file(&write_path, write_mode)?;
+                    // R49-H1: stamp this compaction's cf_id onto the writer
+                    // options so the SST footer + SstFileMeta carry CF identity.
+                    let mut writer_opts = self.writer_options.clone();
+                    writer_opts.cf_id = self.cf_id;
+                    let mut writer = SstWriterImpl::with_options(writer_opts).streaming(&mut *wf);
+                    let mut file_emitted = 0u64;
+                    while i < all.len() {
+                        let key_end = {
+                            let key = &all[i].key;
+                            let mut j = i + 1;
+                            while j < all.len() && all[j].key == *key {
+                                j += 1;
+                            }
+                            j
+                        };
+                        // Versions for this key, newest first.
+                        let versions = &all[i..key_end];
+                        i = key_end;
+                        self.emit_key_versions(&mut writer, versions, &mut file_emitted)?;
+                        // Roll to the next slot at this user-key boundary when
+                        // the file has content, splitting is enabled, we are NOT
+                        // on the final slot, the file reached target, and keys
+                        // remain. Splitting only between keys keeps every
+                        // version of a key in one file.
+                        if !last_slot
+                            && target > 0
+                            && file_emitted > 0
+                            && i < all.len()
+                            && writer.estimated_size() >= target
+                        {
+                            break;
+                        }
                     }
-                    j
+                    if file_emitted == 0 {
+                        // Bottommost-tombstone-only input: emit nothing. The
+                        // streaming writer requires ≥ 1 entry, so drop it
+                        // unfinished and best-effort clean up the tmp file. Not
+                        // referenced by any VersionEdit. R38-L2: warn on delete
+                        // failure (restore orphan-scan still catches it).
+                        drop(writer);
+                        drop(wf);
+                        if let Err(e) = self.fs.delete_file(&write_path) {
+                            tracing::warn!(
+                                "CompactionJob: zero-emit tmp delete failed for {}: {} \
+                                 (R38-L2; restore orphan-scan will rename on restart)",
+                                write_path.display(),
+                                e
+                            );
+                        }
+                        (0, None)
+                    } else {
+                        let info = writer.finish()?;
+                        wf.flush()?;
+                        wf.sync()?;
+                        (file_emitted, Some(info))
+                    }
                 };
 
-                // Versions for this key, newest first.
-                let versions = &all[i..key_end];
-                i = key_end;
-
-                self.emit_key_versions(&mut writer, versions, &mut emitted)?;
-            }
-
-            // 4. If we emitted zero rows (e.g. everything was a bottommost
-            //    tombstone), drop the writer without finishing — the
-            //    streaming-finish() call would have tried to emit a footer
-            //    but the streaming writer requires ≥ 1 entry. The temp
-            //    file may be partially written, but we never `rename` it,
-            //    so the engine never sees it; the caller's `fs` cleanup
-            //    will sweep it on the next compaction round. We also
-            //    short-circuit with a deletion-only VersionEdit below.
-            if emitted == 0 {
-                drop(writer);
-                drop(wf);
-                // Best-effort tmp cleanup; the file may not exist if the
-                // writer hasn't emitted anything yet, and the VersionEdit
-                // doesn't reference it. R38-L2: surface delete failures
-                // via a warn-level log so operators can spot a leaking
-                // compaction tmp file (the restore orphan-scan in
-                // open_from_checkpoint still catches it on next restart,
-                // but a warn-line helps in-process diagnosis).
-                if let Err(e) = self.fs.delete_file(&write_path) {
-                    tracing::warn!(
-                        "CompactionJob: zero-emit tmp delete failed for {}: {} \
-                         (R38-L2; restore orphan-scan will rename on restart)",
-                        write_path.display(),
-                        e
-                    );
+                if let Some(info) = info_opt {
+                    // Publish this file: rename on local FS (the upload already
+                    // published it on object stores). R38-H1: best-effort tmp
+                    // cleanup on rename failure before propagating.
+                    if atomic_rename {
+                        if let Err(e) = self.fs.rename(&write_path, &cur_path) {
+                            let _ = self.fs.delete_file(&write_path);
+                            return Err(e);
+                        }
+                        // R49-H3: fsync(parent_dir) so the dirent change is
+                        // durable across power loss (best-effort).
+                        if let Some(parent) = cur_path.parent() {
+                            if let Err(e) = self.fs.sync_dir(parent) {
+                                tracing::warn!(
+                                    "CompactionJob: sync_dir({}) failed after rename: {} (R49-H3)",
+                                    parent.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    produced.push((cur_fnum, info));
                 }
-                return Ok(None);
-            }
 
-            let info = writer.finish()?;
-            wf.flush()?;
-            wf.sync()?;
-            Ok(Some(info))
+                // Advance to the next slot only if more keys remain (i.e. we
+                // rolled mid-stream). When the inner loop consumed everything,
+                // `i == all.len()` and the outer loop exits — so `slot_idx`
+                // never exceeds the final slot and no slot is reused.
+                if i < all.len() {
+                    slot_idx += 1;
+                }
+            }
+            Ok(produced)
         })();
-        let info = match write_outcome {
-            Ok(Some(info)) => info,
-            Ok(None) => {
-                // Zero-emit: tmp already cleaned up by the inner branch; emit a deletion-only
-                // VersionEdit.
-                // R0A-H1: same rationale as above — keep last_sequence at
-                // the input max so the version counter does not regress.
-                let max_in_seq = self
+
+        let produced = write_outcome?;
+
+        // Zero-emit across ALL slots (e.g. everything was a bottommost
+        // tombstone): emit a deletion-only VersionEdit. R0A-H1: keep
+        // last_sequence at the input max so the version counter does not
+        // regress.
+        if produced.is_empty() {
+            let max_in_seq = self
+                .inputs
+                .iter()
+                .map(|(_, m, _)| m.max_sequence.value())
+                .max()
+                .unwrap_or(0);
+            let last_seq = if max_in_seq > 0 {
+                Some(forst_rs_common::SequenceNumber(max_in_seq))
+            } else {
+                None
+            };
+            return Ok(Some(VersionEdit {
+                deleted_files: self
                     .inputs
                     .iter()
-                    .map(|(_, m, _)| m.max_sequence.value())
-                    .max()
-                    .unwrap_or(0);
-                let last_seq = if max_in_seq > 0 {
-                    Some(forst_rs_common::SequenceNumber(max_in_seq))
-                } else {
-                    None
-                };
-                return Ok(Some(VersionEdit {
-                    deleted_files: self
-                        .inputs
-                        .iter()
-                        .map(|(lvl, m, _)| (*lvl, m.file_number))
-                        .collect(),
-                    new_files: Vec::new(),
-                    next_file_number: None,
-                    last_sequence: last_seq,
-                }));
-            }
-            Err(e) => {
-                // Best-effort cleanup; orphan-scan on restart still covers any residual file.
-                let _ = self.fs.delete_file(&write_path);
-                return Err(e);
-            }
-        };
-        // On object stores `write_path == output_path` and the upload already
-        // published atomically on close — no rename or dir-fsync needed.
-        if atomic_rename {
-            // R38-H1: best-effort cleanup of the temp file on rename failure
-            // (EXDEV, cross-FS, transient I/O). Without this, a failed compaction
-            // leaves a `.<num>.sst.tmp` orphan. We delete before propagating
-            // the error; if delete itself fails the file remains visible to the
-            // next restore, which now matches `.*.sst.tmp` and renames it out
-            // of the active naming space.
-            if let Err(e) = self.fs.rename(&write_path, &self.output_path) {
-                let _ = self.fs.delete_file(&write_path);
-                return Err(e);
-            }
-            // R49-H3: fsync(parent_dir) so the rename's directory entry change
-            // is durable across a power-loss event. Best-effort: a failure here
-            // leaves the SST contents on disk; the next checkpoint cycle will
-            // re-attempt the dirent sync via its own copy_live_ssts pass.
-            if let Some(parent) = self.output_path.parent() {
-                if let Err(e) = self.fs.sync_dir(parent) {
-                    tracing::warn!(
-                        "CompactionJob: sync_dir({}) failed after rename: {} (R49-H3)",
-                        parent.display(),
-                        e
-                    );
-                }
-            }
+                    .map(|(lvl, m, _)| (*lvl, m.file_number))
+                    .collect(),
+                new_files: Vec::new(),
+                next_file_number: None,
+                last_sequence: last_seq,
+            }));
         }
 
-        // 6. Build the VersionEdit: add the new file, remove all inputs.
-        // R49-H1: stamp the job's cf_id onto the meta record.
-        debug_assert_eq!(info.cf_id, self.cf_id);
-        let meta = SstFileMeta {
-            file_number: self.output_file_number,
-            cf_id: self.cf_id,
-            file_size: info.file_size,
-            smallest_key: info.min_key,
-            largest_key: info.max_key,
-            min_sequence: forst_rs_common::SequenceNumber(info.min_sequence),
-            max_sequence: forst_rs_common::SequenceNumber(info.max_sequence),
-            num_entries: info.entry_count,
-        };
+        // 6. Build the VersionEdit: add EVERY produced file at output_level,
+        // remove all inputs. R49-H1: stamp the job's cf_id onto each meta.
+        let mut new_files: Vec<(u32, SstFileMeta)> = Vec::with_capacity(produced.len());
+        let mut max_out_seq = 0u64;
+        for (fnum, info) in produced {
+            debug_assert_eq!(info.cf_id, self.cf_id);
+            max_out_seq = max_out_seq.max(info.max_sequence);
+            new_files.push((
+                self.output_level,
+                SstFileMeta {
+                    file_number: fnum,
+                    cf_id: self.cf_id,
+                    file_size: info.file_size,
+                    smallest_key: info.min_key,
+                    largest_key: info.max_key,
+                    min_sequence: forst_rs_common::SequenceNumber(info.min_sequence),
+                    max_sequence: forst_rs_common::SequenceNumber(info.max_sequence),
+                    num_entries: info.entry_count,
+                },
+            ));
+        }
         let deleted = self
             .inputs
             .iter()
             .map(|(lvl, m, _)| (*lvl, m.file_number))
             .collect();
-        // R0A-H1: stamp last_sequence with the output file's max seq so the
-        // version-set's `last_sequence` counter tracks the persistent
-        // high-water mark. Pre-fix compaction left it at `None`, so
-        // checkpoint→restore reset `sequence_number` to a stale value and
-        // subsequent writes silently overwrote restored SST rows (the mvcc
-        // read path returned the older SST row because it had a higher
-        // seq than the post-restore write).
-        let last_seq = if info.max_sequence > 0 {
-            Some(forst_rs_common::SequenceNumber(info.max_sequence))
+        // R0A-H1: stamp last_sequence with the max output seq across all
+        // produced files so the version-set high-water mark tracks the
+        // persistent maximum (checkpoint→restore correctness).
+        let last_seq = if max_out_seq > 0 {
+            Some(forst_rs_common::SequenceNumber(max_out_seq))
         } else {
             None
         };
         Ok(Some(VersionEdit {
-            new_files: vec![(self.output_level, meta)],
+            new_files,
             deleted_files: deleted,
             next_file_number: None,
             last_sequence: last_seq,

@@ -352,6 +352,57 @@ impl Version {
         }
         None
     }
+
+    /// FRS-PERLEVEL-SCAN (2026-06-04): per-level, binary-search-bounded
+    /// enumeration of the SST files that may contain a key in the range
+    /// `[lower, upper)`, appended (borrowed) to `out` in `live_sst_files_iter`
+    /// order (level-ascending, then per-level smallest_key order).
+    ///
+    /// This is the range analogue the prefix/range scan read path
+    /// (`build_lazy_prefix_key_stream` / `build_lazy_range_key_stream` in
+    /// db.rs) uses INSTEAD of `live_sst_files_iter()` + a flat per-file
+    /// range check. The flat path paid an O(total_files) coarse range check
+    /// per probe; this path bounds each level to the files that start before
+    /// `upper` via a `partition_point` binary search on `smallest_key`
+    /// (the files within a level are kept sorted by `smallest_key` by
+    /// `apply_edit`), then rejects the cheap `largest_key < lower` left tail.
+    ///
+    /// CORRECTNESS — IDENTICAL RESULT SET to the flat path: a file overlaps
+    /// `[lower, upper)` iff `largest_key >= lower && smallest_key < upper`.
+    /// The flat path checks both bounds on every file across every level;
+    /// this path checks the SAME two predicates. The only structural change
+    /// is the per-level `partition_point` upper cut, which is sound because
+    /// files within a level are sorted by `smallest_key` — every file at or
+    /// after the cut has `smallest_key >= upper` and is excluded by the flat
+    /// path's `smallest_key >= upper` test too. No CF filtering is applied
+    /// (the flat scan does none either — it relies on the byte-range check),
+    /// so multi-CF deployments observe exactly the same files as before.
+    /// `upper == None` means unbounded above (scan to each level's end).
+    pub fn overlapping_ssts_in_range<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        out: &mut Vec<&'a SstFileMeta>,
+    ) {
+        for level in &self.levels {
+            let files = &level.files;
+            // Binary-search the upper cut: first file whose smallest_key is
+            // >= upper. Files within a level are sorted by smallest_key, so
+            // everything from `end` onward cannot overlap (their start is at
+            // or past the exclusive upper bound).
+            let end = match upper {
+                Some(hi) => files.partition_point(|f| f.smallest_key.as_slice() < hi),
+                None => files.len(),
+            };
+            for f in &files[..end] {
+                // Left tail: a file entirely below `lower` cannot overlap.
+                if f.largest_key.as_slice() < lower {
+                    continue;
+                }
+                out.push(f);
+            }
+        }
+    }
 }
 
 impl Default for Version {
@@ -724,6 +775,88 @@ mod tests {
         assert_eq!(files[0].file_number, FileNumber(2)); // "a"
         assert_eq!(files[1].file_number, FileNumber(3)); // "m"
         assert_eq!(files[2].file_number, FileNumber(1)); // "z"
+    }
+
+    #[test]
+    fn test_overlapping_ssts_in_range_matches_flat_scan() {
+        // FRS-PERLEVEL-SCAN: the binary-search-bounded per-level locator must
+        // return EXACTLY the file set the flat live_sst_files_iter + range
+        // check would (same overlap predicate), across L0 (overlapping) +
+        // L1/L2 (sorted) and multiple CFs with interleaved byte ranges.
+        let cf_a = DEFAULT_CF_ID;
+        let cf_b = forst_rs_common::ColumnFamilyId(7);
+        let mk = |num: u64, cf: forst_rs_common::ColumnFamilyId, s: &[u8], l: &[u8]| SstFileMeta {
+            file_number: FileNumber(num),
+            cf_id: cf,
+            file_size: 1024,
+            smallest_key: s.to_vec(),
+            largest_key: l.to_vec(),
+            min_sequence: SequenceNumber(1),
+            max_sequence: SequenceNumber(100),
+            num_entries: 50,
+        };
+        let edit = VersionEdit {
+            new_files: vec![
+                // L0: overlapping ranges (as flushed memtables are).
+                (0, mk(1, cf_a, b"a", b"m")),
+                (0, mk(2, cf_a, b"f", b"z")),
+                (0, mk(3, cf_b, b"c", b"t")),
+                // L1: non-overlapping per CF, but cf_b nests inside cf_a's span.
+                (1, mk(10, cf_a, b"a", b"d")),
+                (1, mk(11, cf_b, b"e", b"g")),
+                (1, mk(12, cf_a, b"h", b"k")),
+                (1, mk(13, cf_a, b"m", b"z")),
+                // L2: a single wide file + a later one.
+                (2, mk(20, cf_a, b"a", b"p")),
+                (2, mk(21, cf_b, b"r", b"z")),
+            ],
+            ..Default::default()
+        };
+        let v = Version::new().apply_edit(&edit).unwrap();
+
+        // Brute-force reference: same overlap predicate over live_sst_files_iter.
+        let flat = |lower: &[u8], upper: Option<&[u8]>| -> Vec<FileNumber> {
+            v.live_sst_files_iter()
+                .filter(|f| {
+                    if f.largest_key.as_slice() < lower {
+                        return false;
+                    }
+                    if let Some(hi) = upper {
+                        if f.smallest_key.as_slice() >= hi {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .map(|f| f.file_number)
+                .collect()
+        };
+
+        let bounds: &[(&[u8], Option<&[u8]>)] = &[
+            (b"a", Some(b"b")),
+            (b"e", Some(b"f")),
+            (b"e", Some(b"h")),
+            (b"f", Some(b"g")),
+            (b"\x00", Some(b"\xff")),
+            (b"m", None),
+            (b"q", Some(b"s")),
+            (b"z", None),
+            (b"d", Some(b"e")),
+            (b"k", Some(b"m")),
+        ];
+        for (lower, upper) in bounds {
+            let mut got: Vec<&SstFileMeta> = Vec::new();
+            v.overlapping_ssts_in_range(lower, *upper, &mut got);
+            let mut got_nums: Vec<FileNumber> = got.iter().map(|f| f.file_number).collect();
+            let mut want = flat(lower, *upper);
+            got_nums.sort_by_key(|n| n.0);
+            want.sort_by_key(|n| n.0);
+            assert_eq!(
+                got_nums, want,
+                "range [{:?},{:?}) mismatch: locator returned a different SST set than the flat scan",
+                lower, upper
+            );
+        }
     }
 
     #[test]

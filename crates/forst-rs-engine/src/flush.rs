@@ -429,6 +429,89 @@ pub(crate) fn flush_loop<E>(
     }
 }
 
+// ---------------------------------------------------------------------
+// FRS-COMPACT-BG (2026-06-03): background L0→L1 compaction worker.
+//
+// Previously `run_flush` called `maybe_auto_compact` INLINE on the single
+// flush-worker thread, so a large L0→L1 compaction blocked subsequent
+// flushes → memtables backed up (write-stall) AND L0 stayed deep → point
+// reads (`get_arc → sst_get`) scanned a growing L0 → throughput DECAY
+// (NexMark q11 665K→37K rec/s; q4 likewise). Mirroring the flush-worker
+// pattern, compaction now runs on its OWN thread: the flush worker just
+// ENQUEUES a request and returns immediately, keeping L0 shallow without
+// stalling flushes. Concurrency is already safe — `compact_l0_for_cf`
+// takes `compaction_mutex` (engine-global) before any per-CF `flush_mutex`,
+// and `version_set.apply` is serialized with stale-edit (R44-L2) validation.
+// ---------------------------------------------------------------------
+
+/// A single asynchronous L0→L1 compaction job for a CF. Like
+/// [`FlushRequest`], carries only the CF so the worker re-reads the current
+/// L0 set under `compaction_mutex` (bursty duplicates collapse to a no-op).
+pub(crate) struct CompactionRequest {
+    pub cf_data: Arc<ColumnFamilyData>,
+}
+
+/// MPSC channel handing compaction requests from the flush worker to the
+/// background compaction worker. Same shape as [`FlushQueue`].
+pub(crate) struct CompactionQueue {
+    tx: SyncSender<CompactionRequest>,
+    rx: Mutex<Option<Receiver<CompactionRequest>>>,
+}
+
+impl CompactionQueue {
+    pub(crate) fn new(capacity: usize) -> Self {
+        let (tx, rx) = sync_channel::<CompactionRequest>(capacity);
+        Self {
+            tx,
+            rx: Mutex::new(Some(rx)),
+        }
+    }
+
+    pub(crate) fn take_receiver(&self) -> Option<Receiver<CompactionRequest>> {
+        self.rx.lock().expect("lock poisoned").take()
+    }
+
+    /// Non-blocking enqueue from the flush worker. Returns `Err` only if the
+    /// receiver was dropped (engine shutting down).
+    pub(crate) fn enqueue(&self, req: CompactionRequest) -> ForstResult<()> {
+        match self.tx.try_send(req) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(req)) => self.tx.send(req).map_err(|_| {
+                ForstError::aborted("compaction queue receiver dropped (engine shutting down)")
+            }),
+            Err(TrySendError::Disconnected(_)) => Err(ForstError::aborted(
+                "compaction queue receiver dropped (engine shutting down)",
+            )),
+        }
+    }
+}
+
+/// Trait abstracting the engine method the compaction worker calls back into.
+pub(crate) trait CompactionExecutor: Send + Sync {
+    /// Run an L0→L1 compaction for `cf_data` (no-op if nothing to compact).
+    fn run_compaction(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()>;
+}
+
+/// Worker loop: drains the compaction queue and dispatches to the engine via
+/// [`CompactionExecutor`]. Mirrors [`flush_loop`] exactly (Weak-upgrade exit,
+/// record-error-and-continue, channel-close shutdown).
+pub(crate) fn compaction_loop<E>(
+    rx: Receiver<CompactionRequest>,
+    engine_weak: Weak<E>,
+    record_error: impl Fn(ForstError) + Send + 'static,
+) where
+    E: CompactionExecutor + 'static,
+{
+    while let Ok(req) = rx.recv() {
+        let Some(engine) = engine_weak.upgrade() else {
+            break;
+        };
+        if let Err(e) = engine.run_compaction(&req.cf_data) {
+            record_error(e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

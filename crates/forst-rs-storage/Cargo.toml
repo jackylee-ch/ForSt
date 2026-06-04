@@ -37,6 +37,11 @@ crossbeam-skiplist = { workspace = true }
 # showed Rust's default SipHash (BuildHasher::hash_one + Hasher::write)
 # dominated join CPU (~588/sample). FxHash is ~5-10× faster for short keys.
 rustc-hash = "2.1"
+# FRS-MEMTABLE-INLINE-KEY (2026-06-04): inline small keys in the sorted-index
+# `InternalKey` to eliminate the per-entry `Arc<[u8]>` heap allocation (vmmap
+# pinned ~137M such allocs ≈ 32 GiB = the q4 memory wall). 48 bytes inline covers
+# the NexMark join keys (~36 B); larger keys spill to heap.
+smallvec = "1"
 
 [dev-dependencies]
 forst-rs-test-utils = { workspace = true }

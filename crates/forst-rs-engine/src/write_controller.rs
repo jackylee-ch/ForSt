@@ -29,6 +29,14 @@ use forst_rs_common::{ForstError, ForstResult};
 /// Configuration knobs for [`WriteController`].
 #[derive(Debug, Clone)]
 pub struct WriteControllerConfig {
+    /// FRS-COMPACT-BG (2026-06-03): L0 file count that triggers a BACKGROUND
+    /// L0→L1 compaction (RocksDB `level0_file_num_compaction_trigger`, default
+    /// 4). MUST be ≪ `l0_slowdown_trigger`: compaction fires early and keeps L0
+    /// shallow so point reads (`get_arc → sst_get`) scan few SSTs (the q4/q11
+    /// read-amp decay fix). A prior inline-compaction trigger=4 attempt
+    /// (2026-05-30) stalled the flush worker; now compaction runs on its own
+    /// thread (`forst-rs-compact`), so a low trigger no longer blocks flushes.
+    pub l0_compaction_trigger: u32,
     /// L0 file count that triggers slowdown (writers sleep briefly).
     pub l0_slowdown_trigger: u32,
     /// L0 file count that triggers stall (writers block).
@@ -54,6 +62,18 @@ impl Default for WriteControllerConfig {
             // `DbImpl::open`). stall_timeout stays < the ~50s Flink TaskManager
             // heartbeat threshold (R24-M4) so a single stall can't trip the
             // unresponsive-task watchdog.
+            // FRS-COMPACT-BG / FRS-L0-SHORTCIRCUIT (2026-06-03): RocksDB's
+            // default L0→L1 trigger is 4; a shallow L0 bounds the point-read
+            // bloom-check count. trigger=4 ALONE regressed q7 (248K → ~13K
+            // decay): the single bg-compaction thread couldn't keep up with q7's
+            // writes, L0 grew, and the OLD sst_get re-read EVERY L0 data block
+            // per point read → read-amp decay. The L0 newest-first short-circuit
+            // (2026-06-03-l0-point-read-shortcircuit.md) now makes each point
+            // read cost ONE data block regardless of L0 depth, so even when
+            // compaction falls behind the read side no longer amplifies —
+            // re-enabling trigger=4 to keep q11's bloom-check count low WITHOUT
+            // the q7 read-amp regression. Gated on the q7/q11 trajectory sweep.
+            l0_compaction_trigger: 4,
             l0_slowdown_trigger: 40,
             l0_stop_trigger: 64,
             max_write_buffer_number: 3,

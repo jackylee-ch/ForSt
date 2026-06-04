@@ -422,13 +422,45 @@ impl FileSystem for CachedFileSystem {
             return Ok(Box::new(InMemoryRandom::new(bytes)));
         };
         let key = self.cache_key(path)?.to_string();
-        let remote = self.remote.open_random_access_file(path)?;
-        Ok(Box::new(RangeCachedRandomAccessFile {
-            remote,
-            cache: Arc::clone(&self.cache),
-            path_key: key,
-            file_size,
-        }))
+        // FRS-LOCAL-DIRECT-READ (2026-06-03): choose the SST reader by remote type.
+        //
+        // ROOT CAUSE of the q4/q7/q9 decay (pinned via async-profiler + write/read
+        // key localization): on a LOCAL (POSIX) backend, SSTs are written to a
+        // `.tmp` staging path then renamed to `.sst`. `open_writable_file`'s is_sst
+        // check is false for `.tmp`, so write-through (CachePopulatingWritableFile)
+        // NEVER admits the SST under its whole-file `path_key`, and `rename` only
+        // INVALIDATES (never admits). So `get_range(path_key)` ALWAYS missed and
+        // every scattered ~16-64 KB block read fell to the chunk path, fetching a
+        // whole 1 MiB chunk (open+read+close per block) = 64× read amplification +
+        // an `__open` storm that grew with state → the 181K→7K q4 decay (RocksDB
+        // stays flat at 237K). For local, `LocalFirstSstFile` reads the EXACT block
+        // from the durable local file (the data dir IS the local store) on a HELD
+        // fd, with the OS page cache giving RAM-residency — the v3.8 / RocksDB
+        // direct-local-read model.
+        //
+        // `supports_atomic_rename()` is the local-vs-object-store signal (true for
+        // POSIX local fs, false for S3/OpenDAL — the same signal flush.rs uses to
+        // pick the SST write path). For an object store, keep the chunk reader,
+        // whose 1 MiB chunking amortizes network round-trip latency (the opposite
+        // of the local case). S3 is out of scope here; this preserves its behavior.
+        if self.remote.supports_atomic_rename() {
+            Ok(Box::new(LocalFirstSstFile {
+                cache: Arc::clone(&self.cache),
+                key,
+                file_size,
+                remote: Arc::clone(&self.remote),
+                path: path.to_path_buf(),
+                remote_fallback: std::sync::Mutex::new(None),
+            }))
+        } else {
+            let remote = self.remote.open_random_access_file(path)?;
+            Ok(Box::new(RangeCachedRandomAccessFile {
+                remote,
+                cache: Arc::clone(&self.cache),
+                path_key: key,
+                file_size,
+            }))
+        }
     }
 
     fn open_writable_file(
@@ -656,20 +688,97 @@ struct LocalFirstSstFile {
     remote_fallback: std::sync::Mutex<Option<Box<dyn RandomAccessFile>>>,
 }
 
+/// A-spike instrumentation (2026-06-04, env-gated `FRS_READ_AT_DIAG=1`): a
+/// latency histogram of `LocalFirstSstFile::read_at`. A warm pread (page-cache
+/// hit) is ~sub-µs; a cold read that major-faults to disk is tens–hundreds of
+/// µs. The warm/cold split tells us how much of read_at's cost mmap could
+/// actually recover in q4's regime (mmap removes the syscall+copy of a WARM
+/// read, but NOT the page-in of a COLD one). Off by default; zero overhead when
+/// disabled.
+pub mod read_at_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub fn enabled() -> bool {
+        static E: OnceLock<bool> = OnceLock::new();
+        *E.get_or_init(|| {
+            matches!(
+                std::env::var("FRS_READ_AT_DIAG").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            )
+        })
+    }
+
+    // Buckets by latency: [<1µs, <2µs, <5µs, <20µs, <100µs, >=100µs].
+    const Z: AtomicU64 = AtomicU64::new(0);
+    static BUCKETS: [AtomicU64; 6] = [Z; 6];
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn record(ns: u64) {
+        let b = if ns < 1_000 {
+            0
+        } else if ns < 2_000 {
+            1
+        } else if ns < 5_000 {
+            2
+        } else if ns < 20_000 {
+            3
+        } else if ns < 100_000 {
+            4
+        } else {
+            5
+        };
+        BUCKETS[b].fetch_add(1, Ordering::Relaxed);
+        TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
+        let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        // Dump every 2^20 reads to the TM log.
+        if c % (1 << 20) == 0 {
+            let bk: Vec<u64> = BUCKETS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+            let total = TOTAL_NS.load(Ordering::Relaxed);
+            // "warm" = served from page cache without a disk fault (< 20µs);
+            // "cold" = >= 20µs (likely a major fault / disk page-in — the part
+            // mmap CANNOT remove).
+            let cold = bk[4] + bk[5];
+            let cold_pct = cold as f64 * 100.0 / c as f64;
+            eprintln!(
+                "[READ_AT_DIAG] reads={c} mean={}ns buckets[<1,<2,<5,<20,<100,>=100µs]={bk:?} cold(>=20µs)={cold} ({cold_pct:.1}%)",
+                total / c
+            );
+        }
+    }
+}
+
 impl RandomAccessFile for LocalFirstSstFile {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
+        if !read_at_diag::enabled() {
+            return self.read_at_impl(offset, buf);
+        }
+        let start = std::time::Instant::now();
+        let r = self.read_at_impl(offset, buf);
+        read_at_diag::record(start.elapsed().as_nanos() as u64);
+        r
+    }
+
+    fn file_size(&self) -> ForstResult<u64> {
+        Ok(self.file_size)
+    }
+}
+
+impl LocalFirstSstFile {
+    #[inline]
+    fn read_at_impl(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-        // Fast path: positional read from the local write-through copy.
-        match self.cache.get_range(&self.key, offset, buf.len()) {
-            Ok(Some(bytes)) => {
-                // `bytes` may be shorter than `buf` only at EOF (write-once file)
-                // — mirror the remote reader's short-read-at-EOF semantics.
-                let n = bytes.len().min(buf.len());
-                buf[..n].copy_from_slice(&bytes[..n]);
-                return Ok(n);
-            }
+        // Fast path: positional read from the local write-through copy, pread'd
+        // DIRECTLY into the caller's `buf` — no intermediate Vec, no second copy
+        // (get_range's old owned-Vec return forced a `copy_from_slice` here;
+        // measured ~66% of read_at's cost was that wrapper waste). A short fill
+        // (n < buf.len()) happens only at EOF — mirror the remote reader's
+        // short-read-at-EOF semantics; the caller (read_at_exact) validates.
+        match self.cache.get_range_into(&self.key, offset, buf) {
+            Ok(Some(n)) => return Ok(n),
             // `None` = entry evicted; fall back to the remote backend below.
             Ok(None) => {}
             Err(e) => {
@@ -695,10 +804,6 @@ impl RandomAccessFile for LocalFirstSstFile {
             .as_ref()
             .expect("remote fallback initialized above")
             .read_at(offset, buf)
-    }
-
-    fn file_size(&self) -> ForstResult<u64> {
-        Ok(self.file_size)
     }
 }
 

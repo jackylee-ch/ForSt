@@ -826,6 +826,28 @@ pub unsafe extern "C" fn frs_db_open_remote_with_options(
                 }
             }
         }
+        // FRS-SST-COMPRESSION (2026-06-04): override the SST data-block codec per
+        // run without a rebuild. A symbolized native profile of the LOCAL q4
+        // interval join showed `sst::compression::decompress` (LZ4) as the #1
+        // hot frame under `frs_vec_iter_prefix_open` (~4500/8030 samples): each
+        // scattered ~1-key prefix probe `pread`s + LZ4-decompresses a whole data
+        // block. On LOCAL storage there is no disk-space / upload-bandwidth
+        // pressure, so `none` trades disk for CPU — it eliminates the decompress
+        // AND lets `decode_data_block_zerocopy` slice the block buffer instead of
+        // copying each column out (the reader's zero-copy fast path is gated on
+        // `CompressionType::None`). `lz4` / `zstd` keep a compressed codec (right
+        // for the S3 open path where upload bytes dominate). Mirrors the
+        // `FRS_MEMTABLE_SHARDS` / `FRS_BLOCK_SIZE_KB` per-run tuning hooks.
+        if let Ok(s) = std::env::var("FRS_SST_COMPRESSION") {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "none" | "off" | "0" => {
+                    engine_opts.compression = forst_rs_common::CompressionType::None
+                }
+                "lz4" => engine_opts.compression = forst_rs_common::CompressionType::Lz4,
+                "zstd" => engine_opts.compression = forst_rs_common::CompressionType::Zstd,
+                _ => {}
+            }
+        }
 
         let cache_path = PathBuf::from(&cache_dir_str);
         match DbImpl::open_remote_with_default_cf(
@@ -4793,6 +4815,26 @@ impl IterHandle {
     fn is_aborted(&self) -> bool {
         self.aborted.load(std::sync::atomic::Ordering::Acquire)
     }
+
+    /// FRS-ITER-EAGER-FREE (2026-06-04): the iterator is EXHAUSTED — drop its
+    /// heavy backing state NOW (the `LazyPrefixIter` tier cursors, any buffered
+    /// SST/Arrow `RecordBatch`es, and the captured `Arc<DbImpl>`) by replacing
+    /// `inner` with an empty iterator. The handle stays registered + valid: a
+    /// later `next_row()` yields `None` (EOF) and `close` frees the now-light
+    /// shell. WHY: q4's async join issues ~one prefix iterator PER record, most
+    /// exhausted by their first chunk; the Java consumer's `close()` and the
+    /// lifetime watchdog lag under that rate, so exhausted iterators (each
+    /// pinning decoded Arrow batches) accumulate to millions of live allocations
+    /// — the dominant q4 memory wall (`heap`: ~85M live 80-96B Arrow structs).
+    /// Freeing on exhaustion bounds resident memory regardless of close latency.
+    /// Sound: only called when `fill_chunk_from_iter` reported `exhausted == true`
+    /// (upstream `next_row()` returned `None`), so no pending rows are dropped.
+    fn drop_inner(&mut self) {
+        self.inner = Box::new(std::iter::empty());
+        self.pending = None;
+        self.terminal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// Number of registry shards.  Power-of-two so the shard index is a fast
@@ -4830,23 +4872,34 @@ fn shard_for(handle: u64) -> &'static Mutex<HashMap<u64, IterHandle>> {
 /// # Safety
 /// `buf` must point to at least `cap` writable bytes for the duration of
 /// the call.
-unsafe fn fill_chunk_from_iter(iter: &mut IterHandle, buf: *mut u8, cap: usize) -> (u32, u32) {
-    // Aborted iters return an empty chunk — preserve the abort semantic.
+/// Fills one chunk and reports whether the iterator was EXHAUSTED (its
+/// `next_row()` returned `None`) vs merely buffer-full (a row was `put_back`).
+/// The `exhausted` flag lets callers eagerly free the iterator's heavy backing
+/// state via [`IterHandle::drop_inner`] — see FRS-ITER-EAGER-FREE.
+unsafe fn fill_chunk_from_iter(iter: &mut IterHandle, buf: *mut u8, cap: usize) -> (u32, u32, bool) {
+    // Aborted iters return an empty chunk — preserve the abort semantic
+    // (treated as exhausted so callers free the shell).
     if iter.is_aborted() {
-        return (0, 0);
+        return (0, 0, true);
     }
     let mut off = 0usize;
     let mut row_count = 0u32;
-    while let Some((k, v)) = iter.next_row() {
+    loop {
+        let (k, v) = match iter.next_row() {
+            // `None` ⟹ the iterator is genuinely exhausted (no rows left).
+            None => return (off as u32, row_count, true),
+            Some(row) => row,
+        };
         let klen = k.len();
         let vlen = v.len();
         let row_size = 8 + klen + vlen;
         if off + row_size > cap {
-            // Row doesn't fit — roll back so the next call returns it.
+            // Row doesn't fit — roll back so the next call returns it. NOT
+            // exhausted: there is at least this pending row plus possibly more.
             // For `IterKey::Arc` this is a cheap atomic refcount move; for
             // `IterKey::Vec` it is a pointer move. No bytes are copied.
             iter.put_back((k, v));
-            break;
+            return (off as u32, row_count, false);
         }
         let klen_u32 = klen as u32;
         let vlen_u32 = vlen as u32;
@@ -4865,7 +4918,6 @@ unsafe fn fill_chunk_from_iter(iter: &mut IterHandle, buf: *mut u8, cap: usize) 
         off += vlen;
         row_count += 1;
     }
-    (off as u32, row_count)
 }
 
 /// Open a prefix-scoped iterator anchored to a point-in-time snapshot of
@@ -4994,8 +5046,13 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
 
         // Fill the first chunk lazily into the caller's buffer.
-        let (bytes_used, row_count) =
+        let (bytes_used, row_count, iter_exhausted) =
             fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
+        if iter_exhausted {
+            // FRS-ITER-EAGER-FREE: first chunk drained the whole result — free the
+            // heavy backing state now (don't pin it until the lagging Java close()).
+            handle_state.drop_inner();
+        }
 
         if let (Some(t0), Some(build_us)) = (probe_t0, probe_build_us) {
             let total_us = t0.elapsed().as_micros();
@@ -5107,8 +5164,13 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
             iter.mark_terminal();
             return error_to_frs_code(&err);
         }
-        let (bytes_used, row_count) =
+        let (bytes_used, row_count, iter_exhausted) =
             fill_chunk_from_iter(iter, chunk_buf_ptr, chunk_buf_cap as usize);
+        if iter_exhausted {
+            // FRS-ITER-EAGER-FREE: this `next` chunk exhausted the iterator — free
+            // its heavy backing state now (the registered shell stays valid for close).
+            iter.drop_inner();
+        }
         *out_row_count = row_count;
         *out_bytes_used = bytes_used;
         // R16-M2 + R17-M3: drain the per-iter error slot AFTER the chunk fill
@@ -5404,8 +5466,14 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
             let mut handle_state = IterHandle::new_with_error_slot(inner, batch_error_slot);
 
             // Fill the first chunk into the caller-owned buffer.
-            let (bytes_used, row_count) =
+            let (bytes_used, row_count, iter_exhausted) =
                 fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap as usize);
+            if iter_exhausted {
+                // FRS-ITER-EAGER-FREE: batch-open's first chunk drained this row's
+                // whole result — free the heavy backing state now. The handle stays
+                // registered (light shell) for the consumer's eventual close().
+                handle_state.drop_inner();
+            }
             // R16-M2 + R17-M3: if the first chunk fill captured an error,
             // surface it through the per-descriptor return path (batch open
             // returns multiple results; subsequent next() calls will drain
@@ -5570,8 +5638,13 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
         let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
 
         // Fill the first chunk lazily into the caller's buffer.
-        let (bytes_used, row_count) =
+        let (bytes_used, row_count, iter_exhausted) =
             fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
+        if iter_exhausted {
+            // FRS-ITER-EAGER-FREE: first chunk drained the whole result — free the
+            // heavy backing state now (don't pin it until the lagging Java close()).
+            handle_state.drop_inner();
+        }
 
         // R16-M2 + R17-M3: partial-chunk state machine matches the prefix
         // path. Error with NO rows -> fail open(); error after some rows

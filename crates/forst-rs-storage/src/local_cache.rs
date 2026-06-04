@@ -505,6 +505,38 @@ impl LocalCache {
         if len == 0 {
             return Ok(Some(Vec::new()));
         }
+        // Reuse the zero-second-copy path; existing owned-Vec callers pay the
+        // one alloc + truncate here, while the hot SST read path uses
+        // `get_range_into` directly (no intermediate Vec, no second copy).
+        let mut buf = vec![0u8; len];
+        match self.get_range_into(key, offset, &mut buf)? {
+            Some(filled) => {
+                buf.truncate(filled);
+                Ok(Some(buf))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Like [`Self::get_range`], but preads DIRECTLY into the caller's `dst`
+    /// buffer — no intermediate `Vec` allocation and no second copy (the SST
+    /// read path's hot fast-path; ~66% of `read_at`'s cost was that wrapper
+    /// waste, measured 2026-06-04). Returns `Ok(Some(n))` with `n` bytes filled
+    /// (`n < dst.len()` only at EOF — a short read the caller validates), or
+    /// `Ok(None)` on a cache miss (caller re-fetches). Bumps the LRU on a hit
+    /// exactly like `get`. Sound ONLY for write-once files (SSTs): a fixed
+    /// `(key, offset)` maps to immutable bytes, so positional reads into the
+    /// caller buffer are always consistent, and a shared cached fd is safe
+    /// because `pread` uses an explicit offset (no shared file cursor).
+    pub fn get_range_into(
+        &self,
+        key: &str,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> io::Result<Option<usize>> {
+        if dst.is_empty() {
+            return Ok(Some(0));
+        }
         // Critical section: membership check + LRU bump. The pread happens
         // AFTER the guard is released (mirrors `get`) so disk I/O never
         // serializes concurrent readers on the single cache mutex.
@@ -531,18 +563,17 @@ impl LocalCache {
             }
         };
 
-        let mut buf = vec![0u8; len];
+        let len = dst.len();
         let mut filled = 0usize;
         while filled < len {
-            let n = pread(&file, offset + filled as u64, &mut buf[filled..])?;
+            let n = pread(&file, offset + filled as u64, &mut dst[filled..])?;
             if n == 0 {
                 break; // EOF before len — short read, caller validates.
             }
             filled += n;
         }
-        buf.truncate(filled);
         self.record_get(true);
-        Ok(Some(buf))
+        Ok(Some(filled))
     }
 
     /// Writes `data` into the cache under `key`. Evicts oldest entries
@@ -799,6 +830,100 @@ mod tests {
         assert_eq!(cache.current_bytes(), payload.len() as u64);
         assert_eq!(cache.len(), 1);
         assert!(cache.contains("/db/00000001.sst"));
+    }
+
+    #[test]
+    fn get_range_into_fills_caller_buffer_directly() {
+        // FRS-2026-06-04: zero-intermediate-alloc, zero-second-copy read path.
+        let (_tmp, cache) = fresh_cache(4096);
+        let payload: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        assert!(cache.put("/db/7.sst", &payload).unwrap());
+
+        // Middle sub-range filled directly into the caller's buffer.
+        let mut dst = vec![0u8; 50];
+        let n = cache
+            .get_range_into("/db/7.sst", 100, &mut dst)
+            .expect("ok")
+            .expect("hit");
+        assert_eq!(n, 50);
+        assert_eq!(dst, &payload[100..150]);
+
+        // Short read at EOF: returns fewer bytes; only [..n] is defined.
+        let mut dst2 = vec![0xFFu8; 50];
+        let n2 = cache
+            .get_range_into("/db/7.sst", 990, &mut dst2)
+            .expect("ok")
+            .expect("hit");
+        assert_eq!(n2, 10);
+        assert_eq!(&dst2[..10], &payload[990..1000]);
+
+        // Miss → None (caller falls back to remote).
+        let mut d = [0u8; 10];
+        assert!(cache
+            .get_range_into("/db/nope.sst", 0, &mut d)
+            .expect("ok")
+            .is_none());
+
+        // Zero-length → Some(0), no file touch.
+        let mut empty: [u8; 0] = [];
+        assert_eq!(
+            cache.get_range_into("/db/7.sst", 0, &mut empty).unwrap(),
+            Some(0)
+        );
+
+        // Equivalence: get_range (owned Vec) must equal get_range_into.
+        let owned = cache.get_range("/db/7.sst", 100, 50).unwrap().unwrap();
+        assert_eq!(owned, dst);
+    }
+
+    #[test]
+    fn get_range_into_concurrent_shared_fd_no_torn_reads() {
+        // Concurrency gate: 16 threads pread mixed sub-ranges of 8 shared files
+        // concurrently into their own buffers via the shared cached fd + the
+        // per-read LRU lock. Verifies no torn reads, no cross-thread
+        // corruption, lock correctness — the silent-bug surface single-threaded
+        // ground truth misses.
+        let (_tmp, cache) = fresh_cache(8 * 1024 * 1024);
+        let cache = Arc::new(cache);
+        let nfiles = 8usize;
+        let fsize = 64 * 1024usize;
+        let content = |f: usize| -> Vec<u8> {
+            (0..fsize).map(|i| ((f * 131 + i) & 0xff) as u8).collect()
+        };
+        let contents: Arc<Vec<Vec<u8>>> = Arc::new((0..nfiles).map(content).collect());
+        for f in 0..nfiles {
+            cache.put(&format!("/db/{f}.sst"), &contents[f]).unwrap();
+        }
+
+        let mut handles = Vec::new();
+        for tid in 0..16usize {
+            let cache = cache.clone();
+            let contents = contents.clone();
+            handles.push(thread::spawn(move || {
+                let mut buf = vec![0u8; 4096];
+                let blk = (fsize / 4096) as u64;
+                let mut s = (tid as u64).wrapping_mul(0x9E37_79B1).wrapping_add(1);
+                for _ in 0..5000 {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let f = (s >> 24) as usize % nfiles;
+                    let off = ((s >> 8) % blk) * 4096;
+                    let n = cache
+                        .get_range_into(&format!("/db/{f}.sst"), off, &mut buf)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(n, 4096);
+                    let o = off as usize;
+                    assert_eq!(
+                        &buf[..],
+                        &contents[f][o..o + 4096],
+                        "torn/cross read tid={tid} f={f} off={off}"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker join");
+        }
     }
 
     #[test]

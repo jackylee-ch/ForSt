@@ -36,8 +36,35 @@ use crate::cache::{BlockCache, CacheEntry, CacheKey, CachePriority};
 use super::bloom_filter::Sbbf;
 use super::data_block::decode_data_block_zerocopy;
 use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
-use super::schema::{FILE_HEADER_SIZE, SST_MAGIC};
+use super::kv_block::KvBlock;
+use super::schema::{BLOCK_TYPE_DATA, BLOCK_TYPE_DATA_KV, FILE_HEADER_SIZE, SST_MAGIC};
 use super::sparse_index::{decode_index, search_index, BlockStats, SparseIndexEntry};
+
+/// A decoded SST data block — either a v1 Arrow `RecordBatch` or a v2 KV block
+/// (C / [`KvBlock`]). The reader dispatches on the block-header `block_type`
+/// byte and returns this so the read paths (point `get`, `get_versions`, scan)
+/// need not know the on-disk format.
+pub enum DecodedBlock {
+    /// v1 Arrow-IPC `RecordBatch` (`block_type = BLOCK_TYPE_DATA`).
+    Arrow(RecordBatch),
+    /// v2 KV block (`block_type = BLOCK_TYPE_DATA_KV`), shared via `Arc` with
+    /// the decoded-block cache.
+    Kv(Arc<KvBlock>),
+}
+
+impl DecodedBlock {
+    /// Invokes `cb` once per row, in on-disk `(key ASC, sequence DESC)` order,
+    /// dispatching to the format-specific row walker.
+    pub fn for_each_row<F>(&self, cb: F) -> ForstResult<()>
+    where
+        F: FnMut(RowView<'_>) -> ForstResult<()>,
+    {
+        match self {
+            DecodedBlock::Arrow(batch) => for_each_row_in_batch(batch, cb),
+            DecodedBlock::Kv(kv) => kv.for_each_row(cb),
+        }
+    }
+}
 
 /// A single row produced by [`SstReaderImpl::scan`]:
 /// `(key, value, sequence, op_type)`.
@@ -313,19 +340,27 @@ impl SstReaderImpl {
     /// `block_size` (Sweep R3 H by Reviewers 2 + 5). The `file_size`
     /// is cached at `open()` so this check costs no syscall on the
     /// hot lookup path.
-    fn read_data_block(&self, block_offset: u64, block_size: u32) -> ForstResult<RecordBatch> {
+    fn read_decoded_block(
+        &self,
+        block_offset: u64,
+        block_size: u32,
+    ) -> ForstResult<DecodedBlock> {
         // 2026-05-30 DECODED-BLOCK CACHE: serve a decoded block from the shared
         // L1 cache when present — skips the `serial_read_at` + decompress +
         // decode chain that dominated the q9 prefix-iterator profile. Cloning a
-        // `RecordBatch` is cheap (Arc-shared column buffers).
+        // `RecordBatch` (Arc-shared column buffers) / an `Arc<KvBlock>` is cheap.
         let cache_key = self
             .block_cache
             .as_ref()
             .map(|_| CacheKey::new(self.cache_file_id, block_offset));
         if let (Some(cache), Some(key)) = (self.block_cache.as_ref(), cache_key) {
             if let Some(entry) = cache.get(&key) {
-                if let CacheEntry::DecodedBatch(batch) = entry.as_ref() {
-                    return Ok((**batch).clone());
+                match entry.as_ref() {
+                    CacheEntry::DecodedBatch(batch) => {
+                        return Ok(DecodedBlock::Arrow((**batch).clone()))
+                    }
+                    CacheEntry::DecodedKv(kv) => return Ok(DecodedBlock::Kv(Arc::clone(kv))),
+                    CacheEntry::RawBlock(_) => {}
                 }
             }
         }
@@ -339,42 +374,72 @@ impl SstReaderImpl {
                 block_offset, block_end, self.file_size
             )));
         }
-        // FRS-ZEROCOPY (2026-06-02): read the raw block into a fresh Arrow
-        // `Buffer` and decode ZERO-COPY via `decode_data_block_zerocopy` — the
-        // returned `RecordBatch` columns SLICE the block buffer instead of being
-        // copied out (the per-column copy that `decode_data_block`/`StreamReader`
-        // pays). A differential q7 profile showed Arrow decode + decompress is
-        // ~70% of the heavy-join prefix-iter CPU once state spills to SSTs; for
-        // `CompressionType::None` SSTs this path skips the column copy entirely
-        // (verified zero-copy in data_block tests). The block `Buffer` is kept
-        // alive by the batch (and the decoded-block cache below) — sound because
-        // SST blocks are immutable. This supersedes the FRS-NOZERO scratch-reuse
-        // path: that reused one thread-local buffer but still paid a full column
-        // copy in `StreamReader`; zero-copy trades the reused scratch for no copy,
-        // a net win for the large blocks the prefix-iterator re-probes. (The Vec
-        // alloc backs the live `Buffer`, so it is used productively, not churned;
-        // `forbid(unsafe_code)` keeps the safe zero-fill, dwarfed by the saved
-        // column copy.)
-        let mut raw = vec![0u8; block_size as usize];
-        read_at_exact(self.file.as_ref(), block_offset, &mut raw)?;
-        let block_buf = arrow::buffer::Buffer::from_vec(raw);
-        let batch = decode_data_block_zerocopy(&block_buf)?;
+        // FRS-ZEROCOPY (2026-06-02) + A-orthogonal buffer reuse (2026-06-04):
+        // read the raw block into a REUSED thread-local scratch (avoids the
+        // per-read `vec![0u8;blk]` alloc + zero-fill — measured ~85-170 ns/read,
+        // policy-clean, no unsafe, independent of A/mmap). The first header byte
+        // is the `block_type` discriminant — dispatch v1 Arrow vs v2 KV.
+        //   * v2 KV: `KvBlock::decode` COPIES the payload out (decompress returns
+        //     an owned Vec even for None), so the scratch is transient and reused
+        //     across calls — this is where the win lands (q4 is all-KV).
+        //   * v1 Arrow: `decode_data_block_zerocopy` slices a `Buffer` that must
+        //     OWN the bytes, so we `mem::take` the scratch (it becomes empty →
+        //     the next read reallocates). Identical cost to the old fresh-vec
+        //     path — NO extra copy, NO regression for v1.
+        // SST blocks are immutable, so cached entries never go stale.
+        let verify = super::data_block::sst_read_verify_checksum();
+        let bs = block_size as usize;
 
-        // Populate the cache (best-effort) so repeat probes of this block —
-        // common in the streaming join's per-key prefix scans — hit the decoded
-        // entry instead of re-reading+re-decoding. SSTs are immutable, so the
-        // cached entry never goes stale.
-        if let (Some(cache), Some(key)) = (self.block_cache.as_ref(), cache_key) {
-            let arc = Arc::new(batch.clone());
-            let charge = CacheEntry::DecodedBatch(Arc::clone(&arc)).charge();
-            cache.insert(
-                key,
-                CacheEntry::DecodedBatch(arc),
-                charge,
-                CachePriority::Low,
-            );
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
         }
-        Ok(batch)
+
+        let decoded = SCRATCH.with(|cell| -> ForstResult<DecodedBlock> {
+            let mut scratch = cell.borrow_mut();
+            // No-op (no realloc, no zero-fill) once warmed to a uniform block
+            // size; grows/shrinks only when the block size changes.
+            scratch.resize(bs, 0);
+            read_at_exact(self.file.as_ref(), block_offset, &mut scratch[..bs])?;
+            match scratch[0] {
+                BLOCK_TYPE_DATA => {
+                    // Hand ownership to the zero-copy Arrow Buffer; scratch is
+                    // left empty (reallocated on the next read).
+                    let raw = std::mem::take(&mut *scratch);
+                    let block_buf = arrow::buffer::Buffer::from_vec(raw);
+                    Ok(DecodedBlock::Arrow(decode_data_block_zerocopy(
+                        &block_buf, verify,
+                    )?))
+                }
+                BLOCK_TYPE_DATA_KV => {
+                    // decode copies the payload out → scratch stays reusable.
+                    Ok(DecodedBlock::Kv(Arc::new(KvBlock::decode(&scratch[..bs], verify)?)))
+                }
+                other => Err(ForstError::corruption(format!(
+                    "unknown SST data block_type 0x{other:02X}"
+                ))),
+            }
+        })?;
+
+        // Populate the decoded-block cache (best-effort) per variant.
+        if let (Some(cache), Some(key)) = (self.block_cache.as_ref(), cache_key) {
+            match &decoded {
+                DecodedBlock::Arrow(batch) => {
+                    let arc = Arc::new(batch.clone());
+                    let charge = CacheEntry::DecodedBatch(Arc::clone(&arc)).charge();
+                    cache.insert(key, CacheEntry::DecodedBatch(arc), charge, CachePriority::Low);
+                }
+                DecodedBlock::Kv(kv) => {
+                    let charge = CacheEntry::DecodedKv(Arc::clone(kv)).charge();
+                    cache.insert(
+                        key,
+                        CacheEntry::DecodedKv(Arc::clone(kv)),
+                        charge,
+                        CachePriority::Low,
+                    );
+                }
+            }
+        }
+        Ok(decoded)
     }
 
     /// Performs a point lookup for `key`.
@@ -407,77 +472,94 @@ impl SstReaderImpl {
             None => return Ok(None),
         };
 
-        // 4. Read and decode the DataBlock.
+        // 4. Read and decode the DataBlock (v1 Arrow or v2 KV).
         let entry = &self.index_entries[block_idx];
-        let batch = self.read_data_block(entry.block_offset, entry.block_size)?;
+        match self.read_decoded_block(entry.block_offset, entry.block_size)? {
+            DecodedBlock::Arrow(batch) => {
+                // 5. Binary search within the RecordBatch.
+                let first_row = match search_key_in_batch(&batch, key)? {
+                    Some(idx) => idx,
+                    None => return Ok(None),
+                };
 
-        // 5. Binary search within the RecordBatch.
-        let first_row = match search_key_in_batch(&batch, key)? {
-            Some(idx) => idx,
-            None => return Ok(None),
-        };
+                // 6. Find the row with the highest sequence among matching keys.
+                //
+                // R38-M1: a crafted or corrupt SST whose schema doesn't match
+                // the writer-side contract must surface as a corruption error,
+                // not a panic.
+                let keys = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
+                let sequences = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
+                let op_types = batch
+                    .column(3)
+                    .as_any()
+                    .downcast_ref::<UInt8Array>()
+                    .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
+                let values = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
 
-        // 6. Find the row with the highest sequence number among matching keys.
-        //
-        // R38-M1: a crafted or corrupt SST whose schema doesn't match the
-        // writer-side contract must surface as a corruption error, not a
-        // panic. The batch path (`for_each_row_in_batch` at line 481+) uses
-        // `ok_or_else(corruption)` here too; mirror that pattern.
-        let keys = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
-        let sequences = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
-        let op_types = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<UInt8Array>()
-            .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
-        let values = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
+                let mut best_row = first_row;
+                let mut best_seq = sequences.value(first_row);
 
-        let mut best_row = first_row;
-        let mut best_seq = sequences.value(first_row);
-
-        let mut row = first_row + 1;
-        while row < batch.num_rows() && keys.value(row) == key {
-            let seq = sequences.value(row);
-            if seq > best_seq {
-                best_seq = seq;
-                best_row = row;
-            }
-            row += 1;
-        }
-
-        // 7. Build result based on op_type.
-        let op_byte = op_types.value(best_row);
-        let op = OpType::from_u8(op_byte)
-            .ok_or_else(|| ForstError::corruption(format!("invalid op_type byte: {}", op_byte)))?;
-
-        let value = match op {
-            OpType::Delete | OpType::SingleDelete => None,
-            OpType::Put | OpType::Merge => {
-                if values.is_null(best_row) {
-                    None
-                } else {
-                    Some(values.value(best_row).to_vec())
+                let mut row = first_row + 1;
+                while row < batch.num_rows() && keys.value(row) == key {
+                    let seq = sequences.value(row);
+                    if seq > best_seq {
+                        best_seq = seq;
+                        best_row = row;
+                    }
+                    row += 1;
                 }
-            }
-        };
 
-        Ok(Some(LookupResult {
-            value,
-            sequence: best_seq,
-            op_type: op,
-        }))
+                // 7. Build result based on op_type.
+                let op_byte = op_types.value(best_row);
+                let op = OpType::from_u8(op_byte).ok_or_else(|| {
+                    ForstError::corruption(format!("invalid op_type byte: {}", op_byte))
+                })?;
+
+                let value = match op {
+                    OpType::Delete | OpType::SingleDelete => None,
+                    OpType::Put | OpType::Merge => {
+                        if values.is_null(best_row) {
+                            None
+                        } else {
+                            Some(values.value(best_row).to_vec())
+                        }
+                    }
+                };
+
+                Ok(Some(LookupResult {
+                    value,
+                    sequence: best_seq,
+                    op_type: op,
+                }))
+            }
+            DecodedBlock::Kv(kv) => match kv.lookup(key)? {
+                None => Ok(None),
+                Some((raw_value, sequence, op_type)) => {
+                    // Mirror the v1 op-type semantics exactly.
+                    let value = match op_type {
+                        OpType::Delete | OpType::SingleDelete => None,
+                        OpType::Put | OpType::Merge => raw_value,
+                    };
+                    Ok(Some(LookupResult {
+                        value,
+                        sequence,
+                        op_type,
+                    }))
+                }
+            },
+        }
     }
 
     /// Returns every visible version of `key` in this SST, newest first.
@@ -510,53 +592,79 @@ impl SstReaderImpl {
             }
 
             let entry = &self.index_entries[block_idx];
-            let batch = self.read_data_block(entry.block_offset, entry.block_size)?;
-            let Some(first_row) = search_key_in_batch(&batch, key)? else {
-                continue;
-            };
-            let keys = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
-            let values = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
-            let sequences = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<UInt64Array>()
-                .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
-            let op_types = batch
-                .column(3)
-                .as_any()
-                .downcast_ref::<UInt8Array>()
-                .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
+            match self.read_decoded_block(entry.block_offset, entry.block_size)? {
+                DecodedBlock::Arrow(batch) => {
+                    let Some(first_row) = search_key_in_batch(&batch, key)? else {
+                        continue;
+                    };
+                    let keys = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .ok_or_else(|| {
+                            ForstError::corruption("SST batch column 0 not BinaryArray")
+                        })?;
+                    let values = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<BinaryArray>()
+                        .ok_or_else(|| {
+                            ForstError::corruption("SST batch column 1 not BinaryArray")
+                        })?;
+                    let sequences = batch
+                        .column(2)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or_else(|| {
+                            ForstError::corruption("SST batch column 2 not UInt64Array")
+                        })?;
+                    let op_types = batch
+                        .column(3)
+                        .as_any()
+                        .downcast_ref::<UInt8Array>()
+                        .ok_or_else(|| {
+                            ForstError::corruption("SST batch column 3 not UInt8Array")
+                        })?;
 
-            let mut row = first_row;
-            while row < batch.num_rows() && keys.value(row) == key {
-                let op_byte = op_types.value(row);
-                let op = OpType::from_u8(op_byte).ok_or_else(|| {
-                    ForstError::corruption(format!("invalid op_type byte: {}", op_byte))
-                })?;
-                let value = match op {
-                    OpType::Delete | OpType::SingleDelete => None,
-                    OpType::Put | OpType::Merge => {
-                        if values.is_null(row) {
-                            None
-                        } else {
-                            Some(values.value(row).to_vec())
-                        }
+                    let mut row = first_row;
+                    while row < batch.num_rows() && keys.value(row) == key {
+                        let op_byte = op_types.value(row);
+                        let op = OpType::from_u8(op_byte).ok_or_else(|| {
+                            ForstError::corruption(format!("invalid op_type byte: {}", op_byte))
+                        })?;
+                        let value = match op {
+                            OpType::Delete | OpType::SingleDelete => None,
+                            OpType::Put | OpType::Merge => {
+                                if values.is_null(row) {
+                                    None
+                                } else {
+                                    Some(values.value(row).to_vec())
+                                }
+                            }
+                        };
+                        out.push(LookupResult {
+                            value,
+                            sequence: sequences.value(row),
+                            op_type: op,
+                        });
+                        row += 1;
                     }
-                };
-                out.push(LookupResult {
-                    value,
-                    sequence: sequences.value(row),
-                    op_type: op,
-                });
-                row += 1;
+                }
+                DecodedBlock::Kv(kv) => {
+                    let mut raw = Vec::new();
+                    kv.collect_versions(key, &mut raw)?;
+                    for (raw_value, sequence, op) in raw {
+                        let value = match op {
+                            OpType::Delete | OpType::SingleDelete => None,
+                            OpType::Put | OpType::Merge => raw_value,
+                        };
+                        out.push(LookupResult {
+                            value,
+                            sequence,
+                            op_type: op,
+                        });
+                    }
+                }
             }
         }
 
@@ -636,6 +744,9 @@ impl SstReaderImpl {
     /// `scan() -> Vec<SstScanRow>` materialisation. Callers iterate the
     /// returned `RecordBatch` directly via [`for_each_row_in_batch`] (which
     /// yields zero-copy [`RowView`]s borrowing from the batch buffers).
+    ///
+    /// v1-only: errors on a v2 KV block. New streaming callers should use the
+    /// format-agnostic [`Self::for_each_row_in_block`] instead.
     pub fn read_block_at(&self, block_idx: usize) -> ForstResult<RecordBatch> {
         self.blocks_read
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -646,7 +757,34 @@ impl SstReaderImpl {
                 self.index_entries.len()
             ))
         })?;
-        self.read_data_block(entry.block_offset, entry.block_size)
+        match self.read_decoded_block(entry.block_offset, entry.block_size)? {
+            DecodedBlock::Arrow(batch) => Ok(batch),
+            DecodedBlock::Kv(_) => Err(ForstError::corruption(
+                "read_block_at called on a v2 KV block; use for_each_row_in_block",
+            )),
+        }
+    }
+
+    /// Format-agnostic streaming primitive: invokes `cb` once per row of the
+    /// data block at `block_idx`, in on-disk `(key ASC, sequence DESC)` order,
+    /// dispatching v1 Arrow vs v2 KV internally. The block is decoded (or served
+    /// from the decoded-block cache) and dropped when this returns, so the
+    /// callback must consume each [`RowView`] inline or copy it out.
+    pub fn for_each_row_in_block<F>(&self, block_idx: usize, cb: F) -> ForstResult<()>
+    where
+        F: FnMut(RowView<'_>) -> ForstResult<()>,
+    {
+        self.blocks_read
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let entry = self.index_entries.get(block_idx).ok_or_else(|| {
+            ForstError::invalid_argument(format!(
+                "SST block index {} out of range (have {} blocks)",
+                block_idx,
+                self.index_entries.len()
+            ))
+        })?;
+        let block = self.read_decoded_block(entry.block_offset, entry.block_size)?;
+        block.for_each_row(cb)
     }
 
     /// Scans the SST file for all entries in the `[lower, upper)` key range,
@@ -687,8 +825,8 @@ impl SstReaderImpl {
                 }
             }
 
-            let batch = self.read_data_block(entry.block_offset, entry.block_size)?;
-            for_each_row_in_batch(&batch, |view| {
+            let block = self.read_decoded_block(entry.block_offset, entry.block_size)?;
+            block.for_each_row(|view| {
                 if view.key < lower {
                     return Ok(());
                 }

@@ -36,7 +36,16 @@ pub const SST_MAGIC: &[u8; 4] = b"FRST";
 pub const SST_FORMAT_VERSION: u16 = 2;
 
 /// Block type discriminant for data blocks.
+///
+/// `0x01` — v1 Arrow-IPC `RecordBatch` payload (legacy; still read).
+/// `0x02` — v2 KV payload (C / [`super::kv_block`]): prefix-compressed sorted KV
+///   rows + restart points. Decode is a pointer-walk (no Arrow array build / no
+///   FlatBuffers / no offset validation). The reader dispatches on this byte, so
+///   v1 and v2 blocks coexist in the same DB with no migration.
 pub const BLOCK_TYPE_DATA: u8 = 0x01;
+
+/// Block type discriminant for v2 KV data blocks (see [`BLOCK_TYPE_DATA`]).
+pub const BLOCK_TYPE_DATA_KV: u8 = 0x02;
 
 /// Size in bytes of a block header (type + compression + reserved + sizes + checksum).
 pub const BLOCK_HEADER_SIZE: usize = 16;

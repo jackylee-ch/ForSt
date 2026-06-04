@@ -474,6 +474,22 @@ impl ShardedMemTable {
         shard.get(key, read_sequence)
     }
 
+    /// FRS-MERGE-PERF: single-pass merge-operand collection for `key` (see
+    /// [`VectorizedMemTable::collect_merge_operands`]). Acquires the key's shard
+    /// read lock ONCE and collects the whole chain, replacing the engine peel
+    /// path's O(N²) per-operand `get(key, cutoff)` loop (which also re-locked
+    /// the shard per operand).
+    pub fn collect_merge_operands(
+        &self,
+        key: &[u8],
+        cutoff: u64,
+        operands: &mut Vec<Vec<u8>>,
+    ) -> ForstResult<Option<Option<Vec<u8>>>> {
+        let idx = self.shard_for_key(key);
+        let shard = self.shards[idx].read().expect("lock poisoned");
+        shard.collect_merge_operands(key, cutoff, operands)
+    }
+
     /// Zero-copy point lookup: returns a raw pointer + length to the inline
     /// value without allocating. Returns `None` if the key is not found, is
     /// a tombstone, or the value is not inlined (exceeds INLINE_THRESHOLD).
@@ -637,18 +653,6 @@ impl ShardedMemTable {
             // the unsorted buffer is bounded by MAX_UNSORTED_MERGE_THRESHOLD
             // (4096), so the unsorted filter is O(4096), not O(N). Mirrors
             // `range_scan_cursor`, which already scans under a read lock.
-            //
-            // WHY: the prior `shard.write()` + `merge_if_dirty()` held a WRITE
-            // lock across a potentially-expensive merge (up to 4096 entries into
-            // a multi-million-entry BTree) on EVERY prefix scan. The old comment
-            // claimed "uncontended under single-threaded access", but with the
-            // MapStateCache bypassed (all reads routed to the engine) plus the
-            // background flush worker, a JFR/native profile of q9 at the memtable
-            // spill showed ~32 % of the Join thread in `RwLock::lock_contended`
-            // here — the heavy-join cap. A read lock with no merge holds the lock
-            // only for the O(log N + K) scan, eliminating the contention. The
-            // merge still happens on the INSERT path when the unsorted buffer
-            // exceeds the threshold, so sorted_index stays compact over time.
             let guard = shard.read().expect("lock poisoned");
             let mut keys = guard.prefix_scan_keys(lower, upper);
             drop(guard);

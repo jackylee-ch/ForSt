@@ -20,8 +20,8 @@ use arrow::array::{Array, BinaryArray, UInt64Array};
 use forst_rs_common::{get_fixed32, CompressionType, OpType};
 use forst_rs_io::RandomAccessFile;
 use forst_rs_storage::sst::{
-    decode_data_block, decode_index, search_index, FileHeader, FooterV1, Sbbf, SstReaderImpl,
-    SstWriterImpl, SstWriterOptions, FILE_HEADER_SIZE, SST_MAGIC,
+    decode_data_block, decode_index, search_index, FileHeader, FooterV1, LookupResult, Sbbf,
+    SstReaderImpl, SstWriterImpl, SstWriterOptions, FILE_HEADER_SIZE, SST_MAGIC,
 };
 
 /// In-memory RandomAccessFile for integration tests.
@@ -428,6 +428,161 @@ fn test_m2_reader_full_pipeline_with_deletes() {
             assert_eq!(lr.op_type, OpType::Put);
             let expected = format!("pval_{:05}", i);
             assert_eq!(lr.value, Some(expected.into_bytes()));
+        }
+    }
+}
+
+/// C (2026-06-04) — DUAL-VERSION COMPATIBILITY: the same logical data, written
+/// once as a v1 Arrow SST and once as a v2 KV SST, must read back IDENTICALLY
+/// through the same reader (get / get_versions / scan). This covers BOTH the
+/// new-format correctness AND the old-format-SST compatibility the format
+/// migration depends on (the reader auto-detects per block, so v1 and v2 SSTs
+/// coexist with no migration step).
+mod c_dual_version_compat {
+    use super::*;
+    use forst_rs_storage::sst::{BLOCK_TYPE_DATA, BLOCK_TYPE_DATA_KV};
+
+    type Row = (Vec<u8>, Option<Vec<u8>>, u64, u8);
+
+    fn dataset() -> Vec<Row> {
+        // 200 sorted distinct keys sharing the "user:" prefix (exercises prefix
+        // compression + restart boundaries). Mix of Put / tombstone (Delete) /
+        // present-but-empty value (must NOT collapse to a tombstone).
+        (0..200u64)
+            .map(|i| {
+                let k = format!("user:{i:05}").into_bytes();
+                if i % 7 == 0 {
+                    (k, None, i + 1, 0) // Delete tombstone
+                } else if i % 11 == 0 {
+                    (k, Some(Vec::new()), i + 1, 1) // Put, empty value
+                } else {
+                    (k, Some(format!("val_{i}").into_bytes()), i + 1, 1) // Put
+                }
+            })
+            .collect()
+    }
+
+    fn build(kv_format: bool, rows: &[Row]) -> Vec<u8> {
+        let mut w = SstWriterImpl::with_options(SstWriterOptions {
+            // Small blocks so the 200 keys span many data blocks → exercises
+            // multi-block get/scan + restart points across blocks.
+            block_size: 256,
+            compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
+        });
+        w.force_kv_block_format(kv_format);
+        for (k, v, seq, op) in rows {
+            w.add(k, v.as_deref(), *seq, *op).unwrap();
+        }
+        w.finish().unwrap().0
+    }
+
+    fn open(data: Vec<u8>) -> SstReaderImpl {
+        SstReaderImpl::open(Box::new(MemRandomAccessFile {
+            data: Arc::new(data),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn v1_and_v2_ssts_read_identically() {
+        let rows = dataset();
+        let v1 = build(false, &rows);
+        let v2 = build(true, &rows);
+
+        // Sanity: the two files really use different on-disk block formats.
+        // The first data block begins right after the 16-byte file header.
+        assert_eq!(v1[FILE_HEADER_SIZE], BLOCK_TYPE_DATA, "v1 must be Arrow block");
+        assert_eq!(
+            v2[FILE_HEADER_SIZE], BLOCK_TYPE_DATA_KV,
+            "v2 must be KV block"
+        );
+
+        let r1 = open(v1);
+        let r2 = open(v2);
+
+        // Point get + version lookup parity, including absent keys past the end
+        // and a key strictly between two present keys.
+        for i in 0..210u64 {
+            let k = format!("user:{i:05}").into_bytes();
+            assert_eq!(
+                r1.get(&k).unwrap(),
+                r2.get(&k).unwrap(),
+                "get mismatch at user:{i:05}"
+            );
+            assert_eq!(
+                r1.get_versions(&k).unwrap(),
+                r2.get_versions(&k).unwrap(),
+                "get_versions mismatch at user:{i:05}"
+            );
+        }
+        // Absent key lexically between present keys.
+        assert_eq!(r1.get(b"user:00050x").unwrap(), r2.get(b"user:00050x").unwrap());
+
+        // Full scan + bounded range scan parity.
+        assert_eq!(
+            r1.scan(b"", None).unwrap(),
+            r2.scan(b"", None).unwrap(),
+            "full scan mismatch"
+        );
+        assert_eq!(
+            r1.scan(b"user:00050", Some(b"user:00150")).unwrap(),
+            r2.scan(b"user:00050", Some(b"user:00150")).unwrap(),
+            "bounded range scan mismatch"
+        );
+
+        // And the v2 scan must actually return the expected row count (not
+        // silently empty) — guards against a "both empty" false pass.
+        assert_eq!(r2.scan(b"", None).unwrap().len(), rows.len());
+    }
+
+    /// Concurrency gate (2026-06-04): the read path now uses a per-thread
+    /// thread-local scratch buffer (banked buffer-reuse) and, for v1, a
+    /// `mem::take` of that scratch into a zero-copy Arrow `Buffer`. A torn
+    /// scratch / cross-thread aliasing bug there is exactly what single-threaded
+    /// ground truth misses (cf. the `seek_restart` bug). So hammer ONE shared
+    /// reader from many threads (get + full scan) for BOTH formats and assert
+    /// every thread sees the correct, complete result.
+    #[test]
+    fn concurrent_readers_one_reader_both_formats() {
+        use std::thread;
+        let rows = dataset();
+        let keys: Vec<Vec<u8>> = rows.iter().map(|(k, ..)| k.clone()).collect();
+
+        for kv_format in [false, true] {
+            let reader = Arc::new(open(build(kv_format, &rows)));
+            // Single-threaded reference (the reader's own correct output);
+            // concurrency must never change it.
+            let ref_scan = Arc::new(reader.scan(b"", None).unwrap());
+            let ref_get: Arc<Vec<Option<LookupResult>>> =
+                Arc::new(keys.iter().map(|k| reader.get(k).unwrap()).collect());
+
+            let mut handles = Vec::new();
+            for _tid in 0..12 {
+                let r = Arc::clone(&reader);
+                let ref_scan = Arc::clone(&ref_scan);
+                let ref_get = Arc::clone(&ref_get);
+                let keys = keys.clone();
+                handles.push(thread::spawn(move || {
+                    for _round in 0..50 {
+                        assert_eq!(
+                            &r.scan(b"", None).unwrap(),
+                            &*ref_scan,
+                            "concurrent scan corruption (kv={kv_format})"
+                        );
+                        for (i, k) in keys.iter().enumerate() {
+                            assert_eq!(
+                                &r.get(k).unwrap(),
+                                &ref_get[i],
+                                "concurrent get mismatch (kv={kv_format})"
+                            );
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("reader thread");
+            }
         }
     }
 }
