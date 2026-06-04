@@ -1406,6 +1406,9 @@ mod tests {
             compression: CompressionType::None,
             cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
+        // This test asserts the v1 Arrow zero-copy decode path specifically; the
+        // writer default is now v2 KV, so force v1 for this v1-path test.
+        writer.force_kv_block_format(false);
         for i in 0..32u64 {
             writer
                 .add(

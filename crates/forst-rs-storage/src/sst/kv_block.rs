@@ -71,10 +71,17 @@ pub const KV_RESTART_INTERVAL: usize = 16;
 pub fn sst_write_kv_format() -> bool {
     use std::sync::OnceLock;
     static KV: OnceLock<bool> = OnceLock::new();
+    // FLIPPED TO DEFAULT-ON 2026-06-04: the #31 scan-heavy v1-vs-v2 gate came back
+    // 5/5 neutral-or-better (q5/q8 finish faster, q7 +23%, q11 v2-finishes-v1-
+    // doesn't, q15 ≈) + q4 exercised v2 throughout + correctness proven both modes
+    // (dual-version byte-identical, engine ground-truth, full suites v2-forced).
+    // `FRS_SST_KV_BLOCK_FORMAT=0` is the instant opt-out back to v1 Arrow blocks.
+    // (Coverage caveat: gated on the scan/iter-heavy RISK queries + q4, not the
+    // full q0–q22; light queries are source-bound + block-format-agnostic.)
     *KV.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("FRS_SST_KV_BLOCK_FORMAT").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE")
+            Some("0") | Some("false") | Some("FALSE")
         )
     })
 }

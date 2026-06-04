@@ -149,6 +149,59 @@ fn frs_iter_diag_enabled() -> bool {
     })
 }
 
+/// BULK-SAMPLE DIAG (FRS_BULK_SAMPLE=K, off when 0/unset): time 1-in-K
+/// `build_lazy_prefix` builds at NANOSECOND granularity and break the per-probe
+/// cost into resident-read sub-components — `rfve` (resident_flushed read-lock +
+/// O(N) clone), `bloom` (may_contain_range prune), `cursor` (prefix_scan_cursor
+/// = scan + sort) — vs `sst` (Tier-3 fan-out). 1/K SAMPLING (not a lowered
+/// threshold) so the ~1.7µs bulk builds are measured WITHOUT observer-effect
+/// pollution: only 1-in-K builds pay the `Instant::now` calls. Answers "is the
+/// 3.3× floor the resident FIXED overhead or SST fan-out?" → picks the lever.
+fn bulk_sample_k() -> usize {
+    use std::sync::OnceLock;
+    static K: OnceLock<usize> = OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("FRS_BULK_SAMPLE")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// Returns true on every K-th call (the sampled builds).
+fn bulk_sample_hit(k: usize) -> bool {
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    k > 0 && CTR.fetch_add(1, Ordering::Relaxed) % (k as u64) == 0
+}
+
+/// Accumulate one sampled build's sub-phase ns; dump running averages every 8192
+/// samples. `resident-fixed` = rfve+bloom+cursor; `sst` = fan-out.
+fn bulk_record(rfve: u64, bloom: u64, cursor: u64, sst: u64, total: u64) {
+    static N: AtomicU64 = AtomicU64::new(0);
+    static RFVE: AtomicU64 = AtomicU64::new(0);
+    static BLOOM: AtomicU64 = AtomicU64::new(0);
+    static CURSOR: AtomicU64 = AtomicU64::new(0);
+    static SST: AtomicU64 = AtomicU64::new(0);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+    RFVE.fetch_add(rfve, Ordering::Relaxed);
+    BLOOM.fetch_add(bloom, Ordering::Relaxed);
+    CURSOR.fetch_add(cursor, Ordering::Relaxed);
+    SST.fetch_add(sst, Ordering::Relaxed);
+    TOTAL.fetch_add(total, Ordering::Relaxed);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 8192 == 0 {
+        let g = |a: &AtomicU64| a.load(Ordering::Relaxed) / n;
+        eprintln!(
+            "[BULK_DIAG] samples={n} avg_ns total={} | resident-fixed: rfve={} bloom={} cursor={} | sst_fanout={}",
+            g(&TOTAL),
+            g(&RFVE),
+            g(&BLOOM),
+            g(&CURSOR),
+            g(&SST)
+        );
+    }
+}
+
 /// Bounded capacity for the background flush queue. Sized comfortably above
 /// `max_write_buffer_number` so the writer's `try_send` rarely blocks; real
 /// backpressure is handled by [`WriteController::set_imm_count`] which
@@ -5574,6 +5627,20 @@ impl DbImpl {
             None
         };
 
+        // BULK-SAMPLE DIAG: decide once per build whether to nanosecond-time
+        // this one (1-in-K) so the bulk ~1.7µs builds are measured without
+        // observer-effect. Accumulators below stay 0 on unsampled builds.
+        let bulk_sampled = bulk_sample_hit(bulk_sample_k());
+        let bulk_start = if bulk_sampled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let mut bulk_rfve_ns = 0u64;
+        let mut bulk_bloom_ns = 0u64;
+        let mut bulk_cursor_ns = 0u64;
+        let mut bulk_resident_done_ns = 0u64;
+
         let upper = prefix_upper_bound(prefix);
         let upper_slice = upper.as_deref();
         let cf_data = self.lookup_cf_by_id(cf.id())?;
@@ -5640,7 +5707,23 @@ impl DbImpl {
         // NOT added to `resident_shadowed`, so Tier 3 reads its SST — but that
         // SST's range also excludes the prefix, so Tier 3's own range check
         // skips it too (consistent, no data loss).
+        let rfve_t0 = bulk_start.map(|_| std::time::Instant::now());
         let resident_entries = cf_data.resident_flushed_visible_entries(&live_files);
+        if let Some(t) = rfve_t0 {
+            // rfve = JUST the resident_flushed read-lock acquire + O(N) clone.
+            bulk_rfve_ns = t.elapsed().as_nanos() as u64;
+        }
+        // DECAY AUTOPSY discriminator (3a unbounded-state vs 3b slower-work): the
+        // resident path is O(resident-SST-count) per probe — this accessor clones
+        // ALL N resident entries (under a RwLock read), and the loop below iterates
+        // all N. `resident_total` = N; `resident_examined` = N reaching the bloom/
+        // seek decision (post range-prune); `resident_seeks` = N that escaped the
+        // bloom prune into a BTreeMap seek. `resident_us / resident_examined` (per-
+        // entry cost over time) separates "more work" (flat ⇒ O(N) structural, 3a)
+        // from "slower work" (rising ⇒ bigger seeks / lock-wait, 3b).
+        let resident_total = resident_entries.len();
+        let mut resident_examined = 0usize;
+        let mut resident_seeks = 0usize;
         let mut resident_shadowed: std::collections::HashSet<FileNumber> =
             std::collections::HashSet::new();
         // FRS-RESIDENT-BLOOM-SKIP (2026-06-03): snapshot the SST reader cache once so
@@ -5660,6 +5743,7 @@ impl DbImpl {
                     }
                 }
             }
+            resident_examined += 1;
             // FRS-RESIDENT-BLOOM-SKIP: the #1 q4/q7/q9 decay cost (symbolized profile:
             // `btree::search::find_lower_bound_index`) is the per-probe BTreeMap
             // lower-bound seek over the resident-shadow memtables — and `FRS_ITER_DIAG`
@@ -5675,12 +5759,22 @@ impl DbImpl {
             // shadowed (Tier 3 correctly skips it too — no data is missed). Falls back to
             // seeking when the reader isn't cached yet (e.g. async-upload window).
             if let Some(reader) = readers_snapshot.get(&entry.file_number) {
-                if !reader.may_contain_range(prefix, upper_slice) {
+                let bt = bulk_start.map(|_| std::time::Instant::now());
+                let pass = reader.may_contain_range(prefix, upper_slice);
+                if let Some(t) = bt {
+                    bulk_bloom_ns += t.elapsed().as_nanos() as u64;
+                }
+                if !pass {
                     resident_shadowed.insert(entry.file_number);
                     continue;
                 }
             }
+            resident_seeks += 1;
+            let ct = bulk_start.map(|_| std::time::Instant::now());
             let resident_cursor = entry.memtable.prefix_scan_cursor(prefix, upper_slice);
+            if let Some(t) = ct {
+                bulk_cursor_ns += t.elapsed().as_nanos() as u64;
+            }
             // Shadow the SST only when we actually serve this entry from RAM.
             resident_shadowed.insert(entry.file_number);
             if !resident_cursor.is_empty() {
@@ -5688,6 +5782,10 @@ impl DbImpl {
                     cursor: resident_cursor,
                 });
             }
+        }
+        if let Some(t) = bulk_start {
+            // Everything after this point is the Tier-3 SST fan-out.
+            bulk_resident_done_ns = t.elapsed().as_nanos() as u64;
         }
         // FRS-ITER-DIAG sub-phase split (2026-06-02): capture how much of the
         // build is the memtable/resident-tier prep vs the Tier-3 SST loop, and
@@ -5784,12 +5882,15 @@ impl DbImpl {
                 let imm_us = imm_done_us.saturating_sub(active_us);
                 let resident_us = prep_us.saturating_sub(imm_done_us);
                 eprintln!(
-                    "FRS-ITER-DIAG build_lazy_prefix us={} prep_us={} active_us={} imm_us={} resident_us={} n_imm={} sst_open_us={} sst_considered={} prefix_len={} mem_sources={} mem_keys={} sst_sources={} resident_shadowed={} new_peak={}",
+                    "FRS-ITER-DIAG build_lazy_prefix us={} prep_us={} active_us={} imm_us={} resident_us={} resident_total={} resident_examined={} resident_seeks={} n_imm={} sst_open_us={} sst_considered={} prefix_len={} mem_sources={} mem_keys={} sst_sources={} resident_shadowed={} new_peak={}",
                     us,
                     prep_us,
                     active_us,
                     imm_us,
                     resident_us,
+                    resident_total,
+                    resident_examined,
+                    resident_seeks,
                     n_imm,
                     sst_open_us,
                     sst_considered,
@@ -5801,6 +5902,19 @@ impl DbImpl {
                     new_peak
                 );
             }
+        }
+
+        if let Some(t) = bulk_start {
+            let total_ns = t.elapsed().as_nanos() as u64;
+            // sst = everything after the resident loop (Tier-3 fan-out + setup).
+            let sst_ns = total_ns.saturating_sub(bulk_resident_done_ns);
+            bulk_record(
+                bulk_rfve_ns,
+                bulk_bloom_ns,
+                bulk_cursor_ns,
+                sst_ns,
+                total_ns,
+            );
         }
 
         LazyPrefixIter::new(sources)
@@ -8474,6 +8588,44 @@ impl FlushExecutor for DbImpl {
         // Auto-compact L0 if it has grown past the slowdown trigger so
         // the engine stays well clear of the write-stall ceiling.
         self.maybe_auto_compact(cf_data)?;
+
+        // DECAY AUTOPSY (FRS_DECAY_DIAG=1, off by default): per-flush LSM shape
+        // + state-size proxy (sum of live SST bytes, post-compaction). Monotonic
+        // `state` ⇒ window expiry isn't reclaiming (operator state-lifecycle);
+        // a plateau ⇒ self-asymptoting; an L0-dominated `ssts` ⇒ compaction-bound.
+        {
+            use std::sync::OnceLock;
+            static EN: OnceLock<bool> = OnceLock::new();
+            let on = *EN.get_or_init(|| {
+                matches!(
+                    std::env::var("FRS_DECAY_DIAG").ok().as_deref(),
+                    Some("1") | Some("true") | Some("TRUE")
+                )
+            });
+            if on {
+                static FSEQ: AtomicU64 = AtomicU64::new(0);
+                let seq = FSEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                let v = self.version_set.current();
+                let mut parts = Vec::new();
+                let mut tot_files = 0usize;
+                let mut tot_bytes = 0u64;
+                for (lvl, lm) in v.levels.iter().enumerate() {
+                    let n = lm.files.len();
+                    if n == 0 {
+                        continue;
+                    }
+                    let b: u64 = lm.files.iter().map(|f| f.file_size).sum();
+                    parts.push(format!("L{lvl}={n}/{}MiB", b >> 20));
+                    tot_files += n;
+                    tot_bytes += b;
+                }
+                eprintln!(
+                    "[DECAY_DIAG] flush#{seq} ssts={tot_files} state={}MiB levels=[{}]",
+                    tot_bytes >> 20,
+                    parts.join(" ")
+                );
+            }
+        }
         Ok(())
     }
 }

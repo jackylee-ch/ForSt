@@ -989,6 +989,9 @@ mod tests {
             compression: CompressionType::None,
             cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
+        // Pins the v1 Arrow path (decode_data_block below is the v1 decoder); the
+        // writer default is now v2 KV, so force v1 explicitly for this v1 test.
+        writer.force_kv_block_format(false);
         for i in 0..20u64 {
             let key = format!("key{:03}", i);
             let val = format!("val{:03}", i);

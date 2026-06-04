@@ -54,6 +54,9 @@ fn write_and_verify(n: usize, compression: CompressionType, block_size: usize) {
         cf_id: forst_rs_common::DEFAULT_CF_ID,
     };
     let mut writer = SstWriterImpl::with_options(options);
+    // This e2e test decodes blocks with the v1 `decode_data_block`; the writer
+    // default is now v2 KV, so pin v1 (the v1 Arrow path is still supported).
+    writer.force_kv_block_format(false);
 
     // Generate sorted keys: "key_00000" .. "key_NNNNN"
     for i in 0..n {
@@ -174,6 +177,8 @@ fn test_e2e_search_index_point_lookup() {
         cf_id: forst_rs_common::DEFAULT_CF_ID,
     };
     let mut writer = SstWriterImpl::with_options(options);
+    // v1-path test (decodes via decode_data_block); pin v1 now that default=v2.
+    writer.force_kv_block_format(false);
 
     for i in 0..500u64 {
         let key = format!("k{:05}", i);

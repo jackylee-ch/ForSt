@@ -69,6 +69,47 @@ pub const DEFAULT_SHARD_COUNT: usize = 16;
 /// parallelism on large multi-socket hosts.
 pub const MAX_SHARD_COUNT: usize = 256;
 
+/// CURSOR DIAG (FRS_CURSOR_DIAG=K, off when 0/unset): 1-in-K sampled split of
+/// `prefix_scan_cursor` into `scan` (BTreeMap range + O(≤4096) unsorted filter)
+/// vs `sort` (keys.sort). Picks the cheap fix for lever #2 (the active-memtable
+/// cursor) — structure swap is OFF the table (skiplist already reverted for
+/// cache-miss reasons, see `VectorizedMemTable::index` doc).
+mod cursor_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+
+    pub fn k() -> usize {
+        static K: OnceLock<usize> = OnceLock::new();
+        *K.get_or_init(|| {
+            std::env::var("FRS_CURSOR_DIAG")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    pub fn hit(k: usize) -> bool {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        k > 0 && CTR.fetch_add(1, Ordering::Relaxed) % (k as u64) == 0
+    }
+
+    pub fn record(scan_ns: u64, sort_ns: u64) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        static SCAN: AtomicU64 = AtomicU64::new(0);
+        static SORT: AtomicU64 = AtomicU64::new(0);
+        SCAN.fetch_add(scan_ns, Ordering::Relaxed);
+        SORT.fetch_add(sort_ns, Ordering::Relaxed);
+        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 8192 == 0 {
+            eprintln!(
+                "[CURSOR_DIAG] samples={n} avg_ns scan(range+unsorted-filter)={} sort={}",
+                SCAN.load(Ordering::Relaxed) / n,
+                SORT.load(Ordering::Relaxed) / n
+            );
+        }
+    }
+}
+
 /// A sharded MemTable: N independent [`VectorizedMemTable`]s each protected
 /// by its own [`RwLock`]. See module docs for the design rationale.
 pub struct ShardedMemTable {
@@ -645,6 +686,16 @@ impl ShardedMemTable {
         // ~`(N/16) log(N/16)` for the default config — about 5× cheaper
         // than the global `N log N` sort that the legacy path paid.
         let mut shard_snapshots: Vec<Vec<Arc<[u8]>>> = Vec::with_capacity(self.shards.len());
+        // CURSOR DIAG (FRS_CURSOR_DIAG=K, 1/K sampled, off when 0): split the
+        // cursor cost into `scan` (prefix_scan_keys = BTreeMap range — cache-
+        // optimal per FRS-MEMTABLE-CACHE — + the O(≤4096) unsorted-buffer filter)
+        // vs `sort` (keys.sort of the matched set). Decides the cheap fix: scan-
+        // dominated ⇒ shrink the unsorted buffer (eager merge / flush sooner);
+        // sort-dominated ⇒ avoid re-sorting per probe. (Structure-swap to a
+        // skiplist is OFF the table — already reverted for cache-miss reasons.)
+        let cd_sampled = cursor_diag::hit(cursor_diag::k());
+        let mut cd_scan_ns = 0u64;
+        let mut cd_sort_ns = 0u64;
         for shard in &self.shards {
             // FRS-READLOCK-SCAN (2026-06-01): use a READ lock and DO NOT merge on
             // the scan path. `prefix_scan_keys` is `&self` and already enumerates
@@ -654,13 +705,24 @@ impl ShardedMemTable {
             // (4096), so the unsorted filter is O(4096), not O(N). Mirrors
             // `range_scan_cursor`, which already scans under a read lock.
             let guard = shard.read().expect("lock poisoned");
+            let st = cd_sampled.then(std::time::Instant::now);
             let mut keys = guard.prefix_scan_keys(lower, upper);
+            if let Some(t) = st {
+                cd_scan_ns += t.elapsed().as_nanos() as u64;
+            }
             drop(guard);
             // The `prefix_index` fast path returns insertion-order; the
             // `sorted_index` fallback returns sorted. Sort unconditionally
             // here so the cursor's heap invariant holds in both cases.
+            let so = cd_sampled.then(std::time::Instant::now);
             keys.sort();
+            if let Some(t) = so {
+                cd_sort_ns += t.elapsed().as_nanos() as u64;
+            }
             shard_snapshots.push(keys);
+        }
+        if cd_sampled {
+            cursor_diag::record(cd_scan_ns, cd_sort_ns);
         }
         MemTierCursor::new(shard_snapshots)
     }
