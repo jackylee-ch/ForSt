@@ -9489,6 +9489,96 @@ mod tests {
         DbImpl::open_default().expect("open")
     }
 
+    /// FRS-COMPACT-MICROBENCH (2026-06-05): an IN-PROCESS, substrate-independent
+    /// measurement of the q4 compaction-merge cost (gather→sort→walk/encode),
+    /// so a merge refactor can be proven with data WITHOUT the flaky Flink/Mac
+    /// substrate (and without instrumenting the production dylib, which crashes
+    /// the FFM TaskManager). Builds q4-like inputs (~43 B rows: 36 B key + 7 B
+    /// value, no compression, 8 KiB blocks) across 4 sorted L0 SSTs over a
+    /// MemoryFileSystem, then times `compact_l0` (the full merge). Reports
+    /// ns/row + ns/byte — the same arbiter the end-to-end COMPACT_PHASE diag
+    /// produced (~25 ns/byte, 1118 ns/row at q4 floor). Run explicitly:
+    ///   cargo test -p forst-rs-engine --release bench_compaction_q4like -- --ignored --nocapture
+    #[test]
+    #[ignore = "microbench; run explicitly with --ignored --nocapture"]
+    fn bench_compaction_q4like() {
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            block_size: 8 * 1024,
+            compression: forst_rs_common::CompressionType::None,
+            // single-file output (no split) to mirror one L0→L1 rollup's merge
+            target_file_size_base: 0,
+            // Large write buffer so each chunk stays in ONE memtable → exactly
+            // one L0 SST per switch_and_flush (no mid-chunk auto-flush pushing
+            // L0 past the trigger and letting the maintenance ticker compact).
+            write_buffer_size: 2_000_000_000,
+            max_write_buffer_number: 8,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = DbImpl::open_with_fs(opts, fs).expect("open");
+        let cf = db.default_cf();
+
+        // q4-like: 36-byte key (CF-prefix-ish + join key), 7-byte value.
+        // N_SST=3 stays BELOW l0_compaction_trigger (4) so the background
+        // maintenance ticker does NOT auto-compact L0 mid-build — we time a
+        // clean MANUAL compact_l0 of exactly these inputs. Scale via
+        // FRS_BENCH_ROWS (rows per SST) to reach the q4-floor regime
+        // (~5.3M/SST × 3 ≈ 16M rows / ~700 MB, where ns/byte degrades).
+        let rows_per_sst: usize = std::env::var("FRS_BENCH_ROWS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_300_000);
+        const N_SST: usize = 3;
+        let val = [0xABu8; 7];
+        let mut total_bytes: u64 = 0;
+        for s in 0..N_SST {
+            for r in 0..rows_per_sst {
+                // globally unique, ascending-ish keys spread across SSTs so the
+                // 4 L0 files overlap in key range (forces a real k-way merge).
+                let k = (r as u64) * (N_SST as u64) + (s as u64);
+                let mut key = [0u8; 36];
+                key[..8].copy_from_slice(b"q4cf\0\0\0\0");
+                key[8..16].copy_from_slice(&k.to_be_bytes());
+                // pad remainder deterministically
+                for (i, b) in key[16..].iter_mut().enumerate() {
+                    *b = (k.wrapping_add(i as u64)) as u8;
+                }
+                db.put(&cf, &key, &val).unwrap();
+                total_bytes += (key.len() + val.len()) as u64;
+            }
+            db.switch_and_flush(&cf).unwrap();
+        }
+        let l0 = db.version_set.current().l0_files().len();
+        assert!(l0 >= 2, "expected ≥2 L0 SSTs to merge, got {l0}");
+        let total_rows = (rows_per_sst * N_SST) as u64;
+
+        // FRS_BENCH_SNAPSHOT=1: hold a live snapshot across the compaction so
+        // emit_key_versions runs the MVCC snapshot-retention (pinned/tail) path
+        // per key-group — mimicking q4's 30s-checkpoint snapshots. Rules in/out
+        // whether the snapshot logic explains q4's live ~25 ns/byte vs the
+        // isolated ~3 ns/byte.
+        let _snap = if std::env::var("FRS_BENCH_SNAPSHOT").as_deref() == Ok("1") {
+            Some(db.snapshot())
+        } else {
+            None
+        };
+
+        let t0 = std::time::Instant::now();
+        db.compact_l0(&cf).unwrap();
+        let el = t0.elapsed();
+        let ns = el.as_nanos() as f64;
+        eprintln!(
+            "[COMPACT_MICROBENCH] rows={total_rows} in_bytes={total_bytes} l0={N_SST} \
+             compact_ms={} ns/row={:.0} ns/byte={:.1}",
+            el.as_millis(),
+            ns / total_rows as f64,
+            ns / total_bytes as f64,
+        );
+        // sanity: output present
+        assert_eq!(db.version_set.current().l0_files().len(), 0);
+    }
+
     // --- bring-up ---
 
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): a hot key Put-overwritten on every
