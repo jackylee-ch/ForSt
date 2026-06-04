@@ -2,7 +2,23 @@
 
 **Date:** 2026-06-04
 **Baseline:** commit 274bc0204 (C KV format + B1 + buffer-reuse + get_range_into, all test-green).
-**Status:** RUNNING (q4 local, 300s, `FRS_DECAY_DIAG=1` + `FRS_ITER_DIAG=1`, KV+B1 config).
+**Status:** CLOSED (see the falsification table + terminal synthesis below).
+
+## ⇒ SUCCESSION — the q4 line's true heir (start HERE if revisiting the RocksDB gap)
+q4 itself is closed: the residual decay is the active-memtable BTreeMap seek (~724 ns), which is
+**irreducible** (arena-skiplist refuted by spike; memtable-size O(log N)-insensitive) AND is the same cost
+class RocksDB's own memtable seek pays — so it is **not the gap**. The investigation proved (falsification
+table below) that the **sole genuinely forst-specific source of the structural RocksDB gap is the Tier-2
+RESIDENT-SHADOW** (the in-RAM cache of flushed SSTs that RocksDB has no analogue for). It was built for the
+S3 regime; post-C, local SST reads are cheap, so the shadow's per-probe bloom+cursor (~1400 ns) may now
+cost MORE than the SST read it avoids (~855 ns).
+**HEIR = the post-C re-evaluation of Tier-2 (resident-shadow).** Entry points already written:
+- the local-warm **bypass** analysis + its net recompute (~340 ns, bloom is a wash) + regime-gate +
+  cross-tier MVCC correctness gate spec — §"VERIFICATION before building the resident-shadow bypass" below;
+- the broader **"should Tier-2 be redesigned wholesale post-C"** question — PMC item in
+  `2026-06-04-PMC-q4-arena-skiplist-DECISION.md`.
+Anyone reopening the gap should start from Tier-2, NOT from the active-cursor/arena-skiplist (refuted) or
+the 993 ms lock stalls (red herring). Tracked as a task so this entry point isn't lost when q4 archives.
 
 ## Method (what we instrument, and what each answers)
 - **Per-level LSM shape** (`FRS_DECAY_DIAG`, per flush): `[DECAY_DIAG] flush#N ssts=… state=…MiB levels=[L0=n/MiB L1=…]`.

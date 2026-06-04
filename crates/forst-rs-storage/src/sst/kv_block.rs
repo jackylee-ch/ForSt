@@ -78,6 +78,9 @@ pub fn sst_write_kv_format() -> bool {
     // `FRS_SST_KV_BLOCK_FORMAT=0` is the instant opt-out back to v1 Arrow blocks.
     // (Coverage caveat: gated on the scan/iter-heavy RISK queries + q4, not the
     // full q0–q22; light queries are source-bound + block-format-agnostic.)
+    // PRODUCTION-RELYING PREREQUISITE (not yet done): a full q0–q22 v1-vs-v2
+    // correctness diff (task #34). Until then, env=0 above is the interim revert.
+    // Ops/release note: docs/superpowers/specs/2026-06-04-KV-default-revert-and-prerequisite.md
     *KV.get_or_init(|| {
         !matches!(
             std::env::var("FRS_SST_KV_BLOCK_FORMAT").ok().as_deref(),
