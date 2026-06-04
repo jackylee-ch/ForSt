@@ -69,6 +69,41 @@ throughput. Must be validated END-TO-END (the contention effect only manifests l
 measure it). The full L1→…→L6 cascade was already measured WORSE (−8 %); the untested middle ground is a
 SINGLE bounded L1→L2 drain.
 
+## Evidence chain #5 — Lever A (write-amp reduction via bounded L1→L2) REFUTED end-to-end
+Implemented a single-step bounded L1→L2 drain (env `FRS_COMPACT_DRAIN_L1=1`): after each L0→L1 rollup, if L1
+exceeds `max_bytes_for_level_base`, run ONE bounded `compact_level_for_cf(1)` (level-1 only, never cascading
+to L6 — the full cascade was −8%), re-enqueued while still over budget. Same-machine A/B (q4, MAXSEC 280):
+
+| | drain OFF (baseline) | drain ON |
+|---|---|---|
+| events @~262 s | 64.57 M | 67.2 M (+4 %, within ±10 % run variance) |
+| **cum_in (total compaction bytes)** | 8872 MiB | **9499 MiB (+7 %, MORE)** |
+| max L1 files | 10 | **6 (bounded ✓)** |
+| L2 | empty | populated (42 drains) |
+
+The drain MECHANICALLY works (L1 bounded, L2 populated), but **cum_in INCREASED +7 %** — the L1→L2 rewrites
+cost more than the L0→L1 re-merge they save at q4's run length (the quadratic-L1-re-merge savings only pay
+off over far more rollups than a 280 s run produces). Events +4 % is within noise. **Lever A is REFUTED for
+q4 here — bounding L1 adds net compaction work.** Kept as the env-gated `FRS_COMPACT_DRAIN_L1` toggle
+(off by default; documents the tested-refuted lever; may pay off on a longer/cloud run).
+
+## TERMINAL CONCLUSION (data-backed) — q4 engine levers exhausted on this dev Mac
+Every engine-side q4 lever has now been attributed and tested with data:
+- **Read path:** A=fan-out FIXED (periodic compaction trigger, +17 %, committed 84dee6040); B=resident
+  REFUTED end-to-end (removing 12 % read-CPU → +2.2 % noise). Read path is NOT the binder.
+- **Compaction (the binder):** merge ALGORITHM is fast (~3 ns/byte isolated, microbench); the live ~25
+  ns/byte is CONTENTION between the compaction thread and the 78 %-engine-CPU pipeline for CPU/mem-bandwidth,
+  × write-amp volume. **Lever B (faster merge) refuted** (already fast). **Lever A (reduce write-amp)
+  refuted** (bounding L1 adds net work; full cascade −8 %).
+- ⇒ q4's residual gap is **live resource contention + write-amp on a single shared machine**, which this
+  project's heritage independently documents as **machine-bound on this dev Mac** ("the binding q0–q22 3× is
+  NOT validly reproducible on this Mac for write/checkpoint-heavy queries — must run on the co-located cloud
+  box"; dev-Mac S3 uplink 10 MB/s; swap-poisons after many runs). **2–3× q4 is not achievable via engine
+  refactoring on this substrate** — the merge is already fast and more compaction scheduling only adds work.
+  The validated win banked this campaign: the A=fan-out fix (+17 %) + the full attribution + reproducible
+  microbench tooling. Reaching 2–3× requires the co-located cloud box (intra-DC bandwidth, dedicated cores,
+  no swap contention) where compaction and the pipeline do not fight for the same resources.
+
 ## Infra note (measurement harness)
 `measure-sql.sh`'s stop+start cluster restart became flaky after ~15 q4 runs this session (TM failed to
 register → `taskmanagers:0, slots:0` → job admitted RUNNING but all vertices stuck CREATED → src_out=0, NOT
