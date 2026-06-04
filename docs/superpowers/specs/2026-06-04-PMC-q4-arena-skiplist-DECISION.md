@@ -40,3 +40,20 @@ the real safe wins: read_at −12–14 %, decode-side → 0, q4 floor 197K→230
 flat curve is structural (RocksDB has no resident-shadow tier + a single merged-iterator read path), and no
 policy-clean throughput lever — and no justified unsafe lever — remains for q4. Recommend the PMC close the
 arena-skiplist item as refuted and NOT open an unsafe exception on current evidence.
+
+## Default-flip CORRECTNESS close-out (the real remaining gate — not perf polish)
+C was flipped to the writer default (commit f375ef9d6). The #31 5/5 result is a PERF pass on 5 scan-heavy
+queries; it does NOT close the **correctness** risk surface the flip creates: every deployment now writes v2
+by default, so any rarely-exercised **Arrow-assuming cold path** in a query NOT yet tested could silently
+mis-read a v2 block. Performance on the 13 untested queries is masked by source-bound queries; **correctness
+is not** — so the gate is a v1-vs-v2 OUTPUT diff across all q0–q22, not a TPS comparison.
+- **Cold-path code audit (2026-06-04) — de-risks it:** NO production path assumes Arrow blocks. `read_block_at`
+  (the only v1-only API; errors on KV) has ZERO production callers (both hits = the error string + a
+  v1-pinned test). Every `decode_data_block` / `DecodedBlock::Arrow` use is a test or sits INSIDE the
+  centralized `read_decoded_block` dispatch that also handles KV. The FFI Arrow exports
+  (`frs_batch_get_arrow`/`prefix_scan_arrow`) build Arrow from value bytes via the dispatched get/scan, so
+  they're format-agnostic. ⇒ the read surface is centrally dispatched with no v1-assuming bypass; cold-path
+  correctness risk is LOW and the full sweep is CONFIRMATION, not discovery.
+- **Status:** NOT urgent — `FRS_SST_KV_BLOCK_FORMAT=0` + the honest coverage caveat cover the interim — but
+  it is the NECESSARY gate before relying on the v2 default in production. Tracked so the 5/5 result does
+  not let it slip indefinitely. (q0–q22 v1-vs-v2 output diff.)

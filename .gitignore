@@ -13,3 +13,11 @@
 
 # Stray run/snapshot logs must never be committed (may capture substituted S3 secrets)
 docs/superpowers/specs/*.log
+
+# Build/index/session artifacts + bench OUTPUT data — never tracked (kept out of
+# the working-tree "loose state" that otherwise lingers every `git status`).
+/.codegraph/
+/.claude/
+/META-INF/
+/org/
+docs/superpowers/specs/v5-bench-data/
