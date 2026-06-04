@@ -2,13 +2,32 @@
 
 **Date:** 2026-06-04
 **Baseline:** commit 274bc0204 (C KV format + B1 + buffer-reuse + get_range_into, all test-green).
-**Status:** A-BRANCH FIXED, q4 NOT solved. The fan-out (A) decay was attributed + a policy-clean lever
-landed (periodic compaction trigger) — n_ovl bounded, A_fanout floor 5× down, events +17%. But **q4 still
-does NOT finish 100 M in 320 s (~75 M)**; after A is arrested the DOMINANT residual per-probe cost is now
-**B_resident (Tier-2 shadow)**, plus compaction-coincident stalls (unquantified — see §oscillation). This
-supersedes the earlier "Branch 3 / compaction-won't-help" verdict (an instrument artifact), but does NOT
-claim q4 closed. Honest framing: A fixed → B is the new dominant layer → 100 M unmet. A revealed B; B may
-reveal C — each layer must be confirmed with deep=0→1-style hard proof, not inferred.
+**Status:** A-BRANCH FIXED (committed 84dee6040); B-BRANCH REFUTED end-to-end; q4 NOT solved. Binding
+constraint = the periodic COMPACTION STALL, proven to be **engine merge CPU + write-amplification** (NOT the
+read path, NOT S3 uplink, NOT disk-I/O, NOT machine-bound — see the phase-split in the A-branch section). q4
+IS engine-fixable in principle (bound L1 write-amp / speed the ~35 MB/s merge) but those levers are uncertain
+and in tension with fan-out.
+- **A (fan-out):** attributed + policy-clean lever landed (periodic compaction trigger) — n_ovl bounded,
+  A_fanout floor 5× down, events +17 %. Introduced a SELF-LIMITING periodic compaction stall (L0→L1 rewrites
+  a growing L1). A full leveled cascade to fix the stall was MEASURED WORSE (6× write-amp) and reverted.
+- **B (resident read path):** fully attributed (~1450 ns = 99 %-useless bloom 717 ns + irreducible cursor
+  seek 750 ns), then REFUTED end-to-end: a CPU gating profile said ENGINE=71 % on-CPU, but removing the
+  bloom (−12 % query CPU, confirmed) moved throughput +2.2 % = NOISE. ⇒ q4 is bound by wall-clock (the
+  periodic compaction stall / disk contention), NOT read-path CPU. Adaptive bloom-skip NOT built.
+- **Net:** the engine READ path is exhausted as a q4 lever (A capped, B refuted). The binder is the periodic
+  COMPACTION STALL — and (correcting an earlier tentative "machine-bound" guess) it is **engine merge CPU,
+  NOT machine-bound**, proven by a compaction phase-split (`COMPACT_PHASE`, n=22, 9538 MiB): **upload_await
+  = 0 % (562 ms of 250 s) and merge+local-write = 100 % (249.8 s)**, at only **~35 MB/s** (≪ the 1.6 GB/s
+  local disk), with **in ≈ out growing 391→720 MB** ⇒ write-amplification (each L0→L1 rewrites the whole
+  growing L1), NOT merge-operand-chain collapse (in≈out), NOT S3 uplink, NOT disk-saturated. So q4 IS
+  engine-fixable: levers = (1) bound L1 write-amp WITHOUT over-cascading (the full L1→…→L6 cascade was worse;
+  a single-level L1→L2 drain to keep L1 ≤ base is untested middle ground); (2) speed the anomalously slow
+  ~35 MB/s merge (decode/k-way/encode per-row path). Both UNCERTAIN + in tension with fan-out — attribute
+  (write-amp vs merge-speed) before fixing; don't assume 3×.
+- **Lessons banked:** on-CPU attribution (ENGINE 71 %) is necessary-but-NOT-sufficient — verify the layer
+  binds end-to-end (cheapest experiment first). And don't assert "machine-bound" from heritage — a 2-line
+  phase-split (upload vs merge) overturned it. jstack canNOT see the native `forst-rs-compact` thread
+  (use in-code phase timing or macOS `sample`).
 
 ## ⇑⇑ A-BRANCH FIX (2026-06-04) — the fan-out lever: a PERIODIC compaction trigger (decoupled from flush)
 **Scope of this section: it fixes the A=fan-out decay ONLY. q4 end-to-end is NOT solved (100 M unmet, ~75 M
@@ -45,8 +64,28 @@ counts) shows:
 - So **B_resident ≈ 1 shadow × (bloom ~717 ns [~1 % useful for q4] + cursor ~750 ns [BTreeMap seek, same
   irreducible class as C]).** Per-cost-driven, not count-driven.
 
-**Candidate B levers (NONE taken yet — each needs its own before/after experiment; do NOT assume any reaches
-3×):** (1) make the resident-shadow bloom ADAPTIVE — skip `may_contain_range` when its recent prune-rate is
+### ⇒ B LEVER REFUTED end-to-end (bloom-skip experiment + gating profile, 2026-06-04)
+Before building any B machinery, two gates were run:
+1. **q4 CPU-split gating profile** (jstack, idle netty/metrics selectors excluded, n=538): **ENGINE 70.8 %**,
+   JOIN 14.1 %, CHECKPOINT 15.1 %. The engine read path dominates *on-CPU* time — overturning the heritage
+   worry that q4 is Java-join/checkpoint-bound. This GREEN-LIT a B experiment.
+2. **Cheapest B experiment — hard bloom-skip** (`FRS_RESIDENT_BLOOM_SKIP=1`): removed the ~717 ns/probe
+   resident bloom (confirmed bloom=0; per-probe floor 3600–5100 → 3000–4100 ns, a real ~20 % per-probe cut).
+   **Controlled same-machine A/B: skip ON 66.55 M vs OFF 65.12 M events @281 s = +2.2 %, WITHIN NOISE.**
+   Both runs show identical compaction-stall troughs (~99 K @141 s, ~96 K @261 s) regardless of the bloom.
+
+**VERDICT: removing 12 % of query CPU moved end-to-end throughput by ~0.** So q4 is **NOT bound by read-path
+per-probe CPU** — the gating profile's ENGINE 71 % is *on-CPU* time, NECESSARY-BUT-NOT-SUFFICIENT; the
+binding constraint is **wall-clock (the periodic compaction stalls / disk-I/O contention)**, where the
+pipeline competes with the 20 s compactions for disk bandwidth, not CPU. **The entire B (read-path) direction
+is refuted as a q4 throughput lever** — the adaptive bloom-skip was NOT built (no end-to-end win to bank).
+This also matches the dev-Mac heritage (disk/memory/swap-bound for write/heavy queries; valid q4 perf needs
+the co-located cloud box). q4's remaining lever is the compaction-stall/write-amp/I/O structure (cascade made
+it worse; L0-only is the floor) — likely machine-bound here. The bloom-skip + B-split toggles are kept
+env-gated/off as diagnostics documenting this dead lever.
+
+**Candidate B levers (REFUTED end-to-end per the experiment above — documented for completeness; do NOT
+build without a NEW machine/regime where read CPU binds):** (1) make the resident-shadow bloom ADAPTIVE — skip `may_contain_range` when its recent prune-rate is
 low (saves ~700 ns for q4 without hurting q7's high-prune regime); risk = adaptivity logic + per-CF state.
 (2) BYPASS the resident shadow on local — let Tier-3 read the (NVMe-warm) L0 SST instead; trades B's
 bloom+cursor (~1450 ns) for +1 n_ovl in A (~750 ns) → net unclear, and the autopsy's earlier estimate was

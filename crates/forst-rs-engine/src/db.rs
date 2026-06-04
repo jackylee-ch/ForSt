@@ -5403,6 +5403,10 @@ impl DbImpl {
         // whole level (the write-amp source). target=0 ⇒ single-file legacy.
         let target_file_size = self.options.target_file_size_base as u64;
         let total_input_bytes: u64 = inputs.iter().map(|(_, m, _)| m.file_size).sum();
+        // FRS-COMPACT-PHASE-DIAG: input row count, to compute the merge-cost
+        // ARBITER ns/byte AND ns/row — distinguishing per-BYTE cost (memcpy/
+        // encode) from per-ROW overhead (decode/k-way/alloc per entry).
+        let total_input_rows: u64 = inputs.iter().map(|(_, m, _)| m.num_entries).sum();
         let additional_outputs =
             self.alloc_compaction_output_slots(total_input_bytes, target_file_size);
         let job = CompactionJob {
@@ -5421,9 +5425,18 @@ impl DbImpl {
             min_active_snapshot,
         };
 
+        // FRS-COMPACT-PHASE-DIAG (FRS_COMPACT_DIAG=1): time the merge+local-write
+        // phase (job.run) separately from the S3 upload-await phase below, to
+        // attribute the q4 compaction STALL — engine merge CPU (a lever) vs the
+        // dev-Mac ~10 MB/s S3 uplink await (machine/network-bound → cloud box).
+        let phase_diag = compact_diag_on();
+        let t_run = phase_diag.then(std::time::Instant::now);
+        let total_input_bytes_diag = total_input_bytes;
         let Some(edit) = job.run()? else {
             return Ok(None);
         };
+        let run_ms = t_run.map(|t| t.elapsed().as_millis()).unwrap_or(0);
+        let t_upload = phase_diag.then(std::time::Instant::now);
 
         // Apply the VersionEdit atomically. With R44-H1's compaction_mutex
         // held, no other compaction can have raced ahead of us, so apply
@@ -5489,6 +5502,30 @@ impl DbImpl {
             self.delete_file_guarded(*file_number);
         }
         self.reap_pending_deletions();
+
+        // FRS-COMPACT-PHASE-DIAG: attribute the stall — merge+local-write (run_ms)
+        // vs S3 upload-await (upload_ms). If upload_ms dominates, the q4 compaction
+        // stall is the dev-Mac ~10 MB/s S3 uplink (machine/network-bound), NOT an
+        // engine merge lever; the local NVMe write inside run_ms is fast.
+        if let Some(t) = t_upload {
+            let upload_ms = t.elapsed().as_millis();
+            let out_bytes: u64 = edit.new_files.iter().map(|(_, m)| m.file_size).sum();
+            let out_rows: u64 = edit.new_files.iter().map(|(_, m)| m.num_entries).sum();
+            let in_mb = total_input_bytes_diag as f64 / 1_048_576.0;
+            let out_mb = out_bytes as f64 / 1_048_576.0;
+            // ARBITER: ns per input byte and ns per input row over the
+            // merge+local-write phase. Healthy merge ≈ 1-5 ns/byte; ≫ that ⇒
+            // per-row inefficiency (Lever B). rows_in≫rows_out ⇒ merge/dedup
+            // collapse; rows_in≈rows_out with in≈out but cumulative-in inflated
+            // across compactions ⇒ write-amp (Lever A).
+            let run_ns = (run_ms as f64) * 1.0e6;
+            let ns_per_byte = if total_input_bytes_diag > 0 { run_ns / total_input_bytes_diag as f64 } else { 0.0 };
+            let ns_per_row = if total_input_rows > 0 { run_ns / total_input_rows as f64 } else { 0.0 };
+            eprintln!(
+                "[COMPACT_PHASE] in={in_mb:.0}MiB out={out_mb:.0}MiB rows_in={total_input_rows} rows_out={out_rows} run_ms={run_ms} upload_ms={upload_ms} ns/byte={ns_per_byte:.1} ns/row={ns_per_row:.0} out_files={}",
+                edit.new_files.len()
+            );
+        }
 
         // Update back-pressure counts — L0 is now empty (for this rollup).
         self.write_controller
@@ -5894,15 +5931,26 @@ impl DbImpl {
             // BOTH the resident copy and the SST, so we skip the seek AND keep the SST
             // shadowed (Tier 3 correctly skips it too — no data is missed). Falls back to
             // seeking when the reader isn't cached yet (e.g. async-upload window).
-            if let Some(reader) = readers_snapshot.get(&entry.file_number) {
-                let bt = bulk_start.map(|_| std::time::Instant::now());
-                let pass = reader.may_contain_range(prefix, upper_slice);
-                if let Some(t) = bt {
-                    bulk_bloom_ns += t.elapsed().as_nanos() as u64;
-                }
-                if !pass {
-                    resident_shadowed.insert(entry.file_number);
-                    continue;
+            // FRS-RESIDENT-BLOOM-SKIP EXPERIMENT (env FRS_RESIDENT_BLOOM_SKIP=1,
+            // off by default): hard-skip the resident bloom to MEASURE whether
+            // its ~717 ns/probe (proven ~99% non-pruning for q4 via FRS-B-SPLIT
+            // n_seek≈n_res) actually translates to q4 end-to-end throughput
+            // before building the adaptive (q7-safe) production version.
+            // Correctness when skipped: we fall through to the seek + shadow the
+            // SST — the resident memtable is byte-identical to its SST, so always
+            // serving it from RAM (and Tier-3 skipping the shadowed SST) loses no
+            // data; the only cost is a useless seek on the rare absent prefix.
+            if !resident_bloom_skip() {
+                if let Some(reader) = readers_snapshot.get(&entry.file_number) {
+                    let bt = bulk_start.map(|_| std::time::Instant::now());
+                    let pass = reader.may_contain_range(prefix, upper_slice);
+                    if let Some(t) = bt {
+                        bulk_bloom_ns += t.elapsed().as_nanos() as u64;
+                    }
+                    if !pass {
+                        resident_shadowed.insert(entry.file_number);
+                        continue;
+                    }
                 }
             }
             resident_seeks += 1;
@@ -8871,6 +8919,22 @@ fn compact_diag_on() -> bool {
     *ON.get_or_init(|| {
         matches!(
             std::env::var("FRS_COMPACT_DIAG").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-RESIDENT-BLOOM-SKIP experiment toggle (`FRS_RESIDENT_BLOOM_SKIP=1`),
+/// cached. When set, the per-resident-shadow `may_contain_range` bloom is
+/// skipped (straight to the seek). Used to measure the bloom's end-to-end q4
+/// payoff (it is ~99% non-pruning for q4) before productionising an adaptive,
+/// prune-rate-gated version that stays q7-safe.
+fn resident_bloom_skip() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_RESIDENT_BLOOM_SKIP").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE")
         )
     })
