@@ -2,7 +2,122 @@
 
 **Date:** 2026-06-04
 **Baseline:** commit 274bc0204 (C KV format + B1 + buffer-reuse + get_range_into, all test-green).
-**Status:** CLOSED (see the falsification table + terminal synthesis below).
+**Status:** A-BRANCH FIXED, q4 NOT solved. The fan-out (A) decay was attributed + a policy-clean lever
+landed (periodic compaction trigger) — n_ovl bounded, A_fanout floor 5× down, events +17%. But **q4 still
+does NOT finish 100 M in 320 s (~75 M)**; after A is arrested the DOMINANT residual per-probe cost is now
+**B_resident (Tier-2 shadow)**, plus compaction-coincident stalls (unquantified — see §oscillation). This
+supersedes the earlier "Branch 3 / compaction-won't-help" verdict (an instrument artifact), but does NOT
+claim q4 closed. Honest framing: A fixed → B is the new dominant layer → 100 M unmet. A revealed B; B may
+reveal C — each layer must be confirmed with deep=0→1-style hard proof, not inferred.
+
+## ⇑⇑ A-BRANCH FIX (2026-06-04) — the fan-out lever: a PERIODIC compaction trigger (decoupled from flush)
+**Scope of this section: it fixes the A=fan-out decay ONLY. q4 end-to-end is NOT solved (100 M unmet, ~75 M
+in 320 s); B_resident is now the dominant residual — see the close-loop table's caveat below.**
+
+### Oscillation autopsy + a REFUTED cascade fix (FRS_COMPACT_DIAG, 2026-06-04)
+The L0-only fix replaced the pre-fix monotonic collapse with an oscillating throughput (troughs ~103 K @162 s,
+~95 K @283 s). `FRS_COMPACT_DIAG` (per-`run_compaction` timing) proved the troughs are **periodic compaction
+stalls, not stutter-free**: each L0→L1 rollup re-merges the FULL overlapping L1, and L1 grows (no L2 outlet),
+so compaction **duration grows with L1**: 2.3 s (l1=1) → 20.7 s (l1=11); **total compaction 248 s of a 320 s
+run**; bursts recur every ~120 s (the time for 30 s checkpoints to refill L0 to trigger=4) — exactly the
+trough period. So the L0-only fix **traded a steady slowdown for periodic ~20 s stalls** + an unbounded-L1
+long-run concern.
+**Cascade fix BUILT, MEASURED, REVERTED:** drive `compact_once` until balanced (drain L0→L1→…→Ln). It DID
+drain deeper (ldeep 0→6) but multiplied write-amp and was **strictly worse on q4**: compaction sum 248 s→
+**401 s**, max 20.7 s→**38.7 s**, events 74.8 M→**68.8 M (−8 %)**, worst trough 95 K→**28 K**. Rewriting data
+down 6 levels costs more I/O than the read-fan-out it saves. **Ranking: L0-only (74.8 M) > cascade (68.8 M) >
+no-fix (63.8 M).** Kept the L0-only rollup; reverted the cascade (code comment in `run_compaction`).
+**Honest conclusion:** compaction is a net-positive but SELF-LIMITING lever for q4 — moderate L0 rollup helps
+(bounds read fan-out), more compaction hurts (write-amp). The periodic stall + unbounded-L1 are accepted
+costs; the next lever is the READ side (B_resident), which has no write-amp tradeoff.
+
+### B_resident attribution (FRS-B-SPLIT, windowed n_res/n_seek, 2026-06-04) — per-cost-driven, bloom ~useless for q4
+With A bounded, B_resident (~1170–2100 ns) is co-dominant with A at the floor (probe ~3600–5000 ns). The
+windowed split (raw per-8192-probe SUMs, after fixing an integer-average resolution bug that hid sub-1
+counts) shows:
+- **n_res/8192 ≈ 8192–12349 ⇒ ~1.0–1.5 resident shadows per probe, FLAT (not growing).** ⇒ B is NOT
+  count-driven; my A-fix's L0-bounding already keeps the resident set ~1 (resident shadows = in-RAM copies of
+  live L0 SSTs, filtered by `live_files`; compaction stales the rest).
+- **n_seek/8192 ≈ n_res/8192 (e.g. 11920 vs 12029) ⇒ ~99 % of resident shadows PASS the bloom into a full
+  BTreeMap seek.** The `may_contain_range` prune-rate is **~1 %** for q4 — it costs ~717 ns/probe and skips
+  almost nothing. (It was built for q7's empty probes, where the prune-rate IS high; for q4's interval join
+  the single resident shadow almost always overlaps the join prefix.)
+- So **B_resident ≈ 1 shadow × (bloom ~717 ns [~1 % useful for q4] + cursor ~750 ns [BTreeMap seek, same
+  irreducible class as C]).** Per-cost-driven, not count-driven.
+
+**Candidate B levers (NONE taken yet — each needs its own before/after experiment; do NOT assume any reaches
+3×):** (1) make the resident-shadow bloom ADAPTIVE — skip `may_contain_range` when its recent prune-rate is
+low (saves ~700 ns for q4 without hurting q7's high-prune regime); risk = adaptivity logic + per-CF state.
+(2) BYPASS the resident shadow on local — let Tier-3 read the (NVMe-warm) L0 SST instead; trades B's
+bloom+cursor (~1450 ns) for +1 n_ovl in A (~750 ns) → net unclear, and the autopsy's earlier estimate was
+"marginal (~340 ns), regime-risky" (pre-A-fix; re-measure post-fix). **C-warning:** the cursor half (~750 ns)
+is the BTreeMap memtable seek = the SAME class A's sstloop and C_activeseek pay (arena-skiplist refuted under
+forbid(unsafe)). So even a perfect bloom-skip leaves a memtable-seek floor; B may reveal that floor (C), and
+the Java-side join CPU (a separate, parallel ceiling — see this autopsy's heritage note) may cap q4 before
+the engine read path does. Confirm with a real fix experiment, not inference.
+The A-split + L0/deep decomposition (`DECAY_ATTR … A_fanout=ss(locate=…,sstloop=…,n_ovl=N[L0=,deep=])`,
+`FRS_BULK_SAMPLE`) localized the runaway precisely:
+- **A_fanout = `sstloop` = n_ovl × ~750 ns/SST.** `locate` (the `overlapping_ssts_in_range` call, incl. the
+  2026-06-04 L1+ lower-bound binary-search) is FLAT+negligible (~70–125 ns). The decay is entirely the
+  per-overlapping-SST setup loop (`get_or_open` + `may_contain_range` + `first_block_ge`) × the COUNT.
+- **n_ovl grew unbounded 0→10, and it was 100% L0 (`deep=0` for the whole run).** `deep=0` ⇒ L0→L1
+  compaction NEVER ran. The LSM had 195 SSTs / 6.9 GiB all stuck in L0.
+
+**ROOT CAUSE:** the ONLY compaction trigger was `maybe_auto_compact`, called solely from the background
+`run_flush` worker. q4 rarely fills its 1 GiB write buffer, so `run_flush` essentially never fires (this is
+why `DECAY_DIAG`, hooked on `run_flush`, showed 0× — the instrument was right that run_flush is idle, but
+that was MIS-READ as "LSM shallow"). The L0 SSTs actually come from the 30 s **checkpoint** path
+(`create_incremental_checkpoint_impl` → `flush_all`), which seals memtables to L0 but does NOT call
+`maybe_auto_compact`. So checkpoint-driven L0 accumulated uncompacted forever → fan-out decay.
+
+**FIX (policy-clean, safest — the pre-committed A-branch):** a periodic maintenance poll that triggers
+L0→L1 compaction INDEPENDENT of the flush path. `DbImpl::cfs_due_for_compaction()` (pure read: CFs with L0
+≥ `l0_compaction_trigger`) + `enqueue_due_compactions()` (deduped, non-blocking enqueue), called every ~1 s
+from the existing maintenance ticker (snapshot-age worker). Scoped to L0 (the measured source) to reuse the
+fully-tested `compact_l0_for_cf` rollup and add NO new deeper-level compaction (which could pile background
+SST uploads onto the q7 S3 checkpoint drain). TDD: `test_cfs_due_for_compaction_flags_uncompacted_l0`
+(builds L0 over trigger via `switch_and_flush` — the non-auto-compacting path — asserts the scheduler flags
+it, and not after `compact_l0`). Suites green: engine 263, storage 353, ffi 96.
+
+**CLOSE-LOOP re-profile (q4, same config, MAXSEC 320):**
+| metric | pre-fix floor | post-fix floor |
+|---|---|---|
+| n_ovl | 8–10, **all L0, deep=0** (unbounded) | **2–4, L0=1–3, deep=1** (bounded; L1 now populated) |
+| A_fanout (sstloop) | ~5600–7600 ns (runaway) | **~1100–1340 ns** (~5×, decay arrested) |
+| probe total | ~9000–10500 ns | ~3400–5100 ns |
+| events @ ~300 s | 63.8 M | **74.8 M (+17%)** |
+| rate shape | monotonic collapse 208→101 K, no floor | **decays then RECOVERS** 194→106→203→287→244 K |
+
+`deep=1` (L1 populated) is the proof compaction now runs; pre-fix `deep` was 0 for the entire run. The
+fan-out multiplier (n_ovl) is now bounded by the trigger, so A_fanout no longer runs away. q4 still does not
+finish 100 M in 320 s (~75 M) — the residual is now co-dominated by **B_resident** (Tier-2 shadow ~1400–2400
+ns, the documented §SUCCESSION heir) plus compaction-coincident resident stalls. The A=fan-out decay — the
+thing this autopsy set out to attribute and refactor — is FIXED.
+
+**Possible further A headroom (NOT taken — risk/scope):** lowering `l0_compaction_trigger` (global config →
+affects all queries + more compaction) would cap n_ovl tighter (→2); reducing the ~750 ns/SST setup is a
+read-path micro-opt. Neither is needed to arrest the decay; the heir is now B (resident), not A.
+
+## ⇑ MATERIAL CORRECTION (2026-06-04, windowed decay-attribution) — the floor decay is A=FAN-OUT, not active-seek
+The earlier "terminal synthesis" (active-seek irreducible ⇒ no lever) used a CUMULATIVE-average snapshot that
+blended the run's phases. A **windowed** per-probe breakdown (per-8192-build means, `DECAY_ATTR` /
+`FRS_BULK_SAMPLE`, q4 300 s) shows the decay is PHASE-DEPENDENT and the floor is dominated by a *different,
+policy-clean-addressable* ceiling:
+
+| phase | probe ns | A_fanout | B_resident | C_activeseek |
+|---|---|---|---|---|
+| early/burst | 673 | 21 | 0 | **416 (62%)** |
+| mid (post-flush) | 3651 | 53 | **2182 (60%)** | 977 |
+| late floor | 6645 | **3629 (55%)** | 1678 | 678 |
+| deepest floor | 10046 | **6334 (63%, STILL GROWING)** | 2263 (plateaued) | 862 (flat) |
+
+**Decay attribution: A (Tier-3 SST-tier build = per-probe overlapping-SST count) is the dominant + runaway
+floor cost (→6334 ns, ~63%, still climbing); B (resident Tier-2) ~22% (plateaus at the shadow budget); C
+(active-seek BTreeMap) ~8% (flat).** Reader cache is hold-all (no cold-open churn) ⇒ A = the *number* of
+overlapping SSTs per probe growing as the LSM fills ⇒ the lever per the pre-committed criteria is the
+**A-branch: compaction/flush refactor (policy-clean, attacks the decay multiplier, safest)** — NOT the
+active-seek (refuted/irreducible) and NOT (primarily) the resident bypass. This REOPENS a real policy-clean
+q4 lever. (B/Tier-2 remains the secondary, mid-regime cost — still the §SUCCESSION heir if A is exhausted.)
 
 ## ⇒ SUCCESSION — the q4 line's true heir (start HERE if revisiting the RocksDB gap)
 q4 itself is closed: the residual decay is the active-memtable BTreeMap seek (~724 ns), which is

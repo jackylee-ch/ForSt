@@ -176,28 +176,86 @@ fn bulk_sample_hit(k: usize) -> bool {
 
 /// Accumulate one sampled build's sub-phase ns; dump running averages every 8192
 /// samples. `resident-fixed` = rfve+bloom+cursor; `sst` = fan-out.
-fn bulk_record(rfve: u64, bloom: u64, cursor: u64, sst: u64, total: u64) {
+/// DECAY-ATTRIBUTION (windowed, NOT cumulative): each dump is the per-probe mean of
+/// the LAST window of 8192 sampled builds, so comparing the run's EARLY vs LATE
+/// dumps attributes the per-probe GROWTH (the decay) — not a blended snapshot —
+/// into the three refactorable ceilings: A=fan-out (Tier-3 SST), B=resident Tier-2
+/// (bloom+cursor), C=active-seek (Tier-1 active-memtable cursor). `rfve` (resident
+/// clone+lock) is reported separately (known ~1%).
+#[allow(clippy::too_many_arguments)]
+fn bulk_record(
+    active: u64,
+    rfve: u64,
+    bloom: u64,
+    cursor: u64,
+    sst: u64,
+    locate: u64,
+    n_overlap: u64,
+    n_overlap_l0: u64,
+    resident_total: u64,
+    resident_seeks: u64,
+    total: u64,
+) {
+    const W: u64 = 8192;
     static N: AtomicU64 = AtomicU64::new(0);
+    static ACTIVE: AtomicU64 = AtomicU64::new(0);
     static RFVE: AtomicU64 = AtomicU64::new(0);
     static BLOOM: AtomicU64 = AtomicU64::new(0);
     static CURSOR: AtomicU64 = AtomicU64::new(0);
     static SST: AtomicU64 = AtomicU64::new(0);
+    static LOCATE: AtomicU64 = AtomicU64::new(0);
+    static NOVERLAP: AtomicU64 = AtomicU64::new(0);
+    static NOVERLAP_L0: AtomicU64 = AtomicU64::new(0);
+    static RTOTAL: AtomicU64 = AtomicU64::new(0);
+    static RSEEKS: AtomicU64 = AtomicU64::new(0);
     static TOTAL: AtomicU64 = AtomicU64::new(0);
+    ACTIVE.fetch_add(active, Ordering::Relaxed);
     RFVE.fetch_add(rfve, Ordering::Relaxed);
     BLOOM.fetch_add(bloom, Ordering::Relaxed);
     CURSOR.fetch_add(cursor, Ordering::Relaxed);
     SST.fetch_add(sst, Ordering::Relaxed);
+    LOCATE.fetch_add(locate, Ordering::Relaxed);
+    NOVERLAP.fetch_add(n_overlap, Ordering::Relaxed);
+    NOVERLAP_L0.fetch_add(n_overlap_l0, Ordering::Relaxed);
+    RTOTAL.fetch_add(resident_total, Ordering::Relaxed);
+    RSEEKS.fetch_add(resident_seeks, Ordering::Relaxed);
     TOTAL.fetch_add(total, Ordering::Relaxed);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n % 8192 == 0 {
-        let g = |a: &AtomicU64| a.load(Ordering::Relaxed) / n;
+    if n % W == 0 {
+        // Windowed: swap each accumulator to 0 so the NEXT window starts fresh →
+        // each dump is this window's per-probe mean (early vs late = the decay).
+        let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) / W;
+        // Raw window SUM (NOT /W): resident shadows are sparse (<1 per probe),
+        // so a per-probe integer average rounds to 0 and hides the count. The
+        // raw sum over the 8192-probe window preserves sub-1 resolution.
+        let take_sum = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+        let (act, rf, bl, cu, ss, lo, nov, novl0, tot) = (
+            take(&ACTIVE),
+            take(&RFVE),
+            take(&BLOOM),
+            take(&CURSOR),
+            take(&SST),
+            take(&LOCATE),
+            take(&NOVERLAP),
+            take(&NOVERLAP_L0),
+            take(&TOTAL),
+        );
+        let rtot = take_sum(&RTOTAL);
+        let rseek = take_sum(&RSEEKS);
+        let resident = bl + cu; // B = Tier-2 resident-shadow (bloom + cursor)
+        // FRS-A-SPLIT: A_fanout = A_locate (overlapping_ssts_in_range) + A_sstloop
+        // (per-SST get_or_open + may_contain_range prune + first_block_ge). n_ovl
+        // = mean overlapping-SST count (n_ovl_l0 of which are L0): if n_ovl_l0
+        // dominates+grows ⇒ L0 compaction-starved (trigger lever); if the DEEP
+        // remainder (n_ovl - n_ovl_l0) grows ⇒ multi-level spread (merge lever).
+        // FRS-B-SPLIT: B_resident broken into n_res (resident shadows examined)
+        // + n_seek (those passing the bloom into a BTreeMap seek). If n_res grows
+        // ⇒ count-driven (shrink the shadow set); if n_res flat but bloom/cursor
+        // rise ⇒ per-seek-cost-driven (the seek/bloom itself is the lever).
+        let sstloop = ss.saturating_sub(lo);
+        let nov_deep = nov.saturating_sub(novl0);
         eprintln!(
-            "[BULK_DIAG] samples={n} avg_ns total={} | resident-fixed: rfve={} bloom={} cursor={} | sst_fanout={}",
-            g(&TOTAL),
-            g(&RFVE),
-            g(&BLOOM),
-            g(&CURSOR),
-            g(&SST)
+            "[DECAY_ATTR win@{n}] probe={tot}ns | A_fanout={ss}(locate={lo},sstloop={sstloop},n_ovl={nov}[L0={novl0},deep={nov_deep}]) B_resident={resident}(bloom={bl},cursor={cu},n_res/{W}={rtot},n_seek/{W}={rseek}) C_activeseek={act} rfve={rf}"
         );
     }
 }
@@ -2834,6 +2892,60 @@ impl DbImpl {
             self.enqueue_compaction(cf_data.clone());
         }
         Ok(())
+    }
+
+    /// FRS-COMPACT-MAINTENANCE (2026-06-04): the set of CFs whose L0 is at or
+    /// over `l0_compaction_trigger` and therefore warrant an L0→L1 rollup. A
+    /// PURE read over the current version (no enqueue), so the periodic
+    /// maintenance ticker can poll it cheaply and it is deterministically
+    /// unit-testable.
+    ///
+    /// WHY THIS EXISTS: the only compaction trigger used to be
+    /// `maybe_auto_compact`, called solely from the background `run_flush`
+    /// worker. q4 (interval join) rarely fills its 1 GiB write buffer, so
+    /// `run_flush` essentially never fires; meanwhile 30 s checkpoints keep
+    /// sealing the memtable to L0 via `flush_all`, which does NOT call
+    /// `maybe_auto_compact`. Result: L0 grew UNBOUNDED, the per-probe
+    /// overlapping-SST fan-out climbed without bound (the q4 throughput decay
+    /// — measured 0→10 overlapping SSTs, ALL L0, deep=0, "compact" 0× in the
+    /// TM log), and compaction never ran. Polling this from the maintenance
+    /// ticker decouples the trigger from the flush path so L0 stays shallow
+    /// regardless of which path produced the SSTs. Scoped to L0 (the measured
+    /// q4 fan-out source) to reuse the fully-tested `compact_l0_for_cf` rollup
+    /// and avoid introducing new deeper-level compaction work that could add
+    /// background SST uploads to the checkpoint drain on the S3 path.
+    fn cfs_due_for_compaction(&self) -> Vec<Arc<ColumnFamilyData>> {
+        let trigger = self.write_controller.config().l0_compaction_trigger;
+        let version = self.version_set.current();
+        let cfs: Vec<Arc<ColumnFamilyData>> = {
+            let guard = self.cfs.read().expect("lock poisoned");
+            guard.values().cloned().collect()
+        };
+        cfs.into_iter()
+            .filter(|cf_data| {
+                if cf_data.is_dropped() {
+                    return false;
+                }
+                let cf_id = cf_data.handle().id();
+                let l0_count = version
+                    .l0_files()
+                    .iter()
+                    .filter(|f| f.cf_id == cf_id)
+                    .count() as u32;
+                l0_count >= trigger
+            })
+            .collect()
+    }
+
+    /// FRS-COMPACT-MAINTENANCE: enqueue a background L0→L1 compaction for every
+    /// CF that [`Self::cfs_due_for_compaction`] reports. Per-CF deduped by
+    /// `enqueue_compaction`, so calling this every maintenance tick is cheap
+    /// and idempotent — a CF already queued/running is skipped. Non-blocking:
+    /// the rollup runs on the dedicated `forst-rs-compact` worker.
+    fn enqueue_due_compactions(&self) {
+        for cf_data in self.cfs_due_for_compaction() {
+            self.enqueue_compaction(cf_data);
+        }
     }
 
     /// Applies a [`WriteBatch`] atomically. Returns the last assigned sequence.
@@ -5639,7 +5751,25 @@ impl DbImpl {
         let mut bulk_rfve_ns = 0u64;
         let mut bulk_bloom_ns = 0u64;
         let mut bulk_cursor_ns = 0u64;
+        let mut bulk_active_ns = 0u64;
         let mut bulk_resident_done_ns = 0u64;
+        // FRS-A-SPLIT (2026-06-04): split A_fanout (sst_ns) into the locate call
+        // (`overlapping_ssts_in_range`) vs the per-SST loop, and capture the
+        // OVERLAP COUNT — the discriminator between "L0 fan-out grows with state"
+        // (count-driven → compaction lever) and "per-SST read is the floor".
+        let mut bulk_locate_ns = 0u64;
+        let mut bulk_n_overlap = 0u64;
+        // FRS-A-SPLIT level decomposition: how many of the overlapping SSTs are
+        // L0 (compaction-starved → L0-trigger lever) vs deeper levels (structural
+        // multi-level spread → level-multiplier/merge lever). Picks the exact
+        // compaction sub-lever for the fan-out decay.
+        let mut bulk_n_overlap_l0 = 0u64;
+        // FRS-B-SPLIT (2026-06-04): windowed resident-shadow COUNT (N) + how many
+        // pass the bloom into an actual BTreeMap seek. Discriminates B_resident:
+        // count-driven (N grows → shrink the shadow set) vs per-seek-cost-driven
+        // (N flat, cost rises → the seek/bloom itself). Attribution before any B fix.
+        let mut bulk_resident_total = 0u64;
+        let mut bulk_resident_seeks = 0u64;
 
         let upper = prefix_upper_bound(prefix);
         let upper_slice = upper.as_deref();
@@ -5660,7 +5790,13 @@ impl DbImpl {
         // no global sort, no global dedup, `O(num_shards)` resident
         // footprint regardless of total matching key count.
         let mem_arc = cf_data.active_memtable();
+        let at = bulk_start.map(|_| std::time::Instant::now());
         let active_cursor = mem_arc.prefix_scan_cursor(prefix, upper_slice);
+        if let Some(t) = at {
+            // C = Tier-1 active-memtable cursor (the BTreeMap seek; structurally
+            // capped under forbid(unsafe) per the arena-skiplist spike).
+            bulk_active_ns = t.elapsed().as_nanos() as u64;
+        }
         if !active_cursor.is_empty() {
             sources.push(TierKeySource::MemCursor {
                 cursor: active_cursor,
@@ -5786,6 +5922,10 @@ impl DbImpl {
         if let Some(t) = bulk_start {
             // Everything after this point is the Tier-3 SST fan-out.
             bulk_resident_done_ns = t.elapsed().as_nanos() as u64;
+            // FRS-B-SPLIT: capture the resident-shadow count + seek count for
+            // the windowed attribution (only on sampled builds).
+            bulk_resident_total = resident_total as u64;
+            bulk_resident_seeks = resident_seeks as u64;
         }
         // FRS-ITER-DIAG sub-phase split (2026-06-02): capture how much of the
         // build is the memtable/resident-tier prep vs the Tier-3 SST loop, and
@@ -5804,7 +5944,19 @@ impl DbImpl {
         // upper`), so the considered file set is byte-for-byte identical — it
         // just bounds each level's scan to the files that start before `upper`.
         let mut overlapping_ssts: Vec<&forst_rs_storage::version::SstFileMeta> = Vec::new();
+        let locate_t = bulk_start.map(|_| std::time::Instant::now());
         version.overlapping_ssts_in_range(prefix, upper_slice, &mut overlapping_ssts);
+        if let Some(t) = locate_t {
+            bulk_locate_ns = t.elapsed().as_nanos() as u64;
+            bulk_n_overlap = overlapping_ssts.len() as u64;
+            // Sampled-only (1/K), so the HashSet build is observer-effect-safe.
+            let l0: std::collections::HashSet<forst_rs_common::FileNumber> =
+                version.l0_files().iter().map(|f| f.file_number).collect();
+            bulk_n_overlap_l0 = overlapping_ssts
+                .iter()
+                .filter(|s| l0.contains(&s.file_number))
+                .count() as u64;
+        }
         for sst in overlapping_ssts {
             // FRS-RESIDENT-FLUSHED: skip SSTs whose data is currently served
             // from Tier 2 by a resident memtable (same content, same seqs).
@@ -5909,10 +6061,16 @@ impl DbImpl {
             // sst = everything after the resident loop (Tier-3 fan-out + setup).
             let sst_ns = total_ns.saturating_sub(bulk_resident_done_ns);
             bulk_record(
+                bulk_active_ns,
                 bulk_rfve_ns,
                 bulk_bloom_ns,
                 bulk_cursor_ns,
                 sst_ns,
+                bulk_locate_ns,
+                bulk_n_overlap,
+                bulk_n_overlap_l0,
+                bulk_resident_total,
+                bulk_resident_seeks,
                 total_ns,
             );
         }
@@ -6637,6 +6795,17 @@ impl DbImpl {
                     // the next compaction. ~1 s cadence is ample (S3 storage is
                     // cheap; the goal is timely reclamation, not instant).
                     db.reap_pending_deletions();
+                    // FRS-COMPACT-MAINTENANCE (2026-06-04): trigger L0→L1
+                    // compaction for any CF whose L0 has grown to the trigger,
+                    // INDEPENDENT of the flush path. The only prior trigger was
+                    // `maybe_auto_compact` on the background flush worker, which
+                    // q4 rarely exercises (its write buffer seldom fills) — so
+                    // checkpoint-driven L0 SSTs accumulated uncompacted and the
+                    // per-probe SST fan-out decayed throughput unbounded. This
+                    // ~1 s poll keeps L0 shallow regardless of SST source.
+                    // Deduped + non-blocking (enqueue only); the actual rollup
+                    // runs on the dedicated compaction worker.
+                    db.enqueue_due_compactions();
                     if let Some(w) = db.snapshot_registry.check_long_lived() {
                         // Emit structured fields so a log aggregator can
                         // index by seq / db_id. The Display impl gives a
@@ -8642,9 +8811,69 @@ impl CompactionExecutor for DbImpl {
             .lock()
             .expect("lock poisoned")
             .remove(&cf_data.handle().id());
-        self.compact_l0_for_cf(cf_data)?;
+        // FRS-COMPACT-DIAG (env FRS_COMPACT_DIAG=1, off by default): time each
+        // L0→L1 rollup + record the L0 depth it absorbed, so the maintenance
+        // poll's compaction frequency + per-run DURATION can be correlated
+        // against the q4 throughput troughs — i.e. did the ~1 s poll trade a
+        // steady slowdown for periodic stutter (a long compaction holding the
+        // compaction_mutex/version lock while read probes stall)?
+        let diag = compact_diag_on();
+        let cf_id = cf_data.handle().id();
+        let (t0, l0_before) = if diag {
+            let v = self.version_set.current();
+            let n = v.l0_files().iter().filter(|f| f.cf_id == cf_id).count();
+            (Some(std::time::Instant::now()), n)
+        } else {
+            (None, 0)
+        };
+        // FRS-COMPACT-BG: roll up L0→L1 only. A FULL leveled cascade
+        // (`compact_once` until balanced, draining L1→L2→…) was BUILT and
+        // MEASURED on q4 (2026-06-04) and REVERTED: it drained deeper levels
+        // (ldeep 0→6) but multiplied write-amp — compaction sum 248s→401s, max
+        // 20.7s→38.7s, q4 events 74.8M→68.8M (−8%), worst trough 95K→28K. The
+        // L0-only rollup (bounding the read-side fan-out via the periodic
+        // trigger) is the net-positive sweet spot; draining deeper levels costs
+        // more in rewrite I/O than it saves in read fan-out for q4. The
+        // unbounded-L1 / periodic-stall cost of L0-only is accepted (further
+        // compaction tuning is negative-return here; the next lever is the
+        // read-side B_resident tier, not more compaction).
+        let r = self.compact_l0_for_cf(cf_data);
+        if let Some(t) = t0 {
+            let v = self.version_set.current();
+            let l0_after = v.l0_files().iter().filter(|f| f.cf_id == cf_id).count();
+            let l1_after = v.levels[1].files.iter().filter(|f| f.cf_id == cf_id).count();
+            eprintln!(
+                "[COMPACT_DIAG t={}ms] cf={} l0 {l0_before}->{l0_after} l1={l1_after} dur_ms={} ok={}",
+                process_elapsed_ms(),
+                cf_id.0,
+                t.elapsed().as_millis(),
+                r.is_ok(),
+            );
+        }
+        r?;
         Ok(())
     }
+}
+
+/// Process-relative wall clock (ms since first call), so background-thread
+/// diagnostics (compaction, decay) can be time-correlated with the driver's
+/// throughput samples without a `Date`/UTC dependency. Lazily anchored.
+fn process_elapsed_ms() -> u128 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis()
+}
+
+/// FRS-COMPACT-DIAG toggle (`FRS_COMPACT_DIAG=1`), cached.
+fn compact_diag_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_COMPACT_DIAG").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
 }
 
 /// Drains pending flushes and joins the worker thread on shutdown so no
@@ -10886,6 +11115,45 @@ mod tests {
         let db = open();
         let cf = db.default_cf();
         assert!(db.compact_l0(&cf).unwrap().is_none());
+    }
+
+    /// FRS-COMPACT-MAINTENANCE (2026-06-04): regression guard for the q4
+    /// fan-out decay. `switch_and_flush` / checkpoint flush / `flush_all` add
+    /// L0 SSTs but — unlike the background `run_flush` worker — never call
+    /// `maybe_auto_compact`. In q4 the write-buffer flush path essentially
+    /// never fires (the 1 GiB memtable rarely fills) while 30 s checkpoints
+    /// keep sealing the memtable to L0, so L0 grew UNBOUNDED and compaction
+    /// NEVER ran (measured: per-probe overlapping-SST count climbed 0→10, all
+    /// L0, deep=0; "compact" appeared 0× in the TM log). The maintenance
+    /// scheduler must detect a CF whose L0 is at/over the compaction trigger
+    /// INDEPENDENT of the flush path, so the periodic ticker can enqueue the
+    /// rollup and keep L0 shallow regardless of which path produced the SSTs.
+    #[test]
+    fn test_cfs_due_for_compaction_flags_uncompacted_l0() {
+        let db = open();
+        let cf = db.default_cf();
+        let trigger = db.write_controller.config().l0_compaction_trigger;
+        // Seal `trigger + 1` L0 files via the path that does NOT auto-compact.
+        for i in 0..(trigger + 1) {
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"v").unwrap();
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        assert!(
+            db.version_set.current().l0_files().len() as u32 > trigger,
+            "precondition: L0 must be over the trigger and uncompacted"
+        );
+        // The scheduler must flag this CF as due — this is the fix.
+        let due = db.cfs_due_for_compaction();
+        assert_eq!(due.len(), 1, "CF with L0 over trigger must be flagged due");
+        assert_eq!(due[0].handle().id(), cf.id());
+
+        // Once compacted, the CF must no longer be reported as due.
+        db.compact_l0(&cf).unwrap();
+        assert_eq!(db.version_set.current().l0_files().len(), 0);
+        assert!(
+            db.cfs_due_for_compaction().is_empty(),
+            "a balanced CF must not be flagged due"
+        );
     }
 
     #[test]

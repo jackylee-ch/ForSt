@@ -384,7 +384,7 @@ impl Version {
         upper: Option<&[u8]>,
         out: &mut Vec<&'a SstFileMeta>,
     ) {
-        for level in &self.levels {
+        for (lvl_idx, level) in self.levels.iter().enumerate() {
             let files = &level.files;
             // Binary-search the upper cut: first file whose smallest_key is
             // >= upper. Files within a level are sorted by smallest_key, so
@@ -394,12 +394,38 @@ impl Version {
                 Some(hi) => files.partition_point(|f| f.smallest_key.as_slice() < hi),
                 None => files.len(),
             };
-            for f in &files[..end] {
-                // Left tail: a file entirely below `lower` cannot overlap.
-                if f.largest_key.as_slice() < lower {
-                    continue;
+            if lvl_idx == 0 {
+                // L0 files may OVERLAP (flushed memtables) → largest_key is not
+                // monotonic, so the lower bound must be a linear left-skip. L0 is
+                // kept shallow by `l0_compaction_trigger`, so this stays bounded.
+                for f in &files[..end] {
+                    if f.largest_key.as_slice() < lower {
+                        continue;
+                    }
+                    out.push(f);
                 }
-                out.push(f);
+            } else {
+                // FRS-LOCATOR-LOWER-BSEARCH (2026-06-04): L1+ are NON-OVERLAPPING
+                // and sorted ⇒ largest_key is monotonic, so the lower bound is
+                // binary-searchable too. This removes the O(files-before-prefix)
+                // left-tail LINEAR skip that was q4's runaway A_fanout decay
+                // driver: `overlapping_ssts_in_range` cost grew with accumulated
+                // L1+ files (thousands at the floor) even though only ~0-4 files
+                // actually overlap a narrow interval-join prefix. Now O(log +
+                // matched) per level. Sound iff the leveled non-overlap invariant
+                // holds (CF-prefixed keys are disjoint across CFs; leveled
+                // compaction keeps each L≥1 non-overlapping) — asserted in debug.
+                debug_assert!(
+                    files
+                        .windows(2)
+                        .all(|w| w[0].largest_key <= w[1].smallest_key),
+                    "L{lvl_idx} files overlap — binary-search lower bound is unsound; \
+                     falling back would be required"
+                );
+                let start = files.partition_point(|f| f.largest_key.as_slice() < lower);
+                for f in &files[start.min(end)..end] {
+                    out.push(f);
+                }
             }
         }
     }
@@ -856,6 +882,64 @@ mod tests {
                 "range [{:?},{:?}) mismatch: locator returned a different SST set than the flat scan",
                 lower, upper
             );
+        }
+    }
+
+    #[test]
+    fn test_overlapping_ssts_dense_left_tail_lower_bsearch() {
+        // FRS-LOCATOR-LOWER-BSEARCH: a LARGE non-overlapping L1 with the query
+        // range at the very END — the case the lower-bound binary search targets
+        // (the old code linearly skipped every earlier file). Must still equal
+        // the flat scan: exactly the late files, none missed, none extra.
+        let cf = DEFAULT_CF_ID;
+        let mut new_files = Vec::new();
+        // 500 non-overlapping L1 files: key "k{000}".."k{499}", each its own file.
+        for i in 0..500u64 {
+            let s = format!("k{i:04}").into_bytes();
+            let l = format!("k{i:04}~").into_bytes(); // largest < next smallest
+            new_files.push((
+                1u32,
+                SstFileMeta {
+                    file_number: FileNumber(1000 + i),
+                    cf_id: cf,
+                    file_size: 1024,
+                    smallest_key: s,
+                    largest_key: l,
+                    min_sequence: SequenceNumber(1),
+                    max_sequence: SequenceNumber(100),
+                    num_entries: 50,
+                },
+            ));
+        }
+        let v = Version::new()
+            .apply_edit(&VersionEdit {
+                new_files,
+                ..Default::default()
+            })
+            .unwrap();
+        let flat = |lo: &[u8], hi: Option<&[u8]>| -> Vec<FileNumber> {
+            v.live_sst_files_iter()
+                .filter(|f| {
+                    f.largest_key.as_slice() >= lo
+                        && hi.is_none_or(|u| f.smallest_key.as_slice() < u)
+                })
+                .map(|f| f.file_number)
+                .collect()
+        };
+        // Query the last 3 files (deep left tail before them).
+        for (lo, hi) in [
+            (b"k0497".as_ref(), None),
+            (b"k0497".as_ref(), Some(b"k0499~".as_ref())),
+            (b"k0000".as_ref(), Some(b"k0001".as_ref())), // head (start=0)
+            (b"k9999".as_ref(), None),                    // past end → empty
+        ] {
+            let mut got: Vec<&SstFileMeta> = Vec::new();
+            v.overlapping_ssts_in_range(lo, hi, &mut got);
+            let mut g: Vec<FileNumber> = got.iter().map(|f| f.file_number).collect();
+            let mut w = flat(lo, hi);
+            g.sort_by_key(|n| n.0);
+            w.sort_by_key(|n| n.0);
+            assert_eq!(g, w, "dense left-tail [{lo:?},{hi:?}) locator != flat scan");
         }
     }
 
