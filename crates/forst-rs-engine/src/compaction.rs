@@ -256,24 +256,32 @@ impl CompactionJob {
                 Some("1") | Some("true") | Some("TRUE")
             );
         let produced: Vec<(FileNumber, SstFileInfo)> = if parallel {
-            // Partition into slots.len() ranges of ~equal row count, snapped to
-            // the next user-key boundary so every version of a key lands in one
-            // partition (point-get / scan correctness).
+            // Partition by ENCODED-SIZE (≈ key+value+overhead bytes ≥ target),
+            // snapped to the next user-key boundary — matching the serial slot
+            // path's `estimated_size >= target` rolling, so the parallel output
+            // has the SAME file count/boundaries as serial (no file-count
+            // explosion → no extra downstream compaction). Cap partitions at
+            // slots.len() (the final partition takes the remainder).
             let n = slots.len();
             let total = all.len();
-            let per = total.div_ceil(n);
+            let part_target = if target > 0 { target } else { u64::MAX };
             let mut bounds: Vec<usize> = vec![0];
-            let mut cut = per;
-            while bounds.len() < n && cut < total {
-                let mut idx = cut;
-                while idx < total && idx > 0 && all[idx].key == all[idx - 1].key {
-                    idx += 1;
+            let mut acc: u64 = 0;
+            let mut i = 0usize;
+            while i < total && bounds.len() < n {
+                acc += (all[i].key.len() + all[i].value.as_ref().map_or(0, |v| v.len()) + 16) as u64;
+                i += 1;
+                if acc >= part_target && i < total {
+                    // snap to the next user-key boundary
+                    while i < total && all[i].key == all[i - 1].key {
+                        i += 1;
+                    }
+                    if i >= total {
+                        break;
+                    }
+                    bounds.push(i);
+                    acc = 0;
                 }
-                if idx >= total {
-                    break;
-                }
-                bounds.push(idx);
-                cut = idx + per;
             }
             bounds.push(total);
             // Contiguous, key-boundary-aligned (range → slot) pairs. Each range

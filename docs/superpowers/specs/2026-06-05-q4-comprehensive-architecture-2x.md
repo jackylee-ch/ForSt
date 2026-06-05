@@ -43,3 +43,18 @@ batch → poor instruction/data cache hit rates + no SIMD. The fix is multi-leve
   OPT-IN (default off) because row-count partitioning does not yet byte-match the serial size-based file
   layout (broke a layout-asserting test under default-on); engine suite 263 green with it default-off.
   A/B vs serial-drain (461s): q4 finished ~564s with 139 compactions / 962s total compaction (vs ~22 serial) — the row-count partitioning makes more/smaller files → more downstream drain compactions → MORE total work, negating the parallelism. NO gain (within trough variance, not faster). REFUTED as implemented; needs layout-preserving partitioning (same file count as serial, parallel emit) to isolate the concurrency benefit. Kept opt-in default-off.
+
+## Evidence chain — parallel compaction REFUTED (both partitionings); reveals the real direction
+- row-count partitioning: q4 ~564s, 139 compactions / 962s compaction (file-count explosion).
+- **size-based partitioning (layout-equivalent to serial; suite 263 green parallel-on):** q4 did NOT finish
+  in 600s, **n=189 / 1315s total compaction**, troughs deeper (16–33K).
+- **MECHANISM:** parallel compaction spawns N threads that steal cores from the FOREGROUND pipeline during
+  each burst → the foreground (the throughput we want) starves harder → deeper troughs → slower. On a shared
+  machine, MORE compaction concurrency = WORSE. RocksDB RATE-LIMITS compaction (gives it LESS) to protect the
+  foreground — the OPPOSITE of "add compaction concurrency".
+- **⇒ Corrected direction:** the concurrency/batch lever must target the FOREGROUND per-record path (process
+  records in batches → fewer FFM crossings + engine ops → lower foreground CPU → less contention → flatter),
+  NOT compaction parallelism. Plus compaction THROTTLING (cap its core/IO use). q4's interval-join arrives
+  per-record (Flink V1-sync operator); batching its state ops within forst-rs is the lever, but the operator
+  itself is Flink-runtime (out of the backend's scope) — the in-scope piece is the MapState/write-buffer
+  batching + a throttled single-thread compaction (current default) which already finishes (461s).
