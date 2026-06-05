@@ -234,7 +234,113 @@ impl CompactionJob {
         // published from earlier slots are referenced in the returned
         // VersionEdit's `new_files`, which the caller deletes on a failed apply
         // (and the restore orphan-scan sweeps any residue on restart).
-        let write_outcome: ForstResult<Vec<(FileNumber, SstFileInfo)>> = (|| {
+        // FRS-COMPACT-PARALLEL (2026-06-05, default ON; opt out =0): emit the
+        // output SSTs CONCURRENTLY across cores instead of one-at-a-time. The
+        // single-threaded merge left the Mac's other cores idle during a 25 s
+        // L1→L2 burst while the foreground starved (the q4 trough). Partition
+        // the sorted `all` into `slots.len()` contiguous, key-boundary-aligned
+        // ranges and emit each to its own non-overlapping output SST on a
+        // separate thread (std::thread::scope). Each partition reuses the exact
+        // serial emit (`emit_one_sst` → `emit_key_versions`), so output is
+        // byte-equivalent; partitions are disjoint key ranges ⇒ no shared
+        // mutable state. Burst wall-time ≈ serial/N.
+        // OPT-IN (FRS_COMPACT_PARALLEL=1) while validating: the partitioning is
+        // by row-count into slots.len() files, which is data-correct (disjoint
+        // key ranges, all versions preserved) but does NOT yet byte-match the
+        // serial size-based file layout, so it stays off-by-default until an
+        // A/B + the layout-equivalence is settled. Default = serial.
+        let parallel = slots.len() > 1
+            && all.len() > slots.len()
+            && matches!(
+                std::env::var("FRS_COMPACT_PARALLEL").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            );
+        let produced: Vec<(FileNumber, SstFileInfo)> = if parallel {
+            // Partition into slots.len() ranges of ~equal row count, snapped to
+            // the next user-key boundary so every version of a key lands in one
+            // partition (point-get / scan correctness).
+            let n = slots.len();
+            let total = all.len();
+            let per = total.div_ceil(n);
+            let mut bounds: Vec<usize> = vec![0];
+            let mut cut = per;
+            while bounds.len() < n && cut < total {
+                let mut idx = cut;
+                while idx < total && idx > 0 && all[idx].key == all[idx - 1].key {
+                    idx += 1;
+                }
+                if idx >= total {
+                    break;
+                }
+                bounds.push(idx);
+                cut = idx + per;
+            }
+            bounds.push(total);
+            // Contiguous, key-boundary-aligned (range → slot) pairs. Each range
+            // gets slot[pi]; ranges are disjoint key intervals.
+            let ranges: Vec<(usize, usize)> = bounds
+                .windows(2)
+                .filter(|w| w[0] < w[1])
+                .map(|w| (w[0], w[1]))
+                .collect();
+            let all_ref = &all;
+            let this: &CompactionJob = &self;
+            let results: Vec<ForstResult<Option<(FileNumber, SstFileInfo)>>> =
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = ranges
+                        .iter()
+                        .enumerate()
+                        .map(|(pi, &(s, e))| {
+                            let (fnum, path) = slots[pi].clone();
+                            scope.spawn(move || {
+                                this.emit_one_sst(
+                                    all_ref,
+                                    s..e,
+                                    fnum,
+                                    &path,
+                                    atomic_rename,
+                                    write_mode,
+                                )
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                Err(ForstError::corruption(
+                                    "compaction partition thread panicked",
+                                ))
+                            })
+                        })
+                        .collect()
+                });
+            let mut produced: Vec<(FileNumber, SstFileInfo)> = Vec::new();
+            let mut first_err: Option<ForstError> = None;
+            for r in results {
+                match r {
+                    Ok(Some(x)) => produced.push(x),
+                    Ok(None) => {}
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            if let Some(e) = first_err {
+                // Best-effort cleanup: every partition's output file is not yet
+                // referenced by any Version, so delete any that were written.
+                for (_, path) in &slots[..ranges.len()] {
+                    let _ = self.fs.delete_file(path);
+                    let _ = self.fs.delete_file(&sst_temp_path(path));
+                }
+                return Err(e);
+            }
+            // Shared apply + reader-open finalize runs below with this produced.
+            produced
+        } else {
+            let write_outcome: ForstResult<Vec<(FileNumber, SstFileInfo)>> = (|| {
             let mut produced: Vec<(FileNumber, SstFileInfo)> = Vec::new();
             let mut i = 0usize;
             let mut slot_idx = 0usize;
@@ -341,9 +447,9 @@ impl CompactionJob {
                 }
             }
             Ok(produced)
-        })();
-
-        let produced = write_outcome?;
+            })();
+            write_outcome?
+        };
 
         // Zero-emit across ALL slots (e.g. everything was a bottommost
         // tombstone): emit a deletion-only VersionEdit. R0A-H1: keep
@@ -413,6 +519,89 @@ impl CompactionJob {
             next_file_number: None,
             last_sequence: last_seq,
         }))
+    }
+
+    /// FRS-COMPACT-PARALLEL (2026-06-05): emit ONE output SST covering the
+    /// sorted entries `all[range]` (a contiguous, key-boundary-aligned key
+    /// range). No mid-range slot rolling — the partition IS the file. Reuses
+    /// `emit_key_versions` per key-group, so the per-partition output is
+    /// byte-identical to what the serial slot loop would produce for that range.
+    /// Returns `None` when the partition emits zero rows (e.g. all bottommost
+    /// tombstones). Pure read of `&self` + `all` ⇒ safe to call concurrently
+    /// across disjoint partitions.
+    fn emit_one_sst(
+        &self,
+        all: &[CompactionEntry],
+        range: std::ops::Range<usize>,
+        fnum: FileNumber,
+        path: &std::path::Path,
+        atomic_rename: bool,
+        write_mode: forst_rs_io::WriteMode,
+    ) -> ForstResult<Option<(FileNumber, SstFileInfo)>> {
+        let write_path = if atomic_rename {
+            sst_temp_path(path)
+        } else {
+            path.to_path_buf()
+        };
+        let (file_emitted, info_opt): (u64, Option<SstFileInfo>) = {
+            let mut wf = self.fs.open_writable_file(&write_path, write_mode)?;
+            let mut writer_opts = self.writer_options.clone();
+            writer_opts.cf_id = self.cf_id;
+            let mut writer = SstWriterImpl::with_options(writer_opts).streaming(&mut *wf);
+            let mut file_emitted = 0u64;
+            let mut i = range.start;
+            while i < range.end {
+                let key_end = {
+                    let key = &all[i].key;
+                    let mut j = i + 1;
+                    while j < range.end && all[j].key == *key {
+                        j += 1;
+                    }
+                    j
+                };
+                let versions = &all[i..key_end];
+                i = key_end;
+                self.emit_key_versions(&mut writer, versions, &mut file_emitted)?;
+            }
+            if file_emitted == 0 {
+                drop(writer);
+                drop(wf);
+                if let Err(e) = self.fs.delete_file(&write_path) {
+                    tracing::warn!(
+                        "CompactionJob: zero-emit tmp delete failed for {}: {}",
+                        write_path.display(),
+                        e
+                    );
+                }
+                (0, None)
+            } else {
+                let info = writer.finish()?;
+                wf.flush()?;
+                wf.sync()?;
+                (file_emitted, Some(info))
+            }
+        };
+        let _ = file_emitted;
+        if let Some(info) = info_opt {
+            if atomic_rename {
+                if let Err(e) = self.fs.rename(&write_path, path) {
+                    let _ = self.fs.delete_file(&write_path);
+                    return Err(e);
+                }
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = self.fs.sync_dir(parent) {
+                        tracing::warn!(
+                            "CompactionJob: sync_dir({}) failed after rename: {}",
+                            parent.display(),
+                            e
+                        );
+                    }
+                }
+            }
+            Ok(Some((fnum, info)))
+        } else {
+            Ok(None)
+        }
     }
 
     fn emit_key_versions<W>(
