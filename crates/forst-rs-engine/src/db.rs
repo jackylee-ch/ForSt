@@ -8886,15 +8886,15 @@ impl CompactionExecutor for DbImpl {
         // compaction tuning is negative-return here; the next lever is the
         // read-side B_resident tier, not more compaction).
         let r = self.compact_l0_for_cf(cf_data);
-        // FRS-COMPACT-DRAIN-L1 (2026-06-05, env FRS_COMPACT_DRAIN_L1=1, off by
-        // default): after the L0→L1 rollup, if L1 has grown past its size
-        // budget, do ONE bounded L1→L2 compaction (NOT a full cascade to L6 —
-        // that was measured −8%). This keeps L1 small so each L0→L1 re-merges
-        // ≤ base instead of a growing 720 MB, cutting the cumulative write-amp
-        // (cum_in 8936 MiB) that contends with the pipeline. Re-enqueue while L1
-        // stays over budget so the drain spreads across maintenance ticks
-        // rather than blocking one run. Strictly level-1 → L2 grows but stays
-        // non-overlapping (read-fine) and is only touched by bounded picking.
+        // FRS-COMPACT-DRAIN-L1 (2026-06-05, DEFAULT ON; opt out =0): after the
+        // L0→L1 rollup, if L1 has grown past its size budget, do ONE bounded
+        // L1→L2 compaction (NOT a full cascade to L6 — that was −8%). Keeps L1
+        // small so each L0→L1 re-merges ≤ base instead of a growing 720 MB.
+        // DATA: without this q4 NEVER FINISHES (L1 grows → compaction bursts
+        // grow → pipeline collapses, ~65 M stall); WITH it q4 FINISHES 98 M in
+        // 461 s (first completion). Re-enqueue while L1 stays over budget so the
+        // drain spreads across maintenance ticks. Strictly level-1 → L2 grows
+        // but stays non-overlapping (read-fine), touched only by bounded picking.
         let mut drained_l1 = false;
         if r.is_ok() && drain_l1_on() && !cf_data.is_dropped() {
             let over = self
@@ -8949,17 +8949,29 @@ fn compact_diag_on() -> bool {
     })
 }
 
-/// FRS-COMPACT-DRAIN-L1 toggle (`FRS_COMPACT_DRAIN_L1=1`), cached. When set,
-/// `run_compaction` drains L1→L2 (one bounded step, re-enqueued) once L1 is over
-/// its size budget — the write-amp-reduction lever (keeps L1 small so L0→L1
-/// re-merges less). Off by default; the L0-only rollup is the committed default.
+/// FRS-COMPACT-DRAIN-L1 (default ON; opt out with `FRS_COMPACT_DRAIN_L1=0`).
+/// `run_compaction` drains L1→L2 (one bounded `compact_level_for_cf(1)` step,
+/// re-enqueued) once L1 exceeds `max_bytes_for_level_base` — proper bounded
+/// leveled compaction, so each L0→L1 rollup re-merges ≤ base instead of an
+/// ever-growing L1.
+///
+/// WHY DEFAULT ON (2026-06-05, data-backed): WITHOUT it, q4's L0-only rollup
+/// re-merges a monotonically growing L1; the compaction bursts grow (2.3 s →
+/// 20 s), the foreground pipeline collapses, and q4 NEVER FINISHES (~65 M / stall,
+/// confirmed across many runs + heritage "froze every config at ~64 M"). WITH it,
+/// **q4 FINISHES 98 M in 461 s** (first completion in the whole investigation) —
+/// the write-amp savings compound over a long run. A short 280 s A/B undervalued
+/// it (+7 % cum_in, +4 % events = noise) because the completion benefit only shows
+/// past the point L0-only collapses. Strictly level-1 (never cascades L1→…→L6 —
+/// that full cascade was −8 %); L2 grows but stays non-overlapping (read-fine).
+/// Opt-out `=0` restores the legacy L0-only rollup.
 fn drain_l1_on() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("FRS_COMPACT_DRAIN_L1").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE")
+            Some("0") | Some("false") | Some("FALSE")
         )
     })
 }

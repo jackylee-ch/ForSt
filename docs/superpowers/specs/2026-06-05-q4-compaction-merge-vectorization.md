@@ -139,3 +139,26 @@ RocksDB stays flat on the same HW? Read-path levers (bloom-skip, prior) = noise;
 with compaction bursts (troughs) that RECOVER — consistent with forst-rs's UNTHROTTLED compaction starving
 the foreground pipeline (RocksDB rate-limits compaction I/O; forst-rs does not). Next: test the full
 resident-shadow bypass (match RocksDB's read path) and compaction throttling/scheduling.
+
+## ★ Evidence chain #7 — BOUNDED L1→L2 DRAIN = q4 STABILITY FIX (q4 FINISHES). Default ON.
+The Lever-A "refutation" (#5) was a MEASUREMENT-WINDOW ARTIFACT: the 280 s A/B showed drain +7 % cum_in / +4 %
+events (noise) — but it stopped before L0-only collapses. A FULL-LENGTH run (MAXSEC 600) is decisive:
+
+| config | result |
+|---|---|
+| drain OFF (L0-only) | stalls ~65 M, decays 600 K→100 K, **NEVER finishes** (heritage: "froze every config ~64 M") |
+| **drain ON (bounded L1→L2)** | **FINISHES 98 M in 461 s** (first completion in the entire investigation) |
+| RocksDB (reference, same Mac) | finishes 98 M in 241 s |
+
+⇒ the bounded L1→L2 drain is **proper leveled compaction** (each L0→L1 re-merges ≤ base, not a growing
+720 MB); the write-amp savings COMPOUND over a long run, so q4 stops collapsing and COMPLETES. This is the
+q4 **stability** fix (the goal's stability half — resolved, data-backed). Made **DEFAULT ON** (opt-out
+`FRS_COMPACT_DRAIN_L1=0`); strictly level-1 (no L1→…→L6 cascade, which was −8 %). Engine suite 263 green
+(compaction-correctness tests unaffected — they use < base data so the drain doesn't fire). Broad-query
+validation (q5/q7/q11; q7-on-S3 ckpt-upload interaction) is the follow-up gate; opt-out env covers interim.
+
+**Remaining PERF gap (next):** forst-rs-with-drain finishes 98 M/461 s = ~212 K/s vs RocksDB 98 M/241 s =
+~407 K/s → still ~1.9× slower (goal: 2–3× FASTER). The 461 s trajectory still has deep compaction-burst
+troughs (29–43 K) that drag the average below the ~315 K peak. Next lever: smooth the compaction bursts
+(rate-limit / smaller-more-frequent compactions so a burst doesn't starve the foreground) — RocksDB stays
+flat partly via compaction I/O rate-limiting, which forst-rs lacks.
