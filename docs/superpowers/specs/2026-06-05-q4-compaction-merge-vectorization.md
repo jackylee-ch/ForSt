@@ -162,3 +162,26 @@ validation (q5/q7/q11; q7-on-S3 ckpt-upload interaction) is the follow-up gate; 
 troughs (29–43 K) that drag the average below the ~315 K peak. Next lever: smooth the compaction bursts
 (rate-limit / smaller-more-frequent compactions so a burst doesn't starve the foreground) — RocksDB stays
 flat partly via compaction I/O rate-limiting, which forst-rs lacks.
+
+## Evidence chain #8 — flat-curve root cause: compaction too expensive LIVE → no good leveling operating point
+Goal refined: 2× over RocksDB + ZERO decay (flat curve), via vectorization/zero-copy/batch/SIMD.
+Data from the drain-ON full run (which FINISHES 98M/461s but with deep troughs 29–43K):
+- COMPACT_DIAG shows the drain produces **25 s L1→L2 bursts** (`drained_l1=true dur_ms=25706`), and **L2 grew
+  to 11 files** — the single-level drain moved the unbounded growth from L1 to L2 (L1→L2 now re-merges a
+  growing L2). Same write-amp pattern, one level down. These 25 s bursts coincide with the troughs.
+- No write-stall log surfaced ⇒ the trough is the compaction burst's CPU/contention, not (only) a flush lock.
+- compaction merge is ~3 ns/byte ISOLATED (microbench) but ~18–33 ns/byte LIVE here ⇒ contention with the
+  78%-engine-CPU pipeline.
+
+**Unified root cause:** forst-rs's compaction is too expensive LIVE, so EVERY leveling choice is bad —
+L0-only (L1 grows → collapse), single-drain (L2 grows → 25 s troughs), full cascade (over-rewrites, −8%).
+No good operating point exists while compaction contends this heavily with the pipeline.
+
+**⇒ The flat curve AND the 2× both require the goal's named lever: cut per-record/per-byte ENGINE CPU via
+vectorization / zero-copy / batch / SIMD.** Lower engine CPU → cheaper compaction (deeper leveling stops
+hurting → flat) + leaner pipeline (higher throughput → 2×). The hot paths to vectorize/SIMD: the KV-block
+decode/encode (compaction read+write), the k-way merge, and the per-record memtable/state ops. This is a
+substantial, correctness-gated engine program (each change: full-length A/B for 2× + flat, under the test
+suite). Delivered foundation this session: A-fix +17% (84dee6040) + q4 STABILITY (drain default-on → q4
+FINISHES 98M/461s, 595faad76) + the full attribution + same-machine RocksDB baseline (241s) + reproducible
+microbench. The 2×+flat+SIMD program builds on this finish-able, measurable q4.
