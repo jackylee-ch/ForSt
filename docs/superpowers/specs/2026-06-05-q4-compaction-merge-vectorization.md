@@ -116,3 +116,26 @@ hard-reset (pkill all flink procs + clean `/tmp/flink-forst-rs-*` + `/tmp/nexmar
 `start-cluster`, verify `slots-total=4` via `:8081/overview`, start sql-gateway, then submit via
 `run_query.sh oa q4` with **FLINK_HOME/NEXMARK_HOME/JAVA_HOME/HADOOP_CLASSPATH exported** (run_query.sh
 hard-requires FLINK_HOME in env). Reuse the running cluster across iterations rather than restarting.
+
+## Evidence chain #6 — RocksDB-on-this-Mac baseline + checkpoint hypothesis FALSIFIED (re-issued goal: no HW excuses)
+The re-issued goal rejects "machine-bound" — RocksDB runs q4 on this exact Mac, so the gap is forst-rs-specific.
+**Measured on THIS Mac, identical Flink config (ckpt 30s):**
+- **RocksDB q4: FINISHED 98 M in 241 s, FLAT ~400–445 K/s (even accelerates mid-run).** No decay.
+- **forst-rs q4: starts FASTER (628 K) then COLLAPSES** to ~100 K, reaches only ~65 M, never finishes.
+
+So the decay is 100 % forst-rs-specific (same HW, same checkpoint interval, RocksDB stays flat). My prior
+"machine-bound" conclusion was WRONG — retracted.
+
+Config diff found: RocksDB sets `state.backend.incremental: true`; the forst-rs template does not (+
+`forst.rs.checkpoint.noflush=false`). **Hypothesis: forst-rs's non-incremental checkpoint drives the decay.**
+**FALSIFIED by experiment:** forst-rs q4 with checkpointing DISABLED (interval 9999999 s) decays HARDER — a
+cliff to 66 K at ~100 s (vs ckpt-ON's oscillating 100–290 K), only 49.6 M. ⇒ the checkpoint's periodic flush
+BOUNDS the active memtable and HELPS; it is NOT the decay cause. (Removing it lets the 1 GiB write buffer
+grow until Tier-1 active-memtable reads collapse — a separate large-memtable cliff.)
+
+**Standing question (open):** what forst-rs-specific cost makes q4 COLLAPSE under compaction bursts while
+RocksDB stays flat on the same HW? Read-path levers (bloom-skip, prior) = noise; compaction levers
+(drain/cascade) = refuted/worse; memory = noise; checkpoint = mitigation not cause. The collapse coincides
+with compaction bursts (troughs) that RECOVER — consistent with forst-rs's UNTHROTTLED compaction starving
+the foreground pipeline (RocksDB rate-limits compaction I/O; forst-rs does not). Next: test the full
+resident-shadow bypass (match RocksDB's read path) and compaction throttling/scheduling.
