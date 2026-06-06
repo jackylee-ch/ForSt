@@ -150,6 +150,20 @@ checkpoint) but is NOT the beat lever. Beating RocksDB needs lowering the diffus
 CPU — a micro-optimization campaign with no single lever, possibly partly inherent to the
 async design on low-latency local dir (forst-rs's advantage is S3/disagg, unmeasured here).
 
+## Resource/operator parity CONFIRMED — the 14% is pure backend efficiency (2026-06-06)
+Compared the two NexMark configs head-to-head: SAME async-state V2 operator
+(`table.exec.async-state.enabled: true` both; mini-batch off both), SAME parallelism (4),
+SAME 30s incremental checkpoints, and forst-rs has MORE JVM memory (process.size 12288m vs
+RocksDB 8192m). So forst-rs is 14% slower DESPITE more memory and the identical operator —
+the gap is neither resources nor operator choice; it is **backend per-record efficiency**:
+forst-rs's FFM marshalling + engine read/write path vs RocksDB's JNI + native path on the
+async-state op stream. (FFM-per-call > JNI is a known forst-rs characteristic; batching
+amortizes but does not erase it.) Every external lever is now ruled out. Closing 14% =
+lowering the FFM+engine per-record CPU — a structural backend effort (true zero-copy read
+path / tighter marshalling), multi-session, and per-change deltas (~1%) are below the
+~12% run-to-run variance so it cannot be tuned incrementally — it needs a rewrite measured
+in aggregate.
+
 ## Honest conclusion
 Beating RocksDB on q4 local is **not reachable by tuning or incremental fixes** — it needs
 the WAL (gap 1) and the async-dispatch/opendal reduction (gap 2). Each is a substantial,
