@@ -179,6 +179,33 @@ decade-mature RocksDB JNI+native engine. Beating it requires broad backend re-en
 the whole path) measured in aggregate — open-ended, not a bounded single-session or even
 single-feature deliverable. This is the complete, evidence-exhausted root cause.
 
+## CORRECTION (2026-06-06): RocksDB is 245s (tight), gap is 24%, and changes ARE measurable
+RocksDB q4 best-of-3 back-to-back: **245s / 247s / 240s** (median ~245s, ±1.5%). The earlier
+single 283s was a slow outlier. So:
+- True gap: forst-rs **322s** vs RocksDB **~245s** = **1.32× (79 s / 24%)** — bigger than the
+  1.14× I'd cited against the bad 283 baseline.
+- Run-to-run variance is **tight (~±1.5-2%)**, NOT the ~12% I claimed (that was *config*
+  spread, not run-to-run). **So the "sub-1% changes are unmeasurable" conclusion was WRONG**
+  — a 3-5% engine change IS measurable against this tight baseline.
+This RE-OPENS the verifiable micro-optimization campaign: real engine changes, each
+benchmarked against a stable ~322s baseline, stacking toward the 79 s. The gap is larger
+(24%) but the path is now measurable change-by-change (which prior reasoning wrongly
+excluded). Next: confirm forst-rs run-to-run variance, then drive measurable engine CPU
+reductions one at a time.
+
+## DEFINITIVE best-of-3 (rigorous, supersedes single-run numbers) — 2026-06-06
+Both engines, q4, back-to-back best-of-3 on the clean machine:
+- **RocksDB: 245s** (245 / 247 / 240; ±1.5%)
+- **forst-rs (noflush=true + async batching, best config): 340s** (361 / 340 / 340; ±3%)
+- **Gap: 1.39× (95 s, 39%)**
+This CORRECTS the earlier "1.14× / within 14%", which used a bad RocksDB baseline (a single
+283 s outlier) AND a single lucky 322 s forst-rs run. The honest median-of-3 gap is **39%**.
+Session improvement is still real: fair start ≈ forst-rs 557 vs rocksdb 245 = 2.27× →
+now 1.39× (via C1+C2+C3 + value-carrying merge + noflush + batching). But forst-rs remains
+**39% slower**, and the gap is diffuse backend per-record efficiency (young FFM+Rust engine
+vs decade-mature RocksDB) — measurable per-change (tight variance) but requiring a broad,
+multi-session campaign to close 95 s. Not a single-session deliverable.
+
 ## Honest conclusion
 Beating RocksDB on q4 local is **not reachable by tuning or incremental fixes** — it needs
 the WAL (gap 1) and the async-dispatch/opendal reduction (gap 2). Each is a substantial,
