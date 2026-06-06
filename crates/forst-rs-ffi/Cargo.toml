@@ -33,6 +33,27 @@ forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
 arrow = { workspace = true }
 
+# FRS-JEMALLOC (2026-06-05): global allocator for the cdylib. The default system
+# allocator retained ~14 GB of freed small-alloc memory (55.9 M live allocations
+# churned per q4) → 43 GB RSS, which does NOT fit the 8c/32g target and swaps.
+# jemalloc returns freed pages to the OS (dirty/muzzy decay + background purge)
+# and handles small-alloc churn with low fragmentation — the allocator RocksDB
+# uses (6.4 GB RSS). Not available under MSVC.
+# `disable_initial_exec_tls`: this cdylib is `dlopen`'d at RUNTIME by Flink's FFM
+# linker (not loaded at JVM start), so jemalloc's default initial-exec TLS model
+# has no static-TLS slot left → "cannot allocate memory in static TLS block" on
+# Linux. The general-dynamic TLS model (this feature) is dlopen-safe.
+#
+# LINUX ONLY (2026-06-06): jemalloc is gated to Linux because the 8c/32g
+# memory-fit target IS the Linux container — that is where return-to-OS matters.
+# On macOS, jemalloc's pthread-TSD thread-exit destructor SIGSEGVs (si_addr=0x0)
+# when a JVM worker thread exits (`_pthread_tsd_cleanup` → jemalloc tsd_cleanup)
+# under this dlopen'd dylib — reproduced 3× on q4 (crash at ~896s elapsed). The
+# macOS host therefore uses the system allocator (what every prior working q4 run
+# used), which also keeps the host A/B vs RocksDB fair.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }
+
 # Fault injection harness (L5, umbrella spec §5). Optional behind
 # `fault-injection` feature so production cdylib builds pay zero cost.
 forst-rs-test-harness = { workspace = true, optional = true }

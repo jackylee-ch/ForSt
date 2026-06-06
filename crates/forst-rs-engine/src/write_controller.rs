@@ -50,6 +50,15 @@ pub struct WriteControllerConfig {
     pub stall_timeout: Duration,
 }
 
+/// FRS-L0-TRIGGER-ENV: parse a positive `u32` from `var`, else `default`.
+fn env_u32(var: &str, default: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
 impl Default for WriteControllerConfig {
     fn default() -> Self {
         Self {
@@ -73,9 +82,17 @@ impl Default for WriteControllerConfig {
             // compaction falls behind the read side no longer amplifies —
             // re-enabling trigger=4 to keep q11's bloom-check count low WITHOUT
             // the q7 read-amp regression. Gated on the q7/q11 trajectory sweep.
-            l0_compaction_trigger: 4,
-            l0_slowdown_trigger: 40,
-            l0_stop_trigger: 64,
+            // FRS-L0-TRIGGER-ENV (2026-06-05): the q4 troughs are write-stalls
+            // when L0 reaches `l0_stop_trigger` while the (now 2.7 ns/byte
+            // isolated) bg compaction is mid-burst. Per the goal's fallback —
+            // once the merge is at its ns/byte floor, attack the troughs via the
+            // L0 stop-trigger / flush cadence, not the merge — these are tunable
+            // for A/B: raising them trades read-amp (deeper L0, bounded by the
+            // L0 newest-first point-read short-circuit) for fewer foreground
+            // write-stalls during compaction bursts.
+            l0_compaction_trigger: env_u32("FRS_L0_COMPACTION_TRIGGER", 4),
+            l0_slowdown_trigger: env_u32("FRS_L0_SLOWDOWN_TRIGGER", 40),
+            l0_stop_trigger: env_u32("FRS_L0_STOP_TRIGGER", 64),
             max_write_buffer_number: 3,
             slowdown_delay: Duration::from_micros(100),
             stall_timeout: Duration::from_secs(45),

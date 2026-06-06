@@ -23,7 +23,6 @@ use std::sync::Arc;
 // 2026-05-29 PERF: FxHashMap replaces std HashMap (SipHash) for the hot
 // hash_index. Profiling showed SipHash (BuildHasher::hash_one +
 // Hasher::write) was the #1 q4/q7 join hot path.
-use rustc_hash::FxHashMap as HashMap;
 
 use arrow::array::{Array, BinaryArray, BinaryBuilder, RecordBatch, UInt64Builder, UInt8Builder};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -33,6 +32,13 @@ use super::{
     GetBorrowedResult, GetResult, MemTableConfig, MemtableValueRef, ScanRow, SinkGetOutcome,
     ValueSink,
 };
+
+/// Legacy value-size threshold. Since FRS-C2 (hash_index removal) values of ANY
+/// size are served directly from the columnar `value_arena` — there is no longer
+/// an inline-value cliff. Retained only as a size reference in tests that assert
+/// the cliff is gone (values above and below it round-trip identically).
+#[cfg(test)]
+const INLINE_THRESHOLD: usize = 256;
 
 /// Index of a single row within the columnar storage arrays.
 #[derive(Debug, Clone, Copy)]
@@ -121,37 +127,6 @@ impl PartialOrd for InternalKey {
     }
 }
 
-/// Maximum value size (bytes) that will be stored inline in the hash entry.
-/// Covers most Flink ValueState<Long/String/etc> payloads (≤64 bytes).
-const INLINE_THRESHOLD: usize = 256;
-
-/// Per-key entry in the hash index. For small values (≤ INLINE_THRESHOLD bytes),
-/// the latest version's value is stored inline to avoid dereferencing through
-/// the columnar value storage on point lookups.
-#[derive(Clone)]
-struct HashEntry {
-    /// Row indices of all versions of this key (oldest first). FRS-MEMTABLE-INLINE-KEY
-    /// (2026-06-04): `SmallVec<[_; 4]>` inlines the common case (most keys have 1–4
-    /// versions in a single memtable) → no per-key heap allocation for the version
-    /// list, cutting another slice of the ~34M live allocations vmmap pinned. Spills
-    /// to the heap only for hot keys with >4 versions.
-    row_indices: smallvec::SmallVec<[RowIndex; 4]>,
-    /// FRS-MEMTABLE-INLINE-KEY (2026-06-04): row offset of the latest version in
-    /// the columnar `value_arena`, replacing the prior `inline_value: Option<Box<[u8]>>`
-    /// cache. The value bytes already live in `value_arena` (non-moving chunks), so the
-    /// `Box` was a per-key DUPLICATE + a per-write `to_vec()` copy + an allocation. The
-    /// fast-path `get` now reads `value_at(latest_offset)` directly — zero duplicate,
-    /// zero alloc, serves ANY value size (no `INLINE_THRESHOLD` cliff), and the
-    /// `get_pinned_ptr` pointer is now STABLE across overwrites (the arena never moves,
-    /// unlike the old `Box` that realloc'd). Tombstone/null is detected via the row's
-    /// `value_nulls` (so `value_at` returns `None`); `latest_op` distinguishes
-    /// Put/Delete/Merge for fast-path eligibility.
-    latest_offset: u32,
-    /// Latest version's sequence number (for fast-path eligibility check).
-    latest_seq: u64,
-    /// Latest version's op_type byte (for tombstone detection on fast path).
-    latest_op: u8,
-}
 
 /// A vectorized MemTable using columnar storage + BTreeMap sorted index.
 ///
@@ -221,24 +196,12 @@ pub struct VectorizedMemTable {
     /// is the follow-on for ultimate perf; BTreeMap first validates the cache fix.)
     index: std::collections::BTreeMap<InternalKey, RowIndex>,
 
-    /// Persistent hash index for O(1) point lookups. Maps user_key to a
-    /// [`HashEntry`] containing ALL RowIndex entries for that key (across both
-    /// sorted and unsorted zones) plus an inline cache of the latest version's
-    /// value (when ≤ INLINE_THRESHOLD bytes). Unlike `unsorted_lookup` (which
-    /// is drained on merge), this index is append-only and survives
-    /// `merge_unsorted_to_sorted()`. Entries are in insertion order (oldest
-    /// first); `get()` uses the inline cache for current-version reads and
-    /// falls through to the columnar path for MVCC snapshot reads.
-    ///
-    /// Memory overhead: ~56 bytes per unique key (Box<[u8]> + HashEntry header)
-    /// + 16 bytes per version (RowIndex) + up to 64 bytes inline value.
-    ///   For 1M keys with avg 32-byte keys and 1 version each: ~112 MB worst
-    ///   case (all values ≤64B inlined) — still within a 128 MiB memtable budget.
-    // FRS-MEMTABLE-INLINE-KEY (2026-06-04): key is an inline `KeyBuf`
-    // (`SmallVec<[u8;48]>`) instead of `Box<[u8]>` — no per-unique-key heap
-    // allocation for the key bytes. `SmallVec: Borrow<[u8]>` with slice-consistent
-    // `Hash`, so `get(&[u8])` lookups need no probe-key copy.
-    hash_index: HashMap<KeyBuf, HashEntry>,
+    // FRS-C2 (spec C2): the `hash_index: HashMap<KeyBuf, HashEntry>` field is
+    // REMOVED. It was a second full copy of every key plus a per-key HashEntry
+    // (~56 B/key + the HashMap buckets) — pure memory duplication of the sorted
+    // BTreeMap `index`, which already holds every version. Point lookups now
+    // resolve from `index` via `idx_newest_visible`. This is the per-key
+    // memtable-memory cut that lets q4 state fit the 8c/32g budget.
 
     // -- State --
     /// Current sequence counter (incremented on each insert).
@@ -275,9 +238,6 @@ impl VectorizedMemTable {
             sequences: Vec::with_capacity(INIT_ROWS_HINT),
             op_types: Vec::with_capacity(INIT_ROWS_HINT),
             index: std::collections::BTreeMap::new(),
-            // FxHashMap has no `with_capacity` (custom hasher) — use
-            // with_capacity_and_hasher with the default FxBuildHasher.
-            hash_index: HashMap::with_capacity_and_hasher(INIT_ROWS_HINT, Default::default()),
             next_sequence: 1,
             memory_used: 0,
             frozen: false,
@@ -390,58 +350,12 @@ impl VectorizedMemTable {
         // For per-key aggregations this saves an allocation per repeat.
         self.index_insert(key, row_index);
 
-        // Persistent hash index: always append so get() is O(1).
-        // Also maintain the inline value cache for the latest version.
-        //
-        // B-R12-H1: capture whether this write IS the new latest BEFORE
-        // mutating the hash entry. Used below to gate the prefix_index
-        // update so a late-arriving lower-seq write does not stomp the
-        // prefix-index bucket — symmetric to B11-H1's inline-cache
-        // gate, but on the prefix-scan-visibility path.
-        let is_new_latest;
-        if let Some(entry) = self.hash_index.get_mut(key) {
-            entry.row_indices.push(row_index);
-            // B11-H1: only update the latest-seq cache when this write's
-            // seq is strictly newer than the cached one. The engine
-            // allocates seqs lock-free (D1) BEFORE acquiring the shard
-            // lock, so two concurrent same-shard writers can land in
-            // opposite seq order — without this gate, the late-arriving
-            // lower-seq write would unconditionally overwrite the
-            // already-cached higher-seq value, making `get(key,
-            // u64::MAX)` return the stale value PERSISTENTLY (until the
-            // next write to that key). `row_indices.push` is
-            // unconditional — every version stays in the columnar
-            // storage; only the inline-cache fast path needs the gate.
-            is_new_latest = seq > entry.latest_seq;
-            if is_new_latest {
-                entry.latest_seq = seq;
-                entry.latest_op = op_type_byte;
-                entry.latest_offset = row_offset; // value lives in value_arena[row_offset]
-            }
-        } else {
-            self.hash_index.insert(
-                KeyBuf::from_slice(key),
-                HashEntry {
-                    row_indices: smallvec::smallvec![row_index],
-                    latest_offset: row_offset,
-                    latest_seq: seq,
-                    latest_op: op_type_byte,
-                },
-            );
-            is_new_latest = true; // first write, always wins
-        }
-
-        // 2026-05-29 PERF: prefix_index maintenance REMOVED. The prefix-scan
-        // read fast path that consumed it was deleted by S3-MAPITER-FIX (see
-        // `prefix_scan_keys` — it now does a byte-range scan over sorted_index,
-        // never reading prefix_index). The maintenance was therefore pure
-        // dead-weight, AND its Put membership check (`v.iter().any(|k| ..)`)
-        // was an O(bucket) linear scan → O(N²) for N keys under one prefix —
-        // exactly the million-key streaming-join MapState pattern (q4/q7/q9/
-        // q15-q19). Eliminating it removes the dominant `batch_insert` cost
-        // for those queries. `is_new_latest` is still used above to gate the
-        // inline-value cache.
-        let _ = is_new_latest;
+        // FRS-C2 (spec C2): the redundant `hash_index` (a second full copy of
+        // every key + a per-key HashEntry) is GONE — point lookups now resolve
+        // from the sorted BTreeMap `index` populated by `index_insert` above
+        // (`get`/`get_borrowed`/`get_into`/`get_pinned_ptr`/`collect_merge_operands`
+        // all route through `idx_newest_visible`). This removes the per-key
+        // HashMap memory that prevented the q4 state from fitting 8c/32g.
 
         // Update memory tracking (approximate).
         self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
@@ -917,29 +831,14 @@ impl VectorizedMemTable {
     /// MVCC snapshot reads fall through to the row_indices + columnar path.
     #[inline]
     pub fn get(&self, key: &[u8], read_sequence: u64) -> ForstResult<Option<GetResult>> {
-        let entry = match self.hash_index.get(key) {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-
-        // Fast path: caller wants the latest version (read_sequence >= latest_seq)
-        // and it is a Put — serve its value straight from the columnar `value_arena`
-        // via `latest_offset` (no inline duplicate; any size). Tombstone/Merge fall
-        // through to the columnar MVCC path, preserving the prior behaviour.
-        if entry.latest_seq <= read_sequence && entry.latest_op == OpType::Put as u8 {
-            let off = entry.latest_offset;
-            let seq = entry.latest_seq;
-            let value = self.value_at(off).map(|s| s.to_vec());
-            return Ok(Some(GetResult {
-                value,
-                sequence: seq,
-                op_type: OpType::Put,
-            }));
-        }
-
-        // Slow path: MVCC snapshot read, tombstone, or Merge.
-        let result = self.find_latest(&entry.row_indices, read_sequence);
-        Ok(result)
+        // FRS-C2: resolve the newest visible version from the sorted BTreeMap
+        // index (single source of truth). `value_at` yields `None` for a
+        // tombstone row, so Delete/SingleDelete naturally produce `value: None`.
+        Ok(self.idx_newest_visible(key, read_sequence).map(|ri| GetResult {
+            value: self.value_at(ri.offset).map(|s| s.to_vec()),
+            sequence: ri.sequence,
+            op_type: ri.op_type,
+        }))
     }
 
     /// FRS-MERGE-PERF (2026-06-03): single-pass merge-operand collection for
@@ -968,23 +867,17 @@ impl VectorizedMemTable {
         cutoff: u64,
         operands: &mut Vec<Vec<u8>>,
     ) -> ForstResult<Option<Option<Vec<u8>>>> {
-        let entry = match self.hash_index.get(key) {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-        // One pass: gather the versions visible at `cutoff`, then sort
-        // newest-first (seq DESC). `row_indices` is not maintained sorted
-        // (find_latest scans it), so sort defensively rather than assume order.
-        let mut versions: Vec<&RowIndex> = entry
-            .row_indices
-            .iter()
-            .filter(|ri| ri.sequence <= cutoff)
-            .collect();
-        if versions.is_empty() {
-            return Ok(None);
-        }
-        versions.sort_unstable_by(|a, b| b.sequence.cmp(&a.sequence));
-        for ri in versions {
+        // FRS-C2: walk this key's versions newest-first directly from the sorted
+        // BTreeMap index (already (key ASC, seq DESC) ordered — no defensive sort
+        // needed, unlike the old unsorted `row_indices`). Collect Merge operands
+        // with seq ≤ cutoff until a Put/Delete base terminates the chain.
+        for (ik, ri) in self.index.range(InternalKey::range_start(key)..) {
+            if ik.user_key.as_slice() != key {
+                break; // past every version of this user key
+            }
+            if ik.sequence > cutoff {
+                continue; // not visible at this snapshot
+            }
             match ri.op_type {
                 OpType::Put => {
                     // Put terminates the chain with its value as the base.
@@ -1034,31 +927,16 @@ impl VectorizedMemTable {
         key: &[u8],
         read_sequence: u64,
     ) -> ForstResult<Option<GetBorrowedResult<'_>>> {
-        let entry = match self.hash_index.get(key) {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-
-        // Fast path: latest version visible AND it is a Put — borrow its value
-        // straight from the columnar `value_arena` via `latest_offset` (no inline
-        // duplicate). Tombstone/Merge fall through to the columnar MVCC path.
-        if entry.latest_seq <= read_sequence && entry.latest_op == OpType::Put as u8 {
-            let off = entry.latest_offset;
-            let seq = entry.latest_seq;
-            if let Some(bytes) = self.value_at(off) {
-                return Ok(Some(GetBorrowedResult {
-                    value: Some(MemtableValueRef::Inline(bytes)),
-                    sequence: seq,
-                    op_type: OpType::Put,
-                }));
-            }
-        }
-
-        // Slow path: MVCC snapshot read or no inline cache. The
-        // columnar `value_arena` lives in `&self`, so we can
-        // still return a borrowed view without allocating.
-        let result = self.find_latest_borrowed(&entry.row_indices, read_sequence);
-        Ok(result)
+        // FRS-C2: newest visible version from the sorted BTreeMap index; borrow
+        // the value straight from the columnar `value_arena` (no per-key alloc).
+        // `value_at` is `None` for a tombstone row.
+        Ok(self
+            .idx_newest_visible(key, read_sequence)
+            .map(|ri| GetBorrowedResult {
+                value: self.value_at(ri.offset).map(MemtableValueRef::Inline),
+                sequence: ri.sequence,
+                op_type: ri.op_type,
+            }))
     }
 
     /// Zero-copy point lookup: returns a raw pointer + length to the inline
@@ -1078,14 +956,13 @@ impl VectorizedMemTable {
     ///   In Flink's single-threaded-per-slot model, both conditions hold for
     ///   the duration of a single record processing.
     pub fn get_pinned_ptr(&self, key: &[u8]) -> Option<(*const u8, usize)> {
-        let entry = self.hash_index.get(key)?;
-        // Only serve for Put ops (not Delete/Merge).
-        if entry.latest_op != OpType::Put as u8 {
+        // FRS-C2: newest version from the sorted index. Only serve a Put.
+        let ri = self.idx_newest_visible(key, u64::MAX)?;
+        if ri.op_type != OpType::Put {
             return None;
         }
-        // Pointer into `value_arena` (non-moving chunks → stable across overwrites,
-        // unlike the prior `Box` that realloc'd on a same-key overwrite).
-        let bytes = self.value_at(entry.latest_offset)?;
+        // Pointer into `value_arena` (non-moving chunks → stable across overwrites).
+        let bytes = self.value_at(ri.offset)?;
         Some((bytes.as_ptr(), bytes.len()))
     }
 
@@ -1113,24 +990,23 @@ impl VectorizedMemTable {
         read_sequence: u64,
         sink: &mut S,
     ) -> SinkGetOutcome {
-        let entry = match self.hash_index.get(key) {
-            Some(e) => e,
+        // FRS-C2: newest visible version from the sorted index (MVCC-correct —
+        // resolves an older version directly when the newest is beyond the
+        // snapshot, instead of bailing to the full path; same resulting bytes).
+        let ri = match self.idx_newest_visible(key, read_sequence) {
+            Some(r) => r,
             None => return SinkGetOutcome::Miss,
         };
-        if entry.latest_seq > read_sequence {
-            // MVCC snapshot read into an older version — fall back.
-            return SinkGetOutcome::NeedsFullPath;
-        }
-        match OpType::from_u8(entry.latest_op).unwrap_or(OpType::Put) {
+        match ri.op_type {
             OpType::Delete | OpType::SingleDelete => {
                 sink.append_null();
                 SinkGetOutcome::HitTombstone
             }
             OpType::Merge => SinkGetOutcome::NeedsFullPath,
             OpType::Put => {
-                // Zero-extra-alloc fast path: borrow the latest value straight from
+                // Zero-extra-alloc fast path: borrow the value straight from
                 // the columnar `value_arena` (any size — no INLINE_THRESHOLD cliff).
-                if let Some(bytes) = self.value_at(entry.latest_offset) {
+                if let Some(bytes) = self.value_at(ri.offset) {
                     sink.append_borrowed(bytes);
                     SinkGetOutcome::HitPut
                 } else {
@@ -1250,31 +1126,8 @@ impl VectorizedMemTable {
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
             // B-R12-H1: capture `is_new_latest` for prefix_index gate.
-            let is_new_latest;
-            if let Some(entry) = self.hash_index.get_mut(key) {
-                entry.row_indices.push(row_index);
-                // B11-H1: gate cache mutation on seq monotonicity to
-                // defend against out-of-order seq allocation under
-                // D1's lock-free seq allocation. See put_with_seq for
-                // detailed rationale.
-                is_new_latest = seq > entry.latest_seq;
-                if is_new_latest {
-                    entry.latest_seq = seq;
-                    entry.latest_op = op_types[i];
-                    entry.latest_offset = row_offset;
-                }
-            } else {
-                self.hash_index.insert(
-                    KeyBuf::from_slice(key),
-                    HashEntry {
-                        row_indices: smallvec::smallvec![row_index],
-                        latest_offset: row_offset,
-                        latest_seq: seq,
-                        latest_op: op_types[i],
-                    },
-                );
-                is_new_latest = true;
-            }
+            // FRS-C2: hash_index removed — point lookups resolve from the sorted
+            // BTreeMap `index` (populated by `index_insert` above).
 
             // Prefix index: maintain mapping from prefix → full keys.
             // PR-B7-H3 fix: the batch-insert paths previously skipped this
@@ -1286,7 +1139,6 @@ impl VectorizedMemTable {
             // 2026-05-29 PERF: prefix_index maintenance REMOVED here too (see the
             // batch_insert site above) — the O(N²) dead-weight on the join
             // insert hot path. `is_new_latest` still gates the inline cache.
-            let _ = is_new_latest;
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
@@ -1383,35 +1235,11 @@ impl VectorizedMemTable {
             // Persistent hash index: always append so get() is O(1).
             // Maintain inline value cache for the latest version.
             // B-R12-H1: capture `is_new_latest` for prefix_index gate.
-            let is_new_latest;
-            if let Some(entry) = self.hash_index.get_mut(key) {
-                entry.row_indices.push(row_index);
-                // B11-H1: gate cache mutation on seq monotonicity to
-                // defend against out-of-order seq allocation under
-                // D1's lock-free seq allocation. See put_with_seq for
-                // detailed rationale.
-                is_new_latest = seq > entry.latest_seq;
-                if is_new_latest {
-                    entry.latest_seq = seq;
-                    entry.latest_op = op_types[i];
-                    entry.latest_offset = row_offset;
-                }
-            } else {
-                self.hash_index.insert(
-                    KeyBuf::from_slice(key),
-                    HashEntry {
-                        row_indices: smallvec::smallvec![row_index],
-                        latest_offset: row_offset,
-                        latest_seq: seq,
-                        latest_op: op_types[i],
-                    },
-                );
-                is_new_latest = true;
-            }
+            // FRS-C2: hash_index removed — point lookups resolve from the sorted
+            // BTreeMap `index` (populated by `index_insert` above).
 
             // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight
             // on the sharded-batch insert path; see batch_insert site).
-            let _ = is_new_latest;
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
@@ -1511,33 +1339,9 @@ impl VectorizedMemTable {
 
             self.index_insert(key, row_index);
 
-            // Persistent hash index: always append so get() is O(1).
-            // B-R12-H1: capture `is_new_latest` for prefix_index gate.
-            let is_new_latest;
-            if let Some(entry) = self.hash_index.get_mut(key) {
-                entry.row_indices.push(row_index);
-                // B11-H1: gate cache mutation on seq monotonicity.
-                is_new_latest = seq > entry.latest_seq;
-                if is_new_latest {
-                    entry.latest_seq = seq;
-                    entry.latest_op = op_types[idx];
-                    entry.latest_offset = row_offset;
-                }
-            } else {
-                self.hash_index.insert(
-                    KeyBuf::from_slice(key),
-                    HashEntry {
-                        row_indices: smallvec::smallvec![row_index],
-                        latest_offset: row_offset,
-                        latest_seq: seq,
-                        latest_op: op_types[idx],
-                    },
-                );
-                is_new_latest = true;
-            }
+            // FRS-C2: hash_index removed — point lookups use the BTreeMap `index`.
 
             // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight).
-            let _ = is_new_latest;
 
             self.memory_used += key.len() + value.map_or(0, |v| v.len()) + 8 + 1 + 48;
         }
@@ -1721,31 +1525,9 @@ impl VectorizedMemTable {
             };
             self.index_insert(key, row_index);
 
-            // hash_index + inline-cache (B11-H1 gated)
-            let is_new_latest;
-            if let Some(entry) = self.hash_index.get_mut(key) {
-                entry.row_indices.push(row_index);
-                is_new_latest = seq > entry.latest_seq;
-                if is_new_latest {
-                    entry.latest_seq = seq;
-                    entry.latest_op = op_byte;
-                    entry.latest_offset = row_offset;
-                }
-            } else {
-                self.hash_index.insert(
-                    KeyBuf::from_slice(key),
-                    HashEntry {
-                        row_indices: smallvec::smallvec![row_index],
-                        latest_offset: row_offset,
-                        latest_seq: seq,
-                        latest_op: op_byte,
-                    },
-                );
-                is_new_latest = true;
-            }
+            // FRS-C2: hash_index removed — point lookups use the BTreeMap `index`.
 
             // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight).
-            let _ = is_new_latest;
 
             self.memory_used += key.len() + value_opt.map(|v| v.len()).unwrap_or(0) + 8 + 1 + 48;
         }
@@ -1904,34 +1686,10 @@ impl VectorizedMemTable {
 
             // Persistent hash index: always append so get() is O(1). The latest
             // version's value lives in `value_arena[row_offset]`; the hash entry
-            // tracks `latest_offset` (no inline duplicate).
-            let is_new_latest;
-            if let Some(entry) = self.hash_index.get_mut(key) {
-                entry.row_indices.push(row_index);
-                // B11-H1: gate cache mutation on seq monotonicity.
-                // See put_with_seq for detailed rationale.
-                is_new_latest = seq > entry.latest_seq;
-                if is_new_latest {
-                    entry.latest_seq = seq;
-                    entry.latest_op = op_values[i];
-                    entry.latest_offset = row_offset;
-                }
-            } else {
-                self.hash_index.insert(
-                    KeyBuf::from_slice(key),
-                    HashEntry {
-                        row_indices: smallvec::smallvec![row_index],
-                        latest_offset: row_offset,
-                        latest_seq: seq,
-                        latest_op: op_values[i],
-                    },
-                );
-                is_new_latest = true;
-            }
+            // FRS-C2: hash_index removed — point lookups use the BTreeMap `index`.
 
             // 2026-05-29 PERF: prefix_index maintenance REMOVED (O(N²) dead-weight
             // on the Arrow zero-copy batch-write path; see batch_insert site).
-            let _ = is_new_latest;
 
             // Approximate memory accounting matching put()/batch_insert().
             let v_len = if values.is_null(i) {
@@ -1950,50 +1708,28 @@ impl VectorizedMemTable {
 
     /// Among a list of RowIndex entries, find the one with the highest
     /// sequence that is <= `read_sequence` and build a GetResult.
-    fn find_latest(&self, indices: &[RowIndex], read_sequence: u64) -> Option<GetResult> {
-        let mut best: Option<&RowIndex> = None;
-        for idx in indices {
-            if idx.sequence <= read_sequence {
-                match best {
-                    Some(b) if idx.sequence <= b.sequence => {}
-                    _ => best = Some(idx),
-                }
+    /// FRS-C2 (2026-06-06, spec C2): newest version of `user_key` visible at
+    /// `read_seq`, resolved from the sorted BTreeMap `index` — the single source
+    /// of truth once the redundant `hash_index` is dropped. Entries are ordered
+    /// (user_key ASC, sequence DESC), so the FIRST entry for `user_key` whose
+    /// sequence ≤ `read_seq` is the newest visible version — byte-equivalent to
+    /// the old `hash_index` + `find_latest` (which selected max-seq ≤ read_seq).
+    #[inline]
+    fn idx_newest_visible(&self, user_key: &[u8], read_seq: u64) -> Option<RowIndex> {
+        for (ik, ri) in self.index.range(InternalKey::range_start(user_key)..) {
+            if ik.user_key.as_slice() != user_key {
+                return None; // walked past every version of this user key
+            }
+            if ik.sequence <= read_seq {
+                return Some(*ri); // seq DESC → first visible is the newest
             }
         }
-        best.map(|idx| GetResult {
-            value: self.value_at(idx.offset).map(|v| v.to_vec()),
-            sequence: idx.sequence,
-            op_type: idx.op_type,
-        })
+        None
     }
 
-    /// Borrowed-value sibling of [`Self::find_latest`].
-    ///
-    /// PR-B7-H2: same selection logic, but constructs a
-    /// [`GetBorrowedResult`] whose `value` borrows from `self.value_arena`
-    /// (the columnar payload buffer) via `value_at()`. No per-key
-    /// allocation. Used by [`Self::get_borrowed`] for the MVCC-snapshot
-    /// and oversized-Put paths where the inline cache is unavailable.
-    fn find_latest_borrowed(
-        &self,
-        indices: &[RowIndex],
-        read_sequence: u64,
-    ) -> Option<GetBorrowedResult<'_>> {
-        let mut best: Option<&RowIndex> = None;
-        for idx in indices {
-            if idx.sequence <= read_sequence {
-                match best {
-                    Some(b) if idx.sequence <= b.sequence => {}
-                    _ => best = Some(idx),
-                }
-            }
-        }
-        best.map(|idx| GetBorrowedResult {
-            value: self.value_at(idx.offset).map(MemtableValueRef::Inline),
-            sequence: idx.sequence,
-            op_type: idx.op_type,
-        })
-    }
+    // FRS-C2: `find_latest` / `find_latest_borrowed` (which scanned the old
+    // `hash_index` `row_indices` version lists) are REMOVED — `idx_newest_visible`
+    // above resolves the newest visible version directly from the sorted BTreeMap.
 }
 
 #[cfg(test)]

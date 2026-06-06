@@ -41,6 +41,30 @@
 // Workspace-wide ForstError is intentionally large; see forst-rs-common rationale.
 #![allow(clippy::result_large_err)]
 
+// FRS-JEMALLOC (2026-06-05): route every allocation in this cdylib through
+// jemalloc. The default system allocator retained ~14 GB of freed memory across
+// 55.9 M small q4 allocations (key/value `Vec` + memtable node per row) → 43 GB
+// RSS, unfit for the 8c/32g target (swaps → collapse). jemalloc returns freed
+// pages to the OS via dirty/muzzy decay (+ a background purge thread on Linux)
+// and fragments far less under small-alloc churn — matching RocksDB's 6.4 GB.
+// LINUX ONLY: on macOS jemalloc's pthread-TSD destructor SIGSEGVs on JVM
+// thread-exit under this dlopen'd dylib (see Cargo.toml). The 8c/32g target is
+// Linux; macOS host uses the system allocator. Keep cfg in sync with Cargo.toml.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Memory return tuned for throughput: a background thread purges off the hot
+// path, and dirty/muzzy pages are returned to the OS on jemalloc's standard
+// ~10 s decay. (An earlier 1 s decay cut RSS 43→34 GB but RE-FAULTED within each
+// checkpoint burst and slowed q4 — 10 s spans the 30 s checkpoint cycle so memory
+// is returned between bursts without re-faulting inside one.) jemalloc ignores
+// `background_thread` where unsupported; the decay settings still apply.
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
+
 /// JNI compatibility shim — exports `Java_org_forstdb_RocksDB_*` symbols
 /// so the resulting cdylib is a drop-in for the community
 /// `libforstjni.so` that Apache Flink's `flink-statebackend-forst`

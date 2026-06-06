@@ -86,6 +86,7 @@
 // Workspace-wide ForstError is intentionally large; see forst-rs-common rationale.
 #![allow(clippy::result_large_err)]
 
+pub(crate) mod bg_pool;
 pub mod checkpoint;
 pub mod column_family;
 pub mod compaction;

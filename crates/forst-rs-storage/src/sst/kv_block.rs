@@ -58,6 +58,7 @@ use forst_rs_common::{
 use super::block_header::BlockHeader;
 use super::compression::{compress, decompress};
 use super::reader::RowView;
+use std::sync::Arc;
 use super::schema::{BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA_KV};
 
 /// Number of entries per restart interval (full key stored every K entries).
@@ -578,6 +579,92 @@ struct EntryParse {
     next: usize,
 }
 
+/// FRS-ZERO-COPY-MERGE (2026-06-05): a pull cursor over a [`KvBlock`], yielding
+/// rows sequentially by reference for the k-way compaction merge. Mirrors
+/// [`KvBlock::for_each_row`] exactly (same prefix-key reconstruction), but as a
+/// `current`/`advance` stepper so multiple inputs can be merged by a heap
+/// without materializing a `Vec` of owned entries. The value is borrowed
+/// straight from the payload (zero copy); only the running key is reconstructed
+/// into a reused buffer (one truncate+extend per row, not a fresh alloc).
+pub(crate) struct KvBlockCursor {
+    block: Arc<KvBlock>,
+    /// Offset of the NEXT entry to decode (already advanced past `cur_*`).
+    pos: usize,
+    /// Running reconstructed key of the CURRENT entry (reused across advances).
+    key_buf: Vec<u8>,
+    cur_value: Option<(usize, usize)>,
+    cur_seq: u64,
+    cur_op: u8,
+    valid: bool,
+}
+
+impl KvBlockCursor {
+    /// Creates a cursor positioned at the first row (or invalid if empty).
+    pub(crate) fn new(block: Arc<KvBlock>) -> ForstResult<Self> {
+        let mut c = Self {
+            block,
+            pos: 0,
+            key_buf: Vec::new(),
+            cur_value: None,
+            cur_seq: 0,
+            cur_op: 0,
+            valid: false,
+        };
+        c.load()?;
+        Ok(c)
+    }
+
+    /// Decodes the entry at `self.pos` into the current slot and advances `pos`
+    /// to the following entry. Sets `valid=false` at end-of-block.
+    fn load(&mut self) -> ForstResult<()> {
+        if self.pos >= self.block.restarts_start {
+            self.valid = false;
+            return Ok(());
+        }
+        let e = self.block.parse_entry(self.pos)?;
+        if e.shared > self.key_buf.len() {
+            return Err(ForstError::corruption(
+                "KV cursor entry shared-prefix len exceeds previous key",
+            ));
+        }
+        self.key_buf.truncate(e.shared);
+        self.key_buf
+            .extend_from_slice(&self.block.payload[e.key_range.0..e.key_range.1]);
+        self.cur_value = e.value_range;
+        self.cur_seq = e.sequence;
+        self.cur_op = e.op_byte;
+        self.pos = e.next;
+        self.valid = true;
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn valid(&self) -> bool {
+        self.valid
+    }
+    #[inline]
+    pub(crate) fn key(&self) -> &[u8] {
+        &self.key_buf
+    }
+    #[inline]
+    pub(crate) fn value(&self) -> Option<&[u8]> {
+        self.cur_value
+            .map(|(s, e)| &self.block.payload[s..e])
+    }
+    #[inline]
+    pub(crate) fn sequence(&self) -> u64 {
+        self.cur_seq
+    }
+    #[inline]
+    pub(crate) fn op_byte(&self) -> u8 {
+        self.cur_op
+    }
+    /// Advances to the next row; after this `valid()` reports availability.
+    pub(crate) fn advance(&mut self) -> ForstResult<()> {
+        self.load()
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -615,6 +702,45 @@ mod tests {
         })
         .unwrap();
         out
+    }
+
+    /// Drains a KvBlock via the pull cursor for assertion.
+    fn collect_cursor(kv: Arc<KvBlock>) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64, OpType)> {
+        let mut out = Vec::new();
+        let mut c = KvBlockCursor::new(kv).unwrap();
+        while c.valid() {
+            out.push((
+                c.key().to_vec(),
+                c.value().map(|b| b.to_vec()),
+                c.sequence(),
+                OpType::from_u8(c.op_byte()).unwrap(),
+            ));
+            c.advance().unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn kv_block_cursor_matches_for_each_row() {
+        // (a) prefix + tombstone + empty-value block
+        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = vec![
+            (b"user:1", Some(b"alice".as_ref()), 10, OpType::Put),
+            (b"user:2", Some(b"".as_ref()), 9, OpType::Put),
+            (b"user:3", None, 8, OpType::Delete),
+        ];
+        let blk = KvBlock::decode(
+            &encode_kv_data_block(&make_batch(&rows), CompressionType::None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let want = collect(&blk);
+        assert_eq!(collect_cursor(Arc::new(blk)), want, "basic block");
+
+        // (b) 50-row multi-restart block (crosses restart boundaries 0/16/32/48)
+        let big = KvBlock::decode(&big_block(), true).unwrap();
+        let want_big = collect(&big);
+        assert_eq!(want_big.len(), 50);
+        assert_eq!(collect_cursor(Arc::new(big)), want_big, "big block");
     }
 
     #[test]

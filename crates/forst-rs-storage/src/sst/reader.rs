@@ -920,6 +920,164 @@ where
     Ok(())
 }
 
+/// FRS-ZERO-COPY-MERGE (2026-06-05): a pull cursor over an ENTIRE SST file,
+/// yielding every row (all versions) in on-disk `(key ASC, seq DESC)` order by
+/// reference. This is the per-input iterator for the streaming k-way compaction
+/// merge — it replaces the alloc-heavy `scan_borrowed → push CompactionEntry`
+/// gather. Values are borrowed straight from the current block (zero copy);
+/// only the small running key is materialized (by the KV stepper). Handles both
+/// v1 Arrow and v2 KV blocks; reads one block at a time (peak memory = one block).
+pub struct SstBlockCursor {
+    reader: Arc<SstReaderImpl>,
+    /// Index of the NEXT block to load.
+    next_block: usize,
+    inner: CursorInner,
+}
+
+enum CursorInner {
+    Done,
+    Arrow { batch: RecordBatch, row: usize },
+    Kv(crate::sst::kv_block::KvBlockCursor),
+}
+
+impl SstBlockCursor {
+    /// Creates a cursor positioned at the first row of the file (invalid if the
+    /// SST has no data rows).
+    pub fn new(reader: Arc<SstReaderImpl>) -> ForstResult<Self> {
+        let mut c = Self {
+            reader,
+            next_block: 0,
+            inner: CursorInner::Done,
+        };
+        c.load_next_nonempty()?;
+        Ok(c)
+    }
+
+    /// Loads successive blocks until a non-empty one is positioned, or marks the
+    /// cursor Done at end-of-file.
+    fn load_next_nonempty(&mut self) -> ForstResult<()> {
+        loop {
+            if self.next_block >= self.reader.index_entries.len() {
+                self.inner = CursorInner::Done;
+                return Ok(());
+            }
+            let entry = &self.reader.index_entries[self.next_block];
+            let block = self
+                .reader
+                .read_decoded_block(entry.block_offset, entry.block_size)?;
+            self.next_block += 1;
+            match block {
+                DecodedBlock::Arrow(batch) => {
+                    if batch.num_rows() > 0 {
+                        self.inner = CursorInner::Arrow { batch, row: 0 };
+                        return Ok(());
+                    }
+                }
+                DecodedBlock::Kv(kv) => {
+                    let cur = crate::sst::kv_block::KvBlockCursor::new(kv)?;
+                    if cur.valid() {
+                        self.inner = CursorInner::Kv(cur);
+                        return Ok(());
+                    }
+                }
+            }
+            // empty block — keep scanning
+        }
+    }
+
+    #[inline]
+    pub fn valid(&self) -> bool {
+        !matches!(self.inner, CursorInner::Done)
+    }
+
+    /// Advances to the next row, crossing block boundaries as needed.
+    pub fn advance(&mut self) -> ForstResult<()> {
+        match &mut self.inner {
+            CursorInner::Done => Ok(()),
+            CursorInner::Arrow { batch, row } => {
+                *row += 1;
+                if *row >= batch.num_rows() {
+                    self.load_next_nonempty()
+                } else {
+                    Ok(())
+                }
+            }
+            CursorInner::Kv(cur) => {
+                cur.advance()?;
+                if !cur.valid() {
+                    self.load_next_nonempty()
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Current row's key. Empty slice when invalid. Schema validated at decode,
+    /// so the column downcasts cannot fail for engine-produced SSTs.
+    pub fn key(&self) -> &[u8] {
+        match &self.inner {
+            CursorInner::Arrow { batch, row } => batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("SST col0 BinaryArray")
+                .value(*row),
+            CursorInner::Kv(cur) => cur.key(),
+            CursorInner::Done => &[],
+        }
+    }
+
+    /// Current row's value (`None` = tombstone).
+    pub fn value(&self) -> Option<&[u8]> {
+        match &self.inner {
+            CursorInner::Arrow { batch, row } => {
+                let vals = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .expect("SST col1 BinaryArray");
+                if vals.is_null(*row) {
+                    None
+                } else {
+                    Some(vals.value(*row))
+                }
+            }
+            CursorInner::Kv(cur) => cur.value(),
+            CursorInner::Done => None,
+        }
+    }
+
+    /// Current row's sequence number.
+    pub fn sequence(&self) -> u64 {
+        match &self.inner {
+            CursorInner::Arrow { batch, row } => batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("SST col2 UInt64Array")
+                .value(*row),
+            CursorInner::Kv(cur) => cur.sequence(),
+            CursorInner::Done => 0,
+        }
+    }
+
+    /// Current row's op type.
+    pub fn op_type(&self) -> OpType {
+        let byte = match &self.inner {
+            CursorInner::Arrow { batch, row } => batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .expect("SST col3 UInt8Array")
+                .value(*row),
+            CursorInner::Kv(cur) => cur.op_byte(),
+            CursorInner::Done => 0,
+        };
+        OpType::from_u8(byte).expect("SST op_type validated at decode")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1124,71 @@ mod tests {
         }
         let (data, _info) = writer.finish().unwrap();
         Arc::new(data)
+    }
+
+    /// Builds an SST in a forced format (kv=true → v2 KV, false → v1 Arrow) with
+    /// shared key prefixes + tombstones + an empty value, across multiple blocks.
+    fn write_test_sst_fmt(n: usize, kv: bool) -> Arc<Vec<u8>> {
+        let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+            block_size: 1024, // small → force many blocks for cross-block coverage
+            compression: CompressionType::None,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
+        });
+        writer.force_kv_block_format(kv);
+        for i in 0..n {
+            let key = format!("user:{:05}", i); // shared "user:" prefix exercises KV compression
+            // every 7th row a tombstone; every 5th an empty-but-present value
+            if i % 7 == 0 {
+                writer.add(key.as_bytes(), None, i as u64 + 1, 0).unwrap(); // Delete=0
+            } else if i % 5 == 0 {
+                writer.add(key.as_bytes(), Some(b""), i as u64 + 1, 1).unwrap();
+            } else {
+                let val = format!("value_for_{:05}", i);
+                writer.add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 1).unwrap();
+            }
+        }
+        let (data, _info) = writer.finish().unwrap();
+        Arc::new(data)
+    }
+
+    #[test]
+    fn sst_block_cursor_matches_scan_borrowed() {
+        for &kv in &[false, true] {
+            for &n in &[1usize, 7, 100, 5000] {
+                let sst = write_test_sst_fmt(n, kv);
+                let reader = Arc::new(
+                    SstReaderImpl::open(Box::new(MemRandomAccessFile { data: sst.clone() }))
+                        .unwrap(),
+                );
+                // Oracle: the existing push-based scan over the whole key range.
+                let mut oracle = Vec::new();
+                reader
+                    .scan_borrowed(b"", None, |r| {
+                        oracle.push((
+                            r.key.to_vec(),
+                            r.value.map(|x| x.to_vec()),
+                            r.sequence,
+                            r.op_type,
+                        ));
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(oracle.len(), n, "oracle row count kv={kv} n={n}");
+                // Pull cursor must yield the identical sequence.
+                let mut cur = SstBlockCursor::new(reader.clone()).unwrap();
+                let mut got = Vec::new();
+                while cur.valid() {
+                    got.push((
+                        cur.key().to_vec(),
+                        cur.value().map(|x| x.to_vec()),
+                        cur.sequence(),
+                        cur.op_type(),
+                    ));
+                    cur.advance().unwrap();
+                }
+                assert_eq!(got, oracle, "cursor vs scan_borrowed kv={kv} n={n}");
+            }
+        }
     }
 
     #[test]

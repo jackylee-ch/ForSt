@@ -49,8 +49,7 @@ use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::compaction_filter::CompactionFilter;
 use crate::file_deletion_guard::FileDeletionGuard;
 use crate::flush::{
-    sst_file_path, CompactionExecutor, CompactionQueue, CompactionRequest, FlushExecutor,
-    FlushJob, FlushQueue, FlushRequest, SST_TMP_PREFIX, SST_TMP_SUFFIX,
+    sst_file_path, CompactionExecutor, FlushExecutor, FlushJob, SST_TMP_PREFIX, SST_TMP_SUFFIX,
 };
 use crate::mvcc::{self, DbId, Snapshot, SnapshotRegistry};
 use crate::runtime_tuning::WriteBufferManager;
@@ -260,15 +259,6 @@ fn bulk_record(
     }
 }
 
-/// Bounded capacity for the background flush queue. Sized comfortably above
-/// `max_write_buffer_number` so the writer's `try_send` rarely blocks; real
-/// backpressure is handled by [`WriteController::set_imm_count`] which
-/// stalls writers when imm count >= the configured cap.
-const FLUSH_QUEUE_CAPACITY: usize = 64;
-/// FRS-COMPACT-BG: bounded capacity for the background compaction queue.
-/// Per-CF dedup (`compaction_queued`) keeps the queue tiny in practice.
-const COMPACTION_QUEUE_CAPACITY: usize = 64;
-
 /// Cadence at which the snapshot-age ticker polls
 /// [`SnapshotRegistry::check_long_lived`] (spec §6a.3). One second is
 /// far below the 5-minute default warn threshold, so the worst-case
@@ -449,20 +439,14 @@ pub struct DbImpl {
     write_mutex: Mutex<()>,
     /// Allocator for new CF ids.
     next_cf_id: AtomicU32,
-    /// Background flush queue (B1: writers enqueue, worker drains). The
-    /// sender lives in here; the receiver is taken once by the worker on
-    /// startup. Dropping this `Arc` drops the sender, which closes the
-    /// channel and signals the worker to exit.
-    flush_queue: Arc<FlushQueue>,
-    /// Handle to the background flush worker thread. `Some` while the
-    /// engine is alive; taken and joined in [`Drop`] for clean shutdown.
-    flush_worker: Mutex<Option<JoinHandle<()>>>,
-    /// FRS-COMPACT-BG: background L0→L1 compaction queue + worker, mirroring
-    /// the flush worker. The flush worker enqueues a compaction request and
-    /// returns immediately instead of compacting inline, so a large
-    /// compaction never blocks flushes (the q11/q4 read-amp decay fix).
-    compaction_queue: Arc<CompactionQueue>,
-    compaction_worker: Mutex<Option<JoinHandle<()>>>,
+    /// FRS-SLOT-SHARED-BG (2026-06-05): a `Weak` self-reference so background
+    /// jobs submitted to the PROCESS-GLOBAL flush/compaction pools
+    /// ([`bg_flush_pool`]/[`bg_compact_pool`]) can upgrade back into this engine
+    /// (or no-op if it has been dropped). Replaces the former per-DbImpl
+    /// `flush_queue`/`compaction_queue` + dedicated worker threads, whose count
+    /// scaled with (operators × parallelism) and starved the foreground on q4.
+    /// Set once at construction via [`Self::init_self_weak`].
+    self_weak: std::sync::OnceLock<Weak<DbImpl>>,
     /// Per-CF enqueue-time dedup: a CF whose id is in this set already has a
     /// compaction queued or running, so re-triggers are dropped (the queue
     /// holds at most one entry per CF). Cleared at the START of
@@ -638,7 +622,7 @@ impl DbImpl {
         const BLOCK_CACHE_FLOOR: usize = 256 * 1024 * 1024;
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
-        let block_cache = Arc::new(ShardedClockCache::with_capacity(cache_bytes));
+        let block_cache = shared_block_cache(cache_bytes); // FRS-ROCKSDB-PARITY C3: slot-shared
         // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
         // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
         // shared-WriteBufferManager model), not 512 MiB × instance-count. The
@@ -677,10 +661,7 @@ impl DbImpl {
             write_controller: Arc::new(WriteController::new(wc_config)),
             write_mutex: Mutex::new(()),
             next_cf_id: AtomicU32::new(1),
-            flush_queue: Arc::new(FlushQueue::new(FLUSH_QUEUE_CAPACITY)),
-            flush_worker: Mutex::new(None),
-            compaction_queue: Arc::new(CompactionQueue::new(COMPACTION_QUEUE_CAPACITY)),
-            compaction_worker: Mutex::new(None),
+            self_weak: std::sync::OnceLock::new(),
             compaction_queued: Mutex::new(std::collections::HashSet::new()),
             flush_error: Mutex::new(None),
             fatal_error: Mutex::new(None),
@@ -697,8 +678,7 @@ impl DbImpl {
         });
 
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
-        Self::spawn_flush_worker(&db);
-        Self::spawn_compaction_worker(&db);
+        Self::init_self_weak(&db);
         Self::spawn_snapshot_age_worker(&db);
         Ok(db)
     }
@@ -4575,7 +4555,7 @@ impl DbImpl {
         const BLOCK_CACHE_FLOOR: usize = 256 * 1024 * 1024;
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
-        let block_cache = Arc::new(ShardedClockCache::with_capacity(cache_bytes));
+        let block_cache = shared_block_cache(cache_bytes); // FRS-ROCKSDB-PARITY C3: slot-shared
         // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
         // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
         // shared-WriteBufferManager model), not 512 MiB × instance-count. The
@@ -4613,10 +4593,7 @@ impl DbImpl {
             write_controller: Arc::new(WriteController::new(wc_config)),
             write_mutex: Mutex::new(()),
             next_cf_id: AtomicU32::new(1),
-            flush_queue: Arc::new(FlushQueue::new(FLUSH_QUEUE_CAPACITY)),
-            flush_worker: Mutex::new(None),
-            compaction_queue: Arc::new(CompactionQueue::new(COMPACTION_QUEUE_CAPACITY)),
-            compaction_worker: Mutex::new(None),
+            self_weak: std::sync::OnceLock::new(),
             compaction_queued: Mutex::new(std::collections::HashSet::new()),
             flush_error: Mutex::new(None),
             fatal_error: Mutex::new(None),
@@ -4716,8 +4693,7 @@ impl DbImpl {
             db.create_cf_with_id(cf.cf_id, desc)?;
         }
 
-        Self::spawn_flush_worker(&db);
-        Self::spawn_compaction_worker(&db);
+        Self::init_self_weak(&db);
         Self::spawn_snapshot_age_worker(&db);
         Ok(db)
     }
@@ -5331,7 +5307,16 @@ impl DbImpl {
         // Serialize compaction per CF so two callers cannot both pick the
         // same L0 files. We piggyback on the flush_mutex since flush and
         // compaction both rewrite the on-disk layer.
-        let _guard = cf_data.lock_flush();
+        // FRS-COMPACT-RELEASE-LOCK (lever A, env FRS_COMPACT_RELEASE_LOCK=1):
+        // re-bindable so we can DROP it during the long merge (job.run) and
+        // re-acquire for the apply — letting flush proceed concurrently so the
+        // foreground does not stall on write-backpressure during a 20s burst
+        // (the q4 trough). Safe: flush only ADDS L0 (never deletes the
+        // compaction's immutable inputs), compactions are serialized by
+        // compaction_mutex (held throughout), and version_set.apply serializes
+        // via its apply_lock + validates inputs-still-present, so concurrent
+        // flush+compaction applies compose.
+        let mut flush_guard = Some(cf_data.lock_flush());
 
         // R60-H1: gate compaction on `is_dropped()`. drop_cf flips the
         // flag before its retry loop walks the Version; if the flag is
@@ -5430,11 +5415,23 @@ impl DbImpl {
         // attribute the q4 compaction STALL — engine merge CPU (a lever) vs the
         // dev-Mac ~10 MB/s S3 uplink await (machine/network-bound → cloud box).
         let phase_diag = compact_diag_on();
-        let t_run = phase_diag.then(std::time::Instant::now);
+        // Also time the merge when FRS-WAMP is active so the wamp line carries
+        // ns/byte (the suspected real binder: merge SPEED, not write-amp volume).
+        let t_run = (phase_diag || wamp_file().is_some()).then(std::time::Instant::now);
         let total_input_bytes_diag = total_input_bytes;
+        // Lever A: release lock_flush for the long merge so concurrent flushes
+        // proceed (no foreground write-backpressure stall), then re-acquire for
+        // the apply. Inputs are immutable + compaction_mutex still held, so this
+        // is safe (see the guard comment above).
+        if compact_release_lock() {
+            flush_guard = None;
+        }
         let Some(edit) = job.run()? else {
             return Ok(None);
         };
+        if flush_guard.is_none() {
+            flush_guard = Some(cf_data.lock_flush());
+        }
         let run_ms = t_run.map(|t| t.elapsed().as_millis()).unwrap_or(0);
         let t_upload = phase_diag.then(std::time::Instant::now);
 
@@ -5503,6 +5500,25 @@ impl DbImpl {
         }
         self.reap_pending_deletions();
 
+        // FRS-WAMP: record this compaction's write-amp contribution (ungated by
+        // S3 upload, so it works in local mode). L1 size = the level we keep
+        // rewriting; if cum input ÷ flushed climbs with it, that's the O(N²).
+        {
+            let out_bytes: u64 = edit.new_files.iter().map(|(_, m)| m.file_size).sum();
+            let cur = self.version_set.current();
+            let (l1_files, l1_bytes) = cur
+                .levels
+                .get(1)
+                .map(|lm| {
+                    (
+                        lm.files.len(),
+                        lm.files.iter().map(|f| f.file_size).sum::<u64>(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            wamp_record_compaction(total_input_bytes_diag, out_bytes, l1_files, l1_bytes, run_ms);
+        }
+
         // FRS-COMPACT-PHASE-DIAG: attribute the stall — merge+local-write (run_ms)
         // vs S3 upload-await (upload_ms). If upload_ms dominates, the q4 compaction
         // stall is the dev-Mac ~10 MB/s S3 uplink (machine/network-bound), NOT an
@@ -5526,6 +5542,11 @@ impl DbImpl {
                 edit.new_files.len()
             );
         }
+
+        // Lever A: explicit drop of the (possibly re-acquired) flush guard —
+        // held through the version apply + reader-cache update above; releasing
+        // it now is the same point the function-scoped guard would drop.
+        drop(flush_guard);
 
         // Update back-pressure counts — L0 is now empty (for this rollup).
         self.write_controller
@@ -5738,13 +5759,28 @@ impl DbImpl {
         let mut inner = self.build_lazy_prefix_key_stream(cf, prefix)?;
         inner.set_shared_error_slot(error_slot);
         let db = Arc::clone(self);
-        Ok(Box::new(inner.filter_map(
-            move |key_arc| match db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX) {
-                Ok(Some(value)) => Some(Ok((key_arc, Arc::<[u8]>::from(value)))),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            },
-        )))
+        // FRS-VALUE-CARRYING-MERGE (2026-06-06): resolve SST-resident Puts
+        // inline from the merge's cursor position — eliminating the per-key
+        // `get_internal` that re-walked the WHOLE LSM (O(K×tiers), the
+        // profile-proven q4 2× read-path binder). `get_internal` now runs ONLY
+        // for memtable-tier winners (a cheap memtable hit, no SST I/O) and
+        // merge-chains. Byte-identical results: the inline `Put` value is the
+        // exact `(key ASC, seq DESC)` newest version `get_internal` would
+        // return, and tier precedence is preserved (memtable newer than SST;
+        // max-sequence SST wins; tombstones hide).
+        Ok(Box::new(std::iter::from_fn(move || loop {
+            let (key_arc, decision) = inner.next_with_value()?;
+            match decision {
+                ValueDecision::Put(value) => return Some(Ok((key_arc, value))),
+                ValueDecision::Fallback => {
+                    match db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX) {
+                        Ok(Some(value)) => return Some(Ok((key_arc, Arc::<[u8]>::from(value)))),
+                        Ok(None) => continue,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+            }
+        })))
     }
 
     /// Builds the lazy k-way merge over key sources (one per LSM tier)
@@ -5881,7 +5917,20 @@ impl DbImpl {
         // SST's range also excludes the prefix, so Tier 3's own range check
         // skips it too (consistent, no data loss).
         let rfve_t0 = bulk_start.map(|_| std::time::Instant::now());
-        let resident_entries = cf_data.resident_flushed_visible_entries(&live_files);
+        // FRS-RESIDENT-BYPASS (lever C, env FRS_RESIDENT_BYPASS=1): skip the
+        // Tier-2 resident-shadow entirely so reads go memtable + SST (block
+        // cache), like RocksDB (which has no in-RAM SST-copy tier). LOCAL-SAFE:
+        // flushed SSTs are write-through to local disk and readable immediately,
+        // so Tier-3 reads the exact data the shadow would have served (same
+        // seqs). With no shadowing, Tier-3's own range check reads the
+        // overlapping SSTs. Shaves the per-probe rfve clone + N tier cursors +
+        // the resident memory footprint (the constant-factor/contention baseline
+        // vs RocksDB).
+        let resident_entries = if resident_bypass() {
+            Vec::new()
+        } else {
+            cf_data.resident_flushed_visible_entries(&live_files)
+        };
         if let Some(t) = rfve_t0 {
             // rfve = JUST the resident_flushed read-lock acquire + O(N) clone.
             bulk_rfve_ns = t.elapsed().as_nanos() as u64;
@@ -6635,13 +6684,19 @@ impl DbImpl {
         // join state is served from RAM, never touching the not-yet-uploaded object.
         // Enroll uses only `meta` + `oldest`, both available here; the imm is still
         // present (pop happens below) so reads are doubly covered (seq-dedup neutral).
-        cf_data.add_resident_flushed_with_bounds(
-            meta.file_number,
-            oldest.clone(),
-            meta.smallest_key.clone(),
-            meta.largest_key.clone(),
-            crate::column_family::resident_flushed_cap_bytes(),
-        );
+        // FRS-ROCKSDB-PARITY Component 1: only retain the flushed memtable in RAM
+        // (Tier-2 shadow) when explicitly enabled. Default OFF — flushed reads are
+        // served from the SST (Tier-3) + the bounded block cache, like RocksDB, so
+        // RAM is bounded by the cache size, not by total state size.
+        if resident_shadow_enabled() {
+            cf_data.add_resident_flushed_with_bounds(
+                meta.file_number,
+                oldest.clone(),
+                meta.smallest_key.clone(),
+                meta.largest_key.clone(),
+                crate::column_family::resident_flushed_cap_bytes(),
+            );
+        }
 
         self.version_set.apply(&edit)?;
 
@@ -6728,6 +6783,7 @@ impl DbImpl {
             .set_l0_file_count(self.version_set.current().l0_files().len() as u32);
         self.write_controller.on_flush_complete();
 
+        wamp_record_flush(meta.file_size); // FRS-WAMP: ingested bytes, all flush paths
         Ok(Some(meta))
     }
 
@@ -6747,59 +6803,11 @@ impl DbImpl {
     // Background flush worker plumbing (B1)
     // ---------------------------------------------------------------
 
-    /// Spawns the background flush worker thread. Called once during
-    /// engine construction. The worker holds a `Weak<DbImpl>` so the
-    /// engine can still be dropped while the worker is mid-recv.
-    fn spawn_flush_worker(db: &Arc<Self>) {
-        let rx = match db.flush_queue.take_receiver() {
-            Some(rx) => rx,
-            None => {
-                // Should never happen — only called once per construction.
-                debug_assert!(false, "flush worker spawned more than once");
-                return;
-            }
-        };
-        let weak: Weak<DbImpl> = Arc::downgrade(db);
-        let weak_for_err = Weak::clone(&weak);
-        let handle = std::thread::Builder::new()
-            .name("forst-rs-flush".to_string())
-            .spawn(move || {
-                crate::flush::flush_loop(rx, weak, move |err| {
-                    if let Some(db) = weak_for_err.upgrade() {
-                        db.record_flush_error(err);
-                    }
-                });
-            })
-            .expect("failed to spawn flush worker thread");
-        *db.flush_worker.lock().expect("lock poisoned") = Some(handle);
-    }
-
-    /// FRS-COMPACT-BG: spawns the background compaction worker thread.
-    /// Mirrors [`Self::spawn_flush_worker`]. The worker drains the compaction
-    /// queue and runs L0→L1 compaction off the flush worker's stack so a
-    /// large compaction never blocks flushes. Errors route into the same
-    /// `flush_error` slot so the next writer surfaces them.
-    fn spawn_compaction_worker(db: &Arc<Self>) {
-        let rx = match db.compaction_queue.take_receiver() {
-            Some(rx) => rx,
-            None => {
-                debug_assert!(false, "compaction worker spawned more than once");
-                return;
-            }
-        };
-        let weak: Weak<DbImpl> = Arc::downgrade(db);
-        let weak_for_err = Weak::clone(&weak);
-        let handle = std::thread::Builder::new()
-            .name("forst-rs-compact".to_string())
-            .spawn(move || {
-                crate::flush::compaction_loop(rx, weak, move |err| {
-                    if let Some(db) = weak_for_err.upgrade() {
-                        db.record_flush_error(err);
-                    }
-                });
-            })
-            .expect("failed to spawn compaction worker thread");
-        *db.compaction_worker.lock().expect("lock poisoned") = Some(handle);
+    /// FRS-SLOT-SHARED-BG: records the `Weak` self-reference used by background
+    /// jobs submitted to the process-global flush/compaction pools. Called once
+    /// at construction (replaces the former per-DbImpl worker-thread spawn).
+    fn init_self_weak(db: &Arc<Self>) {
+        let _ = db.self_weak.set(Arc::downgrade(db));
     }
 
     /// Spawns the background snapshot-age ticker (spec §6a.3).
@@ -6884,22 +6892,34 @@ impl DbImpl {
     /// has dropped its receiver) — in which case the writer surfaces the
     /// error to its caller.
     fn enqueue_flush(&self, cf_data: Arc<ColumnFamilyData>) -> ForstResult<()> {
+        // FRS-SLOT-SHARED-BG: submit to the PROCESS-GLOBAL flush pool (bounded
+        // worker count) rather than a per-DbImpl thread. `pending_flush_count`
+        // is incremented here and decremented by the RAII guard inside
+        // `run_flush`; `wait_for_pending_flushes` still observes it correctly.
         self.pending_flush_count.fetch_add(1, Ordering::AcqRel);
-        match self.flush_queue.enqueue(FlushRequest { cf_data }) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Roll back the counter so a shutdown-time failure can't
-                // wedge a `wait_for_pending_flushes` caller.
-                self.pending_flush_count.fetch_sub(1, Ordering::AcqRel);
-                Err(e)
+        let Some(weak) = self.self_weak.get().cloned() else {
+            self.pending_flush_count.fetch_sub(1, Ordering::AcqRel);
+            return Err(ForstError::aborted("flush submit before self_weak init"));
+        };
+        bg_flush_pool().submit(Box::new(move || {
+            // If the engine has been dropped, the job no-ops (and the counter is
+            // moot — nobody is waiting on a dropped engine).
+            if let Some(db) = weak.upgrade() {
+                if let Err(e) = db.run_flush(&cf_data) {
+                    db.record_flush_error(e);
+                }
             }
-        }
+        }));
+        Ok(())
     }
 
-    /// FRS-COMPACT-BG: non-blocking, per-CF-deduped enqueue of an L0→L1
-    /// compaction. Called by the flush worker (`maybe_auto_compact`) instead
-    /// of compacting inline. If a compaction for this CF is already queued or
-    /// running, the trigger is dropped (the queue holds ≤1 entry per CF).
+    /// FRS-COMPACT-BG / FRS-SLOT-SHARED-BG: non-blocking, per-CF-deduped enqueue
+    /// of an L0→L1 compaction onto the PROCESS-GLOBAL compaction pool (bounded
+    /// worker count, so total background compaction CPU cannot scale with the
+    /// number of DbImpl instances — the q4 foreground-starvation fix). If a
+    /// compaction for this CF is already queued or running, the trigger is
+    /// dropped (`compaction_queued` holds ≤1 entry per CF; `run_compaction`
+    /// clears the flag at its start so a re-trigger re-queues next round).
     fn enqueue_compaction(&self, cf_data: Arc<ColumnFamilyData>) {
         let cf_id = cf_data.handle().id();
         {
@@ -6908,14 +6928,19 @@ impl DbImpl {
                 return; // already queued/running for this CF
             }
         }
-        if self
-            .compaction_queue
-            .enqueue(CompactionRequest { cf_data })
-            .is_err()
-        {
-            // engine shutting down — clear the flag we just set.
+        let Some(weak) = self.self_weak.get().cloned() else {
             self.compaction_queued.lock().expect("lock poisoned").remove(&cf_id);
-        }
+            return;
+        };
+        bg_compact_pool().submit(Box::new(move || {
+            if let Some(db) = weak.upgrade() {
+                if let Err(e) = db.run_compaction(&cf_data) {
+                    db.record_flush_error(e);
+                }
+            }
+            // `run_compaction` clears `compaction_queued` itself; if the engine
+            // was dropped before the job ran, the flag dies with it.
+        }));
     }
 
     /// Records the most recent background flush error so the next writer
@@ -8801,6 +8826,8 @@ impl FlushExecutor for DbImpl {
         // (writer1 enqueues, then before the worker recvs writer2 enqueues
         // again). The second `flush_cf_data` will simply find an empty
         // imm list and return `Ok(None)`, so we treat that as a no-op.
+        // (FRS-WAMP ingested-bytes accounting lives inside flush_cf_data so it
+        // captures every flush path, not just this one.)
         self.flush_cf_data(cf_data)?;
         // Auto-compact L0 if it has grown past the slowdown trigger so
         // the engine stays well clear of the write-stall ceiling.
@@ -8976,6 +9003,208 @@ fn drain_l1_on() -> bool {
     })
 }
 
+// ---------------------------------------------------------------------
+// FRS-WAMP (2026-06-05): write-amplification confirmation tooling. Gated by
+// `FRS_WAMP_FILE=<path>` (no-op when unset, zero production cost). Appends one
+// line per L0→L1/compaction with this compaction's input/output MiB, the current
+// L1 size, and the CUMULATIVE ratio (total compaction input bytes ÷ total flushed
+// bytes). If that ratio CLIMBS with state size, L0→L1 is rewriting an ever-larger
+// L1 (the suspected O(N²) write-amp); if it stays FLAT (~10-15×), leveling is
+// bounded and the big compaction rewrite is NOT the binder — do not refactor.
+// ---------------------------------------------------------------------
+static WAMP_CUM_COMPACT_IN: AtomicU64 = AtomicU64::new(0);
+static WAMP_CUM_COMPACT_OUT: AtomicU64 = AtomicU64::new(0);
+static WAMP_CUM_FLUSH_OUT: AtomicU64 = AtomicU64::new(0);
+static WAMP_CUM_RUN_MS: AtomicU64 = AtomicU64::new(0);
+static WAMP_N: AtomicU64 = AtomicU64::new(0);
+
+fn wamp_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    use std::sync::OnceLock;
+    static F: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    F.get_or_init(|| {
+        let path = std::env::var("FRS_WAMP_FILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(std::sync::Mutex::new)
+    })
+    .as_ref()
+}
+
+/// Accumulate flushed (ingested) bytes — the denominator of write-amp.
+fn wamp_record_flush(out_bytes: u64) {
+    if wamp_file().is_some() {
+        WAMP_CUM_FLUSH_OUT.fetch_add(out_bytes, Ordering::Relaxed);
+    }
+}
+
+/// Record one compaction and append the cumulative write-amp + ns/byte line.
+fn wamp_record_compaction(
+    in_bytes: u64,
+    out_bytes: u64,
+    l1_files: usize,
+    l1_bytes: u64,
+    run_ms: u128,
+) {
+    let Some(m) = wamp_file() else { return };
+    let ci = WAMP_CUM_COMPACT_IN.fetch_add(in_bytes, Ordering::Relaxed) + in_bytes;
+    let co = WAMP_CUM_COMPACT_OUT.fetch_add(out_bytes, Ordering::Relaxed) + out_bytes;
+    let n = WAMP_N.fetch_add(1, Ordering::Relaxed) + 1;
+    let cum_run_ms = WAMP_CUM_RUN_MS.fetch_add(run_ms as u64, Ordering::Relaxed) + run_ms as u64;
+    let fo = WAMP_CUM_FLUSH_OUT.load(Ordering::Relaxed).max(1);
+    let ns_per_byte = if in_bytes > 0 {
+        (run_ms as f64 * 1.0e6) / in_bytes as f64
+    } else {
+        0.0
+    };
+    // FRS-WAMP phase split: cumulative gather (per-row to_vec allocs) + sort,
+    // with emit = run − gather − sort (Arrow-encode + block write). Compare the
+    // ISOLATED-microbench split vs this LIVE split: if gather/emit inflate under
+    // load, the alloc/encode memory traffic is the contention source → zero-copy
+    // pays off; if all phases inflate uniformly, it's external contention.
+    let cum_gather_ms = crate::compaction::CUM_GATHER_NS.load(Ordering::Relaxed) / 1_000_000;
+    let cum_sort_ms = crate::compaction::CUM_SORT_NS.load(Ordering::Relaxed) / 1_000_000;
+    let cum_emit_ms = cum_run_ms.saturating_sub(cum_gather_ms + cum_sort_ms);
+    use std::io::Write;
+    if let Ok(mut f) = m.lock() {
+        let _ = writeln!(
+            f,
+            "n={n} in_mb={:.1} out_mb={:.1} l1_files={l1_files} l1_mb={:.1} cum_flush_mb={:.0} wamp_in={:.2} wamp_total={:.2} run_ms={run_ms} ns_per_byte={ns_per_byte:.1} cum_run_ms={cum_run_ms} cum_gather_ms={cum_gather_ms} cum_sort_ms={cum_sort_ms} cum_emit_ms={cum_emit_ms}",
+            in_bytes as f64 / 1_048_576.0,
+            out_bytes as f64 / 1_048_576.0,
+            l1_bytes as f64 / 1_048_576.0,
+            fo as f64 / 1_048_576.0,
+            ci as f64 / fo as f64,
+            (fo + co) as f64 / fo as f64,
+        );
+    }
+}
+
+/// FRS-SLOT-SHARED-BG (2026-06-05): resolve a background-pool worker count from
+/// `var` (>0 wins) else `default_fn(cores)`. `cores` = logical CPUs.
+fn bg_pool_threads(var: &str, default_fn: impl Fn(usize) -> usize) -> usize {
+    if let Ok(s) = std::env::var(var) {
+        if let Ok(n) = s.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
+    default_fn(cores).max(1)
+}
+
+/// Process-global FLUSH pool (RocksDB's HIGH Env pool analogue). Bounded worker
+/// count so total flush CPU cannot scale with DbImpl count. Default `cores/8`
+/// (≥1); override `FRS_BG_FLUSH_THREADS`.
+fn bg_flush_pool() -> &'static crate::bg_pool::WorkerPool {
+    use std::sync::OnceLock;
+    static P: OnceLock<crate::bg_pool::WorkerPool> = OnceLock::new();
+    P.get_or_init(|| {
+        // Data-driven (2026-06-05 q4 sweep, 18-core): flush≈cores/3 — the low
+        // cores/8 default caused write-stalls (L0 couldn't drain).
+        let n = bg_pool_threads("FRS_BG_FLUSH_THREADS", |c| (c / 3).max(1));
+        crate::bg_pool::WorkerPool::new(n, "forst-rs-flush")
+    })
+}
+
+/// Process-global COMPACTION pool (RocksDB's LOW Env pool analogue). Bounded
+/// worker count — THE q4 decay fix: total background compaction CPU is capped
+/// regardless of how many keyed-state DbImpl instances exist, so compaction
+/// bursts cannot starve the CPU-bound foreground join. Default `cores/6` (≥2);
+/// override `FRS_BG_COMPACT_THREADS`.
+fn bg_compact_pool() -> &'static crate::bg_pool::WorkerPool {
+    use std::sync::OnceLock;
+    static P: OnceLock<crate::bg_pool::WorkerPool> = OnceLock::new();
+    P.get_or_init(|| {
+        // Data-driven (2026-06-05 q4 sweep, 18-core): compact≈cores/2 is the
+        // sweet spot — f6c9 (514s, 7 troughs, peak CPU 1127%) beat both the
+        // unbounded baseline (545s, 1451%) and lower bounds f3c5/f4c6 (~565s,
+        // write-stalled). Too few starves L0 drain; too many starves the join.
+        let n = bg_pool_threads("FRS_BG_COMPACT_THREADS", |c| (c / 2).max(2));
+        crate::bg_pool::WorkerPool::new(n, "forst-rs-compact")
+    })
+}
+
+/// cached. When set, `compact_l0_for_cf` drops `lock_flush` during the long merge
+/// so concurrent flushes proceed, re-acquiring it only for the version apply.
+///
+/// REVERTED to default-OFF (2026-06-05): the earlier default-ON flip was based on
+/// a swap-POISONED measurement (538s vs 564s). On a CLEAN rebooted machine the
+/// release is SLOWER (543s with vs 473s without) — the apparent win was an
+/// artifact of the contaminated machine state. Kept env-gated for the record only.
+/// Correctness of the release path itself is sound (apply_lock serializes apply,
+/// flush is L0-add-only, compaction_mutex serializes deletes), it just doesn't help.
+fn compact_release_lock() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_COMPACT_RELEASE_LOCK").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-ROCKSDB-PARITY Component 3 (2026-06-06): ONE decoded-block cache shared by
+/// every DbImpl in the process (≈ a Flink slot), mirroring RocksDB's
+/// `getSharedMemoryResourceForSlot`. Previously each DbImpl allocated its own
+/// `cache_bytes` (×~12 keyed-state instances → multi-GB duplication). Cache keys
+/// are already `db_id`-salted (`SstReaderImpl::with_block_cache(.., db_id, ..)`),
+/// so sharing is collision-safe. Sized once from the first caller's `cache_bytes`
+/// (all DbImpls in a slot pass the same config). Total cache RAM is now bounded
+/// by ONE budget regardless of operator × parallelism.
+fn shared_block_cache(cache_bytes: usize) -> std::sync::Arc<ShardedClockCache> {
+    use std::sync::OnceLock;
+    static C: OnceLock<std::sync::Arc<ShardedClockCache>> = OnceLock::new();
+    std::sync::Arc::clone(
+        C.get_or_init(|| std::sync::Arc::new(ShardedClockCache::with_capacity(cache_bytes))),
+    )
+}
+
+/// FRS-RESIDENT-BYPASS toggle (`FRS_RESIDENT_BYPASS=1`, off by default), cached.
+/// When set, the Tier-2 resident-shadow loop is skipped entirely — reads go
+/// memtable + SST (block cache) like RocksDB. Local-safe (write-through SSTs are
+/// readable immediately). Lever C: drop the forst-specific in-RAM SST tier.
+fn resident_bypass() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        // FRS-ROCKSDB-PARITY Component 1 (2026-06-06): the resident shadow is OFF
+        // by default now, so reads bypass it whether or not this env is set.
+        !resident_shadow_enabled()
+            || matches!(
+                std::env::var("FRS_RESIDENT_BYPASS").ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            )
+    })
+}
+
+/// FRS-ROCKSDB-PARITY Component 1 (2026-06-06): whether the Tier-2 resident
+/// shadow (in-RAM copies of flushed memtables) is populated at all. DEFAULT OFF —
+/// it is the forst-rs-specific RAM hog RocksDB lacks (it re-reads SST blocks via
+/// the bounded block cache instead), and on q4 it drove the ~23 GB RSS that does
+/// not fit 8c/32g. With it off, flushed reads fall through to the (synchronously
+/// readable, on local fs) SST + block cache — byte-identical data. Re-enable with
+/// `FRS_RESIDENT_SHADOW=1` for the S3 path until Phase-2 disaggregation lands the
+/// proper local-file-cache tier (the shadow covers the S3 upload window today).
+fn resident_shadow_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_RESIDENT_SHADOW").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
 /// FRS-RESIDENT-BLOOM-SKIP experiment toggle (`FRS_RESIDENT_BLOOM_SKIP=1`),
 /// cached. When set, the per-resident-shadow `may_contain_range` bloom is
 /// skipped (straight to the seek). Used to measure the bloom's end-to-end q4
@@ -9020,47 +9249,17 @@ impl Drop for DbImpl {
             );
         }
 
-        // 2. Drop our last sender by replacing the queue with an empty
-        //    one. This closes the channel and the worker's `recv()`
-        //    returns `Err`, exiting `flush_loop`.
-        //
-        //    Note: `Arc::strong_count(&self.flush_queue)` may still be > 1
-        //    if any in-flight `enqueue_flush` call holds a clone, but
-        //    those are bounded — they'll drop the clone before returning
-        //    to the writer.
-        self.flush_queue = Arc::new(FlushQueue::new(1));
+        // 2. FRS-SLOT-SHARED-BG: flush/compaction now run on the PROCESS-GLOBAL
+        //    pools, not per-DbImpl worker threads, so there is nothing to
+        //    signal/join here. Background jobs already queued for this engine
+        //    hold only a `Weak<DbImpl>`; once this `Drop` completes the `Weak`
+        //    fails to upgrade and those jobs no-op. A job that is CURRENTLY
+        //    executing holds an upgraded `Arc<DbImpl>`, which keeps the engine
+        //    alive until it finishes — so `Drop` cannot race an in-flight flush
+        //    or compaction (the engine is only freed once no job references it).
+        //    Best-effort: queued-but-unstarted compactions are not awaited — the
+        //    data is already durable in the L0 SSTs.
 
-        // 3. Take and join the worker. If the thread has already exited
-        //    (e.g. because we dropped the queue above), `join` returns
-        //    immediately. We log on join error rather than panic per the
-        //    contract: a poisoned thread must not abort the runtime.
-        let handle = self.flush_worker.lock().ok().and_then(|mut g| g.take());
-        if let Some(h) = handle {
-            if let Err(e) = h.join() {
-                eprintln!("forst-rs: flush worker panicked during shutdown: {:?}", e);
-            }
-        }
-
-        // 3b. FRS-COMPACT-BG: shut down the background compaction worker AFTER
-        //     the flush worker joins (so any compaction the flush worker
-        //     enqueued during the final drain is accepted), then join it.
-        //     Best-effort: queued-but-unstarted compactions are NOT awaited —
-        //     the data is already durable in the L0 SSTs; L0 staying slightly
-        //     deep at shutdown is harmless.
-        self.compaction_queue = Arc::new(CompactionQueue::new(1));
-        let compact_handle = self
-            .compaction_worker
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take());
-        if let Some(h) = compact_handle {
-            if let Err(e) = h.join() {
-                eprintln!(
-                    "forst-rs: compaction worker panicked during shutdown: {:?}",
-                    e
-                );
-            }
-        }
         // A final compaction may have produced an SST upload after install;
         // drain it for remote durability (cheap no-op if nothing pending).
         if let Err(e) = self.fs.await_all_uploads() {
@@ -9175,9 +9374,28 @@ enum TierKeySource {
         lower: Vec<u8>,
         upper: Option<Vec<u8>>,
         next_block: usize,
-        buffered: Vec<Arc<[u8]>>,
+        buffered: Vec<SstHeadRow>,
         pos: usize,
     },
+}
+
+/// FRS-VALUE-CARRYING-MERGE (2026-06-06): the newest version of one user-key
+/// buffered from an SST block. Previously the SST tier source buffered only
+/// the key (`Arc<[u8]>`) and the value was re-resolved by a per-key
+/// `get_internal` that re-walked the WHOLE LSM (O(K×tiers) — the profile-proven
+/// q4 2× read-path binder). Carrying `(value, sequence, op_type)` at the head
+/// lets `LazyPrefixIter::next_with_value` resolve an SST-resident `Put` inline
+/// (no second LSM walk) — RocksDB-parity iteration without the resident shadow.
+/// One `Arc::from(value)` per buffered row REPLACES the value alloc the
+/// eliminated `get_internal` would have paid, so it is net-neutral on allocs
+/// and removes the redundant block decode. See the design spec
+/// `docs/superpowers/specs/2026-06-06-q4-prefix-scan-value-carrying-merge-design.md`.
+struct SstHeadRow {
+    key: Arc<[u8]>,
+    /// `None` for a tombstone (Delete/SingleDelete); `Some` for Put/Merge.
+    value: Option<Arc<[u8]>>,
+    sequence: u64,
+    op_type: OpType,
 }
 
 impl TierKeySource {
@@ -9199,7 +9417,7 @@ impl TierKeySource {
                 // or we've exhausted the SST.
                 loop {
                     if *pos < buffered.len() {
-                        return Ok(Some(buffered[*pos].as_ref()));
+                        return Ok(Some(buffered[*pos].key.as_ref()));
                     }
                     if *next_block >= reader.index_entry_count() {
                         return Ok(None);
@@ -9248,8 +9466,22 @@ impl TierKeySource {
                         // iteration of the outer `loop`). But downstream
                         // emit + last_emitted tracking now use
                         // `Arc::clone` (atomic refcount bump only).
-                        if buffered.last().map(|k| k.as_ref()) != Some(view.key) {
-                            buffered.push(Arc::<[u8]>::from(view.key));
+                        //
+                        // FRS-VALUE-CARRYING-MERGE: also capture the NEWEST
+                        // version's `(value, sequence, op_type)`. Rows are
+                        // `(key ASC, sequence DESC)`, so the FIRST row for a
+                        // user-key (the one we push, gated by the `!=` dedup)
+                        // is its newest version — exactly what `get_internal`
+                        // would resolve for this tier. The value `Arc::from`
+                        // replaces the alloc the eliminated per-key
+                        // `get_internal` would have paid.
+                        if buffered.last().map(|r| r.key.as_ref()) != Some(view.key) {
+                            buffered.push(SstHeadRow {
+                                key: Arc::<[u8]>::from(view.key),
+                                value: view.value.map(Arc::<[u8]>::from),
+                                sequence: view.sequence,
+                                op_type: view.op_type,
+                            });
                         }
                         Ok(())
                     })?;
@@ -9286,7 +9518,27 @@ impl TierKeySource {
     fn peek_arc(&self) -> Option<Arc<[u8]>> {
         match self {
             TierKeySource::MemCursor { cursor } => cursor.peek_arc(),
-            TierKeySource::Sst { buffered, pos, .. } => buffered.get(*pos).map(Arc::clone),
+            TierKeySource::Sst { buffered, pos, .. } => {
+                buffered.get(*pos).map(|r| Arc::clone(&r.key))
+            }
+        }
+    }
+
+    /// FRS-VALUE-CARRYING-MERGE: returns the head row's `(sequence, op_type,
+    /// value)` for an SST source, or `None` for a memtable source.
+    ///
+    /// `None` signals to [`LazyPrefixIter::next_with_value`] that this is a
+    /// memtable/immutable/resident tier — which is ALWAYS newer than any SST
+    /// for a key it holds (data flows memtable → SST), so its presence at a
+    /// user-key forces the safe `get_internal` fallback (a cheap memtable hit,
+    /// no SST I/O). `Some(..)` lets the merge resolve an SST-resident `Put`
+    /// inline. Precondition: caller has just `peek`-ed `Some(_)`.
+    fn head_sst_info(&self) -> Option<(u64, OpType, Option<Arc<[u8]>>)> {
+        match self {
+            TierKeySource::MemCursor { .. } => None,
+            TierKeySource::Sst { buffered, pos, .. } => buffered
+                .get(*pos)
+                .map(|r| (r.sequence, r.op_type, r.value.clone())),
         }
     }
 }
@@ -9368,6 +9620,147 @@ impl LazyPrefixIter {
     pub fn take_last_error(&mut self) -> Option<ForstError> {
         self.last_error.take()
     }
+
+    /// FRS-VALUE-CARRYING-MERGE: record a tier-peek error with the SAME
+    /// sticky-FIRST semantics `next()` uses (shared FFI slot when wired, else
+    /// the local `last_error`). Factored out so `next_with_value` surfaces
+    /// errors through the identical channel without duplicating the block.
+    fn record_peek_error(&mut self, e: ForstError) {
+        if let Some(slot) = self.shared_error_slot.as_ref() {
+            let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if guard.is_none() {
+                *guard = Some(e);
+            }
+        } else if self.last_error.is_none() {
+            self.last_error = Some(e);
+        }
+    }
+
+    /// FRS-VALUE-CARRYING-MERGE (2026-06-06): the k-way merge variant that
+    /// resolves the value INLINE from the winning tier's cursor position,
+    /// eliminating the per-key `get_internal` second LSM walk that dominated
+    /// q4's read path (see the design spec).
+    ///
+    /// Yields `(user_key, decision)` for each visible user-key in sorted order:
+    /// - `ValueDecision::Put(value)` — the newest version is an SST-resident
+    ///   `Put`; `value` is final, NO `get_internal` needed.
+    /// - `ValueDecision::Fallback` — a memtable/immutable/resident tier holds
+    ///   the key (its value is cheap to resolve via `get_internal`, a memtable
+    ///   hit), OR the newest SST version is a `Merge` (operand chain spans older
+    ///   tiers), OR a corrupt SST `Put` (missing payload) — let `get_internal`
+    ///   resolve/surface it. The caller MUST call `get_internal` and skip the
+    ///   key if it resolves to `None`.
+    ///
+    /// Tombstone winners (newest version is a Delete on an SST with no newer
+    /// memtable tier) are skipped INTERNALLY — the key is not emitted.
+    ///
+    /// Correctness mirrors `get_internal` exactly: tier precedence decides the
+    /// winner (memtable newer than any SST; among SSTs the max `sequence`
+    /// wins), Put→value, Delete→hidden, Merge→operand resolution (deferred).
+    fn next_with_value(&mut self) -> Option<(Arc<[u8]>, ValueDecision)> {
+        // Owned outcome of one source `peek()` — computed while the source is
+        // borrowed, acted on AFTER the borrow ends (so the dup-`advance()` and
+        // `record_peek_error()` `&mut self` calls do not alias the source).
+        enum PeekAction {
+            Keep,
+            SkipDup,
+            Drained,
+            Err(ForstError),
+        }
+        let n = self.sources.len();
+        loop {
+            // Phase A: per-source dedup past `last_emitted`, then find the
+            // lex-smallest pending head across all sources.
+            let mut min_key: Option<Arc<[u8]>> = None;
+            for i in 0..n {
+                loop {
+                    let action = match self.sources[i].peek() {
+                        Ok(Some(head)) => {
+                            // Skip any head already emitted (cross-tier dedup).
+                            // `self.last_emitted` is a disjoint field from
+                            // `self.sources[i]`, so this borrow is sound.
+                            if self
+                                .last_emitted
+                                .as_ref()
+                                .is_some_and(|le| head <= le.as_ref())
+                            {
+                                PeekAction::SkipDup
+                            } else {
+                                PeekAction::Keep
+                            }
+                        }
+                        Ok(None) => PeekAction::Drained,
+                        Err(e) => PeekAction::Err(e),
+                    };
+                    match action {
+                        PeekAction::SkipDup => {
+                            self.sources[i].advance();
+                            continue;
+                        }
+                        PeekAction::Keep | PeekAction::Drained => break,
+                        PeekAction::Err(e) => {
+                            self.record_peek_error(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(k) = self.sources[i].peek_arc() {
+                    match &min_key {
+                        None => min_key = Some(k),
+                        Some(m) if k.as_ref() < m.as_ref() => min_key = Some(k),
+                        _ => {}
+                    }
+                }
+            }
+            let min = min_key?;
+
+            // Phase B: among all sources whose head == `min`, pick the winner
+            // (memtable presence forces fallback; else max-sequence SST), and
+            // advance every source positioned at `min` (cross-tier dedup).
+            let mut mem_present = false;
+            let mut best: Option<(u64, OpType, Option<Arc<[u8]>>)> = None;
+            for i in 0..n {
+                let at_min = matches!(self.sources[i].peek(), Ok(Some(k)) if k == min.as_ref());
+                if !at_min {
+                    continue;
+                }
+                match self.sources[i].head_sst_info() {
+                    None => mem_present = true,
+                    Some((seq, op, val)) => {
+                        if best.as_ref().is_none_or(|(bseq, _, _)| seq > *bseq) {
+                            best = Some((seq, op, val));
+                        }
+                    }
+                }
+                self.sources[i].advance();
+            }
+            self.last_emitted = Some(Arc::clone(&min));
+
+            // Phase C: decide. Memtable tiers and merge-chains defer to
+            // `get_internal`; SST Put resolves inline; SST tombstone hides.
+            if mem_present {
+                return Some((min, ValueDecision::Fallback));
+            }
+            match best {
+                Some((_, OpType::Put, Some(v))) => return Some((min, ValueDecision::Put(v))),
+                // Corrupt SST Put (no payload): let get_internal raise it.
+                Some((_, OpType::Put, None)) => return Some((min, ValueDecision::Fallback)),
+                Some((_, OpType::Delete, _)) | Some((_, OpType::SingleDelete, _)) => continue,
+                Some((_, OpType::Merge, _)) => return Some((min, ValueDecision::Fallback)),
+                // No source produced head info though `min` came from one —
+                // be conservative and let get_internal resolve it.
+                None => return Some((min, ValueDecision::Fallback)),
+            }
+        }
+    }
+}
+
+/// FRS-VALUE-CARRYING-MERGE: outcome of [`LazyPrefixIter::next_with_value`].
+enum ValueDecision {
+    /// Newest version is an SST-resident Put; the value is final.
+    Put(Arc<[u8]>),
+    /// Resolve via `get_internal` (memtable tier, merge-chain, or corrupt Put).
+    Fallback,
 }
 
 impl Iterator for LazyPrefixIter {
@@ -11133,6 +11526,112 @@ mod tests {
         let mut out2: Vec<(Vec<u8>, Vec<u8>)> = iter2.collect::<ForstResult<Vec<_>>>().unwrap();
         out2.sort_by(|l, r| l.0.cmp(&r.0));
         assert_eq!(out2.len(), 3);
+    }
+
+    /// FRS-VALUE-CARRYING-MERGE: scan via the slot variant (the q4 FFI path)
+    /// and assert byte-equivalence against the point-get oracle.
+    fn scan_slot(
+        db: &Arc<DbImpl>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let slot: Arc<Mutex<Option<ForstError>>> = Arc::new(Mutex::new(None));
+        let it = db
+            .prefix_scan_iter_owned_arc_with_error_slot(cf, prefix, slot.clone())
+            .unwrap();
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = it
+            .map(|r| r.unwrap())
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect();
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "no tier-peek error expected"
+        );
+        out.sort();
+        out
+    }
+
+    fn point_get_oracle(
+        db: &Arc<DbImpl>,
+        cf: &ColumnFamilyHandle,
+        keys: &[&[u8]],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut expected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for k in keys {
+            if let Some(v) = db.get(cf, k).unwrap() {
+                expected.push((k.to_vec(), v));
+            }
+        }
+        expected.sort();
+        expected
+    }
+
+    /// FRS-VALUE-CARRYING-MERGE: the inline-value prefix scan must yield
+    /// EXACTLY what per-key `get_internal` would, across every tier mix:
+    /// SST-resident Put, newer-SST-version-wins (max sequence), tombstone in a
+    /// newer SST hiding an older Put, active-memtable shadow of an SST key, and
+    /// active-mem-only keys.
+    #[test]
+    fn value_carrying_merge_matches_point_get_all_tiers() {
+        let db = open();
+        let cf = db.default_cf();
+
+        // (a) First SST: plain Puts.
+        db.put(&cf, b"u:a", b"A0").unwrap();
+        db.put(&cf, b"u:b", b"B0").unwrap();
+        db.put(&cf, b"u:tomb", b"X").unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flush1 sst");
+
+        // (b) Second SST (newer): newer u:b version (max-seq SST winner) and a
+        //     tombstone over u:tomb (newer-SST Delete hides older-SST Put).
+        db.put(&cf, b"u:b", b"B1").unwrap();
+        db.delete(&cf, b"u:tomb").unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flush2 sst");
+
+        // (c) Active memtable shadows u:a (memtable tier wins → fallback path).
+        db.put(&cf, b"u:a", b"A2").unwrap();
+        // (d) Active-mem-only key.
+        db.put(&cf, b"u:c", b"C").unwrap();
+
+        let scanned = scan_slot(&db, &cf, b"u:");
+        let expected = point_get_oracle(&db, &cf, &[b"u:a", b"u:b", b"u:c", b"u:tomb"]);
+        assert_eq!(
+            scanned, expected,
+            "inline-value scan must equal point-get for every tier mix"
+        );
+        // Explicit resolutions:
+        assert_eq!(db.get(&cf, b"u:a").unwrap().unwrap(), b"A2"); // memtable wins
+        assert_eq!(db.get(&cf, b"u:b").unwrap().unwrap(), b"B1"); // newer SST wins
+        assert!(db.get(&cf, b"u:tomb").unwrap().is_none()); // tombstone hides
+        assert!(
+            scanned.iter().all(|(k, _)| k.as_slice() != b"u:tomb"),
+            "tombstoned key must not be emitted"
+        );
+    }
+
+    /// FRS-VALUE-CARRYING-MERGE: an SST-resident Merge head must defer to the
+    /// `get_internal` fallback (operand chain spans tiers), while a sibling
+    /// SST-resident Put under the same prefix resolves inline — both
+    /// byte-identical to point-get.
+    #[test]
+    fn value_carrying_merge_fallback_resolves_merge_chain() {
+        let (db, cf) = open_with_merge_cf();
+        db.put(&cf, b"m:k", b"base").unwrap();
+        db.merge(&cf, b"m:k", b"x").unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flush1 sst");
+        db.merge(&cf, b"m:k", b"y").unwrap();
+        db.put(&cf, b"m:p", b"P").unwrap(); // inline Put alongside the merge chain
+        db.switch_and_flush(&cf).unwrap().expect("flush2 sst");
+
+        let scanned = scan_slot(&db, &cf, b"m:");
+        let expected = point_get_oracle(&db, &cf, &[b"m:k", b"m:p"]);
+        assert_eq!(
+            scanned, expected,
+            "merge-chain (fallback) + inline Put must equal point-get"
+        );
+        assert_eq!(db.get(&cf, b"m:p").unwrap().unwrap(), b"P");
+        // The merge head resolved to a non-empty concatenation including base.
+        assert!(scanned.iter().any(|(k, v)| k.as_slice() == b"m:k" && !v.is_empty()));
     }
 
     /// C8-H1 regression: the BORROWING `prefix_scan_iter` must also see

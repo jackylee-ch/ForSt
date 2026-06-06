@@ -327,6 +327,7 @@ pub fn sst_file_path(db_path: &Path, file_number: FileNumber) -> PathBuf {
 /// mutex. This lets the worker collapse multiple requests for the same CF
 /// into one no-op when the queue is bursty (the second request finds an
 /// empty imm list and returns early).
+#[allow(dead_code)] // FRS-SLOT-SHARED-BG: legacy per-DbImpl queue, superseded by crate::bg_pool shared pool
 pub(crate) struct FlushRequest {
     pub cf_data: Arc<ColumnFamilyData>,
 }
@@ -339,11 +340,13 @@ pub(crate) struct FlushRequest {
 /// Bounded capacity prevents a runaway producer from ballooning queued
 /// requests; the bound is large enough that ordinary backpressure flows
 /// through the WriteController instead.
+#[allow(dead_code)] // FRS-SLOT-SHARED-BG: legacy per-DbImpl queue, superseded by crate::bg_pool shared pool
 pub(crate) struct FlushQueue {
     tx: SyncSender<FlushRequest>,
     rx: Mutex<Option<Receiver<FlushRequest>>>,
 }
 
+#[allow(dead_code)] // FRS-SLOT-SHARED-BG: legacy per-DbImpl queue, superseded by crate::bg_pool shared pool
 impl FlushQueue {
     /// Constructs a new queue with the given bounded capacity. Returns the
     /// queue plus a one-time-takeable receiver consumer (kept inside the
@@ -406,6 +409,7 @@ pub(crate) trait FlushExecutor: Send + Sync {
 /// writer can observe and surface them. We never panic the worker on
 /// flush errors — the engine should remain usable for reads even if a
 /// flush is failing repeatedly.
+#[allow(dead_code)] // FRS-SLOT-SHARED-BG: legacy per-DbImpl queue, superseded by crate::bg_pool shared pool
 pub(crate) fn flush_loop<E>(
     rx: Receiver<FlushRequest>,
     engine_weak: Weak<E>,
@@ -447,17 +451,20 @@ pub(crate) fn flush_loop<E>(
 /// A single asynchronous L0→L1 compaction job for a CF. Like
 /// [`FlushRequest`], carries only the CF so the worker re-reads the current
 /// L0 set under `compaction_mutex` (bursty duplicates collapse to a no-op).
+#[allow(dead_code)] // FRS-SLOT-SHARED-BG: legacy per-DbImpl queue, superseded by crate::bg_pool shared pool
 pub(crate) struct CompactionRequest {
     pub cf_data: Arc<ColumnFamilyData>,
 }
 
 /// MPSC channel handing compaction requests from the flush worker to the
 /// background compaction worker. Same shape as [`FlushQueue`].
+#[allow(dead_code)] // FRS-SLOT-SHARED-BG: legacy per-DbImpl queue, superseded by crate::bg_pool shared pool
 pub(crate) struct CompactionQueue {
     tx: SyncSender<CompactionRequest>,
     rx: Mutex<Option<Receiver<CompactionRequest>>>,
 }
 
+#[allow(dead_code)] // FRS-SLOT-SHARED-BG: legacy per-DbImpl queue, superseded by crate::bg_pool shared pool
 impl CompactionQueue {
     pub(crate) fn new(capacity: usize) -> Self {
         let (tx, rx) = sync_channel::<CompactionRequest>(capacity);
@@ -495,6 +502,7 @@ pub(crate) trait CompactionExecutor: Send + Sync {
 /// Worker loop: drains the compaction queue and dispatches to the engine via
 /// [`CompactionExecutor`]. Mirrors [`flush_loop`] exactly (Weak-upgrade exit,
 /// record-error-and-continue, channel-close shutdown).
+#[allow(dead_code)] // FRS-SLOT-SHARED-BG: legacy per-DbImpl queue, superseded by crate::bg_pool shared pool
 pub(crate) fn compaction_loop<E>(
     rx: Receiver<CompactionRequest>,
     engine_weak: Weak<E>,

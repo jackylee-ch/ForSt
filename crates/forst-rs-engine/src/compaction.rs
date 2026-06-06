@@ -25,13 +25,25 @@
 //! containing the resolved state for every key in the input range.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+// FRS-WAMP phase split (2026-06-05): cumulative ns spent in the GATHER (per-row
+// key/value to_vec into Vec<CompactionEntry>) and SORT phases of CompactionJob,
+// summed across all compactions. db.rs's wamp line reads these and derives
+// emit_ms = run_ms − gather − sort, so we can attribute the live 21 ns/byte to
+// intrinsic alloc/encode vs external cache/bandwidth contention before deciding
+// whether a zero-copy streaming merge is worth building. Always-accumulated
+// (Instant::now is cheap); only READ when FRS_WAMP_FILE is set.
+pub(crate) static CUM_GATHER_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static CUM_SORT_NS: AtomicU64 = AtomicU64::new(0);
 
 use forst_rs_common::{ColumnFamilyId, FileNumber, ForstError, ForstResult, SequenceNumber};
 use forst_rs_io::{FileSystem, WritableFile};
 use forst_rs_storage::merge_operator::MergeOperator;
 use forst_rs_storage::sst::{
-    writer::StreamingSstWriter, SstFileInfo, SstReaderImpl, SstWriterImpl, SstWriterOptions,
+    writer::StreamingSstWriter, SstBlockCursor, SstFileInfo, SstReaderImpl, SstWriterImpl,
+    SstWriterOptions,
 };
 use forst_rs_storage::version::{SstFileMeta, VersionEdit};
 
@@ -100,6 +112,19 @@ impl CompactionJob {
     /// because the merge sort outlives each individual block's
     /// `RecordBatch`).
     pub fn run(self) -> ForstResult<Option<VersionEdit>> {
+        // FRS-ZERO-COPY-MERGE (2026-06-05): the DEFAULT path is the streaming
+        // k-way merge (`run_streaming`) — it replaces the alloc-heavy global
+        // `gather Vec<CompactionEntry>` + `sort` with a heap over per-input
+        // pull cursors, materializing only one tiny per-key version group at a
+        // time. Output is byte-equivalent (same per-key groups → same
+        // `emit_key_versions`). The legacy gather-sort body below is retained
+        // ONLY for the opt-in (and previously refuted) parallel sub-compaction
+        // (`FRS_COMPACT_PARALLEL`), which random-accesses the materialized
+        // vector by index range and so cannot stream.
+        if !compaction_parallel_env() {
+            return self.run_streaming();
+        }
+
         // R49-H1 defense-in-depth: every input must already belong to the
         // same CF as the compaction job. The engine-side caller (db.rs)
         // builds compaction inputs by reading one CF's file list, so a
@@ -121,6 +146,7 @@ impl CompactionJob {
         //    source file_number so we can break ties when two SSTs use the
         //    same memtable-local sequence (each VectorizedMemTable starts
         //    counting seqs from 1).
+        let _t_gather = std::time::Instant::now();
         let mut all: Vec<CompactionEntry> = Vec::new();
         for (level, meta, reader) in &self.inputs {
             let _ = level;
@@ -139,6 +165,7 @@ impl CompactionJob {
                 Ok(())
             })?;
         }
+        CUM_GATHER_NS.fetch_add(_t_gather.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         if all.is_empty() {
             // Nothing to merge — still produce a VersionEdit that deletes
@@ -178,10 +205,12 @@ impl CompactionJob {
         // 2. Sort by (key ASC, effective_sequence DESC). The effective
         //    sequence uses file_number as the high bits so a newer SST file
         //    wins over an older one even if they share a memtable-local seq.
+        let _t_sort = std::time::Instant::now();
         all.sort_by(|a, b| match a.key.cmp(&b.key) {
             std::cmp::Ordering::Equal => b.effective_seq().cmp(&a.effective_seq()),
             ord => ord,
         });
+        CUM_SORT_NS.fetch_add(_t_sort.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
         // 3. Walk keys, consolidating versions per key, and stream the
         //    output SST directly to the temp file via the streaming writer.
@@ -521,6 +550,307 @@ impl CompactionJob {
         } else {
             None
         };
+        Ok(Some(VersionEdit {
+            new_files,
+            deleted_files: deleted,
+            next_file_number: None,
+            last_sequence: last_seq,
+        }))
+    }
+
+    /// FRS-ZERO-COPY-MERGE (2026-06-05): the streaming k-way compaction merge.
+    ///
+    /// Replaces the global `gather Vec<CompactionEntry>` (2 heap allocs/row) +
+    /// `sort` with a `BinaryHeap` over one [`SstBlockCursor`] per input. Pulls
+    /// the globally-smallest key, collects ALL its versions into a small reused
+    /// `group`, sorts that (tiny) group by `effective_seq` DESC to match the old
+    /// global sort order, and feeds it to the UNCHANGED `emit_key_versions`.
+    /// Peak working set = one block per input + one key's versions (vs the whole
+    /// dataset), so the ~GB of sort traffic + the 400 MB resident vector that
+    /// drove the memory-bandwidth-bound merge are gone. Output is byte-identical
+    /// to [`Self::run`] (same per-key groups, same order, same emit), so the
+    /// existing compaction suite is the equivalence gate.
+    ///
+    /// Multi-file output (`target_file_size` / `additional_outputs`) rolls to the
+    /// next slot at a user-key boundary, identical to the serial path in `run`.
+    fn run_streaming(self) -> ForstResult<Option<VersionEdit>> {
+        for (_, meta, _) in &self.inputs {
+            debug_assert_eq!(
+                meta.cf_id, self.cf_id,
+                "CompactionJob cf_id {:?} ≠ input file {} cf_id {:?} — cross-CF input",
+                self.cf_id,
+                meta.file_number.value(),
+                meta.cf_id,
+            );
+        }
+
+        // One pull cursor per input; track each input's file_number for the
+        // effective-seq tie-break (newer file dominates).
+        let mut cursors: Vec<SstBlockCursor> = Vec::with_capacity(self.inputs.len());
+        let mut file_nums: Vec<u64> = Vec::with_capacity(self.inputs.len());
+        for (_lvl, meta, reader) in &self.inputs {
+            cursors.push(SstBlockCursor::new(Arc::clone(reader))?);
+            file_nums.push(meta.file_number.value());
+        }
+
+        let mut heap: std::collections::BinaryHeap<HeapKey> = std::collections::BinaryHeap::new();
+        for (idx, c) in cursors.iter().enumerate() {
+            if c.valid() {
+                heap.push(HeapKey {
+                    key: c.key().to_vec(),
+                    idx,
+                });
+            }
+        }
+
+        // Empty merge: produce a deletion-only VersionEdit (preserve input max
+        // seq so the high-water mark does not regress) — mirrors `run`.
+        if heap.is_empty() {
+            let max_in_seq = self
+                .inputs
+                .iter()
+                .map(|(_, m, _)| m.max_sequence.value())
+                .max()
+                .unwrap_or(0);
+            let last_seq = (max_in_seq > 0).then_some(SequenceNumber(max_in_seq));
+            return Ok(Some(VersionEdit {
+                deleted_files: self
+                    .inputs
+                    .iter()
+                    .map(|(lvl, m, _)| (*lvl, m.file_number))
+                    .collect(),
+                new_files: Vec::new(),
+                next_file_number: None,
+                last_sequence: last_seq,
+            }));
+        }
+
+        let atomic_rename = self.fs.supports_atomic_rename();
+        let write_mode = if atomic_rename {
+            forst_rs_io::WriteMode::CreateNew
+        } else {
+            forst_rs_io::WriteMode::CreateOrTruncate
+        };
+        if let Some(parent) = self.output_path.parent() {
+            self.fs.create_dir_all(parent)?;
+        }
+        let mut slots: Vec<(FileNumber, PathBuf)> =
+            Vec::with_capacity(1 + self.additional_outputs.len());
+        slots.push((self.output_file_number, self.output_path.clone()));
+        slots.extend(self.additional_outputs.iter().cloned());
+        let target = self.target_file_size;
+
+        let mut produced: Vec<(FileNumber, SstFileInfo)> = Vec::new();
+        let mut slot_idx = 0usize;
+        let mut group: Vec<CompactionEntry> = Vec::new();
+        let mut members: Vec<usize> = Vec::new();
+
+        // FRS-ZERO-COPY-MERGE fast path: when there is NO compaction filter AND
+        // NO live snapshot (min_active == u64::MAX, so `emit_key_versions`'s
+        // pinned slice is always empty), a key whose globally-newest version is
+        // a Put is emitted as exactly that Put with every older version dropped
+        // (compaction.rs Put branch). We can then write the newest Put's
+        // BORROWED bytes straight to the writer — no `CompactionEntry` value
+        // copy — and drain the shadowed older versions. Filters (Replace/Discard)
+        // and snapshot pinning force the byte-equivalent copy fallback.
+        let fast_eligible =
+            self.compaction_filter.is_none() && self.min_active_snapshot.0 == u64::MAX;
+
+        let write_outcome: ForstResult<()> = (|| {
+            while !heap.is_empty() {
+                let last_slot = slot_idx + 1 >= slots.len();
+                let (cur_fnum, cur_path) = slots[slot_idx].clone();
+                let write_path = if atomic_rename {
+                    sst_temp_path(&cur_path)
+                } else {
+                    cur_path.clone()
+                };
+                let (file_emitted, info_opt): (u64, Option<SstFileInfo>) = {
+                    let mut wf = self.fs.open_writable_file(&write_path, write_mode)?;
+                    let mut writer_opts = self.writer_options.clone();
+                    writer_opts.cf_id = self.cf_id;
+                    let mut writer = SstWriterImpl::with_options(writer_opts).streaming(&mut *wf);
+                    let mut file_emitted = 0u64;
+                    while !heap.is_empty() {
+                        let cur_key = heap.peek().expect("heap non-empty").key.clone();
+                        // Pop every cursor currently positioned at `cur_key`.
+                        // Each is at ITS newest `cur_key` version (on-disk order
+                        // is key ASC, seq DESC), so the global newest is the
+                        // member with the max effective_seq.
+                        members.clear();
+                        while heap.peek().map(|h| h.key == cur_key).unwrap_or(false) {
+                            members.push(heap.pop().expect("peeked").idx);
+                        }
+
+                        let mut fast_done = false;
+                        if fast_eligible {
+                            let newest_idx = *members
+                                .iter()
+                                .max_by_key(|&&i| {
+                                    ((file_nums[i] as u128) << 64)
+                                        | (cursors[i].sequence() as u128)
+                                })
+                                .expect("members non-empty");
+                            if cursors[newest_idx].op_type() == forst_rs_common::OpType::Put {
+                                // Write the newest Put's BORROWED bytes directly
+                                // (zero CompactionEntry copy) — equivalent to
+                                // emit_key_versions' Put branch (emit newest,
+                                // drop all older) when nothing is pinned/filtered.
+                                writer.add(
+                                    cursors[newest_idx].key(),
+                                    cursors[newest_idx].value(),
+                                    cursors[newest_idx].sequence(),
+                                    forst_rs_common::OpType::Put as u8,
+                                )?;
+                                file_emitted += 1;
+                                // Drain (drop) every shadowed version of cur_key
+                                // across all members, then re-push their next key.
+                                for &i in &members {
+                                    while cursors[i].valid() && cursors[i].key() == cur_key {
+                                        cursors[i].advance()?;
+                                    }
+                                    if cursors[i].valid() {
+                                        heap.push(HeapKey {
+                                            key: cursors[i].key().to_vec(),
+                                            idx: i,
+                                        });
+                                    }
+                                }
+                                fast_done = true;
+                            }
+                        }
+
+                        if !fast_done {
+                            // Byte-equivalent fallback: materialize this key's
+                            // versions and run the unchanged consolidation.
+                            group.clear();
+                            for &i in &members {
+                                while cursors[i].valid() && cursors[i].key() == cur_key {
+                                    group.push(CompactionEntry {
+                                        key: cursors[i].key().to_vec(),
+                                        value: cursors[i].value().map(|v| v.to_vec()),
+                                        sequence: cursors[i].sequence(),
+                                        op_type: cursors[i].op_type(),
+                                        file_number: file_nums[i],
+                                    });
+                                    cursors[i].advance()?;
+                                }
+                                if cursors[i].valid() {
+                                    heap.push(HeapKey {
+                                        key: cursors[i].key().to_vec(),
+                                        idx: i,
+                                    });
+                                }
+                            }
+                            // Newest-first within the key (index 0 = newest).
+                            group.sort_by(|a, b| b.effective_seq().cmp(&a.effective_seq()));
+                            self.emit_key_versions(&mut writer, &group, &mut file_emitted)?;
+                        }
+
+                        // Roll to the next slot at this user-key boundary once the
+                        // file reached target and more keys remain.
+                        if !last_slot
+                            && target > 0
+                            && file_emitted > 0
+                            && !heap.is_empty()
+                            && writer.estimated_size() >= target
+                        {
+                            break;
+                        }
+                    }
+                    if file_emitted == 0 {
+                        drop(writer);
+                        drop(wf);
+                        if let Err(e) = self.fs.delete_file(&write_path) {
+                            tracing::warn!(
+                                "CompactionJob(streaming): zero-emit tmp delete failed for {}: {}",
+                                write_path.display(),
+                                e
+                            );
+                        }
+                        (0, None)
+                    } else {
+                        let info = writer.finish()?;
+                        wf.flush()?;
+                        wf.sync()?;
+                        (file_emitted, Some(info))
+                    }
+                };
+                let _ = file_emitted;
+
+                if let Some(info) = info_opt {
+                    if atomic_rename {
+                        if let Err(e) = self.fs.rename(&write_path, &cur_path) {
+                            let _ = self.fs.delete_file(&write_path);
+                            return Err(e);
+                        }
+                        if let Some(parent) = cur_path.parent() {
+                            if let Err(e) = self.fs.sync_dir(parent) {
+                                tracing::warn!(
+                                    "CompactionJob(streaming): sync_dir({}) failed: {}",
+                                    parent.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    produced.push((cur_fnum, info));
+                }
+
+                if !heap.is_empty() {
+                    slot_idx += 1;
+                }
+            }
+            Ok(())
+        })();
+        write_outcome?;
+
+        // Zero-emit across all slots (e.g. all bottommost tombstones).
+        if produced.is_empty() {
+            let max_in_seq = self
+                .inputs
+                .iter()
+                .map(|(_, m, _)| m.max_sequence.value())
+                .max()
+                .unwrap_or(0);
+            let last_seq = (max_in_seq > 0).then_some(SequenceNumber(max_in_seq));
+            return Ok(Some(VersionEdit {
+                deleted_files: self
+                    .inputs
+                    .iter()
+                    .map(|(lvl, m, _)| (*lvl, m.file_number))
+                    .collect(),
+                new_files: Vec::new(),
+                next_file_number: None,
+                last_sequence: last_seq,
+            }));
+        }
+
+        let mut new_files: Vec<(u32, SstFileMeta)> = Vec::with_capacity(produced.len());
+        let mut max_out_seq = 0u64;
+        for (fnum, info) in produced {
+            debug_assert_eq!(info.cf_id, self.cf_id);
+            max_out_seq = max_out_seq.max(info.max_sequence);
+            new_files.push((
+                self.output_level,
+                SstFileMeta {
+                    file_number: fnum,
+                    cf_id: self.cf_id,
+                    file_size: info.file_size,
+                    smallest_key: info.min_key,
+                    largest_key: info.max_key,
+                    min_sequence: forst_rs_common::SequenceNumber(info.min_sequence),
+                    max_sequence: forst_rs_common::SequenceNumber(info.max_sequence),
+                    num_entries: info.entry_count,
+                },
+            ));
+        }
+        let deleted = self
+            .inputs
+            .iter()
+            .map(|(lvl, m, _)| (*lvl, m.file_number))
+            .collect();
+        let last_seq = (max_out_seq > 0).then_some(SequenceNumber(max_out_seq));
         Ok(Some(VersionEdit {
             new_files,
             deleted_files: deleted,
@@ -1043,6 +1373,46 @@ impl CompactionJob {
             }
         }
         Ok(())
+    }
+}
+
+/// FRS-ZERO-COPY-MERGE: whether the opt-in parallel sub-compaction path is
+/// requested (`FRS_COMPACT_PARALLEL`). When false (the default), `run()`
+/// delegates to the streaming `run_streaming`.
+fn compaction_parallel_env() -> bool {
+    matches!(
+        std::env::var("FRS_COMPACT_PARALLEL").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// Heap element for the streaming k-way merge: orders inputs by current key
+/// ASCENDING (so `BinaryHeap`, a max-heap, yields the smallest key first via the
+/// reversed `Ord`). Ties on key are broken by `idx` for a total order; the
+/// merge collects ALL same-key versions then re-sorts them by `effective_seq`
+/// DESC, so intra-key heap order does not affect output.
+struct HeapKey {
+    key: Vec<u8>,
+    idx: usize,
+}
+impl PartialEq for HeapKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.idx == other.idx
+    }
+}
+impl Eq for HeapKey {}
+impl Ord for HeapKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reversed: smaller key ⇒ "greater" so the max-heap pops it first.
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| other.idx.cmp(&self.idx))
+    }
+}
+impl PartialOrd for HeapKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
