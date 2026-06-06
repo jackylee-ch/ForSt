@@ -3309,6 +3309,27 @@ impl DbImpl {
 
         let base_seq = prev + 1;
 
+        // FRS-WAL Phase 2b: write-ahead — append the WHOLE batch and group-commit
+        // fsync ONCE (the amortized-durability point) before the memtable insert.
+        // Record i carries seq `base_seq + i`, matching `batch_insert_with_base_seq`.
+        // No-op (zero cost) when the WAL is disabled (default). On WAL I/O failure
+        // the batch fails here with the memtable untouched.
+        {
+            let mut guard = self.wal.lock().expect("wal lock poisoned");
+            if let Some(w) = guard.as_mut() {
+                for i in 0..keys.len() {
+                    w.append(&crate::wal::WalRecord {
+                        cf_id: single_cf_id.0,
+                        sequence: base_seq + i as u64,
+                        op_type: op_types[i],
+                        key: keys[i].to_vec(),
+                        value: values[i].map(|v| v.to_vec()),
+                    })?;
+                }
+                w.sync()?;
+            }
+        }
+
         // R56-H1 bounded-retry on FrozenMemTable absorbs a concurrent
         // flush's swap atomically from the caller's view.
         let mut attempt: u32 = 0;
@@ -11622,6 +11643,37 @@ mod tests {
         assert_eq!(scan.records[2].value, None, "delete logged as tombstone");
         assert!(scan.records[0].sequence < scan.records[1].sequence);
         assert!(scan.records[1].sequence < scan.records[2].sequence);
+    }
+
+    /// FRS-WAL Phase 2b: the batch write path (q4's async vectorized path) logs
+    /// the whole batch with contiguous sequence numbers and tombstones intact.
+    #[test]
+    fn wal_phase2b_batch_writes_are_logged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.wal");
+        let db = open();
+        let cf = db.default_cf();
+        *db.wal.lock().unwrap() = Some(crate::wal::WalWriter::open(&path).unwrap());
+
+        let keys: Vec<&[u8]> = vec![&b"a"[..], &b"b"[..], &b"c"[..]];
+        let vals: Vec<Option<&[u8]>> = vec![Some(&b"1"[..]), Some(&b"2"[..]), None];
+        let ops = vec![
+            OpType::Put as u8,
+            OpType::Put as u8,
+            OpType::Delete as u8,
+        ];
+        db.batch_put_borrowed_single_cf(&cf, &keys, &vals, &ops)
+            .unwrap();
+
+        let scan = crate::wal::read_segment(&path).unwrap();
+        assert!(scan.clean_eof);
+        assert_eq!(scan.records.len(), 3);
+        assert_eq!(scan.records[0].key, b"a");
+        assert_eq!(scan.records[0].value, Some(b"1".to_vec()));
+        assert_eq!(scan.records[2].key, b"c");
+        assert_eq!(scan.records[2].value, None, "batch delete logged as tombstone");
+        assert_eq!(scan.records[1].sequence, scan.records[0].sequence + 1);
+        assert_eq!(scan.records[2].sequence, scan.records[1].sequence + 1);
     }
 
     /// FRS-WAL Phase 2: with the WAL disabled (default), no segment is created
