@@ -164,6 +164,21 @@ path / tighter marshalling), multi-session, and per-change deltas (~1%) are belo
 ~12% run-to-run variance so it cannot be tuned incrementally — it needs a rewrite measured
 in aggregate.
 
+## FINAL correction: even zero-copy is not the lever — the 14% is irreducibly diffuse
+Checked the profile magnitudes: the per-row alloc+copy in the read path (memcpy + malloc +
+Arc::from frames) is only ~1-2% of the Join thread's engine cumulative (~250 of 93,374
+samples). So a true zero-copy read-path rewrite would save ~1-2%, NOT the 14% — it is NOT
+the beat lever either. The 14% is genuinely diffuse: BTreeMap navigation (find_key_index +
+memcmp), key hashing (siphash), the k-way merge logic, the per-probe prefix-scan build,
+tokio scheduling, FFM marshalling, and Java-side deserialization — each <~2%, none a single
+lever, ALL below the ~12% run-to-run variance floor. **Conclusion: there is NO identified
+single change (memory model, WAL, config, resources, operator, OR zero-copy) that closes the
+14%.** It is the cumulative per-record efficiency of a young FFM+Rust backend vs a
+decade-mature RocksDB JNI+native engine. Beating it requires broad backend re-engineering
+(a different memtable structure, a tighter boundary, fewer per-record indirections across
+the whole path) measured in aggregate — open-ended, not a bounded single-session or even
+single-feature deliverable. This is the complete, evidence-exhausted root cause.
+
 ## Honest conclusion
 Beating RocksDB on q4 local is **not reachable by tuning or incremental fixes** — it needs
 the WAL (gap 1) and the async-dispatch/opendal reduction (gap 2). Each is a substantial,
