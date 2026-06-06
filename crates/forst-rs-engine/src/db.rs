@@ -531,6 +531,14 @@ pub struct DbImpl {
     /// `deleted_files` entry still exists in the current version and
     /// returns retry-able `ForstError::Busy` otherwise (R44-L2).
     compaction_mutex: Mutex<()>,
+    /// FRS-WAL Phase 2 (2026-06-06): optional local write-ahead log. `None`
+    /// unless `FRS_WAL_DIR` is set, so the default build is byte-identical to
+    /// the pre-WAL engine (the append sites are `if let Some(..)` no-ops when
+    /// `None`). When `Some`, every mutation is appended and the batch is
+    /// group-commit fsynced before the write returns — durability today, and the
+    /// foundation for the cheap-checkpoint path (sync WAL instead of forced
+    /// flush) that closes the q4-vs-RocksDB gap. See `crate::wal`.
+    wal: Mutex<Option<crate::wal::WalWriter>>,
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): diagnostic counter — number of L0 SST
     /// data-block reads performed during point `get`s inside [`Self::sst_get`].
     /// The L0 walk now visits files newest-first and STOPS at the first
@@ -674,11 +682,13 @@ impl DbImpl {
             snapshot_age_worker: Mutex::new(None),
             snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_mutex: Mutex::new(()),
+            wal: Mutex::new(None),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
 
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
         Self::init_self_weak(&db);
+        db.maybe_init_wal();
         Self::spawn_snapshot_age_worker(&db);
         Ok(db)
     }
@@ -2646,6 +2656,47 @@ impl DbImpl {
         self.write_single(cf, key, Some(operand), OpType::Merge)
     }
 
+    /// FRS-WAL Phase 2 (2026-06-06): initialize the local write-ahead log from
+    /// the `FRS_WAL_DIR` env var. A no-op (WAL stays disabled, `self.wal` stays
+    /// `None`) when the var is unset — keeping the default engine byte-identical
+    /// to pre-WAL. One segment per `db_id` so the ~12 q4 DbImpls don't collide.
+    fn maybe_init_wal(&self) {
+        let dir = match std::env::var("FRS_WAL_DIR") {
+            Ok(d) if !d.trim().is_empty() => d,
+            _ => return,
+        };
+        let dir = std::path::Path::new(&dir);
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(target: "forst_rs_engine::wal", "WAL dir {dir:?} create failed: {e}; WAL disabled");
+            return;
+        }
+        let path = dir.join(format!("db-{}.wal", self.db_id.0));
+        match crate::wal::WalWriter::open(&path) {
+            Ok(w) => {
+                *self.wal.lock().expect("wal lock poisoned") = Some(w);
+                tracing::info!(target: "forst_rs_engine::wal", "WAL enabled at {path:?}");
+            }
+            Err(e) => {
+                tracing::warn!(target: "forst_rs_engine::wal", "WAL open {path:?} failed: {e}; disabled")
+            }
+        }
+    }
+
+    /// FRS-WAL Phase 2: append a group of records and group-commit fsync them as
+    /// a unit. No-op (returns `Ok`) when the WAL is disabled. On WAL I/O failure
+    /// returns `Err` — once enabled, durability is mandatory, so the caller's
+    /// write must fail rather than silently lose the log record.
+    fn wal_append_commit(&self, recs: &[crate::wal::WalRecord]) -> ForstResult<()> {
+        let mut guard = self.wal.lock().expect("wal lock poisoned");
+        if let Some(w) = guard.as_mut() {
+            for r in recs {
+                w.append(r)?;
+            }
+            w.sync()?;
+        }
+        Ok(())
+    }
+
     fn write_single(
         &self,
         cf: &ColumnFamilyHandle,
@@ -2703,6 +2754,19 @@ impl DbImpl {
         // R31-M3: reserve BEFORE put_with_seq so the budget is accurate
         // even if the put fails. The guard releases the reservation on
         // drop unless the put succeeds and we commit() it.
+        // FRS-WAL Phase 2: write-ahead — append this mutation and group-commit
+        // fsync it BEFORE touching the memtable, so a crash after the write is
+        // acknowledged is recoverable. No-op (zero cost) when the WAL is
+        // disabled (the default: `FRS_WAL_DIR` unset). On WAL I/O failure the
+        // write fails here and the memtable is left untouched.
+        self.wal_append_commit(&[crate::wal::WalRecord {
+            cf_id: cf.id().0,
+            sequence: seq,
+            op_type: op as u8,
+            key: key.to_vec(),
+            value: value.map(|v| v.to_vec()),
+        }])?;
+
         let charge = key.len() as u64
             + value.map(|v| v.len() as u64).unwrap_or(0)
             + 8 // seq
@@ -4606,8 +4670,10 @@ impl DbImpl {
             snapshot_age_worker: Mutex::new(None),
             snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_mutex: Mutex::new(()),
+            wal: Mutex::new(None),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
+        db.maybe_init_wal();
 
         let default_desc = if let Some(cf) = snapshot
             .cf_descriptors
@@ -11526,6 +11592,47 @@ mod tests {
         let mut out2: Vec<(Vec<u8>, Vec<u8>)> = iter2.collect::<ForstResult<Vec<_>>>().unwrap();
         out2.sort_by(|l, r| l.0.cmp(&r.0));
         assert_eq!(out2.len(), 3);
+    }
+
+    /// FRS-WAL Phase 2: with the WAL enabled, every point write is appended +
+    /// group-commit fsynced before the memtable insert, and the segment replays
+    /// to exactly the written mutations (key/value/op/seq), tombstones included.
+    /// Forces the WAL on directly (not via `FRS_WAL_DIR`) to avoid cross-test
+    /// env races; the env path is exercised by `maybe_init_wal` in production.
+    #[test]
+    fn wal_phase2_point_writes_are_logged_and_replayable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.wal");
+        let db = open();
+        let cf = db.default_cf();
+        *db.wal.lock().unwrap() = Some(crate::wal::WalWriter::open(&path).unwrap());
+
+        db.put(&cf, b"k1", b"v1").unwrap();
+        db.put(&cf, b"k2", b"v2").unwrap();
+        db.delete(&cf, b"k1").unwrap();
+
+        let scan = crate::wal::read_segment(&path).unwrap();
+        assert!(scan.clean_eof, "all group-commits intact");
+        assert_eq!(scan.records.len(), 3);
+        assert_eq!(scan.records[0].key, b"k1");
+        assert_eq!(scan.records[0].value, Some(b"v1".to_vec()));
+        assert_eq!(scan.records[1].key, b"k2");
+        assert_eq!(scan.records[1].value, Some(b"v2".to_vec()));
+        assert_eq!(scan.records[2].key, b"k1");
+        assert_eq!(scan.records[2].value, None, "delete logged as tombstone");
+        assert!(scan.records[0].sequence < scan.records[1].sequence);
+        assert!(scan.records[1].sequence < scan.records[2].sequence);
+    }
+
+    /// FRS-WAL Phase 2: with the WAL disabled (default), no segment is created
+    /// and writes behave exactly as before (the gating no-op path).
+    #[test]
+    fn wal_phase2_disabled_by_default_is_noop() {
+        let db = open();
+        let cf = db.default_cf();
+        assert!(db.wal.lock().unwrap().is_none(), "WAL off unless FRS_WAL_DIR set");
+        db.put(&cf, b"k", b"v").unwrap();
+        assert_eq!(db.get(&cf, b"k").unwrap(), Some(b"v".to_vec()));
     }
 
     /// FRS-VALUE-CARRYING-MERGE: scan via the slot variant (the q4 FFI path)
