@@ -31,6 +31,9 @@ arrow = { workspace = true }
 opendal = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# FRS-WAL (2026-06-06): per-record checksums for torn-write detection during
+# crash recovery. Already in the lockfile (transitive); promoted to a direct dep.
+crc32c = "0.6"
 
 [dev-dependencies]
 forst-rs-test-utils = { workspace = true }

@@ -98,6 +98,7 @@ pub mod list_merge;
 pub mod mvcc;
 pub mod runtime_tuning;
 pub mod snapshot_view;
+pub mod wal;
 pub mod write_batch;
 pub mod write_controller;
 
