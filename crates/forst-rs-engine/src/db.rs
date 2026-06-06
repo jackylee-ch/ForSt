@@ -2682,16 +2682,28 @@ impl DbImpl {
         }
     }
 
-    /// FRS-WAL Phase 2: append a group of records and group-commit fsync them as
-    /// a unit. No-op (returns `Ok`) when the WAL is disabled. On WAL I/O failure
-    /// returns `Err` — once enabled, durability is mandatory, so the caller's
-    /// write must fail rather than silently lose the log record.
-    fn wal_append_commit(&self, recs: &[crate::wal::WalRecord]) -> ForstResult<()> {
+    /// FRS-WAL Phase 2: append a group of records to the WAL buffer. No-op
+    /// (returns `Ok`) when the WAL is disabled. Does NOT fsync — durability is
+    /// established at checkpoint time via [`wal_sync`](Self::wal_sync), which is
+    /// all Flink's exactly-once contract requires (recovery replays the source
+    /// from the last completed checkpoint). Per-write fsync was catastrophic
+    /// (q4 ~1.8K/s vs 304K/s) and is unnecessary for checkpointed recovery.
+    fn wal_append(&self, recs: &[crate::wal::WalRecord]) -> ForstResult<()> {
         let mut guard = self.wal.lock().expect("wal lock poisoned");
         if let Some(w) = guard.as_mut() {
             for r in recs {
                 w.append(r)?;
             }
+        }
+        Ok(())
+    }
+
+    /// FRS-WAL Phase 3: flush + fsync the WAL buffer to stable storage. Called
+    /// at checkpoint time (the durability barrier) instead of forcing a memtable
+    /// flush. No-op when the WAL is disabled.
+    fn wal_sync(&self) -> ForstResult<()> {
+        let mut guard = self.wal.lock().expect("wal lock poisoned");
+        if let Some(w) = guard.as_mut() {
             w.sync()?;
         }
         Ok(())
@@ -2754,12 +2766,11 @@ impl DbImpl {
         // R31-M3: reserve BEFORE put_with_seq so the budget is accurate
         // even if the put fails. The guard releases the reservation on
         // drop unless the put succeeds and we commit() it.
-        // FRS-WAL Phase 2: write-ahead — append this mutation and group-commit
-        // fsync it BEFORE touching the memtable, so a crash after the write is
-        // acknowledged is recoverable. No-op (zero cost) when the WAL is
-        // disabled (the default: `FRS_WAL_DIR` unset). On WAL I/O failure the
-        // write fails here and the memtable is left untouched.
-        self.wal_append_commit(&[crate::wal::WalRecord {
+        // FRS-WAL Phase 2: write-ahead — append this mutation to the WAL buffer
+        // BEFORE touching the memtable. Durability is established at checkpoint
+        // (`wal_sync`), which is all Flink's exactly-once needs. No-op (zero
+        // cost) when the WAL is disabled (default: `FRS_WAL_DIR` unset).
+        self.wal_append(&[crate::wal::WalRecord {
             cf_id: cf.id().0,
             sequence: seq,
             op_type: op as u8,
@@ -3309,11 +3320,12 @@ impl DbImpl {
 
         let base_seq = prev + 1;
 
-        // FRS-WAL Phase 2b: write-ahead — append the WHOLE batch and group-commit
-        // fsync ONCE (the amortized-durability point) before the memtable insert.
-        // Record i carries seq `base_seq + i`, matching `batch_insert_with_base_seq`.
-        // No-op (zero cost) when the WAL is disabled (default). On WAL I/O failure
-        // the batch fails here with the memtable untouched.
+        // FRS-WAL Phase 2b: write-ahead — append the WHOLE batch to the WAL
+        // buffer before the memtable insert (record i carries seq `base_seq + i`,
+        // matching `batch_insert_with_base_seq`). NO per-batch fsync — durability
+        // is established at checkpoint via `wal_sync` (Flink replays the source
+        // from the last checkpoint, so the WAL only needs to be durable there;
+        // per-batch fsync was a ~170× throughput cliff). No-op when WAL disabled.
         {
             let mut guard = self.wal.lock().expect("wal lock poisoned");
             if let Some(w) = guard.as_mut() {
@@ -3326,7 +3338,6 @@ impl DbImpl {
                         value: values[i].map(|v| v.to_vec()),
                     })?;
                 }
-                w.sync()?;
             }
         }
 
@@ -4847,6 +4858,20 @@ impl DbImpl {
         // captured by the caller as an Arrow-IPC artifact instead of being
         // sealed to an L0 SST, so we skip the flush entirely and snapshot only
         // the existing (WBM-flushed) SST set.
+        //
+        // FRS-WAL Phase 3 (2026-06-06): when the WAL is enabled, the live
+        // memtable's durability is ALREADY provided by the WAL (every mutation
+        // was group-commit fsynced on the write path), so a checkpoint need NOT
+        // force a memtable flush+compaction — the expensive per-checkpoint cost
+        // that the WAL exists to remove. We reference the existing WBM-flushed
+        // SSTs; the unflushed tail is recoverable from the WAL. This is the
+        // compact-state (WBM keeps the memtable small) + cheap-checkpoint combo
+        // that closes the q4-vs-RocksDB gap on local dir. NOTE: completing the
+        // restore side is WAL Phase 4 (replay the tail on open) — until then a
+        // RESTORE from a WAL-mode checkpoint would drop the unflushed tail; this
+        // override only activates when `FRS_WAL_DIR` is set (off by default).
+        let flush_memtables =
+            flush_memtables && self.wal.lock().expect("wal lock poisoned").is_none();
         if flush_memtables {
             self.flush_all()?;
             let cfs: Vec<Arc<ColumnFamilyData>> = {
@@ -4867,6 +4892,13 @@ impl DbImpl {
                 }
             }
         }
+
+        // FRS-WAL Phase 3: the checkpoint's durability barrier for the unflushed
+        // memtable tail. When the WAL is enabled the forced flush above is
+        // skipped (see the `flush_memtables &&` override), so here we fsync the
+        // WAL instead — cheap sequential append-sync vs an expensive
+        // flush+compaction. No-op when the WAL is disabled.
+        self.wal_sync()?;
 
         // 2026-06-02 q7 ckpt-ON FREEZE FIX: the durability barrier is deferred
         // until AFTER the VersionSet snapshot below, where it awaits the upload
@@ -11631,9 +11663,10 @@ mod tests {
         db.put(&cf, b"k1", b"v1").unwrap();
         db.put(&cf, b"k2", b"v2").unwrap();
         db.delete(&cf, b"k1").unwrap();
+        db.wal_sync().unwrap(); // durability barrier (checkpoint does this in prod)
 
         let scan = crate::wal::read_segment(&path).unwrap();
-        assert!(scan.clean_eof, "all group-commits intact");
+        assert!(scan.clean_eof, "all records intact after sync");
         assert_eq!(scan.records.len(), 3);
         assert_eq!(scan.records[0].key, b"k1");
         assert_eq!(scan.records[0].value, Some(b"v1".to_vec()));
@@ -11664,6 +11697,7 @@ mod tests {
         ];
         db.batch_put_borrowed_single_cf(&cf, &keys, &vals, &ops)
             .unwrap();
+        db.wal_sync().unwrap(); // durability barrier (checkpoint does this in prod)
 
         let scan = crate::wal::read_segment(&path).unwrap();
         assert!(scan.clean_eof);

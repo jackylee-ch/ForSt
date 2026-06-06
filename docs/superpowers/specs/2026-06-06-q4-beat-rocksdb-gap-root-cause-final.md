@@ -131,6 +131,25 @@ flush). That is a substantial, correctness-critical engine subsystem (append, gr
 fsync, crash recovery/replay ordering, segment GC tied to flush) — a multi-session project,
 not a config or single-function change. It is the definitive, bounded path to <283s.
 
+## WAL hypothesis TESTED end-to-end — disproven as the beat lever (2026-06-06)
+Built + benchmarked the WAL (Phases 1-3: writer, write-path append, checkpoint fsync-WAL
+instead of forced flush). Result: **q4 322s, peak 43 GB — TIES noflush=true (322s), does
+NOT beat RocksDB (283s).**
+- First attempt fsynced per write-batch → ~170× collapse (q4 ~1.8K/s). Fixed: append-only
+  on the write path, fsync ONLY at checkpoint (all Flink exactly-once needs).
+- Corrected WAL run: 321-322s, same as noflush=true. **Why no beat:** the checkpoint cost
+  was ALREADY removed by noflush=true (artifact) — the WAL merely matches it with cleaner
+  recovery semantics. The state is NOT compact under WAL either (43 GB: the working set is
+  async in-flight buffers + join state + memtable, not just the memtable artifact; bounding
+  WBM to 2 GB did not reduce the 43 GB or the wall).
+**Corrected conclusion:** the residual 39 s (322→283) is NOT checkpoint cost (noflush AND
+WAL both eliminate it) — it is **steady-state per-record CPU** (diffuse engine + async
+coordination) on the CPU-saturated 18-core host, where forst-rs does more work per record
+than RocksDB. The WAL is a correct, valuable feature (durability; recovery-clean cheap
+checkpoint) but is NOT the beat lever. Beating RocksDB needs lowering the diffuse per-record
+CPU — a micro-optimization campaign with no single lever, possibly partly inherent to the
+async design on low-latency local dir (forst-rs's advantage is S3/disagg, unmeasured here).
+
 ## Honest conclusion
 Beating RocksDB on q4 local is **not reachable by tuning or incremental fixes** — it needs
 the WAL (gap 1) and the async-dispatch/opendal reduction (gap 2). Each is a substantial,
