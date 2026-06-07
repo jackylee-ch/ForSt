@@ -5116,10 +5116,30 @@ impl DbImpl {
         // Per-(db, checkpoint) staging root under the OS temp dir. The
         // 20-digit zero-padded checkpoint id matches the on-S3 layout and
         // keeps concurrent checkpoints from colliding.
-        let stage_root = std::env::temp_dir()
+        let stage_db_root = std::env::temp_dir()
             .join("forst-rs-ckpt-stage")
-            .join(format!("{}", self.db_id.0))
-            .join(format!("{:020}", checkpoint_id));
+            .join(format!("{}", self.db_id.0));
+        // FRS-CKPT-STAGE-GC (2026-06-06): prune staging dirs from PRIOR
+        // checkpoints of this db before staging the current one. The Java
+        // `ForStRsSstUploader` consumes each checkpoint's staged manifest +
+        // new-SSTs SYNCHRONOUSLY (reads the returned local paths and uploads)
+        // before the next checkpoint is created — with the default
+        // max-concurrent-checkpoints=1, checkpoint N-1's async phase fully
+        // completes before N begins. So any sibling staging dir whose id is
+        // numerically < `checkpoint_id` is dead. Without this prune, every
+        // checkpoint leaked its staged bytes to the OS temp dir: a single
+        // Nexmark sweep accumulated ~296 GB of `forst-rs-ckpt-stage` and filled
+        // the disk (ENOSPC → run abort). The 20-digit zero-padded ids sort
+        // lexicographically == numerically, so a string `<` compare is exact.
+        let keep = format!("{:020}", checkpoint_id);
+        if let Ok(entries) = std::fs::read_dir(&stage_db_root) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().as_ref() < keep.as_str() {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        let stage_root = stage_db_root.join(&keep);
         let local_fs = LocalFileSystem::new();
         local_fs.create_dir_all(&stage_root)?;
 
@@ -6393,17 +6413,38 @@ impl DbImpl {
         error_slot: Arc<Mutex<Option<ForstError>>>,
     ) -> ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>>
     {
-        let cf_handle = cf.clone();
+        // FRS-VALUE-CARRYING-MERGE (2026-06-07): mirror the prefix path
+        // (`prefix_scan_iter_owned_arc_with_error_slot`) — resolve SST-resident
+        // Puts inline from the merge cursor instead of a per-key `get_arc` that
+        // re-walks the WHOLE LSM (O(K×tiers)). Pre-fix this range path STILL did
+        // `db.get_arc(cf, key)` per yielded key — the exact double-walk the
+        // prefix path eliminated as "the q4 2× read-path fix" (task #51) but
+        // which was never carried over to the range scan. This range scan backs
+        // the engine timer drain (`frs_vec_iter_range_open`, q11) and q9/q19/q20
+        // TopN/OVER range reads, so the per-key re-walk was a unified read-amp
+        // tax across every range-scan-heavy query. `get_internal(cf_data, key,
+        // u64::MAX)` is byte-identical to `get_arc` (lookup_cf_by_id +
+        // get_internal + Arc::from); the inline `Put` value is the exact
+        // (key ASC, seq DESC) newest version, tier precedence preserved
+        // (memtable newer than SST; max-seq SST wins; tombstones hide). Fallback
+        // (Merge-chains / memtable-tier winners) still resolves via get_internal.
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
         let mut inner = self.build_lazy_range_key_stream(cf, lower, upper)?;
         inner.set_shared_error_slot(error_slot);
         let db = Arc::clone(self);
-        Ok(Box::new(inner.filter_map(
-            move |key_arc| match db.get_arc(&cf_handle, key_arc.as_ref()) {
-                Ok(Some(value)) => Some(Ok((key_arc, value))),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            },
-        )))
+        Ok(Box::new(std::iter::from_fn(move || loop {
+            let (key_arc, decision) = inner.next_with_value()?;
+            match decision {
+                ValueDecision::Put(value) => return Some(Ok((key_arc, value))),
+                ValueDecision::Fallback => {
+                    match db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX) {
+                        Ok(Some(value)) => return Some(Ok((key_arc, Arc::<[u8]>::from(value)))),
+                        Ok(None) => continue,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
+            }
+        })))
     }
 
     #[allow(clippy::type_complexity)]
@@ -10416,6 +10457,110 @@ mod tests {
                 db2.get(&cf2, mk.as_bytes()).unwrap().as_deref(),
                 Some(&b"memval"[..]),
                 "live-memtable key {} lost on no-flush restore (artifact replay gap)",
+                mk
+            );
+        }
+    }
+
+    #[test]
+    fn test_noflush_checkpoint_restore_non_default_cf_round_trip() {
+        // FRS-TIMER-CF checkpoint-safety: a dedicated non-default CF (as used by the
+        // engine-backed timer queue, "frs_timers") must survive a no-flush
+        // checkpoint+restore — its sealed-SST data, its live-memtable data (captured
+        // as a per-CF Arrow artifact keyed on cf_id), AND the CF itself, re-registered
+        // by name with its ORIGINAL cf_id. The last point is what makes the Java
+        // backend's `dbOpenOrCreateCf` open the CF on restore (rather than failing to
+        // re-create an already-present name). Mirrors
+        // `test_noflush_checkpoint_combined_restore_round_trip` but for a non-default CF.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("db");
+        let art_dir = tmp.path().join("artifacts");
+        let restore_dir = tmp.path().join("restored");
+
+        let manifest_path;
+        let sst_files: Vec<String>;
+        let timer_cf_id;
+        {
+            let fs: Arc<dyn FileSystem> = Arc::new(forst_rs_io::LocalFileSystem::new());
+            let opts = EngineOptions {
+                db_path: db_path.to_string_lossy().to_string(),
+                ..EngineOptions::default()
+            };
+            let db = DbImpl::open_with_fs(opts, fs).unwrap();
+
+            let timer_cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("frs_timers"))
+                .unwrap();
+            timer_cf_id = timer_cf.id();
+            assert_ne!(timer_cf_id, DEFAULT_CF_ID);
+
+            // SST-resident timer data: write then SEAL to an SST.
+            for i in 0..50u32 {
+                let k = format!("tsst_{:04}", i);
+                db.put(&timer_cf, k.as_bytes(), b"tsstval").unwrap();
+            }
+            db.switch_and_flush(&timer_cf).unwrap();
+
+            // Memtable-resident timer data: stays in the LIVE active memtable (no flush).
+            for i in 0..50u32 {
+                let k = format!("tmem_{:04}", i);
+                db.put(&timer_cf, k.as_bytes(), b"tmemval").unwrap();
+            }
+
+            let snap = db.snapshot();
+            let result = db
+                .create_incremental_checkpoint_noflush(&snap, 1, 0)
+                .unwrap();
+            // Capture every CF's live memtable — the timer CF among them.
+            let arts = db.snapshot_memtables_to_dir(&art_dir, None).unwrap();
+            assert!(
+                arts.iter().any(|(cf_id, _)| *cf_id == timer_cf_id.0),
+                "the timer CF's live memtable must be captured as an artifact"
+            );
+
+            manifest_path = result.manifest_path.to_string_lossy().to_string();
+            sst_files = result
+                .new_ssts
+                .iter()
+                .chain(result.shared_ssts.iter())
+                .map(|f| f.path.to_string_lossy().to_string())
+                .collect();
+        } // drop db1
+
+        // Restore via the exact path the Java backend uses (dbOpenFromIncremental).
+        let db2 = DbImpl::open_from_incremental(
+            &restore_dir.to_string_lossy(),
+            &manifest_path,
+            &sst_files,
+        )
+        .unwrap();
+        db2.replay_memtable_artifacts_from_dir(&art_dir).unwrap();
+
+        // The timer CF must be re-registered BY NAME (what dbOpenOrCreateCf opens on
+        // restore) with its ORIGINAL cf_id preserved (artifact filenames key on it).
+        let timer_cf2 = db2
+            .column_family("frs_timers")
+            .expect("timer CF must be re-registered on restore");
+        assert_eq!(
+            timer_cf2.id(),
+            timer_cf_id,
+            "restored timer CF must preserve its original cf_id"
+        );
+
+        // Both the flushed-SST data AND the live-memtable data must survive.
+        for i in 0..50u32 {
+            let sk = format!("tsst_{:04}", i);
+            assert_eq!(
+                db2.get(&timer_cf2, sk.as_bytes()).unwrap().as_deref(),
+                Some(&b"tsstval"[..]),
+                "timer SST-resident key {} lost on no-flush restore",
+                sk
+            );
+            let mk = format!("tmem_{:04}", i);
+            assert_eq!(
+                db2.get(&timer_cf2, mk.as_bytes()).unwrap().as_deref(),
+                Some(&b"tmemval"[..]),
+                "timer live-memtable key {} lost on no-flush restore",
                 mk
             );
         }

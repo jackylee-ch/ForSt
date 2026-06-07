@@ -27,7 +27,8 @@ CONF="$FLINK_HOME/conf/config.yaml"
 case "$CONFIG" in
   rocksdb) cp "$FLINK_HOME/conf/templates/config-rocksdb.yaml" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-rocksdb-io /tmp/nexmark-checkpoints-rocksdb ;;
   forst-rs-ffm-s3) envsubst "$S3VARS" < "$FLINK_HOME/conf/templates/config-forst-rs.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache ;;
-  forst-rs-ffm-local) envsubst "$S3VARS" < "$FLINK_HOME/conf/templates/config-forst-rs-local.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache /tmp/flink-forst-rs-data ;;
+  forst-rs-ffm-local) envsubst "$S3VARS" < "$FLINK_HOME/conf/templates/config-forst-rs-local.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache /tmp/flink-forst-rs-data /tmp/nexmark-checkpoints-forst-rs "${TMPDIR:-/tmp}/forst-rs-ckpt-stage" /tmp/forst-rs-ckpt-stage ;;
+  forst-local) cp "$FLINK_HOME/conf/templates/config-forst-local.yaml.tpl" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-forst-io /tmp/flink-forst-data /tmp/nexmark-checkpoints-forst ;;
   *) echo "unknown config $CONFIG"; exit 1 ;;
 esac
 # The repo's sql-client.sh is a WRAPPER that reroutes nexmark's hardcoded

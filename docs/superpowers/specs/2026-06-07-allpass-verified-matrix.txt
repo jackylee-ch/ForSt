@@ -1,0 +1,28 @@
+query    forst-rs    rocksdb     (all local 100M, MAXSEC=1800)
+q0       25s         22s       
+q1       23s         21s       
+q2       22s         20s       
+q3       31s         30s       
+q4       344s        260s      
+q5       38s         149s      
+q7       527s        1191s     
+q8       39s         34s       
+q9       952s        534s      
+q10      54s         52s       
+q11      529s        123s      
+q12      44s         34s       
+q13      23s         21s       
+q14      23s         21s       
+q15      147s        274s      
+q16      265s        445s      
+q17      61s         57s       
+q18      121s        195s      
+q19      428s        147s      
+q20      578s        408s      
+q21      43s         46s       
+q22      34s         33s       
+=== ALLPASS DONE ===
+
+TOTAL(22q,both finish): forst-rs 4351s vs rocksdb 4117s = 1.057x slower. DNF: NONE (all pass).
+forst-rs WINS: q5 3.9x, q7 2.26x, q15 1.86x, q16 1.68x, q18 1.61x, q21.
+forst-rs LOSES (unified read-amp): q9 +418, q11 +406, q19 +281, q20 +170, q4 +84.

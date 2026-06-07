@@ -224,10 +224,185 @@ fn bench_batched_put(c: &mut Criterion) {
     group.finish();
 }
 
+/// BM-1.5 — full-range scan over a MULTI-LEVEL (overlapping-L0) CF.
+///
+/// This is the engine path behind the NexMark range-scan-heavy queries
+/// (q9/q19/q20 and the q11 timer drain): `DbImpl::scan_iter_owned_arc_*` /
+/// RocksDB's forward iterator, where the lazy k-way merge must dedup the same
+/// key range across many overlapping SSTs (read-amplification). We seed the
+/// SAME key range in `WAVES` flushed batches so each wave is one overlapping L0
+/// SST — the merge must compare `WAVES` cursors per emitted key. Measures the
+/// per-entry merge+decode+value-resolution cost that gates the diffuse
+/// per-record floor (see 2026-06-07-value-carrying-range-scan-design.md).
+fn bench_range_scan_multilevel(c: &mut Criterion) {
+    const N: u32 = 20_000;
+    const WAVES: u32 = 8;
+    let mut group = c.benchmark_group("range_scan_multilevel");
+    group.throughput(Throughput::Elements((N as u64) * 0 + N as u64));
+
+    // forst-rs: WAVES overlapping L0 SSTs over the same key range.
+    let frs_db = open_in_memory(8 * 1024 * 1024);
+    let frs_cf = create_cf(&frs_db, "scan-cf");
+    for w in 0..WAVES {
+        for i in 0..N {
+            let k = format!("k{:08}", i);
+            let v = format!("v{:08}-w{}", i, w);
+            frs_db.put(&frs_cf, k.as_bytes(), v.as_bytes()).expect("put");
+        }
+        let _ = frs_db.switch_and_flush(&frs_cf);
+    }
+
+    // rocksdb: same shape — WAVES flushed memtables over the same range.
+    let tmp = TempDir::new().expect("tempdir");
+    let mut rocks_opts = RocksOpts::default();
+    rocks_opts.create_if_missing(true);
+    rocks_opts.create_missing_column_families(true);
+    // Disable auto-compaction so the WAVES L0 files persist (match forst-rs).
+    rocks_opts.set_disable_auto_compactions(true);
+    let rocks_db = Arc::new(
+        RocksDb::open_cf_descriptors(
+            &rocks_opts,
+            tmp.path(),
+            vec![RocksCfDesc::new("default", RocksOpts::default())],
+        )
+        .expect("rocksdb open"),
+    );
+    let rocks_cf = rocks_db.cf_handle("default").expect("rocksdb cf");
+    for w in 0..WAVES {
+        for i in 0..N {
+            let k = format!("k{:08}", i);
+            let v = format!("v{:08}-w{}", i, w);
+            rocks_db
+                .put_cf(&rocks_cf, k.as_bytes(), v.as_bytes())
+                .expect("rocksdb put");
+        }
+        rocks_db.flush_cf(&rocks_cf).expect("rocksdb flush");
+    }
+
+    group.bench_function(BenchmarkId::new("forst_rs", N), |b| {
+        b.iter(|| {
+            let slot = Arc::new(std::sync::Mutex::new(None));
+            let it = frs_db
+                .scan_iter_owned_arc_with_error_slot(&frs_cf, b"", None, slot)
+                .expect("frs scan open");
+            let mut count = 0u64;
+            for r in it {
+                let (_k, _v) = r.expect("frs row");
+                count += 1;
+            }
+            std::hint::black_box(count);
+        })
+    });
+
+    group.bench_function(BenchmarkId::new("rocksdb", N), |b| {
+        b.iter(|| {
+            let it = rocks_db.iterator_cf(&rocks_cf, rocksdb::IteratorMode::Start);
+            let mut count = 0u64;
+            for item in it {
+                let (_k, _v) = item.expect("rocksdb row");
+                count += 1;
+            }
+            std::hint::black_box(count);
+        })
+    });
+
+    group.finish();
+}
+
+/// BM-1.6 — prefix scan over a CHURNED hot prefix (q9/q19 TopN pattern).
+///
+/// The 3-backend NexMark sweep showed forst-rs LOSES q9/q19 to BOTH RocksDB and
+/// ForSt-Java, yet BM-1.5 (static overlapping layout) showed forst-rs FASTER.
+/// The difference q9/q19 add is CHURN: a TopN keeps a small (~N) sorted buffer
+/// per key and rewrites+evicts it on every input row, so the prefix accumulates
+/// many versions + tombstones across SSTs until compaction. This bench replays
+/// that: N live keys, ROUNDS cycles of delete-all + re-put (each cycle a new
+/// version + a tombstone per key), flushed each cycle so the prefix spans ROUNDS
+/// SSTs of churn. Then it prefix-scans the N live keys — the read must merge the
+/// live value past ROUNDS-1 stale versions/tombstones per key. If forst-rs is
+/// slower HERE (unlike BM-1.5), the q9/q19 gap is churn-merge read-amp.
+fn bench_hot_prefix_churn(c: &mut Criterion) {
+    const N: u32 = 1_000;
+    const ROUNDS: u32 = 64;
+    let mut group = c.benchmark_group("hot_prefix_churn");
+    group.throughput(Throughput::Elements(N as u64));
+
+    let frs_db = open_in_memory(8 * 1024 * 1024);
+    let frs_cf = create_cf(&frs_db, "churn-cf");
+    for r in 0..ROUNDS {
+        for i in 0..N {
+            let k = format!("p{:08}", i);
+            if r > 0 {
+                frs_db.delete(&frs_cf, k.as_bytes()).expect("del");
+            }
+            let v = format!("v{:08}-r{}", i, r);
+            frs_db.put(&frs_cf, k.as_bytes(), v.as_bytes()).expect("put");
+        }
+        let _ = frs_db.switch_and_flush(&frs_cf);
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let mut rocks_opts = RocksOpts::default();
+    rocks_opts.create_if_missing(true);
+    rocks_opts.create_missing_column_families(true);
+    rocks_opts.set_disable_auto_compactions(true);
+    let rocks_db = Arc::new(
+        RocksDb::open_cf_descriptors(
+            &rocks_opts,
+            tmp.path(),
+            vec![RocksCfDesc::new("default", RocksOpts::default())],
+        )
+        .expect("rocksdb open"),
+    );
+    let rocks_cf = rocks_db.cf_handle("default").expect("rocksdb cf");
+    for r in 0..ROUNDS {
+        for i in 0..N {
+            let k = format!("p{:08}", i);
+            if r > 0 {
+                rocks_db.delete_cf(&rocks_cf, k.as_bytes()).expect("del");
+            }
+            let v = format!("v{:08}-r{}", i, r);
+            rocks_db.put_cf(&rocks_cf, k.as_bytes(), v.as_bytes()).expect("put");
+        }
+        rocks_db.flush_cf(&rocks_cf).expect("flush");
+    }
+
+    group.bench_function(BenchmarkId::new("forst_rs", N), |b| {
+        b.iter(|| {
+            let slot = Arc::new(std::sync::Mutex::new(None));
+            let it = frs_db
+                .scan_iter_owned_arc_with_error_slot(&frs_cf, b"", None, slot)
+                .expect("frs scan");
+            let mut count = 0u64;
+            for r in it {
+                let _ = r.expect("row");
+                count += 1;
+            }
+            std::hint::black_box(count);
+        })
+    });
+
+    group.bench_function(BenchmarkId::new("rocksdb", N), |b| {
+        b.iter(|| {
+            let it = rocks_db.iterator_cf(&rocks_cf, rocksdb::IteratorMode::Start);
+            let mut count = 0u64;
+            for item in it {
+                let _ = item.expect("row");
+                count += 1;
+            }
+            std::hint::black_box(count);
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     rocksdb_compare,
     bench_point_lookup,
     bench_sequential_put,
-    bench_batched_put
+    bench_batched_put,
+    bench_range_scan_multilevel,
+    bench_hot_prefix_churn
 );
 criterion_main!(rocksdb_compare);
