@@ -7990,10 +7990,10 @@ pub extern "system" fn Java_org_forstdb_LiveFileMetaData_sequenceNumber<'local>(
 // ===========================================================================
 // P4 — Statistics + getProperty + multiGet
 //
-// Surface (~6 entries):
+// Surface (~10 entries):
 //   - Statistics class:                     4 thunks
-//   - RocksDB.getProperty:                  1 thunk
-//   - RocksDB.multiGet:                     1 thunk
+//   - RocksDB.getProperty/getLongProperty:  2 thunks
+//   - RocksDB.multiGet:                     4 overload thunks
 //
 // `Statistics` is purely a sink class — forst-rs reports metrics through
 // `forst_rs_common::metrics::*` rather than per-DB Statistics objects, so
@@ -8254,141 +8254,309 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLongProperty<'local>(
 // RocksDB.multiGet (multi-CF)
 // ---------------------------------------------------------------------------
 
-/// `org.forstdb.RocksDB.multiGet(long handle, long readOptionsHandle,
-///                                long[] cfHandles, byte[][] keys) -> byte[][]`
-///
-/// Java signature: `(JJ[J[[B)[[B`
-///
-/// Multi-CF batch lookup. `cfHandles[i]` and `keys[i]` are paired —
-/// missing keys yield a null array entry. If `cfHandles` is null, every
-/// lookup runs against the default CF (community RocksDB convention).
-/// Length mismatch throws `RocksDBException`.
+fn read_int_array<'env, 'arr>(
+    env: &mut JNIEnv<'env>,
+    arr: &JPrimitiveArray<'arr, jint>,
+    label: &str,
+) -> Option<Vec<jint>> {
+    let outer: &JObject = arr.as_ref();
+    if outer.is_null() {
+        throw_rocksdb(env, &format!("{label}: array is null"));
+        return None;
+    }
+    let len = match env.get_array_length(arr) {
+        Ok(n) => n,
+        Err(e) => {
+            throw_rocksdb(env, &format!("{label}: get_array_length failed: {e}"));
+            return None;
+        }
+    };
+    if len < 0 {
+        throw_rocksdb(env, &format!("{label}: negative array length"));
+        return None;
+    }
+    let mut out = vec![0_i32; len as usize];
+    if let Err(e) = env.get_int_array_region(arr, 0, &mut out) {
+        throw_rocksdb(env, &format!("{label}: get_int_array_region failed: {e}"));
+        return None;
+    }
+    Some(out)
+}
+
+fn read_byte_matrix_slices<'env, 'arr>(
+    env: &mut JNIEnv<'env>,
+    keys: &JObjectArray<'arr>,
+    offsets: &JPrimitiveArray<'arr, jint>,
+    lengths: &JPrimitiveArray<'arr, jint>,
+    label: &str,
+) -> Option<Vec<Vec<u8>>> {
+    let outer: &JObject = keys.as_ref();
+    if outer.is_null() {
+        throw_rocksdb(env, &format!("{label}: keys array is null"));
+        return None;
+    }
+    let count = match env.get_array_length(keys) {
+        Ok(n) => n,
+        Err(e) => {
+            throw_rocksdb(env, &format!("{label}: keys get_array_length failed: {e}"));
+            return None;
+        }
+    };
+    if count < 0 {
+        throw_rocksdb(env, &format!("{label}: negative keys length"));
+        return None;
+    }
+    let offsets = read_int_array(env, offsets, &format!("{label}.offsets"))?;
+    let lengths = read_int_array(env, lengths, &format!("{label}.lengths"))?;
+    let count = count as usize;
+    if offsets.len() != count || lengths.len() != count {
+        throw_rocksdb(
+            env,
+            &format!(
+                "{label}: keys/offsets/lengths length mismatch: keys={count}, offsets={}, lengths={}",
+                offsets.len(),
+                lengths.len()
+            ),
+        );
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let elem = match env.get_object_array_element(keys, i as jint) {
+            Ok(o) => o,
+            Err(e) => {
+                throw_rocksdb(
+                    env,
+                    &format!("{label}: get_object_array_element({i}) failed: {e}"),
+                );
+                return None;
+            }
+        };
+        if elem.is_null() {
+            throw_rocksdb(env, &format!("{label}: element {i} is null"));
+            return None;
+        }
+        let jba = unsafe { JByteArray::from_raw(elem.into_raw()) };
+        let Some(key) = read_byte_slice(env, &jba, offsets[i], lengths[i]) else {
+            return None;
+        };
+        out.push(key);
+    }
+    Some(out)
+}
+
+fn multi_get_cf_list<'env, 'arr>(
+    env: &mut JNIEnv<'env>,
+    handle: jlong,
+    cf_handles: Option<&JPrimitiveArray<'arr, jlong>>,
+    count: usize,
+) -> Option<Vec<FrsCfHandle>> {
+    let use_default = cf_handles
+        .map(|arr| (arr.as_ref() as &JObject).is_null())
+        .unwrap_or(true);
+    if use_default {
+        if handle == 0 {
+            throw_rocksdb(env, "RocksDB.multiGet: null DB handle and no cfHandles");
+            return None;
+        }
+        let mut default_cf: FrsCfHandle = ptr::null_mut();
+        let st = unsafe { frs_db_default_cf(handle as FrsDb, &mut default_cf) };
+        if check_status(env, st, "RocksDB.multiGet.defaultCf") {
+            return None;
+        }
+        return Some(vec![default_cf; count]);
+    }
+
+    let cf_handles = cf_handles.expect("checked above");
+    let cf_len = match env.get_array_length(cf_handles) {
+        Ok(n) => n as usize,
+        Err(e) => {
+            throw_rocksdb(env, &format!("RocksDB.multiGet: cf get_array_length failed: {e}"));
+            return None;
+        }
+    };
+    if cf_len != count {
+        throw_rocksdb(
+            env,
+            &format!("RocksDB.multiGet: cfHandles.length ({cf_len}) != keys.length ({count})"),
+        );
+        return None;
+    }
+    let mut raw = vec![0_i64; cf_len];
+    if let Err(e) = env.get_long_array_region(cf_handles, 0, &mut raw) {
+        throw_rocksdb(env, &format!("RocksDB.multiGet: read cf array failed: {e}"));
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(count);
+    for (i, cf_handle) in raw.into_iter().enumerate() {
+        if cf_handle == 0 {
+            let mut default_cf: FrsCfHandle = ptr::null_mut();
+            let st = unsafe { frs_db_default_cf(handle as FrsDb, &mut default_cf) };
+            if check_status(env, st, &format!("RocksDB.multiGet.defaultCf[{i}]")) {
+                return None;
+            }
+            out.push(default_cf);
+        } else {
+            let Some(frs_cf) = cf_from_java_handle(
+                env,
+                cf_handle,
+                &format!("RocksDB.multiGet.cfHandles[{i}]"),
+            ) else {
+                return None;
+            };
+            out.push(frs_cf);
+        }
+    }
+    Some(out)
+}
+
+fn multi_get_impl<'env, 'arr>(
+    env: &mut JNIEnv<'env>,
+    handle: jlong,
+    keys: &JObjectArray<'arr>,
+    offsets: &JPrimitiveArray<'arr, jint>,
+    lengths: &JPrimitiveArray<'arr, jint>,
+    cf_handles: Option<&JPrimitiveArray<'arr, jlong>>,
+) -> jobjectArray {
+    let Some(ks) = read_byte_matrix_slices(env, keys, offsets, lengths, "RocksDB.multiGet") else {
+        return ptr::null_mut();
+    };
+    let count = ks.len();
+    let Some(cf_list) = multi_get_cf_list(env, handle, cf_handles, count) else {
+        return ptr::null_mut();
+    };
+
+    let element_class = match env.find_class("[B") {
+        Ok(c) => c,
+        Err(e) => {
+            throw_rocksdb(env, &format!("RocksDB.multiGet: find_class([B): {e}"));
+            return ptr::null_mut();
+        }
+    };
+    let outer = match env.new_object_array(count as jint, &element_class, JObject::null()) {
+        Ok(a) => a,
+        Err(e) => {
+            throw_rocksdb(env, &format!("RocksDB.multiGet: new_object_array: {e}"));
+            return ptr::null_mut();
+        }
+    };
+
+    for (i, key) in ks.iter().enumerate() {
+        let mut out = FrsBytes {
+            data: ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let st = unsafe {
+            frs_get(
+                handle as FrsDb,
+                cf_list[i],
+                key.as_ptr(),
+                key.len(),
+                &mut out,
+            )
+        };
+        if st == FRS_STATUS_NOT_FOUND {
+            continue;
+        }
+        if check_status(env, st, &format!("RocksDB.multiGet[{i}]")) {
+            return ptr::null_mut();
+        }
+        if out.data.is_null() {
+            continue;
+        }
+        let s = unsafe { std::slice::from_raw_parts(out.data, out.len) };
+        let arr = match env.byte_array_from_slice(s) {
+            Ok(a) => a,
+            Err(e) => {
+                unsafe {
+                    let _ = crate::frs_bytes_free(&mut out);
+                }
+                throw_rocksdb(env, &format!("RocksDB.multiGet[{i}]: byte_array_from_slice: {e}"));
+                return ptr::null_mut();
+            }
+        };
+        if let Err(e) = env.set_object_array_element(&outer, i as jint, &arr) {
+            unsafe {
+                let _ = crate::frs_bytes_free(&mut out);
+            }
+            throw_rocksdb(env, &format!("RocksDB.multiGet[{i}]: set_object_array_element: {e}"));
+            return ptr::null_mut();
+        }
+        unsafe {
+            let _ = crate::frs_bytes_free(&mut out);
+        }
+    }
+    outer.into_raw()
+}
+
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_RocksDB_multiGet<'local>(
+pub extern "system" fn Java_org_forstdb_RocksDB_multiGet__J_3_3B_3I_3I<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
-    _ro_handle: jlong,
-    cf_handles: JPrimitiveArray<'local, jlong>,
     keys: JObjectArray<'local>,
+    offsets: JPrimitiveArray<'local, jint>,
+    lengths: JPrimitiveArray<'local, jint>,
 ) -> jobjectArray {
     jni_guard(
         &mut env,
         || ptr::null_mut() as jobjectArray,
-        |env| -> jobjectArray {
-            let Some(ks) = read_byte_matrix(env, &keys, "RocksDB.multiGet.keys") else {
-                return ptr::null_mut();
-            };
-            let count = ks.len();
+        |env| multi_get_impl(env, handle, &keys, &offsets, &lengths, None),
+    )
+}
 
-            // Resolve CF list — null cf_handles means "all default".
-            let cf_list: Vec<FrsCfHandle> = if (cf_handles.as_ref() as &JObject).is_null() {
-                if handle == 0 {
-                    throw_rocksdb(env, "RocksDB.multiGet: null DB handle and null cfHandles");
-                    return ptr::null_mut();
-                }
-                let mut default_cf: FrsCfHandle = ptr::null_mut();
-                // SAFETY: handle valid; out_cf stack-local.
-                let st = unsafe { frs_db_default_cf(handle as FrsDb, &mut default_cf) };
-                if check_status(env, st, "RocksDB.multiGet.defaultCf") {
-                    return ptr::null_mut();
-                }
-                vec![default_cf; count]
-            } else {
-                let cf_len = match env.get_array_length(&cf_handles) {
-                    Ok(n) => n as usize,
-                    Err(e) => {
-                        throw_rocksdb(env, &format!("multiGet: get_array_length(cf): {e}"));
-                        return ptr::null_mut();
-                    }
-                };
-                if cf_len != count {
-                    throw_rocksdb(
-                        env,
-                        &format!(
-                            "RocksDB.multiGet: cfHandles.length ({cf_len}) != keys.length ({count})"
-                        ),
-                    );
-                    return ptr::null_mut();
-                }
-                let mut buf = vec![0_i64; cf_len];
-                if let Err(e) = env.get_long_array_region(&cf_handles, 0, &mut buf) {
-                    throw_rocksdb(env, &format!("multiGet: read cf array: {e}"));
-                    return ptr::null_mut();
-                }
-                buf.into_iter().map(|v| v as FrsCfHandle).collect()
-            };
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_multiGet__J_3_3B_3I_3I_3J<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    keys: JObjectArray<'local>,
+    offsets: JPrimitiveArray<'local, jint>,
+    lengths: JPrimitiveArray<'local, jint>,
+    cf_handles: JPrimitiveArray<'local, jlong>,
+) -> jobjectArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut() as jobjectArray,
+        |env| multi_get_impl(env, handle, &keys, &offsets, &lengths, Some(&cf_handles)),
+    )
+}
 
-            // Build the result `byte[][]` shell.
-            let element_class = match env.find_class("[B") {
-                Ok(c) => c,
-                Err(e) => {
-                    throw_rocksdb(env, &format!("multiGet: find_class([B): {e}"));
-                    return ptr::null_mut();
-                }
-            };
-            let outer = match env.new_object_array(count as jint, &element_class, JObject::null()) {
-                Ok(a) => a,
-                Err(e) => {
-                    throw_rocksdb(env, &format!("multiGet: new_object_array: {e}"));
-                    return ptr::null_mut();
-                }
-            };
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_multiGet__JJ_3_3B_3I_3I<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _read_options_handle: jlong,
+    keys: JObjectArray<'local>,
+    offsets: JPrimitiveArray<'local, jint>,
+    lengths: JPrimitiveArray<'local, jint>,
+) -> jobjectArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut() as jobjectArray,
+        |env| multi_get_impl(env, handle, &keys, &offsets, &lengths, None),
+    )
+}
 
-            // Per-pair frs_get; nulls left in place on miss.
-            for (i, key) in ks.iter().enumerate() {
-                let mut out = FrsBytes {
-                    data: ptr::null_mut(),
-                    len: 0,
-                    capacity: 0,
-                };
-                // SAFETY: handle / cf valid; out is stack-local; key vec lives for the call.
-                let st = unsafe {
-                    frs_get(
-                        handle as FrsDb,
-                        cf_list[i],
-                        key.as_ptr(),
-                        key.len(),
-                        &mut out,
-                    )
-                };
-                if st == FRS_STATUS_NOT_FOUND {
-                    continue;
-                }
-                if check_status(env, st, &format!("RocksDB.multiGet[{i}]")) {
-                    return ptr::null_mut();
-                }
-                if out.data.is_null() {
-                    continue;
-                }
-                // SAFETY: out describes a Rust-owned buffer.
-                let s = unsafe { std::slice::from_raw_parts(out.data, out.len) };
-                let arr = match env.byte_array_from_slice(s) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        unsafe {
-                            let _ = crate::frs_bytes_free(&mut out);
-                        }
-                        throw_rocksdb(env, &format!("multiGet[{i}]: byte_array_from_slice: {e}"));
-                        return ptr::null_mut();
-                    }
-                };
-                if let Err(e) = env.set_object_array_element(&outer, i as jint, &arr) {
-                    unsafe {
-                        let _ = crate::frs_bytes_free(&mut out);
-                    }
-                    throw_rocksdb(
-                        env,
-                        &format!("multiGet[{i}]: set_object_array_element: {e}"),
-                    );
-                    return ptr::null_mut();
-                }
-                unsafe {
-                    let _ = crate::frs_bytes_free(&mut out);
-                }
-            }
-            outer.into_raw()
-        },
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_multiGet__JJ_3_3B_3I_3I_3J<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _read_options_handle: jlong,
+    keys: JObjectArray<'local>,
+    offsets: JPrimitiveArray<'local, jint>,
+    lengths: JPrimitiveArray<'local, jint>,
+    cf_handles: JPrimitiveArray<'local, jlong>,
+) -> jobjectArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut() as jobjectArray,
+        |env| multi_get_impl(env, handle, &keys, &offsets, &lengths, Some(&cf_handles)),
     )
 }
 
@@ -10042,10 +10210,13 @@ mod tests {
             "Java_org_forstdb_Statistics_disposeInternal",
             "Java_org_forstdb_Statistics_getTickerCount",
             "Java_org_forstdb_Statistics_getHistogramData",
-            // P4 — RocksDB.getProperty + multiGet (2 entries).
+            // P4 — RocksDB.getProperty + multiGet (6 entries).
             "Java_org_forstdb_RocksDB_getProperty",
             "Java_org_forstdb_RocksDB_getLongProperty",
-            "Java_org_forstdb_RocksDB_multiGet",
+            "Java_org_forstdb_RocksDB_multiGet__J_3_3B_3I_3I",
+            "Java_org_forstdb_RocksDB_multiGet__J_3_3B_3I_3I_3J",
+            "Java_org_forstdb_RocksDB_multiGet__JJ_3_3B_3I_3I",
+            "Java_org_forstdb_RocksDB_multiGet__JJ_3_3B_3I_3I_3J",
             // P3 — BlockBasedTableConfig class (7 entries).
             "Java_org_forstdb_BlockBasedTableConfig_newTableFactoryHandle",
             "Java_org_forstdb_BlockBasedTableConfig_disposeInternal",
