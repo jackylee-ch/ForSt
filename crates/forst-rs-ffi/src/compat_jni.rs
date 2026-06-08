@@ -321,6 +321,8 @@ pub fn register_jni_symbols() -> &'static str {
     "forst-rs-ffi compat_jni: Java_org_forstdb_RocksDB_* symbols active"
 }
 
+const FORSTJNI_COMPAT_VERSION: jint = (0 << 16) | (1 << 8) | 8;
+
 // ---------------------------------------------------------------------------
 // Exception helpers
 // ---------------------------------------------------------------------------
@@ -449,6 +451,17 @@ fn read_string(env: &mut JNIEnv, s: &JString) -> Option<String> {
 // ---------------------------------------------------------------------------
 // Java_org_forstdb_RocksDB_* — the actual JNI surface
 // ---------------------------------------------------------------------------
+
+/// `org.forstdb.RocksDB.version() -> int`
+///
+/// Java signature: `()I`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_version<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jint {
+    FORSTJNI_COMPAT_VERSION
+}
 
 /// `org.forstdb.RocksDB.open(String path) -> long handle`
 ///
@@ -6848,6 +6861,9 @@ mod tests {
             "Java_org_forstdb_RocksDB_getByteArray",
             // JNI library-load hook.
             "JNI_OnLoad",
+            // JNI load path calls RocksDB.version() immediately after
+            // NativeLibraryLoader resolves libforstjni.
+            "Java_org_forstdb_RocksDB_version",
             // P0 — DBOptions class (15 entries).
             "Java_org_forstdb_DBOptions_newDBOptions",
             "Java_org_forstdb_DBOptions_disposeInternal",
