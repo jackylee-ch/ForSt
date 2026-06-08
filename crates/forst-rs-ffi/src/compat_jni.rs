@@ -561,6 +561,25 @@ pub extern "system" fn Java_org_forstdb_RocksDB_close<'local>(
     )
 }
 
+/// `org.forstdb.RocksDB.disposeInternal(long handle)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let status = unsafe { frs_db_close(handle as FrsDb) };
+            check_status(env, status, "RocksDB.disposeInternal");
+        },
+    )
+}
+
 fn default_cf_for_db(env: &mut JNIEnv, handle: jlong, context: &str) -> Option<FrsCfHandle> {
     let mut cf: FrsCfHandle = ptr::null_mut();
     let status = unsafe { frs_db_default_cf(handle as FrsDb, &mut cf) };
@@ -7607,6 +7626,7 @@ mod tests {
             "Java_org_forstdb_RocksDB_open__Ljava_lang_String_2",
             "Java_org_forstdb_RocksDB_open__JLjava_lang_String_2",
             "Java_org_forstdb_RocksDB_close",
+            "Java_org_forstdb_RocksDB_disposeInternal",
             "Java_org_forstdb_RocksDB_put__J_3BII_3BII",
             "Java_org_forstdb_RocksDB_put__J_3BII_3BIIJ",
             "Java_org_forstdb_RocksDB_put__JJ_3BII_3BII",
