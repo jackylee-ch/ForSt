@@ -70,9 +70,11 @@
 //! 4. Restart the Flink TaskManager. `System.loadLibrary("forstjni")`
 //!    will now resolve into forst-rs.
 
+use std::collections::HashMap;
+use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JPrimitiveArray, JString};
 use jni::sys::{
@@ -87,12 +89,106 @@ use forst_rs_io::{FileSystem, LocalFileSystem};
 
 use crate::{
     frs_batch_get, frs_batch_put, frs_compact_all, frs_compact_cf, frs_create_checkpoint,
-    frs_db_close, frs_db_create_cf, frs_db_default_cf, frs_db_open, frs_db_open_cf,
-    frs_db_open_from_checkpoint, frs_delete, frs_flush, frs_flush_cf, frs_get, frs_iterator_close,
-    frs_iterator_next, frs_iterator_open, frs_iterator_seek, frs_l0_file_count, frs_lookup_kv,
-    frs_merge, frs_prefix_lookup_close, frs_prefix_lookup_open, frs_put, frs_sequence_number,
-    FrsBytes, FrsCfHandle, FrsDb, FrsIterator, FRS_STATUS_NOT_FOUND, FRS_STATUS_OK,
+    frs_db_close, frs_db_create_cf, frs_db_create_cf_with_merge, frs_db_default_cf, frs_db_open,
+    frs_db_open_cf, frs_db_open_from_checkpoint, frs_delete, frs_flush, frs_flush_cf, frs_get,
+    frs_iterator_close, frs_iterator_next, frs_iterator_open, frs_iterator_seek, frs_l0_file_count,
+    frs_lookup_kv, frs_merge, frs_prefix_lookup_close, frs_prefix_lookup_open, frs_put,
+    frs_sequence_number, FrsBytes, FrsCfHandle, FrsDb, FrsIterator, FRS_STATUS_NOT_FOUND,
+    FRS_STATUS_OK,
 };
+
+static DB_PATH_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+
+fn db_path_registry() -> &'static Mutex<HashMap<usize, String>> {
+    DB_PATH_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_db_path(handle: FrsDb, path: &str) {
+    if handle.is_null() {
+        return;
+    }
+    if let Ok(mut guard) = db_path_registry().lock() {
+        guard.insert(handle as usize, path.to_string());
+    }
+}
+
+fn unregister_db_path(handle: FrsDb) {
+    if handle.is_null() {
+        return;
+    }
+    if let Ok(mut guard) = db_path_registry().lock() {
+        guard.remove(&(handle as usize));
+    }
+}
+
+fn db_path_for(handle: FrsDb) -> Option<String> {
+    if handle.is_null() {
+        return None;
+    }
+    db_path_registry()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&(handle as usize)).cloned())
+}
+
+fn fallback_live_files_for_db(handle: FrsDb) -> Option<crate::FrsLiveFileList> {
+    let db_path = db_path_for(handle)?;
+    let read_dir = fs::read_dir(&db_path).ok()?;
+    let mut files = Vec::<(String, u64)>::new();
+    let mut manifest_size = 0_u64;
+
+    for entry in read_dir.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        let is_manifest = name.starts_with("MANIFEST");
+        let is_live_data = name.ends_with(".sst") || name.ends_with(".ldb");
+        let is_current = name == "CURRENT";
+        if !(is_manifest || is_live_data || is_current) {
+            continue;
+        }
+        if is_manifest {
+            manifest_size = meta.len();
+        }
+        files.push((name, meta.len()));
+    }
+
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut converted = Vec::<crate::FrsLiveFile>::with_capacity(files.len());
+    for (name, size) in files {
+        let Ok(path_c) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        let cf_c = std::ffi::CString::new("default").expect("static string has no NUL");
+        converted.push(crate::FrsLiveFile {
+            path: path_c.into_raw(),
+            size,
+            sequence: 0,
+            level: 0,
+            cf_name: cf_c.into_raw(),
+        });
+    }
+
+    let count = converted.len();
+    let ptr = if count == 0 {
+        ptr::null_mut()
+    } else {
+        let ptr = converted.as_mut_ptr();
+        std::mem::forget(converted);
+        ptr
+    };
+    Some(crate::FrsLiveFileList {
+        files: ptr,
+        count,
+        manifest_size,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Options-handle ownership module
@@ -114,6 +210,33 @@ pub(crate) mod handles {
     /// [`EngineOptions`]; per-CF overrides go through [`CfOptionsHandle`].
     pub(crate) struct DbOptionsHandle {
         pub opts: EngineOptions,
+        pub max_open_files: jint,
+        pub info_log_level: jbyte,
+        pub db_log_dir: Option<String>,
+        pub keep_log_file_num: jlong,
+        pub max_log_file_size: jlong,
+        pub statistics_handle: jlong,
+    }
+
+    impl Default for DbOptionsHandle {
+        fn default() -> Self {
+            Self {
+                opts: EngineOptions::default(),
+                // RocksDB's Java default is unlimited/open-as-needed. forst-rs
+                // does not expose a table file cache knob yet, but callers may
+                // still round-trip this value through DBOptions tests.
+                max_open_files: -1,
+                // INFO_LEVEL in org.forstdb.InfoLogLevel.
+                info_log_level: 2,
+                db_log_dir: None,
+                // RocksDB Java default. forst-rs tracing/log retention is not
+                // wired to this knob yet, but Flink config tests require the
+                // option to round-trip accurately.
+                keep_log_file_num: 1000,
+                max_log_file_size: 0,
+                statistics_handle: 0,
+            }
+        }
     }
 
     /// Java `org.forstdb.Env` mirror. forst-rs owns its filesystem/runtime
@@ -132,6 +255,12 @@ pub(crate) mod handles {
         /// Flink's setter chain happy. P3 will hydrate this into actual
         /// engine settings.
         pub table_format_handle: jlong,
+        pub compaction_style: jbyte,
+        pub level_compaction_dynamic_level_bytes: bool,
+        pub max_bytes_for_level_base: Option<usize>,
+        pub min_write_buffer_number_to_merge: jint,
+        pub compression_per_level: Vec<u8>,
+        pub arena_block_size: jlong,
     }
 
     /// Java `org.forstdb.WriteOptions` mirror. forst-rs always durably
@@ -155,6 +284,14 @@ pub(crate) mod handles {
         pub fill_cache: bool,
         #[allow(dead_code)]
         pub verify_checksums: bool,
+    }
+
+    /// Java `org.forstdb.FlushOptions` mirror. The current engine flush API
+    /// does not expose wait/stall toggles, but Flink constructs and disposes
+    /// FlushOptions when forcing DB logs/checkpoints.
+    pub(crate) struct FlushOptionsHandle {
+        pub wait_for_flush: bool,
+        pub allow_write_stall: bool,
     }
 
     /// Java `org.forstdb.ColumnFamilyHandle` mirror. Wraps the existing
@@ -278,6 +415,7 @@ pub(crate) mod handles {
     impl_into_from_raw!(CfOptionsHandle);
     impl_into_from_raw!(WriteOptionsHandle);
     impl_into_from_raw!(ReadOptionsHandle);
+    impl_into_from_raw!(FlushOptionsHandle);
     impl_into_from_raw!(CfHandle);
     impl_into_from_raw!(RocksIteratorHandle);
     impl_into_from_raw!(WriteBatchHandle);
@@ -293,11 +431,20 @@ pub(crate) mod handles {
             }
         }
     }
+
+    impl Default for FlushOptionsHandle {
+        fn default() -> Self {
+            Self {
+                wait_for_flush: true,
+                allow_write_stall: false,
+            }
+        }
+    }
 }
 
 use handles::{
-    CfHandle, CfOptionsHandle, DbOptionsHandle, EnvHandle, ReadOptionsHandle, RocksIteratorHandle,
-    WriteBatchEntry, WriteBatchHandle, WriteOptionsHandle,
+    CfHandle, CfOptionsHandle, DbOptionsHandle, EnvHandle, FlushOptionsHandle, ReadOptionsHandle,
+    RocksIteratorHandle, WriteBatchEntry, WriteBatchHandle, WriteOptionsHandle,
 };
 
 // ---------------------------------------------------------------------------
@@ -470,6 +617,115 @@ pub extern "system" fn Java_org_forstdb_RocksDB_version<'local>(
     FORSTJNI_COMPAT_VERSION
 }
 
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.Options.<init>() -> long`
+///
+/// Java signature: `()J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_newOptions__<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| DbOptionsHandle::default().into_raw(),
+    )
+}
+
+/// `org.forstdb.Options.<init>(DBOptions, ColumnFamilyOptions) -> long`
+///
+/// Java signature: `(JJ)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_newOptions__JJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    db_opts_handle: jlong,
+    _cf_opts_handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            let mut opts = DbOptionsHandle::default();
+            if let Some(db_opts) = unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) } {
+                opts.opts = db_opts.opts.clone();
+                opts.max_open_files = db_opts.max_open_files;
+                opts.info_log_level = db_opts.info_log_level;
+                opts.db_log_dir = db_opts.db_log_dir.clone();
+                opts.keep_log_file_num = db_opts.keep_log_file_num;
+                opts.max_log_file_size = db_opts.max_log_file_size;
+                opts.statistics_handle = db_opts.statistics_handle;
+            }
+            opts.into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.Options.copyOptions(long) -> long`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_copyOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            let mut opts = DbOptionsHandle::default();
+            if let Some(src) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                opts.opts = src.opts.clone();
+                opts.max_open_files = src.max_open_files;
+                opts.info_log_level = src.info_log_level;
+                opts.db_log_dir = src.db_log_dir.clone();
+                opts.keep_log_file_num = src.keep_log_file_num;
+                opts.max_log_file_size = src.max_log_file_size;
+                opts.statistics_handle = src.statistics_handle;
+            }
+            opts.into_raw()
+        },
+    )
+}
+
+/// `org.forstdb.Options.disposeInternal(long)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                unsafe { drop(Box::from_raw(handle as *mut DbOptionsHandle)) };
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Options.setCreateIfMissing(long, boolean)`
+///
+/// Java signature: `(JZ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setCreateIfMissing<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+    _value: jboolean,
+) {
+    jni_guard(&mut env, || (), |_env| {})
+}
+
 /// `org.forstdb.RocksDB.open(String path) -> long handle`
 ///
 /// Java signature: `(Ljava/lang/String;)J`
@@ -486,6 +742,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__Ljava_lang_String_2<'local
             let Some(path_str) = read_string(env, &path) else {
                 return 0_i64;
             };
+            let db_path = path_str.clone();
             let c_path = match std::ffi::CString::new(path_str) {
                 Ok(s) => s,
                 Err(_) => {
@@ -500,6 +757,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__Ljava_lang_String_2<'local
             if check_status(env, status, "RocksDB.open") {
                 return 0;
             }
+            register_db_path(handle, &db_path);
             handle as jlong
         },
     )
@@ -526,11 +784,16 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2<'loca
             let mut engine_opts = unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) }
                 .map(|h| h.opts.clone())
                 .unwrap_or_else(EngineOptions::default);
+            let db_path = path_str.clone();
             engine_opts.db_path = path_str;
 
             let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
             match DbImpl::open_with_fs(engine_opts, fs) {
-                Ok(db) => Box::into_raw(Box::new(db)) as jlong,
+                Ok(db) => {
+                    let handle = Box::into_raw(Box::new(db)) as FrsDb;
+                    register_db_path(handle, &db_path);
+                    handle as jlong
+                }
                 Err(e) => {
                     throw_rocksdb(env, &format!("RocksDB.open: {e}"));
                     0
@@ -553,6 +816,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_close<'local>(
         &mut env,
         || (),
         |env| {
+            unregister_db_path(handle as FrsDb);
             // SAFETY: handle came from a prior frs_db_open; nullity is checked
             // inside frs_db_close.
             let status = unsafe { frs_db_close(handle as FrsDb) };
@@ -586,6 +850,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_closeDatabase<'local>(
         &mut env,
         || (),
         |env| {
+            unregister_db_path(handle as FrsDb);
             let status = unsafe { frs_db_close(handle as FrsDb) };
             check_status(env, status, "RocksDB.closeDatabase");
         },
@@ -608,6 +873,39 @@ fn cf_from_java_handle(env: &mut JNIEnv, cf_handle: jlong, context: &str) -> Opt
         return None;
     };
     Some(cf.frs_handle)
+}
+
+fn cf_options_merge_operator_name(cf_options_handle: jlong) -> Option<String> {
+    if cf_options_handle == 0 {
+        return None;
+    }
+    unsafe { CfOptionsHandle::from_raw_ref(cf_options_handle) }
+        .and_then(|h| h.opts.merge_operator.clone())
+}
+
+fn create_cf_with_optional_merge(
+    env: &mut JNIEnv,
+    db: FrsDb,
+    c_name: &std::ffi::CStr,
+    merge_operator: Option<String>,
+    out_cf: &mut FrsCfHandle,
+    context: &str,
+) -> i32 {
+    if let Some(op) = merge_operator {
+        let c_op = match std::ffi::CString::new(op) {
+            Ok(s) => s,
+            Err(_) => {
+                throw_rocksdb(
+                    env,
+                    &format!("{context}: merge operator contains interior NUL"),
+                );
+                return FRS_STATUS_NOT_FOUND;
+            }
+        };
+        unsafe { frs_db_create_cf_with_merge(db, c_name.as_ptr(), c_op.as_ptr(), out_cf) }
+    } else {
+        unsafe { frs_db_create_cf(db, c_name.as_ptr(), out_cf) }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1133,30 +1431,33 @@ pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJ_3BIIJ<'local>(
     )
 }
 
-/// `org.forstdb.RocksDB.createColumnFamily(long handle, String name) -> long cfHandle`
+/// `org.forstdb.RocksDB.createColumnFamily(long handle, byte[] name,
+///                                           int nameLen, long cfOptions)
+///                                           -> long cfHandle`
 ///
-/// Java signature: `(JLjava/lang/String;)J`
+/// Java signature: `(J[BIJ)J`
 ///
-/// If the CF already exists this opens it; otherwise it creates a new
-/// one. This collapses the community API's separate
-/// `createColumnFamily` / `openColumnFamily` into one call because the
-/// Flink state backend only ever wants "give me a handle, creating if
-/// needed" semantics (each Flink state descriptor maps 1:1 to a CF).
+/// If the CF already exists this opens it; otherwise it creates a new one.
+/// The returned value must be the Java-side [`CfHandle`] wrapper, not the raw
+/// engine `FrsCfHandle`, because all later CF operations call
+/// [`cf_from_java_handle`] and expect the wrapper layout.
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_RocksDB_createColumnFamily<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
-    name: JString<'local>,
+    name: JByteArray<'local>,
+    name_len: jint,
+    _cf_options_handle: jlong,
 ) -> jlong {
     jni_guard(
         &mut env,
         || 0_i64,
         |env| {
-            let Some(s) = read_string(env, &name) else {
+            let Some(name_bytes) = read_byte_slice(env, &name, 0, name_len) else {
                 return 0_i64;
             };
-            let c_name = match std::ffi::CString::new(s) {
+            let c_name = match std::ffi::CString::new(name_bytes.clone()) {
                 Ok(s) => s,
                 Err(_) => {
                     throw_rocksdb(env, "CF name contains interior NUL");
@@ -1167,16 +1468,28 @@ pub extern "system" fn Java_org_forstdb_RocksDB_createColumnFamily<'local>(
             // Try open first, then fall back to create.
             // SAFETY: pointers valid for the call; out_cf is a stack local.
             let open_status = unsafe { frs_db_open_cf(handle as FrsDb, c_name.as_ptr(), &mut cf) };
-            if open_status == FRS_STATUS_OK {
-                return cf as jlong;
-            }
-            // SAFETY: same as above.
-            let create_status =
-                unsafe { frs_db_create_cf(handle as FrsDb, c_name.as_ptr(), &mut cf) };
-            if check_status(env, create_status, "RocksDB.createColumnFamily") {
+            let status = if open_status == FRS_STATUS_OK {
+                open_status
+            } else {
+                create_cf_with_optional_merge(
+                    env,
+                    handle as FrsDb,
+                    c_name.as_c_str(),
+                    cf_options_merge_operator_name(_cf_options_handle),
+                    &mut cf,
+                    "RocksDB.createColumnFamily",
+                )
+            };
+            if check_status(env, status, "RocksDB.createColumnFamily") {
                 return 0;
             }
-            cf as jlong
+            CfHandle {
+                name: name_bytes,
+                frs_handle: cf,
+                // The ColumnFamilyDescriptor still owns its options object.
+                owned_opts_handle: 0,
+            }
+            .into_raw()
         },
     )
 }
@@ -1199,10 +1512,20 @@ pub extern "system" fn Java_org_forstdb_RocksDB_dropColumnFamily<'local>(
         &mut env,
         || (),
         |env| {
-            // SAFETY: cf_handle came from a prior createColumnFamily; nullity
-            // checked inside frs_cf_close.
-            let status = unsafe { crate::frs_cf_close(cf_handle as FrsCfHandle) };
-            check_status(env, status, "RocksDB.dropColumnFamily");
+            let Some(cf) = (unsafe { CfHandle::from_raw_ref(cf_handle) }) else {
+                throw_rocksdb(env, "RocksDB.dropColumnFamily: null ColumnFamilyHandle");
+                return;
+            };
+            // forst-rs does not expose physical CF drop yet. Close the engine
+            // handle only if Java explicitly asks to drop; the wrapper remains
+            // owned by ColumnFamilyHandle.disposeInternal.
+            if !cf.frs_handle.is_null() {
+                let status = unsafe { crate::frs_cf_close(cf.frs_handle) };
+                if check_status(env, status, "RocksDB.dropColumnFamily") {
+                    return;
+                }
+                cf.frs_handle = ptr::null_mut();
+            }
         },
     )
 }
@@ -1215,14 +1538,43 @@ pub extern "system" fn Java_org_forstdb_RocksDB_flush<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
+    _flush_options_handle: jlong,
+    cf_handles: JPrimitiveArray<'local, jlong>,
 ) {
     jni_guard(
         &mut env,
         || (),
         |env| {
-            // SAFETY: handle came from a prior open; nullity checked inside.
-            let status = unsafe { frs_flush(handle as FrsDb) };
-            check_status(env, status, "RocksDB.flush");
+            let len = match env.get_array_length(&cf_handles) {
+                Ok(n) if n >= 0 => n as usize,
+                Ok(n) => {
+                    throw_rocksdb(
+                        env,
+                        &format!("RocksDB.flush: negative cf_handles length: {n}"),
+                    );
+                    return;
+                }
+                Err(_) => 0,
+            };
+            if len == 0 {
+                let status = unsafe { frs_flush(handle as FrsDb) };
+                check_status(env, status, "RocksDB.flush");
+                return;
+            }
+            let mut handles = vec![0_i64; len];
+            if let Err(e) = env.get_long_array_region(&cf_handles, 0, &mut handles) {
+                throw_rocksdb(env, &format!("RocksDB.flush: read cf_handles: {e}"));
+                return;
+            }
+            for cf_handle in handles {
+                let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.flush") else {
+                    return;
+                };
+                let status = unsafe { frs_flush_cf(handle as FrsDb, frs_cf) };
+                if check_status(env, status, "RocksDB.flush") {
+                    return;
+                }
+            }
         },
     )
 }
@@ -1258,24 +1610,48 @@ pub extern "system" fn Java_org_forstdb_RocksDB_createCheckpoint<'local>(
     )
 }
 
-/// `org.forstdb.RocksDB.merge(long handle, long cfHandle, byte[] key,
+fn merge_bytes(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: FrsCfHandle,
+    key: &JByteArray,
+    key_off: jint,
+    key_len: jint,
+    val: &JByteArray,
+    val_off: jint,
+    val_len: jint,
+    context: &str,
+) {
+    let Some(k) = read_byte_slice(env, key, key_off, key_len) else {
+        return;
+    };
+    let Some(v) = read_byte_slice(env, val, val_off, val_len) else {
+        return;
+    };
+    let status = unsafe {
+        frs_merge(
+            handle as FrsDb,
+            cf_handle,
+            k.as_ptr(),
+            k.len(),
+            v.as_ptr(),
+            v.len(),
+        )
+    };
+    check_status(env, status, context);
+}
+
+/// `org.forstdb.RocksDB.merge(long handle, byte[] key,
 ///                            int keyOff, int keyLen, byte[] value,
 ///                            int valueOff, int valueLen)`
 ///
-/// Java signature: `(JJ[BII[BII)V`
-///
-/// Issues a merge operand against the configured merge operator for the
-/// CF (created via `frs_db_create_cf_with_merge` from the engine side).
-/// If no operator is configured, [`frs_merge`] returns
-/// `FRS_STATUS_INVALID_ARGUMENT` and we surface that as a
-/// `RocksDBException`.
+/// Java signature: `(J[BII[BII)V`
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_org_forstdb_RocksDB_merge<'local>(
+pub extern "system" fn Java_org_forstdb_RocksDB_merge__J_3BII_3BII<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
-    cf_handle: jlong,
     key: JByteArray<'local>,
     key_off: jint,
     key_len: jint,
@@ -1287,24 +1663,149 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge<'local>(
         &mut env,
         || (),
         |env| {
-            let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
+            let Some(cf_handle) = default_cf_for_db(env, handle, "RocksDB.merge.defaultCF") else {
                 return;
             };
-            let Some(v) = read_byte_slice(env, &val, val_off, val_len) else {
+            merge_bytes(
+                env,
+                handle,
+                cf_handle,
+                &key,
+                key_off,
+                key_len,
+                &val,
+                val_off,
+                val_len,
+                "RocksDB.merge",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.merge(long handle, byte[] key,
+///                            int keyOff, int keyLen, byte[] value,
+///                            int valueOff, int valueLen, long cfHandle)`
+///
+/// Java signature: `(J[BII[BIIJ)V`
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_merge__J_3BII_3BIIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    val: JByteArray<'local>,
+    val_off: jint,
+    val_len: jint,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.merge") else {
                 return;
             };
-            // SAFETY: pointers valid for the call; engine copies what it needs.
-            let status = unsafe {
-                frs_merge(
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    k.as_ptr(),
-                    k.len(),
-                    v.as_ptr(),
-                    v.len(),
-                )
+            merge_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                key_off,
+                key_len,
+                &val,
+                val_off,
+                val_len,
+                "RocksDB.merge",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.merge(long handle, long writeOptionsHandle,
+///                            byte[] key, int keyOff, int keyLen,
+///                            byte[] value, int valueOff, int valueLen)`
+///
+/// Java signature: `(JJ[BII[BII)V`
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJ_3BII_3BII<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _write_options_handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    val: JByteArray<'local>,
+    val_off: jint,
+    val_len: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(cf_handle) = default_cf_for_db(env, handle, "RocksDB.merge.defaultCF") else {
+                return;
             };
-            check_status(env, status, "RocksDB.merge");
+            merge_bytes(
+                env,
+                handle,
+                cf_handle,
+                &key,
+                key_off,
+                key_len,
+                &val,
+                val_off,
+                val_len,
+                "RocksDB.merge",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.merge(long handle, long writeOptionsHandle,
+///                            byte[] key, int keyOff, int keyLen,
+///                            byte[] value, int valueOff, int valueLen,
+///                            long cfHandle)`
+///
+/// Java signature: `(JJ[BII[BIIJ)V`
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJ_3BII_3BIIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _write_options_handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    val: JByteArray<'local>,
+    val_off: jint,
+    val_len: jint,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.merge") else {
+                return;
+            };
+            merge_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                key_off,
+                key_len,
+                &val,
+                val_off,
+                val_len,
+                "RocksDB.merge",
+            );
         },
     )
 }
@@ -1333,9 +1834,12 @@ pub extern "system" fn Java_org_forstdb_RocksDB_compactRange<'local>(
         &mut env,
         || (),
         |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.compactRange") else {
+                return;
+            };
             // SAFETY: handles came from prior open / create calls; nullity
             // checked inside frs_compact_cf.
-            let status = unsafe { frs_compact_cf(handle as FrsDb, cf_handle as FrsCfHandle) };
+            let status = unsafe { frs_compact_cf(handle as FrsDb, frs_cf) };
             check_status(env, status, "RocksDB.compactRange");
         },
     )
@@ -1378,8 +1882,11 @@ pub extern "system" fn Java_org_forstdb_RocksDB_flushCf<'local>(
         &mut env,
         || (),
         |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.flushCf") else {
+                return;
+            };
             // SAFETY: handles came from prior open / create calls.
-            let status = unsafe { frs_flush_cf(handle as FrsDb, cf_handle as FrsCfHandle) };
+            let status = unsafe { frs_flush_cf(handle as FrsDb, frs_cf) };
             check_status(env, status, "RocksDB.flushCf");
         },
     )
@@ -2623,12 +3130,7 @@ pub extern "system" fn Java_org_forstdb_DBOptions_newDBOptions<'local>(
     jni_guard(
         &mut env,
         || 0_i64,
-        |_env| {
-            DbOptionsHandle {
-                opts: EngineOptions::default(),
-            }
-            .into_raw()
-        },
+        |_env| DbOptionsHandle::default().into_raw(),
     )
 }
 
@@ -2740,14 +3242,45 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setAvoidFlushDuringShutdown<'l
 pub extern "system" fn Java_org_forstdb_DBOptions_setDbLogDir<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: JString<'local>,
+    handle: jlong,
+    value: JString<'local>,
 ) {
     jni_guard(
         &mut env,
         || (),
-        |_env| {
+        |env| {
+            let value = read_string(env, &value);
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                h.db_log_dir = value;
+            }
             tracing::debug!(target: "compat_jni::dbopts", "setDbLogDir: forst-rs uses tracing for log routing; ignored");
+        },
+    )
+}
+
+/// `org.forstdb.DBOptions.dbLogDir(long) -> String`
+///
+/// Java signature: `(J)Ljava/lang/String;`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_dbLogDir<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jni::sys::jstring {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut(),
+        |env| {
+            let value = unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .and_then(|h| h.db_log_dir.clone())
+                .unwrap_or_default();
+            match env.new_string(value) {
+                Ok(s) => s.into_raw(),
+                Err(e) => {
+                    throw_rocksdb(env, &format!("DBOptions.dbLogDir: new_string failed: {e}"));
+                    ptr::null_mut()
+                }
+            }
         },
     )
 }
@@ -2761,14 +3294,37 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setDbLogDir<'local>(
 pub extern "system" fn Java_org_forstdb_DBOptions_setInfoLogLevel<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jint,
+    handle: jlong,
+    value: jint,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                h.info_log_level = value as jbyte;
+            }
             tracing::debug!(target: "compat_jni::dbopts", "setInfoLogLevel: forst-rs uses tracing for log levels; ignored");
+        },
+    )
+}
+
+/// `org.forstdb.DBOptions.infoLogLevel(long) -> byte`
+///
+/// Java signature: `(J)B`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_infoLogLevel<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyte {
+    jni_guard(
+        &mut env,
+        || 2_i8,
+        |_env| {
+            unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.info_log_level)
+                .unwrap_or(2)
         },
     )
 }
@@ -2810,14 +3366,65 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setMaxBackgroundJobs<'local>(
 pub extern "system" fn Java_org_forstdb_DBOptions_setMaxOpenFiles<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jint,
+    handle: jlong,
+    value: jint,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                h.max_open_files = value;
+            }
             tracing::debug!(target: "compat_jni::dbopts", "setMaxOpenFiles: forst-rs has no per-table FD cache; ignored");
+        },
+    )
+}
+
+/// `org.forstdb.DBOptions.maxOpenFiles(long) -> int`
+///
+/// Java signature: `(J)I`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_maxOpenFiles<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jint {
+    jni_guard(
+        &mut env,
+        || -1,
+        |_env| {
+            unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.max_open_files)
+                .unwrap_or(-1)
+        },
+    )
+}
+
+/// `org.forstdb.DBOptions.maxBackgroundJobs(long) -> int`
+///
+/// Java signature: `(J)I`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_maxBackgroundJobs<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jint {
+    jni_guard(
+        &mut env,
+        || {
+            let d = EngineOptions::default();
+            (d.max_background_compactions + d.max_background_flushes) as jint
+        },
+        |_env| {
+            unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| {
+                    (h.opts.max_background_compactions + h.opts.max_background_flushes) as jint
+                })
+                .unwrap_or_else(|| {
+                    let d = EngineOptions::default();
+                    (d.max_background_compactions + d.max_background_flushes) as jint
+                })
         },
     )
 }
@@ -2827,14 +3434,39 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setMaxOpenFiles<'local>(
 pub extern "system" fn Java_org_forstdb_DBOptions_setMaxLogFileSize<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jlong,
+    handle: jlong,
+    value: jlong,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
-            tracing::debug!(target: "compat_jni::dbopts", "setMaxLogFileSize: tracing-managed; ignored");
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value >= 0 {
+                    h.max_log_file_size = value;
+                }
+            }
+            tracing::debug!(target: "compat_jni::dbopts", "setMaxLogFileSize: tracing-managed; round-tripped only");
+        },
+    )
+}
+
+/// `org.forstdb.DBOptions.maxLogFileSize(long) -> long`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_maxLogFileSize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.max_log_file_size)
+                .unwrap_or(0)
         },
     )
 }
@@ -2844,14 +3476,39 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setMaxLogFileSize<'local>(
 pub extern "system" fn Java_org_forstdb_DBOptions_setKeepLogFileNum<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jlong,
+    handle: jlong,
+    value: jlong,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
-            tracing::debug!(target: "compat_jni::dbopts", "setKeepLogFileNum: tracing-managed; ignored");
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value >= 0 {
+                    h.keep_log_file_num = value;
+                }
+            }
+            tracing::debug!(target: "compat_jni::dbopts", "setKeepLogFileNum: tracing-managed; round-tripped only");
+        },
+    )
+}
+
+/// `org.forstdb.DBOptions.keepLogFileNum(long) -> long`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_keepLogFileNum<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 1000_i64,
+        |_env| {
+            unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.keep_log_file_num)
+                .unwrap_or(1000)
         },
     )
 }
@@ -2865,7 +3522,7 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setStatistics<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
-    _stats_handle: jlong,
+    stats_handle: jlong,
 ) {
     jni_guard(
         &mut env,
@@ -2873,8 +3530,29 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setStatistics<'local>(
         |_env| {
             if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
                 h.opts.enable_statistics = true;
+                h.statistics_handle = stats_handle;
             }
-            tracing::debug!(target: "compat_jni::dbopts", "setStatistics: external Statistics handle ignored; using built-in metrics");
+            tracing::debug!(target: "compat_jni::dbopts", "setStatistics: external Statistics handle round-tripped; using built-in metrics");
+        },
+    )
+}
+
+/// `org.forstdb.DBOptions.statistics(long) -> long`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_statistics<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.statistics_handle)
+                .unwrap_or(0)
         },
     )
 }
@@ -2977,6 +3655,26 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setWriteBufferSize<'
     )
 }
 
+/// `org.forstdb.ColumnFamilyOptions.writeBufferSize(long) -> long`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_writeBufferSize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || EngineOptions::default().write_buffer_size as jlong,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .and_then(|h| h.opts.write_buffer_size.map(|v| v as jlong))
+                .unwrap_or_else(|| EngineOptions::default().write_buffer_size as jlong)
+        },
+    )
+}
+
 /// `org.forstdb.ColumnFamilyOptions.setMaxWriteBufferNumber(long, int)`
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setMaxWriteBufferNumber<'local>(
@@ -2998,6 +3696,47 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setMaxWriteBufferNum
     )
 }
 
+/// `org.forstdb.ColumnFamilyOptions.setArenaBlockSize(long, long)`
+///
+/// Java signature: `(JJ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setArenaBlockSize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { CfOptionsHandle::from_raw_ref(handle) } {
+                h.arena_block_size = value;
+            }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.arenaBlockSize(long) -> long`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_arenaBlockSize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.arena_block_size)
+                .unwrap_or(0)
+        },
+    )
+}
+
 /// `org.forstdb.ColumnFamilyOptions.setMinWriteBufferNumberToMerge(long, int)`
 ///
 /// forst-rs's flush scheduler always picks the largest immutable memtable
@@ -3008,14 +3747,38 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setMinWriteBufferNum
 >(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jint,
+    handle: jlong,
+    value: jint,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
-            tracing::debug!(target: "compat_jni::cfopts", "setMinWriteBufferNumberToMerge: forst-rs has no merge-batch knob; ignored");
+            if let Some(h) = unsafe { CfOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.min_write_buffer_number_to_merge = value;
+                }
+            }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.minWriteBufferNumberToMerge(long)`
+///
+/// Java signature: `(J)I`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_minWriteBufferNumberToMerge<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jint {
+    jni_guard(
+        &mut env,
+        || 0,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.min_write_buffer_number_to_merge)
+                .unwrap_or(0)
         },
     )
 }
@@ -3030,14 +3793,44 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setLevelCompactionDy
 >(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jboolean,
+    handle: jlong,
+    value: jboolean,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
-            tracing::debug!(target: "compat_jni::cfopts", "setLevelCompactionDynamicLevelBytes: forst-rs uses static multiplier; ignored");
+            if let Some(h) = unsafe { CfOptionsHandle::from_raw_ref(handle) } {
+                h.level_compaction_dynamic_level_bytes = value != JNI_FALSE;
+            }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.levelCompactionDynamicLevelBytes(long)`
+///
+/// Java signature: `(J)Z`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_levelCompactionDynamicLevelBytes<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(
+        &mut env,
+        || JNI_FALSE,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .map(|h| {
+                    if h.level_compaction_dynamic_level_bytes {
+                        JNI_TRUE
+                    } else {
+                        JNI_FALSE
+                    }
+                })
+                .unwrap_or(JNI_FALSE)
         },
     )
 }
@@ -3051,14 +3844,58 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setLevelCompactionDy
 pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setMaxBytesForLevelBase<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jlong,
+    handle: jlong,
+    value: jlong,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
-            tracing::debug!(target: "compat_jni::cfopts", "setMaxBytesForLevelBase: per-CF override not yet supported; ignored");
+            if let Some(h) = unsafe { CfOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.max_bytes_for_level_base = Some(value as usize);
+                }
+            }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.maxBytesForLevelBase(long)`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_maxBytesForLevelBase<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .and_then(|h| h.max_bytes_for_level_base.map(|v| v as jlong))
+                .unwrap_or_else(|| EngineOptions::default().max_bytes_for_level_base as jlong)
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.maxWriteBufferNumber(long)`
+///
+/// Java signature: `(J)I`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_maxWriteBufferNumber<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jint {
+    jni_guard(
+        &mut env,
+        || 0,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .and_then(|h| h.opts.max_write_buffer_number.map(|v| v as jint))
+                .unwrap_or_else(|| EngineOptions::default().max_write_buffer_number as jint)
         },
     )
 }
@@ -3080,6 +3917,26 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setTargetFileSizeBas
                     h.opts.target_file_size_base = Some(value as usize);
                 }
             }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.targetFileSizeBase(long)`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_targetFileSizeBase<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .and_then(|h| h.opts.target_file_size_base.map(|v| v as jlong))
+                .unwrap_or_else(|| EngineOptions::default().target_file_size_base as jlong)
         },
     )
 }
@@ -3114,9 +3971,40 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setCompressionPerLev
                     return;
                 }
             };
+            h.compression_per_level = arr.clone();
             // Pick deepest non-zero level.
             if let Some(&deepest) = arr.iter().rev().find(|&&b| b != 0) {
                 h.opts.compression = Some(byte_to_compression(deepest));
+            }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.compressionPerLevel(long) -> byte[]`
+///
+/// Java signature: `(J)[B`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_compressionPerLevel<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyteArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut(),
+        |env| {
+            let levels = unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.compression_per_level.clone())
+                .unwrap_or_default();
+            match env.byte_array_from_slice(&levels) {
+                Ok(a) => a.into_raw(),
+                Err(e) => {
+                    throw_rocksdb(
+                        env,
+                        &format!("ColumnFamilyOptions.compressionPerLevel: byte_array_from_slice failed: {e}"),
+                    );
+                    ptr::null_mut()
+                }
             }
         },
     )
@@ -3131,21 +4019,89 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setCompressionPerLev
 pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setCompactionStyle<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
+    handle: jlong,
     style: jint,
 ) {
     jni_guard(
         &mut env,
         || (),
-        |env| {
-            // 0 = level (default). Anything else is unsupported.
+        |_env| {
+            if let Some(h) = unsafe { CfOptionsHandle::from_raw_ref(handle) } {
+                h.compaction_style = style as jbyte;
+            }
             if style != 0 {
                 tracing::debug!(target: "compat_jni::cfopts", "setCompactionStyle({style}): forst-rs only supports LEVEL; ignored");
-                // Do not throw — many Flink jobs blindly call setCompactionStyle(LEVEL)
-                // and we don't want to break them; the unrecognised style values fall
-                // through silently per the audit's "no-op on unsupported" rule.
-                let _ = env; // suppress unused warning
             }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.compactionStyle(long) -> byte`
+///
+/// Java signature: `(J)B`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_compactionStyle<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jbyte {
+    jni_guard(
+        &mut env,
+        || 0_i8,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.compaction_style)
+                .unwrap_or(0)
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.optimizeForPointLookup(long, long)`
+///
+/// Java signature: `(JJ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_optimizeForPointLookup<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+    _block_cache_size: jlong,
+) {
+    jni_guard(&mut env, || (), |_env| {})
+}
+
+/// `org.forstdb.ColumnFamilyOptions.setMergeOperatorName(long, String)`
+///
+/// Java signature: `(JLjava/lang/String;)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setMergeOperatorName<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    name: JString<'local>,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(h) = (unsafe { CfOptionsHandle::from_raw_ref(handle) }) else {
+                return;
+            };
+            let Some(name) = read_string(env, &name) else {
+                return;
+            };
+            h.opts.merge_operator = match name.as_str() {
+                "" => None,
+                // Flink's ForSt backend uses RocksDB's stringappendtest operator
+                // for ListState append. forst-rs exposes the same comma-delimited
+                // semantics as ListAppendMergeOperator.
+                "stringappendtest"
+                | "ListAppendMergeOperator"
+                | "ListAppendMergeOperator(delim=44)" => {
+                    Some("ListAppendMergeOperator".to_string())
+                }
+                "RawConcatMergeOperator" => Some("RawConcatMergeOperator".to_string()),
+                other => Some(other.to_string()),
+            };
         },
     )
 }
@@ -3167,6 +4123,26 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setPeriodicCompactio
                     h.opts.ttl_seconds = Some(seconds as u64);
                 }
             }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.periodicCompactionSeconds(long)`
+///
+/// Java signature: `(J)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_periodicCompactionSeconds<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            unsafe { CfOptionsHandle::from_raw_ref(handle) }
+                .and_then(|h| h.opts.ttl_seconds.map(|v| v as jlong))
+                .unwrap_or(0)
         },
     )
 }
@@ -3194,11 +4170,34 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setTableFormatConfig
     )
 }
 
-/// `org.forstdb.ColumnFamilyOptions.setCompactionFilterFactory(long, long)`
+/// `org.forstdb.ColumnFamilyOptions.setTableFactory(long, long)`
+///
+/// Java signature: `(JJ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setTableFactory<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    table_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { CfOptionsHandle::from_raw_ref(handle) } {
+                h.table_format_handle = table_handle;
+            }
+        },
+    )
+}
+
+/// `org.forstdb.ColumnFamilyOptions.setCompactionFilterFactoryHandle(long, long)`
 ///
 /// forst-rs has no compaction-filter factory layer. Accept and ignore.
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setCompactionFilterFactory<'local>(
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setCompactionFilterFactoryHandle<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     _handle: jlong,
@@ -3208,8 +4207,24 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setCompactionFilterF
         &mut env,
         || (),
         |_env| {
-            tracing::debug!(target: "compat_jni::cfopts", "setCompactionFilterFactory: not supported; ignored");
+            tracing::debug!(target: "compat_jni::cfopts", "setCompactionFilterFactoryHandle: not supported; ignored");
         },
+    )
+}
+
+/// Legacy alias used by earlier local tests.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setCompactionFilterFactory<'local>(
+    env: JNIEnv<'local>,
+    class: JClass<'local>,
+    handle: jlong,
+    factory_handle: jlong,
+) {
+    Java_org_forstdb_ColumnFamilyOptions_setCompactionFilterFactoryHandle(
+        env,
+        class,
+        handle,
+        factory_handle,
     )
 }
 
@@ -3344,6 +4359,139 @@ pub extern "system" fn Java_org_forstdb_ReadOptions_setReadaheadSize<'local>(
                 // the unsigned cast can't wrap.
                 h.readahead_size = if value < 0 { 0 } else { value as u64 };
             }
+        },
+    )
+}
+
+// ---------------------------------------------------------------------------
+// FlushOptions
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.FlushOptions.<init>() -> long`
+///
+/// Java signature: `()J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlushOptions_newFlushOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| FlushOptionsHandle::default().into_raw(),
+    )
+}
+
+/// `org.forstdb.FlushOptions.disposeInternal(long)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlushOptions_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                unsafe { drop(Box::from_raw(handle as *mut FlushOptionsHandle)) };
+            }
+        },
+    )
+}
+
+/// `org.forstdb.FlushOptions.setWaitForFlush(long, boolean)`
+///
+/// Java signature: `(JZ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlushOptions_setWaitForFlush<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jboolean,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { FlushOptionsHandle::from_raw_ref(handle) } {
+                h.wait_for_flush = value != JNI_FALSE;
+            }
+        },
+    )
+}
+
+/// `org.forstdb.FlushOptions.waitForFlush(long) -> boolean`
+///
+/// Java signature: `(J)Z`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlushOptions_waitForFlush<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(
+        &mut env,
+        || JNI_TRUE,
+        |_env| {
+            unsafe { FlushOptionsHandle::from_raw_ref(handle) }
+                .map(|h| {
+                    if h.wait_for_flush {
+                        JNI_TRUE
+                    } else {
+                        JNI_FALSE
+                    }
+                })
+                .unwrap_or(JNI_TRUE)
+        },
+    )
+}
+
+/// `org.forstdb.FlushOptions.setAllowWriteStall(long, boolean)`
+///
+/// Java signature: `(JZ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlushOptions_setAllowWriteStall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jboolean,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { FlushOptionsHandle::from_raw_ref(handle) } {
+                h.allow_write_stall = value != JNI_FALSE;
+            }
+        },
+    )
+}
+
+/// `org.forstdb.FlushOptions.allowWriteStall(long) -> boolean`
+///
+/// Java signature: `(J)Z`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlushOptions_allowWriteStall<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(
+        &mut env,
+        || JNI_FALSE,
+        |_env| {
+            unsafe { FlushOptionsHandle::from_raw_ref(handle) }
+                .map(|h| {
+                    if h.allow_write_stall {
+                        JNI_TRUE
+                    } else {
+                        JNI_FALSE
+                    }
+                })
+                .unwrap_or(JNI_FALSE)
         },
     )
 }
@@ -3624,6 +4772,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                 };
 
             let mut engine_opts = db_opts.opts.clone();
+            let db_path = path_str.clone();
             engine_opts.db_path = path_str;
 
             for &cf_opts_handle in &cf_opts_buf {
@@ -3705,7 +4854,14 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                     if open_status == FRS_STATUS_OK {
                         open_status
                     } else {
-                        unsafe { frs_db_create_cf(db_handle, c_name.as_ptr(), &mut frs_cf) }
+                        create_cf_with_optional_merge(
+                            env,
+                            db_handle,
+                            c_name.as_c_str(),
+                            cf_options_merge_operator_name(cf_opts_buf[i]),
+                            &mut frs_cf,
+                            "RocksDB.open(multi-CF)",
+                        )
                     }
                 };
                 if status != FRS_STATUS_OK {
@@ -3752,6 +4908,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                 );
                 return ptr::null_mut();
             }
+            register_db_path(db_handle, &db_path);
             result.into_raw()
         },
     )
@@ -3885,6 +5042,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
 
             // 6. Build EngineOptions (clone the caller's, override db_path).
             let mut engine_opts = db_opts.opts.clone();
+            let db_path = path_str.clone();
             engine_opts.db_path = path_str;
 
             // 6a. P3 hydration: walk every CF's CfOptionsHandle, and if it
@@ -4026,6 +5184,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                 return 0;
             }
 
+            register_db_path(db_handle, &db_path);
             db_handle as jlong
         },
     )
@@ -4050,6 +5209,7 @@ fn cleanup_partial_open(db_handle: FrsDb, partial_cf_handles: &[jlong]) {
         }
     }
     if !db_handle.is_null() {
+        unregister_db_path(db_handle);
         let _ = unsafe { frs_db_close(db_handle) };
     }
 }
@@ -4184,10 +5344,12 @@ pub extern "system" fn Java_org_forstdb_RocksDB_iterator<'local>(
                     "RocksDB.iterator: ReadOptions ({read_options_handle:#x}) ignored — engine uses default snapshot semantics"
                 );
             }
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.iterator") else {
+                return 0_i64;
+            };
             let mut iter: FrsIterator = ptr::null_mut();
             // SAFETY: db / cf came from prior open; out_iter is stack-local.
-            let status =
-                unsafe { frs_iterator_open(handle as FrsDb, cf_handle as FrsCfHandle, &mut iter) };
+            let status = unsafe { frs_iterator_open(handle as FrsDb, frs_cf, &mut iter) };
             if check_status(env, status, "RocksDB.iterator") {
                 return 0_i64;
             }
@@ -4622,6 +5784,21 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_value0<'local>(
     )
 }
 
+/// `org.forstdb.RocksIterator.status0(long handle)`
+///
+/// Java signature: `(J)V`
+///
+/// forst-rs iterator APIs surface status during seek/next calls; cached
+/// iterators do not retain a deferred error, so this is a compatibility no-op.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksIterator_status0<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+) {
+    jni_guard(&mut env, || (), |_env| {})
+}
+
 /// `org.forstdb.RocksIterator.disposeInternal(long handle)`
 ///
 /// Java signature: `(J)V`
@@ -4666,7 +5843,7 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_disposeInternal<'local>(
 /// caller's hint controls the initial capacity. Negative inputs are
 /// clamped to 0.
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_WriteBatch_newWriteBatch<'local>(
+pub extern "system" fn Java_org_forstdb_WriteBatch_newWriteBatch__I<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     reserved_bytes: jint,
@@ -4686,6 +5863,25 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_newWriteBatch<'local>(
             }
             .into_raw()
         },
+    )
+}
+
+/// `org.forstdb.WriteBatch.<init>(byte[] serialized, int len) -> long`
+///
+/// Java signature: `([BI)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_WriteBatch_newWriteBatch___3BI<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _serialized: JByteArray<'local>,
+    _serialized_len: jint,
+) -> jlong {
+    // forst-rs has no WriteBatch binary-deserialization surface. Return an
+    // empty batch rather than exposing a mismatched short JNI symbol.
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| WriteBatchHandle::default().into_raw(),
     )
 }
 
@@ -4711,122 +5907,274 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_disposeInternal<'local>(
     )
 }
 
-/// `org.forstdb.WriteBatch.put(long handle, long cfHandle, byte[] key,
-///                              int keyOff, int keyLen, byte[] val,
-///                              int valOff, int valLen)`
+fn write_batch_cf_handle(
+    env: &mut JNIEnv,
+    cf_handle: Option<jlong>,
+    context: &str,
+) -> Option<FrsCfHandle> {
+    match cf_handle {
+        Some(h) => cf_from_java_handle(env, h, context),
+        None => Some(ptr::null_mut()),
+    }
+}
+
+fn write_batch_push_put(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: Option<jlong>,
+    key: JByteArray,
+    key_len: jint,
+    val: JByteArray,
+    val_len: jint,
+    context: &str,
+) {
+    let Some(h) = (unsafe { WriteBatchHandle::from_raw_ref(handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null handle"));
+        return;
+    };
+    let Some(cf) = write_batch_cf_handle(env, cf_handle, context) else {
+        return;
+    };
+    let Some(k) = read_byte_slice(env, &key, 0, key_len) else {
+        return;
+    };
+    let Some(v) = read_byte_slice(env, &val, 0, val_len) else {
+        return;
+    };
+    h.data_size = h.data_size.saturating_add((k.len() + v.len()) as u64);
+    h.entries.push(WriteBatchEntry::Put {
+        cf,
+        key: k,
+        value: v,
+    });
+}
+
+fn write_batch_push_merge(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: Option<jlong>,
+    key: JByteArray,
+    key_len: jint,
+    val: JByteArray,
+    val_len: jint,
+    context: &str,
+) {
+    let Some(h) = (unsafe { WriteBatchHandle::from_raw_ref(handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null handle"));
+        return;
+    };
+    let Some(cf) = write_batch_cf_handle(env, cf_handle, context) else {
+        return;
+    };
+    let Some(k) = read_byte_slice(env, &key, 0, key_len) else {
+        return;
+    };
+    let Some(v) = read_byte_slice(env, &val, 0, val_len) else {
+        return;
+    };
+    h.data_size = h.data_size.saturating_add((k.len() + v.len()) as u64);
+    h.entries.push(WriteBatchEntry::Merge {
+        cf,
+        key: k,
+        value: v,
+    });
+}
+
+fn write_batch_push_delete(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: Option<jlong>,
+    key: JByteArray,
+    key_len: jint,
+    context: &str,
+) {
+    let Some(h) = (unsafe { WriteBatchHandle::from_raw_ref(handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null handle"));
+        return;
+    };
+    let Some(cf) = write_batch_cf_handle(env, cf_handle, context) else {
+        return;
+    };
+    let Some(k) = read_byte_slice(env, &key, 0, key_len) else {
+        return;
+    };
+    h.data_size = h.data_size.saturating_add(k.len() as u64);
+    h.entries.push(WriteBatchEntry::Delete { cf, key: k });
+}
+
+/// `org.forstdb.WriteBatch.put(long handle, byte[] key, int keyLen,
+///                              byte[] val, int valLen)`
 ///
-/// Java signature: `(JJ[BII[BII)V`
+/// Java signature: `(J[BI[BI)V`
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_org_forstdb_WriteBatch_put<'local>(
+pub extern "system" fn Java_org_forstdb_WriteBatch_put__J_3BI_3BI<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
-    cf_handle: jlong,
     key: JByteArray<'local>,
-    key_off: jint,
     key_len: jint,
     val: JByteArray<'local>,
-    val_off: jint,
     val_len: jint,
 ) {
     jni_guard(
         &mut env,
         || (),
         |env| {
-            let Some(h) = (unsafe { WriteBatchHandle::from_raw_ref(handle) }) else {
-                throw_rocksdb(env, "WriteBatch.put: null handle");
-                return;
-            };
-            let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
-                return;
-            };
-            let Some(v) = read_byte_slice(env, &val, val_off, val_len) else {
-                return;
-            };
-            h.data_size = h.data_size.saturating_add((k.len() + v.len()) as u64);
-            h.entries.push(WriteBatchEntry::Put {
-                cf: cf_handle as FrsCfHandle,
-                key: k,
-                value: v,
-            });
+            write_batch_push_put(
+                env,
+                handle,
+                None,
+                key,
+                key_len,
+                val,
+                val_len,
+                "WriteBatch.put",
+            )
         },
     )
 }
 
-/// `org.forstdb.WriteBatch.merge(long handle, long cfHandle, byte[] key,
-///                                int keyOff, int keyLen, byte[] val,
-///                                int valOff, int valLen)`
+/// `org.forstdb.WriteBatch.put(long handle, byte[] key, int keyLen,
+///                              byte[] val, int valLen, long cfHandle)`
 ///
-/// Java signature: `(JJ[BII[BII)V`
+/// Java signature: `(J[BI[BIJ)V`
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_org_forstdb_WriteBatch_merge<'local>(
+pub extern "system" fn Java_org_forstdb_WriteBatch_put__J_3BI_3BIJ<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
-    cf_handle: jlong,
     key: JByteArray<'local>,
-    key_off: jint,
     key_len: jint,
     val: JByteArray<'local>,
-    val_off: jint,
+    val_len: jint,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            write_batch_push_put(
+                env,
+                handle,
+                Some(cf_handle),
+                key,
+                key_len,
+                val,
+                val_len,
+                "WriteBatch.put",
+            )
+        },
+    )
+}
+
+/// `org.forstdb.WriteBatch.merge(long handle, byte[] key, int keyLen,
+///                                byte[] val, int valLen)`
+///
+/// Java signature: `(J[BI[BI)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_WriteBatch_merge__J_3BI_3BI<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key: JByteArray<'local>,
+    key_len: jint,
+    val: JByteArray<'local>,
     val_len: jint,
 ) {
     jni_guard(
         &mut env,
         || (),
         |env| {
-            let Some(h) = (unsafe { WriteBatchHandle::from_raw_ref(handle) }) else {
-                throw_rocksdb(env, "WriteBatch.merge: null handle");
-                return;
-            };
-            let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
-                return;
-            };
-            let Some(v) = read_byte_slice(env, &val, val_off, val_len) else {
-                return;
-            };
-            h.data_size = h.data_size.saturating_add((k.len() + v.len()) as u64);
-            h.entries.push(WriteBatchEntry::Merge {
-                cf: cf_handle as FrsCfHandle,
-                key: k,
-                value: v,
-            });
+            write_batch_push_merge(
+                env,
+                handle,
+                None,
+                key,
+                key_len,
+                val,
+                val_len,
+                "WriteBatch.merge",
+            )
         },
     )
 }
 
-/// `org.forstdb.WriteBatch.delete(long handle, long cfHandle, byte[] key,
-///                                 int keyOff, int keyLen)`
+/// `org.forstdb.WriteBatch.merge(long handle, byte[] key, int keyLen,
+///                                byte[] val, int valLen, long cfHandle)`
 ///
-/// Java signature: `(JJ[BII)V`
+/// Java signature: `(J[BI[BIJ)V`
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_WriteBatch_delete<'local>(
+pub extern "system" fn Java_org_forstdb_WriteBatch_merge__J_3BI_3BIJ<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
-    cf_handle: jlong,
     key: JByteArray<'local>,
-    key_off: jint,
     key_len: jint,
+    val: JByteArray<'local>,
+    val_len: jint,
+    cf_handle: jlong,
 ) {
     jni_guard(
         &mut env,
         || (),
         |env| {
-            let Some(h) = (unsafe { WriteBatchHandle::from_raw_ref(handle) }) else {
-                throw_rocksdb(env, "WriteBatch.delete: null handle");
-                return;
-            };
-            let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
-                return;
-            };
-            h.data_size = h.data_size.saturating_add(k.len() as u64);
-            h.entries.push(WriteBatchEntry::Delete {
-                cf: cf_handle as FrsCfHandle,
-                key: k,
-            });
+            write_batch_push_merge(
+                env,
+                handle,
+                Some(cf_handle),
+                key,
+                key_len,
+                val,
+                val_len,
+                "WriteBatch.merge",
+            )
+        },
+    )
+}
+
+/// `org.forstdb.WriteBatch.delete(long handle, byte[] key, int keyLen)`
+///
+/// Java signature: `(J[BI)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_WriteBatch_delete__J_3BI<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key: JByteArray<'local>,
+    key_len: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| write_batch_push_delete(env, handle, None, key, key_len, "WriteBatch.delete"),
+    )
+}
+
+/// `org.forstdb.WriteBatch.delete(long handle, byte[] key, int keyLen,
+///                                 long cfHandle)`
+///
+/// Java signature: `(J[BIJ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_WriteBatch_delete__J_3BIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key: JByteArray<'local>,
+    key_len: jint,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            write_batch_push_delete(
+                env,
+                handle,
+                Some(cf_handle),
+                key,
+                key_len,
+                "WriteBatch.delete",
+            )
         },
     )
 }
@@ -4958,6 +6306,14 @@ pub extern "system" fn Java_org_forstdb_RocksDB_write0<'local>(
                 let label = format!("RocksDB.write0[{i}]");
                 let status = match entry {
                     WriteBatchEntry::Put { cf, key, value } => {
+                        let cf = if cf.is_null() {
+                            let Some(default_cf) = default_cf_for_db(env, db_handle, &label) else {
+                                return;
+                            };
+                            default_cf
+                        } else {
+                            cf
+                        };
                         // SAFETY: db_handle / cf came from prior open;
                         // key / value vectors live for the duration of
                         // the call and the engine copies internally.
@@ -4973,6 +6329,14 @@ pub extern "system" fn Java_org_forstdb_RocksDB_write0<'local>(
                         }
                     }
                     WriteBatchEntry::Merge { cf, key, value } => {
+                        let cf = if cf.is_null() {
+                            let Some(default_cf) = default_cf_for_db(env, db_handle, &label) else {
+                                return;
+                            };
+                            default_cf
+                        } else {
+                            cf
+                        };
                         // SAFETY: same as above.
                         unsafe {
                             frs_merge(
@@ -4986,6 +6350,14 @@ pub extern "system" fn Java_org_forstdb_RocksDB_write0<'local>(
                         }
                     }
                     WriteBatchEntry::Delete { cf, key } => {
+                        let cf = if cf.is_null() {
+                            let Some(default_cf) = default_cf_for_db(env, db_handle, &label) else {
+                                return;
+                            };
+                            default_cf
+                        } else {
+                            cf
+                        };
                         // SAFETY: same as above.
                         unsafe { frs_delete(db_handle as FrsDb, cf, key.as_ptr(), key.len()) }
                     }
@@ -5512,8 +6884,21 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
         let st = unsafe {
             crate::frs_db_get_live_files(handle as FrsDb, flush_memtable != JNI_FALSE, &mut list)
         };
-        if check_status(env, st, "RocksDB.getLiveFiles.enumerate") {
-            return ptr::null_mut();
+        if st != FRS_STATUS_OK {
+            if st == crate::FRS_STATUS_INVALID_ARGUMENT {
+                match fallback_live_files_for_db(handle as FrsDb) {
+                    Some(fallback) => {
+                        list = fallback;
+                    }
+                    None => {
+                        if check_status(env, st, "RocksDB.getLiveFiles.enumerate") {
+                            return ptr::null_mut();
+                        }
+                    }
+                }
+            } else if check_status(env, st, "RocksDB.getLiveFiles.enumerate") {
+                return ptr::null_mut();
+            }
         }
 
         // Step 2: read the (possibly post-flush) sequence number.
@@ -6457,6 +7842,51 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getProperty<'local>(
     })
 }
 
+/// `org.forstdb.RocksDB.getLongProperty(long handle, long cfHandle,
+///                                      String name, int nameLen) -> long`
+///
+/// Java signature: `(JJLjava/lang/String;I)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_getLongProperty<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _cf_handle: jlong,
+    name: JString<'local>,
+    _name_len: jint,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |env| -> jlong {
+            let Some(name_str) = read_string(env, &name) else {
+                return 0;
+            };
+            match name_str.as_str() {
+                "rocksdb.num-files-at-level0" => {
+                    let mut count: u32 = 0;
+                    let st = unsafe { frs_l0_file_count(handle as FrsDb, &mut count) };
+                    if st == FRS_STATUS_OK {
+                        count as jlong
+                    } else {
+                        0
+                    }
+                }
+                "rocksdb.estimate-num-keys" => {
+                    let mut seq: u64 = 0;
+                    let st = unsafe { frs_sequence_number(handle as FrsDb, &mut seq) };
+                    if st == FRS_STATUS_OK {
+                        seq as jlong
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            }
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // RocksDB.multiGet (multi-CF)
 // ---------------------------------------------------------------------------
@@ -6880,6 +8310,33 @@ pub extern "system" fn Java_org_forstdb_BloomFilter_newBloomFilter<'local>(
     )
 }
 
+/// `org.forstdb.BloomFilter.createNewBloomFilter(double) -> long`
+///
+/// Java signature: `(D)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_BloomFilter_createNewBloomFilter<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    bits_per_key: jni::sys::jdouble,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| {
+            let bits = if bits_per_key.is_finite() && bits_per_key > 0.0 {
+                bits_per_key.round() as usize
+            } else {
+                10
+            };
+            BloomFilterHandle {
+                bits_per_key: bits,
+                block_based_mode: false,
+            }
+            .into_raw()
+        },
+    )
+}
+
 /// `org.forstdb.BloomFilter.disposeInternal(long handle)`
 ///
 /// Java signature: `(J)V`
@@ -7081,6 +8538,23 @@ pub extern "system" fn Java_org_forstdb_FlinkEnv_newFlinkEnv<'local>(
             );
             FlinkEnvHandle { fs_count: count }.into_raw()
         },
+    )
+}
+
+/// `org.forstdb.FlinkEnv.createFlinkEnv(String, Object) -> long`
+///
+/// Java signature: `(Ljava/lang/String;Ljava/lang/Object;)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_FlinkEnv_createFlinkEnv<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _path: JString<'local>,
+    _file_system: JObject<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |_env| FlinkEnvHandle { fs_count: 0 }.into_raw(),
     )
 }
 
@@ -7657,7 +9131,10 @@ mod tests {
             "Java_org_forstdb_RocksDB_flush",
             "Java_org_forstdb_RocksDB_createCheckpoint",
             // 12 additions for broader Flink-statebackend-forst coverage.
-            "Java_org_forstdb_RocksDB_merge",
+            "Java_org_forstdb_RocksDB_merge__J_3BII_3BII",
+            "Java_org_forstdb_RocksDB_merge__J_3BII_3BIIJ",
+            "Java_org_forstdb_RocksDB_merge__JJ_3BII_3BII",
+            "Java_org_forstdb_RocksDB_merge__JJ_3BII_3BIIJ",
             "Java_org_forstdb_RocksDB_compactRange",
             "Java_org_forstdb_RocksDB_compactRangeAll",
             "Java_org_forstdb_RocksDB_flushCf",
@@ -7713,23 +9190,36 @@ mod tests {
             "Java_org_forstdb_DBOptions_setMaxBackgroundJobs",
             "Java_org_forstdb_DBOptions_setMaxOpenFiles",
             "Java_org_forstdb_DBOptions_setMaxLogFileSize",
+            "Java_org_forstdb_DBOptions_maxLogFileSize",
             "Java_org_forstdb_DBOptions_setKeepLogFileNum",
+            "Java_org_forstdb_DBOptions_keepLogFileNum",
             "Java_org_forstdb_DBOptions_setStatistics",
+            "Java_org_forstdb_DBOptions_statistics",
             "Java_org_forstdb_DBOptions_setWriteBufferManager",
             "Java_org_forstdb_DBOptions_setEnv",
             // P0 — ColumnFamilyOptions class (13 entries).
             "Java_org_forstdb_ColumnFamilyOptions_newColumnFamilyOptions",
             "Java_org_forstdb_ColumnFamilyOptions_disposeInternal",
             "Java_org_forstdb_ColumnFamilyOptions_setWriteBufferSize",
+            "Java_org_forstdb_ColumnFamilyOptions_writeBufferSize",
             "Java_org_forstdb_ColumnFamilyOptions_setMaxWriteBufferNumber",
+            "Java_org_forstdb_ColumnFamilyOptions_maxWriteBufferNumber",
+            "Java_org_forstdb_ColumnFamilyOptions_setArenaBlockSize",
+            "Java_org_forstdb_ColumnFamilyOptions_arenaBlockSize",
             "Java_org_forstdb_ColumnFamilyOptions_setMinWriteBufferNumberToMerge",
+            "Java_org_forstdb_ColumnFamilyOptions_minWriteBufferNumberToMerge",
             "Java_org_forstdb_ColumnFamilyOptions_setLevelCompactionDynamicLevelBytes",
+            "Java_org_forstdb_ColumnFamilyOptions_levelCompactionDynamicLevelBytes",
             "Java_org_forstdb_ColumnFamilyOptions_setMaxBytesForLevelBase",
+            "Java_org_forstdb_ColumnFamilyOptions_maxBytesForLevelBase",
             "Java_org_forstdb_ColumnFamilyOptions_setTargetFileSizeBase",
+            "Java_org_forstdb_ColumnFamilyOptions_targetFileSizeBase",
             "Java_org_forstdb_ColumnFamilyOptions_setCompressionPerLevel",
             "Java_org_forstdb_ColumnFamilyOptions_setCompactionStyle",
             "Java_org_forstdb_ColumnFamilyOptions_setPeriodicCompactionSeconds",
+            "Java_org_forstdb_ColumnFamilyOptions_periodicCompactionSeconds",
             "Java_org_forstdb_ColumnFamilyOptions_setTableFormatConfig",
+            "Java_org_forstdb_ColumnFamilyOptions_setCompactionFilterFactoryHandle",
             "Java_org_forstdb_ColumnFamilyOptions_setCompactionFilterFactory",
             "Java_org_forstdb_ColumnFamilyOptions_tableFormatConfig",
             // P0 — WriteOptions class (3 entries).
@@ -7740,6 +9230,13 @@ mod tests {
             "Java_org_forstdb_ReadOptions_newReadOptions",
             "Java_org_forstdb_ReadOptions_disposeInternal",
             "Java_org_forstdb_ReadOptions_setReadaheadSize",
+            // P0 — FlushOptions class (5 entries).
+            "Java_org_forstdb_FlushOptions_newFlushOptions",
+            "Java_org_forstdb_FlushOptions_disposeInternal",
+            "Java_org_forstdb_FlushOptions_setWaitForFlush",
+            "Java_org_forstdb_FlushOptions_waitForFlush",
+            "Java_org_forstdb_FlushOptions_setAllowWriteStall",
+            "Java_org_forstdb_FlushOptions_allowWriteStall",
             // P0 — ColumnFamilyHandle class (3 entries).
             "Java_org_forstdb_ColumnFamilyHandle_disposeInternal",
             "Java_org_forstdb_ColumnFamilyHandle_getName0",
@@ -7757,16 +9254,21 @@ mod tests {
             "Java_org_forstdb_RocksIterator_isValid0",
             "Java_org_forstdb_RocksIterator_key0",
             "Java_org_forstdb_RocksIterator_value0",
+            "Java_org_forstdb_RocksIterator_status0",
             "Java_org_forstdb_RocksIterator_disposeInternal",
             // P1 — RocksDB iterator factory (2 entries).
             "Java_org_forstdb_RocksDB_iterator",
             "Java_org_forstdb_RocksDB_iteratorCF",
             // P1 — WriteBatch class (8 entries).
-            "Java_org_forstdb_WriteBatch_newWriteBatch",
+            "Java_org_forstdb_WriteBatch_newWriteBatch__I",
+            "Java_org_forstdb_WriteBatch_newWriteBatch___3BI",
             "Java_org_forstdb_WriteBatch_disposeInternal",
-            "Java_org_forstdb_WriteBatch_put",
-            "Java_org_forstdb_WriteBatch_merge",
-            "Java_org_forstdb_WriteBatch_delete",
+            "Java_org_forstdb_WriteBatch_put__J_3BI_3BI",
+            "Java_org_forstdb_WriteBatch_put__J_3BI_3BIJ",
+            "Java_org_forstdb_WriteBatch_merge__J_3BI_3BI",
+            "Java_org_forstdb_WriteBatch_merge__J_3BI_3BIJ",
+            "Java_org_forstdb_WriteBatch_delete__J_3BI",
+            "Java_org_forstdb_WriteBatch_delete__J_3BIJ",
             "Java_org_forstdb_WriteBatch_clear0",
             "Java_org_forstdb_WriteBatch_count0",
             "Java_org_forstdb_WriteBatch_getDataSize",
@@ -7807,6 +9309,7 @@ mod tests {
             "Java_org_forstdb_Statistics_getHistogramData",
             // P4 — RocksDB.getProperty + multiGet (2 entries).
             "Java_org_forstdb_RocksDB_getProperty",
+            "Java_org_forstdb_RocksDB_getLongProperty",
             "Java_org_forstdb_RocksDB_multiGet",
             // P3 — BlockBasedTableConfig class (7 entries).
             "Java_org_forstdb_BlockBasedTableConfig_newTableFactoryHandle",
@@ -7868,10 +9371,7 @@ mod tests {
     #[test]
     fn test_db_options_lifecycle() {
         // newDBOptions ⇒ non-zero handle.
-        let h = DbOptionsHandle {
-            opts: EngineOptions::default(),
-        }
-        .into_raw();
+        let h = DbOptionsHandle::default().into_raw();
         assert_ne!(h, 0, "DbOptionsHandle::into_raw must not return 0");
 
         // setCreateIfMissing equivalent: mutating field via from_raw_ref.
