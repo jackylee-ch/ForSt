@@ -90,7 +90,7 @@ write_buffer_size 128mb (compaction-overload → restart). Merge-collapse REFUTE
 | q17   | **74.5 (8c/32g)** | 92,000,000 | **76.7** 🔒1G | 92,000,000 | **255.7 (8c/32g)** | ✓ | **FULL PASS — 1.03× RocksDB (parity) + 3.3× FASTER than ForSt + accurate.** |
 | q18   | **396.1 (8c/32g)** | 92,000,000 | **318.1** 🔒1G | 92,000,000 | **422.8 (8c/32g)** | ✓ | **FULL PASS — 0.80× RocksDB (faster) + faster than ForSt (318<423) + accurate.** |
 | q19   | 305 (8c/32g) | 92,000,000 | **542.5** 🔒1G | 92,000,000 | (host 310.5) | ✓acc | **FAIL — 1.78× slower than RocksDB** (542 vs 305) + likely slower than ForSt. Accurate (exact). NON-join OVER-window dedup → a SECOND perf gap (not join read-amp). Architecture investigate. |
-| q20   | (pending 8c/32g) | — | **DNF @1300s** 🔒1G (59.8M/92M, rate→23.6K/s) | — | (pending) | ? | **read-amp DNF** (join). Joins q7/q9/q20 all DNF on join-probe read-amp → READ-PATH module. |
+| q20   | **800.3 (8c/32g)** | 93,201,404 | **DNF @1300s** 🔒1G (59.8M/93M, rate→23.6K/s) | — | (pending) | ✗ | **FAIL — DNF vs RocksDB 800s.** Join, OUTPUT-amplifying (auction⋈bid). NOT read-amp (n_ovl=2-3) NOT iter-decode (already zero-copy). Bottleneck = executor dispatch / output-emit (profile pending). Bar: must finish ≤1000s + beat ForSt. |
 | q21   | 59.9      | 100,000,000      | 52.6       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
 | q22   | 44.8      | 100,000,000      | 43.6       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
 
