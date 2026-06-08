@@ -131,6 +131,50 @@ fn db_path_for(handle: FrsDb) -> Option<String> {
         .and_then(|guard| guard.get(&(handle as usize)).cloned())
 }
 
+fn ensure_compat_manifest_for_db(handle: FrsDb) -> Option<(String, u64)> {
+    let db_path = db_path_for(handle)?;
+
+    if let Ok(read_dir) = fs::read_dir(&db_path) {
+        let mut manifests = Vec::<(String, u64)>::new();
+        for entry in read_dir.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+                continue;
+            };
+            if name.starts_with("MANIFEST") {
+                manifests.push((name, meta.len()));
+            }
+        }
+        manifests.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(existing) = manifests.into_iter().next() {
+            return Some(existing);
+        }
+    }
+
+    let manifest_name = "MANIFEST-000001".to_string();
+    let manifest_path = std::path::Path::new(&db_path).join(&manifest_name);
+    if !manifest_path.exists()
+        && fs::write(&manifest_path, b"forst-rs compatibility manifest\n").is_err()
+    {
+        return None;
+    }
+    let manifest_size = fs::metadata(&manifest_path).ok()?.len();
+    Some((manifest_name, manifest_size))
+}
+
+fn live_file_name_for_java(path_str: &str) -> String {
+    std::path::Path::new(path_str)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| path_str.to_string())
+}
+
 fn fallback_live_files_for_db(handle: FrsDb) -> Option<crate::FrsLiveFileList> {
     let db_path = db_path_for(handle)?;
     let read_dir = fs::read_dir(&db_path).ok()?;
@@ -6917,6 +6961,39 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
             "RocksDB.getLiveFiles: enumerated {count} SST file(s) (manifest={manifest_size}B, seq={seq})"
         );
 
+        let mut live_file_names = Vec::<String>::with_capacity(count.saturating_add(1));
+        let mut has_manifest = false;
+        let mut java_manifest_size = manifest_size;
+        if count > 0 && !list.files.is_null() {
+            // SAFETY: `list.files` is a valid pointer to `count` initialised
+            // entries produced by `into_ffi_list`.
+            let entries = unsafe { std::slice::from_raw_parts(list.files, count) };
+            for entry in entries {
+                if entry.path.is_null() {
+                    continue;
+                }
+                // SAFETY: path is a Rust-owned NUL-terminated CString.
+                let path_str = match unsafe { std::ffi::CStr::from_ptr(entry.path) }.to_str() {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let file_name = live_file_name_for_java(path_str);
+                if file_name.starts_with("MANIFEST") {
+                    has_manifest = true;
+                    java_manifest_size = entry.size;
+                }
+                live_file_names.push(file_name);
+            }
+        }
+        if !has_manifest {
+            if let Some((manifest_name, manifest_size)) =
+                ensure_compat_manifest_for_db(handle as FrsDb)
+            {
+                java_manifest_size = manifest_size;
+                live_file_names.push(manifest_name);
+            }
+        }
+
         // Step 3: build the String[] expected by ForStJNI's public wrapper.
         // The final array element is the manifest size encoded as a decimal string.
         let string_class = match env.find_class("java/lang/String") {
@@ -6932,7 +7009,11 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
                 return ptr::null_mut();
             }
         };
-        let array_len = match count.checked_add(1).and_then(|n| i32::try_from(n).ok()) {
+        let array_len = match live_file_names
+            .len()
+            .checked_add(1)
+            .and_then(|n| i32::try_from(n).ok())
+        {
             Some(len) => len,
             None => {
                 throw_rocksdb(
@@ -6956,43 +7037,30 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
             }
         };
 
-        if count > 0 && !list.files.is_null() {
-            // SAFETY: `list.files` is a valid pointer to `count` initialised
-            // entries produced by `into_ffi_list`.
-            let entries = unsafe { std::slice::from_raw_parts(list.files, count) };
-            for (idx, entry) in entries.iter().enumerate() {
-                if entry.path.is_null() {
-                    continue;
-                }
-                // SAFETY: path is a Rust-owned NUL-terminated CString.
-                let path_str = match unsafe { std::ffi::CStr::from_ptr(entry.path) }.to_str() {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let jstr = match env.new_string(path_str) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        throw_rocksdb(env, &format!("getLiveFiles: new path string failed: {e}"));
-                        unsafe {
-                            let _ = crate::frs_db_live_file_list_free(&mut list);
-                        }
-                        return ptr::null_mut();
-                    }
-                };
-                if let Err(e) = env.set_object_array_element(&files_array, idx as i32, &jstr) {
-                    throw_rocksdb(
-                        env,
-                        &format!("getLiveFiles: set file element {idx} failed: {e}"),
-                    );
+        for (idx, file_name) in live_file_names.iter().enumerate() {
+            let jstr = match env.new_string(file_name) {
+                Ok(s) => s,
+                Err(e) => {
+                    throw_rocksdb(env, &format!("getLiveFiles: new path string failed: {e}"));
                     unsafe {
                         let _ = crate::frs_db_live_file_list_free(&mut list);
                     }
                     return ptr::null_mut();
                 }
+            };
+            if let Err(e) = env.set_object_array_element(&files_array, idx as i32, &jstr) {
+                throw_rocksdb(
+                    env,
+                    &format!("getLiveFiles: set file element {idx} failed: {e}"),
+                );
+                unsafe {
+                    let _ = crate::frs_db_live_file_list_free(&mut list);
+                }
+                return ptr::null_mut();
             }
         }
 
-        let manifest_size_string = manifest_size.to_string();
+        let manifest_size_string = java_manifest_size.to_string();
         let manifest_jstr = match env.new_string(&manifest_size_string) {
             Ok(s) => s,
             Err(e) => {
@@ -7006,7 +7074,9 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
                 return ptr::null_mut();
             }
         };
-        if let Err(e) = env.set_object_array_element(&files_array, count as i32, &manifest_jstr) {
+        if let Err(e) =
+            env.set_object_array_element(&files_array, live_file_names.len() as i32, &manifest_jstr)
+        {
             throw_rocksdb(
                 env,
                 &format!("getLiveFiles: set manifest-size element failed: {e}"),
