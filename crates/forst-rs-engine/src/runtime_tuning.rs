@@ -129,7 +129,7 @@ pub struct WriteBufferManager {
     current: AtomicU64,
     /// FRS-GLOBAL-WBM-BUDGET: when `true`, reservations also charge the
     /// process-global [`GLOBAL_WBM_USED`] sum and `over_budget()` additionally
-    /// fires when that global sum exceeds [`global_wbm_cap_bytes`]. Enabled by the
+    /// fires when that global sum exceeds `global_wbm_cap_bytes`. Enabled by the
     /// engine open path (`new_global`); `false` for the bare `new` used by tests
     /// and standalone callers (keeps their per-instance semantics + test isolation).
     use_global: bool,
@@ -148,7 +148,7 @@ impl WriteBufferManager {
 
     /// FRS-GLOBAL-WBM-BUDGET: like [`Self::new`] but also enrolls this manager in
     /// the PROCESS-GLOBAL memtable budget. `local_capacity_bytes` stays the
-    /// per-instance secondary bound; the global cap ([`global_wbm_cap_bytes`])
+    /// per-instance secondary bound; the global cap (`global_wbm_cap_bytes`)
     /// bounds the TOTAL across all instances so memtable RAM cannot scale with
     /// instance count. The engine open path uses this.
     pub fn new_global(local_capacity_bytes: u64) -> Arc<Self> {

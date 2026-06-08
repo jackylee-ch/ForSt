@@ -49,11 +49,11 @@ fn key(i: u64) -> Vec<u8> {
 /// The correct final value of `key(i)` after the full workload below, computed
 /// independently of the engine (latest-write-wins by round order).
 fn expected(i: u64) -> Option<Vec<u8>> {
-    if i % 7 == 0 {
+    if i.is_multiple_of(7) {
         Some(format!("r4:{i}").into_bytes()) // round 4 (latest) overwrite
-    } else if i % 5 == 0 {
+    } else if i.is_multiple_of(5) {
         None // round 3 delete (no later write)
-    } else if i % 2 == 0 {
+    } else if i.is_multiple_of(2) {
         Some(format!("r2:{i}").into_bytes()) // round 2 overwrite
     } else {
         Some(format!("r1:{i}").into_bytes()) // round 1 only
@@ -73,13 +73,13 @@ fn kv_format_full_lifecycle_matches_ground_truth() {
     db.list_live_files(true).expect("flush r1");
 
     // Round 2: overwrite even keys. Flush → L0 SST #2.
-    for i in (0..N).filter(|i| i % 2 == 0) {
+    for i in (0..N).filter(|i| i.is_multiple_of(2)) {
         db.put(&cf, &key(i), format!("r2:{i}").as_bytes()).unwrap();
     }
     db.list_live_files(true).expect("flush r2");
 
     // Round 3: delete every 5th key (tombstones across tiers). Flush → L0 #3.
-    for i in (0..N).filter(|i| i % 5 == 0) {
+    for i in (0..N).filter(|i| i.is_multiple_of(5)) {
         db.delete(&cf, &key(i)).unwrap();
     }
     db.list_live_files(true).expect("flush r3");
@@ -91,7 +91,7 @@ fn kv_format_full_lifecycle_matches_ground_truth() {
     // Round 4: latest overwrites for every 7th key — these post-compaction
     // writes live in the active memtable, so reads must merge memtable over
     // the compacted SST tier. (Note i%7==0 wins even where i%5==0 deleted.)
-    for i in (0..N).filter(|i| i % 7 == 0) {
+    for i in (0..N).filter(|i| i.is_multiple_of(7)) {
         db.put(&cf, &key(i), format!("r4:{i}").as_bytes()).unwrap();
     }
 

@@ -354,8 +354,7 @@ impl FlinkTtlCompactionFilter {
         let last_access_ms = u64::from_be_bytes(buf);
         let now = (self.current_time_supplier)();
         let expiration_ms = last_access_ms.saturating_add(self.ttl_ms);
-        let expired = expiration_ms <= now;
-        expired
+        expiration_ms <= now
     }
 
     fn list_unexpired_offset(&self, value: &[u8]) -> usize {

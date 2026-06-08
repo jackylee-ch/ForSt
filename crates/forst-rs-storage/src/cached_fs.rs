@@ -710,8 +710,7 @@ pub mod read_at_diag {
     }
 
     // Buckets by latency: [<1µs, <2µs, <5µs, <20µs, <100µs, >=100µs].
-    const Z: AtomicU64 = AtomicU64::new(0);
-    static BUCKETS: [AtomicU64; 6] = [Z; 6];
+    static BUCKETS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
     static COUNT: AtomicU64 = AtomicU64::new(0);
     static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 
@@ -733,7 +732,7 @@ pub mod read_at_diag {
         TOTAL_NS.fetch_add(ns, Ordering::Relaxed);
         let c = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
         // Dump every 2^20 reads to the TM log.
-        if c % (1 << 20) == 0 {
+        if c.is_multiple_of(1 << 20) {
             let bk: Vec<u64> = BUCKETS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
             let total = TOTAL_NS.load(Ordering::Relaxed);
             // "warm" = served from page cache without a disk fault (< 20µs);

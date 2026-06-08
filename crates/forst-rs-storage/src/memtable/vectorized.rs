@@ -857,11 +857,11 @@ impl VectorizedMemTable {
     /// the visible versions), stopping at the highest-seq `Put`/`Delete` base.
     ///
     /// Returns:
-    ///   * `Ok(Some(Some(v)))` — a `Put` base (value `v`) terminates the chain.
-    ///   * `Ok(Some(None))`    — a `Delete`/`SingleDelete` base terminates it.
-    ///   * `Ok(None)`          — no terminal in THIS memtable; the operands
-    ///                           collected so far stand and the caller continues
-    ///                           to older tiers (imm / SST) for the base.
+    /// * `Ok(Some(Some(v)))` — a `Put` base (value `v`) terminates the chain.
+    /// * `Ok(Some(None))`    — a `Delete`/`SingleDelete` base terminates it.
+    /// * `Ok(None)`          — no terminal in THIS memtable; the operands
+    ///   collected so far stand and the caller continues
+    ///   to older tiers (imm / SST) for the base.
     pub fn collect_merge_operands(
         &self,
         key: &[u8],

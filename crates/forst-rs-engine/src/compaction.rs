@@ -745,7 +745,7 @@ impl CompactionJob {
                                 }
                             }
                             // Newest-first within the key (index 0 = newest).
-                            group.sort_by(|a, b| b.effective_seq().cmp(&a.effective_seq()));
+                            group.sort_by_key(|b| std::cmp::Reverse(b.effective_seq()));
                             self.emit_key_versions(&mut writer, &group, &mut file_emitted)?;
                         }
 

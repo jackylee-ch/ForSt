@@ -90,7 +90,7 @@ mod cursor_diag {
 
     pub fn hit(k: usize) -> bool {
         static CTR: AtomicU64 = AtomicU64::new(0);
-        k > 0 && CTR.fetch_add(1, Ordering::Relaxed) % (k as u64) == 0
+        k > 0 && CTR.fetch_add(1, Ordering::Relaxed).is_multiple_of(k as u64)
     }
 
     pub fn record(scan_ns: u64, sort_ns: u64) {
@@ -100,7 +100,7 @@ mod cursor_diag {
         SCAN.fetch_add(scan_ns, Ordering::Relaxed);
         SORT.fetch_add(sort_ns, Ordering::Relaxed);
         let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 8192 == 0 {
+        if n.is_multiple_of(8192) {
             eprintln!(
                 "[CURSOR_DIAG] samples={n} avg_ns scan(range+unsorted-filter)={} sort={}",
                 SCAN.load(Ordering::Relaxed) / n,

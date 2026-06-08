@@ -64,6 +64,9 @@ use std::sync::Arc;
 /// Number of entries per restart interval (full key stored every K entries).
 pub const KV_RESTART_INTERVAL: usize = 16;
 
+/// Result row returned by [`KvDataBlock::lookup`].
+pub type KvLookupResult = Option<(Option<Vec<u8>>, u64, OpType)>;
+
 /// C (2026-06-04): whether the SST WRITE path should emit v2 KV data blocks
 /// instead of v1 Arrow-IPC blocks. Default = `false` (v1 — the safe default
 /// until v2 is proven). `FRS_SST_KV_BLOCK_FORMAT=1` flips writers (flush +
@@ -368,8 +371,8 @@ impl KvBlock {
     /// Highest-sequence visible row for *exactly* `key` (or `None`). Mirrors the
     /// v1 `get` semantics: returns the raw value (`None` for a tombstone) of the
     /// max-sequence matching row. Early-terminates once the scan passes `key`.
-    pub fn lookup(&self, key: &[u8]) -> ForstResult<Option<(Option<Vec<u8>>, u64, OpType)>> {
-        let mut best: Option<(Option<Vec<u8>>, u64, OpType)> = None;
+    pub fn lookup(&self, key: &[u8]) -> ForstResult<KvLookupResult> {
+        let mut best: KvLookupResult = None;
         let mut best_seq = 0u64;
         self.walk_key(key, |value_range, sequence, op_byte, payload| {
             if best.is_none() || sequence > best_seq {
@@ -674,8 +677,11 @@ mod tests {
     use crate::sst::schema::sst_schema;
     use std::sync::Arc;
 
+    type TestRow<'a> = (&'a [u8], Option<&'a [u8]>, u64, OpType);
+    type OwnedTestRow = (Vec<u8>, Option<Vec<u8>>, u64, OpType);
+
     /// Builds an SST-schema RecordBatch from rows, preserving order.
-    fn make_batch(rows: &[(&[u8], Option<&[u8]>, u64, OpType)]) -> RecordBatch {
+    fn make_batch(rows: &[TestRow<'_>]) -> RecordBatch {
         let keys: Vec<&[u8]> = rows.iter().map(|r| r.0).collect();
         let vals: Vec<Option<&[u8]>> = rows.iter().map(|r| r.1).collect();
         let seqs: Vec<u64> = rows.iter().map(|r| r.2).collect();
@@ -693,7 +699,7 @@ mod tests {
     }
 
     /// Drains a KvBlock into owned rows for assertion.
-    fn collect(kv: &KvBlock) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64, OpType)> {
+    fn collect(kv: &KvBlock) -> Vec<OwnedTestRow> {
         let mut out = Vec::new();
         kv.for_each_row(|v| {
             out.push((
@@ -709,7 +715,7 @@ mod tests {
     }
 
     /// Drains a KvBlock via the pull cursor for assertion.
-    fn collect_cursor(kv: Arc<KvBlock>) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64, OpType)> {
+    fn collect_cursor(kv: Arc<KvBlock>) -> Vec<OwnedTestRow> {
         let mut out = Vec::new();
         let mut c = KvBlockCursor::new(kv).unwrap();
         while c.valid() {
@@ -727,7 +733,7 @@ mod tests {
     #[test]
     fn kv_block_cursor_matches_for_each_row() {
         // (a) prefix + tombstone + empty-value block
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = vec![
+        let rows: Vec<TestRow<'_>> = vec![
             (b"user:1", Some(b"alice".as_ref()), 10, OpType::Put),
             (b"user:2", Some(b"".as_ref()), 9, OpType::Put),
             (b"user:3", None, 8, OpType::Delete),
@@ -752,7 +758,7 @@ mod tests {
         // Shared prefixes ("user:1" / "user:2"), a tombstone (None), and an
         // empty-but-present value (Some(&[])) — the last must NOT collapse to
         // a tombstone.
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = vec![
+        let rows: Vec<TestRow<'_>> = vec![
             (b"user:1", Some(b"alice".as_ref()), 10, OpType::Put),
             (b"user:2", Some(b"".as_ref()), 9, OpType::Put),
             (b"user:3", None, 8, OpType::Delete),
@@ -765,7 +771,7 @@ mod tests {
         let kv = KvBlock::decode(&block, true).unwrap();
         let got = collect(&kv);
 
-        let want: Vec<(Vec<u8>, Option<Vec<u8>>, u64, OpType)> = vec![
+        let want: Vec<OwnedTestRow> = vec![
             (b"user:1".to_vec(), Some(b"alice".to_vec()), 10, OpType::Put),
             (b"user:2".to_vec(), Some(b"".to_vec()), 9, OpType::Put),
             (b"user:3".to_vec(), None, 8, OpType::Delete),
@@ -778,7 +784,7 @@ mod tests {
     /// prefix-compression + restart boundaries + binary-search seek.
     fn big_block() -> Vec<u8> {
         let keys: Vec<Vec<u8>> = (0..50).map(|i| format!("key{i:04}").into_bytes()).collect();
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = keys
+        let rows: Vec<TestRow<'_>> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| {
@@ -852,7 +858,7 @@ mod tests {
 
     #[test]
     fn lz4_roundtrip_matches_uncompressed() {
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = (0..40)
+        let rows: Vec<TestRow<'_>> = (0..40)
             .map(|_| {
                 (
                     b"k".as_ref(),
@@ -864,7 +870,7 @@ mod tests {
             .collect::<Vec<_>>();
         // distinct keys
         let keys: Vec<Vec<u8>> = (0..40).map(|i| format!("key{i:03}").into_bytes()).collect();
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = keys
+        let rows: Vec<TestRow<'_>> = keys
             .iter()
             .zip(rows.iter())
             .map(|(k, r)| (k.as_slice(), r.1, r.2, r.3))
@@ -880,7 +886,7 @@ mod tests {
     #[test]
     fn mvcc_duplicate_keys_preserve_seq_descending_order() {
         // Same key, 3 versions newest-first (key ASC, seq DESC on-disk order).
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = vec![
+        let rows: Vec<TestRow<'_>> = vec![
             (b"k", Some(b"v3".as_ref()), 30, OpType::Put),
             (b"k", Some(b"v2".as_ref()), 20, OpType::Merge),
             (b"k", Some(b"v1".as_ref()), 10, OpType::Put),
@@ -909,8 +915,7 @@ mod tests {
 
     #[test]
     fn checksum_gate_rejects_corruption_only_when_verifying() {
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> =
-            vec![(b"a", Some(b"x".as_ref()), 1, OpType::Put)];
+        let rows: Vec<TestRow<'_>> = vec![(b"a", Some(b"x".as_ref()), 1, OpType::Put)];
         let batch = make_batch(&rows);
         let mut block = encode_kv_data_block(&batch, CompressionType::None).unwrap();
         // Flip a payload byte (just past the 16-byte header) — corrupts the crc.
@@ -935,7 +940,7 @@ mod tests {
         // restarts, or it skips the newest (earliest-on-disk) versions. This
         // reproduces the v2-compaction point-read regression (got v103, want
         // newest) at the unit level.
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = (0..50u64)
+        let rows: Vec<TestRow<'_>> = (0..50u64)
             .map(|i| (b"k".as_ref(), Some(b"v".as_ref()), 50 - i, OpType::Put))
             .collect();
         let batch = make_batch(&rows);
@@ -958,7 +963,7 @@ mod tests {
 
     #[test]
     fn lookup_returns_max_seq_version_and_collect_returns_all() {
-        let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = vec![
+        let rows: Vec<TestRow<'_>> = vec![
             (b"a", Some(b"a1".as_ref()), 5, OpType::Put),
             (b"k", Some(b"newest".as_ref()), 30, OpType::Put),
             (b"k", Some(b"mid".as_ref()), 20, OpType::Merge),

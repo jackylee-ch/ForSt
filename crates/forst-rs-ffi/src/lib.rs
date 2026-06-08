@@ -2702,7 +2702,6 @@ pub unsafe extern "C" fn frs_batch_get_arrow(
 /// returned, sorted in ascending byte-wise order. Callers should therefore
 /// treat the zero-length prefix as a potentially unbounded operation.
 ///
-
 /// This is the W26 fast-path for DeltaJoin Lookup: Java consumers can
 /// wrap the returned arrays with `FFI_ArrowArray` / `FFI_ArrowSchema`
 /// pointers and iterate them without further per-row copies.

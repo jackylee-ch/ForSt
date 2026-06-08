@@ -69,6 +69,7 @@ impl WorkerPool {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn worker_count(&self) -> usize {
         self.workers.len()
     }

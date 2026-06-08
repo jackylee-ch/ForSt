@@ -387,7 +387,7 @@ impl SstReaderImpl {
         let bs = block_size as usize;
 
         thread_local! {
-            static SCRATCH: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
 
         let decoded = SCRATCH.with(|cell| -> ForstResult<DecodedBlock> {

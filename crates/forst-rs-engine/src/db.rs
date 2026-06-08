@@ -170,7 +170,7 @@ fn bulk_sample_k() -> usize {
 /// Returns true on every K-th call (the sampled builds).
 fn bulk_sample_hit(k: usize) -> bool {
     static CTR: AtomicU64 = AtomicU64::new(0);
-    k > 0 && CTR.fetch_add(1, Ordering::Relaxed) % (k as u64) == 0
+    k > 0 && CTR.fetch_add(1, Ordering::Relaxed).is_multiple_of(k as u64)
 }
 
 /// Accumulate one sampled build's sub-phase ns; dump running averages every 8192
@@ -220,7 +220,7 @@ fn bulk_record(
     RSEEKS.fetch_add(resident_seeks, Ordering::Relaxed);
     TOTAL.fetch_add(total, Ordering::Relaxed);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n % W == 0 {
+    if n.is_multiple_of(W) {
         // Windowed: swap each accumulator to 0 so the NEXT window starts fresh →
         // each dump is this window's per-probe mean (early vs late = the decay).
         let take = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) / W;
@@ -540,7 +540,7 @@ pub struct DbImpl {
     /// flush) that closes the q4-vs-RocksDB gap. See `crate::wal`.
     wal: Mutex<Option<crate::wal::WalWriter>>,
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): diagnostic counter — number of L0 SST
-    /// data-block reads performed during point `get`s inside [`Self::sst_get`].
+    /// data-block reads performed during point `get`s inside `Self::sst_get`.
     /// The L0 walk now visits files newest-first and STOPS at the first
     /// Put/Delete base, so an overwrite key present in every L0 SST costs ONE
     /// block read instead of O(L0). This was the q11/q4 read-amplification
@@ -2152,7 +2152,7 @@ impl DbImpl {
     }
 
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): cumulative count of L0 SST data-block
-    /// reads performed during point `get`s (see [`Self::sst_get`] and the
+    /// reads performed during point `get`s (see `Self::sst_get` and the
     /// `l0_point_get_block_reads` field). A monotonically-increasing diagnostic
     /// the regression test snapshots before/after a `get` to assert that a hot
     /// overwrite key present in N L0 SSTs is resolved with ONE block read
@@ -8324,7 +8324,7 @@ impl DbImpl {
     }
 
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): consumes one SST `LookupResult` during
-    /// [`Self::sst_get`]'s L0 walk. Returns `Break(value)` when a Put/Delete base
+    /// `Self::sst_get`'s L0 walk. Returns `Break(value)` when a Put/Delete base
     /// is reached (the value, with any accumulated merge operands applied) — the
     /// caller stops walking older L0 SSTs; `Continue` when a Merge operand was
     /// pushed and the walk must proceed to the next-older version. The arms are
