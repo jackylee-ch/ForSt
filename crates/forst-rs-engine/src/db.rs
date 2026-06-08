@@ -242,15 +242,15 @@ fn bulk_record(
         let rtot = take_sum(&RTOTAL);
         let rseek = take_sum(&RSEEKS);
         let resident = bl + cu; // B = Tier-2 resident-shadow (bloom + cursor)
-        // FRS-A-SPLIT: A_fanout = A_locate (overlapping_ssts_in_range) + A_sstloop
-        // (per-SST get_or_open + may_contain_range prune + first_block_ge). n_ovl
-        // = mean overlapping-SST count (n_ovl_l0 of which are L0): if n_ovl_l0
-        // dominates+grows ⇒ L0 compaction-starved (trigger lever); if the DEEP
-        // remainder (n_ovl - n_ovl_l0) grows ⇒ multi-level spread (merge lever).
-        // FRS-B-SPLIT: B_resident broken into n_res (resident shadows examined)
-        // + n_seek (those passing the bloom into a BTreeMap seek). If n_res grows
-        // ⇒ count-driven (shrink the shadow set); if n_res flat but bloom/cursor
-        // rise ⇒ per-seek-cost-driven (the seek/bloom itself is the lever).
+                                // FRS-A-SPLIT: A_fanout = A_locate (overlapping_ssts_in_range) + A_sstloop
+                                // (per-SST get_or_open + may_contain_range prune + first_block_ge). n_ovl
+                                // = mean overlapping-SST count (n_ovl_l0 of which are L0): if n_ovl_l0
+                                // dominates+grows ⇒ L0 compaction-starved (trigger lever); if the DEEP
+                                // remainder (n_ovl - n_ovl_l0) grows ⇒ multi-level spread (merge lever).
+                                // FRS-B-SPLIT: B_resident broken into n_res (resident shadows examined)
+                                // + n_seek (those passing the bloom into a BTreeMap seek). If n_res grows
+                                // ⇒ count-driven (shrink the shadow set); if n_res flat but bloom/cursor
+                                // rise ⇒ per-seek-cost-driven (the seek/bloom itself is the lever).
         let sstloop = ss.saturating_sub(lo);
         let nov_deep = nov.saturating_sub(novl0);
         eprintln!(
@@ -632,10 +632,10 @@ impl DbImpl {
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
         maybe_start_mem_diag(); // FRS_MEM_DIAG: pinpoint engine resident native (join-OOM 16GB)
         let block_cache = shared_block_cache(cache_bytes); // FRS-ROCKSDB-PARITY C3: slot-shared
-        // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
-        // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
-        // shared-WriteBufferManager model), not 512 MiB × instance-count. The
-        // configured capacity stays the per-instance secondary bound.
+                                                           // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
+                                                           // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
+                                                           // shared-WriteBufferManager model), not 512 MiB × instance-count. The
+                                                           // configured capacity stays the per-instance secondary bound.
         let write_buffer_manager =
             WriteBufferManager::new_global(options.write_buffer_manager_capacity_bytes);
 
@@ -3652,9 +3652,13 @@ impl DbImpl {
         for cf_data in cfs {
             // Drain anything still pending (e.g. imms from
             // `force_switch_memtable` that bypassed the queue) so callers
-            // see a fully-flushed state.
+            // see a fully-flushed state. Empty imms can be produced by older
+            // compatibility paths; if flushing one makes progress by popping
+            // it, keep draining the rest of the queue.
             while cf_data.imm_count() > 0 {
-                if self.flush_cf_data(&cf_data)?.is_none() {
+                let before = cf_data.imm_count();
+                let flushed = self.flush_cf_data(&cf_data)?;
+                if flushed.is_none() && cf_data.imm_count() >= before {
                     break;
                 }
             }
@@ -3697,6 +3701,9 @@ impl DbImpl {
                 guard.values().cloned().collect()
             };
             for cf_data in &cfs {
+                if cf_data.active_memtable().num_entries() == 0 {
+                    continue;
+                }
                 let handle = cf_data.handle().clone();
                 self.force_switch_memtable(&handle)?;
             }
@@ -3772,7 +3779,6 @@ impl DbImpl {
         let cf_data = self.lookup_cf_by_id(cf.id())?;
         self.compact_range_for_cf(&cf_data)
     }
-
 
     /// Runs compaction for every column family. For each CF, this drains
     /// every L0 file and then keeps picking any level that exceeds its
@@ -3853,7 +3859,11 @@ impl DbImpl {
                 continue;
             }
 
-            if bottom_level > 0 && version.levels[bottom_level].files.iter().any(|f| f.cf_id == cf_id)
+            if bottom_level > 0
+                && version.levels[bottom_level]
+                    .files
+                    .iter()
+                    .any(|f| f.cf_id == cf_id)
             {
                 if let Some(meta) = self.compact_bottommost_for_cf(cf_data)? {
                     last_meta = Some(meta);
@@ -4905,10 +4915,10 @@ impl DbImpl {
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
         maybe_start_mem_diag(); // FRS_MEM_DIAG: pinpoint engine resident native (join-OOM 16GB)
         let block_cache = shared_block_cache(cache_bytes); // FRS-ROCKSDB-PARITY C3: slot-shared
-        // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
-        // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
-        // shared-WriteBufferManager model), not 512 MiB × instance-count. The
-        // configured capacity stays the per-instance secondary bound.
+                                                           // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
+                                                           // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
+                                                           // shared-WriteBufferManager model), not 512 MiB × instance-count. The
+                                                           // configured capacity stays the per-instance secondary bound.
         let write_buffer_manager =
             WriteBufferManager::new_global(options.write_buffer_manager_capacity_bytes);
 
@@ -5908,7 +5918,13 @@ impl DbImpl {
                     )
                 })
                 .unwrap_or((0, 0));
-            wamp_record_compaction(total_input_bytes_diag, out_bytes, l1_files, l1_bytes, run_ms);
+            wamp_record_compaction(
+                total_input_bytes_diag,
+                out_bytes,
+                l1_files,
+                l1_bytes,
+                run_ms,
+            );
         }
 
         // FRS-COMPACT-PHASE-DIAG: attribute the stall — merge+local-write (run_ms)
@@ -5927,8 +5943,16 @@ impl DbImpl {
             // collapse; rows_in≈rows_out with in≈out but cumulative-in inflated
             // across compactions ⇒ write-amp (Lever A).
             let run_ns = (run_ms as f64) * 1.0e6;
-            let ns_per_byte = if total_input_bytes_diag > 0 { run_ns / total_input_bytes_diag as f64 } else { 0.0 };
-            let ns_per_row = if total_input_rows > 0 { run_ns / total_input_rows as f64 } else { 0.0 };
+            let ns_per_byte = if total_input_bytes_diag > 0 {
+                run_ns / total_input_bytes_diag as f64
+            } else {
+                0.0
+            };
+            let ns_per_row = if total_input_rows > 0 {
+                run_ns / total_input_rows as f64
+            } else {
+                0.0
+            };
             eprintln!(
                 "[COMPACT_PHASE] in={in_mb:.0}MiB out={out_mb:.0}MiB rows_in={total_input_rows} rows_out={out_rows} run_ms={run_ms} upload_ms={upload_ms} ns/byte={ns_per_byte:.1} ns/row={ns_per_row:.0} out_files={}",
                 edit.new_files.len()
@@ -7010,11 +7034,19 @@ impl DbImpl {
             return Ok(None);
         }
 
-        // Peek at the oldest imm without popping; if it's empty, return early.
+        // Peek at the oldest imm without popping. Empty imms are legal no-op
+        // artifacts from force-switch compatibility paths; drop them without
+        // surfacing FlushJob's invalid-argument error.
         let imm_list = cf_data.imm_memtables();
         let Some(oldest) = imm_list.first().cloned() else {
             return Ok(None);
         };
+        if oldest.num_entries() == 0 {
+            cf_data.pop_oldest_imm();
+            self.write_controller
+                .set_imm_count(cf_data.imm_count() as u32);
+            return Ok(None);
+        }
 
         // Allocate a fresh file number and build the flush job.
         let file_number = self.version_set.allocate_file_number();
@@ -7342,7 +7374,10 @@ impl DbImpl {
             }
         }
         let Some(weak) = self.self_weak.get().cloned() else {
-            self.compaction_queued.lock().expect("lock poisoned").remove(&cf_id);
+            self.compaction_queued
+                .lock()
+                .expect("lock poisoned")
+                .remove(&cf_id);
             return;
         };
         bg_compact_pool().submit(Box::new(move || {
@@ -7473,8 +7508,8 @@ impl DbImpl {
         // (64) → writers hard-stop → pipeline freeze → restart (observed: q17 froze
         // at a 16 MiB floor). 256 MiB keeps forced SSTs large so L0 stays shallow.
         const WBM_FORCE_SWITCH_FLOOR: usize = 256 * 1024 * 1024;
-        let force_for_budget = usage >= WBM_FORCE_SWITCH_FLOOR
-            && self.write_buffer_manager.over_budget();
+        let force_for_budget =
+            usage >= WBM_FORCE_SWITCH_FLOOR && self.write_buffer_manager.over_budget();
         if usage < threshold && !force_for_budget {
             return Ok(false);
         }
@@ -8380,8 +8415,11 @@ impl DbImpl {
         // cannot skip any), this turns O(L0) data-block reads into ONE — the
         // q11/q4 read-amplification decay once the working set spills past the
         // resident RAM shadow.
-        let mut l0: Vec<&SstFileMeta> =
-            version.l0_files().iter().filter(|s| s.cf_id == cf_id).collect();
+        let mut l0: Vec<&SstFileMeta> = version
+            .l0_files()
+            .iter()
+            .filter(|s| s.cf_id == cf_id)
+            .collect();
         l0.sort_by(|a, b| {
             b.max_sequence
                 .cmp(&a.max_sequence)
@@ -8392,9 +8430,7 @@ impl DbImpl {
         // externally-ingested SSTs landing in L0 with non-monotonic sequences;
         // if that is ever observed we fall back to the read-all + global-sort
         // walk, which is correct regardless of file ordering.
-        let l0_disjoint = l0
-            .windows(2)
-            .all(|w| w[0].min_sequence > w[1].max_sequence);
+        let l0_disjoint = l0.windows(2).all(|w| w[0].min_sequence > w[1].max_sequence);
 
         if l0_disjoint {
             // Newest-first lazy walk: a Put/Delete base resolves the read and we
@@ -9381,8 +9417,16 @@ impl CompactionExecutor for DbImpl {
         if let Some(t) = t0 {
             let v = self.version_set.current();
             let l0_after = v.l0_files().iter().filter(|f| f.cf_id == cf_id).count();
-            let l1_after = v.levels[1].files.iter().filter(|f| f.cf_id == cf_id).count();
-            let l2_after = v.levels.get(2).map(|l| l.files.iter().filter(|f| f.cf_id == cf_id).count()).unwrap_or(0);
+            let l1_after = v.levels[1]
+                .files
+                .iter()
+                .filter(|f| f.cf_id == cf_id)
+                .count();
+            let l2_after = v
+                .levels
+                .get(2)
+                .map(|l| l.files.iter().filter(|f| f.cf_id == cf_id).count())
+                .unwrap_or(0);
             eprintln!(
                 "[COMPACT_DIAG t={}ms] cf={} l0 {l0_before}->{l0_after} l1={l1_after} l2={l2_after} drained_l1={drained_l1} dur_ms={} ok={}",
                 process_elapsed_ms(),
@@ -9402,7 +9446,10 @@ impl CompactionExecutor for DbImpl {
 fn process_elapsed_ms() -> u128 {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis()
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
 }
 
 /// FRS-COMPACT-DIAG toggle (`FRS_COMPACT_DIAG=1`), cached.
@@ -9617,13 +9664,20 @@ fn shared_block_cache(cache_bytes: usize) -> std::sync::Arc<ShardedClockCache> {
 /// forst-rs↔ForSt architecture gap-map. Cumulative ns/bytes, RELAXED atomics on COARSE
 /// seams (flush/compaction/stall — not per-tiny-op, so `Instant::now()` overhead is
 /// negligible and the measurement isn't perturbed). Formatted into the FRS_MEM_DIAG line.
-pub(crate) static PROF_STALL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static PROF_FLUSH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static PROF_FLUSH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static PROF_FLUSH_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static PROF_COMPACT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static PROF_COMPACT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static PROF_COMPACT_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_STALL_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_FLUSH_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_FLUSH_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_FLUSH_CNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_COMPACT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_COMPACT_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_COMPACT_CNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
 pub(crate) fn prof_add(c: &std::sync::atomic::AtomicU64, n: u64) {
@@ -9640,8 +9694,16 @@ fn prof_diag_str() -> String {
     let comp_ms = PROF_COMPACT_NS.load(Relaxed) / 1_000_000;
     let comp_mb = PROF_COMPACT_BYTES.load(Relaxed) / (1024 * 1024);
     let comp_cnt = PROF_COMPACT_CNT.load(Relaxed);
-    let flush_msmb = if flush_mb > 0 { flush_ms as f64 / flush_mb as f64 } else { 0.0 };
-    let comp_msmb = if comp_mb > 0 { comp_ms as f64 / comp_mb as f64 } else { 0.0 };
+    let flush_msmb = if flush_mb > 0 {
+        flush_ms as f64 / flush_mb as f64
+    } else {
+        0.0
+    };
+    let comp_msmb = if comp_mb > 0 {
+        comp_ms as f64 / comp_mb as f64
+    } else {
+        0.0
+    };
     // SST-writer sub-cost split (gap-map Task 1: buffer vs encode vs sink-write).
     let (sst_buf_ns, sst_enc_ns, sst_w_ns) = forst_rs_storage::sst::writer::sst_writer_prof_ns();
     let sst_buf_ms = sst_buf_ns / 1_000_000;
@@ -10621,16 +10683,29 @@ mod tests {
         let cf_data = db.lookup_cf_by_id(cf.id()).unwrap();
         let version = db.version_set.current();
         let layout: Vec<usize> = (0..version.num_levels())
-            .map(|l| version.levels[l].files.iter().filter(|s| s.cf_id == cf.id()).count())
+            .map(|l| {
+                version.levels[l]
+                    .files
+                    .iter()
+                    .filter(|s| s.cf_id == cf.id())
+                    .count()
+            })
             .collect();
         assert!(
-            version.l0_files().iter().filter(|s| s.cf_id == cf.id()).count() >= N,
+            version
+                .l0_files()
+                .iter()
+                .filter(|s| s.cf_id == cf.id())
+                .count()
+                >= N,
             "expected at least {N} L0 SSTs each holding 'hot'; per-level layout = {layout:?}"
         );
 
         let before = db.l0_point_get_block_reads();
         let mut operands = Vec::new();
-        let got = db.sst_get(&cf_data, &version, b"hot", &mut operands).unwrap();
+        let got = db
+            .sst_get(&cf_data, &version, b"hot", &mut operands)
+            .unwrap();
         let reads = db.l0_point_get_block_reads() - before;
 
         assert_eq!(
@@ -10717,7 +10792,11 @@ mod tests {
             all.len()
         );
         for (i, (k, v)) in all.iter().enumerate() {
-            assert_eq!(k.as_slice(), key(i).as_bytes(), "scan key order wrong at {i}");
+            assert_eq!(
+                k.as_slice(),
+                key(i).as_bytes(),
+                "scan key order wrong at {i}"
+            );
             assert_eq!(v.as_slice(), val(i).as_bytes(), "scan value wrong at {i}");
         }
     }
@@ -12237,11 +12316,7 @@ mod tests {
 
         let keys: Vec<&[u8]> = vec![&b"a"[..], &b"b"[..], &b"c"[..]];
         let vals: Vec<Option<&[u8]>> = vec![Some(&b"1"[..]), Some(&b"2"[..]), None];
-        let ops = vec![
-            OpType::Put as u8,
-            OpType::Put as u8,
-            OpType::Delete as u8,
-        ];
+        let ops = vec![OpType::Put as u8, OpType::Put as u8, OpType::Delete as u8];
         db.batch_put_borrowed_single_cf(&cf, &keys, &vals, &ops)
             .unwrap();
         db.wal_sync().unwrap(); // durability barrier (checkpoint does this in prod)
@@ -12252,7 +12327,10 @@ mod tests {
         assert_eq!(scan.records[0].key, b"a");
         assert_eq!(scan.records[0].value, Some(b"1".to_vec()));
         assert_eq!(scan.records[2].key, b"c");
-        assert_eq!(scan.records[2].value, None, "batch delete logged as tombstone");
+        assert_eq!(
+            scan.records[2].value, None,
+            "batch delete logged as tombstone"
+        );
         assert_eq!(scan.records[1].sequence, scan.records[0].sequence + 1);
         assert_eq!(scan.records[2].sequence, scan.records[1].sequence + 1);
     }
@@ -12263,7 +12341,10 @@ mod tests {
     fn wal_phase2_disabled_by_default_is_noop() {
         let db = open();
         let cf = db.default_cf();
-        assert!(db.wal.lock().unwrap().is_none(), "WAL off unless FRS_WAL_DIR set");
+        assert!(
+            db.wal.lock().unwrap().is_none(),
+            "WAL off unless FRS_WAL_DIR set"
+        );
         db.put(&cf, b"k", b"v").unwrap();
         assert_eq!(db.get(&cf, b"k").unwrap(), Some(b"v".to_vec()));
     }
@@ -12371,7 +12452,9 @@ mod tests {
         );
         assert_eq!(db.get(&cf, b"m:p").unwrap().unwrap(), b"P");
         // The merge head resolved to a non-empty concatenation including base.
-        assert!(scanned.iter().any(|(k, v)| k.as_slice() == b"m:k" && !v.is_empty()));
+        assert!(scanned
+            .iter()
+            .any(|(k, v)| k.as_slice() == b"m:k" && !v.is_empty()));
     }
 
     /// C8-H1 regression: the BORROWING `prefix_scan_iter` must also see
@@ -12965,9 +13048,8 @@ mod tests {
 
         let now = Arc::new(std::sync::atomic::AtomicU64::new(50));
         let now_for_filter = Arc::clone(&now);
-        let supplier: crate::compaction_filter::CurrentTimeSupplier = Arc::new(move || {
-            now_for_filter.load(std::sync::atomic::Ordering::Relaxed)
-        });
+        let supplier: crate::compaction_filter::CurrentTimeSupplier =
+            Arc::new(move || now_for_filter.load(std::sync::atomic::Ordering::Relaxed));
         let filter = Arc::new(FlinkTtlCompactionFilter::with_supplier(
             100,
             TtlStateType::Value,

@@ -107,8 +107,8 @@ pub use column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHa
 pub use compaction::{compaction_output_path, CompactionJob};
 pub use compaction_filter::{
     decode_ttl_payload, encode_ttl_value, CompactionDecision, CompactionFilter,
-    CurrentTimeSupplier, FlinkTtlCompactionFilter, ListElementOffsetSupplier,
-    TtlCompactionFilter, TtlStateType,
+    CurrentTimeSupplier, FlinkTtlCompactionFilter, ListElementOffsetSupplier, TtlCompactionFilter,
+    TtlStateType,
 };
 pub use db::{DbImpl, IncrementalCheckpointResult, LiveFileInfo, DEFAULT_CF_NAME};
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};

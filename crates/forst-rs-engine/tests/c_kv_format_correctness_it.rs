@@ -115,7 +115,10 @@ fn kv_format_full_lifecycle_matches_ground_truth() {
     }
     let got: Vec<(Vec<u8>, Vec<u8>)> = db.scan(&cf, b"", None).expect("scan");
     let want_vec: Vec<(Vec<u8>, Vec<u8>)> = want.into_iter().collect();
-    assert_eq!(got, want_vec, "full scan must equal the live ground-truth set");
+    assert_eq!(
+        got, want_vec,
+        "full scan must equal the live ground-truth set"
+    );
 
     // --- Bounded range scan correctness. ---
     let lo = key(100);

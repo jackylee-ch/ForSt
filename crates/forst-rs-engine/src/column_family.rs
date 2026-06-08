@@ -1065,7 +1065,8 @@ mod tests {
             let val = vec![0u8; 256];
             for i in 0..1000u64 {
                 let key = format!("k{:08}-{}", i, seq).into_bytes();
-                mt.put_with_seq(&key, Some(&val), 1, seq * 1_000_000 + i).unwrap();
+                mt.put_with_seq(&key, Some(&val), 1, seq * 1_000_000 + i)
+                    .unwrap();
             }
             mt
         };
@@ -1073,7 +1074,10 @@ mod tests {
         let m2 = big(2);
         let m3 = big(3);
         let one = m1.memory_usage();
-        assert!(one > 100_000, "expected a large memtable for a robust signal, got {one}");
+        assert!(
+            one > 100_000,
+            "expected a large memtable for a robust signal, got {one}"
+        );
 
         let used_before = global_resident_shadow_used_bytes();
         // Per-CF cap generous (no per-CF FIFO evict); global default 2 GiB >> 3×one

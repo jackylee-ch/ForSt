@@ -366,7 +366,9 @@ impl FlinkTtlCompactionFilter {
         if let Some(fixed_element_length) = self.fixed_element_length.filter(|len| *len > 0) {
             let mut offset = 0usize;
             while offset < value.len() {
-                let ts_end = offset.saturating_add(self.timestamp_offset).saturating_add(8);
+                let ts_end = offset
+                    .saturating_add(self.timestamp_offset)
+                    .saturating_add(8);
                 if value.len() < ts_end {
                     break;
                 }
@@ -446,7 +448,10 @@ impl CompactionFilter for FlinkTtlCompactionFilter {
         // that differ in `ttl_ms`, `state_type`, or `timestamp_offset`
         // are distinct identities and must not be admitted as
         // "homogeneous" across CFs.
-        let list_filter = match (self.fixed_element_length, self.list_element_offset_supplier.is_some()) {
+        let list_filter = match (
+            self.fixed_element_length,
+            self.list_element_offset_supplier.is_some(),
+        ) {
             (Some(len), _) => format!("fixed:{len}"),
             (None, true) => "callback".to_string(),
             (None, false) => "none".to_string(),

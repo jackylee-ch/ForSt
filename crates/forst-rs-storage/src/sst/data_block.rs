@@ -425,11 +425,15 @@ mod tests {
         // Valid block: both verify modes decode correctly.
         let ok_block = arrow::buffer::Buffer::from_vec(encoded.clone());
         assert_eq!(
-            decode_data_block_zerocopy(&ok_block, true).unwrap().num_rows(),
+            decode_data_block_zerocopy(&ok_block, true)
+                .unwrap()
+                .num_rows(),
             2
         );
         assert_eq!(
-            decode_data_block_zerocopy(&ok_block, false).unwrap().num_rows(),
+            decode_data_block_zerocopy(&ok_block, false)
+                .unwrap()
+                .num_rows(),
             2
         );
 
@@ -440,7 +444,10 @@ mod tests {
 
         // verify=true → checksum mismatch rejected.
         let err = decode_data_block_zerocopy(&bad_block, true);
-        assert!(err.is_err(), "verify=true must reject a corrupt-checksum block");
+        assert!(
+            err.is_err(),
+            "verify=true must reject a corrupt-checksum block"
+        );
         assert!(format!("{}", err.unwrap_err()).contains("checksum mismatch"));
 
         // verify=false → checksum skipped; the intact payload decodes correctly.

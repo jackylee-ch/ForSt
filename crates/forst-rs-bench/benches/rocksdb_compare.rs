@@ -247,7 +247,9 @@ fn bench_range_scan_multilevel(c: &mut Criterion) {
         for i in 0..N {
             let k = format!("k{:08}", i);
             let v = format!("v{:08}-w{}", i, w);
-            frs_db.put(&frs_cf, k.as_bytes(), v.as_bytes()).expect("put");
+            frs_db
+                .put(&frs_cf, k.as_bytes(), v.as_bytes())
+                .expect("put");
         }
         let _ = frs_db.switch_and_flush(&frs_cf);
     }
@@ -336,7 +338,9 @@ fn bench_hot_prefix_churn(c: &mut Criterion) {
                 frs_db.delete(&frs_cf, k.as_bytes()).expect("del");
             }
             let v = format!("v{:08}-r{}", i, r);
-            frs_db.put(&frs_cf, k.as_bytes(), v.as_bytes()).expect("put");
+            frs_db
+                .put(&frs_cf, k.as_bytes(), v.as_bytes())
+                .expect("put");
         }
         let _ = frs_db.switch_and_flush(&frs_cf);
     }
@@ -362,7 +366,9 @@ fn bench_hot_prefix_churn(c: &mut Criterion) {
                 rocks_db.delete_cf(&rocks_cf, k.as_bytes()).expect("del");
             }
             let v = format!("v{:08}-r{}", i, r);
-            rocks_db.put_cf(&rocks_cf, k.as_bytes(), v.as_bytes()).expect("put");
+            rocks_db
+                .put_cf(&rocks_cf, k.as_bytes(), v.as_bytes())
+                .expect("put");
         }
         rocks_db.flush_cf(&rocks_cf).expect("flush");
     }

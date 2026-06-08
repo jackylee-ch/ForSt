@@ -1107,7 +1107,10 @@ fn fadvise_dontneed(path: &std::path::Path) {
     // opt-in via FRS_FADVISE=1 for environments where dropping written-SST pages helps.
     static ON: OnceLock<bool> = OnceLock::new();
     let on = *ON.get_or_init(|| {
-        matches!(std::env::var("FRS_FADVISE").ok().as_deref(), Some("1") | Some("true"))
+        matches!(
+            std::env::var("FRS_FADVISE").ok().as_deref(),
+            Some("1") | Some("true")
+        )
     });
     if !on {
         return;

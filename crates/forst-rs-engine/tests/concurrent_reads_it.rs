@@ -84,8 +84,9 @@ fn concurrent_batch_get_correct_and_safe() {
                 let cf = db.default_cf();
                 for _round in 0..3u32 {
                     // batch-get a window of keys (the executor's multiget path)
-                    let keys: Vec<Vec<u8>> =
-                        (0..256).map(|i| format!("k{:06}", i).into_bytes()).collect();
+                    let keys: Vec<Vec<u8>> = (0..256)
+                        .map(|i| format!("k{:06}", i).into_bytes())
+                        .collect();
                     let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
                     let res = db.batch_get(&cf, &key_refs).unwrap();
                     for (i, r) in res.iter().enumerate() {

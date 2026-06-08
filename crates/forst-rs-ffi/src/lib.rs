@@ -63,7 +63,8 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
+pub static MALLOC_CONF: &[u8] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
 
 /// JNI compatibility shim — exports `Java_org_forstdb_RocksDB_*` symbols
 /// so the resulting cdylib is a drop-in for the community
@@ -4904,7 +4905,11 @@ fn shard_for(handle: u64) -> &'static Mutex<HashMap<u64, IterHandle>> {
 /// `next_row()` returned `None`) vs merely buffer-full (a row was `put_back`).
 /// The `exhausted` flag lets callers eagerly free the iterator's heavy backing
 /// state via [`IterHandle::drop_inner`] — see FRS-ITER-EAGER-FREE.
-unsafe fn fill_chunk_from_iter(iter: &mut IterHandle, buf: *mut u8, cap: usize) -> (u32, u32, bool) {
+unsafe fn fill_chunk_from_iter(
+    iter: &mut IterHandle,
+    buf: *mut u8,
+    cap: usize,
+) -> (u32, u32, bool) {
     // Aborted iters return an empty chunk — preserve the abort semantic
     // (treated as exhausted so callers free the shell).
     if iter.is_aborted() {

@@ -887,9 +887,8 @@ mod tests {
         let cache = Arc::new(cache);
         let nfiles = 8usize;
         let fsize = 64 * 1024usize;
-        let content = |f: usize| -> Vec<u8> {
-            (0..fsize).map(|i| ((f * 131 + i) & 0xff) as u8).collect()
-        };
+        let content =
+            |f: usize| -> Vec<u8> { (0..fsize).map(|i| ((f * 131 + i) & 0xff) as u8).collect() };
         let contents: Arc<Vec<Vec<u8>>> = Arc::new((0..nfiles).map(content).collect());
         for f in 0..nfiles {
             cache.put(&format!("/db/{f}.sst"), &contents[f]).unwrap();

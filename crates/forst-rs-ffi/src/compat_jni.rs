@@ -86,7 +86,9 @@ use jni::sys::{
 use jni::{JNIEnv, JavaVM};
 
 use forst_rs_common::{CfOptions, CompressionType, EngineOptions};
-use forst_rs_engine::{ColumnFamilyHandle, CompactionFilter, DbImpl, FlinkTtlCompactionFilter};
+use forst_rs_engine::{
+    ColumnFamilyDescriptor, ColumnFamilyHandle, CompactionFilter, DbImpl, FlinkTtlCompactionFilter,
+};
 use forst_rs_io::{FileSystem, LocalFileSystem};
 
 use crate::{
@@ -152,9 +154,19 @@ fn unregister_flink_env_base(handle: jlong) {
     }
 }
 
+fn compat_livefiles_debug_enabled() -> bool {
+    std::env::var_os("FORST_JNI_DEBUG_LIVEFILES").is_some()
+}
+
 fn register_db_path(handle: FrsDb, path: &str) {
     if handle.is_null() {
         return;
+    }
+    if compat_livefiles_debug_enabled() {
+        eprintln!(
+            "FORST_JNI_DEBUG_LIVEFILES register_db_path handle={} path={}",
+            handle as usize, path
+        );
     }
     if let Ok(mut guard) = db_path_registry().lock() {
         guard.insert(handle as usize, path.to_string());
@@ -239,40 +251,133 @@ fn db_path_for(handle: FrsDb) -> Option<String> {
         .and_then(|guard| guard.get(&(handle as usize)).cloned())
 }
 
-fn ensure_compat_manifest_for_db(handle: FrsDb) -> Option<(String, u64)> {
-    let db_path = db_path_for(handle)?;
-
-    if let Ok(read_dir) = fs::read_dir(&db_path) {
-        let mut manifests = Vec::<(String, u64)>::new();
-        for entry in read_dir.flatten() {
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
-                continue;
-            };
-            if name.starts_with("MANIFEST") {
-                manifests.push((name, meta.len()));
-            }
-        }
-        manifests.sort_by(|a, b| a.0.cmp(&b.0));
-        if let Some(existing) = manifests.into_iter().next() {
-            return Some(existing);
-        }
-    }
-
-    let manifest_name = "MANIFEST-000001".to_string();
-    let manifest_path = std::path::Path::new(&db_path).join(&manifest_name);
-    if !manifest_path.exists()
-        && fs::write(&manifest_path, b"forst-rs compatibility manifest\n").is_err()
-    {
+unsafe fn db_arc_from_handle_for_compat(handle: FrsDb) -> Option<Arc<DbImpl>> {
+    if handle.is_null() {
         return None;
     }
-    let manifest_size = fs::metadata(&manifest_path).ok()?.len();
-    Some((manifest_name, manifest_size))
+    let ptr = handle as *const Arc<DbImpl>;
+    Some((*ptr).clone())
+}
+
+const COMPAT_MANIFEST_FILE_NAME: &str = "MANIFEST-000001";
+const CHECKPOINT_BLOB_FILE_NAME: &str = forst_rs_engine::checkpoint::CHECKPOINT_BLOB_NAME;
+
+fn write_checkpoint_blob_as_compat_manifest(handle: FrsDb, db_path: &str) -> Option<(String, u64)> {
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "forst-rs-compat-manifest-{}-{}",
+        handle as usize,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).ok()?;
+
+    let tmp_dir_str = tmp_dir.to_string_lossy().into_owned();
+    let Some(db) = (unsafe { db_arc_from_handle_for_compat(handle) }) else {
+        if compat_livefiles_debug_enabled() {
+            eprintln!(
+                "FORST_JNI_DEBUG_LIVEFILES checkpoint missing db handle={}",
+                handle as usize
+            );
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return None;
+    };
+    if let Err(e) = db.create_checkpoint(std::path::Path::new(&tmp_dir_str)) {
+        if compat_livefiles_debug_enabled() {
+            eprintln!("FORST_JNI_DEBUG_LIVEFILES checkpoint error handle={} db_path={} tmp_dir={} error={}", handle as usize, db_path, tmp_dir_str, e);
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return None;
+    }
+
+    let src = tmp_dir.join(CHECKPOINT_BLOB_FILE_NAME);
+    let dst = std::path::Path::new(db_path).join(COMPAT_MANIFEST_FILE_NAME);
+    let copied = match fs::copy(&src, &dst) {
+        Ok(copied) => copied,
+        Err(e) => {
+            if compat_livefiles_debug_enabled() {
+                eprintln!("FORST_JNI_DEBUG_LIVEFILES copy manifest failed handle={} src={} dst={} error={}", handle as usize, src.display(), dst.display(), e);
+            }
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return None;
+        }
+    };
+    let size = fs::metadata(&dst).map(|m| m.len()).unwrap_or(copied);
+    if compat_livefiles_debug_enabled() {
+        eprintln!(
+            "FORST_JNI_DEBUG_LIVEFILES manifest alias ok handle={} db_path={} dst={} size={}",
+            handle as usize,
+            db_path,
+            dst.display(),
+            size
+        );
+    }
+    let _ = fs::remove_dir_all(&tmp_dir);
+    Some((COMPAT_MANIFEST_FILE_NAME.to_string(), size))
+}
+
+fn ensure_compat_manifest_for_db(handle: FrsDb) -> Option<(String, u64)> {
+    let Some(db_path) = db_path_for(handle) else {
+        if compat_livefiles_debug_enabled() {
+            eprintln!(
+                "FORST_JNI_DEBUG_LIVEFILES missing db_path handle={}",
+                handle as usize
+            );
+        }
+        return None;
+    };
+    write_checkpoint_blob_as_compat_manifest(handle, &db_path).or_else(|| {
+        let manifest_path = std::path::Path::new(&db_path).join(COMPAT_MANIFEST_FILE_NAME);
+        let existing = fs::metadata(&manifest_path)
+            .ok()
+            .map(|meta| (COMPAT_MANIFEST_FILE_NAME.to_string(), meta.len()));
+        if compat_livefiles_debug_enabled() {
+            eprintln!(
+                "FORST_JNI_DEBUG_LIVEFILES manifest fallback handle={} db_path={} existing={:?}",
+                handle as usize, db_path, existing
+            );
+        }
+        existing
+    })
+}
+
+fn prepare_checkpoint_blob_alias_for_open(db_path: &str) -> bool {
+    let db_path = std::path::Path::new(db_path);
+    let checkpoint_blob = db_path.join(CHECKPOINT_BLOB_FILE_NAME);
+    if checkpoint_blob.exists() {
+        return true;
+    }
+
+    let manifest_name = fs::read_to_string(db_path.join("CURRENT"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.starts_with("MANIFEST"))
+        .unwrap_or_else(|| COMPAT_MANIFEST_FILE_NAME.to_string());
+    let manifest_path = db_path.join(manifest_name);
+    if !manifest_path.exists() {
+        return false;
+    }
+
+    fs::copy(&manifest_path, &checkpoint_blob).is_ok()
+}
+
+fn open_db_with_optional_checkpoint(
+    engine_opts: EngineOptions,
+    db_path: &str,
+    fs: Arc<dyn FileSystem>,
+) -> forst_rs_common::ForstResult<Arc<DbImpl>> {
+    if prepare_checkpoint_blob_alias_for_open(db_path) {
+        DbImpl::open_from_checkpoint_with_default_cf(
+            engine_opts,
+            fs,
+            ColumnFamilyDescriptor::new("default"),
+        )
+    } else {
+        DbImpl::open_with_fs(engine_opts, fs)
+    }
 }
 
 fn live_file_name_for_java(path_str: &str) -> String {
@@ -366,6 +471,8 @@ pub(crate) mod handles {
         pub info_log_level: jbyte,
         pub db_log_dir: Option<String>,
         pub env_base_path: Option<String>,
+        pub create_if_missing: bool,
+        pub create_missing_column_families: bool,
         pub keep_log_file_num: jlong,
         pub max_log_file_size: jlong,
         pub statistics_handle: jlong,
@@ -383,12 +490,31 @@ pub(crate) mod handles {
                 info_log_level: 2,
                 db_log_dir: None,
                 env_base_path: None,
+                create_if_missing: false,
+                create_missing_column_families: false,
                 // RocksDB Java default. forst-rs tracing/log retention is not
                 // wired to this knob yet, but Flink config tests require the
                 // option to round-trip accurately.
                 keep_log_file_num: 1000,
                 max_log_file_size: 0,
                 statistics_handle: 0,
+            }
+        }
+    }
+
+    impl DbOptionsHandle {
+        pub(crate) fn clone_for_jni(&self) -> Self {
+            Self {
+                opts: self.opts.clone(),
+                max_open_files: self.max_open_files,
+                info_log_level: self.info_log_level,
+                db_log_dir: self.db_log_dir.clone(),
+                env_base_path: self.env_base_path.clone(),
+                create_if_missing: self.create_if_missing,
+                create_missing_column_families: self.create_missing_column_families,
+                keep_log_file_num: self.keep_log_file_num,
+                max_log_file_size: self.max_log_file_size,
+                statistics_handle: self.statistics_handle,
             }
         }
     }
@@ -768,18 +894,24 @@ fn normalize_db_path_for_java(path: String) -> String {
 }
 
 fn resolve_db_path_with_env(path: String, env_base_path: Option<&str>) -> String {
+    let path = normalize_db_path_for_java(path);
     let Some(base_path) = env_base_path.filter(|p| !p.is_empty()) else {
         return path;
     };
     let base_path = normalize_db_path_for_java(base_path.to_string());
+    if path.is_empty() {
+        return base_path;
+    }
+    let base = std::path::PathBuf::from(&base_path);
+    let candidate = std::path::PathBuf::from(&path);
+    if candidate.is_absolute() && candidate.starts_with(&base) {
+        return path;
+    }
     let relative = path.trim_start_matches('/');
     if relative.is_empty() {
         return base_path;
     }
-    std::path::PathBuf::from(base_path)
-        .join(relative)
-        .to_string_lossy()
-        .into_owned()
+    base.join(relative).to_string_lossy().into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -830,17 +962,9 @@ pub extern "system" fn Java_org_forstdb_Options_newOptions__JJ<'local>(
         &mut env,
         || 0_i64,
         |_env| {
-            let mut opts = DbOptionsHandle::default();
-            if let Some(db_opts) = unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) } {
-                opts.opts = db_opts.opts.clone();
-                opts.max_open_files = db_opts.max_open_files;
-                opts.info_log_level = db_opts.info_log_level;
-                opts.db_log_dir = db_opts.db_log_dir.clone();
-                opts.env_base_path = db_opts.env_base_path.clone();
-                opts.keep_log_file_num = db_opts.keep_log_file_num;
-                opts.max_log_file_size = db_opts.max_log_file_size;
-                opts.statistics_handle = db_opts.statistics_handle;
-            }
+            let opts = unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) }
+                .map(|db_opts| db_opts.clone_for_jni())
+                .unwrap_or_default();
             opts.into_raw()
         },
     )
@@ -858,20 +982,7 @@ pub extern "system" fn Java_org_forstdb_Options_copyOptions<'local>(
     jni_guard(
         &mut env,
         || 0_i64,
-        |_env| {
-            let mut opts = DbOptionsHandle::default();
-            if let Some(src) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
-                opts.opts = src.opts.clone();
-                opts.max_open_files = src.max_open_files;
-                opts.info_log_level = src.info_log_level;
-                opts.db_log_dir = src.db_log_dir.clone();
-                opts.env_base_path = src.env_base_path.clone();
-                opts.keep_log_file_num = src.keep_log_file_num;
-                opts.max_log_file_size = src.max_log_file_size;
-                opts.statistics_handle = src.statistics_handle;
-            }
-            opts.into_raw()
-        },
+        |_env| copy_db_options_handle(_env, handle, "Options.copyOptions"),
     )
 }
 
@@ -902,10 +1013,80 @@ pub extern "system" fn Java_org_forstdb_Options_disposeInternal<'local>(
 pub extern "system" fn Java_org_forstdb_Options_setCreateIfMissing<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jboolean,
+    handle: jlong,
+    value: jboolean,
 ) {
-    jni_guard(&mut env, || (), |_env| {})
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                h.create_if_missing = value != JNI_FALSE;
+            }
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_createIfMissing<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(
+        &mut env,
+        || JNI_FALSE,
+        |_env| {
+            if unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.create_if_missing)
+                .unwrap_or(false)
+            {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            }
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setCreateMissingColumnFamilies<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jboolean,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                h.create_missing_column_families = value != JNI_FALSE;
+            }
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_createMissingColumnFamilies<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(
+        &mut env,
+        || JNI_FALSE,
+        |_env| {
+            if unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.create_missing_column_families)
+                .unwrap_or(false)
+            {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            }
+        },
+    )
 }
 
 /// `org.forstdb.RocksDB.open(String path) -> long handle`
@@ -977,7 +1158,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2<'loca
             engine_opts.db_path = path_str;
 
             let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
-            match DbImpl::open_with_fs(engine_opts, fs) {
+            match open_db_with_optional_checkpoint(engine_opts, &db_path, fs) {
                 Ok(db) => {
                     let handle = Box::into_raw(Box::new(db)) as FrsDb;
                     register_db_path(handle, &db_path);
@@ -3389,6 +3570,40 @@ pub extern "system" fn Java_org_forstdb_DBOptions_newDBOptions<'local>(
     )
 }
 
+fn copy_db_options_handle(env: &mut JNIEnv, handle: jlong, context: &str) -> jlong {
+    let Some(src) = (unsafe { DbOptionsHandle::from_raw_ref(handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null DBOptions handle"));
+        return 0;
+    };
+    src.clone_for_jni().into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_copyDBOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |env| copy_db_options_handle(env, handle, "DBOptions.copyDBOptions"),
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_newDBOptionsFromOptions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |env| copy_db_options_handle(env, handle, "DBOptions.newDBOptionsFromOptions"),
+    )
+}
+
 /// `org.forstdb.DBOptions.disposeInternal(long)`
 ///
 /// Java signature: `(J)V`
@@ -3422,14 +3637,78 @@ pub extern "system" fn Java_org_forstdb_DBOptions_disposeInternal<'local>(
 pub extern "system" fn Java_org_forstdb_DBOptions_setCreateIfMissing<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _value: jboolean,
+    handle: jlong,
+    value: jboolean,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
-            // forst-rs always creates the DB directory if missing; no field to set.
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                h.create_if_missing = value != JNI_FALSE;
+            }
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_createIfMissing<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(
+        &mut env,
+        || JNI_FALSE,
+        |_env| {
+            if unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.create_if_missing)
+                .unwrap_or(false)
+            {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            }
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_setCreateMissingColumnFamilies<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jboolean,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                h.create_missing_column_families = value != JNI_FALSE;
+            }
+        },
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_DBOptions_createMissingColumnFamilies<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jboolean {
+    jni_guard(
+        &mut env,
+        || JNI_FALSE,
+        |_env| {
+            if unsafe { DbOptionsHandle::from_raw_ref(handle) }
+                .map(|h| h.create_missing_column_families)
+                .unwrap_or(false)
+            {
+                JNI_TRUE
+            } else {
+                JNI_FALSE
+            }
         },
     )
 }
@@ -4973,8 +5252,12 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             let Some(path_str) = read_string(env, &path) else {
                 return ptr::null_mut();
             };
-            let path_str = normalize_db_path_for_java(path_str);
-            let path_str = resolve_db_path_with_env(path_str, db_opts.env_base_path.as_deref());
+            let raw_path_str = path_str;
+            let normalized_path_str = normalize_db_path_for_java(raw_path_str.clone());
+            let path_str = resolve_db_path_with_env(
+                normalized_path_str.clone(),
+                db_opts.env_base_path.as_deref(),
+            );
 
             let cf_names_len = match env.get_array_length(&cf_names) {
                 Ok(n) if n >= 0 => n as usize,
@@ -5038,6 +5321,21 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                     Some(v) => v,
                     None => return ptr::null_mut(),
                 };
+            if compat_livefiles_debug_enabled() {
+                let names: Vec<String> = cf_name_bytes
+                    .iter()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .collect();
+                eprintln!(
+                    "FORST_JNI_DEBUG_LIVEFILES open-array raw_path={} normalized_path={} env_base={:?} resolved_path={} checkpoint_alias={} cf_names={:?}",
+                    raw_path_str,
+                    normalized_path_str,
+                    db_opts.env_base_path,
+                    path_str,
+                    prepare_checkpoint_blob_alias_for_open(&path_str),
+                    names
+                );
+            }
 
             let mut engine_opts = db_opts.opts.clone();
             let db_path = path_str.clone();
@@ -5077,7 +5375,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             }
 
             let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
-            let db = match DbImpl::open_with_fs(engine_opts, fs) {
+            let db = match open_db_with_optional_checkpoint(engine_opts, &db_path, fs) {
                 Ok(d) => Box::new(d),
                 Err(e) => {
                     throw_rocksdb(
@@ -5123,8 +5421,20 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                     let open_status =
                         unsafe { frs_db_open_cf(db_handle, c_name.as_ptr(), &mut frs_cf) };
                     if open_status == FRS_STATUS_OK {
+                        if compat_livefiles_debug_enabled() {
+                            eprintln!(
+                                "FORST_JNI_DEBUG_LIVEFILES open-array cf={} action=open status={}",
+                                name_str, open_status
+                            );
+                        }
                         open_status
                     } else {
+                        if compat_livefiles_debug_enabled() {
+                            eprintln!(
+                                "FORST_JNI_DEBUG_LIVEFILES open-array cf={} action=create_after_open_failed status={}",
+                                name_str, open_status
+                            );
+                        }
                         create_cf_with_optional_merge(
                             env,
                             db_handle,
@@ -5241,8 +5551,12 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             let Some(path_str) = read_string(env, &path) else {
                 return 0;
             };
-            let path_str = normalize_db_path_for_java(path_str);
-            let path_str = resolve_db_path_with_env(path_str, db_opts.env_base_path.as_deref());
+            let raw_path_str = path_str;
+            let normalized_path_str = normalize_db_path_for_java(raw_path_str.clone());
+            let path_str = resolve_db_path_with_env(
+                normalized_path_str.clone(),
+                db_opts.env_base_path.as_deref(),
+            );
             // 3. Validate arrays & extract sizes.
             let cf_names_len = match env.get_array_length(&cf_names) {
                 Ok(n) if n >= 0 => n as usize,
@@ -5323,6 +5637,21 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                     Some(v) => v,
                     None => return 0,
                 };
+            if compat_livefiles_debug_enabled() {
+                let names: Vec<String> = cf_name_bytes
+                    .iter()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .collect();
+                eprintln!(
+                    "FORST_JNI_DEBUG_LIVEFILES open-out raw_path={} normalized_path={} env_base={:?} resolved_path={} checkpoint_alias={} cf_names={:?}",
+                    raw_path_str,
+                    normalized_path_str,
+                    db_opts.env_base_path,
+                    path_str,
+                    prepare_checkpoint_blob_alias_for_open(&path_str),
+                    names
+                );
+            }
 
             // 6. Build EngineOptions (clone the caller's, override db_path).
             let mut engine_opts = db_opts.opts.clone();
@@ -5385,7 +5714,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             //    DbImpl directly so the configured EngineOptions land on the
             //    engine instead of the default-only path of `frs_db_open`.
             let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
-            let db = match DbImpl::open_with_fs(engine_opts, fs) {
+            let db = match open_db_with_optional_checkpoint(engine_opts, &db_path, fs) {
                 Ok(d) => Box::new(d),
                 Err(e) => {
                     throw_rocksdb(
@@ -5437,8 +5766,20 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                     let open_status =
                         unsafe { frs_db_open_cf(db_handle, c_name.as_ptr(), &mut frs_cf) };
                     if open_status == FRS_STATUS_OK {
+                        if compat_livefiles_debug_enabled() {
+                            eprintln!(
+                                "FORST_JNI_DEBUG_LIVEFILES open-out cf={} action=open status={}",
+                                name_str, open_status
+                            );
+                        }
                         open_status
                     } else {
+                        if compat_livefiles_debug_enabled() {
+                            eprintln!(
+                                "FORST_JNI_DEBUG_LIVEFILES open-out cf={} action=create_after_open_failed status={}",
+                                name_str, open_status
+                            );
+                        }
                         unsafe { frs_db_create_cf(db_handle, c_name.as_ptr(), &mut frs_cf) }
                     }
                 };
@@ -7248,6 +7589,9 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
                 live_file_names.push(manifest_name);
             }
         }
+        if compat_livefiles_debug_enabled() {
+            eprintln!("FORST_JNI_DEBUG_LIVEFILES getLiveFiles handle={} db_path={:?} count={} has_manifest={} java_manifest_size={} names={:?}", handle as usize, db_path_for(handle as FrsDb), count, has_manifest, java_manifest_size, live_file_names);
+        }
 
         // Step 3: build the String[] expected by ForStJNI's public wrapper.
         // The final array element is the manifest size encoded as a decimal string.
@@ -7688,28 +8032,95 @@ fn delete_range_inner(env: &mut JNIEnv, db: FrsDb, cf: FrsCfHandle, begin: &[u8]
     }
 }
 
-/// `org.forstdb.RocksDB.deleteRange(long handle, long cfHandle,
-///                                  long writeOptionsHandle,
-///                                  byte[] begin, int beginOff, int beginLen,
-///                                  byte[] end, int endOff, int endLen)`
-///
-/// Java signature: `(JJJ[BII[BII)V`
-///
-/// Tombstones every key `k` where `begin <= k < end`. forst-rs has no
-/// range-tombstone primitive; this enumerates the affected range via an
-/// iterator and issues per-key `frs_delete`. Performance scales O(n) over
-/// the range — adequate for Flink's typical "drop a window" usage which
-/// covers small key counts; large ranges should use full-CF compaction or
-/// CF-recreation instead.
-///
-/// `WriteOptions.disable_wal` is logged but not honoured (see `write0`).
+fn delete_range_impl(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: jlong,
+    wo_handle: jlong,
+    begin: &JByteArray,
+    begin_off: jint,
+    begin_len: jint,
+    end: &JByteArray,
+    end_off: jint,
+    end_len: jint,
+) {
+    if wo_handle != 0 {
+        if let Some(wo) = unsafe { WriteOptionsHandle::from_raw_ref(wo_handle) } {
+            if wo.disable_wal {
+                tracing::debug!(
+                    target: "compat_jni::deleteRange",
+                    "deleteRange: disable_wal=true ignored - engine always writes WAL"
+                );
+            }
+        }
+    }
+    let Some(cf) = cf_from_java_or_default(env, handle, cf_handle, "RocksDB.deleteRange") else {
+        return;
+    };
+    let Some(b) = read_byte_slice(env, begin, begin_off, begin_len) else {
+        return;
+    };
+    let Some(e) = read_byte_slice(env, end, end_off, end_len) else {
+        return;
+    };
+    delete_range_inner(env, handle as FrsDb, cf, &b, &e);
+}
+
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_org_forstdb_RocksDB_deleteRange<'local>(
+pub extern "system" fn Java_org_forstdb_RocksDB_deleteRange__J_3BII_3BII<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
+    begin: JByteArray<'local>,
+    begin_off: jint,
+    begin_len: jint,
+    end: JByteArray<'local>,
+    end_off: jint,
+    end_len: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            delete_range_impl(
+                env, handle, 0, 0, &begin, begin_off, begin_len, &end, end_off, end_len,
+            )
+        },
+    )
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_deleteRange__J_3BII_3BIIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    begin: JByteArray<'local>,
+    begin_off: jint,
+    begin_len: jint,
+    end: JByteArray<'local>,
+    end_off: jint,
+    end_len: jint,
     cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            delete_range_impl(
+                env, handle, cf_handle, 0, &begin, begin_off, begin_len, &end, end_off, end_len,
+            )
+        },
+    )
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_deleteRange__JJ_3BII_3BII<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
     wo_handle: jlong,
     begin: JByteArray<'local>,
     begin_off: jint,
@@ -7722,23 +8133,36 @@ pub extern "system" fn Java_org_forstdb_RocksDB_deleteRange<'local>(
         &mut env,
         || (),
         |env| {
-            if wo_handle != 0 {
-                if let Some(wo) = unsafe { WriteOptionsHandle::from_raw_ref(wo_handle) } {
-                    if wo.disable_wal {
-                        tracing::debug!(
-                            target: "compat_jni::deleteRange",
-                            "deleteRange: disable_wal=true ignored — engine always writes WAL"
-                        );
-                    }
-                }
-            }
-            let Some(b) = read_byte_slice(env, &begin, begin_off, begin_len) else {
-                return;
-            };
-            let Some(e) = read_byte_slice(env, &end, end_off, end_len) else {
-                return;
-            };
-            delete_range_inner(env, handle as FrsDb, cf_handle as FrsCfHandle, &b, &e);
+            delete_range_impl(
+                env, handle, 0, wo_handle, &begin, begin_off, begin_len, &end, end_off, end_len,
+            )
+        },
+    )
+}
+
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_deleteRange__JJ_3BII_3BIIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    wo_handle: jlong,
+    begin: JByteArray<'local>,
+    begin_off: jint,
+    begin_len: jint,
+    end: JByteArray<'local>,
+    end_off: jint,
+    end_len: jint,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            delete_range_impl(
+                env, handle, cf_handle, wo_handle, &begin, begin_off, begin_len, &end, end_off,
+                end_len,
+            )
         },
     )
 }
@@ -7750,10 +8174,11 @@ pub extern "system" fn Java_org_forstdb_RocksDB_deleteRange<'local>(
 ///
 /// Community ForSt's compaction-side range-drop primitive — pairs in
 /// `ranges` (length must be even) define `[begin_i, end_i)` runs of SSTs
-/// to drop. forst-rs has no SST-deletion-by-range surface; we forward to
-/// per-range [`delete_range_inner`] so the caller's intent (those keys
-/// are gone) is honoured, at the cost of O(n) tombstones rather than
-/// instantaneous file-level drops.
+/// to drop when entire files are covered by the range. forst-rs currently
+/// has no equivalent file-level metadata/delete surface, and replacing this
+/// with key-level deletes is not equivalent for Flink rescaling restore.
+/// Validate inputs, then conservatively no-op; Flink follows this call with
+/// `deleteRange`, which provides the correctness boundary.
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_RocksDB_deleteFilesInRanges<'local>(
     mut env: JNIEnv<'local>,
@@ -7787,18 +8212,15 @@ pub extern "system" fn Java_org_forstdb_RocksDB_deleteFilesInRanges<'local>(
                 );
                 return;
             }
-            for pair in rs.chunks_exact(2) {
-                delete_range_inner(
-                    env,
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    &pair[0],
-                    &pair[1],
-                );
-                if env.exception_check().unwrap_or(false) {
-                    return;
-                }
+            if cf_from_java_or_default(env, handle, cf_handle, "RocksDB.deleteFilesInRanges")
+                .is_none()
+            {
+                return;
             }
+            tracing::debug!(
+                target: "compat_jni::deleteFilesInRanges",
+                "deleteFilesInRanges: no-op because forst-rs has no file-level range delete"
+            );
         },
     )
 }
@@ -8372,7 +8794,10 @@ fn multi_get_cf_list<'env, 'arr>(
     let cf_len = match env.get_array_length(cf_handles) {
         Ok(n) => n as usize,
         Err(e) => {
-            throw_rocksdb(env, &format!("RocksDB.multiGet: cf get_array_length failed: {e}"));
+            throw_rocksdb(
+                env,
+                &format!("RocksDB.multiGet: cf get_array_length failed: {e}"),
+            );
             return None;
         }
     };
@@ -8399,11 +8824,9 @@ fn multi_get_cf_list<'env, 'arr>(
             }
             out.push(default_cf);
         } else {
-            let Some(frs_cf) = cf_from_java_handle(
-                env,
-                cf_handle,
-                &format!("RocksDB.multiGet.cfHandles[{i}]"),
-            ) else {
+            let Some(frs_cf) =
+                cf_from_java_handle(env, cf_handle, &format!("RocksDB.multiGet.cfHandles[{i}]"))
+            else {
                 return None;
             };
             out.push(frs_cf);
@@ -8474,7 +8897,10 @@ fn multi_get_impl<'env, 'arr>(
                 unsafe {
                     let _ = crate::frs_bytes_free(&mut out);
                 }
-                throw_rocksdb(env, &format!("RocksDB.multiGet[{i}]: byte_array_from_slice: {e}"));
+                throw_rocksdb(
+                    env,
+                    &format!("RocksDB.multiGet[{i}]: byte_array_from_slice: {e}"),
+                );
                 return ptr::null_mut();
             }
         };
@@ -8482,7 +8908,10 @@ fn multi_get_impl<'env, 'arr>(
             unsafe {
                 let _ = crate::frs_bytes_free(&mut out);
             }
-            throw_rocksdb(env, &format!("RocksDB.multiGet[{i}]: set_object_array_element: {e}"));
+            throw_rocksdb(
+                env,
+                &format!("RocksDB.multiGet[{i}]: set_object_array_element: {e}"),
+            );
             return ptr::null_mut();
         }
         unsafe {
@@ -9529,34 +9958,36 @@ fn install_configured_flink_ttl_filter(
                         .ok()?;
                     let filter_ref = Arc::new(env.new_global_ref(filter_obj).ok()?);
                     let callback_vm = Arc::clone(&java_vm);
-                    Some(Arc::new(move |bytes: &[u8], ttl_ms: u64, now_ms: u64| -> usize {
-                        let Ok(mut env) = callback_vm.attach_current_thread() else {
-                            return 0;
-                        };
-                        let Ok(bytes_array) = env.byte_array_from_slice(bytes) else {
-                            return 0;
-                        };
-                        let result = env.call_method(
-                            filter_ref.as_obj(),
-                            "nextUnexpiredOffset",
-                            "([BJJ)I",
-                            &[
-                                jni::objects::JValue::Object(bytes_array.as_ref()),
-                                jni::objects::JValue::Long(ttl_ms as jlong),
-                                jni::objects::JValue::Long(now_ms as jlong),
-                            ],
-                        );
-                        match result.and_then(|v| v.i()) {
-                            Ok(offset) if offset > 0 => offset as usize,
-                            Ok(_) => 0,
-                            Err(_) => {
-                                if env.exception_check().unwrap_or(false) {
-                                    let _ = env.exception_clear();
+                    Some(
+                        Arc::new(move |bytes: &[u8], ttl_ms: u64, now_ms: u64| -> usize {
+                            let Ok(mut env) = callback_vm.attach_current_thread() else {
+                                return 0;
+                            };
+                            let Ok(bytes_array) = env.byte_array_from_slice(bytes) else {
+                                return 0;
+                            };
+                            let result = env.call_method(
+                                filter_ref.as_obj(),
+                                "nextUnexpiredOffset",
+                                "([BJJ)I",
+                                &[
+                                    jni::objects::JValue::Object(bytes_array.as_ref()),
+                                    jni::objects::JValue::Long(ttl_ms as jlong),
+                                    jni::objects::JValue::Long(now_ms as jlong),
+                                ],
+                            );
+                            match result.and_then(|v| v.i()) {
+                                Ok(offset) if offset > 0 => offset as usize,
+                                Ok(_) => 0,
+                                Err(_) => {
+                                    if env.exception_check().unwrap_or(false) {
+                                        let _ = env.exception_clear();
+                                    }
+                                    0
                                 }
-                                0
                             }
-                        }
-                    }) as forst_rs_engine::ListElementOffsetSupplier)
+                        }) as forst_rs_engine::ListElementOffsetSupplier,
+                    )
                 })
             } else {
                 None
@@ -9955,6 +10386,32 @@ mod tests {
         assert_eq!(JNI_VERSION_1_8, 0x0001_0008);
     }
 
+    #[test]
+    fn test_resolve_db_path_with_env_keeps_absolute_paths() {
+        assert_eq!(
+            resolve_db_path_with_env(
+                "/tmp/remote/job/op/db".to_string(),
+                Some("/tmp/remote/job/op")
+            ),
+            "/tmp/remote/job/op/db"
+        );
+        assert_eq!(
+            resolve_db_path_with_env(
+                "file:/tmp/remote/job/op/db".to_string(),
+                Some("/tmp/remote/job/op")
+            ),
+            "/tmp/remote/job/op/db"
+        );
+        assert_eq!(
+            resolve_db_path_with_env("db".to_string(), Some("/tmp/remote/job/op")),
+            "/tmp/remote/job/op/db"
+        );
+        assert_eq!(
+            resolve_db_path_with_env("/db".to_string(), Some("/tmp/remote/job/op")),
+            "/tmp/remote/job/op/db"
+        );
+    }
+
     /// Verify the `Java_org_forstdb_RocksDB_*` symbols are present in
     /// the cdylib. We do this by inspecting the running test binary
     /// itself (which is statically linked against forst-rs-ffi as an
@@ -10079,10 +10536,15 @@ mod tests {
             "Java_org_forstdb_Env_lowerThreadPoolCPUPriority",
             "Java_org_forstdb_Env_getThreadList",
             "Java_org_forstdb_RocksEnv_disposeInternal",
-            // P0 — DBOptions class (15 entries).
+            // P0 — DBOptions class (21 entries).
             "Java_org_forstdb_DBOptions_newDBOptions",
+            "Java_org_forstdb_DBOptions_copyDBOptions",
+            "Java_org_forstdb_DBOptions_newDBOptionsFromOptions",
             "Java_org_forstdb_DBOptions_disposeInternal",
             "Java_org_forstdb_DBOptions_setCreateIfMissing",
+            "Java_org_forstdb_DBOptions_createIfMissing",
+            "Java_org_forstdb_DBOptions_setCreateMissingColumnFamilies",
+            "Java_org_forstdb_DBOptions_createMissingColumnFamilies",
             "Java_org_forstdb_DBOptions_setUseFsync",
             "Java_org_forstdb_DBOptions_setStatsDumpPeriodSec",
             "Java_org_forstdb_DBOptions_setAvoidFlushDuringShutdown",
@@ -10182,7 +10644,7 @@ mod tests {
             "Java_org_forstdb_Checkpoint_exportColumnFamily",
             // P2 — Snapshot class (1 entry).
             "Java_org_forstdb_Snapshot_disposeInternal",
-            // P2 — RocksDB snapshot/file-list/range methods (10 entries).
+            // P2 — RocksDB snapshot/file-list/range methods (13 entries).
             "Java_org_forstdb_RocksDB_getSnapshot",
             "Java_org_forstdb_RocksDB_releaseSnapshot",
             "Java_org_forstdb_RocksDB_getLiveFiles",
@@ -10191,7 +10653,10 @@ mod tests {
             "Java_org_forstdb_RocksDB_enableFileDeletions",
             "Java_org_forstdb_RocksDB_disableFileDeletions__J",
             "Java_org_forstdb_RocksDB_enableFileDeletions__JZ",
-            "Java_org_forstdb_RocksDB_deleteRange",
+            "Java_org_forstdb_RocksDB_deleteRange__J_3BII_3BII",
+            "Java_org_forstdb_RocksDB_deleteRange__J_3BII_3BIIJ",
+            "Java_org_forstdb_RocksDB_deleteRange__JJ_3BII_3BII",
+            "Java_org_forstdb_RocksDB_deleteRange__JJ_3BII_3BIIJ",
             "Java_org_forstdb_RocksDB_deleteFilesInRanges",
             "Java_org_forstdb_RocksDB_createColumnFamilyWithImport",
             // P2 — ImportColumnFamilyOptions class (3 entries).
@@ -11024,6 +11489,113 @@ mod tests {
         }
         // SAFETY: db came from frs_db_open.
         let st = unsafe { frs_db_close(db) };
+        assert_eq!(st, FRS_STATUS_OK);
+    }
+
+    /// RocksDB-compatible incremental snapshots need a MANIFEST file in the
+    /// live-file list. The ForSt engine stores checkpoint metadata as
+    /// CHECKPOINT.blob, so the JNI shim must materialize a MANIFEST alias.
+    #[test]
+    fn test_compat_manifest_materialized_from_checkpoint_blob() {
+        use std::ffi::CString;
+
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let db_path_str = db_dir.path().to_str().unwrap().to_string();
+        let mut engine_opts = EngineOptions::default();
+        engine_opts.db_path = db_path_str.clone();
+        let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
+        let db_arc = open_db_with_optional_checkpoint(engine_opts, &db_path_str, fs)
+            .expect("open direct engine");
+        let db = Box::into_raw(Box::new(db_arc)) as FrsDb;
+        assert!(!db.is_null());
+        register_db_path(db, &db_path_str);
+
+        let mut default_cf: FrsCfHandle = ptr::null_mut();
+        // SAFETY: db valid; out_cf stack-local.
+        let st = unsafe { frs_db_default_cf(db, &mut default_cf) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let cf_name = CString::new("state-cf").unwrap();
+        let mut state_cf: FrsCfHandle = ptr::null_mut();
+        // SAFETY: db valid; cf_name lives for the call; out_cf is stack-local.
+        let st = unsafe { crate::frs_db_create_cf(db, cf_name.as_ptr(), &mut state_cf) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let key = b"state-key";
+        let value = b"state-value";
+        // SAFETY: db/cf valid; key/value slices live for the call.
+        let st = unsafe {
+            crate::frs_put(
+                db,
+                state_cf,
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len(),
+            )
+        };
+        assert_eq!(st, FRS_STATUS_OK);
+        let mut live_files = crate::FrsLiveFileList {
+            files: ptr::null_mut(),
+            count: 0,
+            manifest_size: 0,
+        };
+        // SAFETY: db valid; out list is stack-local.
+        let st = unsafe { crate::frs_db_get_live_files(db, true, &mut live_files) };
+        assert_eq!(st, FRS_STATUS_OK);
+        // SAFETY: list was filled by frs_db_get_live_files.
+        unsafe {
+            let _ = crate::frs_db_live_file_list_free(&mut live_files);
+        }
+
+        let manifest = ensure_compat_manifest_for_db(db).expect("manifest alias");
+        assert_eq!(manifest.0, COMPAT_MANIFEST_FILE_NAME);
+        assert!(manifest.1 > 0, "manifest alias should not be empty");
+        assert!(
+            db_dir.path().join(COMPAT_MANIFEST_FILE_NAME).exists(),
+            "manifest alias should exist in the DB directory"
+        );
+
+        unregister_db_path(db);
+        // SAFETY: CF handles came from frs_db_default_cf/frs_db_create_cf.
+        unsafe {
+            let _ = crate::frs_cf_close(default_cf);
+            let _ = crate::frs_cf_close(state_cf);
+        }
+        // SAFETY: db came from direct engine open.
+        let st = unsafe { frs_db_close(db) };
+        assert_eq!(st, FRS_STATUS_OK);
+
+        let mut reopen_opts = EngineOptions::default();
+        reopen_opts.db_path = db_path_str.clone();
+        let reopened_arc = open_db_with_optional_checkpoint(
+            reopen_opts,
+            &db_path_str,
+            Arc::new(LocalFileSystem::new()),
+        )
+        .expect("reopen from compat manifest");
+        let reopened_db = Box::into_raw(Box::new(reopened_arc)) as FrsDb;
+        register_db_path(reopened_db, &db_path_str);
+        let mut reopened_cf: FrsCfHandle = ptr::null_mut();
+        // SAFETY: reopened_db valid; cf_name lives for the call.
+        let st = unsafe { crate::frs_db_open_cf(reopened_db, cf_name.as_ptr(), &mut reopened_cf) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let mut out = crate::FrsBytes::NULL;
+        // SAFETY: reopened_db/cf valid; key slice lives for the call; out is stack-local.
+        let st =
+            unsafe { crate::frs_get(reopened_db, reopened_cf, key.as_ptr(), key.len(), &mut out) };
+        assert_eq!(st, FRS_STATUS_OK);
+        assert!(
+            !out.data.is_null(),
+            "state CF value should survive checkpoint reopen"
+        );
+        let actual = unsafe { std::slice::from_raw_parts(out.data, out.len) };
+        assert_eq!(actual, value);
+        unsafe {
+            let _ = crate::frs_bytes_free(&mut out);
+            let _ = crate::frs_cf_close(reopened_cf);
+        }
+        unregister_db_path(reopened_db);
+        // SAFETY: reopened_db came from direct engine open.
+        let st = unsafe { frs_db_close(reopened_db) };
         assert_eq!(st, FRS_STATUS_OK);
     }
 

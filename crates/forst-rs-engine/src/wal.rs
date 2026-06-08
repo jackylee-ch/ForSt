@@ -169,7 +169,9 @@ impl WalWriter {
             .create(true)
             .append(true)
             .open(path)
-            .map_err(|e| ForstError::Io(std::io::Error::other(format!("WAL open {path:?}: {e}"))))?;
+            .map_err(|e| {
+                ForstError::Io(std::io::Error::other(format!("WAL open {path:?}: {e}")))
+            })?;
         let bytes_written = file
             .metadata()
             .map(|m| m.len())
@@ -184,7 +186,8 @@ impl WalWriter {
     /// Buffers one record for the current group-commit batch. NOT durable until
     /// [`sync`](Self::sync). Returns the number of bytes the framed record adds.
     pub fn append(&mut self, rec: &WalRecord) -> ForstResult<usize> {
-        let mut payload = Vec::with_capacity(32 + rec.key.len() + rec.value.as_ref().map_or(0, |v| v.len()));
+        let mut payload =
+            Vec::with_capacity(32 + rec.key.len() + rec.value.as_ref().map_or(0, |v| v.len()));
         rec.encode_payload(&mut payload);
         let crc = crc32c::crc32c(&payload);
         let frame_len = 8 + payload.len();
@@ -250,7 +253,11 @@ pub fn read_segment(path: &Path) -> ForstResult<WalScan> {
                 clean_eof: true,
             })
         }
-        Err(e) => return Err(ForstError::Io(std::io::Error::other(format!("WAL open: {e}")))),
+        Err(e) => {
+            return Err(ForstError::Io(std::io::Error::other(format!(
+                "WAL open: {e}"
+            ))))
+        }
     };
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
@@ -266,8 +273,7 @@ pub fn read_segment(path: &Path) -> ForstResult<WalScan> {
         if pos + 8 > bytes.len() {
             break false; // torn header
         }
-        let payload_len =
-            u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap());
         let payload_start = pos + 8;
         if payload_start + payload_len > bytes.len() {
@@ -310,7 +316,7 @@ mod tests {
             rec(0, 1, 0, b"alpha", Some(b"one")),
             rec(2, 2, 3, b"beta", Some(b"merge-op")),
             rec(0, 3, 1, b"gamma", None), // tombstone
-            rec(1, 4, 0, b"", Some(b"")),  // empty key + empty value (both valid)
+            rec(1, 4, 0, b"", Some(b"")), // empty key + empty value (both valid)
         ];
         {
             let mut w = WalWriter::open(&path).unwrap();
@@ -358,7 +364,11 @@ mod tests {
 
         let scan = read_segment(&path).unwrap();
         assert!(!scan.clean_eof, "torn tail must report unclean EOF");
-        assert_eq!(scan.records.len(), 1, "only the fully-durable record survives");
+        assert_eq!(
+            scan.records.len(),
+            1,
+            "only the fully-durable record survives"
+        );
         assert_eq!(scan.records[0].key, b"durable-a");
     }
 
@@ -374,8 +384,7 @@ mod tests {
         }
         // Flip a byte inside the SECOND record's payload (past the first frame).
         let mut bytes = std::fs::read(&path).unwrap();
-        let first_payload_len =
-            u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let first_payload_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let second_payload_start = 8 + first_payload_len + 8;
         bytes[second_payload_start] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();

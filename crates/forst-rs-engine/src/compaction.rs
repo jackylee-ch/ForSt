@@ -298,7 +298,8 @@ impl CompactionJob {
             let mut acc: u64 = 0;
             let mut i = 0usize;
             while i < total && bounds.len() < n {
-                acc += (all[i].key.len() + all[i].value.as_ref().map_or(0, |v| v.len()) + 16) as u64;
+                acc +=
+                    (all[i].key.len() + all[i].value.as_ref().map_or(0, |v| v.len()) + 16) as u64;
                 i += 1;
                 if acc >= part_target && i < total {
                     // snap to the next user-key boundary
@@ -378,112 +379,113 @@ impl CompactionJob {
             produced
         } else {
             let write_outcome: ForstResult<Vec<(FileNumber, SstFileInfo)>> = (|| {
-            let mut produced: Vec<(FileNumber, SstFileInfo)> = Vec::new();
-            let mut i = 0usize;
-            let mut slot_idx = 0usize;
-            while i < all.len() {
-                let last_slot = slot_idx + 1 >= slots.len();
-                let (cur_fnum, cur_path) = slots[slot_idx].clone();
-                let write_path = if atomic_rename {
-                    sst_temp_path(&cur_path)
-                } else {
-                    cur_path.clone()
-                };
-                // Write ONE output file in its own scope so the streaming
-                // writer's borrow of `wf` is released before we roll slots.
-                let (_file_emitted, info_opt): (u64, Option<SstFileInfo>) = {
-                    let mut wf = self.fs.open_writable_file(&write_path, write_mode)?;
-                    // R49-H1: stamp this compaction's cf_id onto the writer
-                    // options so the SST footer + SstFileMeta carry CF identity.
-                    let mut writer_opts = self.writer_options.clone();
-                    writer_opts.cf_id = self.cf_id;
-                    let mut writer = SstWriterImpl::with_options(writer_opts).streaming(&mut *wf);
-                    let mut file_emitted = 0u64;
-                    while i < all.len() {
-                        let key_end = {
-                            let key = &all[i].key;
-                            let mut j = i + 1;
-                            while j < all.len() && all[j].key == *key {
-                                j += 1;
-                            }
-                            j
-                        };
-                        // Versions for this key, newest first.
-                        let versions = &all[i..key_end];
-                        i = key_end;
-                        self.emit_key_versions(&mut writer, versions, &mut file_emitted)?;
-                        // Roll to the next slot at this user-key boundary when
-                        // the file has content, splitting is enabled, we are NOT
-                        // on the final slot, the file reached target, and keys
-                        // remain. Splitting only between keys keeps every
-                        // version of a key in one file.
-                        if !last_slot
-                            && target > 0
-                            && file_emitted > 0
-                            && i < all.len()
-                            && writer.estimated_size() >= target
-                        {
-                            break;
-                        }
-                    }
-                    if file_emitted == 0 {
-                        // Bottommost-tombstone-only input: emit nothing. The
-                        // streaming writer requires ≥ 1 entry, so drop it
-                        // unfinished and best-effort clean up the tmp file. Not
-                        // referenced by any VersionEdit. R38-L2: warn on delete
-                        // failure (restore orphan-scan still catches it).
-                        drop(writer);
-                        drop(wf);
-                        if let Err(e) = self.fs.delete_file(&write_path) {
-                            tracing::warn!(
-                                "CompactionJob: zero-emit tmp delete failed for {}: {} \
-                                 (R38-L2; restore orphan-scan will rename on restart)",
-                                write_path.display(),
-                                e
-                            );
-                        }
-                        (0, None)
+                let mut produced: Vec<(FileNumber, SstFileInfo)> = Vec::new();
+                let mut i = 0usize;
+                let mut slot_idx = 0usize;
+                while i < all.len() {
+                    let last_slot = slot_idx + 1 >= slots.len();
+                    let (cur_fnum, cur_path) = slots[slot_idx].clone();
+                    let write_path = if atomic_rename {
+                        sst_temp_path(&cur_path)
                     } else {
-                        let info = writer.finish()?;
-                        wf.flush()?;
-                        wf.sync()?;
-                        (file_emitted, Some(info))
-                    }
-                };
-
-                if let Some(info) = info_opt {
-                    // Publish this file: rename on local FS (the upload already
-                    // published it on object stores). R38-H1: best-effort tmp
-                    // cleanup on rename failure before propagating.
-                    if atomic_rename {
-                        if let Err(e) = self.fs.rename(&write_path, &cur_path) {
-                            let _ = self.fs.delete_file(&write_path);
-                            return Err(e);
+                        cur_path.clone()
+                    };
+                    // Write ONE output file in its own scope so the streaming
+                    // writer's borrow of `wf` is released before we roll slots.
+                    let (_file_emitted, info_opt): (u64, Option<SstFileInfo>) = {
+                        let mut wf = self.fs.open_writable_file(&write_path, write_mode)?;
+                        // R49-H1: stamp this compaction's cf_id onto the writer
+                        // options so the SST footer + SstFileMeta carry CF identity.
+                        let mut writer_opts = self.writer_options.clone();
+                        writer_opts.cf_id = self.cf_id;
+                        let mut writer =
+                            SstWriterImpl::with_options(writer_opts).streaming(&mut *wf);
+                        let mut file_emitted = 0u64;
+                        while i < all.len() {
+                            let key_end = {
+                                let key = &all[i].key;
+                                let mut j = i + 1;
+                                while j < all.len() && all[j].key == *key {
+                                    j += 1;
+                                }
+                                j
+                            };
+                            // Versions for this key, newest first.
+                            let versions = &all[i..key_end];
+                            i = key_end;
+                            self.emit_key_versions(&mut writer, versions, &mut file_emitted)?;
+                            // Roll to the next slot at this user-key boundary when
+                            // the file has content, splitting is enabled, we are NOT
+                            // on the final slot, the file reached target, and keys
+                            // remain. Splitting only between keys keeps every
+                            // version of a key in one file.
+                            if !last_slot
+                                && target > 0
+                                && file_emitted > 0
+                                && i < all.len()
+                                && writer.estimated_size() >= target
+                            {
+                                break;
+                            }
                         }
-                        // R49-H3: fsync(parent_dir) so the dirent change is
-                        // durable across power loss (best-effort).
-                        if let Some(parent) = cur_path.parent() {
-                            if let Err(e) = self.fs.sync_dir(parent) {
+                        if file_emitted == 0 {
+                            // Bottommost-tombstone-only input: emit nothing. The
+                            // streaming writer requires ≥ 1 entry, so drop it
+                            // unfinished and best-effort clean up the tmp file. Not
+                            // referenced by any VersionEdit. R38-L2: warn on delete
+                            // failure (restore orphan-scan still catches it).
+                            drop(writer);
+                            drop(wf);
+                            if let Err(e) = self.fs.delete_file(&write_path) {
                                 tracing::warn!(
+                                    "CompactionJob: zero-emit tmp delete failed for {}: {} \
+                                 (R38-L2; restore orphan-scan will rename on restart)",
+                                    write_path.display(),
+                                    e
+                                );
+                            }
+                            (0, None)
+                        } else {
+                            let info = writer.finish()?;
+                            wf.flush()?;
+                            wf.sync()?;
+                            (file_emitted, Some(info))
+                        }
+                    };
+
+                    if let Some(info) = info_opt {
+                        // Publish this file: rename on local FS (the upload already
+                        // published it on object stores). R38-H1: best-effort tmp
+                        // cleanup on rename failure before propagating.
+                        if atomic_rename {
+                            if let Err(e) = self.fs.rename(&write_path, &cur_path) {
+                                let _ = self.fs.delete_file(&write_path);
+                                return Err(e);
+                            }
+                            // R49-H3: fsync(parent_dir) so the dirent change is
+                            // durable across power loss (best-effort).
+                            if let Some(parent) = cur_path.parent() {
+                                if let Err(e) = self.fs.sync_dir(parent) {
+                                    tracing::warn!(
                                     "CompactionJob: sync_dir({}) failed after rename: {} (R49-H3)",
                                     parent.display(),
                                     e
                                 );
+                                }
                             }
                         }
+                        produced.push((cur_fnum, info));
                     }
-                    produced.push((cur_fnum, info));
-                }
 
-                // Advance to the next slot only if more keys remain (i.e. we
-                // rolled mid-stream). When the inner loop consumed everything,
-                // `i == all.len()` and the outer loop exits — so `slot_idx`
-                // never exceeds the final slot and no slot is reused.
-                if i < all.len() {
-                    slot_idx += 1;
+                    // Advance to the next slot only if more keys remain (i.e. we
+                    // rolled mid-stream). When the inner loop consumed everything,
+                    // `i == all.len()` and the outer loop exits — so `slot_idx`
+                    // never exceeds the final slot and no slot is reused.
+                    if i < all.len() {
+                        slot_idx += 1;
+                    }
                 }
-            }
-            Ok(produced)
+                Ok(produced)
             })();
             write_outcome?
         };
@@ -576,7 +578,8 @@ impl CompactionJob {
     fn run_streaming(self) -> ForstResult<Option<VersionEdit>> {
         for (_, meta, _) in &self.inputs {
             debug_assert_eq!(
-                meta.cf_id, self.cf_id,
+                meta.cf_id,
+                self.cf_id,
                 "CompactionJob cf_id {:?} ≠ input file {} cf_id {:?} — cross-CF input",
                 self.cf_id,
                 meta.file_number.value(),
@@ -687,8 +690,7 @@ impl CompactionJob {
                             let newest_idx = *members
                                 .iter()
                                 .max_by_key(|&&i| {
-                                    ((file_nums[i] as u128) << 64)
-                                        | (cursors[i].sequence() as u128)
+                                    ((file_nums[i] as u128) << 64) | (cursors[i].sequence() as u128)
                                 })
                                 .expect("members non-empty");
                             if cursors[newest_idx].op_type() == forst_rs_common::OpType::Put {

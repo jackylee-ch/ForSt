@@ -58,8 +58,8 @@ use forst_rs_common::{
 use super::block_header::BlockHeader;
 use super::compression::{compress, decompress};
 use super::reader::RowView;
-use std::sync::Arc;
 use super::schema::{BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA_KV};
+use std::sync::Arc;
 
 /// Number of entries per restart interval (full key stored every K entries).
 pub const KV_RESTART_INTERVAL: usize = 16;
@@ -294,7 +294,9 @@ impl KvBlock {
         let (off, _) = get_fixed32(&self.payload[at..])?;
         let off = off as usize;
         if off > self.restarts_start {
-            return Err(ForstError::corruption("KV restart offset past entries region"));
+            return Err(ForstError::corruption(
+                "KV restart offset past entries region",
+            ));
         }
         Ok(off)
     }
@@ -480,12 +482,7 @@ impl KvBlock {
     /// Decodes the entry at `pos`, reconstructing its key into `key_buf`, and
     /// invokes `cb` with the resulting [`RowView`]. Returns the offset of the
     /// next entry.
-    fn read_row_at<F>(
-        &self,
-        pos: usize,
-        key_buf: &mut Vec<u8>,
-        cb: &mut F,
-    ) -> ForstResult<usize>
+    fn read_row_at<F>(&self, pos: usize, key_buf: &mut Vec<u8>, cb: &mut F) -> ForstResult<usize>
     where
         F: FnMut(RowView<'_>) -> ForstResult<()>,
     {
@@ -497,8 +494,9 @@ impl KvBlock {
         }
         key_buf.truncate(e.shared);
         key_buf.extend_from_slice(&self.payload[e.key_range.0..e.key_range.1]);
-        let op_type = OpType::from_u8(e.op_byte)
-            .ok_or_else(|| ForstError::corruption(format!("invalid op_type in KV block: {}", e.op_byte)))?;
+        let op_type = OpType::from_u8(e.op_byte).ok_or_else(|| {
+            ForstError::corruption(format!("invalid op_type in KV block: {}", e.op_byte))
+        })?;
         let value = e.value_range.map(|(s, en)| &self.payload[s..en]);
         cb(RowView {
             key: key_buf,
@@ -517,7 +515,9 @@ impl KvBlock {
         let end = self.restarts_start;
         let p = &self.payload;
         if pos >= end {
-            return Err(ForstError::corruption("KV entry offset past entries region"));
+            return Err(ForstError::corruption(
+                "KV entry offset past entries region",
+            ));
         }
         let (shared, n1) = get_varint32(&p[pos..end])?;
         let mut at = pos + n1;
@@ -648,8 +648,7 @@ impl KvBlockCursor {
     }
     #[inline]
     pub(crate) fn value(&self) -> Option<&[u8]> {
-        self.cur_value
-            .map(|(s, e)| &self.block.payload[s..e])
+        self.cur_value.map(|(s, e)| &self.block.payload[s..e])
     }
     #[inline]
     pub(crate) fn sequence(&self) -> u64 {
@@ -697,7 +696,12 @@ mod tests {
     fn collect(kv: &KvBlock) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64, OpType)> {
         let mut out = Vec::new();
         kv.for_each_row(|v| {
-            out.push((v.key.to_vec(), v.value.map(|b| b.to_vec()), v.sequence, v.op_type));
+            out.push((
+                v.key.to_vec(),
+                v.value.map(|b| b.to_vec()),
+                v.sequence,
+                v.op_type,
+            ));
             Ok(())
         })
         .unwrap();
@@ -777,7 +781,14 @@ mod tests {
         let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = keys
             .iter()
             .enumerate()
-            .map(|(i, k)| (k.as_slice(), Some(b"v".as_ref()), 100 - i as u64, OpType::Put))
+            .map(|(i, k)| {
+                (
+                    k.as_slice(),
+                    Some(b"v".as_ref()),
+                    100 - i as u64,
+                    OpType::Put,
+                )
+            })
             .collect();
         let batch = make_batch(&rows);
         encode_kv_data_block(&batch, CompressionType::None).unwrap()
@@ -842,7 +853,14 @@ mod tests {
     #[test]
     fn lz4_roundtrip_matches_uncompressed() {
         let rows: Vec<(&[u8], Option<&[u8]>, u64, OpType)> = (0..40)
-            .map(|_| (b"k".as_ref(), Some(b"value-bytes".as_ref()), 1u64, OpType::Put))
+            .map(|_| {
+                (
+                    b"k".as_ref(),
+                    Some(b"value-bytes".as_ref()),
+                    1u64,
+                    OpType::Put,
+                )
+            })
             .collect::<Vec<_>>();
         // distinct keys
         let keys: Vec<Vec<u8>> = (0..40).map(|i| format!("key{i:03}").into_bytes()).collect();
@@ -872,9 +890,18 @@ mod tests {
         let block = encode_kv_data_block(&batch, CompressionType::None).unwrap();
         let kv = KvBlock::decode(&block, true).unwrap();
         let got = collect(&kv);
-        assert_eq!(got[0], (b"k".to_vec(), Some(b"v3".to_vec()), 30, OpType::Put));
-        assert_eq!(got[1], (b"k".to_vec(), Some(b"v2".to_vec()), 20, OpType::Merge));
-        assert_eq!(got[2], (b"k".to_vec(), Some(b"v1".to_vec()), 10, OpType::Put));
+        assert_eq!(
+            got[0],
+            (b"k".to_vec(), Some(b"v3".to_vec()), 30, OpType::Put)
+        );
+        assert_eq!(
+            got[1],
+            (b"k".to_vec(), Some(b"v2".to_vec()), 20, OpType::Merge)
+        );
+        assert_eq!(
+            got[2],
+            (b"k".to_vec(), Some(b"v1".to_vec()), 10, OpType::Put)
+        );
         assert_eq!(got[3], (b"m".to_vec(), None, 5, OpType::Delete));
         // seek to the duplicate key yields all 3 versions then 'm'.
         assert_eq!(collect_from(&kv, b"k").len(), 4);
@@ -888,7 +915,10 @@ mod tests {
         let mut block = encode_kv_data_block(&batch, CompressionType::None).unwrap();
         // Flip a payload byte (just past the 16-byte header) — corrupts the crc.
         block[BLOCK_HEADER_SIZE] ^= 0xFF;
-        assert!(KvBlock::decode(&block, true).is_err(), "verify=true must reject");
+        assert!(
+            KvBlock::decode(&block, true).is_err(),
+            "verify=true must reject"
+        );
         // verify=false: crc skipped. The payload-length framing still holds
         // (we flipped a content byte, not a size), so decode succeeds.
         assert!(

@@ -127,7 +127,6 @@ impl PartialOrd for InternalKey {
     }
 }
 
-
 /// A vectorized MemTable using columnar storage + BTreeMap sorted index.
 ///
 /// **Write path:** `put()` appends data to columnar arrays and inserts into
@@ -834,11 +833,13 @@ impl VectorizedMemTable {
         // FRS-C2: resolve the newest visible version from the sorted BTreeMap
         // index (single source of truth). `value_at` yields `None` for a
         // tombstone row, so Delete/SingleDelete naturally produce `value: None`.
-        Ok(self.idx_newest_visible(key, read_sequence).map(|ri| GetResult {
-            value: self.value_at(ri.offset).map(|s| s.to_vec()),
-            sequence: ri.sequence,
-            op_type: ri.op_type,
-        }))
+        Ok(self
+            .idx_newest_visible(key, read_sequence)
+            .map(|ri| GetResult {
+                value: self.value_at(ri.offset).map(|s| s.to_vec()),
+                sequence: ri.sequence,
+                op_type: ri.op_type,
+            }))
     }
 
     /// FRS-MERGE-PERF (2026-06-03): single-pass merge-operand collection for
@@ -3088,11 +3089,17 @@ mod tests {
         let mut mt = VectorizedMemTable::new(test_config());
         let exact = vec![42u8; INLINE_THRESHOLD];
         mt.put(b"exact", Some(&exact), 1).unwrap();
-        assert_eq!(mt.get(b"exact", u64::MAX).unwrap().unwrap().value, Some(exact));
+        assert_eq!(
+            mt.get(b"exact", u64::MAX).unwrap().unwrap().value,
+            Some(exact)
+        );
 
         let over = vec![42u8; INLINE_THRESHOLD + 1];
         mt.put(b"over", Some(&over), 1).unwrap();
-        assert_eq!(mt.get(b"over", u64::MAX).unwrap().unwrap().value, Some(over));
+        assert_eq!(
+            mt.get(b"over", u64::MAX).unwrap().unwrap().value,
+            Some(over)
+        );
     }
 
     #[test]
@@ -3132,7 +3139,10 @@ mod tests {
         mt.put(b"k", Some(b"v2"), 1).unwrap(); // seq=2
 
         // Current read sees v2.
-        assert_eq!(mt.get(b"k", u64::MAX).unwrap().unwrap().value, Some(b"v2".to_vec()));
+        assert_eq!(
+            mt.get(b"k", u64::MAX).unwrap().unwrap().value,
+            Some(b"v2".to_vec())
+        );
 
         // Snapshot read at seq=1 must return v1 (fast path is gated on latest_seq
         // <= read_sequence, so seq=1 < latest_seq=2 falls to the columnar MVCC path).

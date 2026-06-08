@@ -497,7 +497,10 @@ mod c_dual_version_compat {
 
         // Sanity: the two files really use different on-disk block formats.
         // The first data block begins right after the 16-byte file header.
-        assert_eq!(v1[FILE_HEADER_SIZE], BLOCK_TYPE_DATA, "v1 must be Arrow block");
+        assert_eq!(
+            v1[FILE_HEADER_SIZE], BLOCK_TYPE_DATA,
+            "v1 must be Arrow block"
+        );
         assert_eq!(
             v2[FILE_HEADER_SIZE], BLOCK_TYPE_DATA_KV,
             "v2 must be KV block"
@@ -522,7 +525,10 @@ mod c_dual_version_compat {
             );
         }
         // Absent key lexically between present keys.
-        assert_eq!(r1.get(b"user:00050x").unwrap(), r2.get(b"user:00050x").unwrap());
+        assert_eq!(
+            r1.get(b"user:00050x").unwrap(),
+            r2.get(b"user:00050x").unwrap()
+        );
 
         // Full scan + bounded range scan parity.
         assert_eq!(

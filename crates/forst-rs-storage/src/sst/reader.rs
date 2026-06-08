@@ -340,11 +340,7 @@ impl SstReaderImpl {
     /// `block_size` (Sweep R3 H by Reviewers 2 + 5). The `file_size`
     /// is cached at `open()` so this check costs no syscall on the
     /// hot lookup path.
-    fn read_decoded_block(
-        &self,
-        block_offset: u64,
-        block_size: u32,
-    ) -> ForstResult<DecodedBlock> {
+    fn read_decoded_block(&self, block_offset: u64, block_size: u32) -> ForstResult<DecodedBlock> {
         // 2026-05-30 DECODED-BLOCK CACHE: serve a decoded block from the shared
         // L1 cache when present — skips the `serial_read_at` + decompress +
         // decode chain that dominated the q9 prefix-iterator profile. Cloning a
@@ -412,7 +408,10 @@ impl SstReaderImpl {
                 }
                 BLOCK_TYPE_DATA_KV => {
                     // decode copies the payload out → scratch stays reusable.
-                    Ok(DecodedBlock::Kv(Arc::new(KvBlock::decode(&scratch[..bs], verify)?)))
+                    Ok(DecodedBlock::Kv(Arc::new(KvBlock::decode(
+                        &scratch[..bs],
+                        verify,
+                    )?)))
                 }
                 other => Err(ForstError::corruption(format!(
                     "unknown SST data block_type 0x{other:02X}"
@@ -426,7 +425,12 @@ impl SstReaderImpl {
                 DecodedBlock::Arrow(batch) => {
                     let arc = Arc::new(batch.clone());
                     let charge = CacheEntry::DecodedBatch(Arc::clone(&arc)).charge();
-                    cache.insert(key, CacheEntry::DecodedBatch(arc), charge, CachePriority::Low);
+                    cache.insert(
+                        key,
+                        CacheEntry::DecodedBatch(arc),
+                        charge,
+                        CachePriority::Low,
+                    );
                 }
                 DecodedBlock::Kv(kv) => {
                     let charge = CacheEntry::DecodedKv(Arc::clone(kv)).charge();
@@ -1137,14 +1141,18 @@ mod tests {
         writer.force_kv_block_format(kv);
         for i in 0..n {
             let key = format!("user:{:05}", i); // shared "user:" prefix exercises KV compression
-            // every 7th row a tombstone; every 5th an empty-but-present value
+                                                // every 7th row a tombstone; every 5th an empty-but-present value
             if i % 7 == 0 {
                 writer.add(key.as_bytes(), None, i as u64 + 1, 0).unwrap(); // Delete=0
             } else if i % 5 == 0 {
-                writer.add(key.as_bytes(), Some(b""), i as u64 + 1, 1).unwrap();
+                writer
+                    .add(key.as_bytes(), Some(b""), i as u64 + 1, 1)
+                    .unwrap();
             } else {
                 let val = format!("value_for_{:05}", i);
-                writer.add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 1).unwrap();
+                writer
+                    .add(key.as_bytes(), Some(val.as_bytes()), i as u64 + 1, 1)
+                    .unwrap();
             }
         }
         let (data, _info) = writer.finish().unwrap();
