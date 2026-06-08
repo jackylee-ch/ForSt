@@ -98,9 +98,20 @@ use crate::{
 };
 
 static DB_PATH_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+static DB_LOG_REGISTRY: OnceLock<Mutex<HashMap<usize, CompatDbLogState>>> = OnceLock::new();
+
+struct CompatDbLogState {
+    dir: String,
+    next_id: usize,
+    files: Vec<String>,
+}
 
 fn db_path_registry() -> &'static Mutex<HashMap<usize, String>> {
     DB_PATH_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn db_log_registry() -> &'static Mutex<HashMap<usize, CompatDbLogState>> {
+    DB_LOG_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn register_db_path(handle: FrsDb, path: &str) {
@@ -118,6 +129,65 @@ fn unregister_db_path(handle: FrsDb) {
     }
     if let Ok(mut guard) = db_path_registry().lock() {
         guard.remove(&(handle as usize));
+    }
+}
+
+fn register_db_log_dir(handle: FrsDb, db_log_dir: Option<&str>) {
+    if handle.is_null() {
+        return;
+    }
+    let Some(dir) = db_log_dir.filter(|d| !d.is_empty()) else {
+        return;
+    };
+    let _ = fs::create_dir_all(dir);
+    if let Ok(mut guard) = db_log_registry().lock() {
+        guard.insert(
+            handle as usize,
+            CompatDbLogState {
+                dir: dir.to_string(),
+                next_id: 0,
+                files: Vec::new(),
+            },
+        );
+    }
+}
+
+fn touch_compat_db_log_file(handle: FrsDb) {
+    if handle.is_null() {
+        return;
+    }
+    let path = {
+        let Ok(mut guard) = db_log_registry().lock() else {
+            return;
+        };
+        let Some(state) = guard.get_mut(&(handle as usize)) else {
+            return;
+        };
+        let filename = format!("LOG-forst-rs-compat-{:06}", state.next_id);
+        state.next_id += 1;
+        let path = std::path::PathBuf::from(&state.dir).join(filename);
+        state.files.push(path.to_string_lossy().into_owned());
+        path
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"forst-rs compat db log\n");
+}
+
+fn cleanup_compat_db_logs(handle: FrsDb) {
+    if handle.is_null() {
+        return;
+    }
+    let files = match db_log_registry().lock() {
+        Ok(mut guard) => guard
+            .remove(&(handle as usize))
+            .map(|state| state.files)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    for file in files {
+        let _ = fs::remove_file(file);
     }
 }
 
@@ -837,9 +907,12 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2<'loca
             };
             let path_str = normalize_db_path_for_java(path_str);
 
-            let mut engine_opts = unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) }
+            let db_opts = unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) };
+            let mut engine_opts = db_opts
+                .as_ref()
                 .map(|h| h.opts.clone())
                 .unwrap_or_else(EngineOptions::default);
+            let db_log_dir = db_opts.as_ref().and_then(|h| h.db_log_dir.clone());
             let db_path = path_str.clone();
             engine_opts.db_path = path_str;
 
@@ -848,6 +921,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2<'loca
                 Ok(db) => {
                     let handle = Box::into_raw(Box::new(db)) as FrsDb;
                     register_db_path(handle, &db_path);
+                    register_db_log_dir(handle, db_log_dir.as_deref());
                     handle as jlong
                 }
                 Err(e) => {
@@ -872,6 +946,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_close<'local>(
         &mut env,
         || (),
         |env| {
+            cleanup_compat_db_logs(handle as FrsDb);
             unregister_db_path(handle as FrsDb);
             // SAFETY: handle came from a prior frs_db_open; nullity is checked
             // inside frs_db_close.
@@ -906,6 +981,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_closeDatabase<'local>(
         &mut env,
         || (),
         |env| {
+            cleanup_compat_db_logs(handle as FrsDb);
             unregister_db_path(handle as FrsDb);
             let status = unsafe { frs_db_close(handle as FrsDb) };
             check_status(env, status, "RocksDB.closeDatabase");
@@ -1627,7 +1703,9 @@ pub extern "system" fn Java_org_forstdb_RocksDB_flush<'local>(
             };
             if len == 0 {
                 let status = unsafe { frs_flush(handle as FrsDb) };
-                check_status(env, status, "RocksDB.flush");
+                if !check_status(env, status, "RocksDB.flush") {
+                    touch_compat_db_log_file(handle as FrsDb);
+                }
                 return;
             }
             let mut handles = vec![0_i64; len];
@@ -1644,6 +1722,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_flush<'local>(
                     return;
                 }
             }
+            touch_compat_db_log_file(handle as FrsDb);
         },
     )
 }
@@ -2013,7 +2092,12 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getDefaultColumnFamily<'local>(
             if check_status(env, status, "RocksDB.getDefaultColumnFamily") {
                 return 0;
             }
-            cf as jlong
+            CfHandle {
+                name: b"default".to_vec(),
+                frs_handle: cf,
+                owned_opts_handle: 0,
+            }
+            .into_raw()
         },
     )
 }
@@ -5012,6 +5096,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                 return ptr::null_mut();
             }
             register_db_path(db_handle, &db_path);
+            register_db_log_dir(db_handle, db_opts.db_log_dir.as_deref());
             result.into_raw()
         },
     )
@@ -5289,6 +5374,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             }
 
             register_db_path(db_handle, &db_path);
+            register_db_log_dir(db_handle, db_opts.db_log_dir.as_deref());
             db_handle as jlong
         },
     )
@@ -5313,6 +5399,7 @@ fn cleanup_partial_open(db_handle: FrsDb, partial_cf_handles: &[jlong]) {
         }
     }
     if !db_handle.is_null() {
+        cleanup_compat_db_logs(db_handle);
         unregister_db_path(db_handle);
         let _ = unsafe { frs_db_close(db_handle) };
     }
