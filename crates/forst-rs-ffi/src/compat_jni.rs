@@ -75,16 +75,18 @@ use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 
-use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JPrimitiveArray, JString};
-use jni::sys::{
-    jboolean, jbyte, jbyteArray, jint, jlong, jobjectArray, JavaVM, JNI_FALSE, JNI_TRUE,
-    JNI_VERSION_1_8,
+use jni::objects::{
+    GlobalRef, JByteArray, JClass, JObject, JObjectArray, JPrimitiveArray, JString,
 };
-use jni::JNIEnv;
+use jni::sys::{
+    jboolean, jbyte, jbyteArray, jint, jlong, jobjectArray, JNI_FALSE, JNI_TRUE, JNI_VERSION_1_8,
+};
+use jni::{JNIEnv, JavaVM};
 
 use forst_rs_common::{CfOptions, CompressionType, EngineOptions};
-use forst_rs_engine::DbImpl;
+use forst_rs_engine::{ColumnFamilyHandle, CompactionFilter, DbImpl, FlinkTtlCompactionFilter};
 use forst_rs_io::{FileSystem, LocalFileSystem};
 
 use crate::{
@@ -413,6 +415,7 @@ pub(crate) mod handles {
         pub min_write_buffer_number_to_merge: jint,
         pub compression_per_level: Vec<u8>,
         pub arena_block_size: jlong,
+        pub compaction_filter_factory_handle: jlong,
     }
 
     /// Java `org.forstdb.WriteOptions` mirror. forst-rs always durably
@@ -1685,6 +1688,15 @@ pub extern "system" fn Java_org_forstdb_RocksDB_createColumnFamily<'local>(
             if check_status(env, status, "RocksDB.createColumnFamily") {
                 return 0;
             }
+            if !attach_flink_compaction_filter_factory_to_cf(
+                env,
+                handle as FrsDb,
+                cf,
+                _cf_options_handle,
+                "RocksDB.createColumnFamily",
+            ) {
+                return 0;
+            }
             CfHandle {
                 name: name_bytes,
                 frs_handle: cf,
@@ -2029,7 +2041,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_merge__JJ_3BII_3BIIJ<'local>(
 /// "everything". A future revision can add `compactRangeBounded` once the
 /// engine grows range support.
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_RocksDB_compactRange<'local>(
+pub extern "system" fn Java_org_forstdb_RocksDB_compactRange__JJ<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -4447,14 +4459,21 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyOptions_setCompactionFilterF
 >(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _factory_handle: jlong,
+    handle: jlong,
+    factory_handle: jlong,
 ) {
     jni_guard(
         &mut env,
         || (),
-        |_env| {
-            tracing::debug!(target: "compat_jni::cfopts", "setCompactionFilterFactoryHandle: not supported; ignored");
+        |env| {
+            if let Some(cf_opts) = unsafe { CfOptionsHandle::from_raw_ref(handle) } {
+                cf_opts.compaction_filter_factory_handle = factory_handle;
+                hydrate_flink_compaction_filter_factory(
+                    env,
+                    factory_handle,
+                    "ColumnFamilyOptions.setCompactionFilterFactoryHandle",
+                );
+            }
         },
     )
 }
@@ -5126,6 +5145,16 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                     );
                     return ptr::null_mut();
                 }
+                if !attach_flink_compaction_filter_factory_to_cf(
+                    env,
+                    db_handle,
+                    frs_cf,
+                    cf_opts_buf[i],
+                    "RocksDB.open(multi-CF)",
+                ) {
+                    cleanup_partial_open(db_handle, &cf_handles);
+                    return ptr::null_mut();
+                }
 
                 cf_handles.push(
                     CfHandle {
@@ -5421,6 +5450,16 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                         "RocksDB.open(multi-CF): failed to open/create CF `{name_str}`: frs_status={status}"
                     ),
                 );
+                    return 0;
+                }
+                if !attach_flink_compaction_filter_factory_to_cf(
+                    env,
+                    db_handle,
+                    frs_cf,
+                    cf_opts_buf[i],
+                    "RocksDB.open(multi-CF)",
+                ) {
+                    cleanup_partial_open(db_handle, &out_handles);
                     return 0;
                 }
 
@@ -9015,13 +9054,24 @@ pub(crate) mod handles_p5 {
     /// Accepted but never consulted. One Box per Flink CF
     /// (`new FlinkCompactionFilterFactory(timeProvider)` calls our ctor).
     /// Allocated by `Java_org_forstdb_AbstractCompactionFilterFactory_createNewCompactionFilterFactory0`.
-    #[derive(Debug, Default)]
+    #[derive(Default)]
     pub(crate) struct FlinkCompactionFilterFactoryHandle {
         /// Bumped each time the Flink side calls `createCompactionFilter`
         /// (which forwards to `createNewFlinkCompactionFilter0`). Recorded
-        /// for debugging — the engine never reads it.
+        /// for debugging.
         #[allow(dead_code)]
         pub filters_created: u64,
+        /// Java factory object captured during the native factory ctor.
+        pub factory_obj: Option<GlobalRef>,
+        /// JVM handle used by compaction-time callbacks into TimeProvider.
+        pub java_vm: Option<Arc<JavaVM>>,
+        /// ConfigHolder native handle paired by Java constructor order.
+        pub config_holder_handle: jlong,
+        /// Java TimeProvider captured from the fully-built factory object.
+        pub time_provider: Option<Arc<GlobalRef>>,
+        /// CF attachment populated when ColumnFamilyOptions is used to open/create a CF.
+        pub db_handle: FrsDb,
+        pub cf_handle: FrsCfHandle,
     }
 
     /// Accepted but never consulted. One Box per ConfigHolder, allocated
@@ -9054,6 +9104,10 @@ pub(crate) mod handles_p5 {
         /// list state, else the per-element byte width).
         #[allow(dead_code)]
         pub fixed_element_length: i32,
+        /// Java ListElementFilterFactory for variable-length list states.
+        pub list_element_filter_factory: Option<GlobalRef>,
+        /// Owning factory native handle, linked by Java constructor order.
+        pub factory_handle: jlong,
     }
 
     impl FlinkCompactionFilterHandle {
@@ -9097,6 +9151,324 @@ use handles_p5::{
     FlinkCompactionFilterConfigHandle, FlinkCompactionFilterFactoryHandle,
     FlinkCompactionFilterHandle,
 };
+
+static PENDING_FLINK_COMPACTION_FILTER_FACTORIES: OnceLock<Mutex<HashMap<ThreadId, jlong>>> =
+    OnceLock::new();
+
+fn pending_flink_compaction_filter_factories() -> &'static Mutex<HashMap<ThreadId, jlong>> {
+    PENDING_FLINK_COMPACTION_FILTER_FACTORIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_pending_flink_compaction_filter_factory(factory_handle: jlong) {
+    if factory_handle == 0 {
+        return;
+    }
+    if let Ok(mut guard) = pending_flink_compaction_filter_factories().lock() {
+        guard.insert(std::thread::current().id(), factory_handle);
+    }
+}
+
+fn remove_pending_flink_compaction_filter_factory(factory_handle: jlong) {
+    if let Ok(mut guard) = pending_flink_compaction_filter_factories().lock() {
+        guard.retain(|_, pending| *pending != factory_handle);
+    }
+}
+
+fn link_pending_flink_compaction_filter_factory(config_holder_handle: jlong) {
+    if config_holder_handle == 0 {
+        return;
+    }
+    let factory_handle = pending_flink_compaction_filter_factories()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.remove(&std::thread::current().id()));
+    let Some(factory_handle) = factory_handle else {
+        return;
+    };
+    let Some(factory) =
+        (unsafe { FlinkCompactionFilterFactoryHandle::from_raw_ref(factory_handle) })
+    else {
+        return;
+    };
+    let Some(cfg) =
+        (unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(config_holder_handle) })
+    else {
+        return;
+    };
+    factory.config_holder_handle = config_holder_handle;
+    cfg.factory_handle = factory_handle;
+}
+
+unsafe fn compat_db_arc_from_handle(handle: FrsDb) -> Option<Arc<DbImpl>> {
+    if handle.is_null() {
+        return None;
+    }
+    let ptr = handle as *const Arc<DbImpl>;
+    Some((*ptr).clone())
+}
+
+unsafe fn compat_cf_ref<'a>(handle: &'a FrsCfHandle) -> Option<&'a ColumnFamilyHandle> {
+    if handle.is_null() {
+        return None;
+    }
+    Some(&*(*handle as *const ColumnFamilyHandle))
+}
+
+fn hydrate_flink_compaction_filter_factory(env: &mut JNIEnv, factory_handle: jlong, context: &str) {
+    if factory_handle == 0 {
+        return;
+    }
+    let Some(factory) =
+        (unsafe { FlinkCompactionFilterFactoryHandle::from_raw_ref(factory_handle) })
+    else {
+        return;
+    };
+
+    let Some(factory_obj) = factory.factory_obj.as_ref() else {
+        return;
+    };
+
+    if factory.config_holder_handle == 0 {
+        let cfg_obj = match env
+            .get_field(
+                factory_obj.as_obj(),
+                "configHolder",
+                "Lorg/forstdb/FlinkCompactionFilter$ConfigHolder;",
+            )
+            .and_then(|v| v.l())
+        {
+            Ok(obj) if !obj.is_null() => obj,
+            _ => return,
+        };
+        let cfg_handle = match env.call_method(&cfg_obj, "getNativeHandle", "()J", &[]) {
+            Ok(v) => v.j().unwrap_or(0),
+            Err(e) => {
+                tracing::debug!(
+                    target: "compat_jni::flink_compaction_filter",
+                    "{context}: failed to read ConfigHolder native handle: {e}"
+                );
+                0
+            }
+        };
+        if cfg_handle != 0 {
+            factory.config_holder_handle = cfg_handle;
+            if let Some(cfg) =
+                unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(cfg_handle) }
+            {
+                cfg.factory_handle = factory_handle;
+            }
+        }
+    }
+
+    if factory.time_provider.is_none() {
+        let time_provider_obj = match env
+            .get_field(
+                factory_obj.as_obj(),
+                "timeProvider",
+                "Lorg/forstdb/FlinkCompactionFilter$TimeProvider;",
+            )
+            .and_then(|v| v.l())
+        {
+            Ok(obj) if !obj.is_null() => obj,
+            _ => return,
+        };
+        match env.new_global_ref(&time_provider_obj) {
+            Ok(global) => factory.time_provider = Some(Arc::new(global)),
+            Err(e) => tracing::debug!(
+                target: "compat_jni::flink_compaction_filter",
+                "{context}: failed to global-ref TimeProvider: {e}"
+            ),
+        }
+    }
+}
+
+fn install_configured_flink_ttl_filter(
+    env: &mut JNIEnv,
+    factory_handle: jlong,
+    context: &str,
+) -> bool {
+    if factory_handle == 0 {
+        return true;
+    }
+    hydrate_flink_compaction_filter_factory(env, factory_handle, context);
+
+    let (db_handle, cf_handle, cfg_handle, java_vm, time_provider) = {
+        let Some(factory) =
+            (unsafe { FlinkCompactionFilterFactoryHandle::from_raw_ref(factory_handle) })
+        else {
+            return true;
+        };
+        if factory.db_handle.is_null()
+            || factory.cf_handle.is_null()
+            || factory.config_holder_handle == 0
+        {
+            return true;
+        }
+        (
+            factory.db_handle,
+            factory.cf_handle,
+            factory.config_holder_handle,
+            factory.java_vm.clone(),
+            factory.time_provider.clone(),
+        )
+    };
+
+    let (configured, ttl_ms, state_type, timestamp_offset, fixed_element_length, list_factory) = {
+        let Some(cfg) = (unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(cfg_handle) })
+        else {
+            return true;
+        };
+        (
+            cfg.configured,
+            cfg.ttl_ms,
+            cfg.state_type,
+            cfg.timestamp_offset.max(0) as usize,
+            (cfg.fixed_element_length > 0).then_some(cfg.fixed_element_length as usize),
+            cfg.list_element_filter_factory.clone(),
+        )
+    };
+    if !configured {
+        return true;
+    }
+
+    let filter: Arc<dyn CompactionFilter> = match (java_vm, time_provider) {
+        (Some(java_vm), Some(time_provider)) => {
+            let time_vm = Arc::clone(&java_vm);
+            let supplier = Arc::new(move || -> u64 {
+                let Ok(mut env) = time_vm.attach_current_thread() else {
+                    return 0;
+                };
+                env.call_method(time_provider.as_obj(), "currentTimestamp", "()J", &[])
+                    .ok()
+                    .and_then(|v| v.j().ok())
+                    .filter(|v| *v >= 0)
+                    .map(|v| v as u64)
+                    .unwrap_or(0)
+            });
+
+            let list_supplier = if fixed_element_length.is_none() {
+                list_factory.and_then(|factory| {
+                    let mut env = java_vm.attach_current_thread().ok()?;
+                    let filter_obj = env
+                        .call_method(
+                            factory.as_obj(),
+                            "createListElementFilter",
+                            "()Lorg/forstdb/FlinkCompactionFilter$ListElementFilter;",
+                            &[],
+                        )
+                        .ok()?
+                        .l()
+                        .ok()?;
+                    let filter_ref = Arc::new(env.new_global_ref(filter_obj).ok()?);
+                    let callback_vm = Arc::clone(&java_vm);
+                    Some(Arc::new(move |bytes: &[u8], ttl_ms: u64, now_ms: u64| -> usize {
+                        let Ok(mut env) = callback_vm.attach_current_thread() else {
+                            return 0;
+                        };
+                        let Ok(bytes_array) = env.byte_array_from_slice(bytes) else {
+                            return 0;
+                        };
+                        let result = env.call_method(
+                            filter_ref.as_obj(),
+                            "nextUnexpiredOffset",
+                            "([BJJ)I",
+                            &[
+                                jni::objects::JValue::Object(bytes_array.as_ref()),
+                                jni::objects::JValue::Long(ttl_ms as jlong),
+                                jni::objects::JValue::Long(now_ms as jlong),
+                            ],
+                        );
+                        match result.and_then(|v| v.i()) {
+                            Ok(offset) if offset > 0 => offset as usize,
+                            Ok(_) => 0,
+                            Err(_) => {
+                                if env.exception_check().unwrap_or(false) {
+                                    let _ = env.exception_clear();
+                                }
+                                0
+                            }
+                        }
+                    }) as forst_rs_engine::ListElementOffsetSupplier)
+                })
+            } else {
+                None
+            };
+
+            Arc::new(FlinkTtlCompactionFilter::with_list_filter(
+                ttl_ms,
+                forst_rs_engine::TtlStateType::from_ordinal(state_type),
+                timestamp_offset,
+                supplier,
+                fixed_element_length,
+                list_supplier,
+            ))
+        }
+        _ => Arc::new(FlinkTtlCompactionFilter::with_list_filter(
+            ttl_ms,
+            forst_rs_engine::TtlStateType::from_ordinal(state_type),
+            timestamp_offset,
+            Arc::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            }),
+            fixed_element_length,
+            None,
+        )),
+    };
+
+    let Some(db) = (unsafe { compat_db_arc_from_handle(db_handle) }) else {
+        throw_rocksdb(
+            env,
+            &format!("{context}: null DB handle for TTL compaction filter"),
+        );
+        return false;
+    };
+    let Some(cf) = (unsafe { compat_cf_ref(&cf_handle) }) else {
+        throw_rocksdb(
+            env,
+            &format!("{context}: null CF handle for TTL compaction filter"),
+        );
+        return false;
+    };
+    match db.set_compaction_filter(cf, Some(filter)) {
+        Ok(()) => true,
+        Err(e) => {
+            throw_rocksdb(
+                env,
+                &format!("{context}: failed to install TTL compaction filter: {e}"),
+            );
+            false
+        }
+    }
+}
+
+fn attach_flink_compaction_filter_factory_to_cf(
+    env: &mut JNIEnv,
+    db_handle: FrsDb,
+    cf_handle: FrsCfHandle,
+    cf_options_handle: jlong,
+    context: &str,
+) -> bool {
+    if cf_options_handle == 0 {
+        return true;
+    }
+    let factory_handle = unsafe { CfOptionsHandle::from_raw_ref(cf_options_handle) }
+        .map(|opts| opts.compaction_filter_factory_handle)
+        .unwrap_or(0);
+    if factory_handle == 0 {
+        return true;
+    }
+    hydrate_flink_compaction_filter_factory(env, factory_handle, context);
+    if let Some(factory) =
+        unsafe { FlinkCompactionFilterFactoryHandle::from_raw_ref(factory_handle) }
+    {
+        factory.db_handle = db_handle;
+        factory.cf_handle = cf_handle;
+    }
+    install_configured_flink_ttl_filter(env, factory_handle, context)
+}
 
 // ---------------------------------------------------------------------------
 // AbstractCompactionFilter — the parent class of FlinkCompactionFilter
@@ -9147,17 +9519,22 @@ pub extern "system" fn Java_org_forstdb_AbstractCompactionFilterFactory_createNe
     'local,
 >(
     mut env: JNIEnv<'local>,
-    _obj: JObject<'local>,
+    obj: JObject<'local>,
 ) -> jlong {
     jni_guard(
         &mut env,
         || 0_i64,
-        |_env| {
-            tracing::debug!(
-                target: "compat_jni::flink_compaction_filter",
-                "AbstractCompactionFilterFactory.createNewCompactionFilterFactory0: TTL compaction filter factory accepted (handle is a no-op; entries with embedded TTL timestamps will NOT be expired by compaction in this build — see compat_jni::handles_p5 docs)"
-            );
-            FlinkCompactionFilterFactoryHandle::default().into_raw()
+        |env| {
+            let factory_obj = env.new_global_ref(&obj).ok();
+            let java_vm = env.get_java_vm().ok().map(Arc::new);
+            let handle = FlinkCompactionFilterFactoryHandle {
+                factory_obj,
+                java_vm,
+                ..Default::default()
+            }
+            .into_raw();
+            record_pending_flink_compaction_filter_factory(handle);
+            handle
         },
     )
 }
@@ -9176,6 +9553,7 @@ pub extern "system" fn Java_org_forstdb_AbstractCompactionFilterFactory_disposeI
         || (),
         |_env| {
             if handle != 0 {
+                remove_pending_flink_compaction_filter_factory(handle);
                 // SAFETY: handle came from a prior createNewCompactionFilterFactory0.
                 unsafe {
                     drop(Box::from_raw(
@@ -9253,11 +9631,9 @@ pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_createNewFlinkComp
         &mut env,
         || 0_i64,
         |_env| {
-            tracing::debug!(
-                target: "compat_jni::flink_compaction_filter",
-                "FlinkCompactionFilter.createNewFlinkCompactionFilterConfigHolder: ConfigHolder accepted (no-op)"
-            );
-            FlinkCompactionFilterConfigHandle::default().into_raw()
+            let handle = FlinkCompactionFilterConfigHandle::default().into_raw();
+            link_pending_flink_compaction_filter_factory(handle);
+            handle
         },
     )
 }
@@ -9319,12 +9695,12 @@ pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_configureFlinkComp
     ttl: jlong,
     query_time_after_num_entries: jlong,
     fixed_element_length: jint,
-    _list_element_filter_factory: JObject<'local>,
+    list_element_filter_factory: JObject<'local>,
 ) -> jboolean {
     jni_guard(
         &mut env,
         || JNI_FALSE,
-        |_env| {
+        |env| {
             // SAFETY: handle came from a prior createNewFlinkCompactionFilterConfigHolder.
             let Some(cfg) =
                 (unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(config_holder_handle) })
@@ -9353,11 +9729,37 @@ pub extern "system" fn Java_org_forstdb_FlinkCompactionFilter_configureFlinkComp
                 query_time_after_num_entries as u64
             };
             cfg.fixed_element_length = fixed_element_length;
+            cfg.list_element_filter_factory = if list_element_filter_factory.is_null() {
+                None
+            } else {
+                match env.new_global_ref(list_element_filter_factory) {
+                    Ok(global) => Some(global),
+                    Err(e) => {
+                        throw_rocksdb(
+                            env,
+                            &format!(
+                                "configureFlinkCompactionFilter: failed to retain list filter factory: {e}"
+                            ),
+                        );
+                        return JNI_FALSE;
+                    }
+                }
+            };
+            let factory_handle = cfg.factory_handle;
             tracing::debug!(
                 target: "compat_jni::flink_compaction_filter",
-                "configureFlinkCompactionFilter: state_type={state_type} ts_off={timestamp_offset} ttl_ms={} query_after_n={} fixed_len={fixed_element_length} (snapshot only; TTL not enforced)",
+                "configureFlinkCompactionFilter: state_type={state_type} ts_off={timestamp_offset} ttl_ms={} query_after_n={} fixed_len={fixed_element_length}",
                 cfg.ttl_ms, cfg.query_time_after_n
             );
+            if factory_handle != 0
+                && !install_configured_flink_ttl_filter(
+                    env,
+                    factory_handle,
+                    "FlinkCompactionFilter.configureFlinkCompactionFilter",
+                )
+            {
+                return JNI_FALSE;
+            }
             JNI_TRUE
         },
     )
@@ -9465,7 +9867,7 @@ mod tests {
             "Java_org_forstdb_RocksDB_merge__J_3BII_3BIIJ",
             "Java_org_forstdb_RocksDB_merge__JJ_3BII_3BII",
             "Java_org_forstdb_RocksDB_merge__JJ_3BII_3BIIJ",
-            "Java_org_forstdb_RocksDB_compactRange",
+            "Java_org_forstdb_RocksDB_compactRange__JJ",
             "Java_org_forstdb_RocksDB_compactRange__J_3BI_3BIJJ",
             "Java_org_forstdb_RocksDB_compactRangeAll",
             "Java_org_forstdb_RocksDB_flushCf",
@@ -11101,6 +11503,41 @@ mod tests {
 
         // Dispose.
         unsafe { drop(Box::from_raw(h as *mut FlinkCompactionFilterFactoryHandle)) };
+    }
+
+    /// Factory and ConfigHolder are created by Java in constructor order:
+    /// `AbstractCompactionFilterFactory.<init>` allocates the factory handle,
+    /// then `FlinkCompactionFilterFactory.<init>` allocates its ConfigHolder.
+    /// The JNI shim must bind those two native handles so a later CF open can
+    /// install the configured TTL filter on the correct column family.
+    #[test]
+    fn test_flink_compaction_filter_factory_binds_config_holder_by_constructor_order() {
+        let factory_h = FlinkCompactionFilterFactoryHandle::default().into_raw();
+        assert_ne!(factory_h, 0);
+        record_pending_flink_compaction_filter_factory(factory_h);
+
+        let cfg_h = FlinkCompactionFilterConfigHandle::default().into_raw();
+        assert_ne!(cfg_h, 0);
+        link_pending_flink_compaction_filter_factory(cfg_h);
+
+        let factory = unsafe { FlinkCompactionFilterFactoryHandle::from_raw_ref(factory_h) }
+            .expect("factory handle must round-trip");
+        assert_eq!(factory.config_holder_handle, cfg_h);
+
+        let cfg = unsafe { FlinkCompactionFilterConfigHandle::from_raw_ref(cfg_h) }
+            .expect("config holder handle must round-trip");
+        assert_eq!(cfg.factory_handle, factory_h);
+
+        unsafe {
+            drop(Box::from_raw(
+                cfg_h as *mut FlinkCompactionFilterConfigHandle,
+            ))
+        };
+        unsafe {
+            drop(Box::from_raw(
+                factory_h as *mut FlinkCompactionFilterFactoryHandle,
+            ))
+        };
     }
 
     /// ConfigHolder + per-filter handle round-trip:

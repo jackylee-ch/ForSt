@@ -3595,6 +3595,11 @@ impl DbImpl {
     /// tests and when the engine is about to checkpoint.
     pub fn switch_and_flush(&self, cf: &ColumnFamilyHandle) -> ForstResult<Option<SstFileMeta>> {
         self.check_fatal_error()?;
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let active_entries = cf_data.active_memtable().num_entries();
+        if active_entries == 0 {
+            return Ok(None);
+        }
         self.force_switch_memtable(cf)?;
         self.flush_cf(cf)
     }
@@ -3686,6 +3691,18 @@ impl DbImpl {
         self.compact_l0_for_cf(&cf_data)
     }
 
+    /// Runs one manual full-range compaction step for a CF.
+    ///
+    /// Unlike background compaction, this is not gated by level-size
+    /// thresholds: Java `RocksDB.compactRange(cf)` is an explicit caller
+    /// request and Flink TTL tests rely on already-flushed deeper files being
+    /// re-visited even when the level is below the background trigger.
+    pub fn compact_range(&self, cf: &ColumnFamilyHandle) -> ForstResult<Option<SstFileMeta>> {
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        self.compact_range_for_cf(&cf_data)
+    }
+
+
     /// Runs compaction for every column family. For each CF, this drains
     /// every L0 file and then keeps picking any level that exceeds its
     /// target size until the entire LSM is balanced. Useful in tests and
@@ -3727,6 +3744,170 @@ impl DbImpl {
         }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
         self.compact_level_for_cf(&cf_data, level)
+    }
+
+    fn compact_range_for_cf(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+    ) -> ForstResult<Option<SstFileMeta>> {
+        if cf_data.is_dropped() {
+            return Ok(None);
+        }
+
+        let cf_id = cf_data.handle().id();
+        let mut last_meta = None;
+
+        loop {
+            let version = self.version_set.current();
+            if version.l0_files().iter().any(|f| f.cf_id == cf_id) {
+                if let Some(meta) = self.compact_l0_for_cf(cf_data)? {
+                    last_meta = Some(meta);
+                }
+                continue;
+            }
+
+            let bottom_level = version.num_levels().saturating_sub(1);
+            let mut compacted_non_bottom = false;
+            for level in 1..bottom_level {
+                let has_level_file = version.levels[level].files.iter().any(|f| f.cf_id == cf_id);
+                if has_level_file {
+                    if let Some(meta) = self.compact_level_for_cf(cf_data, level as u32)? {
+                        last_meta = Some(meta);
+                    }
+                    compacted_non_bottom = true;
+                    break;
+                }
+            }
+            if compacted_non_bottom {
+                continue;
+            }
+
+            if bottom_level > 0 && version.levels[bottom_level].files.iter().any(|f| f.cf_id == cf_id)
+            {
+                if let Some(meta) = self.compact_bottommost_for_cf(cf_data)? {
+                    last_meta = Some(meta);
+                }
+            }
+            return Ok(last_meta);
+        }
+    }
+
+    fn compact_bottommost_for_cf(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+    ) -> ForstResult<Option<SstFileMeta>> {
+        let _compaction_guard = self
+            .compaction_mutex
+            .lock()
+            .expect("compaction_mutex poisoned");
+        let _guard = cf_data.lock_flush();
+
+        if cf_data.is_dropped() {
+            return Ok(None);
+        }
+
+        let version = self.version_set.current();
+        let bottom_level = version.num_levels().saturating_sub(1);
+        if bottom_level == 0 {
+            return Ok(None);
+        }
+
+        let cf_id = cf_data.handle().id();
+        let bottom_files: Vec<SstFileMeta> = version.levels[bottom_level]
+            .files
+            .iter()
+            .filter(|f| f.cf_id == cf_id)
+            .cloned()
+            .collect();
+        if bottom_files.is_empty() {
+            return Ok(None);
+        }
+
+        let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> = Vec::new();
+        for meta in &bottom_files {
+            inputs.push((
+                bottom_level as u32,
+                meta.clone(),
+                self.get_or_open_sst_reader(meta)?,
+            ));
+        }
+
+        let output_file_number = self.version_set.allocate_file_number();
+        let output_path = compaction_output_path(&self.db_path, output_file_number);
+        let writer_options = SstWriterOptions {
+            block_size: self.options.block_size,
+            compression: self.options.compression,
+            cf_id,
+        };
+        let target_file_size = self.options.target_file_size_base as u64;
+        let total_input_bytes: u64 = inputs.iter().map(|(_, m, _)| m.file_size).sum();
+        let additional_outputs =
+            self.alloc_compaction_output_slots(total_input_bytes, target_file_size);
+        let min_active_snapshot = self.snapshot_registry.min_active();
+        let job = CompactionJob {
+            cf_id,
+            inputs,
+            output_level: bottom_level as u32,
+            output_file_number,
+            output_path: output_path.clone(),
+            additional_outputs,
+            target_file_size,
+            writer_options,
+            fs: self.fs.clone(),
+            merge_operator: cf_data.merge_operator().cloned(),
+            compaction_filter: cf_data.compaction_filter(),
+            is_bottommost: true,
+            min_active_snapshot,
+        };
+
+        let Some(edit) = job.run()? else {
+            return Ok(None);
+        };
+        if let Err(e) = self.version_set.apply(&edit) {
+            for (_, meta) in &edit.new_files {
+                debug_assert!(
+                    self.deletion_guard.can_delete(meta.file_number),
+                    "orphan-delete bypass for bottommost rewrite output {} is unsafe: file is pinned",
+                    meta.file_number.value()
+                );
+                let p = compaction_output_path(&self.db_path, meta.file_number);
+                if let Err(rm_err) = self.fs.delete_file(&p) {
+                    tracing::warn!(
+                        target: "forst_rs_engine::compaction",
+                        file_number = meta.file_number.value(),
+                        error = %rm_err,
+                        "failed to remove orphaned bottommost compaction output after stale-edit reject"
+                    );
+                }
+            }
+            return Err(e);
+        }
+
+        let new_meta = edit.new_files.first().map(|(_, m)| m.clone());
+        for (_, meta) in &edit.new_files {
+            let p = compaction_output_path(&self.db_path, meta.file_number);
+            self.fs.await_upload(&p)?;
+            let rac = self.fs.open_random_access_file(&p)?;
+            let reader = Arc::new(SstReaderImpl::open(rac)?);
+            self.sst_readers.rcu(|cur| {
+                let mut next = (**cur).clone();
+                next.insert(meta.file_number, std::sync::Arc::clone(&reader));
+                std::sync::Arc::new(next)
+            });
+        }
+        self.sst_readers.rcu(|cur| {
+            let mut next = (**cur).clone();
+            for (_, file_number) in &edit.deleted_files {
+                next.remove(file_number);
+            }
+            std::sync::Arc::new(next)
+        });
+        for (_, file_number) in &edit.deleted_files {
+            self.delete_file_guarded(*file_number);
+        }
+        self.reap_pending_deletions();
+
+        Ok(new_meta)
     }
 
     fn compact_once(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<bool> {
@@ -12550,6 +12731,42 @@ mod tests {
 
         assert!(db.get(&cf, b"old").unwrap().is_none(), "expired key kept");
         assert!(db.get(&cf, b"new").unwrap().is_some(), "fresh key dropped");
+    }
+
+    #[test]
+    fn test_compact_range_revisits_deeper_level_for_ttl_filter() {
+        use crate::compaction_filter::{FlinkTtlCompactionFilter, TtlStateType};
+
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("flink-ttl-deeper"))
+            .unwrap();
+
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(50));
+        let now_for_filter = Arc::clone(&now);
+        let supplier: crate::compaction_filter::CurrentTimeSupplier = Arc::new(move || {
+            now_for_filter.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        let filter = Arc::new(FlinkTtlCompactionFilter::with_supplier(
+            100,
+            TtlStateType::Value,
+            0,
+            supplier,
+        ));
+        db.set_compaction_filter(&cf, Some(filter)).unwrap();
+
+        let mut value = Vec::new();
+        value.extend_from_slice(&100u64.to_be_bytes());
+        value.extend_from_slice(b"payload");
+        db.put(&cf, b"k", &value).unwrap();
+
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_range(&cf).unwrap().unwrap();
+        assert!(db.get(&cf, b"k").unwrap().is_some());
+
+        now.store(200, std::sync::atomic::Ordering::Relaxed);
+        db.compact_range(&cf).unwrap();
+        assert!(db.get(&cf, b"k").unwrap().is_none());
     }
 
     /// Clearing a previously-installed filter via

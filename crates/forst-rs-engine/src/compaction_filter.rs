@@ -231,6 +231,7 @@ impl TtlStateType {
 /// shape lets tests inject a deterministic clock without relying on
 /// `SystemTime::now()`.
 pub type CurrentTimeSupplier = Arc<dyn Fn() -> u64 + Send + Sync>;
+pub type ListElementOffsetSupplier = Arc<dyn Fn(&[u8], u64, u64) -> usize + Send + Sync>;
 
 /// Flink-shaped TTL filter mirroring the surface that
 /// `org.forstdb.FlinkCompactionFilter` exposes.
@@ -247,14 +248,14 @@ pub type CurrentTimeSupplier = Arc<dyn Fn() -> u64 + Send + Sync>;
 ///
 /// # Decision matrix
 ///
-/// | state_type | op_type           | now > expiry_ms (BE) | decision |
+/// | state_type | op_type           | last_access_ms + ttl_ms <= now | decision |
 /// |------------|-------------------|----------------------|----------|
 /// | Disabled   | any               | n/a                  | Keep     |
 /// | Value/List | Delete/SingleDel  | n/a                  | Keep     |
-/// | Value/List | Put/Merge         | yes                  | Discard  |
-/// | Value/List | Put/Merge         | no                   | Keep     |
+/// | Value/List | Put/Merge         | yes                            | Discard  |
+/// | Value/List | Put/Merge         | no                             | Keep     |
 /// | Value/List | Put/Merge w/ short value (< offset+8) | n/a | Keep |
-/// | Value/List | Put/Merge w/ expiry in future      | n/a | Keep |
+/// | Value/List | Put/Merge w/ future last-access ts | n/a | Keep |
 ///
 /// `ttl_ms == 0` means "never expire" (mirrors the C++ ConfigHolder
 /// semantics where a zero TTL is treated as "no enforcement").
@@ -263,6 +264,8 @@ pub struct FlinkTtlCompactionFilter {
     state_type: TtlStateType,
     timestamp_offset: usize,
     current_time_supplier: CurrentTimeSupplier,
+    fixed_element_length: Option<usize>,
+    list_element_offset_supplier: Option<ListElementOffsetSupplier>,
 }
 
 impl FlinkTtlCompactionFilter {
@@ -273,6 +276,8 @@ impl FlinkTtlCompactionFilter {
             state_type,
             timestamp_offset,
             current_time_supplier: Arc::new(unix_millis_now),
+            fixed_element_length: None,
+            list_element_offset_supplier: None,
         }
     }
 
@@ -288,6 +293,26 @@ impl FlinkTtlCompactionFilter {
             state_type,
             timestamp_offset,
             current_time_supplier,
+            fixed_element_length: None,
+            list_element_offset_supplier: None,
+        }
+    }
+
+    pub fn with_list_filter(
+        ttl_ms: u64,
+        state_type: TtlStateType,
+        timestamp_offset: usize,
+        current_time_supplier: CurrentTimeSupplier,
+        fixed_element_length: Option<usize>,
+        list_element_offset_supplier: Option<ListElementOffsetSupplier>,
+    ) -> Self {
+        Self {
+            ttl_ms,
+            state_type,
+            timestamp_offset,
+            current_time_supplier,
+            fixed_element_length,
+            list_element_offset_supplier,
         }
     }
 
@@ -307,12 +332,10 @@ impl FlinkTtlCompactionFilter {
     }
 
     /// Returns `true` iff the value at `value[timestamp_offset..+8]`
-    /// decodes (big-endian) to an EXPIRY timestamp less than `now`.
-    /// Matches Flink's `TtlValue.isExpired` predicate (`currentTime >
-    /// expiryTimestamp`) — the stored value is `record.getExpiryTimestamp()
-    /// = now + ttlMillis` written by `TtlSerializer` at write time, so
-    /// the configured `ttl_ms` does NOT participate in this filter's
-    /// expiry decision.
+    /// decodes (big-endian) to Flink runtime's last-access timestamp
+    /// and `last_access + ttl_ms <= now`. This mirrors
+    /// `TtlUtils.expired(lastAccessTimestamp, ttl, currentTimestamp)`
+    /// used by the community ForSt/RocksDB TTL serializers.
     ///
     /// Conservative on partial values: any value shorter than
     /// `timestamp_offset + 8` is treated as "no timestamp present" → kept.
@@ -328,24 +351,57 @@ impl FlinkTtlCompactionFilter {
         }
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&value[self.timestamp_offset..end]);
-        // R81-H1 + R82-H1: Flink's TtlSerializer writes the 8-byte value
-        // as a big-endian EXPIRY timestamp (`record.getExpiryTimestamp()`,
-        // computed at write time as `now + ttlMillis`), and the read-side
-        // predicate is `currentTime > expiryTimestamp` (see
-        // `TtlValue.isExpired` and TtlSerializer.java:94). Pre-R81 the
-        // decoder was `from_le_bytes` (endianness wrong). R81 fixed the
-        // endianness but still computed `now.saturating_sub(ts) > ttl_ms`
-        // — treating the stored value as a CREATION timestamp. That
-        // made the effective drop point `2 * ttl_ms` past write, not
-        // `ttl_ms` (Flink's expiry already includes ttl_ms).
-        //
-        // The correct predicate is simply `now > expiry`. The `ttl_ms`
-        // field is retained on the struct for the legacy non-Flink
-        // `TtlCompactionFilter` semantics and for future API symmetry,
-        // but is not used by this filter's expiry decision.
-        let expiry_ms = u64::from_be_bytes(buf);
+        let last_access_ms = u64::from_be_bytes(buf);
         let now = (self.current_time_supplier)();
-        now > expiry_ms
+        let expiration_ms = last_access_ms.saturating_add(self.ttl_ms);
+        let expired = expiration_ms <= now;
+        expired
+    }
+
+    fn list_unexpired_offset(&self, value: &[u8]) -> usize {
+        if self.ttl_ms == 0 || value.is_empty() {
+            return 0;
+        }
+        let now = (self.current_time_supplier)();
+        if let Some(fixed_element_length) = self.fixed_element_length.filter(|len| *len > 0) {
+            let mut offset = 0usize;
+            while offset < value.len() {
+                let ts_end = offset.saturating_add(self.timestamp_offset).saturating_add(8);
+                if value.len() < ts_end {
+                    break;
+                }
+                let mut buf = [0u8; 8];
+                let ts_offset = offset + self.timestamp_offset;
+                buf.copy_from_slice(&value[ts_offset..ts_offset + 8]);
+                let last_access_ms = u64::from_be_bytes(buf);
+                if last_access_ms.saturating_add(self.ttl_ms) > now {
+                    break;
+                }
+                offset = offset.saturating_add(fixed_element_length).min(value.len());
+            }
+            return offset;
+        }
+        if let Some(ref supplier) = self.list_element_offset_supplier {
+            return supplier(value, self.ttl_ms, now).min(value.len());
+        }
+        if self.is_expired(value) {
+            value.len()
+        } else {
+            0
+        }
+    }
+
+    fn filter_list_value(&self, value: &[u8], value_out: &mut Vec<u8>) -> CompactionDecision {
+        let offset = self.list_unexpired_offset(value);
+        if offset == 0 {
+            CompactionDecision::Keep
+        } else if offset >= value.len() {
+            CompactionDecision::Discard
+        } else {
+            value_out.clear();
+            value_out.extend_from_slice(&value[offset..]);
+            CompactionDecision::Replace
+        }
     }
 }
 
@@ -366,7 +422,7 @@ impl CompactionFilter for FlinkTtlCompactionFilter {
         value: Option<&[u8]>,
         _sequence: u64,
         op_type: OpType,
-        _value_out: &mut Vec<u8>,
+        value_out: &mut Vec<u8>,
     ) -> CompactionDecision {
         if self.state_type == TtlStateType::Disabled {
             return CompactionDecision::Keep;
@@ -375,8 +431,9 @@ impl CompactionFilter for FlinkTtlCompactionFilter {
             // Tombstones are ALWAYS kept — dropping them would resurrect
             // older Puts shadowed at lower levels.
             OpType::Delete | OpType::SingleDelete => CompactionDecision::Keep,
-            OpType::Put | OpType::Merge => match value {
-                Some(v) if self.is_expired(v) => CompactionDecision::Discard,
+            OpType::Put | OpType::Merge => match (self.state_type, value) {
+                (TtlStateType::List, Some(v)) => self.filter_list_value(v, value_out),
+                (_, Some(v)) if self.is_expired(v) => CompactionDecision::Discard,
                 _ => CompactionDecision::Keep,
             },
         }
@@ -389,11 +446,17 @@ impl CompactionFilter for FlinkTtlCompactionFilter {
         // that differ in `ttl_ms`, `state_type`, or `timestamp_offset`
         // are distinct identities and must not be admitted as
         // "homogeneous" across CFs.
+        let list_filter = match (self.fixed_element_length, self.list_element_offset_supplier.is_some()) {
+            (Some(len), _) => format!("fixed:{len}"),
+            (None, true) => "callback".to_string(),
+            (None, false) => "none".to_string(),
+        };
         format!(
-            "FlinkTtlCompactionFilter(ttl_ms={},state_type={},timestamp_offset={})",
+            "FlinkTtlCompactionFilter(ttl_ms={},state_type={},timestamp_offset={},list_filter={})",
             self.ttl_ms,
             self.state_type.ordinal(),
             self.timestamp_offset,
+            list_filter,
         )
     }
 }
@@ -564,16 +627,13 @@ mod tests {
         Arc::new(move || now_ms)
     }
 
-    /// `Value` state: entry whose EXPIRY timestamp is past `now` must be
-    /// discarded. R82-H1: Flink's TtlSerializer stores the EXPIRY
-    /// timestamp (not the creation timestamp); predicate is `now >
-    /// expiry`. ttl_ms is retained on the filter struct but does not
-    /// participate in the expiry decision.
+    /// `Value` state: entry whose last-access timestamp plus TTL is past
+    /// `now` must be discarded, matching Flink runtime `TtlUtils`.
     #[test]
     fn test_ttl_filter_value_expired() {
-        // expiry=500, now=1100 → 1100 > 500 → discard.
+        // lastAccess=500, ttl=500, now=1100 -> 1000 <= 1100 -> discard.
         let f = FlinkTtlCompactionFilter::with_supplier(
-            1000,
+            500,
             TtlStateType::Value,
             0,
             fixed_supplier(1100),
@@ -587,11 +647,11 @@ mod tests {
         // R47-H1: name encodes ttl_ms / state_type / timestamp_offset.
         assert_eq!(
             f.name(),
-            "FlinkTtlCompactionFilter(ttl_ms=1000,state_type=1,timestamp_offset=0)"
+            "FlinkTtlCompactionFilter(ttl_ms=500,state_type=1,timestamp_offset=0,list_filter=none)"
         );
         // Two filters that differ in ttl_ms only must produce distinct names.
         let g = FlinkTtlCompactionFilter::with_supplier(
-            500,
+            1000,
             TtlStateType::Value,
             0,
             fixed_supplier(1100),
@@ -599,11 +659,11 @@ mod tests {
         assert_ne!(f.name(), g.name());
     }
 
-    /// `Value` state: entry whose EXPIRY timestamp is in the future is
-    /// kept verbatim. R82-H1 expiry-semantics shape (was age-based).
+    /// `Value` state: entry whose last-access timestamp plus TTL is in
+    /// the future is kept verbatim.
     #[test]
     fn test_ttl_filter_value_not_expired() {
-        // expiry=2000, now=1000 → 1000 !> 2000 → keep.
+        // lastAccess=2000, ttl=1000, now=1000 -> expiration is in the future.
         let f = FlinkTtlCompactionFilter::with_supplier(
             1000,
             TtlStateType::Value,
@@ -648,8 +708,57 @@ mod tests {
             1,
             fixed_supplier(2000),
         );
-        // ts=1000 sitting after a 1-byte tag, age=1000 → discard.
+        // lastAccess=1000 sitting after a 1-byte tag, ttl=500, now=2000 -> discard.
         let v = flink_value(b"\x01", 1000, b"value");
+        let mut out = Vec::new();
+        assert_eq!(
+            f.filter(0, b"k", Some(&v), 1, OpType::Put, &mut out),
+            CompactionDecision::Discard
+        );
+    }
+
+    #[test]
+    fn test_ttl_filter_fixed_list_prunes_expired_prefix() {
+        let f = FlinkTtlCompactionFilter::with_list_filter(
+            100,
+            TtlStateType::List,
+            0,
+            fixed_supplier(250),
+            Some(10),
+            None,
+        );
+        let mut v = Vec::new();
+        v.extend_from_slice(&100u64.to_be_bytes());
+        v.extend_from_slice(b"a,");
+        v.extend_from_slice(&200u64.to_be_bytes());
+        v.extend_from_slice(b"b,");
+        v.extend_from_slice(&300u64.to_be_bytes());
+        v.extend_from_slice(b"c,");
+
+        let mut out = Vec::new();
+        assert_eq!(
+            f.filter(0, b"k", Some(&v), 1, OpType::Put, &mut out),
+            CompactionDecision::Replace
+        );
+        assert_eq!(out, v[10..]);
+    }
+
+    #[test]
+    fn test_ttl_filter_fixed_list_discards_all_expired_elements() {
+        let f = FlinkTtlCompactionFilter::with_list_filter(
+            100,
+            TtlStateType::List,
+            0,
+            fixed_supplier(500),
+            Some(10),
+            None,
+        );
+        let mut v = Vec::new();
+        v.extend_from_slice(&100u64.to_be_bytes());
+        v.extend_from_slice(b"a,");
+        v.extend_from_slice(&200u64.to_be_bytes());
+        v.extend_from_slice(b"b,");
+
         let mut out = Vec::new();
         assert_eq!(
             f.filter(0, b"k", Some(&v), 1, OpType::Put, &mut out),

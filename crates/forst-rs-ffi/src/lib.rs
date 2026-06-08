@@ -1922,7 +1922,10 @@ pub unsafe extern "C" fn frs_compact_cf(handle: FrsDb, cf: FrsCfHandle) -> i32 {
         let Some(cf) = cf_ref(&cf) else {
             return FRS_STATUS_NULL_ARG;
         };
-        match db.compact_l0(cf) {
+        if let Err(e) = db.switch_and_flush(cf) {
+            return error_to_status(&e);
+        }
+        match db.compact_range(cf) {
             Ok(_) => FRS_STATUS_OK,
             Err(e) => error_to_status(&e),
         }
@@ -7377,6 +7380,63 @@ mod tests {
                 frs_cf_set_compaction_filter_ttl(db, ptr::null_mut(), 0, 1, 0),
                 FRS_STATUS_NULL_ARG
             );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// `frs_compact_cf` is the JNI compactRange backend. It must make the
+    /// current memtable eligible for filtering before running L0 compaction;
+    /// otherwise Flink TTL `compactState` leaves just-written expired values
+    /// untouched until some unrelated flush happens.
+    #[test]
+    fn test_frs_compact_cf_flushes_memtable_before_ttl_filtering() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+            assert_eq!(
+                frs_cf_set_compaction_filter_ttl(db, cf, 100, 1, 0),
+                FRS_STATUS_OK
+            );
+
+            let key = b"expired-before-flush";
+            let mut value = Vec::new();
+            value.extend_from_slice(&0u64.to_be_bytes());
+            value.extend_from_slice(b"payload");
+            assert_eq!(
+                frs_put(db, cf, key.as_ptr(), key.len(), value.as_ptr(), value.len()),
+                FRS_STATUS_OK
+            );
+
+            assert_eq!(frs_compact_cf(db, cf), FRS_STATUS_OK);
+
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            assert!(out.data.is_null());
+            assert_eq!(out.len, 0);
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    #[test]
+    fn test_frs_compact_cf_empty_active_memtable_is_noop() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            assert_eq!(frs_compact_cf(db, cf), FRS_STATUS_OK);
 
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
