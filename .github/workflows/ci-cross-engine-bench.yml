@@ -81,6 +81,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_HTTP_TIMEOUT: '600'
   CARGO_NET_RETRY: '10'
+  # CI artifact portability: .cargo/config.toml keeps target-cpu=native for
+  # local/production performance, but this workflow uploads a cdylib built on
+  # one hosted runner and loads it in a different JVM-bench runner. Pin the GHA
+  # artifact to a stable x86-64-v2 baseline to avoid SIGILL on CPU-heterogeneous
+  # runners.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
   # Bench tunables (resolved here so both jobs see the same default).
   SAMPLE_SIZE: ${{ github.event.inputs.sample_size || '30' }}
   MEASUREMENT_TIME: ${{ github.event.inputs.measurement_time || '3' }}
