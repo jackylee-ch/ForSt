@@ -561,18 +561,130 @@ pub extern "system" fn Java_org_forstdb_RocksDB_close<'local>(
     )
 }
 
-/// `org.forstdb.RocksDB.put(long handle, long cfHandle, byte[] key,
+fn default_cf_for_db(env: &mut JNIEnv, handle: jlong, context: &str) -> Option<FrsCfHandle> {
+    let mut cf: FrsCfHandle = ptr::null_mut();
+    let status = unsafe { frs_db_default_cf(handle as FrsDb, &mut cf) };
+    if check_status(env, status, context) {
+        None
+    } else {
+        Some(cf)
+    }
+}
+
+fn cf_from_java_handle(env: &mut JNIEnv, cf_handle: jlong, context: &str) -> Option<FrsCfHandle> {
+    let Some(cf) = (unsafe { CfHandle::from_raw_ref(cf_handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null ColumnFamilyHandle"));
+        return None;
+    };
+    Some(cf.frs_handle)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn put_bytes(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: FrsCfHandle,
+    key: &JByteArray,
+    key_off: jint,
+    key_len: jint,
+    val: &JByteArray,
+    val_off: jint,
+    val_len: jint,
+    context: &str,
+) {
+    let Some(k) = read_byte_slice(env, key, key_off, key_len) else {
+        return;
+    };
+    let Some(v) = read_byte_slice(env, val, val_off, val_len) else {
+        return;
+    };
+    let status = unsafe {
+        frs_put(
+            handle as FrsDb,
+            cf_handle,
+            k.as_ptr(),
+            k.len(),
+            v.as_ptr(),
+            v.len(),
+        )
+    };
+    check_status(env, status, context);
+}
+
+fn get_bytes(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: FrsCfHandle,
+    key: &JByteArray,
+    key_off: jint,
+    key_len: jint,
+    context: &str,
+) -> jbyteArray {
+    let Some(k) = read_byte_slice(env, key, key_off, key_len) else {
+        return ptr::null_mut();
+    };
+    let mut out = FrsBytes {
+        data: ptr::null_mut(),
+        len: 0,
+        capacity: 0,
+    };
+    let status = unsafe { frs_get(handle as FrsDb, cf_handle, k.as_ptr(), k.len(), &mut out) };
+    if status == FRS_STATUS_NOT_FOUND {
+        return ptr::null_mut();
+    }
+    if check_status(env, status, context) {
+        return ptr::null_mut();
+    }
+    if out.data.is_null() {
+        return ptr::null_mut();
+    }
+    let slice = unsafe { std::slice::from_raw_parts(out.data, out.len) };
+    let java_arr = match env.byte_array_from_slice(slice) {
+        Ok(a) => a.into_raw(),
+        Err(e) => {
+            unsafe {
+                let _ = crate::frs_bytes_free(&mut out);
+            }
+            throw_rocksdb(
+                env,
+                &format!("{context}: byte_array_from_slice failed: {e}"),
+            );
+            return ptr::null_mut();
+        }
+    };
+    unsafe {
+        let _ = crate::frs_bytes_free(&mut out);
+    }
+    java_arr
+}
+
+fn delete_bytes(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: FrsCfHandle,
+    key: &JByteArray,
+    key_off: jint,
+    key_len: jint,
+    context: &str,
+) {
+    let Some(k) = read_byte_slice(env, key, key_off, key_len) else {
+        return;
+    };
+    let status = unsafe { frs_delete(handle as FrsDb, cf_handle, k.as_ptr(), k.len()) };
+    check_status(env, status, context);
+}
+
+/// `org.forstdb.RocksDB.put(long handle, byte[] key,
 ///                          int keyOff, int keyLen, byte[] val,
 ///                          int valOff, int valLen)`
 ///
-/// Java signature: `(JJ[BII[BII)V`
+/// Java signature: `(J[BII[BII)V`
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub extern "system" fn Java_org_forstdb_RocksDB_put<'local>(
+pub extern "system" fn Java_org_forstdb_RocksDB_put__J_3BII_3BII<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
-    cf_handle: jlong,
     key: JByteArray<'local>,
     key_off: jint,
     key_len: jint,
@@ -584,41 +696,164 @@ pub extern "system" fn Java_org_forstdb_RocksDB_put<'local>(
         &mut env,
         || (),
         |env| {
-            let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
+            let Some(cf_handle) = default_cf_for_db(env, handle, "RocksDB.put.defaultCF") else {
                 return;
             };
-            let Some(v) = read_byte_slice(env, &val, val_off, val_len) else {
-                return;
-            };
-            // SAFETY: pointers are valid for the duration of frs_put; the
-            // engine copies the data internally.
-            let status = unsafe {
-                frs_put(
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    k.as_ptr(),
-                    k.len(),
-                    v.as_ptr(),
-                    v.len(),
-                )
-            };
-            check_status(env, status, "RocksDB.put");
+            put_bytes(
+                env,
+                handle,
+                cf_handle,
+                &key,
+                key_off,
+                key_len,
+                &val,
+                val_off,
+                val_len,
+                "RocksDB.put",
+            );
         },
     )
 }
 
-/// `org.forstdb.RocksDB.get(long handle, long cfHandle, byte[] key,
-///                          int keyOff, int keyLen) -> byte[]?`
+/// `org.forstdb.RocksDB.put(long handle, byte[] key,
+///                          int keyOff, int keyLen, byte[] val,
+///                          int valOff, int valLen, long cfHandle)`
 ///
-/// Java signature: `(JJ[BII)[B`
-///
-/// Returns `null` if the key is absent — matches RocksDB Java behavior.
+/// Java signature: `(J[BII[BIIJ)V`
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_RocksDB_get<'local>(
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_put__J_3BII_3BIIJ<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    val: JByteArray<'local>,
+    val_off: jint,
+    val_len: jint,
     cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.put") else {
+                return;
+            };
+            put_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                key_off,
+                key_len,
+                &val,
+                val_off,
+                val_len,
+                "RocksDB.put",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.put(long handle, long writeOptionsHandle,
+///                          byte[] key, int keyOff, int keyLen,
+///                          byte[] val, int valOff, int valLen)`
+///
+/// Java signature: `(JJ[BII[BII)V`
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_put__JJ_3BII_3BII<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _write_options_handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    val: JByteArray<'local>,
+    val_off: jint,
+    val_len: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(cf_handle) = default_cf_for_db(env, handle, "RocksDB.put.defaultCF") else {
+                return;
+            };
+            put_bytes(
+                env,
+                handle,
+                cf_handle,
+                &key,
+                key_off,
+                key_len,
+                &val,
+                val_off,
+                val_len,
+                "RocksDB.put",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.put(long handle, long writeOptionsHandle,
+///                          byte[] key, int keyOff, int keyLen,
+///                          byte[] val, int valOff, int valLen,
+///                          long cfHandle)`
+///
+/// Java signature: `(JJ[BII[BIIJ)V`
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_forstdb_RocksDB_put__JJ_3BII_3BIIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _write_options_handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    val: JByteArray<'local>,
+    val_off: jint,
+    val_len: jint,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.put") else {
+                return;
+            };
+            put_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                key_off,
+                key_len,
+                &val,
+                val_off,
+                val_len,
+                "RocksDB.put",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.get(long handle, byte[] key,
+///                          int keyOff, int keyLen) -> byte[]?`
+///
+/// Java signature: `(J[BII)[B`
+///
+/// Returns `null` if the key is absent — matches RocksDB Java behavior.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_get__J_3BII<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
     key: JByteArray<'local>,
     key_off: jint,
     key_len: jint,
@@ -627,69 +862,118 @@ pub extern "system" fn Java_org_forstdb_RocksDB_get<'local>(
         &mut env,
         || ptr::null_mut() as jbyteArray,
         |env| -> jbyteArray {
-            let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
+            let Some(cf_handle) = default_cf_for_db(env, handle, "RocksDB.get.defaultCF") else {
                 return ptr::null_mut();
             };
-            let mut out = FrsBytes {
-                data: ptr::null_mut(),
-                len: 0,
-                capacity: 0,
-            };
-            // SAFETY: out is a stack-local FrsBytes that we own; the engine
-            // populates data/len/capacity if Some(value) is found.
-            let status = unsafe {
-                frs_get(
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    k.as_ptr(),
-                    k.len(),
-                    &mut out,
-                )
-            };
-            if status == FRS_STATUS_NOT_FOUND {
-                return ptr::null_mut();
-            }
-            if check_status(env, status, "RocksDB.get") {
-                return ptr::null_mut();
-            }
-            if out.data.is_null() {
-                // Status OK + null data == absent key (per FFI contract).
-                return ptr::null_mut();
-            }
-            // SAFETY: out.data/len describe a Rust-owned buffer for the
-            // duration of this call; we copy into a Java byte[] and then
-            // free the original.
-            let slice = unsafe { std::slice::from_raw_parts(out.data, out.len) };
-            let java_arr = match env.byte_array_from_slice(slice) {
-                Ok(a) => a.into_raw(),
-                Err(e) => {
-                    // Free the Rust buffer even on JNI failure.
-                    unsafe {
-                        let _ = crate::frs_bytes_free(&mut out);
-                    }
-                    throw_rocksdb(env, &format!("byte_array_from_slice failed: {e}"));
-                    return ptr::null_mut();
-                }
-            };
-            // SAFETY: out is still the original FrsBytes we got from frs_get.
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
-            }
-            java_arr
+            get_bytes(
+                env,
+                handle,
+                cf_handle,
+                &key,
+                key_off,
+                key_len,
+                "RocksDB.get",
+            )
         },
     )
 }
 
-/// `org.forstdb.RocksDB.delete(long handle, long cfHandle, byte[] key,
-///                             int keyOff, int keyLen)`
+/// `org.forstdb.RocksDB.get(long handle, byte[] key,
+///                          int keyOff, int keyLen, long cfHandle) -> byte[]?`
 ///
-/// Java signature: `(JJ[BII)V`
+/// Java signature: `(J[BIIJ)[B`
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_RocksDB_delete<'local>(
+pub extern "system" fn Java_org_forstdb_RocksDB_get__J_3BIIJ<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
     cf_handle: jlong,
+) -> jbyteArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut() as jbyteArray,
+        |env| -> jbyteArray {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.get") else {
+                return ptr::null_mut();
+            };
+            get_bytes(env, handle, frs_cf, &key, key_off, key_len, "RocksDB.get")
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.get(long handle, long readOptionsHandle,
+///                          byte[] key, int keyOff, int keyLen) -> byte[]?`
+///
+/// Java signature: `(JJ[BII)[B`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_get__JJ_3BII<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _read_options_handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+) -> jbyteArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut() as jbyteArray,
+        |env| -> jbyteArray {
+            let Some(cf_handle) = default_cf_for_db(env, handle, "RocksDB.get.defaultCF") else {
+                return ptr::null_mut();
+            };
+            get_bytes(
+                env,
+                handle,
+                cf_handle,
+                &key,
+                key_off,
+                key_len,
+                "RocksDB.get",
+            )
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.get(long handle, long readOptionsHandle,
+///                          byte[] key, int keyOff, int keyLen,
+///                          long cfHandle) -> byte[]?`
+///
+/// Java signature: `(JJ[BIIJ)[B`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_get__JJ_3BIIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _read_options_handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    cf_handle: jlong,
+) -> jbyteArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut() as jbyteArray,
+        |env| -> jbyteArray {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.get") else {
+                return ptr::null_mut();
+            };
+            get_bytes(env, handle, frs_cf, &key, key_off, key_len, "RocksDB.get")
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.delete(long handle, byte[] key, int keyOff, int keyLen)`
+///
+/// Java signature: `(J[BII)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_delete__J_3BII<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
     key: JByteArray<'local>,
     key_off: jint,
     key_len: jint,
@@ -698,20 +982,122 @@ pub extern "system" fn Java_org_forstdb_RocksDB_delete<'local>(
         &mut env,
         || (),
         |env| {
-            let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
+            let Some(cf_handle) = default_cf_for_db(env, handle, "RocksDB.delete.defaultCF") else {
                 return;
             };
-            // SAFETY: key pointer valid for the call; engine copies what it
-            // needs.
-            let status = unsafe {
-                frs_delete(
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    k.as_ptr(),
-                    k.len(),
-                )
+            delete_bytes(
+                env,
+                handle,
+                cf_handle,
+                &key,
+                key_off,
+                key_len,
+                "RocksDB.delete",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.delete(long handle, byte[] key, int keyOff,
+///                             int keyLen, long cfHandle)`
+///
+/// Java signature: `(J[BIIJ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_delete__J_3BIIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.delete") else {
+                return;
             };
-            check_status(env, status, "RocksDB.delete");
+            delete_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                key_off,
+                key_len,
+                "RocksDB.delete",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.delete(long handle, long writeOptionsHandle,
+///                             byte[] key, int keyOff, int keyLen)`
+///
+/// Java signature: `(JJ[BII)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJ_3BII<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _write_options_handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(cf_handle) = default_cf_for_db(env, handle, "RocksDB.delete.defaultCF") else {
+                return;
+            };
+            delete_bytes(
+                env,
+                handle,
+                cf_handle,
+                &key,
+                key_off,
+                key_len,
+                "RocksDB.delete",
+            );
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.delete(long handle, long writeOptionsHandle,
+///                             byte[] key, int keyOff, int keyLen,
+///                             long cfHandle)`
+///
+/// Java signature: `(JJ[BIIJ)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_delete__JJ_3BIIJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _write_options_handle: jlong,
+    key: JByteArray<'local>,
+    key_off: jint,
+    key_len: jint,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.delete") else {
+                return;
+            };
+            delete_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                key_off,
+                key_len,
+                "RocksDB.delete",
+            );
         },
     )
 }
@@ -1900,19 +2286,36 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getColumnFamilyHandle<'local>(
 ///
 /// Java signature: `(JJ[BII)V`
 ///
-/// Alias for [`Java_org_forstdb_RocksDB_delete`] — the older RocksDB
+/// Alias for [`delete_bytes`] — the older RocksDB
 /// Java API spelled this method `remove`.
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_RocksDB_remove<'local>(
-    env: JNIEnv<'local>,
-    class: JClass<'local>,
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
     handle: jlong,
     cf_handle: jlong,
     key: JByteArray<'local>,
     key_off: jint,
     key_len: jint,
 ) {
-    Java_org_forstdb_RocksDB_delete(env, class, handle, cf_handle, key, key_off, key_len);
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.remove") else {
+                return;
+            };
+            delete_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                key_off,
+                key_len,
+                "RocksDB.remove",
+            );
+        },
+    )
 }
 
 /// `org.forstdb.RocksDB.putByteArray(long handle, long cfHandle,
@@ -1935,33 +2338,35 @@ pub extern "system" fn Java_org_forstdb_RocksDB_putByteArray<'local>(
         &mut env,
         || (),
         |env| {
-            let k = match env.convert_byte_array(&key) {
-                Ok(v) => v,
+            let key_len = match env.get_array_length(&key) {
+                Ok(n) => n,
                 Err(e) => {
-                    throw_rocksdb(env, &format!("putByteArray: convert(key) failed: {e}"));
+                    throw_rocksdb(env, &format!("putByteArray: key length failed: {e}"));
                     return;
                 }
             };
-            let v = match env.convert_byte_array(&val) {
-                Ok(v) => v,
+            let val_len = match env.get_array_length(&val) {
+                Ok(n) => n,
                 Err(e) => {
-                    throw_rocksdb(env, &format!("putByteArray: convert(value) failed: {e}"));
+                    throw_rocksdb(env, &format!("putByteArray: value length failed: {e}"));
                     return;
                 }
             };
-            // SAFETY: pointers valid for the duration of frs_put; the
-            // engine copies the data internally.
-            let status = unsafe {
-                frs_put(
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    k.as_ptr(),
-                    k.len(),
-                    v.as_ptr(),
-                    v.len(),
-                )
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.putByteArray") else {
+                return;
             };
-            check_status(env, status, "RocksDB.putByteArray");
+            put_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                0,
+                key_len,
+                &val,
+                0,
+                val_len,
+                "RocksDB.putByteArray",
+            );
         },
     )
 }
@@ -1985,53 +2390,25 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getByteArray<'local>(
         &mut env,
         || ptr::null_mut() as jbyteArray,
         |env| -> jbyteArray {
-            let k = match env.convert_byte_array(&key) {
-                Ok(v) => v,
+            let key_len = match env.get_array_length(&key) {
+                Ok(n) => n,
                 Err(e) => {
-                    throw_rocksdb(env, &format!("getByteArray: convert(key) failed: {e}"));
+                    throw_rocksdb(env, &format!("getByteArray: key length failed: {e}"));
                     return ptr::null_mut();
                 }
             };
-            let mut out = FrsBytes {
-                data: ptr::null_mut(),
-                len: 0,
-                capacity: 0,
-            };
-            // SAFETY: out is stack-local; engine populates on hit.
-            let status = unsafe {
-                frs_get(
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    k.as_ptr(),
-                    k.len(),
-                    &mut out,
-                )
-            };
-            if status == FRS_STATUS_NOT_FOUND {
+            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.getByteArray") else {
                 return ptr::null_mut();
-            }
-            if check_status(env, status, "RocksDB.getByteArray") {
-                return ptr::null_mut();
-            }
-            if out.data.is_null() {
-                return ptr::null_mut();
-            }
-            // SAFETY: out.data/len describe a Rust-owned buffer; copy and free.
-            let slice = unsafe { std::slice::from_raw_parts(out.data, out.len) };
-            let java_arr = match env.byte_array_from_slice(slice) {
-                Ok(a) => a.into_raw(),
-                Err(e) => {
-                    unsafe {
-                        let _ = crate::frs_bytes_free(&mut out);
-                    }
-                    throw_rocksdb(env, &format!("byte_array_from_slice failed: {e}"));
-                    return ptr::null_mut();
-                }
             };
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
-            }
-            java_arr
+            get_bytes(
+                env,
+                handle,
+                frs_cf,
+                &key,
+                0,
+                key_len,
+                "RocksDB.getByteArray",
+            )
         },
     )
 }
@@ -7230,9 +7607,18 @@ mod tests {
             "Java_org_forstdb_RocksDB_open__Ljava_lang_String_2",
             "Java_org_forstdb_RocksDB_open__JLjava_lang_String_2",
             "Java_org_forstdb_RocksDB_close",
-            "Java_org_forstdb_RocksDB_put",
-            "Java_org_forstdb_RocksDB_get",
-            "Java_org_forstdb_RocksDB_delete",
+            "Java_org_forstdb_RocksDB_put__J_3BII_3BII",
+            "Java_org_forstdb_RocksDB_put__J_3BII_3BIIJ",
+            "Java_org_forstdb_RocksDB_put__JJ_3BII_3BII",
+            "Java_org_forstdb_RocksDB_put__JJ_3BII_3BIIJ",
+            "Java_org_forstdb_RocksDB_get__J_3BII",
+            "Java_org_forstdb_RocksDB_get__J_3BIIJ",
+            "Java_org_forstdb_RocksDB_get__JJ_3BII",
+            "Java_org_forstdb_RocksDB_get__JJ_3BIIJ",
+            "Java_org_forstdb_RocksDB_delete__J_3BII",
+            "Java_org_forstdb_RocksDB_delete__J_3BIIJ",
+            "Java_org_forstdb_RocksDB_delete__JJ_3BII",
+            "Java_org_forstdb_RocksDB_delete__JJ_3BIIJ",
             "Java_org_forstdb_RocksDB_createColumnFamily",
             "Java_org_forstdb_RocksDB_dropColumnFamily",
             "Java_org_forstdb_RocksDB_flush",
