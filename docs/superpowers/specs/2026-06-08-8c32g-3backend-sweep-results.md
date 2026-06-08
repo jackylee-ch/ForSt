@@ -77,20 +77,20 @@ write_buffer_size 128mb (compaction-overload → restart). Merge-collapse REFUTE
 | q3    | 36.8      | 2,201,068        | 36.7       | 2,201,068         | -          | ✓ | **PASS (correct + parity, 1.00×)** |
 | q4    | **313.5 (8c/32g)** | **177,629,788** | **597.2** 🔒1G | **25,849,976** | (host 1217)| ⧗ | **out_rows 25.8M vs 177.6M (6.9× fewer) — but q4 is a RETRACT/changelog query → out_rows is NOT a clean accuracy gate (could be changelog cadence, not wrong final answer). NEEDS final-result compare.** Also 1.9× slower. OOM-fixed/finishes. |
 | q5    | 162.2     | 29,988,376 (det) | 240/138    | 2.0/2.4/2.9M (var)| (host 297) | ✗ | **FAIL — WRONG: ~14× under-emit + non-deterministic (windowed-JOIN bug; both async backends)** |
-| q7    | >1300 (DNF) | (DNF)         | 671.3 (OLD fast cfg) | 92,000,002 | 659.5 / 92,000,002 | ✓ | correct (==ForSt exact); ≈parity ForSt — **RE-MEASURE under committed cfg** |
+| q7    | (pending 8c/32g) | — | **DNF @1300s** 🔒1G (~78.5M/92M, rate→19.7K/s) | — | (host 659) | ? | **read-amp DNF** under locked cfg (join). Old "671s" was unfair noflush=true. Joins q9/q20 → needs READ-PATH module. |
 | q8    | 46.1      | 3,064,457        | 43.7 (OLD) | 3,010,888         | (pending)  | ✗? | time ~parity (0.95×) but out_rows 1.75% LOW (53K fewer) — windowed-JOIN under-emit (mild) |
-| q9    | (pending 8c/32g, ~1100 partial) | — | OOM→bounded, DNF ~53M/1300s | — | (pending) | ? | **OOM FIXED**; join read-amp DNF → needs READ-PATH module (CPU 375% = 4 slots busy/4 idle) |
+| q9    | (pending 8c/32g) | — | **DNF** 🔒1G (43M@762s, rate→10K/s, read-amp collapse) | — | (pending) | ? | **read-amp DNF** (join). Memory-bounded (no OOM); CPU 375% = 4 slots busy/4 idle. Joins q7/q20 → READ-PATH module. |
 | q10   | 120.3     | 100,000,000      | 128.7      | 100,000,000       | -          | ✓ | **PASS (correct; +8.4s ≤ +50s bar)** |
 | q11   | 111.1     | 92,000,000       | 382 (OLD fast cfg) | 92,000,000 | (host 158)| ✓ | correct; 3.4× — **RE-MEASURE under committed cfg** |
 | q12   | 42.1      | 92,000,000       | 50.6       | 92,000,000        | -          | ✓ | **PASS (out_rows match; +8.5s ≤ +50s bar)** |
 | q13   | 30.1      | 100,000,000      | 30.1       | 100,000,000       | -          | ✓ | **PASS (correct + parity)** |
 | q14   | 30.1      | 100,000,000      | 29.0       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
 | q15   | 228.3     | 92,000,000       | 173.9 (OLD)| 92,000,000        | (host 258) | ✓ | correct + faster — **RE-MEASURE under committed cfg** |
-| q16   | 428.4     | 92,000,000       | **re-measure @128M** (noflush=true 365.9 REMOVED) | 92,000,000 | 379.5 | ✓ | pending locked-config run |
+| q16   | 428.4 (8c/32g) | 92,000,000 | **322.9** 🔒1G | 92,000,000 | (host 379.5) | ✓ | **PASS vs RocksDB — 0.75× (FASTER) + accurate** (locked cfg, faster than old unfair 366). ForSt 8c/32g pending for full verdict. |
 | q17   | **74.5 (8c/32g)** | 92,000,000 | **76.7** 🔒1G | 92,000,000 | **255.7 (8c/32g)** | ✓ | **FULL PASS — 1.03× RocksDB (parity) + 3.3× FASTER than ForSt + accurate.** |
 | q18   | **396.1 (8c/32g)** | 92,000,000 | **318.1** 🔒1G | 92,000,000 | **422.8 (8c/32g)** | ✓ | **FULL PASS — 0.80× RocksDB (faster) + faster than ForSt (318<423) + accurate.** |
-| q19   | 305       | 92,000,000       | **re-measure @128M** (noflush=true 298 REMOVED) | 92,000,000 | 310.5 | ✓ | pending locked-config run |
-| q20   | (pending) | (pending)        | pending re-measure | (pending) | (pending)  | ? | OOM set join — re-measure under committed cfg (expect q9-like) |
+| q19   | 305 (8c/32g) | 92,000,000 | **542.5** 🔒1G | 92,000,000 | (host 310.5) | ✓acc | **FAIL — 1.78× slower than RocksDB** (542 vs 305) + likely slower than ForSt. Accurate (exact). NON-join OVER-window dedup → a SECOND perf gap (not join read-amp). Architecture investigate. |
+| q20   | (pending 8c/32g) | — | **DNF @1300s** 🔒1G (59.8M/92M, rate→23.6K/s) | — | (pending) | ? | **read-amp DNF** (join). Joins q7/q9/q20 all DNF on join-probe read-amp → READ-PATH module. |
 | q21   | 59.9      | 100,000,000      | 52.6       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
 | q22   | 44.8      | 100,000,000      | 43.6       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
 
