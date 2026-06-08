@@ -646,6 +646,16 @@ fn read_string(env: &mut JNIEnv, s: &JString) -> Option<String> {
     }
 }
 
+fn normalize_db_path_for_java(path: String) -> String {
+    let Some(mut rest) = path.strip_prefix("file:") else {
+        return path;
+    };
+    while rest.starts_with("//") {
+        rest = &rest[1..];
+    }
+    rest.to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Java_org_forstdb_RocksDB_* — the actual JNI surface
 // ---------------------------------------------------------------------------
@@ -786,6 +796,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__Ljava_lang_String_2<'local
             let Some(path_str) = read_string(env, &path) else {
                 return 0_i64;
             };
+            let path_str = normalize_db_path_for_java(path_str);
             let db_path = path_str.clone();
             let c_path = match std::ffi::CString::new(path_str) {
                 Ok(s) => s,
@@ -824,6 +835,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2<'loca
             let Some(path_str) = read_string(env, &path) else {
                 return 0_i64;
             };
+            let path_str = normalize_db_path_for_java(path_str);
 
             let mut engine_opts = unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) }
                 .map(|h| h.opts.clone())
@@ -4797,6 +4809,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             let Some(path_str) = read_string(env, &path) else {
                 return ptr::null_mut();
             };
+            let path_str = normalize_db_path_for_java(path_str);
 
             let cf_names_len = match env.get_array_length(&cf_names) {
                 Ok(n) if n >= 0 => n as usize,
@@ -5049,6 +5062,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             let Some(path_str) = read_string(env, &path) else {
                 return 0;
             };
+            let path_str = normalize_db_path_for_java(path_str);
             // 3. Validate arrays & extract sizes.
             let cf_names_len = match env.get_array_length(&cf_names) {
                 Ok(n) if n >= 0 => n as usize,
