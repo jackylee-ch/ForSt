@@ -568,6 +568,18 @@ pub extern "system" fn Java_org_forstdb_RocksDB_close<'local>(
 pub extern "system" fn Java_org_forstdb_RocksDB_disposeInternal<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
+    _handle: jlong,
+) {
+    jni_guard(&mut env, || (), |_env| {})
+}
+
+/// `org.forstdb.RocksDB.closeDatabase(long handle)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_closeDatabase<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
     handle: jlong,
 ) {
     jni_guard(
@@ -575,7 +587,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_disposeInternal<'local>(
         || (),
         |env| {
             let status = unsafe { frs_db_close(handle as FrsDb) };
-            check_status(env, status, "RocksDB.disposeInternal");
+            check_status(env, status, "RocksDB.closeDatabase");
         },
     )
 }
@@ -7627,6 +7639,7 @@ mod tests {
             "Java_org_forstdb_RocksDB_open__JLjava_lang_String_2",
             "Java_org_forstdb_RocksDB_close",
             "Java_org_forstdb_RocksDB_disposeInternal",
+            "Java_org_forstdb_RocksDB_closeDatabase",
             "Java_org_forstdb_RocksDB_put__J_3BII_3BII",
             "Java_org_forstdb_RocksDB_put__J_3BII_3BIIJ",
             "Java_org_forstdb_RocksDB_put__JJ_3BII_3BII",
