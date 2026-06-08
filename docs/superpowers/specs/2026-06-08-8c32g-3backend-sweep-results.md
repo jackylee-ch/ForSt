@@ -174,13 +174,23 @@ backpressure — q20 is output-amplifying (auction⋈bid), Calc→Writer is sing
 phase and only collapsed AFTER the first flush (~140s). If the single-threaded Calc→Writer couldn't
 drain the amplified output, the rate would be capped from t=0, not just post-flush. The slowdown tracks
 the STATE BACKEND (memtable→SST), not the output operator → downstream backpressure is not it.
-**Remaining: (1) SST-probe global lock OR (3) per-probe memtable/SST read cost.** 375% CPU (of 800%) +
-3 idle-ish workers + no parallel benefit ⇒ workers BLOCK on a serial lock (low CPU = blocking, not
-CPU-bound) → strongly points at (1): a global lock on the post-flush read/probe path (candidate: the
-ShardedMemTable per-shard RwLock contending with active write-locks — q20 buffers bids continuously —
-or an SST-reader/version lock). NEXT: engine CPU/lock profile of the post-flush steady state to confirm
-WHICH lock, then make that path lock-free (extends the prior lock-free-memtable work). The iterView fix
-is KEPT (a real latent thread-safety bug fix), but **the parallel executor is NOT the join-family lever.**
+**Remaining: (1) SST-probe global lock OR (3) per-probe memtable/SST read cost / growing read-amp.**
+375% CPU (of 800%) + 3 idle-ish workers + no parallel benefit ⇒ workers BLOCK on a serial point (low
+CPU = blocking, not CPU-bound). CODE-AUDITED the obvious lock candidate — **LocalCache (the bounded LRU
+file cache, `cached_fs`→`local_cache.rs`, on the SST read path): REFUTED as a catastrophic serial point.**
+Its single global `inner` Mutex critical section (local_cache.rs:543-551) is ONLY membership-check +
+LRU-bump + path-lookup; the `pread` disk I/O runs AFTER the guard is released (explicit comment :540-
+542). So I/O does NOT serialize on the cache mutex. `touch_lru`/`fd_cache` are short critical sections
+— minor contention at most, not a throughput cap for 3 workers. ShardedMemTable reads take per-shard
+`.read()` (16-way, shared) — also not an obvious serial point unless write-locks (continuous bid
+buffering) starve readers.
+**All four leading hypotheses now refuted with code/data: executor-dispatch serialization, downstream
+backpressure, LRU-lock-holds-I/O, and (weakly) memtable read-lock.** The true bottleneck is NOT
+identifiable by code reading alone → **REQUIRED NEXT STEP: a sampling CPU/lock profile of the post-flush
+steady state** (perf/async-profiler on the TM, or FRS_BULK_SAMPLE + FRS_ITER_DIAG + per-probe n_ovl
+re-sampled at 50M+ not early — the early n_ovl=2-3 may have GROWN as join state accumulated → growing
+read-amp (3) is the live candidate). The iterView fix is KEPT (a real latent thread-safety bug fix);
+**the parallel executor is NOT the join-family lever** — do not pursue it further for q7/q9/q20.
 
 ## ★ WHAT'S LEFT (Phase-1 close)
 1. **Fair baselines:** RocksDB 8c/32g + ForSt 8c/32g for the WHOLE set ("faster than ForSt" clause
