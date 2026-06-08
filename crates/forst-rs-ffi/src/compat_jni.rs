@@ -7257,6 +7257,27 @@ pub extern "system" fn Java_org_forstdb_RocksDB_enableFileDeletions<'local>(
     )
 }
 
+/// Long JNI form for overloaded Java lookup of `disableFileDeletions(long)`.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_disableFileDeletions__J<'local>(
+    env: JNIEnv<'local>,
+    class: JClass<'local>,
+    handle: jlong,
+) {
+    Java_org_forstdb_RocksDB_disableFileDeletions(env, class, handle)
+}
+
+/// Long JNI form for overloaded Java lookup of `enableFileDeletions(long, boolean)`.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_enableFileDeletions__JZ<'local>(
+    env: JNIEnv<'local>,
+    class: JClass<'local>,
+    handle: jlong,
+    force: jboolean,
+) {
+    Java_org_forstdb_RocksDB_enableFileDeletions(env, class, handle, force)
+}
+
 // ---------------------------------------------------------------------------
 // Range deletion
 // ---------------------------------------------------------------------------
@@ -9281,13 +9302,15 @@ mod tests {
             "Java_org_forstdb_Checkpoint_exportColumnFamily",
             // P2 — Snapshot class (1 entry).
             "Java_org_forstdb_Snapshot_disposeInternal",
-            // P2 — RocksDB snapshot/file-list/range methods (8 entries).
+            // P2 — RocksDB snapshot/file-list/range methods (10 entries).
             "Java_org_forstdb_RocksDB_getSnapshot",
             "Java_org_forstdb_RocksDB_releaseSnapshot",
             "Java_org_forstdb_RocksDB_getLiveFiles",
             "Java_org_forstdb_RocksDB_getLiveFilesMetaData",
             "Java_org_forstdb_RocksDB_disableFileDeletions",
             "Java_org_forstdb_RocksDB_enableFileDeletions",
+            "Java_org_forstdb_RocksDB_disableFileDeletions__J",
+            "Java_org_forstdb_RocksDB_enableFileDeletions__JZ",
             "Java_org_forstdb_RocksDB_deleteRange",
             "Java_org_forstdb_RocksDB_deleteFilesInRanges",
             "Java_org_forstdb_RocksDB_createColumnFamilyWithImport",
