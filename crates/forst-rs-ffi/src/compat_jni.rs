@@ -6845,18 +6845,15 @@ pub extern "system" fn Java_org_forstdb_RocksDB_releaseSnapshot<'local>(
 // ---------------------------------------------------------------------------
 
 /// `org.forstdb.RocksDB.getLiveFiles(long handle, boolean flushMemtable)
-///                                   -> org.forstdb.RocksDB$LiveFiles`
+///                                   -> String[]`
 ///
-/// Java signature: `(JZ)Lorg/forstdb/RocksDB$LiveFiles;`
+/// Java signature: `(JZ)[Ljava/lang/String;`
 ///
-/// Community ForSt returns a `LiveFiles` POJO bundling `files` (List<String>),
-/// `manifestFileSize` (long), and `currentSequenceNumber` (long). We delegate
-/// per-file enumeration to [`crate::frs_db_get_live_files`], which walks the
-/// engine's current Version and returns one entry per live SST, then we
-/// adapt the result into the Java POJO Flink expects:
-///
-/// 1. allocate an `ArrayList<String>` and append every SST's absolute path,
-/// 2. construct `RocksDB$LiveFiles(files, manifestFileSize, currentSeq)`.
+/// ForStJNI's private native method returns a `String[]`: every live-file path
+/// first, and the manifest size as the final decimal string. The public Java
+/// wrapper converts that array into `RocksDB.LiveFiles`. We delegate per-file
+/// enumeration to [`crate::frs_db_get_live_files`], which walks the engine's
+/// current Version and returns one entry per live SST.
 ///
 /// Memory: the underlying `FrsLiveFileList` is freed via
 /// [`crate::frs_db_live_file_list_free`] before we return — the JVM has
@@ -6867,8 +6864,8 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
     _class: JClass<'local>,
     handle: jlong,
     flush_memtable: jboolean,
-) -> jni::sys::jobject {
-    jni_guard(&mut env, ptr::null_mut, |env| -> jni::sys::jobject {
+) -> jni::sys::jobjectArray {
+    jni_guard(&mut env, ptr::null_mut, |env| -> jni::sys::jobjectArray {
         if handle == 0 {
             throw_rocksdb(env, "RocksDB.getLiveFiles: null DB handle");
             return ptr::null_mut();
@@ -6920,26 +6917,38 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
             "RocksDB.getLiveFiles: enumerated {count} SST file(s) (manifest={manifest_size}B, seq={seq})"
         );
 
-        // Step 3: build ArrayList<String> with every SST's absolute path.
-        let arraylist_class = match env.find_class("java/util/ArrayList") {
+        // Step 3: build the String[] expected by ForStJNI's public wrapper.
+        // The final array element is the manifest size encoded as a decimal string.
+        let string_class = match env.find_class("java/lang/String") {
             Ok(c) => c,
             Err(e) => {
                 throw_rocksdb(
                     env,
-                    &format!("getLiveFiles: find_class(ArrayList) failed: {e}"),
+                    &format!("getLiveFiles: find_class(String) failed: {e}"),
                 );
-                // SAFETY: list owned by us.
                 unsafe {
                     let _ = crate::frs_db_live_file_list_free(&mut list);
                 }
                 return ptr::null_mut();
             }
         };
-        let files_obj = match env.new_object(&arraylist_class, "()V", &[]) {
-            Ok(o) => o,
+        let array_len = match count.checked_add(1).and_then(|n| i32::try_from(n).ok()) {
+            Some(len) => len,
+            None => {
+                throw_rocksdb(
+                    env,
+                    "getLiveFiles: live file count exceeds Java array length",
+                );
+                unsafe {
+                    let _ = crate::frs_db_live_file_list_free(&mut list);
+                }
+                return ptr::null_mut();
+            }
+        };
+        let files_array = match env.new_object_array(array_len, &string_class, JObject::null()) {
+            Ok(a) => a,
             Err(e) => {
-                throw_rocksdb(env, &format!("getLiveFiles: new ArrayList failed: {e}"));
-                // SAFETY: list owned by us.
+                throw_rocksdb(env, &format!("getLiveFiles: new String[] failed: {e}"));
                 unsafe {
                     let _ = crate::frs_db_live_file_list_free(&mut list);
                 }
@@ -6947,12 +6956,11 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
             }
         };
 
-        // Walk every entry and add its path to the ArrayList.
         if count > 0 && !list.files.is_null() {
             // SAFETY: `list.files` is a valid pointer to `count` initialised
             // entries produced by `into_ffi_list`.
             let entries = unsafe { std::slice::from_raw_parts(list.files, count) };
-            for entry in entries {
+            for (idx, entry) in entries.iter().enumerate() {
                 if entry.path.is_null() {
                     continue;
                 }
@@ -6963,15 +6971,50 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
                 };
                 let jstr = match env.new_string(path_str) {
                     Ok(s) => s,
-                    Err(_) => continue,
+                    Err(e) => {
+                        throw_rocksdb(env, &format!("getLiveFiles: new path string failed: {e}"));
+                        unsafe {
+                            let _ = crate::frs_db_live_file_list_free(&mut list);
+                        }
+                        return ptr::null_mut();
+                    }
                 };
-                let _ = env.call_method(
-                    &files_obj,
-                    "add",
-                    "(Ljava/lang/Object;)Z",
-                    &[jni::objects::JValue::Object(jstr.as_ref())],
-                );
+                if let Err(e) = env.set_object_array_element(&files_array, idx as i32, &jstr) {
+                    throw_rocksdb(
+                        env,
+                        &format!("getLiveFiles: set file element {idx} failed: {e}"),
+                    );
+                    unsafe {
+                        let _ = crate::frs_db_live_file_list_free(&mut list);
+                    }
+                    return ptr::null_mut();
+                }
             }
+        }
+
+        let manifest_size_string = manifest_size.to_string();
+        let manifest_jstr = match env.new_string(&manifest_size_string) {
+            Ok(s) => s,
+            Err(e) => {
+                throw_rocksdb(
+                    env,
+                    &format!("getLiveFiles: new manifest-size string failed: {e}"),
+                );
+                unsafe {
+                    let _ = crate::frs_db_live_file_list_free(&mut list);
+                }
+                return ptr::null_mut();
+            }
+        };
+        if let Err(e) = env.set_object_array_element(&files_array, count as i32, &manifest_jstr) {
+            throw_rocksdb(
+                env,
+                &format!("getLiveFiles: set manifest-size element failed: {e}"),
+            );
+            unsafe {
+                let _ = crate::frs_db_live_file_list_free(&mut list);
+            }
+            return ptr::null_mut();
         }
 
         // Step 4: free the FFI list — Java now owns the Strings.
@@ -6981,43 +7024,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_getLiveFiles<'local>(
             let _ = crate::frs_db_live_file_list_free(&mut list);
         }
 
-        // Step 5: construct LiveFiles via its `(List<String>, long, long)` ctor.
-        let live_files_class = match env.find_class("org/forstdb/RocksDB$LiveFiles") {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(
-                    target: "compat_jni::livefiles",
-                    "getLiveFiles: RocksDB$LiveFiles class missing on classpath ({e}); returning null — Flink will treat as empty"
-                );
-                return ptr::null_mut();
-            }
-        };
-        match env.new_object(
-            &live_files_class,
-            "(Ljava/util/List;JJ)V",
-            &[
-                jni::objects::JValue::Object(files_obj.as_ref()),
-                jni::objects::JValue::Long(manifest_size as jlong),
-                jni::objects::JValue::Long(seq as jlong),
-            ],
-        ) {
-            Ok(o) => o.into_raw(),
-            Err(_) => {
-                // Fallback: try a no-arg ctor (some shims). If neither works,
-                // return null — Flink's null-handling path treats that as "no
-                // live files known".
-                match env.new_object(&live_files_class, "()V", &[]) {
-                    Ok(o) => o.into_raw(),
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "compat_jni::livefiles",
-                            "getLiveFiles: failed to construct RocksDB$LiveFiles ({e}); returning null"
-                        );
-                        ptr::null_mut()
-                    }
-                }
-            }
-        }
+        files_array.into_raw()
     })
 }
 
