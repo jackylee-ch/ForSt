@@ -99,6 +99,7 @@ use crate::{
 
 static DB_PATH_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
 static DB_LOG_REGISTRY: OnceLock<Mutex<HashMap<usize, CompatDbLogState>>> = OnceLock::new();
+static FLINK_ENV_BASE_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
 
 struct CompatDbLogState {
     dir: String,
@@ -112,6 +113,41 @@ fn db_path_registry() -> &'static Mutex<HashMap<usize, String>> {
 
 fn db_log_registry() -> &'static Mutex<HashMap<usize, CompatDbLogState>> {
     DB_LOG_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn flink_env_base_registry() -> &'static Mutex<HashMap<usize, String>> {
+    FLINK_ENV_BASE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_flink_env_base(handle: jlong, base_path: Option<String>) {
+    if handle == 0 {
+        return;
+    }
+    let Some(base_path) = base_path.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    if let Ok(mut guard) = flink_env_base_registry().lock() {
+        guard.insert(handle as usize, base_path);
+    }
+}
+
+fn flink_env_base_for(handle: jlong) -> Option<String> {
+    if handle == 0 {
+        return None;
+    }
+    flink_env_base_registry()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&(handle as usize)).cloned())
+}
+
+fn unregister_flink_env_base(handle: jlong) {
+    if handle == 0 {
+        return;
+    }
+    if let Ok(mut guard) = flink_env_base_registry().lock() {
+        guard.remove(&(handle as usize));
+    }
 }
 
 fn register_db_path(handle: FrsDb, path: &str) {
@@ -327,6 +363,7 @@ pub(crate) mod handles {
         pub max_open_files: jint,
         pub info_log_level: jbyte,
         pub db_log_dir: Option<String>,
+        pub env_base_path: Option<String>,
         pub keep_log_file_num: jlong,
         pub max_log_file_size: jlong,
         pub statistics_handle: jlong,
@@ -343,6 +380,7 @@ pub(crate) mod handles {
                 // INFO_LEVEL in org.forstdb.InfoLogLevel.
                 info_log_level: 2,
                 db_log_dir: None,
+                env_base_path: None,
                 // RocksDB Java default. forst-rs tracing/log retention is not
                 // wired to this knob yet, but Flink config tests require the
                 // option to round-trip accurately.
@@ -726,6 +764,21 @@ fn normalize_db_path_for_java(path: String) -> String {
     rest.to_string()
 }
 
+fn resolve_db_path_with_env(path: String, env_base_path: Option<&str>) -> String {
+    let Some(base_path) = env_base_path.filter(|p| !p.is_empty()) else {
+        return path;
+    };
+    let base_path = normalize_db_path_for_java(base_path.to_string());
+    let relative = path.trim_start_matches('/');
+    if relative.is_empty() {
+        return base_path;
+    }
+    std::path::PathBuf::from(base_path)
+        .join(relative)
+        .to_string_lossy()
+        .into_owned()
+}
+
 // ---------------------------------------------------------------------------
 // Java_org_forstdb_RocksDB_* — the actual JNI surface
 // ---------------------------------------------------------------------------
@@ -780,6 +833,7 @@ pub extern "system" fn Java_org_forstdb_Options_newOptions__JJ<'local>(
                 opts.max_open_files = db_opts.max_open_files;
                 opts.info_log_level = db_opts.info_log_level;
                 opts.db_log_dir = db_opts.db_log_dir.clone();
+                opts.env_base_path = db_opts.env_base_path.clone();
                 opts.keep_log_file_num = db_opts.keep_log_file_num;
                 opts.max_log_file_size = db_opts.max_log_file_size;
                 opts.statistics_handle = db_opts.statistics_handle;
@@ -808,6 +862,7 @@ pub extern "system" fn Java_org_forstdb_Options_copyOptions<'local>(
                 opts.max_open_files = src.max_open_files;
                 opts.info_log_level = src.info_log_level;
                 opts.db_log_dir = src.db_log_dir.clone();
+                opts.env_base_path = src.env_base_path.clone();
                 opts.keep_log_file_num = src.keep_log_file_num;
                 opts.max_log_file_size = src.max_log_file_size;
                 opts.statistics_handle = src.statistics_handle;
@@ -913,6 +968,8 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2<'loca
                 .map(|h| h.opts.clone())
                 .unwrap_or_else(EngineOptions::default);
             let db_log_dir = db_opts.as_ref().and_then(|h| h.db_log_dir.clone());
+            let env_base_path = db_opts.as_ref().and_then(|h| h.env_base_path.clone());
+            let path_str = resolve_db_path_with_env(path_str, env_base_path.as_deref());
             let db_path = path_str.clone();
             engine_opts.db_path = path_str;
 
@@ -3771,14 +3828,18 @@ pub extern "system" fn Java_org_forstdb_DBOptions_setWriteBufferManager<'local>(
 pub extern "system" fn Java_org_forstdb_DBOptions_setEnv<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _handle: jlong,
-    _env_handle: jlong,
+    handle: jlong,
+    env_handle: jlong,
 ) {
     jni_guard(
         &mut env,
         || (),
         |_env| {
-            tracing::debug!(target: "compat_jni::dbopts", "setEnv: forst-rs FileSystem is internal; ignored");
+            let env_base_path = flink_env_base_for(env_handle);
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                h.env_base_path = env_base_path;
+            }
+            tracing::debug!(target: "compat_jni::dbopts", "setEnv: recorded FlinkEnv base path for relative DB paths");
         },
     )
 }
@@ -4894,6 +4955,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                 return ptr::null_mut();
             };
             let path_str = normalize_db_path_for_java(path_str);
+            let path_str = resolve_db_path_with_env(path_str, db_opts.env_base_path.as_deref());
 
             let cf_names_len = match env.get_array_length(&cf_names) {
                 Ok(n) if n >= 0 => n as usize,
@@ -4999,7 +5061,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             let db = match DbImpl::open_with_fs(engine_opts, fs) {
                 Ok(d) => Box::new(d),
                 Err(e) => {
-                    throw_rocksdb(env, &format!("RocksDB.open(multi-CF): {e}"));
+                    throw_rocksdb(
+                        env,
+                        &format!("RocksDB.open(multi-CF): path={db_path:?}: {e}"),
+                    );
                     return ptr::null_mut();
                 }
             };
@@ -5148,6 +5213,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
                 return 0;
             };
             let path_str = normalize_db_path_for_java(path_str);
+            let path_str = resolve_db_path_with_env(path_str, db_opts.env_base_path.as_deref());
             // 3. Validate arrays & extract sizes.
             let cf_names_len = match env.get_array_length(&cf_names) {
                 Ok(n) if n >= 0 => n as usize,
@@ -5293,7 +5359,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_
             let db = match DbImpl::open_with_fs(engine_opts, fs) {
                 Ok(d) => Box::new(d),
                 Err(e) => {
-                    throw_rocksdb(env, &format!("RocksDB.open(multi-CF): {e}"));
+                    throw_rocksdb(
+                        env,
+                        &format!("RocksDB.open(multi-CF): path={db_path:?}: {e}"),
+                    );
                     return 0;
                 }
             };
@@ -6738,7 +6807,7 @@ pub(crate) mod handles2 {
     pub(crate) struct FlinkEnvHandle {
         /// Number of `String` entries the Java side passed to the
         /// constructor (typically a Flink-FS scheme list). Recorded for
-        /// debugging only — the engine never consults it.
+        /// debugging only.
         #[allow(dead_code)]
         pub fs_count: usize,
     }
@@ -8803,13 +8872,18 @@ pub extern "system" fn Java_org_forstdb_FlinkEnv_newFlinkEnv<'local>(
 pub extern "system" fn Java_org_forstdb_FlinkEnv_createFlinkEnv<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
-    _path: JString<'local>,
+    path: JString<'local>,
     _file_system: JObject<'local>,
 ) -> jlong {
     jni_guard(
         &mut env,
         || 0_i64,
-        |_env| FlinkEnvHandle { fs_count: 0 }.into_raw(),
+        |env| {
+            let base_path = read_string(env, &path);
+            let handle = FlinkEnvHandle { fs_count: 0 }.into_raw();
+            register_flink_env_base(handle, base_path);
+            handle
+        },
     )
 }
 
@@ -8827,7 +8901,8 @@ pub extern "system" fn Java_org_forstdb_FlinkEnv_disposeInternal<'local>(
         || (),
         |_env| {
             if handle != 0 {
-                // SAFETY: handle came from a prior `newFlinkEnv`.
+                unregister_flink_env_base(handle);
+                // SAFETY: handle came from a prior `newFlinkEnv` or `createFlinkEnv`.
                 unsafe { drop(Box::from_raw(handle as *mut FlinkEnvHandle)) };
             }
         },
