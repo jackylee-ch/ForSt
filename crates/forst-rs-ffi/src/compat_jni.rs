@@ -474,7 +474,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_version<'local>(
 ///
 /// Java signature: `(Ljava/lang/String;)J`
 #[no_mangle]
-pub extern "system" fn Java_org_forstdb_RocksDB_open<'local>(
+pub extern "system" fn Java_org_forstdb_RocksDB_open__Ljava_lang_String_2<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     path: JString<'local>,
@@ -501,6 +501,41 @@ pub extern "system" fn Java_org_forstdb_RocksDB_open<'local>(
                 return 0;
             }
             handle as jlong
+        },
+    )
+}
+
+/// `org.forstdb.RocksDB.open(long optionsHandle, String path) -> long handle`
+///
+/// Java signature: `(JLjava/lang/String;)J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    db_opts_handle: jlong,
+    path: JString<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
+        |env| {
+            let Some(path_str) = read_string(env, &path) else {
+                return 0_i64;
+            };
+
+            let mut engine_opts = unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) }
+                .map(|h| h.opts.clone())
+                .unwrap_or_else(EngineOptions::default);
+            engine_opts.db_path = path_str;
+
+            let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
+            match DbImpl::open_with_fs(engine_opts, fs) {
+                Ok(db) => Box::into_raw(Box::new(db)) as jlong,
+                Err(e) => {
+                    throw_rocksdb(env, &format!("RocksDB.open: {e}"));
+                    0
+                }
+            }
         },
     )
 }
@@ -1406,7 +1441,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_dbOpen<'local>(
     class: JClass<'local>,
     path: JString<'local>,
 ) -> jlong {
-    Java_org_forstdb_RocksDB_open(env, class, path)
+    Java_org_forstdb_RocksDB_open__Ljava_lang_String_2(env, class, path)
 }
 
 /// `org.forstdb.RocksDB.createColumnFamily2(long handle, String name) -> long cfHandle`
@@ -3089,6 +3124,230 @@ pub extern "system" fn Java_org_forstdb_ColumnFamilyHandle_getDescriptor<'local>
 // ---------------------------------------------------------------------------
 // Multi-CF RocksDB.open
 // ---------------------------------------------------------------------------
+
+/// `org.forstdb.RocksDB.open(long dbOptionsHandle, String path,
+///                           byte[][] cfNames, long[] cfOptions)
+///                           -> long[] { dbHandle, cfHandle... }`
+///
+/// Java signature: `(JLjava/lang/String;[[B[J)[J`
+#[no_mangle]
+#[allow(non_snake_case)]
+pub extern "system" fn Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_3J<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    db_opts_handle: jlong,
+    path: JString<'local>,
+    cf_names: JObjectArray<'local>,
+    cf_opts_handles: JPrimitiveArray<'local, jlong>,
+) -> jni::sys::jlongArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut(),
+        |env| -> jni::sys::jlongArray {
+            let Some(db_opts) = (unsafe { DbOptionsHandle::from_raw_ref(db_opts_handle) }) else {
+                throw_rocksdb(env, "RocksDB.open(multi-CF): null DBOptions handle");
+                return ptr::null_mut();
+            };
+            let Some(path_str) = read_string(env, &path) else {
+                return ptr::null_mut();
+            };
+
+            let cf_names_len = match env.get_array_length(&cf_names) {
+                Ok(n) if n >= 0 => n as usize,
+                Ok(n) => {
+                    throw_rocksdb(
+                        env,
+                        &format!("RocksDB.open(multi-CF): negative cf_names length: {n}"),
+                    );
+                    return ptr::null_mut();
+                }
+                Err(e) => {
+                    throw_rocksdb(
+                        env,
+                        &format!("RocksDB.open(multi-CF): get cf_names length: {e}"),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            let cf_opts_len = match env.get_array_length(&cf_opts_handles) {
+                Ok(n) if n >= 0 => n as usize,
+                Ok(n) => {
+                    throw_rocksdb(
+                        env,
+                        &format!("RocksDB.open(multi-CF): negative cf_opts length: {n}"),
+                    );
+                    return ptr::null_mut();
+                }
+                Err(e) => {
+                    throw_rocksdb(
+                        env,
+                        &format!("RocksDB.open(multi-CF): get cf_opts length: {e}"),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            if cf_names_len != cf_opts_len {
+                throw_rocksdb(
+                    env,
+                    &format!(
+                        "RocksDB.open(multi-CF): array length mismatch (cf_names={}, cf_opts={})",
+                        cf_names_len, cf_opts_len
+                    ),
+                );
+                return ptr::null_mut();
+            }
+            if cf_names_len == 0 {
+                throw_rocksdb(
+                    env,
+                    "RocksDB.open(multi-CF): cf_names must contain at least the default CF",
+                );
+                return ptr::null_mut();
+            }
+
+            let mut cf_opts_buf = vec![0_i64; cf_opts_len];
+            if let Err(e) = env.get_long_array_region(&cf_opts_handles, 0, &mut cf_opts_buf) {
+                throw_rocksdb(env, &format!("RocksDB.open(multi-CF): read cf_opts: {e}"));
+                return ptr::null_mut();
+            }
+            let cf_name_bytes =
+                match read_byte_matrix(env, &cf_names, "RocksDB.open(multi-CF).cf_names") {
+                    Some(v) => v,
+                    None => return ptr::null_mut(),
+                };
+
+            let mut engine_opts = db_opts.opts.clone();
+            engine_opts.db_path = path_str;
+
+            for &cf_opts_handle in &cf_opts_buf {
+                if cf_opts_handle == 0 {
+                    continue;
+                }
+                let Some(cf_opts) = (unsafe { CfOptionsHandle::from_raw_ref(cf_opts_handle) })
+                else {
+                    continue;
+                };
+                if cf_opts.table_format_handle == 0 {
+                    continue;
+                }
+                let Some(tbl) = (unsafe {
+                    BlockBasedTableConfigHandle::from_raw_ref(cf_opts.table_format_handle)
+                }) else {
+                    continue;
+                };
+                if let Some(bs) = tbl.block_size {
+                    engine_opts.block_size = bs;
+                }
+                if let Some(cs) = tbl.block_cache_size {
+                    engine_opts.block_cache_size = cs;
+                }
+                if let Some(bbk) = tbl.bloom_bits_per_key {
+                    engine_opts.bloom_bits_per_key = bbk;
+                }
+                tracing::debug!(
+                    target: "compat_jni::open",
+                    "BlockBasedTableConfig hydrated: block_size={:?}, block_cache_size={:?}, bloom_bits_per_key={:?}, index_type={}",
+                    tbl.block_size, tbl.block_cache_size, tbl.bloom_bits_per_key, tbl.index_type
+                );
+                break;
+            }
+
+            let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
+            let db = match DbImpl::open_with_fs(engine_opts, fs) {
+                Ok(d) => Box::new(d),
+                Err(e) => {
+                    throw_rocksdb(env, &format!("RocksDB.open(multi-CF): {e}"));
+                    return ptr::null_mut();
+                }
+            };
+            let db_handle = Box::into_raw(db) as FrsDb;
+
+            let mut cf_handles = Vec::<jlong>::with_capacity(cf_names_len);
+            for (i, name_bytes) in cf_name_bytes.iter().enumerate() {
+                let name_str = match std::str::from_utf8(name_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        cleanup_partial_open(db_handle, &cf_handles);
+                        throw_rocksdb(
+                            env,
+                            &format!(
+                                "RocksDB.open(multi-CF): cf_names[{i}] is not valid UTF-8: {e}"
+                            ),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+                let c_name = match std::ffi::CString::new(name_str) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        cleanup_partial_open(db_handle, &cf_handles);
+                        throw_rocksdb(
+                            env,
+                            &format!("RocksDB.open(multi-CF): cf_names[{i}] contains interior NUL"),
+                        );
+                        return ptr::null_mut();
+                    }
+                };
+
+                let mut frs_cf: FrsCfHandle = ptr::null_mut();
+                let status = if name_str == "default" {
+                    unsafe { frs_db_default_cf(db_handle, &mut frs_cf) }
+                } else {
+                    let open_status =
+                        unsafe { frs_db_open_cf(db_handle, c_name.as_ptr(), &mut frs_cf) };
+                    if open_status == FRS_STATUS_OK {
+                        open_status
+                    } else {
+                        unsafe { frs_db_create_cf(db_handle, c_name.as_ptr(), &mut frs_cf) }
+                    }
+                };
+                if status != FRS_STATUS_OK {
+                    cleanup_partial_open(db_handle, &cf_handles);
+                    throw_rocksdb(
+                        env,
+                        &format!(
+                            "RocksDB.open(multi-CF): failed to open/create CF `{name_str}`: frs_status={status}"
+                        ),
+                    );
+                    return ptr::null_mut();
+                }
+
+                cf_handles.push(
+                    CfHandle {
+                        name: name_bytes.clone(),
+                        frs_handle: frs_cf,
+                        owned_opts_handle: 0,
+                    }
+                    .into_raw(),
+                );
+            }
+
+            let mut result_handles = Vec::<jlong>::with_capacity(cf_handles.len() + 1);
+            result_handles.push(db_handle as jlong);
+            result_handles.extend(cf_handles.iter().copied());
+
+            let result = match env.new_long_array(result_handles.len() as i32) {
+                Ok(a) => a,
+                Err(e) => {
+                    cleanup_partial_open(db_handle, &cf_handles);
+                    throw_rocksdb(
+                        env,
+                        &format!("RocksDB.open(multi-CF): new result array failed: {e}"),
+                    );
+                    return ptr::null_mut();
+                }
+            };
+            if let Err(e) = env.set_long_array_region(&result, 0, &result_handles) {
+                cleanup_partial_open(db_handle, &cf_handles);
+                throw_rocksdb(
+                    env,
+                    &format!("RocksDB.open(multi-CF): set result array failed: {e}"),
+                );
+                return ptr::null_mut();
+            }
+            result.into_raw()
+        },
+    )
+}
 
 /// `org.forstdb.RocksDB.open(long dbOptionsHandle, String path,
 ///                           byte[][] cfNames, long[] cfOptions,
@@ -6968,7 +7227,8 @@ mod tests {
         let stdout = String::from_utf8_lossy(&nm.stdout);
         let required = [
             // Original 9 entry points (PR adding compat_jni shim).
-            "Java_org_forstdb_RocksDB_open",
+            "Java_org_forstdb_RocksDB_open__Ljava_lang_String_2",
+            "Java_org_forstdb_RocksDB_open__JLjava_lang_String_2",
             "Java_org_forstdb_RocksDB_close",
             "Java_org_forstdb_RocksDB_put",
             "Java_org_forstdb_RocksDB_get",
@@ -7066,6 +7326,7 @@ mod tests {
             "Java_org_forstdb_ColumnFamilyHandle_getName0",
             "Java_org_forstdb_ColumnFamilyHandle_getDescriptor",
             // P0 — multi-CF RocksDB.open overload.
+            "Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_3J",
             "Java_org_forstdb_RocksDB_open__JLjava_lang_String_2_3_3B_3J_3J",
             // P1 — RocksIterator class (10 entries).
             "Java_org_forstdb_RocksIterator_seek0",
