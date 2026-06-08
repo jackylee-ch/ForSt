@@ -86,10 +86,10 @@ write_buffer_size 128mb (compaction-overload → restart). Merge-collapse REFUTE
 | q13   | 30.1      | 100,000,000      | 30.1       | 100,000,000       | -          | ✓ | **PASS (correct + parity)** |
 | q14   | 30.1      | 100,000,000      | 29.0       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
 | q15   | 228.3     | 92,000,000       | 173.9 (OLD)| 92,000,000        | (host 258) | ✓ | correct + faster — **RE-MEASURE under committed cfg** |
-| q16   | 428.4 (8c/32g) | 92,000,000 | **322.9** 🔒1G | 92,000,000 | (host 379.5) | ✓ | **PASS vs RocksDB — 0.75× (FASTER) + accurate** (locked cfg, faster than old unfair 366). ForSt 8c/32g pending for full verdict. |
+| q16   | 428.4 (8c/32g) | 92,000,000 | **322.9** 🔒1G | 92,000,000 | **370.3 (8c/32g)** | ✓ | **FULL PASS — 0.75× RocksDB (faster) + faster than ForSt (322.9<370.3) + accurate.** |
 | q17   | **74.5 (8c/32g)** | 92,000,000 | **76.7** 🔒1G | 92,000,000 | **255.7 (8c/32g)** | ✓ | **FULL PASS — 1.03× RocksDB (parity) + 3.3× FASTER than ForSt + accurate.** |
 | q18   | **396.1 (8c/32g)** | 92,000,000 | **318.1** 🔒1G | 92,000,000 | **422.8 (8c/32g)** | ✓ | **FULL PASS — 0.80× RocksDB (faster) + faster than ForSt (318<423) + accurate.** |
-| q19   | 305 (8c/32g) | 92,000,000 | **542.5** 🔒1G | 92,000,000 | (host 310.5) | ✓acc | **FAIL — 1.78× slower than RocksDB** (542 vs 305) + likely slower than ForSt. Accurate (exact). NON-join OVER-window dedup → a SECOND perf gap (not join read-amp). Architecture investigate. |
+| q19   | 305 (8c/32g) | 92,000,000 | **542.5** 🔒1G | 92,000,000 | **319.2 (8c/32g)** | ✓acc | **FAIL — 1.78× RocksDB (542 vs 305) AND 1.70× ForSt (542 vs 319).** Accurate (exact). forst-rs genuinely behind BOTH on OVER-window/dedup (RocksDB≈ForSt≈310). Separate perf gap (not join async-dispatch); architecture fix needed. |
 | q20   | **800.3 (8c/32g)** | 93,201,404 | **DNF @1300s** 🔒1G (59.8M/93M, rate→23.6K/s) | — | (pending) | ✗ | **FAIL — DNF vs RocksDB 800s.** Join, OUTPUT-amplifying (auction⋈bid). NOT read-amp (n_ovl=2-3) NOT iter-decode (already zero-copy). Bottleneck = executor dispatch / output-emit (profile pending). Bar: must finish ≤1000s + beat ForSt. |
 | q21   | 59.9      | 100,000,000      | 52.6       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
 | q22   | 44.8      | 100,000,000      | 43.6       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
@@ -121,6 +121,66 @@ now PASS; q9/q4/q20 finish-memory-wise, join read-amp is the remaining speed gap
 Pure non-join AGG (q16/q19) = EXACT. The join queries (q4/q5/q7/q8/q9/q11/q20) all need a
 **final-result accuracy check** (upsert-result compare), not out_rows, before their perf counts.
 q5 is the one confirmed-wrong; the rest are open. This is the accuracy work item for the join family.
+
+## ⧗ IN FLIGHT 2026-06-09: q20 PARALLEL-EXECUTOR experiment (the join architecture fix)
+The join family (q7/q9/q20) DNFs because the default executor is depth-1 (each batch runs inline on
+the AEC mailbox thread → in-flight depth==1, documented at VectorizedExecutor.java:337-398). q9 ran at
+only **375% CPU on 8 cores** → serialization headroom, not CPU-bound. `RoutingStateExecutor` (already
+implemented + flag-gated) routes each batch to one of N single-thread VectorizedExecutor workers →
+in-flight depth N (the ForSt coordinator-offload + parallel-readThreads model). Correctness is sound:
+AEC enforces per-key ordering so concurrent batches hold DISJOINT keys, and drains in-flight before
+checkpoint. Refuted for q19 (OVER-window = few disjoint keys) but joins have MANY disjoint keys.
+**Experiment:** q20 @ locked cfg + `FRS_RS_PARALLEL_EXECUTOR=1 FRS_RS_READ_IO_PARALLELISM=3` (match
+ForSt's read-io-parallelism=3). Baseline: RocksDB 800.3s, forst-rs DNF@1300s (59.8M/93M, end 23.6K/s).
+PASS criterion: finishes ≤1000s. If it finishes → parallel-read direction VALIDATED for the join
+family (apply to q7/q9). If still DNF/no rate lift → serialization is NOT the bottleneck (per-iter CPU
+is) → refuted, pivot to per-iter cost. Jar rebuilt 2026-06-09 (source was 18h newer than deployed jar).
+
+### ✗ RESULT 2026-06-09: parallel executor CRASH-LOOPS q20 (thread-safety bug, NOT refuted direction)
+q20 + parallel executor went into a **crash-restart loop** (status RESTARTING, src_out resetting,
+never progressed past ~0.3M). Root cause (TM log, exact stack): **data race on a shared per-subtask
+decode buffer.**
+```
+WrongThreadException: Attempted access outside owning thread
+  at v1sync.MemorySegmentDataInputView.readByteUnsafe:70
+  at ForStRsMapStateV2.deserializeUserKey:825        ← shared `iterView` FIELD
+  at ForStRsDBIterRequest.completeWithEntries:512
+  at ForStRsDBIterRequest.process:357 → VectorizedExecutor.executeIters:1371
+```
+cascade: `EOFException ... want 1936091768 bytes`, `IndexOutOfBoundsException: Out of bound access on
+segment`, `MemorySegmentDataInputView underflow`. **Why:** `iterView` is a reused mutable field on the
+per-subtask `ForStRsMapStateV2`; `RoutingStateExecutor` routes different batches of the SAME subtask to
+DIFFERENT worker threads → two workers re-point the same `iterView` at their own thread-confined chunk
+segments and read concurrently → WrongThreadException + corruption. The design's key-disjointness
+argument is INSUFFICIENT: it protects engine keys, but the reusable Java-side decode scratch on the
+state object is shared across ALL keys of the subtask → raced.
+FIX applied + committed (flink `fc8eb8cd97c`/`c1bb289ae17`): iterator decoders use the existing
+per-thread `VIEW_TL` ThreadLocal view, removed the shared `iterView` field. Behavior-preserving for the
+default single-threaded executor.
+
+### ✗✗ RESULT 2026-06-09 (re-run with iterView fix): parallel executor gives ZERO speedup for q20
+Clean run, NO crash-loop (fix worked). Trajectory: **0–120s burst 150–228K/s** (state in memtable,
+pre-flush) → 18.4M; **~140s COLLAPSE to ~15–20K/s** (first flush → probes hit SSTs) and stays there.
+End: **60.8M/93M @1300s = DNF**, ~47K/s avg. **IDENTICAL to the serial run** (serial DNF@1300s 59.8M,
+~46K/s). Parallel depth-3 = serial depth-1 throughput.
+**→ executor-dispatch SERIALIZATION is REFUTED as the q20 bottleneck** (now refuted for q19 OVER-window
+AND q20 join — the "parallel read threads" hypothesis from the architecture design does NOT hold for
+either). With only 375% CPU (of 800%) AND no benefit from 3 workers, a SERIAL section is blocking the
+workers. Candidates (next, profile to distinguish): (1) post-flush SST-probe path holds a global engine
+lock (version/SST-reader RwLock) so parallel workers serialize on it; (2) downstream output
+backpressure — q20 is output-amplifying (auction⋈bid), Calc→Writer is single-threaded per subtask;
+(3) the per-probe 16-shard memtable cursor + SST merge is the serial cost.
+**Candidate (2) REFUTED by this run's own data:** the source ran at 150–228K/s during the PRE-flush
+phase and only collapsed AFTER the first flush (~140s). If the single-threaded Calc→Writer couldn't
+drain the amplified output, the rate would be capped from t=0, not just post-flush. The slowdown tracks
+the STATE BACKEND (memtable→SST), not the output operator → downstream backpressure is not it.
+**Remaining: (1) SST-probe global lock OR (3) per-probe memtable/SST read cost.** 375% CPU (of 800%) +
+3 idle-ish workers + no parallel benefit ⇒ workers BLOCK on a serial lock (low CPU = blocking, not
+CPU-bound) → strongly points at (1): a global lock on the post-flush read/probe path (candidate: the
+ShardedMemTable per-shard RwLock contending with active write-locks — q20 buffers bids continuously —
+or an SST-reader/version lock). NEXT: engine CPU/lock profile of the post-flush steady state to confirm
+WHICH lock, then make that path lock-free (extends the prior lock-free-memtable work). The iterView fix
+is KEPT (a real latent thread-safety bug fix), but **the parallel executor is NOT the join-family lever.**
 
 ## ★ WHAT'S LEFT (Phase-1 close)
 1. **Fair baselines:** RocksDB 8c/32g + ForSt 8c/32g for the WHOLE set ("faster than ForSt" clause
