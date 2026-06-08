@@ -35,6 +35,11 @@ use forst_rs_io::{
     WriteMode,
 };
 
+// Cargo runs tests in one integration-test binary concurrently by default. These cases
+// deliberately force write stalls and slow background flushes, so keep them serialized to avoid
+// cross-test backlog interference.
+static FLUSH_WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 // ---------------------------------------------------------------------
 // SlowFs — wraps MemoryFileSystem and adds a configurable per-write
 // sleep. Lets us prove flushes run off the writer's stack: we can
@@ -211,6 +216,8 @@ fn small_buf_options() -> EngineOptions {
 /// writer's call wraps up in much less than 200 ms.
 #[test]
 fn test_flush_runs_off_writer_thread() {
+    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+
     let fs = SlowFs::new(Duration::from_millis(200));
     let fs_dyn: Arc<dyn FileSystem> = fs.clone();
     let db = DbImpl::open_with_fs(small_buf_options(), fs_dyn).unwrap();
@@ -250,6 +257,8 @@ fn test_flush_runs_off_writer_thread() {
 ///   - measuring that one of the puts blocked >= 50 ms.
 #[test]
 fn test_max_write_buffer_number_backpressure() {
+    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+
     let fs = SlowFs::new(Duration::from_millis(100));
     let fs_dyn: Arc<dyn FileSystem> = fs.clone();
     let db = DbImpl::open_with_fs(small_buf_options(), fs_dyn).unwrap();
@@ -292,6 +301,8 @@ fn test_max_write_buffer_number_backpressure() {
 /// readable.
 #[test]
 fn test_close_drains_pending_flushes() {
+    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+
     let mem_fs = Arc::new(MemoryFileSystem::new());
     let fs_dyn: Arc<dyn FileSystem> = mem_fs.clone();
 
@@ -325,6 +336,8 @@ fn test_close_drains_pending_flushes() {
 /// the next put must return Err.
 #[test]
 fn test_flush_error_propagates_to_next_writer() {
+    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+
     let fs = FailingFs::new(0); // every write fails
     let fs_dyn: Arc<dyn FileSystem> = fs.clone();
     let db = DbImpl::open_with_fs(small_buf_options(), fs_dyn).unwrap();
@@ -364,6 +377,8 @@ fn test_flush_error_propagates_to_next_writer() {
 /// must be consistent: every value we wrote must be readable via `get`.
 #[test]
 fn test_concurrent_writers_with_async_flush() {
+    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+
     let opts = EngineOptions {
         db_path: "/db".to_string(),
         write_buffer_size: 8 * 1024, // small, but not tiny — want a few flushes
@@ -409,6 +424,8 @@ fn test_concurrent_writers_with_async_flush() {
 /// without leaving imms behind.
 #[test]
 fn test_flush_all_drains_after_async_path() {
+    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+
     let opts = EngineOptions {
         db_path: "/db".to_string(),
         write_buffer_size: 1024,
