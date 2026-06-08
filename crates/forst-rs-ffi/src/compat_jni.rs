@@ -919,6 +919,19 @@ fn cf_from_java_handle(env: &mut JNIEnv, cf_handle: jlong, context: &str) -> Opt
     Some(cf.frs_handle)
 }
 
+fn cf_from_java_or_default(
+    env: &mut JNIEnv,
+    db_handle: jlong,
+    cf_handle: jlong,
+    context: &str,
+) -> Option<FrsCfHandle> {
+    if cf_handle == 0 {
+        default_cf_for_db(env, db_handle, context)
+    } else {
+        cf_from_java_handle(env, cf_handle, context)
+    }
+}
+
 fn cf_options_merge_operator_name(cf_options_handle: jlong) -> Option<String> {
     if cf_options_handle == 0 {
         return None;
@@ -1878,11 +1891,44 @@ pub extern "system" fn Java_org_forstdb_RocksDB_compactRange<'local>(
         &mut env,
         || (),
         |env| {
-            let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.compactRange") else {
+            let Some(frs_cf) =
+                cf_from_java_or_default(env, handle, cf_handle, "RocksDB.compactRange")
+            else {
                 return;
             };
             // SAFETY: handles came from prior open / create calls; nullity
             // checked inside frs_compact_cf.
+            let status = unsafe { frs_compact_cf(handle as FrsDb, frs_cf) };
+            check_status(env, status, "RocksDB.compactRange");
+        },
+    )
+}
+
+/// Long JNI form for `compactRange(long, byte[], int, byte[], int, long, long)`.
+///
+/// ForSt currently exposes full-CF compaction only, so range/options arguments are
+/// accepted for ABI compatibility and ignored.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_compactRange__J_3BI_3BIJJ<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    _begin: JByteArray<'local>,
+    _begin_len: jint,
+    _end: JByteArray<'local>,
+    _end_len: jint,
+    _compact_range_options_handle: jlong,
+    cf_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            let Some(frs_cf) =
+                cf_from_java_or_default(env, handle, cf_handle, "RocksDB.compactRange")
+            else {
+                return;
+            };
             let status = unsafe { frs_compact_cf(handle as FrsDb, frs_cf) };
             check_status(env, status, "RocksDB.compactRange");
         },
@@ -9234,6 +9280,7 @@ mod tests {
             "Java_org_forstdb_RocksDB_merge__JJ_3BII_3BII",
             "Java_org_forstdb_RocksDB_merge__JJ_3BII_3BIIJ",
             "Java_org_forstdb_RocksDB_compactRange",
+            "Java_org_forstdb_RocksDB_compactRange__J_3BI_3BIJJ",
             "Java_org_forstdb_RocksDB_compactRangeAll",
             "Java_org_forstdb_RocksDB_flushCf",
             "Java_org_forstdb_RocksDB_getDefaultColumnFamily",
