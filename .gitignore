@@ -21,3 +21,4 @@ docs/superpowers/specs/*.log
 /META-INF/
 /org/
 docs/superpowers/specs/v5-bench-data/
+target-linux/

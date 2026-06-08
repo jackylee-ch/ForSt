@@ -150,8 +150,7 @@ fn global_shadow_over_budget() -> bool {
     GLOBAL_RESIDENT_SHADOW_USED.load(Ordering::Relaxed) > global_resident_shadow_cap_bytes()
 }
 
-/// Test-only: current global resident-shadow byte total.
-#[cfg(test)]
+/// Current global resident-shadow byte total (also used by the FRS_MEM_DIAG logger).
 pub fn global_resident_shadow_used_bytes() -> usize {
     GLOBAL_RESIDENT_SHADOW_USED.load(Ordering::Relaxed)
 }

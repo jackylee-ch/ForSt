@@ -33,6 +33,24 @@ forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
 arrow = { workspace = true }
 
+# Fault injection harness (L5, umbrella spec §5). Optional behind
+# `fault-injection` feature so production cdylib builds pay zero cost.
+# Cross-platform: must be available on macOS for local compat-jni/fault-injection
+# builds (only jemalloc below is Linux-gated, per the documented macOS SIGSEGV).
+forst-rs-test-harness = { workspace = true, optional = true }
+
+# Optional JNI shim for G-A drop-in replacement of community ForSt's
+# `libforstjni.so`. Pulled in only when the `compat-jni` feature is enabled
+# so non-Java consumers (and the bulk of CI) don't pay the dependency cost.
+# See `src/compat_jni.rs` and design doc 2.5. Cross-platform (jni 0.21 builds
+# on macOS too) so the LittleE2E variant-3 swap can be validated locally.
+jni = { version = "0.21", optional = true }
+# Used by the compat-jni shim only — debug-level diagnostic logging for
+# ignored Options setters that forst-rs cannot represent (RocksDB
+# Statistics / Env / WriteBufferManager etc). Optional so non-JNI builds
+# don't pay the dependency cost.
+tracing = { workspace = true, optional = true }
+
 # FRS-JEMALLOC (2026-06-05): global allocator for the cdylib. The default system
 # allocator retained ~14 GB of freed small-alloc memory (55.9 M live allocations
 # churned per q4) → 43 GB RSS, which does NOT fit the 8c/32g target and swaps.
@@ -53,21 +71,6 @@ arrow = { workspace = true }
 # used), which also keeps the host A/B vs RocksDB fair.
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }
-
-# Fault injection harness (L5, umbrella spec §5). Optional behind
-# `fault-injection` feature so production cdylib builds pay zero cost.
-forst-rs-test-harness = { workspace = true, optional = true }
-
-# Optional JNI shim for G-A drop-in replacement of community ForSt's
-# `libforstjni.so`. Pulled in only when the `compat-jni` feature is enabled
-# so non-Java consumers (and the bulk of CI) don't pay the dependency cost.
-# See `src/compat_jni.rs` and design doc 2.5.
-jni = { version = "0.21", optional = true }
-# Used by the compat-jni shim only — debug-level diagnostic logging for
-# ignored Options setters that forst-rs cannot represent (RocksDB
-# Statistics / Env / WriteBufferManager etc). Optional so non-JNI builds
-# don't pay the dependency cost.
-tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Used by P2 compat-jni tests to materialise on-disk checkpoint dirs that

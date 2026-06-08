@@ -65,8 +65,43 @@ fn global_wbm_cap_bytes() -> u64 {
     })
 }
 
-/// Test-only: current process-global memtable byte total.
-#[cfg(test)]
+/// FRS-WBM-HARD-CAP (2026-06-08): process-global HARD memtable cap. The soft cap
+/// (`global_wbm_cap_bytes`) only TRIGGERS flush (advisory); under a heavy ingest
+/// BURST on the UNBOUNDED-state queries (q4/q9/q17/q18/q20) writes outpace flush,
+/// memtables grow far past the soft cap (~6.9 GiB observed), and the 8c/32g TM OOMs.
+/// This HARD cap is where writers actually STALL (RocksDB `allow_stall`), throttling
+/// the source to a flush-sustainable rate so total RAM stays bounded — like RocksDB.
+/// Set ABOVE the soft cap so normal/bounded-state queries (q5/q16/q19, which stay
+/// under it) never stall (avoids the soft-cap stall that froze q5). Default 6 GiB;
+/// override `FRS_WBM_HARD_MB`; `0` disables the stall entirely.
+pub fn global_wbm_hard_cap_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        // Default 0 = DISABLED (2026-06-08): the memtable hard-cap stall was REFUTED
+        // as the q9 OOM fix — q9's OOM is dominated by compaction transient + Java FFM,
+        // NOT memtables (jemalloc-ctl proven), so stalling on memtables didn't prevent
+        // it and made it WORSE (q9 crashed at 17.6M vs 60M; backpressure accumulated the
+        // Java AEC in-flight → earlier OOM; memtables still hit 7.2GB). Opt in via
+        // FRS_WBM_HARD_MB for experiments; the real memory-model fix must bound the
+        // compaction transient + Java off-heap, not memtables.
+        match std::env::var("FRS_WBM_HARD_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            Some(mb) => mb.saturating_mul(1024 * 1024),
+            None => 0,
+        }
+    })
+}
+
+/// True when the process-global memtable sum exceeds the HARD cap (writers must
+/// stall). `0` hard cap disables it.
+pub fn over_global_hard_budget() -> bool {
+    let cap = global_wbm_hard_cap_bytes();
+    cap != 0 && GLOBAL_WBM_USED.load(Ordering::Relaxed) > cap
+}
+
+/// Current process-global memtable byte total (also used by the FRS_MEM_DIAG logger).
 pub fn global_wbm_used_bytes() -> u64 {
     GLOBAL_WBM_USED.load(Ordering::Relaxed)
 }

@@ -29,5 +29,13 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 opendal = { workspace = true }
 
+# FRS-FADVISE (2026-06-08): posix_fadvise(DONTNEED) on written local SSTs to cap
+# the container page cache (the q9/q20/q4 8c/32g cgroup-OOM margin killer). Linux
+# only — the 8c/32g target is Linux; macOS has no posix_fadvise (no-op there).
+[target.'cfg(target_os = "linux")'.dependencies]
+# nix exposes a SAFE posix_fadvise wrapper — required because this crate is
+# `#![forbid(unsafe_code)]` (no raw libc unsafe block allowed).
+nix = { version = "0.27", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }

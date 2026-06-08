@@ -10,11 +10,11 @@
 #
 # Usage: QUERY=q9 CONFIG=forst-rs-ffm-s3 MAXSEC=3000 bash measure-sql.sh
 set -u
-export FLINK_HOME=/Users/lijunqing/Downloads/workenv/flink-2.2.1
-NEXMARK_HOME=/Users/lijunqing/Code/stczwd/ForSt/nexmark/nexmark-flink/target/nexmark-flink-bin/nexmark-flink
-export HADOOP_CLASSPATH="$(find /Users/lijunqing/Downloads/workenv/hadoop-3.4.3/share/hadoop -name '*.jar' | tr '\n' ':')"
-JDK17=/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home
-JDK25=/Library/Java/JavaVirtualMachines/zulu-25.jdk/Contents/Home
+export FLINK_HOME="${FLINK_HOME:-/Users/lijunqing/Downloads/workenv/flink-2.2.1}"
+NEXMARK_HOME="${NEXMARK_HOME:-/Users/lijunqing/Code/stczwd/ForSt/nexmark/nexmark-flink/target/nexmark-flink-bin/nexmark-flink}"
+export HADOOP_CLASSPATH="$(find "${HADOOP_HOME:-/Users/lijunqing/Downloads/workenv/hadoop-3.4.3}/share/hadoop" -name '*.jar' | tr '\n' ':')"
+JDK17="${JDK17:-/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home}"
+JDK25="${JDK25:-/Library/Java/JavaVirtualMachines/zulu-25.jdk/Contents/Home}"
 export RUN_ID="${RUN_ID:-msql-$(date +%H%M%S)}"
 QUERY="${QUERY:-q9}"
 CONFIG="${CONFIG:-forst-rs-ffm-s3}"
@@ -24,11 +24,12 @@ TPS="${TPS:-10000000}"; EVENTS_NUM="${EVENTS_NUM:-100000000}"
 PERSON_PROPORTION=1; AUCTION_PROPORTION=3; BID_PROPORTION=46
 S3VARS='${S3_ENDPOINT} ${S3_ACCESS_KEY} ${S3_SECRET_KEY} ${S3_BUCKET} ${S3_REGION} ${S3_PREFIX} ${RUN_ID}'
 CONF="$FLINK_HOME/conf/config.yaml"
+TEMPLATES="${TEMPLATES:-$FLINK_HOME/conf/templates}"
 case "$CONFIG" in
-  rocksdb) cp "$FLINK_HOME/conf/templates/config-rocksdb.yaml" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-rocksdb-io /tmp/nexmark-checkpoints-rocksdb ;;
-  forst-rs-ffm-s3) envsubst "$S3VARS" < "$FLINK_HOME/conf/templates/config-forst-rs.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache ;;
-  forst-rs-ffm-local) envsubst "$S3VARS" < "$FLINK_HOME/conf/templates/config-forst-rs-local.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache /tmp/flink-forst-rs-data /tmp/nexmark-checkpoints-forst-rs "${TMPDIR:-/tmp}/forst-rs-ckpt-stage" /tmp/forst-rs-ckpt-stage ;;
-  forst-local) cp "$FLINK_HOME/conf/templates/config-forst-local.yaml.tpl" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-forst-io /tmp/flink-forst-data /tmp/nexmark-checkpoints-forst ;;
+  rocksdb) cp "$TEMPLATES/config-rocksdb.yaml" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-rocksdb-io /tmp/nexmark-checkpoints-rocksdb ;;
+  forst-rs-ffm-s3) envsubst "$S3VARS" < "$TEMPLATES/config-forst-rs.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache ;;
+  forst-rs-ffm-local) envsubst "$S3VARS" < "$TEMPLATES/config-forst-rs-local.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache /tmp/flink-forst-rs-data /tmp/nexmark-checkpoints-forst-rs "${TMPDIR:-/tmp}/forst-rs-ckpt-stage" /tmp/forst-rs-ckpt-stage ;;
+  forst-local) cp "$TEMPLATES/config-forst-local.yaml.tpl" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-forst-io /tmp/flink-forst-data /tmp/nexmark-checkpoints-forst ;;
   *) echo "unknown config $CONFIG"; exit 1 ;;
 esac
 # The repo's sql-client.sh is a WRAPPER that reroutes nexmark's hardcoded
@@ -120,6 +121,15 @@ try: d=json.load(sys.stdin)
 except: print('?'); sys.exit()
 sv=[v for v in d.get('vertices',[]) if 'Source' in v['name']]
 print(sv[0]['metrics'].get('write-records','?') if sv else '?')" 2>/dev/null)
+  # FRS-ACCURACY (2026-06-08): capture the SINK vertex's input row count so a
+  # backend A/B can compare OUTPUT row counts (the blackhole sink discards data,
+  # but read-records on the sink vertex = rows the query produced). Sum across all
+  # sink subtasks; sink vertices are named "Sink:" (Flink) or contain "Writer".
+  outrows=$(echo "$jj" | python3 -c "import json,sys
+try: d=json.load(sys.stdin)
+except: print('?'); sys.exit()
+sk=[v for v in d.get('vertices',[]) if 'Sink' in v['name'] or 'Writer' in v['name']]
+print(sk[0]['metrics'].get('read-records','?') if sk else '?')" 2>/dev/null)
   rate=""
   if [ "$src" != "?" ] && [ -n "$src" ] && [ "$last_t" -gt 0 ]; then
     rate=$(( (src - last_src) / ( (now-last_t) > 0 ? (now-last_t) : 1 ) ))
@@ -132,13 +142,26 @@ print(sv[0]['metrics'].get('write-records','?') if sv else '?')" 2>/dev/null)
   if [ "$st" = "RESTARTING" ] && { [ "$src" = "0" ] || [ "$src" = "?" ]; }; then
     restart_zero=$((restart_zero+1))
     if [ "$restart_zero" -ge 8 ]; then
+      echo "=== JM EXCEPTIONS (root cause of crash-loop) ==="
+      curl -s --max-time 6 "http://localhost:8081/jobs/$JID/exceptions" 2>/dev/null \
+        | python3 -c "import json,sys
+try: d=json.load(sys.stdin)
+except: print('(no exceptions json)'); sys.exit()
+ents=d.get('exceptionHistory',{}).get('entries') or []
+print('--- ORIGINAL failure (oldest entry) ---')
+for e in ents[-2:]:
+    print('EXC:', e.get('exceptionName',''), '@', e.get('taskName',''))
+    for ln in (e.get('stacktrace') or '').splitlines()[:25]: print(ln)
+print('--- root-exception ---')
+for ln in (d.get('root-exception') or '').splitlines()[:15]: print(ln)" 2>/dev/null \
+        | grep -viE 'access[_-]?key|secret|s3\.|endpoint|bucket' | head -45
       echo "RESULT: $QUERY ENDED state=RESTARTING dur_ms=$dur src_out=$src — crash-loop (no progress), aborting early"; break
     fi
   else
     restart_zero=0
   fi
   case "$st" in
-    FINISHED) echo "RESULT: $QUERY FINISHED wall_ms=$dur (=$(awk "BEGIN{printf \"%.1f\", $dur/1000}")s) src_out=$src"; break ;;
+    FINISHED) echo "RESULT: $QUERY FINISHED wall_ms=$dur (=$(awk "BEGIN{printf \"%.1f\", $dur/1000}")s) src_out=$src out_rows=$outrows"; break ;;
     FAILED|CANCELED) echo "RESULT: $QUERY ENDED state=$st dur_ms=$dur src_out=$src — NOT a clean finish"; break ;;
   esac
   sleep 20

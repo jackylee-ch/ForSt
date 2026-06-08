@@ -812,7 +812,25 @@ pub struct OpendalWritableFile {
     /// 2026-05-29 WRITE-BACK FLUSH: backpressure semaphore (clone of the
     /// backend's). The spawned upload acquires a permit before touching S3.
     upload_sem: Option<Arc<Semaphore>>,
+    /// FRS-FADVISE (2026-06-08): absolute on-disk path, set ONLY when this file is
+    /// backed by the local `fs` opendal service. On close we `fsync` + `posix_fadvise
+    /// (POSIX_FADV_DONTNEED)` it so its pages leave the OS page cache — bounding the
+    /// container cgroup page cache (anon + cache) that OOM-kills the 8c/32g join
+    /// queries (q9/q20/q4) once written SSTs accumulate. `None` for S3/memory (the
+    /// pages there are not local; nothing to advise away).
+    fadvise_path: Option<std::path::PathBuf>,
+    /// FRS-SST-WRITE-COALESCE (2026-06-08): streaming SST writes arrive one data
+    /// block at a time (~8 KiB), and the old `append` did a tokio `block_on(opendal
+    /// write)` PER block → ~27K block_on round-trips per 219 MB SST. Profiled as the
+    /// DOMINANT flush cost on q17 (sink-write 428s vs encode 17s + buffer 8s). This
+    /// buffer coalesces block appends and flushes to opendal in large chunks
+    /// (`SST_WRITE_COALESCE_BYTES`), cutting the block_on count ~500×. Drained on
+    /// `close_writer` (sync) so the SST is never truncated.
+    coalesce: Vec<u8>,
 }
+
+/// FRS-SST-WRITE-COALESCE: flush the streaming-write accumulator at this size.
+const SST_WRITE_COALESCE_BYTES: usize = 4 * 1024 * 1024;
 
 impl WritableFile for OpendalWritableFile {
     fn append(&mut self, data: &[u8]) -> ForstResult<()> {
@@ -822,40 +840,28 @@ impl WritableFile for OpendalWritableFile {
                 self.path
             )));
         }
-        let writer = self.writer.as_mut().ok_or_else(|| {
-            ForstError::invalid_argument(format!("OpenDAL writer missing: {}", self.path))
-        })?;
         // FRS-S3-MULTIPART-TRUNC-FIX: the buffered object-store path just
         // accumulates bytes in memory; the single write + verify happens on
-        // close. Handle it before the Buffer materialization the streaming
-        // paths need.
-        if let WriterKind::Buffered { buf: acc, .. } = writer {
+        // close. Handle it before the streaming coalesce path.
+        if let Some(WriterKind::Buffered { buf: acc, .. }) = self.writer.as_mut() {
             acc.extend_from_slice(data);
             self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
             return Ok(());
         }
-        // B-C5R1-NEW-H5: skip the `to_vec()` materialization. OpenDAL's
-        // `write` accepts anything `Into<opendal::Buffer>`; `Buffer::from`
-        // takes a `Bytes` which can be built directly via
-        // `Bytes::copy_from_slice` (one heap alloc + one memcpy vs the
-        // prior `Vec::from(slice)` which copies into a fresh Vec then
-        // `Buffer::from(Vec)` re-allocs a Bytes from it).
-        let buf = opendal::Buffer::from(bytes::Bytes::copy_from_slice(data));
-        match writer {
-            // FRS-S3-MULTIPART: drive the async writer to completion on the
-            // runtime handle. The async writer buffers `MULTIPART_CHUNK_BYTES`
-            // parts and dispatches up to `WRITE_CONCURRENCY` part-uploads in
-            // parallel; `block_on` keeps the synchronous WritableFile contract.
-            WriterKind::Async(w) => self
-                .handle
-                .block_on(w.write(buf))
-                .map_err(|e| map_opendal_err(e, &format!("OpenDAL async write: {}", self.path)))?,
-            WriterKind::Blocking(w) => w.write(buf).map_err(|e| {
-                map_opendal_err(e, &format!("OpenDAL streaming write: {}", self.path))
-            })?,
-            WriterKind::Buffered { .. } => unreachable!("handled above"),
+        if self.writer.is_none() {
+            return Err(ForstError::invalid_argument(format!(
+                "OpenDAL writer missing: {}",
+                self.path
+            )));
         }
+        // FRS-SST-WRITE-COALESCE: streaming SST data blocks arrive ~8 KiB at a time;
+        // doing a block_on(opendal write) PER block was the dominant flush cost
+        // (profiled: sink-write ≫ encode). Accumulate and flush in large chunks.
+        self.coalesce.extend_from_slice(data);
         self.bytes_written = self.bytes_written.saturating_add(data.len() as u64);
+        if self.coalesce.len() >= SST_WRITE_COALESCE_BYTES {
+            self.flush_coalesce()?;
+        }
         Ok(())
     }
 
@@ -873,10 +879,35 @@ impl WritableFile for OpendalWritableFile {
 }
 
 impl OpendalWritableFile {
+    /// FRS-SST-WRITE-COALESCE: flush the accumulated streaming buffer to opendal in
+    /// ONE write. No-op when empty or for the Buffered/absent writer kinds. Must run
+    /// before `close_writer` takes the writer, or the SST tail (bloom/index/footer)
+    /// is lost → "missing trailing magic" corruption.
+    fn flush_coalesce(&mut self) -> ForstResult<()> {
+        if self.coalesce.is_empty() {
+            return Ok(());
+        }
+        let bytes = std::mem::take(&mut self.coalesce);
+        let buf = opendal::Buffer::from(bytes::Bytes::from(bytes));
+        match self.writer.as_mut() {
+            Some(WriterKind::Async(w)) => self
+                .handle
+                .block_on(w.write(buf))
+                .map_err(|e| map_opendal_err(e, &format!("OpenDAL async write: {}", self.path)))?,
+            Some(WriterKind::Blocking(w)) => w.write(buf).map_err(|e| {
+                map_opendal_err(e, &format!("OpenDAL streaming write: {}", self.path))
+            })?,
+            Some(WriterKind::Buffered { .. }) | None => {}
+        }
+        Ok(())
+    }
+
     fn close_writer(&mut self) -> ForstResult<()> {
         if self.closed {
             return Ok(());
         }
+        // Drain any coalesced streaming bytes BEFORE taking/closing the writer.
+        self.flush_coalesce()?;
         if let Some(writer) = self.writer.take() {
             // FRS-S3-MULTIPART: `close()` is what publishes the object — for the
             // async multipart writer it issues CompleteMultipartUpload, so the
@@ -1048,10 +1079,57 @@ impl OpendalWritableFile {
                 }
             };
         }
+        // FRS-FADVISE: the writer is now closed and the bytes are on the local fs.
+        // Drop this file's pages from the OS page cache so the container cgroup
+        // (anon + page cache) does not OOM-kill heavy-write join queries on 8c/32g.
+        // No-op for S3/memory (fadvise_path is None) and on non-Linux.
+        if let Some(path) = self.fadvise_path.take() {
+            fadvise_dontneed(&path);
+        }
         self.closed = true;
         Ok(())
     }
 }
+
+/// FRS-FADVISE (2026-06-08): `fsync` + `posix_fadvise(POSIX_FADV_DONTNEED)` a
+/// just-written local file so its pages leave the OS page cache. The fsync first
+/// makes the pages clean (DONTNEED is a no-op on dirty pages); both are cheap if
+/// the engine already synced. Best-effort: any error is logged and ignored — page
+/// cache is a soft RAM concern, never a correctness invariant. Linux-only.
+#[cfg(target_os = "linux")]
+fn fadvise_dontneed(path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    use std::sync::OnceLock;
+    // FRS-FADVISE default OFF (2026-06-08): the per-SST `sync_all` + posix_fadvise is
+    // EXPENSIVE on a host-bind-mounted /tmp (virtiofs/9p — slow fsync), which taxed
+    // write-heavy queries (q11/q16/q19) on 8c/32g. The page-cache benefit it was added
+    // for is marginal (the join OOM was anon + container-disk, not page cache). So it is
+    // opt-in via FRS_FADVISE=1 for environments where dropping written-SST pages helps.
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        matches!(std::env::var("FRS_FADVISE").ok().as_deref(), Some("1") | Some("true"))
+    });
+    if !on {
+        return;
+    }
+    let f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return, // file may have been compacted away already; benign
+    };
+    // Ensure pages are clean so they are actually droppable.
+    let _ = f.sync_all();
+    // offset=0, len=0 → the whole file. nix gives a safe wrapper (this crate is
+    // `#![forbid(unsafe_code)]`). Best-effort: ignore errors (soft RAM concern).
+    let _ = nix::fcntl::posix_fadvise(
+        f.as_raw_fd(),
+        0,
+        0,
+        nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fadvise_dontneed(_path: &std::path::Path) {}
 
 impl Drop for OpendalWritableFile {
     fn drop(&mut self) {
@@ -1207,6 +1285,16 @@ impl FileSystem for OpendalFileSystem {
             WriterKind::Blocking(w)
         };
 
+        // FRS-FADVISE: resolve the absolute on-disk path for the local `fs` service
+        // so close() can drop this file's pages from the page cache. opendal's
+        // `info().root()` is the absolute mount root; `p` is the path relative to it.
+        let fadvise_path = if self.op.info().scheme() == opendal::Scheme::Fs {
+            let root: String = self.op.info().root().to_string();
+            Some(std::path::Path::new(&root).join(p.trim_start_matches('/')))
+        } else {
+            None
+        };
+
         Ok(Box::new(OpendalWritableFile {
             path: p.to_string(),
             writer: Some(writer_kind),
@@ -1215,6 +1303,8 @@ impl FileSystem for OpendalFileSystem {
             closed: false,
             pending: file_pending,
             upload_sem: file_sem,
+            fadvise_path,
+            coalesce: Vec::new(),
         }))
     }
 

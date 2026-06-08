@@ -630,6 +630,7 @@ impl DbImpl {
         const BLOCK_CACHE_FLOOR: usize = 256 * 1024 * 1024;
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
+        maybe_start_mem_diag(); // FRS_MEM_DIAG: pinpoint engine resident native (join-OOM 16GB)
         let block_cache = shared_block_cache(cache_bytes); // FRS-ROCKSDB-PARITY C3: slot-shared
         // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
         // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
@@ -2635,7 +2636,63 @@ impl DbImpl {
             self.enqueue_flush(cf_data.clone())?;
         }
 
+        if wbm_over {
+            self.wait_for_wbm_headroom();
+        }
+
         Ok(old_value)
+    }
+
+    /// FRS-WBM-STALL (2026-06-08, join 8c/32g OOM fix): when the write-buffer budget (per-instance
+    /// OR the process-GLOBAL memtable sum) is exceeded, BLOCK the writer until enqueued flushes
+    /// drain memtable bytes back under budget — RocksDB's WriteBufferManager `allow_stall`. Without
+    /// this, `over_budget()` only TRIGGERS a flush (advisory); under heavy joins on 8c/32g the writes
+    /// outpace flush across the ~N keyed-state DbImpls, memtables grow unbounded, and the TM hits the
+    /// 32 GiB cgroup → OOM-kill (proven: q9 RSS→32.3 GiB, 99.9% anonymous, engine SST state only
+    /// 1.3 GiB). The flush runs on the shared bg pool (separate threads) so it drains concurrently
+    /// while this writer parks; no lock is held here (write_mutex released, wbm_guard committed) so
+    /// there is no deadlock. Bounded by a 30s backstop. Disable with `FRS_WBM_STALL=0`.
+    fn wait_for_wbm_headroom(&self) {
+        // FRS-WBM-TRUE-BACKPRESSURE (2026-06-08): block the writer while the memtable
+        // budget (per-instance cap OR the process-global SOFT budget) is exceeded,
+        // until enqueued flushes drain it back under budget. This makes the budget a
+        // HARD bound — RocksDB's WriteBufferManager `allow_stall` — instead of the
+        // advisory flush-trigger it was. Without it, `over_budget()` only TRIGGERED a
+        // flush and writes continued unthrottled, so on the UNBOUNDED-state queries
+        // (q4/q9/q17/q18/q20) writes outran flush, memtables grew to 7-11 GB, and the
+        // 8c/32g TM hit the 32 GiB cgroup → OOM (proven: q9 7.2 GB / q17 11.2 GB
+        // memtables at OOM). Flush runs on the INDEPENDENT `bg_flush_pool` (separate
+        // threads from compaction) so it drains while this writer parks; no lock is
+        // held here (wbm_guard committed, write_mutex released) → no deadlock.
+        //
+        // No fixed give-up backstop (the old 120s deadline RELEASED and let memtables
+        // overrun → OOM anyway): we wait until under budget. The ONLY escape is a
+        // progress-based DEFENSE — if the process-global memtable sum makes NO downward
+        // progress for `STALL_NO_PROGRESS`, we release (defends against a genuinely
+        // stuck flush rather than freezing forever; under normal flush the global sum
+        // drops within ms). Disable entirely with FRS_WBM_STALL=0.
+        if !wbm_stall_enabled() {
+            return;
+        }
+        if !self.write_buffer_manager.over_budget() {
+            return;
+        }
+        const STALL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_secs(60);
+        let stall_start = std::time::Instant::now(); // FRS_PROF_DIAG: attribute backpressure stall
+        let mut last_used = crate::runtime_tuning::global_wbm_used_bytes();
+        let mut last_progress = std::time::Instant::now();
+        while self.write_buffer_manager.over_budget() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let now_used = crate::runtime_tuning::global_wbm_used_bytes();
+            if now_used < last_used {
+                // flush is draining the global memtable sum — keep waiting.
+                last_used = now_used;
+                last_progress = std::time::Instant::now();
+            } else if last_progress.elapsed() >= STALL_NO_PROGRESS {
+                break; // flush appears stuck — defensive release, never freeze forever.
+            }
+        }
+        prof_add(&PROF_STALL_NS, stall_start.elapsed().as_nanos() as u64);
     }
 
     /// Deletes the key.
@@ -2821,6 +2878,9 @@ impl DbImpl {
         let wbm_over = self.write_buffer_manager.over_budget();
         if needs_flush || wbm_over {
             self.enqueue_flush(cf_data.clone())?;
+        }
+        if wbm_over {
+            self.wait_for_wbm_headroom();
         }
 
         Ok(seq)
@@ -3194,6 +3254,11 @@ impl DbImpl {
         for cf_data in &cfs_to_flush {
             self.enqueue_flush(cf_data.clone())?;
         }
+        // FRS-WBM-TRUE-BACKPRESSURE: the batch/Arrow write paths are the ONLY paths the
+        // FFM async backend uses, so the stall MUST live here (not just write_single) or
+        // it never engages (q17/q9 memtables grew to 11/7 GB → OOM). Self-guards via
+        // over_budget(); returns immediately when under budget.
+        self.wait_for_wbm_headroom();
 
         Ok(last_seq)
     }
@@ -3369,6 +3434,9 @@ impl DbImpl {
         for cf_to_flush in &cfs_to_flush {
             self.enqueue_flush(cf_to_flush.clone())?;
         }
+        // FRS-WBM-TRUE-BACKPRESSURE: dominant FFM single-CF vectorized write path —
+        // stall here so memtables are a hard bound. Self-guards via over_budget().
+        self.wait_for_wbm_headroom();
 
         Ok(last_seq)
     }
@@ -3525,6 +3593,9 @@ impl DbImpl {
         if needs_flush {
             self.enqueue_flush(cf_data.clone())?;
         }
+        // FRS-WBM-TRUE-BACKPRESSURE: Arrow zero-copy batch path — stall on over-budget
+        // (self-guards) so this path is also a hard memtable bound.
+        self.wait_for_wbm_headroom();
 
         Ok(last_seq)
     }
@@ -4832,6 +4903,7 @@ impl DbImpl {
         const BLOCK_CACHE_FLOOR: usize = 256 * 1024 * 1024;
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
+        maybe_start_mem_diag(); // FRS_MEM_DIAG: pinpoint engine resident native (join-OOM 16GB)
         let block_cache = shared_block_cache(cache_bytes); // FRS-ROCKSDB-PARITY C3: slot-shared
         // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
         // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
@@ -7385,7 +7457,25 @@ impl DbImpl {
         let usage = cf_data.active_memtable().memory_usage();
 
         let threshold = cf_data.options().effective_write_buffer_size(&self.options);
-        if usage < threshold {
+        // FRS-WBM-TRUE-BACKPRESSURE (2026-06-08): normally switch at the per-memtable
+        // size threshold (e.g. 1 GiB write_buffer_size). BUT when the cross-CF WBM
+        // budget is over, FORCE a switch even below that threshold so there is an
+        // immutable for the bg flush pool to drain — otherwise, with a large
+        // write_buffer_size, no single memtable reaches its switch point, NO flush is
+        // ever enqueued, and writers stalling on the budget (`wait_for_wbm_headroom`)
+        // never see the global sum drop → 60s no-progress release → memtable overrun →
+        // 8c/32g OOM (the q9 7 GB / q17 11 GB failure). A floor avoids flushing
+        // trivially small memtables into a storm of tiny SSTs; over budget we still
+        // only switch a memtable carrying real bytes. Mirrors RocksDB's WBM flushing
+        // memtables when the shared buffer budget trips.
+        // Floor sized to avoid an L0 explosion: forcing tiny memtables into many
+        // small L0 SSTs faster than compaction drains them trips `l0_stop_trigger`
+        // (64) → writers hard-stop → pipeline freeze → restart (observed: q17 froze
+        // at a 16 MiB floor). 256 MiB keeps forced SSTs large so L0 stays shallow.
+        const WBM_FORCE_SWITCH_FLOOR: usize = 256 * 1024 * 1024;
+        let force_for_budget = usage >= WBM_FORCE_SWITCH_FLOOR
+            && self.write_buffer_manager.over_budget();
+        if usage < threshold && !force_for_budget {
             return Ok(false);
         }
 
@@ -9169,7 +9259,14 @@ impl FlushExecutor for DbImpl {
         // imm list and return `Ok(None)`, so we treat that as a no-op.
         // (FRS-WAMP ingested-bytes accounting lives inside flush_cf_data so it
         // captures every flush path, not just this one.)
-        self.flush_cf_data(cf_data)?;
+        // FRS_PROF_DIAG: attribute flush wall-time + bytes (gap-map dim 3, flush ms/MB).
+        let _flush_t0 = std::time::Instant::now();
+        let _flushed = self.flush_cf_data(cf_data)?;
+        prof_add(&PROF_FLUSH_NS, _flush_t0.elapsed().as_nanos() as u64);
+        if let Some(meta) = &_flushed {
+            prof_add(&PROF_FLUSH_BYTES, meta.file_size);
+            prof_add(&PROF_FLUSH_CNT, 1);
+        }
         // Auto-compact L0 if it has grown past the slowdown trigger so
         // the engine stays well clear of the write-stall ceiling.
         self.maybe_auto_compact(cf_data)?;
@@ -9253,6 +9350,7 @@ impl CompactionExecutor for DbImpl {
         // unbounded-L1 / periodic-stall cost of L0-only is accepted (further
         // compaction tuning is negative-return here; the next lever is the
         // read-side B_resident tier, not more compaction).
+        let _comp_t0 = std::time::Instant::now(); // FRS_PROF_DIAG: compaction wall-time (dim 4)
         let r = self.compact_l0_for_cf(cf_data);
         // FRS-COMPACT-DRAIN-L1 (2026-06-05, DEFAULT ON; opt out =0): after the
         // L0→L1 rollup, if L1 has grown past its size budget, do ONE bounded
@@ -9278,6 +9376,8 @@ impl CompactionExecutor for DbImpl {
                 }
             }
         }
+        prof_add(&PROF_COMPACT_NS, _comp_t0.elapsed().as_nanos() as u64);
+        prof_add(&PROF_COMPACT_CNT, 1);
         if let Some(t) = t0 {
             let v = self.version_set.current();
             let l0_after = v.l0_files().iter().filter(|f| f.cf_id == cf_id).count();
@@ -9507,6 +9607,127 @@ fn shared_block_cache(cache_bytes: usize) -> std::sync::Arc<ShardedClockCache> {
     std::sync::Arc::clone(
         C.get_or_init(|| std::sync::Arc::new(ShardedClockCache::with_capacity(cache_bytes))),
     )
+}
+
+/// FRS_MEM_DIAG (2026-06-08): one process-global background thread logging the engine's resident
+/// native byte totals every 5s — pinpoints the join-OOM Rust-engine ~16GB (memtables vs resident
+/// shadow). Off unless FRS_MEM_DIAG=1. NMT does not track these (native-lib jemalloc), so this is
+/// the only way to attribute the engine side of the 32g cgroup OOM.
+/// FRS_PROF_DIAG (2026-06-08): process-global wall-time attribution counters for the
+/// forst-rs↔ForSt architecture gap-map. Cumulative ns/bytes, RELAXED atomics on COARSE
+/// seams (flush/compaction/stall — not per-tiny-op, so `Instant::now()` overhead is
+/// negligible and the measurement isn't perturbed). Formatted into the FRS_MEM_DIAG line.
+pub(crate) static PROF_STALL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_FLUSH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_FLUSH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_FLUSH_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_COMPACT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_COMPACT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PROF_COMPACT_CNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn prof_add(c: &std::sync::atomic::AtomicU64, n: u64) {
+    c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Format the attribution counters for the FRS_MEM_DIAG line (gap-map evidence).
+fn prof_diag_str() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let stall_ms = PROF_STALL_NS.load(Relaxed) / 1_000_000;
+    let flush_ms = PROF_FLUSH_NS.load(Relaxed) / 1_000_000;
+    let flush_mb = PROF_FLUSH_BYTES.load(Relaxed) / (1024 * 1024);
+    let flush_cnt = PROF_FLUSH_CNT.load(Relaxed);
+    let comp_ms = PROF_COMPACT_NS.load(Relaxed) / 1_000_000;
+    let comp_mb = PROF_COMPACT_BYTES.load(Relaxed) / (1024 * 1024);
+    let comp_cnt = PROF_COMPACT_CNT.load(Relaxed);
+    let flush_msmb = if flush_mb > 0 { flush_ms as f64 / flush_mb as f64 } else { 0.0 };
+    let comp_msmb = if comp_mb > 0 { comp_ms as f64 / comp_mb as f64 } else { 0.0 };
+    // SST-writer sub-cost split (gap-map Task 1: buffer vs encode vs sink-write).
+    let (sst_buf_ns, sst_enc_ns, sst_w_ns) = forst_rs_storage::sst::writer::sst_writer_prof_ns();
+    let sst_buf_ms = sst_buf_ns / 1_000_000;
+    let sst_enc_ms = sst_enc_ns / 1_000_000;
+    let sst_w_ms = sst_w_ns / 1_000_000;
+    format!(
+        " stall_ms={stall_ms} flush_ms={flush_ms} flush_MB={flush_mb} flush_cnt={flush_cnt} flush_ms/MB={flush_msmb:.2} comp_ms={comp_ms} comp_MB={comp_mb} comp_cnt={comp_cnt} comp_ms/MB={comp_msmb:.2} sstbuf_ms={sst_buf_ms} sstenc_ms={sst_enc_ms} sstwrite_ms={sst_w_ms}"
+    )
+}
+
+fn maybe_start_mem_diag() {
+    use std::sync::OnceLock;
+    static STARTED: OnceLock<()> = OnceLock::new();
+    if !matches!(
+        std::env::var("FRS_MEM_DIAG").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    ) {
+        return;
+    }
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new()
+            .name("frs-mem-diag".to_string())
+            .spawn(|| {
+                use std::io::Write;
+                let path = std::env::var("FRS_MEM_DIAG_FILE")
+                    .unwrap_or_else(|_| "/tmp/frs-mem-diag.log".to_string());
+                loop {
+                    let wbm_mb = crate::runtime_tuning::global_wbm_used_bytes() / (1024 * 1024);
+                    let shadow_mb =
+                        crate::column_family::global_resident_shadow_used_bytes() / (1024 * 1024);
+                    // jemalloc live attribution (Linux only — matches the allocator gate).
+                    let (alloc_mb, resident_mb, retained_mb) = jemalloc_mb();
+                    // process RSS from /proc/self/statm (pages × 4 KiB).
+                    let rss_mb = std::fs::read_to_string("/proc/self/statm")
+                        .ok()
+                        .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()))
+                        .map(|pages| pages * 4 / 1024)
+                        .unwrap_or(0);
+                    let line = format!(
+                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb}{}\n",
+                        prof_diag_str()
+                    );
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = f.write_all(line.as_bytes());
+                        let _ = f.flush();
+                    }
+                    eprint!("{line}");
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
+            });
+    });
+}
+
+/// FRS_MEM_DIAG: read jemalloc live/resident/retained in MiB. Must advance the
+/// stats epoch each call (jemalloc snapshots are epoch-gated). Linux-only — the
+/// jemalloc global allocator is gated to Linux in forst-rs-ffi.
+#[cfg(target_os = "linux")]
+fn jemalloc_mb() -> (u64, u64, u64) {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    let _ = epoch::advance();
+    let a = stats::allocated::read().unwrap_or(0) as u64 / (1024 * 1024);
+    let r = stats::resident::read().unwrap_or(0) as u64 / (1024 * 1024);
+    let ret = stats::retained::read().unwrap_or(0) as u64 / (1024 * 1024);
+    (a, r, ret)
+}
+#[cfg(not(target_os = "linux"))]
+fn jemalloc_mb() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
+/// FRS-WBM-TRUE-BACKPRESSURE toggle (`FRS_WBM_STALL=0`/`false` disables; ON by
+/// default), cached. When enabled, [`DbImpl::wait_for_wbm_headroom`] blocks writers
+/// until flush drains memtables back under the WBM budget (RocksDB `allow_stall`).
+fn wbm_stall_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("FRS_WBM_STALL").ok().as_deref(),
+            Some("0") | Some("false") | Some("FALSE")
+        )
+    })
 }
 
 /// FRS-RESIDENT-BYPASS toggle (`FRS_RESIDENT_BYPASS=1`, off by default), cached.

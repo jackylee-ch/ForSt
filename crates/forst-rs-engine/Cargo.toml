@@ -35,6 +35,12 @@ tracing = { workspace = true }
 # crash recovery. Already in the lockfile (transitive); promoted to a direct dep.
 crc32c = "0.6"
 
+# FRS_MEM_DIAG (2026-06-08): read jemalloc stats.{allocated,resident,retained}
+# to attribute the join-OOM engine native memory (live vs retained). Linux-only
+# to match the jemalloc global allocator gate in forst-rs-ffi.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
 [dev-dependencies]
 forst-rs-test-utils = { workspace = true }
 proptest = { workspace = true }

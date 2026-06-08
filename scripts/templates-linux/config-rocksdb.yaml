@@ -1,0 +1,64 @@
+# Backend: RocksDB | JDK 17 | local store
+# Flat keys (required: bash-java-utils.sh reads env.java.home via sed, not YAML).
+env.java.home: /usr/lib/jvm/java-17-openjdk-arm64
+env.java.opts.all: --add-exports=java.rmi/sun.rmi.registry=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED --add-exports=jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED --add-exports=java.security.jgss/sun.security.krb5=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.text=ALL-UNNAMED --add-opens=java.base/java.time=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.util.concurrent=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED --add-opens=java.base/java.util.concurrent.locks=ALL-UNNAMED
+
+jobmanager:
+  bind-host: localhost
+  rpc:
+    address: localhost
+    port: 6123
+  memory:
+    process:
+      size: 4096m
+  execution:
+    failover-strategy: region
+
+taskmanager:
+  bind-host: localhost
+  host: localhost
+  numberOfTaskSlots: 4
+  memory:
+    # 8C32G envelope: match forst-rs's JVM process.size so both engines compare
+    # within the professional 8c/32g box. RocksDB state is local-disk; its block
+    # cache lives in Flink managed memory within this budget, and the OS page cache
+    # absorbs local-SST reads with spare RAM (parity with forst-rs's on-disk cache).
+    process:
+      size: 8192m
+
+parallelism:
+  default: 4
+
+state:
+  backend:
+    type: rocksdb
+    incremental: true
+    rocksdb:
+      timer-service:
+        factory: HEAP
+  checkpoints:
+    dir: file:///tmp/nexmark-checkpoints-rocksdb
+
+execution:
+  checkpointing:
+    interval: 30 s
+    mode: EXACTLY_ONCE
+
+table:
+  exec:
+    mini-batch:
+      enabled: false
+    async-state:
+      enabled: true
+    state:
+      ttl: 1h
+
+rest:
+  port: 8081
+  bind-port: 8081
+  address: localhost
+  bind-address: localhost
+
+io:
+  tmp:
+    dirs: /tmp/flink-rocksdb-io

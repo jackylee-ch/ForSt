@@ -39,6 +39,26 @@ use super::footer::{ChecksumType, FooterV1};
 use super::schema::{sst_schema, SST_FORMAT_VERSION};
 use super::sparse_index::{encode_index, BlockStats, SparseIndexEntry};
 
+// FRS_PROF_DIAG (2026-06-08): SST-writer sub-cost attribution (gap-map Task 1, verify-before-fix).
+// Splits the flush/compaction write cost into row-buffering vs block-encode(+compress) vs sink-write
+// so the vectorization targets the real hotspot. Cumulative ns; read by the engine's FRS_MEM_DIAG.
+pub static SST_BUFFER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SST_ENCODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SST_SINKWRITE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[inline]
+fn sst_prof_add(c: &std::sync::atomic::AtomicU64, n: u64) {
+    c.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+/// Snapshot of (buffer_ns, encode_ns, sinkwrite_ns) for the FRS_MEM_DIAG line.
+pub fn sst_writer_prof_ns() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SST_BUFFER_NS.load(Relaxed),
+        SST_ENCODE_NS.load(Relaxed),
+        SST_SINKWRITE_NS.load(Relaxed),
+    )
+}
+
 /// Information about a completed SST file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SstFileInfo {
@@ -246,6 +266,7 @@ impl SstWriterImpl {
             "entries must be added in sorted key order"
         );
 
+        let _buf_t0 = std::time::Instant::now(); // FRS_PROF_DIAG: row-buffering sub-cost
         self.key_builder.append_value(key);
         match value {
             Some(v) => self.value_builder.append_value(v),
@@ -281,6 +302,7 @@ impl SstWriterImpl {
             true
         });
         self.key_hashes.push(Sbbf::hash_key(key));
+        sst_prof_add(&SST_BUFFER_NS, _buf_t0.elapsed().as_nanos() as u64);
 
         if self.current_estimated_size >= self.options.block_size {
             self.flush_block(sink)?;
@@ -518,11 +540,13 @@ impl SstWriterImpl {
         let use_kv = self
             .kv_format_override
             .unwrap_or_else(super::kv_block::sst_write_kv_format);
+        let _enc_t0 = std::time::Instant::now(); // FRS_PROF_DIAG: block encode+compress sub-cost
         let block_bytes = if use_kv {
             super::kv_block::encode_kv_data_block(&batch, self.options.compression)?
         } else {
             encode_data_block(&batch, self.options.compression)?
         };
+        sst_prof_add(&SST_ENCODE_NS, _enc_t0.elapsed().as_nanos() as u64);
         let block_offset = self.bytes_written;
         let block_size = block_bytes.len() as u32;
 
@@ -531,7 +555,9 @@ impl SstWriterImpl {
                 // Streaming mode: emit the block bytes into the WritableFile
                 // sink directly. The transient `block_bytes` Vec lives only
                 // for the duration of this call.
+                let _w_t0 = std::time::Instant::now(); // FRS_PROF_DIAG: sink-write sub-cost
                 s.out.append(&block_bytes)?;
+                sst_prof_add(&SST_SINKWRITE_NS, _w_t0.elapsed().as_nanos() as u64);
             }
             None => {
                 // No sink attached — this is the legacy `add()` + `finish()`
