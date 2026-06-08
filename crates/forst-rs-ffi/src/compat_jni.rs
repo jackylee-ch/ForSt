@@ -76,7 +76,8 @@ use std::sync::Arc;
 
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JPrimitiveArray, JString};
 use jni::sys::{
-    jboolean, jbyteArray, jint, jlong, jobjectArray, JavaVM, JNI_FALSE, JNI_TRUE, JNI_VERSION_1_8,
+    jboolean, jbyte, jbyteArray, jint, jlong, jobjectArray, JavaVM, JNI_FALSE, JNI_TRUE,
+    JNI_VERSION_1_8,
 };
 use jni::JNIEnv;
 
@@ -114,6 +115,11 @@ pub(crate) mod handles {
     pub(crate) struct DbOptionsHandle {
         pub opts: EngineOptions,
     }
+
+    /// Java `org.forstdb.Env` mirror. forst-rs owns its filesystem/runtime
+    /// internally, so this is only a lifecycle-compatible placeholder for
+    /// `DBOptions`' default Env reference.
+    pub(crate) struct EnvHandle;
 
     /// Java `org.forstdb.ColumnFamilyOptions` mirror. Wraps a [`CfOptions`]
     /// of per-CF overrides applied at `RocksDB.open` time.
@@ -268,6 +274,7 @@ pub(crate) mod handles {
     }
 
     impl_into_from_raw!(DbOptionsHandle);
+    impl_into_from_raw!(EnvHandle);
     impl_into_from_raw!(CfOptionsHandle);
     impl_into_from_raw!(WriteOptionsHandle);
     impl_into_from_raw!(ReadOptionsHandle);
@@ -289,7 +296,7 @@ pub(crate) mod handles {
 }
 
 use handles::{
-    CfHandle, CfOptionsHandle, DbOptionsHandle, ReadOptionsHandle, RocksIteratorHandle,
+    CfHandle, CfOptionsHandle, DbOptionsHandle, EnvHandle, ReadOptionsHandle, RocksIteratorHandle,
     WriteBatchEntry, WriteBatchHandle, WriteOptionsHandle,
 };
 
@@ -2016,6 +2023,147 @@ const _JNI_BOOL_REFS: (jboolean, jboolean) = (JNI_TRUE, JNI_FALSE);
 // (13), WriteOptions (3), ReadOptions (3), ColumnFamilyHandle (3), plus the
 // multi-CF `RocksDB.open__JLjava_lang_String_2_3_3B_3J_3J` overload.
 // ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Env / RocksEnv
+// ---------------------------------------------------------------------------
+
+/// `org.forstdb.Env.getDefaultEnvInternal() -> long`
+///
+/// Java signature: `()J`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Env_getDefaultEnvInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jlong {
+    jni_guard(&mut env, || 0_i64, |_env| EnvHandle.into_raw())
+}
+
+/// `org.forstdb.RocksEnv.disposeInternal(long)`
+///
+/// Java signature: `(J)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksEnv_disposeInternal<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if handle != 0 {
+                // SAFETY: handle came from `Env.getDefaultEnvInternal` and
+                // Java owns the corresponding RocksEnv lifecycle.
+                unsafe { drop(Box::from_raw(handle as *mut EnvHandle)) };
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Env.setBackgroundThreads(long, int, byte)`
+///
+/// Java signature: `(JIB)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Env_setBackgroundThreads<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+    _threads: jint,
+    _priority: jbyte,
+) {
+    jni_guard(&mut env, || (), |_env| {})
+}
+
+/// `org.forstdb.Env.getBackgroundThreads(long, byte) -> int`
+///
+/// Java signature: `(JB)I`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Env_getBackgroundThreads<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+    _priority: jbyte,
+) -> jint {
+    jni_guard(&mut env, || 0, |_env| 0)
+}
+
+/// `org.forstdb.Env.getThreadPoolQueueLen(long, byte) -> int`
+///
+/// Java signature: `(JB)I`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Env_getThreadPoolQueueLen<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+    _priority: jbyte,
+) -> jint {
+    jni_guard(&mut env, || 0, |_env| 0)
+}
+
+/// `org.forstdb.Env.incBackgroundThreadsIfNeeded(long, int, byte)`
+///
+/// Java signature: `(JIB)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Env_incBackgroundThreadsIfNeeded<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+    _threads: jint,
+    _priority: jbyte,
+) {
+    jni_guard(&mut env, || (), |_env| {})
+}
+
+/// `org.forstdb.Env.lowerThreadPoolIOPriority(long, byte)`
+///
+/// Java signature: `(JB)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Env_lowerThreadPoolIOPriority<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+    _priority: jbyte,
+) {
+    jni_guard(&mut env, || (), |_env| {})
+}
+
+/// `org.forstdb.Env.lowerThreadPoolCPUPriority(long, byte)`
+///
+/// Java signature: `(JB)V`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Env_lowerThreadPoolCPUPriority<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+    _priority: jbyte,
+) {
+    jni_guard(&mut env, || (), |_env| {})
+}
+
+/// `org.forstdb.Env.getThreadList(long) -> ThreadStatus[]`
+///
+/// Java signature: `(J)[Lorg/forstdb/ThreadStatus;`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Env_getThreadList<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    _handle: jlong,
+) -> jobjectArray {
+    jni_guard(
+        &mut env,
+        || ptr::null_mut(),
+        |env| {
+            let Ok(thread_status_class) = env.find_class("org/forstdb/ThreadStatus") else {
+                return ptr::null_mut();
+            };
+            match env.new_object_array(0, thread_status_class, JObject::null()) {
+                Ok(arr) => arr.into_raw(),
+                Err(_) => ptr::null_mut(),
+            }
+        },
+    )
+}
 
 // ---------------------------------------------------------------------------
 // DBOptions
@@ -6864,6 +7012,16 @@ mod tests {
             // JNI load path calls RocksDB.version() immediately after
             // NativeLibraryLoader resolves libforstjni.
             "Java_org_forstdb_RocksDB_version",
+            // DBOptions default constructor keeps a default Env reference.
+            "Java_org_forstdb_Env_getDefaultEnvInternal",
+            "Java_org_forstdb_Env_setBackgroundThreads",
+            "Java_org_forstdb_Env_getBackgroundThreads",
+            "Java_org_forstdb_Env_getThreadPoolQueueLen",
+            "Java_org_forstdb_Env_incBackgroundThreadsIfNeeded",
+            "Java_org_forstdb_Env_lowerThreadPoolIOPriority",
+            "Java_org_forstdb_Env_lowerThreadPoolCPUPriority",
+            "Java_org_forstdb_Env_getThreadList",
+            "Java_org_forstdb_RocksEnv_disposeInternal",
             // P0 — DBOptions class (15 entries).
             "Java_org_forstdb_DBOptions_newDBOptions",
             "Java_org_forstdb_DBOptions_disposeInternal",
