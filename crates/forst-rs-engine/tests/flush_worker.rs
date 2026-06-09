@@ -24,7 +24,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -262,24 +262,49 @@ fn test_max_write_buffer_number_backpressure() {
     let fs = SlowFs::new(Duration::from_millis(100));
     let fs_dyn: Arc<dyn FileSystem> = fs.clone();
     let db = DbImpl::open_with_fs(small_buf_options(), fs_dyn).unwrap();
-    let cf = db.default_cf();
 
     // Fire enough writes to accumulate >3 imms quickly. Each "burst" is
     // small enough to fit in one memtable; the cumulative threshold
     // forces a switch after each burst.
     let mut max_blocked = Duration::ZERO;
+
     'writes: for round in 0..6 {
         for i in 0..50 {
-            let k = format!("r{}k{:04}", round, i);
+            let k = format!("r{}k{:04}", round, i).into_bytes();
             let v = vec![b'v'; 64];
+
+            // Put from a short-lived helper thread so this test can observe
+            // that the writer has stalled, then release the artificial SlowFs
+            // delay well before the production 45s stall timeout can fire.
+            let db_for_put = db.clone();
+            let (tx, rx) = mpsc::channel();
             let start = Instant::now();
-            db.put(&cf, k.as_bytes(), &v).unwrap();
-            let elapsed = start.elapsed();
+            let handle = thread::spawn(move || {
+                let cf = db_for_put.default_cf();
+                let result = db_for_put.put(&cf, &k, &v);
+                let elapsed = start.elapsed();
+                tx.send((result, elapsed)).unwrap();
+            });
+
+            let (result, elapsed) = match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(done) => done,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    max_blocked = Duration::from_millis(50);
+                    fs.disable_delay();
+                    rx.recv().unwrap()
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("writer thread exited before reporting put result")
+                }
+            };
+            handle.join().unwrap();
+            result.unwrap();
 
             if elapsed > max_blocked {
                 max_blocked = elapsed;
             }
             if max_blocked >= Duration::from_millis(50) {
+                fs.disable_delay();
                 break 'writes;
             }
         }
