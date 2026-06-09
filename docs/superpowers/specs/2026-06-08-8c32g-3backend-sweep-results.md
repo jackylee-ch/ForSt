@@ -678,3 +678,15 @@ Verified correct + neutral-or-faster: q3 36.6s(light,exact), q8 windowed-join(co
 318.9→135.7s(2.35×,92M,0.82×RDB PASS), q12 50.6→46.5s(cache-benefiting FASTER,92M). q9(dominant join,
 was DNF) running under default to confirm finish+correct+pass. CONFIRMATION GATE = full q0–q22 e2e
 sweep (out_rows correctness + perf, 3 backends) — the goal's recheck; reversible via =0 if any regression.
+
+## ★★★ OPT-01 default REVERTED — robs cache-benefiting joins (q9) (2026-06-10)
+q9 (dominant join) under DEFAULT parallel+cache-off: DNF 79.2M@1284s = neutral-to-SLOWER vs depth-1
+~84.5M@1204s. q9 is per-probe-READ-bound and RELIES on the MapStateCache; it has no drain-tail (so no
+q11-style win) and loses its read accelerator under cache-off → ROBBED. So parallel+cache-off HELPS
+drain-tail-bound queries (q11 2.35×, q12 faster) but ROBS cache-benefiting throughput-bound joins (q9,
+likely q4/q20) → NOT "benefits all" → default-on REVERTED to OPT-IN. Default = depth-1 + cache.
+**OPT-01 final status: correctness-safe (deadlock + windowed-join fixed), opt-in; a NET win only for
+drain-tail-bound queries; NOT a universal default.** A universal default needs the cache KEPT under
+parallel (per-worker MapStateCache pinned to the key-group's worker thread, so cache-benefiting joins
+keep their accelerator AND get parallelism) — the proper multi-PR OPT-01. q9/q20 still need OPT-02
+(non-blocking FFM) / engine read-path levers, NOT the executor.
