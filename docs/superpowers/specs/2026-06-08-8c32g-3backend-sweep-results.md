@@ -669,3 +669,12 @@ under parallel-coupled next to build the default-enable case.
 - q11 (window): 135.7s (2.35× vs depth-1 318.9s), 92M EXACT, 0.82× RocksDB = PASSES.
 - q8 (windowed-join): correct band (cache-off fixes the −10% race).
 - NEXT: q12 (cache-benefiting, deterministic 92M, depth-1 50.6s) — does parallel+cache-off rob it?
+
+## ★★★ OPT-01 DEFAULT-ENABLED (2026-06-09) — parallel executor + cache-off is now the default
+Committed+pushed (flink): RoutingStateExecutor is DEFAULT (opt-out FRS_RS_PARALLEL_EXECUTOR=0);
+MapStateCache auto-bypassed under parallel (aligned predicate). Both correctness blockers fixed
+(deadlock-free sync key-group routing + cache-off-when-parallel). 528 native tests green; GHA gating.
+Verified correct + neutral-or-faster: q3 36.6s(light,exact), q8 windowed-join(correct band), q11
+318.9→135.7s(2.35×,92M,0.82×RDB PASS), q12 50.6→46.5s(cache-benefiting FASTER,92M). q9(dominant join,
+was DNF) running under default to confirm finish+correct+pass. CONFIRMATION GATE = full q0–q22 e2e
+sweep (out_rows correctness + perf, 3 backends) — the goal's recheck; reversible via =0 if any regression.
