@@ -573,3 +573,24 @@ double-buffered per-worker classifiers OR a real per-worker in-flight slot count
 (=any worker has no free buffer). This is the doc's "buffer-ownership forces depth-1" issue (flagged as
 multiple PRs in VectorizedExecutor javadoc :385-393). VERIFY: q8=3,010,888 + q5/q7 + full q0-q22 under
 default-on, before default-enabling OPT-01. Then OPT-02 + perf sweep. Default stays depth-1 (safe) until done.
+
+## key-group-affine routing ATTEMPT → DEADLOCK (2026-06-09), reverted; q19 findRow fix found
+Implemented RoutingRequestContainer (offer routes by keyGroup%N) + fullyLoaded()=busyWorkers>0.
+Compiled + 70 native tests passed, BUT q8 e2e HUNG: stalled permanently at src_out=921,085 (rate→0).
+Cause: the conservative fullyLoaded/busyWorkers gate deadlocks with the AEC mailbox + future-completion
+thread (completion that should clear busyWorkers can't be observed while the mailbox parks on
+fullyLoaded). CONFIRMS the fix needs proper double-buffered + AEC-aware completion (multi-PR), not a
+conservative gate. REVERTED (uncommitted); default stays safe depth-1.
+SEPARATE FIND: an uncommitted MapStateCache "DECAY FIX" (q19 TopN findRow O(n²)→O(1): tracks eviction
+tombstones + rehashDropTombstones at 0.75 load) is in the tree — DEFAULT-path (benefits all churn-heavy
+queries), has a test. Verifying + committing it as a q19 lever (separate from the join-family OPT-01).
+
+## ★★ q19 findRow O(n^2)->O(1) fix COMMITTED (2026-06-09) — verified benefits-all lever
+MapStateCache decay fix (tombstone tracking + rehashDropTombstones) committed (flink 92a5d7c400b).
+SAME-BOX A/B (degraded box, late session): fix-ON q19 599.7s FINISHED 92M exact vs fix-OFF >700s DNF
+=> fix is >14% faster AND turns DNF->finish; correct (out_rows=92,000,000). Default-path (depth-1
+executor uses MapStateCache too) -> benefits ALL churn-heavy queries (q19 TopN was 52% CPU in findRow
+per JFR). 34 MapStateCacheTest green. NOTE: box is degraded after a long session (fix-OFF q19 >700s
+vs the prior healthy-box 475s baseline) so q19's ABSOLUTE pass vs 0.8x (<=381s) needs a HEALTHY-box
+re-measure — the fix should bring q19 well below 475s there. This is the "second OVER-window lever"
+the doc called for. Join-family OPT-01 still needs the multi-PR key-group-affine routing fix.
