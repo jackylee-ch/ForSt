@@ -760,3 +760,13 @@ q17), so it pipelines for q11 WITHOUT adding latency for q17; (b) a LOCK-FREE pe
 the multi-PR OPT-01 (matches the doc's ForSt-coordinator design). Synchronous-block + sync-cache (this
 session's shortcuts) are insufficient. OPT-01 stays OPT-IN (net win only for drain-tail queries).
 Default = depth-1 (correct + fast for ALL). Repo safe; 3 reverts each caught a real regression.
+
+## q19 third lever = diffuse serde+engine (2026-06-10, JFR analysis)
+Pre-findRow JFR (q19-decay.jfr, Jun8): findRow 52% (34,996/66,989 on-CPU) — the hotspot the committed
+findRow O(n^2)->O(1) fix removed. The NEXT frames (the post-findRow residual): Flink serde
+(RowDataSerializer.copyRowData ~2480, copy ~2149, StringDataSerializer.copy ~2181, String.charAt ~1287)
++ engine read + MapStateCache.hashOf ~2509 + RowDataEventDeserializer. => post-findRow q19 residual is
+DIFFUSE serde + engine-read (same class as q9), NOT a single fixable hotspot. q19's third lever is
+multi-PR (engine read-path / serde-reduction), not a quick win. (Current JFR re-capture failed —
+container killed at MAXSEC before async dump flushed; needs MAXSEC>=500 to re-capture post-findRow.)
+=> ALL failing queries (q4/q9/q11/q19/q20) need multi-PR/diffuse work; none is a quick default-path win.
