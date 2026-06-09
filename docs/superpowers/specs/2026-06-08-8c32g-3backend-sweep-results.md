@@ -639,3 +639,19 @@ key->one worker->one cache = correct AND preserves cache perf — unlike blanket
 cache-benefiting queries). Implementation: make the state object's cache per-worker-thread (ThreadLocal)
 or per-VectorizedExecutor; snapshot/flush/close must drain ALL per-worker caches. This is the LAST
 blocker for OPT-01 default-on (routing logic already proven correct at N=1 = RocksDB-exact).
+
+## ★★★ OPT-01 now CORRECTNESS-SAFE (opt-in) — both blockers fixed (2026-06-09)
+Two parallel-executor correctness blockers RESOLVED + committed (opt-in; default stays depth-1):
+1. DEADLOCK (async-offload coordination) → FIXED: deadlock-free SYNCHRONOUS key-group-affine routing
+   (RoutingRequestContainer routes offer() by keyGroup%N to per-worker sub-containers; executeBatch runs
+   them in parallel + blocks + returns completed future). q8 finishes 42s (was hang).
+2. WINDOWED-JOIN UNDER-EMIT → FIXED: bypass MapStateCache when FRS_RS_PARALLEL_EXECUTOR=1 (the cache is
+   single-threaded; its ops misalign with key-group affinity under parallel). cache-OFF+parallel is the
+   PROVEN-correct config: q8 lands in the correct band (2.95–3.06M, == depth-1/N=1/RocksDB band) vs the
+   broken cache-ON parallel band (1.82–2.81M). [q8 is ~±4% nondeterministic — band, not exact, is its gate.]
+Net: OPT-01 (parallel executor) is now CORRECTNESS-SAFE when enabled (opt-in via FRS_RS_PARALLEL_EXECUTOR=1,
+which auto-bypasses the cache). Default = depth-1 + cache (correct + fast, robs nothing).
+REMAINING for DEFAULT-ENABLE: perf tradeoff — parallel forces cache-off globally, which may cost the
+cache-benefiting queries (q11/q12/q16). Needs a HEALTHY-box sweep (parallelism gain vs cache loss). The
+deeper "keep cache under parallel" fix = run cache ops on the key-group's worker thread (future). q11
+deterministic (92M) under parallel-coupled IN FLIGHT to confirm broad executor correctness.
