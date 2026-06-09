@@ -391,3 +391,18 @@ Per directive ("ALL O(1) lookup + zero-copy value finished before any nexmark"):
   — BUILD SUCCESS** (incl. `IterPrefixBatchOpenTest`, `FrsIteratorTest`, all `MapStateV2*`, `Vectorized*`).
 - e2e correctness: q11 out_rows=92,000,000 == RocksDB (exact gate).
 Levers implemented + verified; nexmark validation/enable-decision is next.
+
+## ★★ q20 ROOT CAUSE (2026-06-09, systematic-debugging Phase 1 — NOT A BUG)
+Hypotheses tested: H1 amplification / H2 unbounded-state / H3 constant-factor.
+- **H1 RULED OUT:** q20 forst-rs @40M scale FINISHED 357.6s, **out_rows=37,279,944 = src_out EXACTLY**
+  (ratio 1.000, == RocksDB's 93,201,404/~93M ≈ 1.0). No over-emission; join is byte-correct.
+- **H2 RULED OUT:** peak RSS bounded 22–24 GB (oscillates 13–15 GB, slow climb to 17.8 GB) — join
+  state lives in flushed SSTs, not RAM. No leak, no OOM.
+- **Verdict = state-size-dependent LSM-efficiency DEGRADATION** (refined H3, not flat constant):
+  forst-rs rate **104K/s @40M (0.90× RocksDB) → ~25–46K/s tail @93M (0.59×)**. Throughput falls as the
+  unbounded inner-join state grows the LSM; RocksDB's local engine stays flat enough to finish @800s.
+  Rate OSCILLATES (24→59→25K/s) = compaction cycles stealing throughput as the SST set grows.
+- **Same root-cause family as q9** (LSM per-op efficiency vs local RocksDB), amplified by q20's larger
+  growing state + 93M output. **ForSt also DNFs** → disaggregated-LSM ceiling; forst-rs already beats ForSt.
+- **Implication:** no quick fix. The lever is the read-path/compaction-scaling module (block-cache fix
+  was its first +25%). Design effort, not a patch. Two full runs DNF'd at MAXSEC 1500/1700 (91–92M/93M).
