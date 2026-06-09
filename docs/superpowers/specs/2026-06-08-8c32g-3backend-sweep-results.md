@@ -339,3 +339,25 @@ where RocksDB finishes and the others don't).
 - B: SST-write coalescing (per-block block_on → 4 MiB writes) → flush 202→20 ms/MB; q17 817→76.7s.
 - C: SIGBUS fix (.so container-local, not FUSE mount) → q18 teardown crash → clean finish.
 Tests: io 209 + storage + engine 277 green.
+
+## ★ LEVER 1 COMPLETE — vectorized zero-copy key path (2026-06-09)
+**All four per-byte FFM sites the lever-1 spec named are now eliminated:**
+- key HASH: wide-stride `JAVA_LONG` `keyHash()` (was per-byte `seg.get(JAVA_BYTE)`) — committed `8ffbc42b933`, byte-identical UT gate.
+- key COMPARE: `keysEqual` already used `MemorySegment.mismatch()` (JDK22+ vector intrinsic) — no per-byte loop.
+- key COPY: `appendKey`/`appendValue` already used `MemorySegment.copy()` intrinsic.
+- iterator chunkBuf: per-probe 64 KiB `Arena.allocate` → per-executor REUSED buffer (`process(...,reusedChunkBuf)`) — committed flink `53722e117d6`. Kills the JFR-pinned `initNativeMemory`/`checkValidStateRaw` per-probe alloc.
+- MapStateCache/ArrowBinaryBuffer key+value segments already pooled (grown rarely).
+
+**Decisive measurement (q9 8c/32g, apples trajectory at ~361s):**
+- pre-chunkBuf forst-rs q9 (bge23t5si): 36.06M @362s
+- chunkBuf-reuse forst-rs q9 (bq01jk6pb): 37.63M @361s ⇒ **+4.4% throughput**
+- RocksDB q9 (b95vxcqzq): 46.4M @401s — forst-rs ~0.85× at this scale, ~0.95× at true finish.
+
+**Verdict (per the agreed test):** the on-CPU reduction DOES translate to throughput (+4.4%), so the
+zero-copy-key direction is validated — but the gain is modest because the system is substantially
+**wait-bound** (JFR: 62,719 ThreadPark on the shared async-state mailbox vs 4,433 on-CPU). Lever 1 narrows
+the gap; closing it fully needs the WAIT to shrink (shared async-state concurrency), which is NOT a
+forst-rs-specific zero-copy lever. Proceeding to lever 2 (coalesced batched lookup) + lever 3 (zero-copy
+value views) per directive; honest expectation is each adds a similar single-digit % on the iteration path
+(the engine read is already O(1)-cheap: memtable n_shards=1, SST n_ovl=1), so q9 stays near-parity rather
+than flipping to a large win — the residual wall is the framework wait.
