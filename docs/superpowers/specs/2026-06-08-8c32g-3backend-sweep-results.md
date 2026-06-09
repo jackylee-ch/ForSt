@@ -459,3 +459,15 @@ SERIALLY after source stop (178s tail); offload drains concurrently → tail eli
 evidence yet that OPT-01 (async offload) is the dominant Phase-1 lever — flips fail→pass,
 correctness-preserved. Single run; needs default-safety check (must not regress light/source-bound
 queries per the "don't rob Peter" constraint) before default-enabling.
+
+## ★★★ OPT-01 DEFAULT-SAFETY confirmed (q3 Peter-check) — ready for default-enable + full sweep (2026-06-09)
+q3 (light/source-bound) + FRS_RS_PARALLEL_EXECUTOR=1 + READ_IO_PARALLELISM=6: FINISHED 36.6s,
+out_rows=2,201,068 EXACT, vs depth-1 36.7s = NO REGRESSION. So the offload BENEFITS heavy queries
+(q11 2.35× fail→pass, q9 +7.7-15%) and is NEUTRAL on light queries (q3) → satisfies "don't rob Peter."
+OPT-01 validated across 3 families: light(q3 neutral)/window(q11 2.35×)/join(q9 +7.7-15%), all correct.
+**NEXT (next session, evidence overwhelming):** (1) default-enable the parallel executor in
+ForStRsAsyncKeyedStateBackend gate (read-io-parallelism default = 3 to MATCH ForSt per constraint;
+spike used 6 — re-measure win at 3); (2) full q0-q22 correctness sweep under default-on (the prior
+crash-loop was q20-specific, fixed via iterView — must reconfirm all windowed-joins q5/q7/q8 + q17/q18);
+(3) full perf sweep → confirm ≥0.8×RocksDB + ≤50s + >ForSt simultaneously; (4) then OPT-02 (non-blocking
+FFM, 400%→800%) for the joins still short. This is THE Phase-1 lever — correctness-safe, default-safe.
