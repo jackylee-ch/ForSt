@@ -15,6 +15,31 @@ just an upper bound, RocksDB-style). 128 M was empirically worse (compaction-ove
 **Any forst-rs number NOT from this exact config is INVALID.** (8c/32g RocksDB ~2× slower than host
 → only 8c/32g-vs-8c/32g counts.)
 
+## ★★★ STATUS UPDATE 2026-06-09: BLOCK-CACHE BYPASS fixed — broad read-path win (join family)
+**The slow join/over-window queries (q9/q20/q19) were gated by an SST-reader block-cache bypass.**
+Profiling q20 post-flush (FRS_BULK_SAMPLE + FRS_ITER_DIAG) refuted read-amp (n_ovl stayed 1–4 at 72M),
+parallel-executor (no speedup; also a thread-safety crash — fixed), and downstream backpressure (pre-flush
+228K/s burst). Real cause: the lazy `get_or_open_sst_reader` opens readers `.with_block_cache(...)`, but
+the **5 EAGER reader-pre-populate sites — flush (db.rs:7195), 3 compaction outputs (3990/4272/5916),
+ingest (1782) — opened readers with bare `SstReaderImpl::open` (no block cache)**. Those readers are what
+the read path finds cached, so **flushed + compacted SSTs (a join's hot, repeatedly-probed working set)
+re-read + re-decompressed every data block on every probe** (B_resident=0 → every probe hit them).
+
+**FIX (engine, committed ForSt `27ae792c3`):** wire the shared decoded-block cache into all 5 sites.
+Read-path architectural, **no config change**, correctness-neutral, **280 engine unit tests pass**.
+
+| query | before (locked cfg) | **after block-cache fix** | vs RocksDB | vs ForSt | verdict |
+|-------|--------------------|---------------------------|------------|----------|---------|
+| q20 (join) | DNF 71M/93M @1300s | **DNF 88.6M/93M @1284s (+25%, ~4× post-flush)** | 800s (0.59×, FAIL) | **84M same wall → BEATS ForSt** | improved; beats ForSt; fails RocksDB bar |
+| q19 (OVER) | 542.5s | **475.3s (−12%, exact 92M)** | 305s (1.56×, FAIL) | 319s (FAIL) | improved; still fails both — needs 2nd lever |
+| q9 (join) | DNF ~43M/762s (collapsed 10K/s) | **re-run in flight (34.4M@261s, ~55K/s — healthy)** | (pending RocksDB 8c) | (pending) | much healthier; result pending |
+
+**Net:** a verified broad win (every query reading flushed/compacted SSTs benefits). q20 now beats ForSt;
+q9 no longer collapses. BUT q19/q20 still miss the RocksDB ≥0.8× bar — q20 is hard for all LSM backends
+(only RocksDB's mature engine finishes ≤800s; ForSt also DNF), q19 needs a second OVER-window lever.
+Also stabilized the flaky `test_max_write_buffer_number_backpressure` CI test (ForSt `2b313f8bb`) for the
+"every change must pass GHA" requirement.
+
 ## ★★★ STATUS UPDATE 2026-06-08 (PM): OOM SET FIXED (memory) via true backpressure — speed now the blocker
 
 **Strategic pivot (user):** learn from ForSt (the backend forst-rs replaces), not RocksDB. ForSt's
