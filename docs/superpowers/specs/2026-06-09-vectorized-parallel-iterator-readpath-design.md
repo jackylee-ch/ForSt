@@ -66,7 +66,27 @@ Rust batch_prefix_scan(prefixes[K]):
 - Both repos' GHA pipelines green.
 
 ## Phasing (each independently verifiable + committable)
-- **A. Engine** `batch_prefix_scan` (coalesced version-pin + rayon fan-out) + UTs (batch==serial).
-- **B. FFI** `frs_vectorized_batch_iter_prefix` + result-buffer/offset layout + round-trip test.
-- **C. Java** `executeIters` → one batched FFI call; per-probe result slicing → futures.
-- **D. e2e** q7/q9/q20 accuracy + perf; regression-check q16/q17/q18; record + commit.
+- **A. Engine — DONE (committed `7ae8876ed`).** `batch_prefix_scan_parallel(self: &Arc<Self>, cf,
+  prefixes: &[&[u8]]) -> Vec<Result<Vec<(k,v)>>>` fans the K probes across a new process-global read
+  pool `bg_read_pool` (`min(cores,4)`, env `FRS_RS_READ_IO_PARALLELISM`). Per-probe error isolation,
+  input order, value-carrying owned scan. 2 UTs prove byte-identical to serial `prefix_scan`
+  (memtable+SST tiers, overlapping/disjoint/empty); 282 engine UTs green. (Note: distinct from the
+  pre-existing SERIAL `batch_prefix_scan` at db.rs:6836, which the `frs_batch_prefix_scan` FFI uses.)
+- **B. FFI — TODO.** `frs_vectorized_batch_iter_prefix(db, cf, prefixes_off[n+1], prefixes_data, n,
+  out_handle*) -> i32`: calls `batch_prefix_scan_parallel`, stashes the `Vec<Result<Vec<(k,v)>>>` behind
+  an opaque handle in the FFI registry (engine-owned, like the iter handles). Companion accessors:
+  `frs_batch_iter_probe_count(h)`, `frs_batch_iter_probe_chunk(h, i, chunkBuf, cap, outRow, outBytes)`
+  (zero-copy view per probe into the engine-owned bytes, reusing the `IteratorEntryView` chunk layout),
+  `frs_batch_iter_close(h)`. Round-trip test in `forst-rs-ffi`.
+- **C. Java — TODO.** Rewrite `executeIters` (VectorizedExecutor:1358): collect all `iterRequests`
+  prefixes → ONE `frsVectorizedBatchIterPrefix` crossing → for each probe `i`, hand its chunk view to
+  the matching `ForStRsDBIterRequest.completeWithEntries` (reuse the existing zero-copy `VIEW_TL`
+  decode) → complete its `StateRequest` future, in request order. Preserve the soft-cap/continuation
+  contract per probe (bounded join windows make single-drain the common case). Add the linker binding
+  + `ForStRsLinker` MethodHandle (mirror `frsVecIterPrefixOpenBatch`).
+- **D. e2e — TODO.** Rebuild Linux `.so` + jar → q7/q9/q20 accuracy (`out_rows`/final-result ==
+  RocksDB) + perf (before/after) → regression-check q16/q17/q18 → both repos' GHA green → record in
+  `2026-06-08-8c32g-3backend-sweep-results.md`.
+
+**Status 2026-06-09:** Phase A complete + verified + pushed. B/C/D are the wiring that makes q7/q9/q20
+actually use the parallel path; they form the next implementation pass (TDD per phase, e2e at D).
