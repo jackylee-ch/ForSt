@@ -253,6 +253,40 @@ ALL read-heavy queries (joins most). Per-query before/after e2e pending: rebuild
 q20/q9/q7 (DNF baseline: q20 ~71M/93M @1300s, ~47K/s). Expected: repeated same-SST probes hit decoded
 blocks → big per-probe drop. ForSt q20 8c/32g baseline (in flight, running ~88K/s — FAST) is the target.
 
+## ★★★ DEFINITIVE ROOT CAUSE 2026-06-09 (JFR full-stack): q7/q9/q20 are WAIT-BOUND on the async-state+FFM per-record boundary — NOT the LSM
+After value-carrying drain (no help), parallel-iterator dispatch (no help), and lock-free memtable
+superversion (marginal) — each targeting the ENGINE READ and each failing to move q9 — a JFR full-stack
+profile (150s steady-state, q9) settled it. The engine read was NEVER the cost; the engine micro-diags
+were a red herring.
+- **ThreadPark 62,719 vs ExecutionSample 4,433** → the system is **WAIT-bound, not CPU-bound**. The
+  dominant non-idle park (22,840) is `TaskMailboxImpl.take()` ← `processMailsWhenDefaultActionUnavailable`
+  — the operator **parks because the async-state controller's in-flight buffer is full / waiting for
+  outstanding state results**. Throughput is gated by how fast the async-state pipeline (operator → AEC →
+  FFM downcall → engine → return → future → callback) drains, NOT by the engine.
+- **On-CPU = 100% framework, 0% engine** (no LSM/SST/memtable frame appears): per-record FFM segment
+  alloc (`SegmentFactories.initNativeMemory`+`Unsafe.checkOffset` ~9%), Arrow key hash
+  (`ArrowBinaryBuffer.hash` ~5%), Flink row serde (`RowDataSerializer.copyRowData`+`ensureMaterialized`
+  ~13%), async-future alloc (`ContextAsyncFutureImpl.makeNewFuture` ~3%).
+- **GC** moderate (young every ~3.75s); **12 bg compaction/flush threads on 8 cores** add contention.
+
+**Why RocksDB doesn't hit this:** RocksDB's backend is **SYNCHRONOUS** — direct in-operator JNI
+`state.value()`, NO async-state pipeline, NO per-record future, NO mailbox-parking-on-async, NO
+per-record Panama FFM segment alloc. forst-rs's **async-state-V2-over-Panama-FFM** pays a per-record
+pipeline round-trip + framework allocation on every probe. **ForSt uses the SAME async-state framework
+but a C++/JNI boundary + mature engine that drains requests faster** — that boundary efficiency is the
+gap. So q7/q9/q20's wall is the FFM + async-state per-record boundary, which is exactly why every
+engine-read fix (drain/parallel-iter/lock-free-memtable) couldn't move it.
+
+**Kept improvements (correctness-verified, no regression, all committed/pushed):** lock-free memtable
+superversion (ArcSwap), value-carrying drain unify, parallel-iter dispatch (flag-OFF), block-cache
+fix. Real + architecturally-correct, just not where the join wall is.
+
+**Levers (honest):** (1) per-record FFM `initNativeMemory` alloc violates the no-per-record-alloc /
+zero-copy mandate → pool/reuse native segments (~9% on-CPU + GC; MODEST since wait-bound). (2) the
+DEEP lever = async-state pipeline completion throughput (why the mailbox parks) → drain requests faster
+(executor coordination + FFM boundary efficiency) — structural, multi-session, the ForSt-parity gap.
+q7/q9/q20 cannot pass the RocksDB bar without (2).
+
 ## ★ WHAT'S LEFT (Phase-1 close)
 1. **Fair baselines:** RocksDB 8c/32g + ForSt 8c/32g for the WHOLE set ("faster than ForSt" clause
    unverified almost everywhere; have RocksDB 8c/32g only for q17/q18).
