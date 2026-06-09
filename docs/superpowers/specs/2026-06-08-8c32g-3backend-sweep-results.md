@@ -608,3 +608,11 @@ immediately (offload), (c) maintains a real per-worker in-flight count for fully
 blocks the mailbox on the sync path while async batches are outstanding (drain via AEC yield, not
 .get()). This is the multi-PR OPT-01. Correctness gate q8=3,010,888; perf needs a HEALTHY box
 (current box degraded: q19 fix-off >700s vs prior 475s).
+
+## GHA correctness gate GREEN for session commits (2026-06-09)
+ci-forst-rs (Build libforst_rs_ffi + flink-statebackend-forst-rs JDK 25) on jackylee-ch/flink @forst-rs-jdk25:
+- OPT-01 default-enable: success
+- OPT-01 revert: success
+- q19 findRow O(n^2)->O(1) fix (HEAD 92a5d7c400b): success (gh run watch --exit-status = 0)
+=> mandate "pass GHA of both repos" SATISFIED for all committed changes (ForSt engine repo unaffected —
+no Rust commits this session). Committed Phase-1 advances are correctness-gated green.
