@@ -416,3 +416,20 @@ coordination side**: flush/compaction/WBM management of a large resident working
 wait (q9's 14:1 park). SAME diffuse ceiling as q9; write-side already addressed by Module #57 (WBM
 backpressure) + #58 (vectorized SST writer) + block-cache (read). Residual = diffuse per-op efficiency,
 NOT a single un-pulled lever. ForSt also DNFs → disaggregated ceiling; forst-rs beats ForSt.
+
+## ★★★ CORRECTION (2026-06-09): q9/q20 are NOT a "diffuse ceiling" — it's depth-1 async dispatch (FIXABLE)
+The earlier "q20/q9 = diffuse LSM write+coordination ceiling, no single lever" conclusion is WRONG and
+RETRACTED. Validated against 2026-06-09-forstrs-join-performance.md + re-confirmed by code + JFR:
+- **CODE [FACT]:** `VectorizedExecutor.executeBatchRequests` runs the batch SYNCHRONOUSLY INLINE on the
+  mailbox thread and returns `CompletableFuture.completedFuture(null)` (:552); `fullyLoaded()` hard-coded
+  `false` (:1023; javadoc :385-393 admits it); in-flight depth = 1 (AsyncDispatchInFlightParallelismTest).
+  ForSt instead returns an INCOMPLETE future + offloads to coordinator + 3-thread read pool (depth 3);
+  RocksDB is synchronous (no async cost).
+- **JFR [FACT] (q9-flame2.jfr):** 65,842 ThreadPark vs 6,419 on-CPU (~10:1). 26,821 parks in
+  `MailboxProcessor.processMailsWhenDefaultActionUnavailable → TaskMailboxImpl.take()` = default action
+  SUPPRESSED (async-state backpressure). On-CPU top = Flink serde (shared) + FFM/key bucket
+  (forst-rs-specific); NO engine-read frame → reads cheap. Wait-bound, in the async-state mailbox.
+- **Why my tested levers missed it:** zero-copy/lever-2 parallelized work INSIDE the synchronous call;
+  the `RoutingStateExecutor` (incomplete-future, real fullyLoaded) is UNUSED by the dispatch path (§4.3).
+- **THE lever = OPT-01:** offload the FFM batch to a worker pool + return an incomplete future + real
+  `fullyLoaded()` → let the AEC pipeline to depth N (matches ForSt). Untested; efficacy needs impl+measure.
