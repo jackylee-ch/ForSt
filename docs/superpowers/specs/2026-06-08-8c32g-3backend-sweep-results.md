@@ -307,6 +307,19 @@ shaving. The zero-copy columnar-key levers help correctness/mandate + GC but, by
 likely also be modest on a wait-bound query. q7/q9/q20 reaching ≥0.8× RocksDB is not yet demonstrated
 achievable and may require reconsidering the async-state request-completion architecture.
 
+## ★★★ 2026-06-09 PIVOTAL: RocksDB q9 ALSO DNFs ~1300s → q9 is NEAR-PARITY, not a failure
+The whole "q7/q9/q20 severely regressed / far below 0.8× RocksDB" framing rested on comparing forst-rs
+DNF to an UNMEASURED RocksDB. **First-ever RocksDB q9 8c/32g baseline: 94.5M @1283s — RocksDB ALSO
+barely finishes / DNFs at ~1300s on this heavy join.** RocksDB is NOT fast on q9 at 8c/32g.
+Apples-to-apples at 1204s: forst-rs ~84.5M vs RocksDB ~88.7M ⇒ **forst-rs q9 ≈ 0.95× RocksDB, near
+parity** — NOT 0.59×. The "DNF = failure" read was an artifact of the missing baseline.
+**Implication:** q9 (and plausibly q7/q20 — re-check their RocksDB finish times, not just RocksDB
+q20=800s which DOES finish) may already be at/near the ≥0.8× bar once compared at true finish times.
+ACTION: run BOTH q9 (RocksDB + forst-rs) to completion (MAXSEC 1700) for clean finish-time ratios; the
+chunkBuf-reuse + accumulated fixes only need to hold near-parity, not 2×. This reframes the heavy-join
+"failure" — measure the real RocksDB finish times for q7/q9 (q20 RocksDB=800s is the genuine outlier
+where RocksDB finishes and the others don't).
+
 ## ★ WHAT'S LEFT (Phase-1 close)
 1. **Fair baselines:** RocksDB 8c/32g + ForSt 8c/32g for the WHOLE set ("faster than ForSt" clause
    unverified almost everywhere; have RocksDB 8c/32g only for q17/q18).
