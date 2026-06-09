@@ -528,3 +528,16 @@ DEFINITIVE prerequisite for OPT-01 default-on. Implementation: RoutingStateExecu
 container/batch to a worker by its records' key-group (needs the AEC container<->key-group association;
 if containers span key-groups, either batch per-key-group or split the dispatch by key-group). Then
 re-verify q5/q7/q8 exact + full q0-q22 under default-on, then OPT-02, then perf sweep.
+
+## key-group-affine routing — IMPLEMENTATION SPEC (2026-06-09, feasibility confirmed)
+Feasibility CONFIRMED by code: RecordContext<K> carries key/key-group; runtime calls
+switchContext(RecordContext) on the mailbox thread before each state request; StateRequest holds its
+RecordContext → key-group obtainable at dispatch. AEC batches SPAN key-groups (active-buffer-size).
+**FIX (next session):** in RoutingStateExecutor.executeBatchRequests, SPLIT the container's requests
+by key-group and dispatch each key-group subset to worker = keyGroup % nWorkers, then combine the
+per-worker CompletableFutures into the container future. Guarantees same key-group → same worker →
+same MapStateCache (read-your-writes) + per-key ordering. createRequestContainer's lease becomes a
+no-op placeholder (routing moves to executeBatchRequests where keys are known). VERIFY: q8 out_rows
+== 3,010,888 (depth-1) + q5/q7 + full q0-q22 under default-on, then default-enable OPT-01.
+DO NOT rush in low-context: a wrong split/route = silent correctness bug (the q8 class). This is the
+sole remaining blocker between the proven OPT-01 win (q11 2.35x) and the join-family Phase-1 pass.
