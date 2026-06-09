@@ -106,6 +106,27 @@ Rust batch_prefix_scan(prefixes[K]):
   (`out_rows`/final-result == RocksDB) + perf (before/after) → regression-check q3/q11/q12/q15/q16/q17/q18
   → both repos' GHA green → record in `2026-06-08-8c32g-3backend-sweep-results.md`.
 
+## ⚠️ RESULT 2026-06-09 (e2e, flag actually ON): parallel path FIRES but COLLAPSES at scale — net loss
+**FIRST: the real bug was the env passthrough.** `FRS_RS_PARALLEL_ITER`/`FRS_ITER_DISPATCH_DIAG` were
+NOT in run-8c32g.sh's docker `-e` list → every prior "flag-ON" run silently ran SERIAL (fixed, ForSt
+`8121ec393`). With the flag truly on, the diagnostic confirms the path fires: q9 fresh%=99 (30.8M fresh
+vs 8123 continuations), 3.03M parallel dispatches, K≈8/batch — and **pre-flush throughput is ~3×**
+(serial ~40K/s → ~110-140K/s).
+**BUT at scale it COLLAPSES:** q9 full run 141K/s (pre-flush) → progressively down to ~5-14K/s, ending
+**~60-64M/93M DNF@1300s — WORSE than serial's 76M.** Read-pool size is NOT the lever (read=4→64M,
+read=2→60M, ~same) → NOT compaction starvation.
+**ROOT CAUSE (my own design flaw): `batch_prefix_scan_parallel` MATERIALIZES** each probe into owned
+`Vec<(Vec,Vec)>` → wraps `IterKey/Value::Vec` → `fill_chunk` COPIES into the chunk buffer. That's a
+per-entry heap alloc + copy that the SERIAL path AVOIDS (it streams views zero-copy via `VIEW_TL`). At
+30M+ probes×entries the allocation churn dominates → collapse. **This VIOLATES the zero-copy mandate.**
+Confirmed by: collapse is read-size-invariant, fast pre-flush (cheap memtable reads) / slow post-flush
+(SST reads + materialization).
+**DECISION: flag stays OFF (default) — no regression to the passing set. The path is NOT a net win
+as built.** REDESIGN needed: parallelize only the BUILD (the `sstloop` cost = overlapping-SST locate +
+reader open, ~5-18µs/probe per DECAY_ATTR) by returning K OPENED lazy `Send` iterators from the engine,
+and keep the DRAIN zero-copy/streaming (no owned-Vec materialization). i.e. a parallel-open + serial-
+zero-copy-drain, not parallel-full-drain. That's the next pass.
+
 **Status 2026-06-09:** Phases A (engine `batch_prefix_scan_parallel`) + B (FFI
 `frs_vec_iter_prefix_open_batch_parallel`) COMPLETE — both verified byte-identical to serial, committed,
 pushed; the parallel infrastructure is built. C+D (the Java wiring + e2e) is the remaining atomic pass
