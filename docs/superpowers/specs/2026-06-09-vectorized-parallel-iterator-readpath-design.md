@@ -72,21 +72,34 @@ Rust batch_prefix_scan(prefixes[K]):
   input order, value-carrying owned scan. 2 UTs prove byte-identical to serial `prefix_scan`
   (memtable+SST tiers, overlapping/disjoint/empty); 282 engine UTs green. (Note: distinct from the
   pre-existing SERIAL `batch_prefix_scan` at db.rs:6836, which the `frs_batch_prefix_scan` FFI uses.)
-- **B. FFI — TODO.** `frs_vectorized_batch_iter_prefix(db, cf, prefixes_off[n+1], prefixes_data, n,
-  out_handle*) -> i32`: calls `batch_prefix_scan_parallel`, stashes the `Vec<Result<Vec<(k,v)>>>` behind
-  an opaque handle in the FFI registry (engine-owned, like the iter handles). Companion accessors:
-  `frs_batch_iter_probe_count(h)`, `frs_batch_iter_probe_chunk(h, i, chunkBuf, cap, outRow, outBytes)`
-  (zero-copy view per probe into the engine-owned bytes, reusing the `IteratorEntryView` chunk layout),
-  `frs_batch_iter_close(h)`. Round-trip test in `forst-rs-ffi`.
-- **C. Java — TODO.** Rewrite `executeIters` (VectorizedExecutor:1358): collect all `iterRequests`
-  prefixes → ONE `frsVectorizedBatchIterPrefix` crossing → for each probe `i`, hand its chunk view to
-  the matching `ForStRsDBIterRequest.completeWithEntries` (reuse the existing zero-copy `VIEW_TL`
-  decode) → complete its `StateRequest` future, in request order. Preserve the soft-cap/continuation
-  contract per probe (bounded join windows make single-drain the common case). Add the linker binding
-  + `ForStRsLinker` MethodHandle (mirror `frsVecIterPrefixOpenBatch`).
-- **D. e2e — TODO.** Rebuild Linux `.so` + jar → q7/q9/q20 accuracy (`out_rows`/final-result ==
-  RocksDB) + perf (before/after) → regression-check q16/q17/q18 → both repos' GHA green → record in
-  `2026-06-08-8c32g-3backend-sweep-results.md`.
+- **B. FFI — DONE (committed `1f4c5cdc2`).** Chose the SIMPLER design that reuses the existing
+  handle/chunk ABI + Java drain machinery rather than a new handle+accessor transport:
+  `frs_vec_iter_prefix_open_batch_parallel` — identical ABI to the serial `frs_vec_iter_prefix_open_batch`
+  (K prefixes SoA → K handles + K first chunks, drained via the existing `frs_vec_iter_prefix_next`/
+  `_close`), but builds+drains the K probes via `batch_prefix_scan_parallel`. Invalid descriptors
+  validated serially + skipped without scanning; heavy build/drain parallel, unsafe pointer writes
+  serial; owned results wrapped as `IterHandle` (`IterKey/Value::Vec`). Round-trip UT proves
+  byte-identical to the serial batch open (memtable+SST, 4×3 rows, unique handles); 99 FFI tests pass.
+- **C. Java — TODO (atomic with D + .so/jar).** (1) Bind `frs_vec_iter_prefix_open_batch_parallel` in
+  `ForStRsLinker` (mirror `frsVecIterPrefixOpenBatch` — field + `bind()` + invoke wrapper). (2) Route the
+  join's iterator probes through the batched-parallel open. Two options, decide by decode-compatibility:
+  (a) make `dispatchIterPrefix` call the parallel binding (one-line) AND re-classify the join's MapState
+  iteration to `IterPrefixRequest` (VectorizedClassifier:653→445) — IF `IterPrefixRequest`'s decode is
+  value-carrying + matches `ForStRsDBIterRequest.completeWithEntries`/`VIEW_TL`; or (b) rewrite
+  `executeIters` (VectorizedExecutor:1358) to batch-open all `iterRequests` prefixes via the parallel
+  binding, then drive each `ForStRsDBIterRequest`'s drain from its handle + first chunk (needs a
+  `processFromBatchedHandle` variant that decodes the pre-drained first chunk then continues via `_next`).
+  **HIGH BLAST RADIUS:** `executeIters` serves ALL MapState iteration (q3/q11/q12/q15/q16/q19 + joins) —
+  any bug regresses many queries, so this MUST be done with full e2e correctness verification, and the
+  linker `bind()` MUST ship atomically with a freshly-built `.so` (a jar bound to a missing symbol throws
+  at class-load → breaks every query).
+- **D. e2e — TODO (with C).** Rebuild Linux `.so` (has A+B symbols) + jar → q7/q9/q20 accuracy
+  (`out_rows`/final-result == RocksDB) + perf (before/after) → regression-check q3/q11/q12/q15/q16/q17/q18
+  → both repos' GHA green → record in `2026-06-08-8c32g-3backend-sweep-results.md`.
 
-**Status 2026-06-09:** Phase A complete + verified + pushed. B/C/D are the wiring that makes q7/q9/q20
-actually use the parallel path; they form the next implementation pass (TDD per phase, e2e at D).
+**Status 2026-06-09:** Phases A (engine `batch_prefix_scan_parallel`) + B (FFI
+`frs_vec_iter_prefix_open_batch_parallel`) COMPLETE — both verified byte-identical to serial, committed,
+pushed; the parallel infrastructure is built. C+D (the Java wiring + e2e) is the remaining atomic pass
+that makes q7/q9/q20 actually use it — deferred because `executeIters` is high-blast-radius and the
+linker binding must ship with the `.so`+jar+e2e together (correctness is non-negotiable). The clean A+B
+checkpoint carries ZERO deployment risk (engine/FFI only, no jar/binding changes).
