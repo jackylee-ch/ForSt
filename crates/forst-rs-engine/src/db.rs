@@ -6056,6 +6056,75 @@ impl DbImpl {
         self.prefix_scan_iter(cf, prefix)?.collect()
     }
 
+    /// Parallel batched prefix scan — the coalesce+parallel join read path (q7/q9/q20).
+    ///
+    /// The async-state executor batches K iterator probes (one per record) that the legacy
+    /// path runs SERIALLY (one FFI crossing + one `build_lazy_prefix_key_stream` each). The K
+    /// probes are INDEPENDENT, read-only reads, so this fans them across the process-global
+    /// [`bg_read_pool`] — overlapping the per-probe LSM build+drain across cores (ForSt's
+    /// read-io-parallelism model). Results are returned in INPUT ORDER, one `Result` per
+    /// prefix (a probe failure is isolated to its own slot, never aborting the batch).
+    ///
+    /// Each probe uses the SAME value-carrying owned scan as the serial [`Self::prefix_scan`],
+    /// so the output is byte-identical to calling `prefix_scan` once per prefix — the
+    /// correctness gate (`batch_prefix_scan_parallel(ps)[i] == prefix_scan(ps[i])`).
+    pub fn batch_prefix_scan_parallel(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefixes: &[&[u8]],
+    ) -> Vec<ForstResult<Vec<(Vec<u8>, Vec<u8>)>>> {
+        let k = prefixes.len();
+        if k == 0 {
+            return Vec::new();
+        }
+        // Single probe: run inline — fan-out + channel overhead would only cost.
+        if k == 1 {
+            return vec![self
+                .prefix_scan_iter_owned(cf, prefixes[0])
+                .and_then(|it| it.collect())];
+        }
+        let pool = bg_read_pool();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, p) in prefixes.iter().enumerate() {
+            let me = Arc::clone(self);
+            let cf = cf.clone();
+            // Own the prefix bytes so the job is 'static. The prefix is a small composite
+            // state key; this is the only copy on the batch path (the value-carrying scan
+            // itself stays zero-copy through the engine tiers).
+            let prefix = p.to_vec();
+            let tx = tx.clone();
+            pool.submit(Box::new(move || {
+                let r = me
+                    .prefix_scan_iter_owned(&cf, &prefix)
+                    .and_then(|it| it.collect::<ForstResult<Vec<_>>>());
+                // The receiver drains exactly K results below, so send never fails.
+                let _ = tx.send((i, r));
+            }));
+        }
+        drop(tx); // only worker clones remain; rx ends once all K have reported.
+        let mut out: Vec<Option<ForstResult<Vec<(Vec<u8>, Vec<u8>)>>>> =
+            (0..k).map(|_| None).collect();
+        let mut filled = 0usize;
+        while filled < k {
+            match rx.recv() {
+                Ok((i, r)) => {
+                    out[i] = Some(r);
+                    filled += 1;
+                }
+                Err(_) => break, // all senders dropped (a worker panicked) — fill the rest with errors
+            }
+        }
+        out.into_iter()
+            .map(|o| {
+                o.unwrap_or_else(|| {
+                    Err(ForstError::internal(
+                        "batch_prefix_scan: a read-pool worker dropped its probe result",
+                    ))
+                })
+            })
+            .collect()
+    }
+
     /// Streaming form of [`Self::prefix_scan`].
     ///
     /// PR-B5-H2 / C8-H1: lazy k-way merge across ALL three LSM tiers
@@ -9656,6 +9725,24 @@ fn bg_flush_pool() -> &'static crate::bg_pool::WorkerPool {
     })
 }
 
+/// Process-global READ pool for parallel batched prefix scans — the join read-path
+/// lever for q7/q9/q20. The K probes in an async-state batch are INDEPENDENT reads on
+/// a pinned, immutable version snapshot, so fanning them across this pool overlaps the
+/// per-probe LSM build+drain across cores (mirrors ForSt's read-io-parallelism). The
+/// engine's read structures are already concurrency-safe — `sst_readers` is an `ArcSwap`
+/// (lock-free), the block cache is sharded, and each probe pins its own consistent
+/// snapshot — so no shared per-probe mutable state is touched across workers (unlike the
+/// Java RoutingStateExecutor, whose shared per-subtask decode buffers raced). Default
+/// `min(cores,4)`; override `FRS_RS_READ_IO_PARALLELISM`.
+fn bg_read_pool() -> &'static crate::bg_pool::WorkerPool {
+    use std::sync::OnceLock;
+    static P: OnceLock<crate::bg_pool::WorkerPool> = OnceLock::new();
+    P.get_or_init(|| {
+        let n = bg_pool_threads("FRS_RS_READ_IO_PARALLELISM", |c| c.min(4).max(1));
+        crate::bg_pool::WorkerPool::new(n, "forst-rs-read")
+    })
+}
+
 /// Process-global COMPACTION pool (RocksDB's LOW Env pool analogue). Bounded
 /// worker count — THE q4 decay fix: total background compaction CPU is capped
 /// regardless of how many keyed-state DbImpl instances exist, so compaction
@@ -12325,6 +12412,78 @@ mod tests {
         let mut out2: Vec<(Vec<u8>, Vec<u8>)> = iter2.collect::<ForstResult<Vec<_>>>().unwrap();
         out2.sort_by(|l, r| l.0.cmp(&r.0));
         assert_eq!(out2.len(), 3);
+    }
+
+    /// CORRECTNESS GATE for the parallel join read path (q7/q9/q20):
+    /// `batch_prefix_scan_parallel` must return, for every prefix, byte-identical
+    /// entries to the serial `prefix_scan` — across memtable + flushed-SST tiers,
+    /// for overlapping/disjoint/empty prefixes, in input order, with per-probe
+    /// error isolation. This is the gate that lets the FFI + Java executeIters
+    /// route the join's K probes through the fan-out pool instead of serially.
+    #[test]
+    fn batch_prefix_scan_parallel_matches_serial() {
+        let db = open();
+        let cf = db.default_cf();
+
+        // Seed several prefixes with enough keys to exercise multi-row probes.
+        // "user:" + "order:" are flushed to an SST; "item:" stays in the memtable;
+        // "user:" gets MORE rows after flush so a probe must merge SST + memtable.
+        for i in 0..20u32 {
+            db.put(&cf, format!("user:{i:03}").as_bytes(), format!("U{i}").as_bytes())
+                .unwrap();
+            db.put(&cf, format!("order:{i:03}").as_bytes(), format!("O{i}").as_bytes())
+                .unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flush produced sst");
+        for i in 20..30u32 {
+            db.put(&cf, format!("user:{i:03}").as_bytes(), format!("U{i}").as_bytes())
+                .unwrap();
+        }
+        for i in 0..15u32 {
+            db.put(&cf, format!("item:{i:03}").as_bytes(), format!("I{i}").as_bytes())
+                .unwrap();
+        }
+
+        // Probe set: overlapping/disjoint/empty (no-match) prefixes. >1 → fan-out path.
+        let prefixes: &[&[u8]] = &[b"user:", b"order:", b"item:", b"missing:", b"user:0"];
+
+        let parallel = db.batch_prefix_scan_parallel(&cf, prefixes);
+        assert_eq!(parallel.len(), prefixes.len());
+
+        for (i, p) in prefixes.iter().enumerate() {
+            let mut serial = db.prefix_scan(&cf, p).expect("serial prefix_scan");
+            serial.sort_by(|l, r| l.0.cmp(&r.0));
+            let mut par = parallel[i]
+                .as_ref()
+                .unwrap_or_else(|e| panic!("probe {i} ({p:?}) errored: {e:?}"))
+                .clone();
+            par.sort_by(|l, r| l.0.cmp(&r.0));
+            assert_eq!(
+                par, serial,
+                "batch_prefix_scan_parallel probe {i} ({p:?}) must equal serial prefix_scan",
+            );
+        }
+
+        // Sanity on the data shape so a silently-empty pass can't mask a regression.
+        assert_eq!(parallel[0].as_ref().unwrap().len(), 30, "user: = 20 pre + 10 post-flush");
+        assert_eq!(parallel[1].as_ref().unwrap().len(), 20, "order:");
+        assert_eq!(parallel[2].as_ref().unwrap().len(), 15, "item:");
+        assert!(parallel[3].as_ref().unwrap().is_empty(), "missing: = no match");
+    }
+
+    /// `batch_prefix_scan_parallel` on the single-probe and empty-batch fast paths.
+    #[test]
+    fn batch_prefix_scan_parallel_edge_counts() {
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k:1", b"v1").unwrap();
+        db.put(&cf, b"k:2", b"v2").unwrap();
+
+        assert!(db.batch_prefix_scan_parallel(&cf, &[]).is_empty());
+
+        let one = db.batch_prefix_scan_parallel(&cf, &[b"k:"]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].as_ref().unwrap().len(), 2);
     }
 
     /// FRS-WAL Phase 2: with the WAL enabled, every point write is appended +
