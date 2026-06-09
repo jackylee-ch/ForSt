@@ -1166,6 +1166,12 @@ impl FileSystem for OpendalFileSystem {
 
     fn open_random_access_file(&self, path: &Path) -> ForstResult<Box<dyn RandomAccessFile>> {
         let p = path_str(path, "open_random_access_file")?;
+        // A previous buffered write to this object may have returned from
+        // sync/close after spawning the async upload but before the object is
+        // visible to stat/read. Wait here so callers that observe an SST in the
+        // version never race a not-yet-published object and get a transient
+        // NotFound.
+        self.await_upload(path)?;
         let meta = self
             .block_on(self.op.stat(p))
             .map_err(|e| map_opendal_err(e, &format!("open_random_access_file stat: {p}")))?;
@@ -2220,6 +2226,30 @@ mod tests {
 
         // await_upload is idempotent: a second call (no pending entry) is Ok.
         fs.await_upload(path).expect("await_upload idempotent");
+    }
+
+    /// Opening a just-closed buffered object must wait for its pending async
+    /// upload. Engine compaction/read paths do not call `await_upload`
+    /// separately before opening newly version-visible SSTs.
+    #[test]
+    fn test_random_access_open_waits_for_pending_upload() {
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+        let path = Path::new("sst/000008.sst");
+        let payload: Vec<u8> = (0..2_000_000u32).map(|i| (i % 239) as u8).collect();
+
+        let mut w = fs
+            .open_writable_file(path, WriteMode::CreateOrTruncate)
+            .expect("open writable");
+        w.append(&payload).expect("append");
+        w.sync().expect("sync");
+        drop(w);
+
+        let rar = fs.open_random_access_file(path).expect("open random");
+        assert_eq!(rar.file_size().unwrap(), payload.len() as u64);
+        let mut got = vec![0u8; payload.len()];
+        let n = rar.read_at(0, &mut got).expect("read_at");
+        got.truncate(n);
+        assert_eq!(got, payload);
     }
 
     /// `await_all_uploads` must drain every in-flight upload across multiple
