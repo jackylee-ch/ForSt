@@ -361,3 +361,10 @@ forst-rs-specific zero-copy lever. Proceeding to lever 2 (coalesced batched look
 value views) per directive; honest expectation is each adds a similar single-digit % on the iteration path
 (the engine read is already O(1)-cheap: memtable n_shards=1, SST n_ovl=1), so q9 stays near-parity rather
 than flipping to a large win — the residual wall is the framework wait.
+
+### Zero-snapshot drain — correctness GATE PASSED (2026-06-09)
+q11 8c/32g (locked cfg, zero-snapshot decode jar): **FINISHED 318.9s, out_rows=92,000,000 == RocksDB
+reference (exact).** q11 is an append/dedup query → out_rows is a clean exact gate. The in-place
+per-chunk decode (no per-chunk `arena.allocate(bytesUsed)` snapshot, no view-accumulation list) is
+byte-correct over a full 92M-event MapState-iteration workload. Lever 1 is COMPLETE + CORRECT.
+Next: q9 zero-snapshot before/after trajectory, then lever 2 (coalesced batched lookup).
