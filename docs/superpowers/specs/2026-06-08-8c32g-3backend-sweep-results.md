@@ -770,3 +770,13 @@ DIFFUSE serde + engine-read (same class as q9), NOT a single fixable hotspot. q1
 multi-PR (engine read-path / serde-reduction), not a quick win. (Current JFR re-capture failed —
 container killed at MAXSEC before async dump flushed; needs MAXSEC>=500 to re-capture post-findRow.)
 => ALL failing queries (q4/q9/q11/q19/q20) need multi-PR/diffuse work; none is a quick default-path win.
+
+## CORRECTION (2026-06-10): first "full sweep" ran a STALE PARALLEL jar — invalid; HEAD is safe
+The post-revert `run-8c32g.sh jar` was a stale incremental build (didn't pick up the git-revert), so
+the first q0-q22 sweep ran a PARALLEL+cache-on-unsync jar (q8=1,938,439 broken cache-race, q11=134.7s
+parallel) — INVALID for the committed depth-1 default. CLEAN rebuild (`mvn clean package`) + redeploy;
+q8 depth-1 verify = 3,064,445 ≈ RocksDB 3,064,457 → COMMITTED DEFAULT IS SAFE (depth-1, correct).
+SIGNAL from the (invalid-cache) parallel sweep: parallel makes q7 FINISH (1052s) and q20 FINISH EXACT
+(1610s = 93,201,404 == RocksDB) — both DNF at depth-1. So OPT-01 (parallel) helps the heaviest joins
+FINISH (q9 still DNF even parallel @1700s). With the cache correct under parallel (the multi-PR fix),
+q7/q20 would finish correctly + parallel. Relaunching the VALID sweep on the clean committed jar.
