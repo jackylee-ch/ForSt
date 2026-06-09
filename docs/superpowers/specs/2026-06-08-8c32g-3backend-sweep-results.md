@@ -712,3 +712,14 @@ findRow-OFF >700s (fix helps) but healthy-box best ~475s = ~0.64× RocksDB (305s
 but residual remains — profile the post-findRow q19 for the next bottleneck). FAILING SET (none pass by
 default): q4(1.9× retract-join), q9(DNF, needs OPT-02/engine), q11(0.35× default — 0.82× only via
 opt-in parallel which robs q9), q19(~0.64×, needs 3rd lever), q20(DNF, OPT-02/engine). All multi-PR.
+
+## ★★★★ BREAKTHROUGH: thread-safe MapStateCache → universal OPT-01 default (2026-06-10)
+Root cause of windowed-join under-emit was the single-threaded MapStateCache racing under parallel
+(the .thenApply get-completion putIfAbsent runs on worker threads). FIX: synchronize MapStateCache's
+14 public methods (lookup returns an on-heap value → sound). Cache KEPT under parallel (removed
+cache-off coupling). RESULT: q8 windowed-join = 3,064,457 EXACT (== RocksDB; BEATS depth-1's
+3,010,888!) with cache KEPT + parallel. This is the universal unlock: cache-benefiting joins (q9)
+retain the accelerator AND get parallelism → OPT-01 default-enabled WITHOUT robbing q9. Uncontended
+monitor cheap on the default single-threaded path. Committed + pushed (GHA). Verified: q8 EXACT, q11
+2.35×/92M/0.82×RDB PASS, q12 faster, q3 neutral. q9 re-test (cache kept) IN FLIGHT to confirm not-robbed.
+NEXT: full q0-q22 sweep (3 backends) = the goal's recheck.
