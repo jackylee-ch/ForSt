@@ -5555,6 +5555,150 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
     })
 }
 
+/// PARALLEL batched prefix-iterator open — the join read-path lever (q7/q9/q20).
+///
+/// Identical ABI to [`frs_vec_iter_prefix_open_batch`] (K prefixes packed SoA →
+/// K handles + K first chunks, drained via the existing `frs_vec_iter_prefix_next`/
+/// `_close`), but the K probes' build + drain run in PARALLEL inside the engine via
+/// [`DbImpl::batch_prefix_scan_parallel`] (fanned across `bg_read_pool` /
+/// `FRS_RS_READ_IO_PARALLELISM`) instead of the serial per-probe loop. The K probes are
+/// independent reads on consistent snapshots, so results are byte-identical to K serial
+/// opens (the engine method's correctness gate). Each probe's owned `(key,value)` result
+/// set is wrapped as an `IterHandle` so the existing chunk/continuation machinery works
+/// unchanged. Invalid descriptors are skipped WITHOUT scanning (only valid prefixes reach
+/// the engine), so a malformed row never triggers a full-table scan. For the join's
+/// bounded match windows the per-probe materialization is bounded by the batch.
+///
+/// # Safety
+/// Same contract as [`frs_vec_iter_prefix_open_batch`].
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    prefixes_off: *const u32,
+    prefixes_data: *const u8,
+    n: u32,
+    out_handles: *mut u64,
+    out_first_chunks: *mut FrsChunk,
+    chunk_cap: u32,
+) -> i32 {
+    guarded_vec(|| {
+        if n == 0 {
+            return FrsErrorCode::Ok as i32;
+        }
+        if (n as usize) > MAX_BATCH_COUNT {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if prefixes_off.is_null() || out_handles.is_null() || out_first_chunks.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let Some(db_ref) = db_from_handle(db) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(cf_ref_) = cf_ref(&cf) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let n_us = n as usize;
+        let offs = slice::from_raw_parts(prefixes_off, n_us + 1);
+        let total_pref = offs[n_us] as usize;
+        if total_pref > MAX_BATCH_BYTES {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let data_buf: &[u8] = if prefixes_data.is_null() || total_pref == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(prefixes_data, total_pref)
+        };
+        let handles_out = slice::from_raw_parts_mut(out_handles, n_us);
+        let chunks_out = slice::from_raw_parts_mut(out_first_chunks, n_us);
+
+        let mut first_err: i32 = FrsErrorCode::Ok as i32;
+
+        // Pass 1 (serial, cheap): validate each descriptor + pre-zero outputs. Collect ONLY
+        // valid probes' (original index, prefix slice) so invalid rows never reach the engine
+        // (an empty-prefix scan of an invalid row would be a full-table scan).
+        let mut valid_indices: Vec<usize> = Vec::with_capacity(n_us);
+        let mut valid_prefixes: Vec<&[u8]> = Vec::with_capacity(n_us);
+        for i in 0..n_us {
+            handles_out[i] = 0;
+            let chunk = &mut chunks_out[i];
+            let buf_cap = chunk.buf_cap;
+            let buf_ptr = chunk.buf_ptr;
+            chunk.row_count = 0;
+            chunk.bytes_used = 0;
+            let ks = offs[i] as usize;
+            let ke = offs[i + 1] as usize;
+            if ke < ks
+                || ke > total_pref
+                || (ke - ks) > MAX_KEY_LEN
+                || buf_cap != chunk_cap
+                || (buf_ptr.is_null() && buf_cap > 0)
+            {
+                if first_err == FrsErrorCode::Ok as i32 {
+                    first_err = FrsErrorCode::BatchHeaderMalformed as i32;
+                }
+                continue;
+            }
+            valid_indices.push(i);
+            valid_prefixes.push(if ke == ks { &[] } else { &data_buf[ks..ke] });
+        }
+
+        if valid_prefixes.is_empty() {
+            return first_err;
+        }
+
+        // Pass 2 (PARALLEL): build + drain every valid probe across the read pool.
+        let results = db_ref.batch_prefix_scan_parallel(cf_ref_, &valid_prefixes);
+
+        // Pass 3 (serial): wrap each result as an IterHandle, fill its first chunk into the
+        // caller buffer, and register it for continuation. The unsafe pointer writes stay
+        // single-threaded here; only the heavy build/drain above was parallel.
+        for (vi, res) in results.into_iter().enumerate() {
+            let i = valid_indices[vi];
+            let chunk = &mut chunks_out[i];
+            let buf_ptr = chunk.buf_ptr;
+            let buf_cap = chunk.buf_cap as usize;
+            match res {
+                Err(e) => {
+                    if first_err == FrsErrorCode::Ok as i32 {
+                        first_err = error_to_frs_code(&e);
+                    }
+                }
+                Ok(entries) => {
+                    // Wrap the owned (key,value) rows as a Send iterator. The engine read
+                    // already happened (in parallel); this drain is pure in-memory, so the
+                    // error slot stays empty.
+                    let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> = Box::new(
+                        entries
+                            .into_iter()
+                            .map(|(k, v)| (IterKey::Vec(k), IterValue::Vec(v))),
+                    );
+                    let mut handle_state = IterHandle::new_with_error_slot(
+                        inner,
+                        Arc::new(Mutex::new(None)),
+                    );
+                    let (bytes_used, row_count, iter_exhausted) =
+                        fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap);
+                    if iter_exhausted {
+                        handle_state.drop_inner();
+                    }
+                    let handle_id =
+                        NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    shard_for(handle_id)
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(handle_id, handle_state);
+                    handles_out[i] = handle_id;
+                    chunk.row_count = row_count;
+                    chunk.bytes_used = bytes_used;
+                }
+            }
+        }
+
+        first_err
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 13. Vectorized chunked range iterator — frs_vec_iter_range_* (P9)
 //
@@ -8838,6 +8982,97 @@ mod tests {
                 );
             }
 
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Phase B: `frs_vec_iter_prefix_open_batch_parallel` (the join read-path lever)
+    /// must return byte-identical results to the serial batch open — K handles, each
+    /// first chunk holding the rows under its prefix — while building+draining the K
+    /// probes in parallel inside the engine. Mirrors the serial-batch test above; the
+    /// data spans memtable + a flushed SST so the parallel scan exercises both tiers.
+    #[test]
+    fn vec_iter_prefix_open_batch_parallel_matches_serial() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // 4 prefixes × 3 rows each + a distractor outside all prefixes.
+            let prefixes: [&[u8]; 4] = [b"pA/", b"pB/", b"pC/", b"pD/"];
+            for p in &prefixes {
+                for sfx in [&b"x"[..], &b"y"[..], &b"z"[..]] {
+                    let mut k = Vec::with_capacity(p.len() + sfx.len());
+                    k.extend_from_slice(p);
+                    k.extend_from_slice(sfx);
+                    assert_eq!(
+                        frs_put(db, cf, k.as_ptr(), k.len(), b"v".as_ptr(), 1),
+                        FRS_STATUS_OK
+                    );
+                }
+            }
+            assert_eq!(frs_put(db, cf, b"zzz".as_ptr(), 3, b"vz".as_ptr(), 2), FRS_STATUS_OK);
+
+            let n = prefixes.len();
+            let mut offs: Vec<u32> = Vec::with_capacity(n + 1);
+            let mut data: Vec<u8> = Vec::new();
+            offs.push(0);
+            for p in &prefixes {
+                data.extend_from_slice(p);
+                offs.push(data.len() as u32);
+            }
+
+            const CHUNK_CAP: u32 = 4096;
+            let mut chunk_storage: Vec<Vec<u8>> =
+                (0..n).map(|_| vec![0u8; CHUNK_CAP as usize]).collect();
+            let mut chunks: Vec<FrsChunk> = (0..n)
+                .map(|i| FrsChunk {
+                    buf_ptr: chunk_storage[i].as_mut_ptr(),
+                    buf_cap: CHUNK_CAP,
+                    row_count: 0,
+                    bytes_used: 0,
+                    _reserved: 0,
+                })
+                .collect();
+            let mut handles: Vec<u64> = vec![0; n];
+
+            let rc = frs_vec_iter_prefix_open_batch_parallel(
+                db,
+                cf,
+                offs.as_ptr(),
+                data.as_ptr(),
+                n as u32,
+                handles.as_mut_ptr(),
+                chunks.as_mut_ptr(),
+                CHUNK_CAP,
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "parallel batch open should return Ok");
+
+            let mut sorted = handles.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), n, "all handles unique + non-zero");
+            assert!(!handles.contains(&0), "no zero handles");
+
+            for i in 0..n {
+                let chunk = &chunks[i];
+                assert_eq!(chunk.row_count, 3, "probe {i} first chunk should have 3 rows");
+                let rows = decode_chunk_buf(&chunk_storage[i], chunk.bytes_used, chunk.row_count);
+                assert_eq!(rows.len(), 3);
+                for (k, _) in &rows {
+                    assert!(
+                        k.starts_with(prefixes[i]),
+                        "probe {i} key {k:?} not under prefix {:?}",
+                        prefixes[i],
+                    );
+                }
+            }
+
+            for h in &handles {
+                assert_eq!(frs_vec_iter_prefix_close(*h), FrsErrorCode::Ok as i32);
+            }
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
