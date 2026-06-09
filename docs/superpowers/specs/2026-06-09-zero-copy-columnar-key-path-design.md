@@ -20,6 +20,16 @@ per-record key/FFM bucket — **~20% of on-CPU (≈900/4433 samples)** — that 
 | `MemorySegment.equalTo` (key equality) | 63 |
 | `ForStRsMapStateV2.serializeMapEntryKeyShared` (key serde) | 59 |
 
+**Refinement (code-confirmed 2026-06-09):** `MapStateCache` + `ArrowBinaryBuffer` ALREADY pool/reuse
+their segments (grown rarely), so the ~20% is NOT one per-record alloc site — it is three diffuse
+**Panama-FFM** costs: (a) `initNativeMemory` ~5% (occasional buffer grows), (b) **per-access FFM safety
+checks** (`Unsafe.checkOffset` + `MemorySessionImpl.checkValidStateRaw`) ~5.5% fired on EVERY
+`MemorySegment.get` — and `ArrowBinaryBuffer.hash` does a **per-byte `seg.get(JAVA_BYTE)`** (N
+bounds-checked accesses per key), (c) the hash arithmetic ~7%. **So the highest-value, mandate-aligned
+sub-lever is VECTORIZED WIDE-STRIDE segment access**: read 8 bytes at a time (`JAVA_LONG`) in the hash +
+key-compare + key-copy loops, cutting the per-byte FFM bounds-checks ~8× (the access-check overhead that
+JNI/critical-array RocksDB doesn't pay). This is on top of the columnar-buffer reuse below.
+
 The system is also partly **wait-bound** (62,719 `ThreadPark` on the shared mailbox vs 4,433 on-CPU), so
 this lever is expected to give a **solid-but-moderate** gain — it is the right FIRST step (removes the
 mandate-violating per-record native alloc + is the forst-rs/RocksDB differentiator), and the foundation
