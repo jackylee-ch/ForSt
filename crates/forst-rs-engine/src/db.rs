@@ -6129,8 +6129,8 @@ impl DbImpl {
     ///
     /// Unlike [`Self::batch_prefix_scan_parallel`] (which fully DRAINS each probe into owned `Vec`s —
     /// a per-entry alloc+copy that collapses at scale and violates zero-copy), this only parallelizes
-    /// the eager BUILD ([`Self::build_lazy_prefix_key_stream`] inside [`Self::prefix_scan_iter_owned_arc`]
-    /// — the `sstloop` cost: overlapping-SST locate + reader open) across [`bg_read_pool`], and returns
+    /// the eager BUILD (`Self::build_lazy_prefix_key_stream` inside [`Self::prefix_scan_iter_owned_arc`]
+    /// — the `sstloop` cost: overlapping-SST locate + reader open) across `bg_read_pool`, and returns
     /// K LAZY `Send` iterators. The caller (FFI) drains them lazily + zero-copy (`Arc<[u8]>` views, no
     /// materialization), exactly like the serial `frs_vec_iter_prefix_open_batch`. Results are in input
     /// order, one `Result` per prefix (a build failure is isolated to its slot).
@@ -6138,8 +6138,9 @@ impl DbImpl {
         self: &Arc<Self>,
         cf: &ColumnFamilyHandle,
         prefixes: &[&[u8]],
-    ) -> Vec<ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>>>
-    {
+    ) -> Vec<
+        ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>>,
+    > {
         let k = prefixes.len();
         if k == 0 {
             return Vec::new();
@@ -6163,7 +6164,9 @@ impl DbImpl {
         }
         drop(tx);
         let mut out: Vec<
-            Option<ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send>>>,
+            Option<
+                ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send>>,
+            >,
         > = (0..k).map(|_| None).collect();
         let mut filled = 0usize;
         while filled < k {
