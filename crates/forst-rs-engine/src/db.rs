@@ -1781,7 +1781,18 @@ impl DbImpl {
             match self.fs.open_random_access_file(dest) {
                 Ok(rac) => match SstReaderImpl::open(rac) {
                     Ok(reader) => {
-                        readers_map.insert(*file_number, Arc::new(reader));
+                        // FRS-INGEST-READER-BLOCKCACHE (2026-06-09): wire the shared decoded-block
+                        // cache (same fix as flush + compaction) so ingested-SST readers hit the
+                        // decoded-RecordBatch cache instead of re-decompressing on every probe.
+                        readers_map.insert(
+                            *file_number,
+                            Arc::new(reader.with_block_cache(
+                                Arc::clone(&self.block_cache)
+                                    as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
+                                self.db_id.0,
+                                file_number.value(),
+                            )),
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -3969,7 +3980,19 @@ impl DbImpl {
             let p = compaction_output_path(&self.db_path, meta.file_number);
             self.fs.await_upload(&p)?;
             let rac = self.fs.open_random_access_file(&p)?;
-            let reader = Arc::new(SstReaderImpl::open(rac)?);
+            // FRS-COMPACT-READER-BLOCKCACHE (2026-06-09): wire the shared decoded-block cache,
+            // mirroring the lazy `get_or_open_sst_reader` path. WITHOUT this, compaction-output
+            // (L1+) readers had `block_cache=None`, so probes of compacted state re-read +
+            // re-decompressed data blocks from disk instead of hitting the decoded-RecordBatch
+            // cache. The deeper levels hold the BULK of a join's accumulated state and are probed
+            // repeatedly — this cache-bypass was a dominant per-probe cost (q9/q20). Same fix as
+            // the flush pre-populate. Correctness-neutral (same bytes, same reader API).
+            let reader = Arc::new(SstReaderImpl::open(rac)?.with_block_cache(
+                Arc::clone(&self.block_cache)
+                    as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
+                self.db_id.0,
+                meta.file_number.value(),
+            ));
             self.sst_readers.rcu(|cur| {
                 let mut next = (**cur).clone();
                 next.insert(meta.file_number, std::sync::Arc::clone(&reader));
@@ -4243,7 +4266,15 @@ impl DbImpl {
             let p = compaction_output_path(&self.db_path, meta.file_number);
             self.fs.await_upload(&p)?;
             let rac = self.fs.open_random_access_file(&p)?;
-            let reader = Arc::new(SstReaderImpl::open(rac)?);
+            // FRS-COMPACT-READER-BLOCKCACHE (2026-06-09): wire the shared decoded-block cache
+            // (same fix as the L0 compaction + flush paths) so L→L+1 compaction-output readers
+            // hit the decoded-RecordBatch cache instead of re-decompressing on every probe.
+            let reader = Arc::new(SstReaderImpl::open(rac)?.with_block_cache(
+                Arc::clone(&self.block_cache)
+                    as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
+                self.db_id.0,
+                meta.file_number.value(),
+            ));
             let inserted = reader;
             self.sst_readers.rcu(|cur| {
                 let mut next = (**cur).clone();
@@ -5882,7 +5913,15 @@ impl DbImpl {
             let p = compaction_output_path(&self.db_path, meta.file_number);
             self.fs.await_upload(&p)?;
             let rac = self.fs.open_random_access_file(&p)?;
-            let reader = Arc::new(SstReaderImpl::open(rac)?);
+            // FRS-COMPACT-READER-BLOCKCACHE (2026-06-09): wire the shared decoded-block cache
+            // (same fix as the other compaction + flush paths) so this compaction-output reader
+            // hits the decoded-RecordBatch cache instead of re-decompressing on every probe.
+            let reader = Arc::new(SstReaderImpl::open(rac)?.with_block_cache(
+                Arc::clone(&self.block_cache)
+                    as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
+                self.db_id.0,
+                meta.file_number.value(),
+            ));
             let fnum = meta.file_number;
             self.sst_readers.rcu(|cur| {
                 let mut next = (**cur).clone();
@@ -7163,7 +7202,22 @@ impl DbImpl {
         match self.fs.open_random_access_file(&path) {
             Ok(rac) => match SstReaderImpl::open(rac) {
                 Ok(reader) => {
-                    let inserted = Arc::new(reader);
+                    // FRS-FLUSH-READER-BLOCKCACHE (2026-06-09): wire the shared decoded-block
+                    // cache, mirroring the lazy `get_or_open_sst_reader` path. WITHOUT this, the
+                    // flush-pre-populated reader for a freshly-flushed L0 SST had `block_cache=None`,
+                    // so every probe of that SST re-read + re-decompressed its data blocks from disk
+                    // instead of hitting the decoded-RecordBatch cache. Flushed SSTs are exactly the
+                    // join's hot, repeatedly-probed working set (interval/Top-N joins re-probe recent
+                    // state per record) — the cache-bypass made q9/q20 pay redundant decode on every
+                    // probe (DECAY_ATTR: per-probe cost dominated by the SST loop, B_resident=0).
+                    // Pre-populate now installs a cache-enabled reader so the first AND subsequent
+                    // probes share decoded blocks. Correctness-neutral (same bytes, same reader API).
+                    let inserted = Arc::new(reader.with_block_cache(
+                        Arc::clone(&self.block_cache)
+                            as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
+                        self.db_id.0,
+                        meta.file_number.value(),
+                    ));
                     self.sst_readers.rcu(|cur| {
                         let mut next = (**cur).clone();
                         next.insert(meta.file_number, std::sync::Arc::clone(&inserted));

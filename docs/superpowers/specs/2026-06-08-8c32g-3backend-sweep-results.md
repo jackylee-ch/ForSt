@@ -192,6 +192,35 @@ re-sampled at 50M+ not early — the early n_ovl=2-3 may have GROWN as join stat
 read-amp (3) is the live candidate). The iterView fix is KEPT (a real latent thread-safety bug fix);
 **the parallel executor is NOT the join-family lever** — do not pursue it further for q7/q9/q20.
 
+## ★★★ ROOT CAUSE FOUND + FIXED 2026-06-09: flushed/compacted SST readers BYPASSED the block cache
+After refuting parallel-executor/backpressure/LRU-lock, a profiling run (FRS_BULK_SAMPLE + FRS_ITER_DIAG,
+default executor, locked cfg) localized the q20 join bottleneck **with data**:
+
+**`[DECAY_ATTR]` at 72.4M records (deep post-flush):** `probe=6–37µs`, **n_ovl=1–4** (L0=1–3, deep=1),
+**B_resident=0**, cost ~90% in **`A_fanout/sstloop`** (per-SST `get_or_open_sst_reader` + in-memory
+`may_contain_range`/`first_block_ge`). → **growing-L0 read-amp REFUTED** (n_ovl stayed low at 72M).
+**`FRS-ITER-DIAG`:** `sst_open_us` is mostly 0 but occasionally **19,614µs (19.6ms) for ONE cold reader
+open**. `first_block_ge`/`may_contain_range` are pure in-memory index ops (reader.rs:703/727) → the
+sstloop cost is **cold `SstReaderImpl::open`** (footer+index read/decode) on the probe hot path.
+
+**THE BUG (code-confirmed, 5 sites):** `get_or_open_sst_reader` (the lazy path, db.rs:8666) opens
+readers **`.with_block_cache(...)`**, but the eager reader-cache pre-populate at **flush** (db.rs:7195),
+**3 compaction-output paths** (db.rs:3990, 4272, 5916), and **ingest** (db.rs:1782) all opened readers
+with **bare `SstReaderImpl::open` — `block_cache=None`**. Since those pre-populated readers are what the
+read path finds in `sst_readers` (a warm hit returns them directly), **flushed + compacted SSTs — i.e.
+the join's entire hot, repeatedly-probed working set — had their data-block reads BYPASS the shared
+decoded-RecordBatch cache**, re-reading + re-decompressing (lz4) the same blocks on every probe. This is
+exactly the q9/q20 hot path the block cache was built for (db.rs:8616 comment), silently disabled for
+every non-lazy-opened SST. B_resident=0 (resident shadow default-OFF) means ALL join probes hit these
+cache-less SST readers.
+
+**FIX (engine, uncommitted, host-compile-clean):** wire `.with_block_cache(self.block_cache, db_id,
+file_number)` into all 5 eager reader-open sites (flush + 3 compaction + ingest), mirroring the lazy
+path. Architectural (read-path), **no config change**, correctness-neutral (same bytes/API), benefits
+ALL read-heavy queries (joins most). Per-query before/after e2e pending: rebuild Linux `.so` → re-run
+q20/q9/q7 (DNF baseline: q20 ~71M/93M @1300s, ~47K/s). Expected: repeated same-SST probes hit decoded
+blocks → big per-probe drop. ForSt q20 8c/32g baseline (in flight, running ~88K/s — FAST) is the target.
+
 ## ★ WHAT'S LEFT (Phase-1 close)
 1. **Fair baselines:** RocksDB 8c/32g + ForSt 8c/32g for the WHOLE set ("faster than ForSt" clause
    unverified almost everywhere; have RocksDB 8c/32g only for q17/q18).
