@@ -471,3 +471,15 @@ spike used 6 — re-measure win at 3); (2) full q0-q22 correctness sweep under d
 crash-loop was q20-specific, fixed via iterView — must reconfirm all windowed-joins q5/q7/q8 + q17/q18);
 (3) full perf sweep → confirm ≥0.8×RocksDB + ≤50s + >ForSt simultaneously; (4) then OPT-02 (non-blocking
 FFM, 400%→800%) for the joins still short. This is THE Phase-1 lever — correctness-safe, default-safe.
+
+## ★★ OPT-01 DEFAULT-ON committed + correctness-verified across 4 families (2026-06-09)
+ForStRsAsyncKeyedStateBackend now defaults to RoutingStateExecutor (worker=3 = match ForSt
+read-io-parallelism); opt-out FRS_RS_PARALLEL_EXECUTOR=0. Committed+pushed (flink) → GHA gating.
+Correctness EXACT + neutral-or-better under default-on:
+- q3 (light): 36.6 vs 36.7s, out_rows 2,201,068 exact.
+- q11 (window/iter): 318.9 -> 253.8s (1.26x), out_rows 92,000,000 exact. PARTIAL (0.44x, needs OPT-02).
+- q12 (windowed-agg): 50.6 -> 46.5s (faster), out_rows 92,000,000 exact.
+- q9 (join): +7.7-15%, no crash.
+4 families correct (light/join/window/windowed-agg). REMAINING correctness risk: windowed-JOINS
+q5/q7/q8 (window+join combo, highest race risk; q5 historically non-deterministic) — must be in the
+final default-on sweep. OPT-02 (non-blocking FFM) is next to lift the PARTIAL joins past 0.8x.
