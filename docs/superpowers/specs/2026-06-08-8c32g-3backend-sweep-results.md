@@ -483,3 +483,18 @@ Correctness EXACT + neutral-or-better under default-on:
 4 families correct (light/join/window/windowed-agg). REMAINING correctness risk: windowed-JOINS
 q5/q7/q8 (window+join combo, highest race risk; q5 historically non-deterministic) — must be in the
 final default-on sweep. OPT-02 (non-blocking FFM) is next to lift the PARTIAL joins past 0.8x.
+
+## ★★★ OPT-01 default-on REVERTED — windowed-join CORRECTNESS REGRESSION (2026-06-09)
+q8 (windowed-join) under OPT-01 default-on: out_rows=**1,819,576** vs depth-1 3,010,888 / RocksDB
+3,064,457 = **~40% UNDER-EMISSION**. The RoutingStateExecutor's cross-worker offload races on
+windowed-join semantics (window-timer firing / namespace ordering under async completion reordering)
+→ windows under-fire. Correctness non-negotiable → REVERTED to OPT-IN (FRS_RS_PARALLEL_EXECUTOR=1);
+depth-1 VectorizedExecutor is the default again (q8 back to 3,010,888).
+**LESSON (mandate-validated):** default-enabling required FULL correctness across ALL families FIRST;
+4 families (q3/q9/q11/q12 exact) were NOT sufficient — the 5th (windowed-join) exposed the race.
+**GATING PREREQUISITE for OPT-01 (and the join-family Phase-1 win):** fix the windowed-join race in
+the offload path — likely window-timer/completion ordering under the AEC when batches complete on
+worker threads out of arrival order. OPT-01 stays the validated dominant lever (q11 2.35×@w6, q9
++7.7-15%, correct on non-windowed-join families) but CANNOT be default until this race is fixed.
+Roadmap: (1) fix windowed-join offload race → (2) re-verify q5/q7/q8 + full q0-q22 out_rows under
+default-on → (3) OPT-02 (non-blocking FFM, w3 parity) → (4) full perf sweep.
