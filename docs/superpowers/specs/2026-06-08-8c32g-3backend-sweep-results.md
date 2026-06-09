@@ -287,6 +287,26 @@ DEEP lever = async-state pipeline completion throughput (why the mailbox parks) 
 (executor coordination + FFM boundary efficiency) — structural, multi-session, the ForSt-parity gap.
 q7/q9/q20 cannot pass the RocksDB bar without (2).
 
+## ⚠️ 2026-06-09 vectorized-hash before/after: ~PERF-NEUTRAL — tempers the on-CPU-micro-opt thesis
+Committed the byte-identical wide-stride key hash (flink `8ffbc42b933`, 8× fewer FFM byte-reads in
+`ArrowBinaryBuffer.keyHash`; 11/11 UTs incl. a scalar-equivalence gate). **e2e before/after (q9 + JFR):
+~perf-neutral.** q9 84.5M@1204s vs prior ~76M baselines = within q9's 60–84M run-to-run variance (NOT a
+win). JFR relative on-CPU shares UNCHANGED: `keyHash` 5%→6%, `checkOffset` 4%→4% (totals rose 4433→6419
+only because more records ran). **Why:** the hash cost is the data-dependent `×31` ARITHMETIC, not the
+FFM byte-reads I cut — so the reduction was negligible. The fix is KEPT (correct, mandate-aligned,
+harmless) but is not a q9 lever.
+
+**Sobering implication for Phase-1 heavy joins:** the forst-rs-specific on-CPU differential vs RocksDB is
+~20% (FFM alloc 4% + per-access checks 4% + hash 6% + …), and the system is partly **wait-bound** (62k
+ThreadParks). Even fully eliminating that ~20% gives <20% throughput — far short of the ~2× q9 needs to
+reach the RocksDB bar. So **on-CPU micro-opts alone cannot close q7/q9/q20** — the dominant factor is
+**request-completion latency (the async-state pipeline drain / the wait)**, where RocksDB's mature
+engine+boundary completes faster. The honest lever is the request-completion path (executor/boundary
+throughput so in-flight stops filling) — structural, the ForSt-parity gap — NOT per-record on-CPU
+shaving. The zero-copy columnar-key levers help correctness/mandate + GC but, by this evidence, will
+likely also be modest on a wait-bound query. q7/q9/q20 reaching ≥0.8× RocksDB is not yet demonstrated
+achievable and may require reconsidering the async-state request-completion architecture.
+
 ## ★ WHAT'S LEFT (Phase-1 close)
 1. **Fair baselines:** RocksDB 8c/32g + ForSt 8c/32g for the WHOLE set ("faster than ForSt" clause
    unverified almost everywhere; have RocksDB 8c/32g only for q17/q18).
