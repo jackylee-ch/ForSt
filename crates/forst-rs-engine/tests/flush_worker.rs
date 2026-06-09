@@ -268,22 +268,27 @@ fn test_max_write_buffer_number_backpressure() {
     // small enough to fit in one memtable; the cumulative threshold
     // forces a switch after each burst.
     let mut max_blocked = Duration::ZERO;
-    for round in 0..6 {
+    'writes: for round in 0..6 {
         for i in 0..50 {
             let k = format!("r{}k{:04}", round, i);
             let v = vec![b'v'; 64];
             let start = Instant::now();
             db.put(&cf, k.as_bytes(), &v).unwrap();
             let elapsed = start.elapsed();
+
             if elapsed > max_blocked {
                 max_blocked = elapsed;
+            }
+            if max_blocked >= Duration::from_millis(50) {
+                break 'writes;
             }
         }
     }
 
     // At least one writer must have observed a stall (50 ms is well
     // below the 100 ms per-flush delay × 3-imm budget but above any
-    // reasonable noise floor on a CI runner).
+    // reasonable noise floor on a CI runner). Stop as soon as this is
+    // proven; this test is not meant to grow an unbounded slow-flush backlog.
     assert!(
         max_blocked >= Duration::from_millis(50),
         "no backpressure observed: max_blocked={:?}",
