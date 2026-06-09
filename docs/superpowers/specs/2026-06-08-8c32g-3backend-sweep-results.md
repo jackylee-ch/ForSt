@@ -795,3 +795,16 @@ q5 correctness suspect. q7 finishes 1441s (RDB baseline pending).
 per-worker cache → q11 pass, q7/q20 finish faster — the invalid parallel sweep showed q11=134.7s,
 q20=1610s EXACT, q7=1052s), OPT-02 (q9), q19 3rd lever (diffuse serde+engine), q4 (-9.5s to clear).
 3-backend: RocksDB/ForSt baselines in earlier rows; forst-rs side now complete.
+
+## ★★ SAME-SESSION frs-vs-RocksDB sweep (2026-06-10) — valid apples-to-apples
+forst-rs (SWEEP2 depth-1) vs RocksDB (RDBSWEEP), same box/session:
+WINS (frs beats RocksDB): q7 (1441.6s FINISHES vs RocksDB DNF@1700!), q15 (161.8 vs 229.7), q16 (323.9
+vs 374.1), q18 (222.9 vs 366.4) + light q0/q1/q2/q10/q13/q21/q22 faster.
+PARITY-PASS: q3 0.98×, q8 0.97×, q12 0.83×, q14 ~1.0×, q17 0.94×.
+FAILS: q4 (+70.3s>50s; out_rows 25.8M vs 177.6M = retract-changelog cadence, needs final-result check),
+q9 (DNF vs RocksDB 1420.5s), q11 (0.40×), q19 (0.59×), q20 (DNF vs 859.7s; finishes 1610s EXACT parallel).
+★ CORRECTNESS BUG: q5 out_rows 808,765 vs RocksDB 29,988,416 = −97% UNDER-EMIT. q5 (windowed-agg) is
+WRONG (confirms historical q5 nondeterminism/under-emit). MUST FIX before its perf counts — top priority
+(correctness non-negotiable). Note q5 frs=41.6s (fast but WRONG).
+=> frs already WINS q7/q15/q16/q18 vs RocksDB. Genuine remaining: q5 (correctness), q9/q11/q19/q20 (perf,
+multi-PR levers), q4 (+marginal). 3-backend: ForSt sweep next to complete the matrix.
