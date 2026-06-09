@@ -381,8 +381,12 @@ fn test_flush_error_propagates_to_next_writer() {
     let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
 
     let fs = FailingFs::new(0); // every write fails
+    let opts = EngineOptions {
+        max_write_buffer_number: 64,
+        ..small_buf_options()
+    };
     let fs_dyn: Arc<dyn FileSystem> = fs.clone();
-    let db = DbImpl::open_with_fs(small_buf_options(), fs_dyn).unwrap();
+    let db = DbImpl::open_with_fs(opts, fs_dyn).unwrap();
     let cf = db.default_cf();
 
     // Trigger a flush: write enough to switch the memtable.
@@ -394,9 +398,10 @@ fn test_flush_error_propagates_to_next_writer() {
         // because the worker recorded a flush failure.
         if let Err(e) = db.put(&cf, k.as_bytes(), &v) {
             // Saw the propagated error — exactly what the test wants.
+            let msg = e.to_string();
             assert!(
-                !e.to_string().is_empty(),
-                "error message should be informative"
+                msg.contains("injected write failure"),
+                "expected injected write failure, got {msg}"
             );
             return;
         }
@@ -409,9 +414,10 @@ fn test_flush_error_propagates_to_next_writer() {
     // If we get here, give the worker a final moment then try once more.
     thread::sleep(Duration::from_millis(50));
     let err = db.put(&cf, b"final", b"v").unwrap_err();
+    let msg = err.to_string();
     assert!(
-        !err.to_string().is_empty(),
-        "expected error after worker recorded failure"
+        msg.contains("injected write failure"),
+        "expected injected write failure after worker recorded failure, got {msg}"
     );
 }
 
