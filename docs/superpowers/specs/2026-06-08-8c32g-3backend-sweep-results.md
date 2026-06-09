@@ -690,3 +690,17 @@ drain-tail-bound queries; NOT a universal default.** A universal default needs t
 parallel (per-worker MapStateCache pinned to the key-group's worker thread, so cache-benefiting joins
 keep their accelerator AND get parallelism) — the proper multi-PR OPT-01. q9/q20 still need OPT-02
 (non-blocking FFM) / engine read-path levers, NOT the executor.
+
+## ★★★ cache+parallel race ROOT-CAUSED precisely (2026-06-10) — the universal-OPT-01 spec
+ForStRsMapStateV2.asyncGet (line 390-397): the GET-miss path does
+  super.asyncGet(key).thenApply(value -> cache.putIfAbsent(keySnapshot, value))
+The cache LOOKUP (line 358) runs on the MAILBOX thread; the get-completion POPULATE (putIfAbsent, line
+394) runs in the .thenApply callback ON THE COMPLETING THREAD = a WORKER thread under the parallel
+executor. So: shared cache → concurrent worker putIfAbsent races (−10%); per-worker cache → lookup
+(mailbox) and populate (worker) hit DIFFERENT caches → inconsistent (−6.7%). cache-off avoids both
+(correct) but kills q9's read accelerator (→ q9 robbed → why OPT-01 can't be default).
+UNIVERSAL OPT-01 FIX (multi-PR, precisely specified): the cache lookup AND its get-completion populate
+must run on the SAME key-group worker thread — i.e., move the read-cache INTO the worker's batch
+processing (per-key-group, owned by the worker), not split mailbox-lookup / worker-populate. Then
+cache-benefiting joins (q9) keep the accelerator AND get parallelism, no race → OPT-01 default-safe
+without robbing q9. This is THE blocker for default-on; q9/q20 throughput separately need OPT-02.
