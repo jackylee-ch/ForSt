@@ -498,3 +498,20 @@ worker threads out of arrival order. OPT-01 stays the validated dominant lever (
 +7.7-15%, correct on non-windowed-join families) but CANNOT be default until this race is fixed.
 Roadmap: (1) fix windowed-join offload race → (2) re-verify q5/q7/q8 + full q0-q22 out_rows under
 default-on → (3) OPT-02 (non-blocking FFM, w3 parity) → (4) full perf sweep.
+
+## ★★★ windowed-join offload race ROOT-CAUSED (2026-06-09, code inspection)
+The gating blocker for OPT-01 default-on (q8 40% under-emit) is ROOT-CAUSED:
+- `RoutingStateExecutor.leaseWorker()` = `free.removeFirst()` (line 265) → leases by AVAILABILITY,
+  NOT by key/key-group. ZERO key-group awareness in the class.
+- Each worker is a SEPARATE VectorizedExecutor with its OWN arena → its OWN MapStateCache (per-worker
+  write-back buffer).
+- MECHANISM: consecutive batches for the SAME key route to DIFFERENT workers → that key's UNCOMMITTED
+  buffered state FRAGMENTS across per-worker caches → a windowed-JOIN probe reading the other side's
+  records MISSES rows buffered in a different worker's unflushed cache → under-match → 40% under-emit.
+- Why q11/q12 (windowed-AGG) survived: aggregation flushes + the engine MERGES fragments (merge-based
+  recombination, no loss); a join POINT-MATCH has no recombination → loses rows.
+**FIX (well-defined): KEY-GROUP-AFFINE routing** — same key-group → same worker (consistent cache),
+mirroring Flink's key-group model. Complication: createRequestContainer() has no key → fix needs the
+AEC container↔key-group association. Correctness-critical; careful implementation required. This is THE
+prerequisite for OPT-01 default-on (and the join-family Phase-1 win). Alternative: write-through (no
+per-worker cache) under parallel exec — simpler, sacrifices the cache perf lever.
