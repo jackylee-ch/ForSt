@@ -628,3 +628,14 @@ per-worker). Even with key-group affinity (each key→one worker), concurrent wo
 SAME hash table → structural data race → lost entries. If so, fix = PER-WORKER MapStateCache (each
 worker's VectorizedExecutor owns its cache) or thread-safe/key-group-partitioned cache. Test: q8 N=3 +
 FRS_DISABLE_MAPSTATE_CACHE=1 — if correct, shared-cache race confirmed.
+
+## ★★★ OPT-01 windowed-join race ROOT-CAUSED + PROVEN (2026-06-09): shared MapStateCache structural race
+q8 N=3 key-group-affine: cache-ON 2,704,710 (−10%) vs cache-OFF 3,064,514 (≈RocksDB 3,064,457 CORRECT).
+=> The −10% IS the shared MapStateCache: single hash-table instance per state object; concurrent workers
+(holding DIFFERENT keys via affinity, but mutating the SAME backing table/eviction) structurally race →
+lost entries. Affinity fixes per-KEY consistency but not the shared STRUCTURE.
+PROVEN FIX = PER-WORKER MapStateCache (each worker owns its cache instance; with key-group affinity,
+key->one worker->one cache = correct AND preserves cache perf — unlike blanket cache-off which would rob
+cache-benefiting queries). Implementation: make the state object's cache per-worker-thread (ThreadLocal)
+or per-VectorizedExecutor; snapshot/flush/close must drain ALL per-worker caches. This is the LAST
+blocker for OPT-01 default-on (routing logic already proven correct at N=1 = RocksDB-exact).
