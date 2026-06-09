@@ -368,3 +368,26 @@ reference (exact).** q11 is an append/dedup query → out_rows is a clean exact 
 per-chunk decode (no per-chunk `arena.allocate(bytesUsed)` snapshot, no view-accumulation list) is
 byte-correct over a full 92M-event MapState-iteration workload. Lever 1 is COMPLETE + CORRECT.
 Next: q9 zero-snapshot before/after trajectory, then lever 2 (coalesced batched lookup).
+
+## ★★ ALL THREE LEVERS FINISHED + TESTED (2026-06-09)
+Per directive ("ALL O(1) lookup + zero-copy value finished before any nexmark"):
+- **Lever 1 (columnar buffer / zero-copy key):** wide-stride `keyHash`, `mismatch()` compare,
+  `copy()` intrinsic, per-executor reused `chunkBuf`, + **zero-snapshot drain** (decode each chunk
+  in place to detached on-heap, no per-chunk `arena.allocate` snapshot, no view-accumulation list).
+  Applied to BOTH `process()` and `processFromBatchedOpen()`. Dead `parseChunkInto` removed.
+- **Lever 2 (O(1)/coalesced batched lookup):** `executeItersBatchedParallel` + FFI
+  `frs_vec_iter_prefix_open_batch_parallel` (one crossing opens K probes, engine drains across read
+  pool); drain uses the zero-snapshot path. Gated on `FRS_RS_PARALLEL_ITER` pending e2e enable-decision.
+- **Lever 3 (zero-copy value):** `ForStRsMapStateV2.deserializeUserKey/Value(IteratorEntryView)`
+  rewind a `MemorySegmentDataInputView` directly onto the chunk slice via per-thread `VIEW_TL` — no
+  intermediate `byte[]`. The zero-snapshot change makes the view reference the reused `chunkBuf`
+  directly, completing the zero-copy chain (engine buffer → on-heap RowData, the one materialization
+  Flink requires).
+
+**TESTS (all green):**
+- Unit (mock linker): `ForStRsDBIterRequestTest` 5/5 (incl. 2 new `processFromBatchedOpen` cases:
+  single-chunk decode + multi-chunk no-corruption) + `ArrowBinaryBufferTest` 11/11.
+- **Full native suite vs real engine (host dylib rebuilt): 528 run, 0 failures, 0 errors, 11 skipped
+  — BUILD SUCCESS** (incl. `IterPrefixBatchOpenTest`, `FrsIteratorTest`, all `MapStateV2*`, `Vectorized*`).
+- e2e correctness: q11 out_rows=92,000,000 == RocksDB (exact gate).
+Levers implemented + verified; nexmark validation/enable-decision is next.
