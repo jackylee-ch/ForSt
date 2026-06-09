@@ -80,19 +80,28 @@ Rust batch_prefix_scan(prefixes[K]):
   validated serially + skipped without scanning; heavy build/drain parallel, unsafe pointer writes
   serial; owned results wrapped as `IterHandle` (`IterKey/Value::Vec`). Round-trip UT proves
   byte-identical to the serial batch open (memtable+SST, 4×3 rows, unique handles); 99 FFI tests pass.
-- **C. Java — TODO (atomic with D + .so/jar).** (1) Bind `frs_vec_iter_prefix_open_batch_parallel` in
-  `ForStRsLinker` (mirror `frsVecIterPrefixOpenBatch` — field + `bind()` + invoke wrapper). (2) Route the
-  join's iterator probes through the batched-parallel open. Two options, decide by decode-compatibility:
-  (a) make `dispatchIterPrefix` call the parallel binding (one-line) AND re-classify the join's MapState
-  iteration to `IterPrefixRequest` (VectorizedClassifier:653→445) — IF `IterPrefixRequest`'s decode is
-  value-carrying + matches `ForStRsDBIterRequest.completeWithEntries`/`VIEW_TL`; or (b) rewrite
-  `executeIters` (VectorizedExecutor:1358) to batch-open all `iterRequests` prefixes via the parallel
-  binding, then drive each `ForStRsDBIterRequest`'s drain from its handle + first chunk (needs a
-  `processFromBatchedHandle` variant that decodes the pre-drained first chunk then continues via `_next`).
-  **HIGH BLAST RADIUS:** `executeIters` serves ALL MapState iteration (q3/q11/q12/q15/q16/q19 + joins) —
-  any bug regresses many queries, so this MUST be done with full e2e correctness verification, and the
+- **C. Java — TODO (atomic with D + .so/jar). Option (a) REFUTED; do option (b), FLAG-GATED.**
+  Option (a) [route join → `IterPrefixRequest`/`dispatchIterPrefix` + swap its FFI to parallel] is OUT:
+  `IterPrefixRequest` completes with a RAW `IterFirstChunk(handle, rows)` (VectorizedExecutor:2188) — an
+  undecoded chunk+handle for the caller to drain — NOT the decoded UK/UV the join needs. The join requires
+  `ForStRsDBIterRequest.completeWithEntries` (zero-copy `VIEW_TL` decode). So **option (b)**:
+  (1) Bind `frs_vec_iter_prefix_open_batch_parallel` in `ForStRsLinker` (field + `bind()` + invoke
+      wrapper, mirror `frsVecIterPrefixOpenBatch`).
+  (2) Add `ForStRsDBIterRequest.processFromBatchedOpen(linker, db, cf, handle, firstChunkBuf,
+      firstRowCount, firstBytesUsed)` — parse the provided first chunk (`parseChunkInto`) then run the
+      SAME `_next` drain loop + `completeWithEntries` as `process()` (which already cleanly splits
+      open / parse-first-chunk / drain / complete; the batch open already filled the first chunk +
+      registered the handle, so reuse the rest). Add a `prefix()` getter.
+  (3) In `executeIters` (VectorizedExecutor:1358), gate on `FRS_RS_PARALLEL_ITER` (default OFF, like
+      the prior `FRS_RS_PARALLEL_EXECUTOR`): if ON AND all requests are fresh opens (`existingVecHandle
+      == 0`) AND count > 1 → pack prefixes SoA + K `CHUNK_BUF_CAP` chunk buffers + K-handle/AoS-FrsChunk
+      out arrays (model the buffer management on `dispatchIterPrefix`, VectorizedExecutor:2030-2200) →
+      ONE `frsVecIterPrefixOpenBatchParallel` crossing → per request `processFromBatchedOpen`; ELSE the
+      existing serial loop UNCHANGED. **Default-OFF flag = ZERO regression risk** for the passing set
+      while the parallel path is e2e-validated; flip default once proven.
+  **HIGH BLAST RADIUS** (executeIters serves q3/q11/q12/q15/q16/q19 + joins) — hence the flag gate. The
   linker `bind()` MUST ship atomically with a freshly-built `.so` (a jar bound to a missing symbol throws
-  at class-load → breaks every query).
+  at class-load → breaks every query), so C lands together with a `.so` rebuild + the e2e gate (D).
 - **D. e2e — TODO (with C).** Rebuild Linux `.so` (has A+B symbols) + jar → q7/q9/q20 accuracy
   (`out_rows`/final-result == RocksDB) + perf (before/after) → regression-check q3/q11/q12/q15/q16/q17/q18
   → both repos' GHA green → record in `2026-06-08-8c32g-3backend-sweep-results.md`.
