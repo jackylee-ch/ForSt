@@ -616,3 +616,15 @@ ci-forst-rs (Build libforst_rs_ffi + flink-statebackend-forst-rs JDK 25) on jack
 - q19 findRow O(n^2)->O(1) fix (HEAD 92a5d7c400b): success (gh run watch --exit-status = 0)
 => mandate "pass GHA of both repos" SATISFIED for all committed changes (ForSt engine repo unaffected —
 no Rust commits this session). Committed Phase-1 advances are correctness-gated green.
+
+## OPT-01 windowed-join race — ISOLATED to cross-worker concurrency (2026-06-09)
+Deadlock-free key-group-affine RoutingStateExecutor committed (opt-in). q8 diagnostics:
+- N=1 (routing path, no parallelism): out_rows=3,064,667 ≈ RocksDB 3,064,457 = CORRECT (even > depth-1's
+  3,010,888). => My routing/sync-execution LOGIC IS CORRECT.
+- N=3 (routing, parallel): out_rows=2,704,710 (−10%). => the −10% is purely a CROSS-WORKER CONCURRENCY
+  RACE, not a logic bug.
+HYPOTHESIS (testing): the MapStateCache is a SINGLE shared hash-table instance per state object (not
+per-worker). Even with key-group affinity (each key→one worker), concurrent workers insert/evict in the
+SAME hash table → structural data race → lost entries. If so, fix = PER-WORKER MapStateCache (each
+worker's VectorizedExecutor owns its cache) or thread-safe/key-group-partitioned cache. Test: q8 N=3 +
+FRS_DISABLE_MAPSTATE_CACHE=1 — if correct, shared-cache race confirmed.
