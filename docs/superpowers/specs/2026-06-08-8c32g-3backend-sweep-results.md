@@ -32,7 +32,7 @@ Read-path architectural, **no config change**, correctness-neutral, **280 engine
 |-------|--------------------|---------------------------|------------|----------|---------|
 | q20 (join) | DNF 71M/93M @1300s | **DNF 88.6M/93M @1284s (+25%, ~4× post-flush)** | 800s (0.59×, FAIL) | **84M same wall → BEATS ForSt** | improved; beats ForSt; fails RocksDB bar |
 | q19 (OVER) | 542.5s | **475.3s (−12%, exact 92M)** | 305s (1.56×, FAIL) | 319s (FAIL) | improved; still fails both — needs 2nd lever |
-| q9 (join) | DNF ~43M/762s (collapsed 10K/s) | **re-run in flight (34.4M@261s, ~55K/s — healthy)** | (pending RocksDB 8c) | (pending) | much healthier; result pending |
+| q9 (join) | DNF ~43M-COLLAPSE (→10K/s) | **DNF 76.4M/93M @1284s (+77%, no collapse, ~1550s proj)** | (pending RocksDB 8c) | (pending) | collapse ELIMINATED; still DNF, needs more |
 
 **Net:** a verified broad win (every query reading flushed/compacted SSTs benefits). q20 now beats ForSt;
 q9 no longer collapses. BUT q19/q20 still miss the RocksDB ≥0.8× bar — q20 is hard for all LSM backends
@@ -104,7 +104,7 @@ write_buffer_size 128mb (compaction-overload → restart). Merge-collapse REFUTE
 | q5    | 162.2     | 29,988,376 (det) | 240/138    | 2.0/2.4/2.9M (var)| (host 297) | ✗ | **FAIL — WRONG: ~14× under-emit + non-deterministic (windowed-JOIN bug; both async backends)** |
 | q7    | (pending 8c/32g) | — | **DNF @1300s** 🔒1G (~78.5M/92M, rate→19.7K/s) | — | (host 659) | ? | **read-amp DNF** under locked cfg (join). Old "671s" was unfair noflush=true. Joins q9/q20 → needs READ-PATH module. |
 | q8    | 46.1      | 3,064,457        | 43.7 (OLD) | 3,010,888         | (pending)  | ✗? | time ~parity (0.95×) but out_rows 1.75% LOW (53K fewer) — windowed-JOIN under-emit (mild) |
-| q9    | (pending 8c/32g) | — | **DNF** 🔒1G (43M@762s, rate→10K/s, read-amp collapse) | — | (pending) | ? | **read-amp DNF** (join). Memory-bounded (no OOM); CPU 375% = 4 slots busy/4 idle. Joins q7/q20 → READ-PATH module. |
+| q9    | (pending 8c/32g) | — | **DNF, block-cache fix: 76.4M/93M @1284s (was ~43M-COLLAPSE), ~1550s proj** 🔒1G | — | (pending) | ? | ★ block-cache fix ELIMINATED the read-amp collapse: q9 went from collapsing at ~43M (→10K/s) to sustained 76.4M@1284s (+77%, no collapse). Still DNF; needs RocksDB/ForSt 8c baselines + further work. The collapse WAS the cache-bypass. |
 | q10   | 120.3     | 100,000,000      | 128.7      | 100,000,000       | -          | ✓ | **PASS (correct; +8.4s ≤ +50s bar)** |
 | q11   | 111.1     | 92,000,000       | 382 (OLD fast cfg) | 92,000,000 | (host 158)| ✓ | correct; 3.4× — **RE-MEASURE under committed cfg** |
 | q12   | 42.1      | 92,000,000       | 50.6       | 92,000,000        | -          | ✓ | **PASS (out_rows match; +8.5s ≤ +50s bar)** |
