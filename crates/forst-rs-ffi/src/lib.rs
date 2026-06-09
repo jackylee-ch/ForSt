@@ -5647,13 +5647,18 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
             return first_err;
         }
 
-        // Pass 2 (PARALLEL): build + drain every valid probe across the read pool.
-        let results = db_ref.batch_prefix_scan_parallel(cf_ref_, &valid_prefixes);
+        // Pass 2 (PARALLEL, BUILD-ONLY): open every valid probe's iterator across the read pool.
+        // Returns LAZY iterators — no rows are drained/materialized here (zero-copy: the prior
+        // batch_prefix_scan_parallel full-drain materialized owned Vecs per entry, an alloc+copy
+        // that collapsed at scale and violated the zero-copy mandate). Only the eager BUILD
+        // (overlapping-SST locate + reader open = the `sstloop` cost) runs in parallel.
+        let iters = db_ref.batch_open_prefix_iters_parallel(cf_ref_, &valid_prefixes);
 
-        // Pass 3 (serial): wrap each result as an IterHandle, fill its first chunk into the
-        // caller buffer, and register it for continuation. The unsafe pointer writes stay
-        // single-threaded here; only the heavy build/drain above was parallel.
-        for (vi, res) in results.into_iter().enumerate() {
+        // Pass 3 (serial): wrap each lazy iterator + fill its first chunk into the caller buffer +
+        // register — IDENTICAL to the serial frs_vec_iter_prefix_open_batch drain (zero-copy
+        // IterKey/Value::Arc, streamed; engine errors land in the per-probe slot). Unsafe pointer
+        // writes stay single-threaded; only the build above was parallel.
+        for (vi, res) in iters.into_iter().enumerate() {
             let i = valid_indices[vi];
             let chunk = &mut chunks_out[i];
             let buf_ptr = chunk.buf_ptr;
@@ -5664,21 +5669,37 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
                         first_err = error_to_frs_code(&e);
                     }
                 }
-                Ok(entries) => {
-                    // Wrap the owned (key,value) rows as a Send iterator. The engine read
-                    // already happened (in parallel); this drain is pure in-memory, so the
-                    // error slot stays empty.
-                    let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> = Box::new(
-                        entries
-                            .into_iter()
-                            .map(|(k, v)| (IterKey::Vec(k), IterValue::Vec(v))),
-                    );
-                    let mut handle_state =
-                        IterHandle::new_with_error_slot(inner, Arc::new(Mutex::new(None)));
+                Ok(owned_iter) => {
+                    let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+                        Arc::new(Mutex::new(None));
+                    let slot_inner = Arc::clone(&error_slot);
+                    let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+                        Box::new(owned_iter.filter_map(move |r| match r {
+                            Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                            Err(e) => {
+                                let mut guard =
+                                    slot_inner.lock().unwrap_or_else(|p| p.into_inner());
+                                if guard.is_none() {
+                                    *guard = Some(e);
+                                }
+                                None
+                            }
+                        }));
+                    let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
                     let (bytes_used, row_count, iter_exhausted) =
                         fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap);
                     if iter_exhausted {
                         handle_state.drop_inner();
+                    }
+                    if let Some(err) = handle_state.take_last_error() {
+                        if row_count == 0 {
+                            if first_err == FrsErrorCode::Ok as i32 {
+                                first_err = error_to_frs_code(&err);
+                            }
+                            handle_state.mark_terminal();
+                        } else {
+                            handle_state.set_deferred_error(err);
+                        }
                     }
                     let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     shard_for(handle_id)

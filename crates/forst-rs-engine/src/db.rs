@@ -6125,6 +6125,67 @@ impl DbImpl {
             .collect()
     }
 
+    /// Parallel batched prefix-iterator OPEN — the ZERO-COPY join read-path lever (q7/q9/q20).
+    ///
+    /// Unlike [`Self::batch_prefix_scan_parallel`] (which fully DRAINS each probe into owned `Vec`s —
+    /// a per-entry alloc+copy that collapses at scale and violates zero-copy), this only parallelizes
+    /// the eager BUILD ([`Self::build_lazy_prefix_key_stream`] inside [`Self::prefix_scan_iter_owned_arc`]
+    /// — the `sstloop` cost: overlapping-SST locate + reader open) across [`bg_read_pool`], and returns
+    /// K LAZY `Send` iterators. The caller (FFI) drains them lazily + zero-copy (`Arc<[u8]>` views, no
+    /// materialization), exactly like the serial `frs_vec_iter_prefix_open_batch`. Results are in input
+    /// order, one `Result` per prefix (a build failure is isolated to its slot).
+    pub fn batch_open_prefix_iters_parallel(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefixes: &[&[u8]],
+    ) -> Vec<ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>>>
+    {
+        let k = prefixes.len();
+        if k == 0 {
+            return Vec::new();
+        }
+        if k == 1 {
+            return vec![self.prefix_scan_iter_owned_arc(cf, prefixes[0])];
+        }
+        let pool = bg_read_pool();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, p) in prefixes.iter().enumerate() {
+            let me = Arc::clone(self);
+            let cf = cf.clone();
+            let prefix = p.to_vec();
+            let tx = tx.clone();
+            pool.submit(Box::new(move || {
+                // Only the BUILD runs here (eager locate + reader open); the returned iterator is
+                // lazy, so no rows are drained/materialized on the pool — the caller streams them.
+                let r = me.prefix_scan_iter_owned_arc(&cf, &prefix);
+                let _ = tx.send((i, r));
+            }));
+        }
+        drop(tx);
+        let mut out: Vec<
+            Option<ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send>>>,
+        > = (0..k).map(|_| None).collect();
+        let mut filled = 0usize;
+        while filled < k {
+            match rx.recv() {
+                Ok((i, r)) => {
+                    out[i] = Some(r);
+                    filled += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        out.into_iter()
+            .map(|o| {
+                o.unwrap_or_else(|| {
+                    Err(ForstError::internal(
+                        "batch_open_prefix_iters_parallel: a read-pool worker dropped its result",
+                    ))
+                })
+            })
+            .collect()
+    }
+
     /// Streaming form of [`Self::prefix_scan`].
     ///
     /// PR-B5-H2 / C8-H1: lazy k-way merge across ALL three LSM tiers
