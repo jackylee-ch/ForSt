@@ -406,3 +406,13 @@ Hypotheses tested: H1 amplification / H2 unbounded-state / H3 constant-factor.
   growing state + 93M output. **ForSt also DNFs** → disaggregated-LSM ceiling; forst-rs already beats ForSt.
 - **Implication:** no quick fix. The lever is the read-path/compaction-scaling module (block-cache fix
   was its first +25%). Design effort, not a patch. Two full runs DNF'd at MAXSEC 1500/1700 (91–92M/93M).
+
+## q20 sub-cause LOCALIZED (2026-06-09, DECAY_DIAG) — NOT read-amp, it's write+coordination
+DECAY_DIAG (TM log, $WORKENV-mounted) across the q20 run: L0 stays ≤3 files, NOTHING promoted to
+L1+, SST state ~1.3 GB while RSS ~13 GB → join state is MOSTLY MEMTABLE-RESIDENT; reads touch ≤3
+small L0 files (matches prior n_ovl 1–4 @72M). **Read-amp is NOT the cause** (reads cheap, like q9's
+µs engine read). The state-size throughput collapse (104K/s@40M → 7.8K/s tail@66M) is **write+
+coordination side**: flush/compaction/WBM management of a large resident working set + the async-state
+wait (q9's 14:1 park). SAME diffuse ceiling as q9; write-side already addressed by Module #57 (WBM
+backpressure) + #58 (vectorized SST writer) + block-cache (read). Residual = diffuse per-op efficiency,
+NOT a single un-pulled lever. ForSt also DNFs → disaggregated ceiling; forst-rs beats ForSt.
