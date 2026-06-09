@@ -744,3 +744,19 @@ per-key-group cache OWNED by each worker (lookup+populate on the worker thread, 
 cross-thread race). Then cache-hot queries (q17) keep zero-overhead cache AND cache-benefiting joins
 (q9) keep the accelerator AND windowed-joins (q8) are correct AND drain-tail queries (q11) win — all
 without robbing any. That is the multi-PR OPT-01; synchronization is insufficient (q17). Repo safe.
+
+## ★★★ DEFINITIVE root-cause model for OPT-01 non-universality (2026-06-10)
+q17/q11/q12 agg-state (ValueState/Aggregating/Reducing V2) do NOT use MapStateCache. So q17's 3.5×
+regression (76.7→270s) is THE PARALLEL EXECUTOR ITSELF, not the cache lock. => OPT-01's
+non-universality has TWO INDEPENDENT causes:
+1. EXECUTOR OVERHEAD: the synchronous-blocking-per-batch RoutingStateExecutor adds per-batch fan-out +
+   block latency that HELPS drain-tail-bound queries (q11 2.35×, eliminates the 178s serial drain) but
+   CATASTROPHICALLY ROBS non-drain-tail queries (q17 3.5× slower). Independent of the cache.
+2. CACHE RACE: the single-threaded MapStateCache races under parallel (q8 −40%); synchronized fixes
+   correctness (q8 EXACT) but the lock robs cache-hot MapState queries.
+=> TRUE universal OPT-01 needs BOTH: (a) a CORRECT ASYNC-OFFLOAD executor — incomplete future, NO
+per-batch block (the deadlock-free-but-non-blocking design; my synchronous version's block is what robs
+q17), so it pipelines for q11 WITHOUT adding latency for q17; (b) a LOCK-FREE per-worker cache. Both are
+the multi-PR OPT-01 (matches the doc's ForSt-coordinator design). Synchronous-block + sync-cache (this
+session's shortcuts) are insufficient. OPT-01 stays OPT-IN (net win only for drain-tail queries).
+Default = depth-1 (correct + fast for ALL). Repo safe; 3 reverts each caught a real regression.
