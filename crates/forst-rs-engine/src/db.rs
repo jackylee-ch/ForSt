@@ -6299,16 +6299,20 @@ impl DbImpl {
         prefix: &[u8],
     ) -> ForstResult<Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>>
     {
-        let cf_handle = cf.clone();
-        let inner = self.build_lazy_prefix_key_stream(cf, prefix)?;
-        let db = Arc::clone(self);
-        Ok(Box::new(inner.filter_map(
-            move |key_arc| match db.get_arc(&cf_handle, key_arc.as_ref()) {
-                Ok(Some(value)) => Some(Ok((key_arc, value))),
-                Ok(None) => None,
-                Err(e) => Some(Err(e)),
-            },
-        )))
+        // FRS-VALUE-CARRYING-UNIFY (2026-06-09): delegate to the value-carrying variant instead of
+        // resolving each yielded key via `get_arc` (which re-walked the WHOLE LSM per key — O(K×tiers),
+        // the per-record drain that made the parallel join path no faster than serial). The
+        // `_with_error_slot` variant resolves SST-resident `Put`s INLINE from the merge cursor
+        // (`next_with_value`/`ValueDecision`) — byte-identical results, no per-key re-walk. This is the
+        // SAME drain RocksDB/ForSt iterators do natively (value sits with the key in the block). The
+        // internal error slot carries merge tier-peek errors; value-resolution errors still surface
+        // in-band via the `Item = Result`. Removes the get_arc footgun for ALL callers
+        // (batch_open_prefix_iters_parallel, prefix_scan_iter_owned, benches, tests).
+        self.prefix_scan_iter_owned_arc_with_error_slot(
+            cf,
+            prefix,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
+        )
     }
 
     /// R17-M1: shared-error-slot variant of [`Self::prefix_scan_iter_owned_arc`].
