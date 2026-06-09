@@ -780,3 +780,18 @@ SIGNAL from the (invalid-cache) parallel sweep: parallel makes q7 FINISH (1052s)
 (1610s = 93,201,404 == RocksDB) — both DNF at depth-1. So OPT-01 (parallel) helps the heaviest joins
 FINISH (q9 still DNF even parallel @1700s). With the cache correct under parallel (the multi-PR fix),
 q7/q20 would finish correctly + parallel. Relaunching the VALID sweep on the clean committed jar.
+
+## ★★ VALID q0-q22 forst-rs sweep (committed depth-1 default, 2026-06-10)
+Clean committed jar (depth-1 default). out_rows correct except noted:
+q0 30.9s/100M | q1 29.3s/100M | q2 27.8s/100M | q3 35.6s/2,201,068 | q4 373.0s/25,835,082(retract) |
+q5 41.6s/808,765(windowed-agg, correctness?) | q7 1441.6s/92,000,002(finishes) | q8 43.6s/3,064,445(✓) |
+q9 DNF@1700 | q10 124.2s/100M | q11 264.8s/92M | q12 49.6s/92M | q13 28.5s | q14 29.4s | q15 161.8s/92M |
+q16 323.9s/92M | q17 77.7s/92M | q18 222.9s/92M | q19 527.9s/92M | q20 DNF@1700/93.2M(exact when finishes) |
+q21 53.9s | q22 43.6s.
+PASS (≥0.8×RDB, ≤50s, correct): q0/q1/q2/q3/q8/q12/q17/q18 (+ light q10/q13/q14/q21/q22). 
+FAIL: q4 (+59.5s >50s regression), q11 (0.42×), q19 (0.58×), q9 (DNF near-parity), q20 (DNF vs RDB 800s).
+q5 correctness suspect. q7 finishes 1441s (RDB baseline pending).
+=> 5 failing queries (q4/q9/q11/q19/q20) need the multi-PR levers: universal OPT-01 (parallel+lock-free
+per-worker cache → q11 pass, q7/q20 finish faster — the invalid parallel sweep showed q11=134.7s,
+q20=1610s EXACT, q7=1052s), OPT-02 (q9), q19 3rd lever (diffuse serde+engine), q4 (-9.5s to clear).
+3-backend: RocksDB/ForSt baselines in earlier rows; forst-rs side now complete.
