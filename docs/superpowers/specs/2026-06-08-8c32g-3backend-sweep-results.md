@@ -541,3 +541,17 @@ no-op placeholder (routing moves to executeBatchRequests where keys are known). 
 == 3,010,888 (depth-1) + q5/q7 + full q0-q22 under default-on, then default-enable OPT-01.
 DO NOT rush in low-context: a wrong split/route = silent correctness bug (the q8 class). This is the
 sole remaining blocker between the proven OPT-01 win (q11 2.35x) and the join-family Phase-1 pass.
+
+## key-group-affine routing — SCOPE confirmed = classifier-level refactor (2026-06-09)
+Code-read: createRequestContainer() returns the pooled VectorizedClassifier, which buckets requests
+BY TYPE (getKeys/putKeys/putValues/deleteKeys/appendMerge/iters) into shared columnar buffers. So
+key-group-affine routing requires partitioning ALL those typed arrays + columnar buffers PER WORKER by
+key-group at executeBatchRequests — a structural classifier/dispatch rework, NOT a localized edit.
+Cleanest implementation paths for next session:
+  (A) Per-worker classifiers: at executeBatchRequests, for each request compute keyGroup (via
+      RecordContext) -> append to per-worker classifier (worker=keyGroup%N) -> dispatch each ->
+      combine futures. Requires a classifier "add one request" API (currently filled by the AEC).
+  (B) Backend presents N sub-executors and the AEC routes records to them by key-group range (changes
+      the StateExecutor integration, higher-level).
+Either is a one-pass-resolvable refactor in FRESH context with the q8/q5/q7 + full-sweep gate. NOT
+safe to rush in low context (large surface, columnar-buffer partitioning). Default stays depth-1 (safe).
