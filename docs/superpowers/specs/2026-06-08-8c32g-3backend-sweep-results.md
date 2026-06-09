@@ -433,3 +433,19 @@ RETRACTED. Validated against 2026-06-09-forstrs-join-performance.md + re-confirm
   the `RoutingStateExecutor` (incomplete-future, real fullyLoaded) is UNUSED by the dispatch path (§4.3).
 - **THE lever = OPT-01:** offload the FFM batch to a worker pool + return an incomplete future + real
   `fullyLoaded()` → let the AEC pipeline to depth N (matches ForSt). Untested; efficacy needs impl+measure.
+
+## ★★★ OPT-01 SPIKE — offload efficacy CONFIRMED (2026-06-09), prior refutation EXPLAINED
+Minimal depth-N proof: q9 + FRS_RS_PARALLEL_EXECUTOR=1 + READ_IO_PARALLELISM=6 on the CURRENT jar
+(lock-free memtable + all levers), instrumented.
+- **Throughput +7.7–15%** vs depth-1 baseline: 37.19M@362s vs 32.24M (+15%); 39.50M@402s vs 36.67M (+7.7%).
+- **CPU 497–646% burst / ~400% steady** (vs the refuted experiment's pinned 375%/zero-speedup).
+- **Parallel dispatch fired:** ITER_DISPATCH_DIAG parDispatches=3.03M, fresh%=99, continuations=8265.
+- **No crash-loop** (iterView race fix held).
+**WHY the prior "parallel executor REFUTED" was pre-lock-free:** the memtable RwLock serialized the
+workers (375% CPU, zero speedup). This session's lock-free ArcSwap memtable (column_family.rs) removed
+that lock → offload now scales + helps. Refutation wasn't wrong; it predated the fix.
+**Remaining ceiling LOCATED:** steady CPU ~400% (not 800%) = workers still serialize on the BLOCKING
+single-threaded FFM iter open (frsVecIterPrefixOpenBatch) = OPT-02 (non-blocking/parallel FFM).
+**Validated path to beat RocksDB on q9/q20: OPT-01 (offload, +7.7–15% confirmed) + OPT-02 (non-blocking
+FFM → 400%→800%).** NOT a ceiling. Caveat: single noisy run; correctness (out_rows exact under parallel
+exec) must be verified before production-enabling.
