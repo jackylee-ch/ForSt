@@ -411,14 +411,31 @@ fn test_flush_error_propagates_to_next_writer() {
         }
     }
 
-    // If we get here, give the worker a final moment then try once more.
-    thread::sleep(Duration::from_millis(50));
-    let err = db.put(&cf, b"final", b"v").unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("injected write failure"),
-        "expected injected write failure after worker recorded failure, got {msg}"
-    );
+    // If we get here, the worker had not recorded the error before the first
+    // 200 writers checked the slot. Keep crossing writer boundaries until the
+    // background flush reports the injected write failure. A fixed sleep is
+    // racy on busy CI runners because the final writer can beat the worker.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut attempt = 0usize;
+    while Instant::now() < deadline {
+        let key = format!("final{:04}", attempt);
+        match db.put(&cf, key.as_bytes(), &[b'v'; 64]) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("injected write failure"),
+                    "expected injected write failure after worker recorded failure, got {msg}"
+                );
+                return;
+            }
+            Ok(_) => {
+                attempt += 1;
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    panic!("expected injected write failure after waiting for background flush worker");
 }
 
 /// Multiple writer threads + async flush. The on-disk + in-memory state
