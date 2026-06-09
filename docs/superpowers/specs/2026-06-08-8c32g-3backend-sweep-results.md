@@ -449,3 +449,13 @@ single-threaded FFM iter open (frsVecIterPrefixOpenBatch) = OPT-02 (non-blocking
 **Validated path to beat RocksDB on q9/q20: OPT-01 (offload, +7.7–15% confirmed) + OPT-02 (non-blocking
 FFM → 400%→800%).** NOT a ceiling. Caveat: single noisy run; correctness (out_rows exact under parallel
 exec) must be verified before production-enabling.
+
+## ★★★ OPT-01 CORRECTNESS + BIG WIN on q11 (2026-06-09)
+q11 + FRS_RS_PARALLEL_EXECUTOR=1 + READ_IO_PARALLELISM=6 (current jar): **FINISHED 135.8s,
+out_rows=92,000,000 EXACT.** Offload preserves correctness (make-or-break gate PASSED).
+**q11: 318.9s (depth-1) → 135.8s (offload) = 2.35× faster** → vs RocksDB 111.1s = **0.35×→0.82×:
+a FAILING query now PASSES the ≥0.8× bar.** Mechanism: depth-1 drained q11's in-flight backlog
+SERIALLY after source stop (178s tail); offload drains concurrently → tail eliminated. Strongest
+evidence yet that OPT-01 (async offload) is the dominant Phase-1 lever — flips fail→pass,
+correctness-preserved. Single run; needs default-safety check (must not regress light/source-bound
+queries per the "don't rob Peter" constraint) before default-enabling.
