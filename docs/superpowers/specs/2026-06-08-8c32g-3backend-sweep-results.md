@@ -515,3 +515,16 @@ mirroring Flink's key-group model. Complication: createRequestContainer() has no
 AEC container↔key-group association. Correctness-critical; careful implementation required. This is THE
 prerequisite for OPT-01 default-on (and the join-family Phase-1 win). Alternative: write-through (no
 per-worker cache) under parallel exec — simpler, sacrifices the cache perf lever.
+
+## ★★★ windowed-join race — fix DEFINITIVELY pinned (2026-06-09): key-group-affine routing REQUIRED
+Test (q8, parallel exec, cache ON vs OFF):
+- cache ON: out_rows 1,819,576 (-40%); cache OFF: 2,805,877 (-6.8%); depth-1: 3,010,888.
+- Disabling per-worker MapStateCache recovered ~1M of ~1.2M lost rows → cache fragmentation = MAJORITY
+  of the race. BUT residual ~6.8% under-emit with cache OFF → a SECOND race: per-key OP ORDERING
+  violated when a key's ops split across workers (key-agnostic leaseWorker), independent of the cache.
+**=> write-through alone is INSUFFICIENT. The fix MUST be KEY-GROUP-AFFINE ROUTING** (same key-group ->
+same worker), which solves BOTH cache fragmentation AND per-key ordering structurally. This is the
+DEFINITIVE prerequisite for OPT-01 default-on. Implementation: RoutingStateExecutor must route a
+container/batch to a worker by its records' key-group (needs the AEC container<->key-group association;
+if containers span key-groups, either batch per-key-group or split the dispatch by key-group). Then
+re-verify q5/q7/q8 exact + full q0-q22 under default-on, then OPT-02, then perf sweep.
