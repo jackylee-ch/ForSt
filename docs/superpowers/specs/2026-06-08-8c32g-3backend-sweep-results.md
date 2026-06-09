@@ -663,3 +663,9 @@ out_rows=92,000,000 EXACT. = 318.9s(depth-1) → 135.7s = 2.35× faster → 0.82
 depth-1 (318.9s) — so cache-off under parallel did NOT rob this cache-benefiting query (parallelism
 dominates). Weakens the "robs Peter" concern → default-enable is promising. Verifying q3(light)/q9(join)
 under parallel-coupled next to build the default-enable case.
+
+## Default-enable case-builder (parallel+cache-off, 2026-06-09)
+- q3 (light): 36.6s vs depth-1 36.7s, out_rows 2,201,068 EXACT = NEUTRAL + correct (no light-query tax).
+- q11 (window): 135.7s (2.35× vs depth-1 318.9s), 92M EXACT, 0.82× RocksDB = PASSES.
+- q8 (windowed-join): correct band (cache-off fixes the −10% race).
+- NEXT: q12 (cache-benefiting, deterministic 92M, depth-1 50.6s) — does parallel+cache-off rob it?
