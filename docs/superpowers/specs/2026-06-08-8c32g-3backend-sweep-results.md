@@ -655,3 +655,11 @@ REMAINING for DEFAULT-ENABLE: perf tradeoff — parallel forces cache-off global
 cache-benefiting queries (q11/q12/q16). Needs a HEALTHY-box sweep (parallelism gain vs cache loss). The
 deeper "keep cache under parallel" fix = run cache ops on the key-group's worker thread (future). q11
 deterministic (92M) under parallel-coupled IN FLIGHT to confirm broad executor correctness.
+
+## ★★★ q11 PASSES via parallel+cache-off (correct) (2026-06-09)
+q11 + FRS_RS_PARALLEL_EXECUTOR=1 (worker=3, cache auto-off via coupling): FINISHED 135.7s,
+out_rows=92,000,000 EXACT. = 318.9s(depth-1) → 135.7s = 2.35× faster → 0.82× RocksDB (111.1s) = PASSES
+≥0.8× bar, CORRECTLY. Notably cache-OFF+parallel (135.7s) is FASTER than cache-ON+parallel (253.8s) and
+depth-1 (318.9s) — so cache-off under parallel did NOT rob this cache-benefiting query (parallelism
+dominates). Weakens the "robs Peter" concern → default-enable is promising. Verifying q3(light)/q9(join)
+under parallel-coupled next to build the default-enable case.
