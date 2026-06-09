@@ -12196,9 +12196,16 @@ mod tests {
             let v = format!("value{:04}", i);
             db.put(&cf, k.as_bytes(), v.as_bytes()).unwrap();
         }
-        // Flushes run on the background pool; wait for the enqueued auto-flush
-        // before checking the installed L0 file.
-        db.wait_for_pending_flushes();
+        // Auto-flush submits work to the global background pool. Under parallel
+        // `cargo test` the pool can be busy, so synchronously drain the immutable
+        // memtable produced by the threshold switch if the worker has not landed it yet.
+        for _ in 0..100 {
+            if !db.version_set.current().l0_files().is_empty() {
+                break;
+            }
+            let _ = db.flush_cf(&cf).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!db.version_set.current().l0_files().is_empty());
         for i in 0..10u32 {
             let k = format!("key{:04}", i);
