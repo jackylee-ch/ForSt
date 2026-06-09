@@ -12196,7 +12196,9 @@ mod tests {
             let v = format!("value{:04}", i);
             db.put(&cf, k.as_bytes(), v.as_bytes()).unwrap();
         }
-        // Some L0 files should have been created.
+        // Flushes run on the background pool; wait for the enqueued auto-flush
+        // before checking the installed L0 file.
+        db.wait_for_pending_flushes();
         assert!(!db.version_set.current().l0_files().is_empty());
         for i in 0..10u32 {
             let k = format!("key{:04}", i);
