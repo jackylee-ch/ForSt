@@ -594,3 +594,17 @@ per JFR). 34 MapStateCacheTest green. NOTE: box is degraded after a long session
 vs the prior healthy-box 475s baseline) so q19's ABSOLUTE pass vs 0.8x (<=381s) needs a HEALTHY-box
 re-measure — the fix should bring q19 well below 475s there. This is the "second OVER-window lever"
 the doc called for. Join-family OPT-01 still needs the multi-PR key-group-affine routing fix.
+
+## OPT-01 key-group routing — DEADLOCK analysis + deadlock-free design (2026-06-09)
+My attempt hung q8 at src_out=921,085 (ran, then stalled — not immediate). Reasoned root cause:
+ad-hoc completion coordination, NOT the routing. executeBatchRequests fanned one batch across N
+workers + completed the container future only at remaining==0, with fullyLoaded()=busyWorkers>0 AND
+the sync path (executeRequestSync -> drainInflight() + workerThreads[0].submit().get() on the mailbox).
+Wait cycle: mailbox blocks in drainInflight/sync awaiting a multi-worker batch future while completion
+depends on threads the mailbox no longer services.
+DEADLOCK-FREE DESIGN (mirror ForStStateExecutor coordinator model): single coordinator thread that
+(a) keeps key-group->worker affinity (the q8 correctness fix), (b) returns an INCOMPLETE future
+immediately (offload), (c) maintains a real per-worker in-flight count for fullyLoaded(), (d) NEVER
+blocks the mailbox on the sync path while async batches are outstanding (drain via AEC yield, not
+.get()). This is the multi-PR OPT-01. Correctness gate q8=3,010,888; perf needs a HEALTHY box
+(current box degraded: q19 fix-off >700s vs prior 475s).
