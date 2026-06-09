@@ -555,3 +555,21 @@ Cleanest implementation paths for next session:
       the StateExecutor integration, higher-level).
 Either is a one-pass-resolvable refactor in FRESH context with the q8/q5/q7 + full-sweep gate. NOT
 safe to rush in low context (large surface, columnar-buffer partitioning). Default stays depth-1 (safe).
+
+## key-group-affine routing — IMPLEMENTATION-READY spec, all APIs confirmed (2026-06-09)
+Confirmed accessors: AsyncRequestContainer.offer(REQUEST)/isEmpty(); AsyncRequest.getRecordContext()
+-> RecordContext.getKeyGroup() (public int). StateRequest extends AsyncRequest<K>.
+DESIGN (RoutingStateExecutor rewrite — route at OFFER time, not split filled buffers):
+  - createRequestContainer() returns a RoutingRequestContainer wrapping N independent per-worker
+    VectorizedClassifier sub-containers (per-worker arena).
+  - RoutingRequestContainer.offer(req): kg=req.getRecordContext().getKeyGroup(); subContainer[kg % N].offer(req).
+    => same key-group always -> same worker -> same MapStateCache (read-your-writes) + per-key ordering. FIXES q8.
+  - executeBatchRequests(rc): for each non-empty sub-container, dispatch to workers[w] on workerThreads[w];
+    combine the N CompletableFutures (allOf) into the container future.
+  - isEmpty(): all sub-containers empty.
+LIFECYCLE (the hard part = why multi-PR, not 1 commit): per-worker classifiers are POOLED+reset per
+batch -> batch N+1 must NOT reuse a worker's classifier while batch N still runs on it. Need either
+double-buffered per-worker classifiers OR a real per-worker in-flight slot count feeding fullyLoaded()
+(=any worker has no free buffer). This is the doc's "buffer-ownership forces depth-1" issue (flagged as
+multiple PRs in VectorizedExecutor javadoc :385-393). VERIFY: q8=3,010,888 + q5/q7 + full q0-q22 under
+default-on, before default-enabling OPT-01. Then OPT-02 + perf sweep. Default stays depth-1 (safe) until done.
