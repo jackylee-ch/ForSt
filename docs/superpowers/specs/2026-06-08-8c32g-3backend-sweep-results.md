@@ -723,3 +723,10 @@ retain the accelerator AND get parallelism → OPT-01 default-enabled WITHOUT ro
 monitor cheap on the default single-threaded path. Committed + pushed (GHA). Verified: q8 EXACT, q11
 2.35×/92M/0.82×RDB PASS, q12 faster, q3 neutral. q9 re-test (cache kept) IN FLIGHT to confirm not-robbed.
 NEXT: full q0-q22 sweep (3 backends) = the goal's recheck.
+
+## OPT-01 universal default JUSTIFIED — q9 no longer robbed (2026-06-10)
+q9 default-on with thread-safe cache KEPT: 81.6M@1184s ≈ depth-1 84.5M@1204s = NEUTRAL (cache-off-
+parallel was 79.2M@1284s/61.7K/s → cache-kept 68.9K/s ≈ depth-1 70.2K/s; accelerator restored). So
+default-on (thread-safe cache) is NEUTRAL-OR-BETTER across all tested families: q3 neutral, q8 EXACT
+(3,064,457), q9 neutral (~0.85× both DNF), q11 2.35× PASS, q12 faster. No rob-Peter → default JUSTIFIED.
+REMAINING: full q0–q22 sweep (passing-set no-regression + q20/q4 + 3-backend) = the goal's recheck.
