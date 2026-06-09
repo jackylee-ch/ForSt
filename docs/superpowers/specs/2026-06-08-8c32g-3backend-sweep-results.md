@@ -704,3 +704,11 @@ must run on the SAME key-group worker thread — i.e., move the read-cache INTO 
 processing (per-key-group, owned by the worker), not split mailbox-lookup / worker-populate. Then
 cache-benefiting joins (q9) keep the accelerator AND get parallelism, no race → OPT-01 default-safe
 without robbing q9. This is THE blocker for default-on; q9/q20 throughput separately need OPT-02.
+
+## q19 still FAILS 0.8× even with findRow fix (2026-06-10)
+q19 re-measure (findRow fix, default depth-1): DNF >600s. Same-box A/B earlier: findRow-ON 599.7s vs
+findRow-OFF >700s (fix helps) but healthy-box best ~475s = ~0.64× RocksDB (305s) — still FAILS ≤381s
+(0.8×). q19 (OVER-window/TopN) needs a THIRD lever beyond findRow (findRow fixed the 52%-CPU hotspot
+but residual remains — profile the post-findRow q19 for the next bottleneck). FAILING SET (none pass by
+default): q4(1.9× retract-join), q9(DNF, needs OPT-02/engine), q11(0.35× default — 0.82× only via
+opt-in parallel which robs q9), q19(~0.64×, needs 3rd lever), q20(DNF, OPT-02/engine). All multi-PR.
