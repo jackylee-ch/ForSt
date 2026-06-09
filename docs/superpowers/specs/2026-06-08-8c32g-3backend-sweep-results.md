@@ -730,3 +730,17 @@ parallel was 79.2M@1284s/61.7K/s → cache-kept 68.9K/s ≈ depth-1 70.2K/s; acc
 default-on (thread-safe cache) is NEUTRAL-OR-BETTER across all tested families: q3 neutral, q8 EXACT
 (3,064,457), q9 neutral (~0.85× both DNF), q11 2.35× PASS, q12 faster. No rob-Peter → default JUSTIFIED.
 REMAINING: full q0–q22 sweep (passing-set no-regression + q20/q4 + 3-backend) = the goal's recheck.
+
+## ★★★ OPT-01 default REVERTED again (3rd) — thread-safe cache robs q17 (2026-06-10)
+q17 (group-agg, cache-HOT) default-on with thread-safe cache: FINISHED 270.0s vs depth-1 76.7s = 3.5×
+REGRESSION (out_rows 92M correct). The parallel executor + CONTENDED synchronized-cache (q17 hammers
+the cache at high hit-rate; multiple workers + mailbox contend the lock) catastrophically robs q17.
+=> Every default shortcut robs SOME query: cache-OFF+parallel robs q9 (cache-benefiting joins);
+synchronized-cache+parallel robs q17 (cache-hot agg, lock contention). Reverted default-on (git revert
+e4d487df177) → known-good opt-in: default depth-1 + unsynchronized cache (q17 76.7s, q9 fast, ALL
+correct+fast); OPT-01 opt-in (cache-off+parallel, correct, q11 2.35× when enabled).
+**DEFINITIVE: OPT-01 universal default REQUIRES the deep cache-into-worker fix** — a LOCK-FREE
+per-key-group cache OWNED by each worker (lookup+populate on the worker thread, no shared lock, no
+cross-thread race). Then cache-hot queries (q17) keep zero-overhead cache AND cache-benefiting joins
+(q9) keep the accelerator AND windowed-joins (q8) are correct AND drain-tail queries (q11) win — all
+without robbing any. That is the multi-PR OPT-01; synchronization is insufficient (q17). Repo safe.
