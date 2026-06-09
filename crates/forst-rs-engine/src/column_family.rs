@@ -319,6 +319,17 @@ impl std::fmt::Debug for ColumnFamilyDescriptor {
 /// individually) so further writes are rejected at the shard level.
 pub type SharedMemTable = Arc<ShardedMemTable>;
 
+/// FRS-LOCKFREE-MEMTABLE (2026-06-09): the active memtable + immutable queue as ONE immutable
+/// snapshot, swapped atomically (RocksDB "superversion"). Held behind `ColumnFamilyData.memtables:
+/// ArcSwap<MemtableSet>` so reads are lock-free and a switch is a single atomic publish — readers
+/// always see a consistent (active, imms) pair and never block on a switch.
+#[derive(Clone)]
+struct MemtableSet {
+    active: SharedMemTable,
+    /// Newest-last. `Arc<Vec<…>>` so `imm_memtables()` can hand out a cheap clone of the list.
+    imms: Arc<Vec<SharedMemTable>>,
+}
+
 /// Mutable, per-column-family runtime state.
 ///
 /// Holds the active memtable, the immutable memtable queue, and a lock-free
@@ -367,8 +378,15 @@ pub struct ColumnFamilyData {
     /// `dyn CompactionFilter` is unsized so `ArcSwapOption` (which needs
     /// `Sized` inner) is not an option here.
     compaction_filter: RwLock<Option<Arc<dyn CompactionFilter>>>,
-    active_memtable: RwLock<SharedMemTable>,
-    imm_list: RwLock<Vec<SharedMemTable>>,
+    /// FRS-LOCKFREE-MEMTABLE (2026-06-09): the active memtable + immutable list as ONE immutable
+    /// bundle behind an `ArcSwap` (RocksDB "superversion" model), replacing the prior
+    /// `RwLock<active_memtable>` + `RwLock<imm_list>`. Reads (`active_memtable()`/`imm_memtables()`)
+    /// are a lock-free `load()`; a memtable switch installs a NEW `MemtableSet` via an atomic
+    /// `rcu` swap. Pinned root cause of the q7/q9/q20 join wall: per-probe read-lock acquisition on
+    /// these pointers blocked ~1ms behind frequent memtable switches (WBM force-switch under join
+    /// ingest). One atomic bundle = readers never block on a switch AND always observe a consistent
+    /// (active, imms) snapshot (no key ever invisible mid-switch). Mirrors the `sst_readers` ArcSwap.
+    memtables: ArcSwap<MemtableSet>,
     cached_snapshot_view: ArcSwap<SnapshotView>,
     /// Serializes per-CF flush operations so concurrent callers cannot
     /// flush the same oldest imm twice.
@@ -467,8 +485,10 @@ impl ColumnFamilyData {
             options,
             merge_operator,
             compaction_filter: RwLock::new(compaction_filter),
-            active_memtable: RwLock::new(memtable),
-            imm_list: RwLock::new(Vec::new()),
+            memtables: ArcSwap::from_pointee(MemtableSet {
+                active: memtable,
+                imms: Arc::new(Vec::new()),
+            }),
             cached_snapshot_view: ArcSwap::new(initial_snapshot),
             flush_mutex: Mutex::new(()),
             shard_count,
@@ -537,12 +557,14 @@ impl ColumnFamilyData {
     /// Returns a clone of the active memtable `Arc`. Callers can then acquire
     /// a read or write lock on the returned pointer.
     pub fn active_memtable(&self) -> SharedMemTable {
-        self.active_memtable.read().expect("lock poisoned").clone()
+        // Lock-free load — never blocks on a concurrent memtable switch.
+        self.memtables.load().active.clone()
     }
 
     /// Returns a cloned snapshot of the immutable memtable list (oldest first).
     pub fn imm_memtables(&self) -> Vec<SharedMemTable> {
-        self.imm_list.read().expect("lock poisoned").clone()
+        // Lock-free load; clone the (typically tiny) list out of the immutable snapshot.
+        (*self.memtables.load().imms).clone()
     }
 
     /// Returns the currently cached snapshot view.
@@ -559,43 +581,35 @@ impl ColumnFamilyData {
     /// queue, installing a fresh empty memtable in its place. Returns the
     /// frozen memtable (shared `Arc<ShardedMemTable>`).
     pub fn swap_active_memtable(&self) -> SharedMemTable {
-        // A-R8-H1: hold the active-memtable write lock across the imm
-        // push so the swap is atomic to readers. Pre-fix the lock was
-        // dropped (line 404) before pushing `old` onto `imm_list`,
-        // leaving a window where:
-        //   * cf_data.active_memtable() returns the FRESH (empty) active;
-        //   * cf_data.imm_memtables() returns a vec WITHOUT `old`;
-        //   * every entry in `old` is invisible to all reads
-        //     (get_internal, iter_versions_of, scan, scan_at,
-        //     prefix_scan_iter, batch_get) for the duration of the gap.
-        // Acquiring imm_list's write lock while still holding
-        // active_guard makes the (active swap) + (imm push) atomic
-        // from a reader's perspective — readers that observe the new
-        // active also observe `old` on imm_list.
-        let mut active_guard = self.active_memtable.write().expect("lock poisoned");
-        let old = std::mem::replace(
-            &mut *active_guard,
-            Arc::new(ShardedMemTable::new(
-                self.shard_count,
-                MemTableConfig::default(),
-            )),
-        );
-        // Freeze the old memtable BEFORE the imm push so readers that
-        // pick it up from imm_list immediately observe its frozen
-        // state (no shard-level writes can race the freeze).
-        old.freeze();
-        // Push to imm_list while still holding active_guard.
-        self.imm_list
-            .write()
-            .expect("lock poisoned")
-            .push(old.clone());
-        drop(active_guard);
-        old
+        // FRS-LOCKFREE-MEMTABLE: a SINGLE atomic `rcu` publish makes (new active) + (old pushed to
+        // imms) visible together — readers that observe the new active ALSO observe the old on imms,
+        // and a reader mid-swap loads either the whole old set or the whole new set (never a torn
+        // state where the old active's keys are invisible). This is the same atomicity the prior
+        // A-R8-H1 two-write-lock dance guaranteed, but WITHOUT blocking concurrent readers (the join
+        // read-path wall). The closure is pure + idempotent-safe under CAS retry: `freeze()` is
+        // idempotent; the fresh active is allocated once and Arc-cloned per attempt.
+        let fresh_active: SharedMemTable = Arc::new(ShardedMemTable::new(
+            self.shard_count,
+            MemTableConfig::default(),
+        ));
+        let prev = self.memtables.rcu(|cur| {
+            // Freeze the old active BEFORE publishing so any reader that picks it up from `imms`
+            // immediately observes its frozen state (no shard-level write can race the freeze).
+            cur.active.freeze();
+            let mut imms = (*cur.imms).clone();
+            imms.push(cur.active.clone());
+            MemtableSet {
+                active: fresh_active.clone(),
+                imms: Arc::new(imms),
+            }
+        });
+        // `prev.active` is the now-frozen memtable that just moved to the immutable queue.
+        prev.active.clone()
     }
 
     /// Returns the number of immutable memtables currently queued.
     pub fn imm_count(&self) -> usize {
-        self.imm_list.read().expect("lock poisoned").len()
+        self.memtables.load().imms.len()
     }
 
     /// FRS-RESIDENT-FLUSHED: returns a cloned snapshot of the resident
@@ -807,11 +821,22 @@ impl ColumnFamilyData {
     /// Removes the oldest immutable memtable from the queue (called after
     /// flush completes).
     pub fn pop_oldest_imm(&self) -> Option<SharedMemTable> {
-        let mut guard = self.imm_list.write().expect("lock poisoned");
-        if guard.is_empty() {
+        // FRS-LOCKFREE-MEMTABLE: atomic rcu drop of the oldest imm. `prev.imms[0]` (if any) is the
+        // memtable we removed — return it. Pure closure (clone-mutate-publish), safe under CAS retry.
+        let prev = self.memtables.rcu(|cur| {
+            let mut imms = (*cur.imms).clone();
+            if !imms.is_empty() {
+                imms.remove(0);
+            }
+            MemtableSet {
+                active: cur.active.clone(),
+                imms: Arc::new(imms),
+            }
+        });
+        if prev.imms.is_empty() {
             None
         } else {
-            Some(guard.remove(0))
+            Some(prev.imms[0].clone())
         }
     }
 

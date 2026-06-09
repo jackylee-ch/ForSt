@@ -696,6 +696,10 @@ impl ShardedMemTable {
         let cd_sampled = cursor_diag::hit(cursor_diag::k());
         let mut cd_scan_ns = 0u64;
         let mut cd_sort_ns = 0u64;
+        // FRS-CURSOR-SUBCAUSE (2026-06-09): split the per-probe memtable cost into LOCK-acquire
+        // (16 read-locks contending with concurrent writers/switches) vs SCAN vs cursor CONSTRUCTION,
+        // to settle whether the ~1ms `active_us` (ITER_DIAG) is RwLock-wait or build overhead.
+        let mut cd_lock_ns = 0u64;
         for shard in &self.shards {
             // FRS-READLOCK-SCAN (2026-06-01): use a READ lock and DO NOT merge on
             // the scan path. `prefix_scan_keys` is `&self` and already enumerates
@@ -704,7 +708,11 @@ impl ShardedMemTable {
             // the unsorted buffer is bounded by MAX_UNSORTED_MERGE_THRESHOLD
             // (4096), so the unsorted filter is O(4096), not O(N). Mirrors
             // `range_scan_cursor`, which already scans under a read lock.
+            let lt = cd_sampled.then(std::time::Instant::now);
             let guard = shard.read().expect("lock poisoned");
+            if let Some(t) = lt {
+                cd_lock_ns += t.elapsed().as_nanos() as u64;
+            }
             let st = cd_sampled.then(std::time::Instant::now);
             let mut keys = guard.prefix_scan_keys(lower, upper);
             if let Some(t) = st {
@@ -721,10 +729,21 @@ impl ShardedMemTable {
             }
             shard_snapshots.push(keys);
         }
+        let ct = cd_sampled.then(std::time::Instant::now);
+        let cursor = MemTierCursor::new(shard_snapshots);
         if cd_sampled {
+            let cd_construct_ns = ct.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
             cursor_diag::record(cd_scan_ns, cd_sort_ns);
+            eprintln!(
+                "[CURSOR_SUBCAUSE] lock_ns={} scan_ns={} sort_ns={} construct_ns={} n_shards={}",
+                cd_lock_ns,
+                cd_scan_ns,
+                cd_sort_ns,
+                cd_construct_ns,
+                self.shards.len()
+            );
         }
-        MemTierCursor::new(shard_snapshots)
+        cursor
     }
 
     /// B-R7-NEW-H1: range-bounded variant of [`Self::prefix_scan_cursor`].
