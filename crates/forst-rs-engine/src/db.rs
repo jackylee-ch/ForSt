@@ -6061,7 +6061,7 @@ impl DbImpl {
     /// The async-state executor batches K iterator probes (one per record) that the legacy
     /// path runs SERIALLY (one FFI crossing + one `build_lazy_prefix_key_stream` each). The K
     /// probes are INDEPENDENT, read-only reads, so this fans them across the process-global
-    /// [`bg_read_pool`] — overlapping the per-probe LSM build+drain across cores (ForSt's
+    /// `bg_read_pool` — overlapping the per-probe LSM build+drain across cores (ForSt's
     /// read-io-parallelism model). Results are returned in INPUT ORDER, one `Result` per
     /// prefix (a probe failure is isolated to its own slot, never aborting the batch).
     ///
@@ -9738,7 +9738,7 @@ fn bg_read_pool() -> &'static crate::bg_pool::WorkerPool {
     use std::sync::OnceLock;
     static P: OnceLock<crate::bg_pool::WorkerPool> = OnceLock::new();
     P.get_or_init(|| {
-        let n = bg_pool_threads("FRS_RS_READ_IO_PARALLELISM", |c| c.min(4).max(1));
+        let n = bg_pool_threads("FRS_RS_READ_IO_PARALLELISM", |c| c.clamp(1, 4));
         crate::bg_pool::WorkerPool::new(n, "forst-rs-read")
     })
 }
@@ -12429,19 +12429,37 @@ mod tests {
         // "user:" + "order:" are flushed to an SST; "item:" stays in the memtable;
         // "user:" gets MORE rows after flush so a probe must merge SST + memtable.
         for i in 0..20u32 {
-            db.put(&cf, format!("user:{i:03}").as_bytes(), format!("U{i}").as_bytes())
-                .unwrap();
-            db.put(&cf, format!("order:{i:03}").as_bytes(), format!("O{i}").as_bytes())
-                .unwrap();
+            db.put(
+                &cf,
+                format!("user:{i:03}").as_bytes(),
+                format!("U{i}").as_bytes(),
+            )
+            .unwrap();
+            db.put(
+                &cf,
+                format!("order:{i:03}").as_bytes(),
+                format!("O{i}").as_bytes(),
+            )
+            .unwrap();
         }
-        db.switch_and_flush(&cf).unwrap().expect("flush produced sst");
+        db.switch_and_flush(&cf)
+            .unwrap()
+            .expect("flush produced sst");
         for i in 20..30u32 {
-            db.put(&cf, format!("user:{i:03}").as_bytes(), format!("U{i}").as_bytes())
-                .unwrap();
+            db.put(
+                &cf,
+                format!("user:{i:03}").as_bytes(),
+                format!("U{i}").as_bytes(),
+            )
+            .unwrap();
         }
         for i in 0..15u32 {
-            db.put(&cf, format!("item:{i:03}").as_bytes(), format!("I{i}").as_bytes())
-                .unwrap();
+            db.put(
+                &cf,
+                format!("item:{i:03}").as_bytes(),
+                format!("I{i}").as_bytes(),
+            )
+            .unwrap();
         }
 
         // Probe set: overlapping/disjoint/empty (no-match) prefixes. >1 → fan-out path.
@@ -12465,10 +12483,17 @@ mod tests {
         }
 
         // Sanity on the data shape so a silently-empty pass can't mask a regression.
-        assert_eq!(parallel[0].as_ref().unwrap().len(), 30, "user: = 20 pre + 10 post-flush");
+        assert_eq!(
+            parallel[0].as_ref().unwrap().len(),
+            30,
+            "user: = 20 pre + 10 post-flush"
+        );
         assert_eq!(parallel[1].as_ref().unwrap().len(), 20, "order:");
         assert_eq!(parallel[2].as_ref().unwrap().len(), 15, "item:");
-        assert!(parallel[3].as_ref().unwrap().is_empty(), "missing: = no match");
+        assert!(
+            parallel[3].as_ref().unwrap().is_empty(),
+            "missing: = no match"
+        );
     }
 
     /// `batch_prefix_scan_parallel` on the single-probe and empty-batch fast paths.

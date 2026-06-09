@@ -5673,17 +5673,14 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
                             .into_iter()
                             .map(|(k, v)| (IterKey::Vec(k), IterValue::Vec(v))),
                     );
-                    let mut handle_state = IterHandle::new_with_error_slot(
-                        inner,
-                        Arc::new(Mutex::new(None)),
-                    );
+                    let mut handle_state =
+                        IterHandle::new_with_error_slot(inner, Arc::new(Mutex::new(None)));
                     let (bytes_used, row_count, iter_exhausted) =
                         fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap);
                     if iter_exhausted {
                         handle_state.drop_inner();
                     }
-                    let handle_id =
-                        NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     shard_for(handle_id)
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -9013,7 +9010,10 @@ mod tests {
                     );
                 }
             }
-            assert_eq!(frs_put(db, cf, b"zzz".as_ptr(), 3, b"vz".as_ptr(), 2), FRS_STATUS_OK);
+            assert_eq!(
+                frs_put(db, cf, b"zzz".as_ptr(), 3, b"vz".as_ptr(), 2),
+                FRS_STATUS_OK
+            );
 
             let n = prefixes.len();
             let mut offs: Vec<u32> = Vec::with_capacity(n + 1);
@@ -9048,7 +9048,11 @@ mod tests {
                 chunks.as_mut_ptr(),
                 CHUNK_CAP,
             );
-            assert_eq!(rc, FrsErrorCode::Ok as i32, "parallel batch open should return Ok");
+            assert_eq!(
+                rc,
+                FrsErrorCode::Ok as i32,
+                "parallel batch open should return Ok"
+            );
 
             let mut sorted = handles.clone();
             sorted.sort_unstable();
@@ -9058,7 +9062,10 @@ mod tests {
 
             for i in 0..n {
                 let chunk = &chunks[i];
-                assert_eq!(chunk.row_count, 3, "probe {i} first chunk should have 3 rows");
+                assert_eq!(
+                    chunk.row_count, 3,
+                    "probe {i} first chunk should have 3 rows"
+                );
                 let rows = decode_chunk_buf(&chunk_storage[i], chunk.bytes_used, chunk.row_count);
                 assert_eq!(rows.len(), 3);
                 for (k, _) in &rows {
