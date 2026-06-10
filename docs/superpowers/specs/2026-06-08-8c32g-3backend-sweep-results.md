@@ -1292,3 +1292,15 @@ read I/O. FIX (7ebe51daa): ratio gate — drain only when tombstones >= 20% of e
 flushed since last drain (q9-class drains, q7-class skips; never-rob by construction).
 VALIDATION running: q7@1700 (must restore ~1441-class) then q9@2700 (must keep the
 2484.4s finish — q9's delete ratio is high so the gate stays open for it).
+
+# q7 ratio-gate validation (night): partial recovery, residual gap needs control
+| q7@100M run | @1684s | verdict |
+|---|---|---|
+| lever stack, absolute drain | 79.5M | drain robbed q7 |
+| lever stack, RATIO gate (7ebe51daa) | 86.0M (+8%) | gate recovers part |
+| pre-lever (different day/jar) | finished 1441.6s | residual ~25% unattributed |
+Residual candidates: jar changes (classifier pool era), N14 (q7 = merge-heavy), bloom
+overhead on hot-prefix scans, or cross-DAY variance (the ±10% band was measured
+within one day). CONTROL queued: q7@100M with FRS_DISABLE_PREFIX_BLOOM=1 +
+FRS_GARBAGE_DRAIN_TOMBSTONES=0 on the current jar — separates engine levers from
+jar/variance. q9 ratio-gate validation in flight (must keep the 2484.4s finish).
