@@ -897,3 +897,16 @@ RocksDB finishes because sync in-process block-cache reads have a µs-class floo
 Estimates (A=executor, B=direct-read): q7 1441→A ~750-1000 → A+B ~500-700 (bar <587);
 q9 ~2600→A ~1100-1500 → A+B ~700-1200 (bar 1776); q20 1610(par)→A ~1200-1450 →
 A+B ~700-1000 (bar 1074); q11 134.7 measured (bar 132.6). GO on A+B.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# q9 READ_AT_DIAG discriminator (2026-06-10) — Stage-2 lever CORRECTED
+# ═══════════════════════════════════════════════════════════════════════════
+Run: q9 EVENTS_NUM=50M, FRS_READ_AT_DIAG=1. FINISHED 813.5s, out_rows=45,904,788
+(fast A/B baseline for read-path levers).
+- Histogram (LocalFirstSstFile.read_at — the SYNC local-cache-hit pread path):
+  reads=6.3M→9.4M across decay; mean 146µs→191µs; cold(≥20µs) 24.9%→29.1% RISING;
+  ~72% warm 1-5µs. ~0.6 preads/record × ~182µs ≈ 110µs/record = the measured floor.
+- VERDICT: tokio/block_on REFUTED for local decay (sync fast path already exists and
+  is where the time goes). Binder = COLD PREADS once state outgrows container page
+  cache (Docker-VM disk ~0.1-1ms). Levers: (a) per-probe SST bloom/range pruning,
+  (b) block-cache hit-rate for join hot set, (c) compaction shape. Engine-only.

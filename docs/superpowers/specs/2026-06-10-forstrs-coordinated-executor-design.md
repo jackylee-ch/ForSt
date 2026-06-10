@@ -126,13 +126,26 @@ full data in the sweep doc "q9 DEEP PROFILE" section) established:
   alone can't fix a high per-op floor) and RocksDB's finish (sync in-process
   block-cache reads, µs-class floor).
 
-**Stage-2 lever (now co-primary with Stage 1): direct-local-read** — serve
-local-cache/local-disk block reads synchronously on the calling thread, bypassing
-the block_on/tokio handoff; keep the async path for genuinely remote reads.
-Engine-only, benefits all read-heavy queries (q9/q19/q7/q20/q4), config untouched.
+**Stage-2 lever — CORRECTED by the FRS_READ_AT_DIAG discriminator (2026-06-10):**
+the "bypass block_on/tokio" theory is REFUTED for the local decay regime. The sync
+local fast path already exists (`LocalFirstSstFile.read_at_impl` → `get_range_into`
+pread, cached_fs.rs:769-789); the histogram on a 50M q9 run shows the latency lives
+INSIDE that path: mean 146→191µs and cold(≥20µs) 24.9%→29.1% RISING through decay,
+~72% of reads warm 1-5µs. Arithmetic: ~0.6 preads/record × ~182µs ≈ 110µs/record =
+the measured floor. Verdict: **cold preads against the (Docker-VM) local disk once
+state outgrows the container page cache** — read VOLUME × page-cache-miss, not
+dispatch overhead. (50M q9 baseline for A/B: finishes 813.5s.)
 
-Deferred follow-ups (re-rank after Stage 1 + direct-local-read land): q20
-prefix-bloom probe pruning; decode-per-entry allocations; mailbox serialization.
+**Stage-2 lever (corrected): reduce blocks read per probe** — in priority order:
+(a) per-probe SST pruning on the prefix/iter path (bloom + tighter key-range skip
+so a probe touches only SSTs that can contain the prefix — RocksDB's actual
+advantage on q9/q20-class state); (b) block/chunk-cache effectiveness for the join
+hot set (verify what fraction of these preads SHOULD have been block-cache hits);
+(c) compaction shape (fewer overlapping tiers per probe). All engine-only.
+
+Deferred follow-ups: decode-per-entry allocations; mailbox serialization; tokio
+handoff on the genuinely-remote path (still real for S3/Phase-2, just not the
+local-mode binder).
 
 ### 3.4 Estimated post-fix performance (A = Stage-1 executor, B = direct-local-read)
 
