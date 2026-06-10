@@ -910,3 +910,35 @@ Run: q9 EVENTS_NUM=50M, FRS_READ_AT_DIAG=1. FINISHED 813.5s, out_rows=45,904,788
   is where the time goes). Binder = COLD PREADS once state outgrows container page
   cache (Docker-VM disk ~0.1-1ms). Levers: (a) per-probe SST bloom/range pruning,
   (b) block-cache hit-rate for join hot set, (c) compaction shape. Engine-only.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PR-1 coordinated-executor GATES + bisect (2026-06-10) — two verdicts
+# ═══════════════════════════════════════════════════════════════════════════
+Jar = clean build @7a14ccaf1a7 (classifier pool + CoordinatedStateExecutor + 3-way gate).
+GHA ci-forst-rs GREEN. All runs 8c/32g, 100M, FRS_RS_EXECUTOR as noted.
+
+| run                        | wall    | out_rows   | verdict |
+|----------------------------|---------|------------|---------|
+| q17 coordinated N=3        | 271.8s  | 92M exact  | ✗ FAIL ≤85s gate (depth-1 = 77s; ForSt = 253s!) |
+| q8  coordinated N=3        | 40.6s   | 2,511,323  | ✗ FAIL band (−18% under-emit) |
+| q8  routing  N=3 (this jar)| 40.7s   | 3,064,485  | ✓ band (Task-1 pool exonerated) |
+| q8  coordinated N=1        | 45.6s   | 3,064,540  | ✓ band (pipelining alone OK) |
+
+## Verdict 1 — q17: the COORDINATOR HANDOFF is the q17 robber, not the blocking
+Non-blocking coordinated N=3 = 271.8s ≈ ForSt's own q17 (253.0s). High-rate cheap-state
+queries (1.2M rec/s) die on per-batch mailbox→worker→mailbox switches regardless of
+blocking. Depth-1 inline is WHY frs beats ForSt 3.3× on q17. ⇒ default must be ADAPTIVE:
+inline for get-only/cheap batches, offload iterator-containing batches (every measured
+parallel win is iter-heavy; every robbery is cheap-batch handoff).
+
+## Verdict 2 — q8 N=3: write/read ORDER INVERSION via mailbox-direct statebuf writes
+MapStateV2 put/remove/clearForPrefix flush DIRECTLY to the engine on the mailbox
+(MapStateArrowBuffer.putShared → flushTo :171/:177; clearForPrefix), while engine
+reads (iters/gets) queue behind worker backlogs. With run-ahead (N=3; N=1 is throttled
+by fullyLoaded=ongoing≥1 into quasi-lockstep) a LATER cleanup-remove lands BEFORE an
+EARLIER-created iter executes → iter misses live rows → −18%. Matches all 3 bisect cells.
+⇒ Correct fix = reads execute against a CREATION/DISPATCH-time MVCC snapshot (engine
+has MVCC + snapshot_view): capture/pin seq per batch on the mailbox at dispatch, workers
+read as-of-seq, release after batch. Restores exact depth-1 visibility semantics under
+any scheduling. Required for ANY parallel default (incl. opt-in routing? NO — routing
+blocks the mailbox, no run-ahead, proven correct).
