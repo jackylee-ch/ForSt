@@ -1218,3 +1218,19 @@ garbage-drain v1+continuous); all exactness-verified; box unfit for bar judgment
 v1 CONTAINS garbage at 100M (vs the unbounded pre-drain climb) but doesn't shrink it
 (zeroed counter forfeits backlog). Continuous mode (f716a70fc) targets exactly this:
 expect a materially lower plateau on the rebooted-box re-run.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# NEW-STACK 10M CORRECTNESS GATE (full suite, frs vs rocksdb, 2026-06-10 evening)
+# Engine = prefix bloom v3 + N14 depth-gated + garbage-drain v1 (928b25535-era .so)
+# ═══════════════════════════════════════════════════════════════════════════
+EXACT out_rows match (20/22): q0,q1,q2,q3,q7,q8,q9,q10,q11,q12,q13,q14,q15,q16,
+q17,q18,q19,q20,q21,q22 — including the heavy joins q7=9,200,001 / q9=9,177,252 /
+q20=9,321,032 byte-equal to RocksDB. The lever stack is functionally clean.
+EXCEPTIONS:
+- q4: frs WEDGED at 9.65M/9.8M rate=0 (NEW-STACK STALL — bisect with kill-switches:
+  drain off → bloom off; q4 finished on all prior builds = blocker until fixed).
+- q5: 599,672 vs 2,998,360 = the PRE-EXISTING exact-1/5 HOP churn ratio (inner window
+  agg proven exact 2026-06-10 morning; not lever-induced; tracked separately).
+ALSO: scratch dir held 54GB/926 entries of dead artifacts (43GB nexmark-qout +
+hundreds of stale planner jars) — cleaned to 3.5GB; drift test pending to decide
+whether THIS (not the box) caused the day's +25% degradation.
