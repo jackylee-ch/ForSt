@@ -1377,3 +1377,18 @@ engine is no longer the bottleneck), (4) block locality. q20 = OPT-N04 merge-op
 Bar 1776s gap = 225s (1.13×). Curve slope unbroken — probing 100K. GHA note: the
 single ci-rust failure was the known-flaky flush_worker coverage trio (passed on
 identical code in adjacent runs); all code-bearing pushes green.
+
+# ★ q9 TUNING MAP COMPLETE — drain-threshold KNEE at 200K (2026-06-11 03:00)
+| routing + threshold | wall |
+|---|---|
+| 2M | 2378.5s |
+| 500K | 2199.2s |
+| **200K (knee)** | **2001.2s** |
+| 100K | 2038.7s (flattened — reclaim benefit ≈ drain overhead) |
+All seven q9@100M finishes: out_rows 91,813,372 IDENTICAL. FULL JOURNEY: DNF-forever
+→ 2001.2s (1.41× RDB; bar 1776 gap 225s). Remaining levers for the last 225s:
+OPT-N16 zero-copy batch-get (to_vec at every tier — warm-path CPU), routing pool
+width 4-6, block locality. BEFORE folding 200K into defaults: validate q7 (ratio
+gate should hold) + q17/q20 at the winning setting. q9's bar is now ONE build-lever
+away — the architecture campaign converted an unfinishable query into a tuned,
+deterministic, near-bar pipeline.
