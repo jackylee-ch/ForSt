@@ -1251,3 +1251,16 @@ identified mechanism (not "the Mac degrading", not junk). RULE: ±10% error bars
 single runs; only back-to-back large deltas and DNF/finish transitions are decisions.
 The q9 100M lever progression (91M→94.8M→98M-source-complete at cutoff) EXCEEDS the
 noise band and stands.
+
+# ★ q9@100M FIRST FINISH (2026-06-10 night): 2484.4s, out_rows=91,813,372
+| build | outcome |
+|---|---|
+| pre-levers | DNF ~91M@2400 cutoff |
+| + prefix bloom v3 | DNF 94.8M@2400 |
+| + garbage-drain v1 | DNF (source-complete 98M@2388, tail cut @2400) |
+| + CONTINUOUS drain (f716a70fc) | **FINISHED 2484.4s** (src done 2388 + 96s tail) |
+vs bar 1776s (0.8× RDB 1420.5): 1.40× over — NOT cleared; gap ~700s. Late rate with
+continuous drain was ~1.7× v1's at matching points (43K vs 25K @1866s). Remaining
+q9 levers: drain-threshold tuning (lower than 2M), executor parallel retest (engine
+is now much faster → the latency-hiding math changed), block/locality. 10M-scale
+correctness EXACT (9,177,252 == RocksDB). q20@100M MAXSEC 1800 queued on same .so.
