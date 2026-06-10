@@ -12,16 +12,25 @@ values.value(row).to_vec()` — even on pure cache hits; `batch_get_arrow` ("eli
 per-value memcpy") reachable only from the non-default ForStRsStateExecutor. q9 tuning floor
 2001.2s vs bar 1776s = 225s; gets are the warm-path CPU at ~33-45K probes/s.
 
-**Tasks:**
-1. Read `batch_get_arrow` (engine + FFI) end-to-end; confirm its output contract (Arrow
-   buffers + validity) matches what `VectorizedExecutor.executeGets` decodes (outOffsets/
-   outData/outValidity). If contracts match → swap `vectorizedBatchGet` linker target to the
-   arrow variant behind env `FRS_ZERO_COPY_GET=1` (A/B-able), per-row completion unchanged
-   (completeGet already deserializes from segments).
-2. Rust suite + 534 Java tests + q8/q11 10M exactness gates.
-3. A/B: q9@100M routing+200K with/without FRS_ZERO_COPY_GET (back-to-back). Target ≤1850s.
-4. If contract mismatch: minimal adapter on the FFI boundary (no Java-side changes), retest.
-5. If bar cleared: q17/q3/q8 no-regress + default-on + GHA + record.
+**⚠ DESIGN CORRECTED (2026-06-11 04:00, contract read):** `batch_get_arrow` is NOT a
+drop-in — its zero-copy covers ONLY active-memtable hits (BinaryBuilderSink, db.rs:8442-8466);
+everything else falls back to PER-KEY get_internal with NO batched SST phase (no file
+grouping, no L0 short-circuit) → would REGRESS q9's cold-heavy regime. Do NOT swap.
+
+**Correct design — SINK-THREAD `batch_get_vectorized`:**
+1. New engine method `batch_get_vectorized_into(cf, keys, read_seq, out: &mut dyn BatchValueSink)`
+   where BatchValueSink appends (slot_idx, present, value_bytes) — phases resolve as today but
+   Put values flow via the sink: memtable hits use the EXISTING get_into/ValueSink machinery
+   (no Vec); SST/KvBlock values still own one copy (borrowing across block decode is the
+   deeper lifetime work — defer) but skip the SECOND copy by writing into the sink's segment.
+2. FFI: frs_vectorized_batch_get builds a SegmentSink over the caller's out_data/out_offsets
+   (running offset; on overflow return BUFFER_TOO_SMALL exactly as today's retry contract).
+   Engine Vec<Option<Vec<u8>>> materialization deleted from the hot path.
+3. Env gate FRS_ZERO_COPY_GET=1 for A/B; old path kept until gates pass.
+4. Rust suite + 534 Java + q8/q11 10M exactness gates.
+5. A/B q9@100M routing+200K back-to-back. Target ≤1850s (one copy saved per resolved value
+   at 33-45K probes/s, plus zero-alloc memtable hits).
+6. Bar cleared → q17/q3/q8 no-regress → default-on → GHA → record.
 
 **Also queued after:** q20 OPT-N04 (engine merge-operator for the join count map — kills the
 per-record dependent GET; q20's biggest lever), q7 jar-vs-day attribution run, validate
