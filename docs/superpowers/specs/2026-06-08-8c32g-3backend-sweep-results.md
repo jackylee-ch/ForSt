@@ -1423,3 +1423,19 @@ q9/q20 keep their transformative OPT-IN results (q9 2001.2s, q20 1477.7s @
 FRS_GARBAGE_DRAIN_TOMBSTONES=200000 + routing). Re-enabling by default requires gating
 that passes q17/q3/q8 @100M no-regress — queued with the OPT-N16/OPT-N04 builds.
 q9 no-regress on the floor build: 2081.6s (band), rows exact (9th identical).
+
+# ★ q17-UNDER-DRAIN PROFILED → PRINCIPLED GATE DESIGN (2026-06-11 05:30)
+Drag-window CPU (20s sample): compaction threads 723+513+502 ticks ≈ 87% of the box;
+task threads starved. MECHANISM: q17's FLUSH stream is tombstone-rich (window cleanup →
+passes the 20% flush-ratio gate) but its LEVELS are live-rich (persistent aggregates) →
+drains rewrite GBs of live data for tiny reclaim, hogging all cores. The flush-ratio
+signal measures the wrong population.
+## SAFE-GATE DESIGN (implement next session, before re-defaulting):
+1. SST footer v4: tombstone_count u64 (writer counts Delete/SingleDelete per file —
+   same versioning pattern as v3 prefix bloom; v3 files decode 0 = unknown→conservative).
+2. Drain condition: per-CF L1 stored-tombstone fraction = Σ tombstone_count / Σ
+   total_entries ≥ 20% AND L1 volume ≥ 512MB (existing floor) AND count threshold.
+   q9/q20 levels = garbage-dominated → drain; q17 levels = live-dominated → never.
+3. This replaces the flush-ratio condition (wrong population, proven by profile).
+Then: re-validate q17/q3/q8@100M no-regress → default the drain (the q9 2001s/q20
+1477s wins become DEFAULT-path results). Queue order: gate-v2 → OPT-N16 → OPT-N04.
