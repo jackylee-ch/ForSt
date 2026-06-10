@@ -971,3 +971,21 @@ REAL q11 lever INDEPENDENT of the executor (cache it per key / avoid re-drain).
 
 STATE: default = depth-1 inline (untouched, safe); adaptive+coordinated+routing all
 env-gated opt-in; 534 unit tests + GHA ci-forst-rs green @b1f4a936dd8.
+
+# ADAPTIVE re-gate on LEAK-FIXED jar @1a95d0a010f (2026-06-10)
+ROOT CAUSE of wedge+corruption FOUND+FIXED: Task-1 classifier pool leaked a classifier +
+4 arena ColumnarBatchBuffers PER BATCH in all non-coordinated modes (incl. depth-1 default!)
+→ q17-adaptive TM cgroup-OOM-killed ~13s (the wedge). Fix = SELF-RELEASE in
+executeBatchRequests finally (1a95d0a010f) + inline path getNow-not-join.
+| run (adaptive, fixed jar) | result | verdict |
+|---|---|---|
+| q17 | 148.8s, 92M exact | ✗ bar ≤85s — but FINISHES; corruption family CLEARED |
+| q8  | 40.6s, 3,064,493  | ✓ IN BAND — adaptive corruption GONE (was leak/join-coupled) |
+q17 residual 148.8 vs 77 depth-1: per-batch KEY-GROUP SPLITTING (≤3 sub-classifiers,
+3 FFM calls/batch) taxes high-batch-rate queries even inline.
+NEXT DESIGN (final iteration): split ONLY iter requests by kg; gets/puts in ONE shared
+classifier executed INLINE FIRST (preserves writes-before-iters invariant), then latch
+the iter sub-batches to workers. q17 → byte-identical to depth-1; iter queries keep wins.
+Then gates: q17≤85, q8 band, q11≤140, q20, q9-noregress → default flip.
+⚠ depth-1 DEFAULT also leaked on jars built from d82427efb1c..b1f4a936dd8 (≈1h window,
+fixed by 1a95d0a010f) — any perf runs on those jars are SUSPECT; re-measure on fixed jar.
