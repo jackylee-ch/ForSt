@@ -194,8 +194,15 @@ pub(crate) fn note_flushed_tombstones(tombs: u64, total: u64) {
 }
 
 /// Threshold (flushed tombstone ENTRIES) that forces a deep drain.
-/// `FRS_GARBAGE_DRAIN_TOMBSTONES` overrides; `0` disables. Default 2M entries
-/// (≈ GBs of dead data at typical join row sizes).
+/// `FRS_GARBAGE_DRAIN_TOMBSTONES` overrides; `0` disables.
+/// DEFAULT = 0 (OFF) as of 2026-06-11: at the 2M default + ratio gate +
+/// 512MB L1 floor, q17@100M still regressed 3.2× (267.9s vs 77-85s norm) —
+/// the drain's forced rewrites hurt small-live-state queries in ways the
+/// three gate conditions don't yet capture. The lever is PROVEN and
+/// transformative as an OPT-IN for delete-dominated big-state joins
+/// (q9: DNF→2001s @200K; q20: DNF→1477.7s @200K) — set the env for those
+/// runs. Re-enable by default only after gating that passes q17/q3/q8
+/// no-regress at 100M.
 fn garbage_drain_threshold() -> u64 {
     use std::sync::OnceLock;
     static T: OnceLock<u64> = OnceLock::new();
