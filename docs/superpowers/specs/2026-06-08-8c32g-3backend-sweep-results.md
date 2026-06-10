@@ -1234,3 +1234,20 @@ EXCEPTIONS:
 ALSO: scratch dir held 54GB/926 entries of dead artifacts (43GB nexmark-qout +
 hundreds of stale planner jars) — cleaned to 3.5GB; drift test pending to decide
 whether THIS (not the box) caused the day's +25% degradation.
+
+# q4@10M STALL: 3-step bisect VERDICT = PRE-EXISTING (not today's stack) + DRIFT verdict
+| bisect | config | result |
+|---|---|---|
+| 1 | new jar+engine, drain OFF | stall @9.65M |
+| 2 | new jar, drain+bloom OFF  | stall @9.65M |
+| 3 | PRE-CAMPAIGN jar (8e5a057da48), levers OFF | stall @9.655M — SAME |
+→ q4@10M wedge predates everything shipped today (RocksDB@10M = 19.9s; frs wedges at
+98.5% of source with rate=0 — a scale-specific frs issue; q4@100M finishes 373s).
+TODAY'S STACK: ZERO regressions — correctness gate final: 20/22 EXACT, q4 = pre-existing
+scale artifact (own ticket), q5 = pre-existing churn artifact.
+# DRIFT TEST verdict: scratch-junk theory ALSO REFUTED (908.6s post-clean vs 860.7 pre,
+same code). Day's spread 765.6-908.6 = ±10% INTRINSIC run-to-run variance, no trend, no
+identified mechanism (not "the Mac degrading", not junk). RULE: ±10% error bars on all
+single runs; only back-to-back large deltas and DNF/finish transitions are decisions.
+The q9 100M lever progression (91M→94.8M→98M-source-complete at cutoff) EXCEEDS the
+noise band and stands.
