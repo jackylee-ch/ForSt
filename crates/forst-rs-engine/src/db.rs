@@ -249,8 +249,7 @@ fn garbage_drain_due() -> bool {
 /// for at most 2 probe drains per run, then never again); any productive
 /// drain resets the counter (q9-class reclaims GBs each time → never backs
 /// off).
-static GARBAGE_DRAIN_WASTED: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static GARBAGE_DRAIN_WASTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const GARBAGE_DRAIN_MAX_WASTED: u32 = 2;
 
 fn garbage_drain_consume() {
@@ -9872,22 +9871,17 @@ impl CompactionExecutor for DbImpl {
                 >= GARBAGE_DRAIN_MAX_WASTED;
             let garbage_due = !backoff
                 && garbage_drain_due()
-                && self
-                    .version_set
-                    .current()
-                    .levels
-                    .get(1)
-                    .is_some_and(|l| {
-                        let mut bytes = 0u64;
-                        let mut any = false;
-                        for f in &l.files {
-                            if f.cf_id == cf_id {
-                                any = true;
-                                bytes = bytes.saturating_add(f.file_size);
-                            }
+                && self.version_set.current().levels.get(1).is_some_and(|l| {
+                    let mut bytes = 0u64;
+                    let mut any = false;
+                    for f in &l.files {
+                        if f.cf_id == cf_id {
+                            any = true;
+                            bytes = bytes.saturating_add(f.file_size);
                         }
-                        any && bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
-                    });
+                    }
+                    any && bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
+                });
             if over || garbage_due {
                 let before = if garbage_due {
                     cf_deep_bytes(&self.version_set.current())
@@ -9904,8 +9898,7 @@ impl CompactionExecutor for DbImpl {
                     let after = cf_deep_bytes(&self.version_set.current());
                     let reclaimed = before.saturating_sub(after);
                     if before > 0 && reclaimed.saturating_mul(20) < before {
-                        GARBAGE_DRAIN_WASTED
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        GARBAGE_DRAIN_WASTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         GARBAGE_DRAIN_WASTED.store(0, std::sync::atomic::Ordering::Relaxed);
                     }
