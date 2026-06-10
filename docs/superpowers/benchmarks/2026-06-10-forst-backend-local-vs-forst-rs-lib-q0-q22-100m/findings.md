@@ -22,3 +22,13 @@ See `query_inventory.tsv`. It records simple SQL feature tags for Q0-Q22, used t
 - 1M fixed-CSV p1 + blackhole-metric stop policy is not reliable enough for all-query accuracy: q3 forst-local reached MAXSEC=900 without output stability. Keep fixed CSV as the correct input methodology, but change result capture/completion policy before running Q0-Q22.
 
 - 1M fixed-CSV p8 is a viable accuracy methodology for stateful join q3 and loads the intended ForSt native libraries. Q4 shows that blackhole sink metrics are not a reliable all-query correctness oracle; result capture needs a committed/hashable sink or query-specific completion logic before claiming Q0-Q22 accuracy.
+
+- REST `out_rows` is not a reliable correctness oracle for all queries. In the 1K fixed-CSV Q3 run, REST reported 20 sink-like rows while the accuracy output and direct offline CSV join both showed the true Q3 result set is empty. Formal accuracy must compare emitted records from the `accuracy-file` sink, materialized by changelog semantics.
+- Checkpointing is orthogonal to fixed-input accuracy validation. The previous Q3 run hit a ForSt checkpoint restart (`dbFile not found`); for accuracy-only fixed CSV runs, the runner now supports `CHECKPOINT_INTERVAL=999999 s` to avoid checkpoint interference, while restart/exception history is still treated as failure evidence.
+
+- Q6 is not a valid backend accuracy comparison point with the current Nexmark Flink SQL template. The original template fails validation with `Column 'rownum' not found`; an alias-nested rewrite then fails with a rowtime rowtype mismatch, and a casted-time rewrite fails with `Non-time attribute sort is not supported for bounded OVER window`. Treat Q6 as `UNSUPPORTED_BY_FLINK_SQL_TEMPLATE` unless the benchmark suite defines an officially supported alternative query.
+- Per-record flush in the custom `accuracy-file` sink is too expensive for long join queries. The runner now passes `ACCURACY_FLUSH_EVERY` (default 1024) and relies on sink close/flush for final output comparison.
+
+- Accuracy-file sink is now the correctness source of truth. REST out_rows is unreliable: Q12 reported 920000 REST output rows while committed accuracy sink files showed baseline nonzero rows and forst-rs-lib zero rows.
+- Q12 is PROCTIME 10s tumble and not strictly input-deterministic under fixed CSV. However, forst-rs-lib producing zero materialized rows in repeated diagnostic runs is a correctness blocker for the current ForSt backend + forst-rs JNI replacement path.
+- Full 100M Q0-Q22 performance should wait until Q12 is fixed or explicitly scoped out; otherwise the performance table is not defensible as a final comparison.
