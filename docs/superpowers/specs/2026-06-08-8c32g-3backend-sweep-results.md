@@ -1367,3 +1367,13 @@ curve hasn't flattened), (2) OPT-N16 zero-copy batch-get (engine to_vec at every
 tier — the warm-path CPU), (3) executor read-pool width (routing N=3 → probe 4-6;
 engine is no longer the bottleneck), (4) block locality. q20 = OPT-N04 merge-op
 (operator-level, biggest q20 lever). q7 = jar-vs-day attribution run first.
+
+# q9 drain-threshold curve (2026-06-11): 200K → 2001.2s — STILL DESCENDING
+| routing + drain threshold | wall | out_rows |
+|---|---|---|
+| 2M  | 2378.5s | exact |
+| 500K | 2199.2s | exact |
+| 200K | **2001.2s** | exact (6th identical) |
+Bar 1776s gap = 225s (1.13×). Curve slope unbroken — probing 100K. GHA note: the
+single ci-rust failure was the known-flaky flush_worker coverage trio (passed on
+identical code in adjacent runs); all code-bearing pushes green.
