@@ -1330,3 +1330,14 @@ over control · 20/22 10M-correctness EXACT · zero regressions (all bisect-prov
 OPEN (ordered): q9 bar gap (drain bar 10% probe + executor retest) · q20 OPT-N04
 merge-op · q7 jar-vs-day attribution · q5 churn · q4@10M pre-existing wedge ·
 executor race (40s repro + stream-diff tooling) · full 3-backend sweep.
+
+# q9 drain-threshold probe (2026-06-11 early): FRS_GARBAGE_DRAIN_TOMBSTONES=500K
+| q9@100M | wall | out_rows |
+|---|---|---|
+| drain 2M absolute | 2484.4s | 91,813,372 |
+| drain 2M ratio-gated | 2678.7s | 91,813,372 |
+| drain 500K ratio-gated | **2311.5s** | 91,813,372 (3rd identical = deterministic) |
+More frequent reclaim → less garbage → −173s vs best. Bar 1776 now 535s away (1.63×
+RDB). Ratio gate keeps q7 safe at any count threshold (its delete ratio fails the
+gate). NOTE: threshold is an ENV today — if 500K (or lower) proves universal, fold
+into the default. Routing-executor retest in flight (~69K/s early).
