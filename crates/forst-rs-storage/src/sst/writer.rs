@@ -36,7 +36,7 @@ use super::bloom_filter::Sbbf;
 use super::data_block::encode_data_block;
 use super::file_header::FileHeader;
 use super::footer::{ChecksumType, FooterV1};
-use super::schema::{sst_schema, SST_FORMAT_VERSION};
+use super::schema::{sst_schema, PREFIX_BLOOM_LEN, SST_FORMAT_VERSION};
 use super::sparse_index::{encode_index, BlockStats, SparseIndexEntry};
 
 // FRS_PROF_DIAG (2026-06-08): SST-writer sub-cost attribution (gap-map Task 1, verify-before-fix).
@@ -152,6 +152,11 @@ pub struct SstWriterImpl {
     /// Last added key for debug-mode sorted-order invariant check.
     last_added_key: Option<Bytes>,
     key_hashes: Vec<u64>,
+    /// v3 prefix bloom: hashes of distinct PREFIX_BLOOM_LEN-byte key prefixes
+    /// (sorted append order makes last-prefix comparison exact dedup).
+    prefix_hashes: Vec<u64>,
+    /// Last prefix pushed into `prefix_hashes` (dedup state).
+    last_prefix: Option<Vec<u8>>,
     /// C (2026-06-04): per-instance override for the v2 KV block-format flag.
     /// `None` (production default) defers to [`super::kv_block::sst_write_kv_format`]
     /// (the `FRS_SST_KV_BLOCK_FORMAT` env gate); tests set it explicitly via
@@ -199,6 +204,8 @@ impl SstWriterImpl {
             finished: false,
             last_added_key: None,
             key_hashes: Vec::new(),
+            prefix_hashes: Vec::new(),
+            last_prefix: None,
             kv_format_override: None,
         }
     }
@@ -302,6 +309,18 @@ impl SstWriterImpl {
             true
         });
         self.key_hashes.push(Sbbf::hash_key(key));
+        // v3 prefix bloom: hash the first PREFIX_BLOOM_LEN bytes. Keys are
+        // appended in sorted order, so identical prefixes are consecutive —
+        // comparing against the last pushed prefix is exact dedup. Keys
+        // shorter than the prefix length never match a probe of that length
+        // and are skipped entirely.
+        if key.len() >= PREFIX_BLOOM_LEN {
+            let p = &key[..PREFIX_BLOOM_LEN];
+            if self.last_prefix.as_deref() != Some(p) {
+                self.prefix_hashes.push(Sbbf::hash_key(p));
+                self.last_prefix = Some(p.to_vec());
+            }
+        }
         sst_prof_add(&SST_BUFFER_NS, _buf_t0.elapsed().as_nanos() as u64);
 
         if self.current_estimated_size >= self.options.block_size {
@@ -410,6 +429,22 @@ impl SstWriterImpl {
         out.append(&bloom_bytes)?;
         self.bytes_written += bloom_bytes.len() as u64;
 
+        // --- Write Prefix Bloom Section (v3) ---
+        // A second Sbbf over distinct PREFIX_BLOOM_LEN-byte key prefixes so
+        // prefix scans can skip SSTs containing no keys for the probe's
+        // prefix. Absent (0/0 in the footer) when no key reached the prefix
+        // length — readers then skip pruning for this SST (conservative).
+        let (prefix_bloom_offset, prefix_bloom_size) = if self.prefix_hashes.is_empty() {
+            (0u64, 0u32)
+        } else {
+            let off = self.bytes_written;
+            let pbloom = Sbbf::from_hashes(&self.prefix_hashes);
+            let pbytes = pbloom.encode();
+            out.append(&pbytes)?;
+            self.bytes_written += pbytes.len() as u64;
+            (off, pbytes.len() as u32)
+        };
+
         // --- Write Index Section ---
         // Buffered because the sparse index encodes the offset + size of
         // every data block; we only know the final layout after all blocks
@@ -458,6 +493,8 @@ impl SstWriterImpl {
             creation_time,
             format_version: SST_FORMAT_VERSION,
             cf_id: self.options.cf_id,
+            prefix_bloom_offset,
+            prefix_bloom_size,
         };
         let footer_bytes = footer.encode();
         out.append(&footer_bytes)?;
@@ -756,6 +793,18 @@ impl<'a, W: WritableFile + ?Sized> StreamingSstWriter<'a, W> {
         self.sink.out.append(&bloom_bytes)?;
         inner.bytes_written += bloom_bytes.len() as u64;
 
+        // --- Write Prefix Bloom Section (v3, mirrors the buffered finish) ---
+        let (prefix_bloom_offset, prefix_bloom_size) = if inner.prefix_hashes.is_empty() {
+            (0u64, 0u32)
+        } else {
+            let off = inner.bytes_written;
+            let pbloom = Sbbf::from_hashes(&inner.prefix_hashes);
+            let pbytes = pbloom.encode();
+            self.sink.out.append(&pbytes)?;
+            inner.bytes_written += pbytes.len() as u64;
+            (off, pbytes.len() as u32)
+        };
+
         // --- Write Index Section ---
         let index_offset = inner.bytes_written;
         let index_bytes = encode_index(&inner.index_entries, &inner.block_stats);
@@ -795,6 +844,8 @@ impl<'a, W: WritableFile + ?Sized> StreamingSstWriter<'a, W> {
             creation_time,
             format_version: SST_FORMAT_VERSION,
             cf_id: inner.options.cf_id,
+            prefix_bloom_offset,
+            prefix_bloom_size,
         };
         let footer_bytes = footer.encode();
         self.sink.out.append(&footer_bytes)?;
@@ -918,6 +969,72 @@ mod tests {
         assert_eq!(&data[..4], SST_MAGIC);
         let len = data.len();
         assert_eq!(&data[len - 4..], SST_MAGIC);
+    }
+
+    #[test]
+    fn test_prefix_bloom_writer_reader_round_trip() {
+        use crate::sst::reader::SstReaderImpl;
+        use forst_rs_io::filesystem::RandomAccessFile;
+
+        struct MemFile {
+            data: Vec<u8>,
+        }
+        impl RandomAccessFile for MemFile {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
+                let off = offset as usize;
+                if off >= self.data.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.data.len() - off);
+                buf[..n].copy_from_slice(&self.data[off..off + n]);
+                Ok(n)
+            }
+            fn file_size(&self) -> ForstResult<u64> {
+                Ok(self.data.len() as u64)
+            }
+        }
+
+        // One SHORT key (< PREFIX_BLOOM_LEN, sorts first) + three distinct
+        // 16-byte prefixes (PREFIX_BLOOM_LEN), several keys each, sorted order.
+        let prefixes: [&[u8; 16]; 3] =
+            [b"prefixAAAAAAAAA1", b"prefixBBBBBBBBB2", b"prefixCCCCCCCCC3"];
+        let suffixes: [&[u8]; 3] = [b"-k1", b"-k2", b"-k3"];
+        let mut writer = SstWriterImpl::new();
+        writer.add(b"abc", Some(b"v"), 100, 0).unwrap();
+        let mut seq = 101u64;
+        for p in &prefixes {
+            for suffix in &suffixes {
+                let mut key = p.to_vec();
+                key.extend_from_slice(suffix);
+                writer.add(&key, Some(b"v"), seq, 0).unwrap();
+                seq += 1;
+            }
+        }
+        let (data, _info) = writer.finish().unwrap();
+
+        let reader = SstReaderImpl::open(Box::new(MemFile { data })).unwrap();
+
+        // Footer carries a non-empty prefix bloom.
+        assert!(reader.footer().prefix_bloom_size > 0);
+        // All present prefixes answer true (probe = prefix + extra bytes,
+        // mirroring a scan probe that is >= PREFIX_BLOOM_LEN).
+        for p in &prefixes {
+            let mut probe = p.to_vec();
+            probe.extend_from_slice(b"-anything");
+            assert!(reader.may_contain_prefix(&probe), "present prefix must hit");
+            assert!(reader.may_contain_prefix(&p[..]), "exact-length probe must hit");
+        }
+        // Short probes bypass (conservative true).
+        assert!(reader.may_contain_prefix(b"short"));
+        // Absent prefixes: fpp-tolerant — at least 60 of 64 random probes miss.
+        let mut misses = 0;
+        for i in 0..64u32 {
+            let probe = format!("zzabsent-prefix-{i:04}-pad-to-long");
+            if !reader.may_contain_prefix(probe.as_bytes()) {
+                misses += 1;
+            }
+        }
+        assert!(misses >= 60, "expected >=60/64 absent-prefix misses, got {misses}");
     }
 
     #[test]

@@ -33,7 +33,20 @@ pub const SST_MAGIC: &[u8; 4] = b"FRST";
 ///   [`super::footer::FooterV1`] to enforce per-CF SST isolation (R49-H1).
 ///   v1 footers continue to decode; their `cf_id` defaults to
 ///   [`forst_rs_common::DEFAULT_CF_ID`].
-pub const SST_FORMAT_VERSION: u16 = 2;
+/// * `3` — adds the prefix-bloom section pointer (`prefix_bloom_offset: u64`,
+///   `prefix_bloom_size: u32`) after `cf_id`: a second Sbbf over the first
+///   [`PREFIX_BLOOM_LEN`] bytes of each key (keys shorter than that do not
+///   contribute — they can never match a probe prefix of that length), so
+///   prefix scans skip SSTs containing no keys for the probe's prefix (the
+///   q7/q9/q20 read-volume lever, 2026-06-10). v1/v2 footers decode with
+///   0/0 = absent → readers skip pruning for those SSTs.
+pub const SST_FORMAT_VERSION: u16 = 3;
+
+/// Fixed prefix length (bytes) the v3 prefix bloom is built over. Probes with
+/// a prefix shorter than this bypass the filter (conservative). 16 bytes
+/// covers key-group + stateId + join key in the composite key layouts the
+/// NEXMark joins probe by.
+pub const PREFIX_BLOOM_LEN: usize = 16;
 
 /// Block type discriminant for data blocks.
 ///
@@ -121,8 +134,10 @@ mod tests {
 
     #[test]
     fn test_format_version() {
-        // v2: footer carries cf_id (R49-H1).
-        assert_eq!(SST_FORMAT_VERSION, 2);
+        // v3: footer carries cf_id (R49-H1) + the prefix-bloom pointer
+        // (the q7/q9/q20 scan-pruning lever, 2026-06-10).
+        assert_eq!(SST_FORMAT_VERSION, 3);
+        assert_eq!(PREFIX_BLOOM_LEN, 16);
     }
 
     #[test]

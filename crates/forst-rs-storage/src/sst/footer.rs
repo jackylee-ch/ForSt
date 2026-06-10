@@ -61,9 +61,14 @@ pub const FOOTER_FIXED_FIELDS_SIZE_V1: usize = 76;
 /// Size in bytes of the v2 fixed-field portion of the footer (adds cf_id).
 pub const FOOTER_FIXED_FIELDS_SIZE_V2: usize = 80;
 
+/// Size in bytes of the v3 fixed-field portion of the footer (adds the
+/// prefix-bloom section pointer: offset u64 + size u32 — the q7/q9/q20
+/// scan-path pruning lever, 2026-06-10).
+pub const FOOTER_FIXED_FIELDS_SIZE_V3: usize = 92;
+
 /// Backwards-compatible alias for callers that expect the current writer-
-/// side size. Always equals the v2 size since v2 is the writer's emit format.
-pub const FOOTER_FIXED_FIELDS_SIZE: usize = FOOTER_FIXED_FIELDS_SIZE_V2;
+/// side size. Always equals the v3 size since v3 is the writer's emit format.
+pub const FOOTER_FIXED_FIELDS_SIZE: usize = FOOTER_FIXED_FIELDS_SIZE_V3;
 
 /// Size in bytes of the footer tail: checksum (4) + length (4) + magic (4).
 pub const FOOTER_TAIL_SIZE: usize = 12;
@@ -141,6 +146,13 @@ pub struct FooterV1 {
     /// `format_version >= 2`. Decoding a v1 footer fills this with
     /// [`DEFAULT_CF_ID`] so legacy SSTs continue to be readable.
     pub cf_id: ColumnFamilyId,
+    /// Byte offset of the PREFIX bloom section (v3+; 0 = absent). A second
+    /// Sbbf built over fixed-length key prefixes so prefix scans can skip
+    /// SSTs containing no keys for the probe's prefix (point blooms cannot
+    /// prune range scans — the q7/q9/q20 read-volume lever).
+    pub prefix_bloom_offset: u64,
+    /// Size in bytes of the prefix bloom section (v3+; 0 = absent).
+    pub prefix_bloom_size: u32,
 }
 
 impl FooterV1 {
@@ -156,11 +168,12 @@ impl FooterV1 {
     pub fn encode(&self) -> Vec<u8> {
         let min_key_len = self.min_key.len() as u16;
         let max_key_len = self.max_key.len() as u16;
-        // R49-H1: writer always emits the v2 layout (cf_id appended to the
-        // fixed-field area). `min_key_offset` and `max_key_offset` are
-        // relative to the v2 fixed-field size so decoders parse the keys at
-        // the correct location regardless of whether they understand cf_id.
-        let fixed_size = FOOTER_FIXED_FIELDS_SIZE_V2;
+        // The writer always emits the NEWEST layout (v3: cf_id + prefix-bloom
+        // pointer appended to the fixed-field area). `min_key_offset` and
+        // `max_key_offset` are relative to the emitted fixed-field size so
+        // decoders parse the keys at the correct location regardless of which
+        // trailing fields they understand.
+        let fixed_size = FOOTER_FIXED_FIELDS_SIZE_V3;
         let total_size = fixed_size + self.min_key.len() + self.max_key.len() + FOOTER_TAIL_SIZE;
 
         let mut buf = Vec::with_capacity(total_size);
@@ -185,9 +198,14 @@ impl FooterV1 {
 
         debug_assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE_V1);
 
-        // R49-H1: v2-only cf_id at offset 76.
+        // R49-H1: v2+ cf_id at offset 76.
         put_fixed32(&mut buf, self.cf_id.value());
         debug_assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE_V2);
+
+        // v3+: prefix-bloom section pointer at offset 80 (0/0 = absent).
+        put_fixed64(&mut buf, self.prefix_bloom_offset);
+        put_fixed32(&mut buf, self.prefix_bloom_size);
+        debug_assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE_V3);
 
         // Variable-length keys
         buf.extend_from_slice(&self.min_key);
@@ -306,6 +324,21 @@ impl FooterV1 {
             DEFAULT_CF_ID
         };
 
+        // v3+: prefix-bloom section pointer at offset 80, gated on the same
+        // min_key_offset discriminator (see the R50-L2 rationale above).
+        // v1/v2 footers decode with 0/0 = "no prefix bloom" — readers then
+        // skip prefix pruning for those SSTs (conservative, correct).
+        let (prefix_bloom_offset, prefix_bloom_size) = if (min_key_offset as usize)
+            >= FOOTER_FIXED_FIELDS_SIZE_V3
+            && data.len() >= FOOTER_FIXED_FIELDS_SIZE_V3 + FOOTER_TAIL_SIZE
+        {
+            let (off, _) = get_fixed64(&data[FOOTER_FIXED_FIELDS_SIZE_V2..])?;
+            let (size, _) = get_fixed32(&data[FOOTER_FIXED_FIELDS_SIZE_V2 + 8..])?;
+            (off, size)
+        } else {
+            (0u64, 0u32)
+        };
+
         // Validate compression type
         let compression = match compression_byte {
             0 => CompressionType::None,
@@ -358,6 +391,8 @@ impl FooterV1 {
             creation_time,
             format_version,
             cf_id,
+            prefix_bloom_offset,
+            prefix_bloom_size,
         })
     }
 }
@@ -388,7 +423,30 @@ mod tests {
             creation_time: 1_700_000_000_000,
             format_version: SST_FORMAT_VERSION,
             cf_id: DEFAULT_CF_ID,
+            prefix_bloom_offset: 20480,
+            prefix_bloom_size: 256,
         }
+    }
+
+    #[test]
+    fn test_prefix_bloom_round_trip() {
+        // v3: prefix-bloom pointer survives encode→decode.
+        let footer = sample_footer();
+        let decoded = FooterV1::decode(&footer.encode()).unwrap();
+        assert_eq!(decoded.prefix_bloom_offset, 20480);
+        assert_eq!(decoded.prefix_bloom_size, 256);
+        assert_eq!(decoded, footer);
+    }
+
+    #[test]
+    fn test_prefix_bloom_absent_round_trip() {
+        // 0/0 = absent; must survive round-trip unchanged.
+        let mut footer = sample_footer();
+        footer.prefix_bloom_offset = 0;
+        footer.prefix_bloom_size = 0;
+        let decoded = FooterV1::decode(&footer.encode()).unwrap();
+        assert_eq!(decoded.prefix_bloom_offset, 0);
+        assert_eq!(decoded.prefix_bloom_size, 0);
     }
 
     // -----------------------------------------------------------------------
@@ -545,10 +603,11 @@ mod tests {
 
     #[test]
     fn test_fixed_fields_size() {
-        // R49-H1: writer emits v2 (80-byte) fixed-field area.
-        assert_eq!(FOOTER_FIXED_FIELDS_SIZE, 80);
+        // v3: writer emits the 92-byte fixed-field area (cf_id + prefix-bloom ptr).
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE, 92);
         assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V1, 76);
         assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V2, 80);
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V3, 92);
     }
 
     #[test]
@@ -558,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_min_size() {
-        assert_eq!(FOOTER_FIXED_FIELDS_SIZE + FOOTER_TAIL_SIZE, 92);
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE + FOOTER_TAIL_SIZE, 104);
     }
 
     /// R49-H1: a v1-encoded footer (no cf_id) decodes with

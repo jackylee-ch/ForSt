@@ -156,6 +156,20 @@ fn frs_iter_diag_enabled() -> bool {
 /// threshold) so the ~1.7µs bulk builds are measured WITHOUT observer-effect
 /// pollution: only 1-in-K builds pay the `Instant::now` calls. Answers "is the
 /// 3.3× floor the resident FIXED overhead or SST fan-out?" → picks the lever.
+/// FRS-PREFIX-BLOOM kill switch (A/B + emergency revert): the v3 prefix-bloom
+/// SST prune on the prefix-scan path is ON by default; `FRS_DISABLE_PREFIX_BLOOM=1`
+/// bypasses it. Read once (env lookups are not free on the per-SST hot loop).
+fn prefix_bloom_enabled() -> bool {
+    use std::sync::OnceLock;
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        !matches!(
+            std::env::var("FRS_DISABLE_PREFIX_BLOOM").ok().as_deref(),
+            Some("1") | Some("true")
+        )
+    })
+}
+
 fn bulk_sample_k() -> usize {
     use std::sync::OnceLock;
     static K: OnceLock<usize> = OnceLock::new();
@@ -6675,6 +6689,21 @@ impl DbImpl {
             // was the dominant per-probe cost once state spilled past the RAM
             // shadow. This decode-free prune removes that fan-out. Sound: it
             // skips only when the range is provably empty.
+            // FRS-PREFIX-BLOOM (2026-06-10, SST format v3): cheapest prune first —
+            // one hash + bit probe proves this SST contains NO key whose first
+            // PREFIX_BLOOM_LEN bytes match the scan prefix. The filter covers ALL
+            // entries (incl. tombstones and merge operands), so a negative answer
+            // is MVCC-safe at any sequence: no entry with this prefix exists in
+            // the file at all. Pre-v3 SSTs and prefixes shorter than the filter
+            // length answer `true` and fall through to the range prune below.
+            // This is the q7/q9/q20 read-volume lever: point blooms cannot prune
+            // range scans, so before this check every key-range-overlapping SST
+            // paid index+data-block reads per probe (READ_AT 182µs mean preads,
+            // 26% cold once state outgrows the page cache).
+            // Kill switch for A/B: FRS_DISABLE_PREFIX_BLOOM=1.
+            if prefix_bloom_enabled() && !reader.may_contain_prefix(prefix) {
+                continue;
+            }
             if !reader.may_contain_range(prefix, upper_slice) {
                 continue;
             }
@@ -12489,6 +12518,57 @@ mod tests {
         let mut out2: Vec<(Vec<u8>, Vec<u8>)> = iter2.collect::<ForstResult<Vec<_>>>().unwrap();
         out2.sort_by(|l, r| l.0.cmp(&r.0));
         assert_eq!(out2.len(), 3);
+    }
+
+    /// FRS-PREFIX-BLOOM (SST format v3) correctness: prefix scans over LONG
+    /// keys (>= PREFIX_BLOOM_LEN = 16 bytes, the join-key regime) across
+    /// MULTIPLE flushed SSTs with disjoint prefixes must return exactly the
+    /// matching rows — the bloom prune may only skip SSTs that provably hold
+    /// no key for the probe's prefix, never drop rows (incl. tombstones:
+    /// a delete in a later SST must still mask an older value).
+    #[test]
+    fn prefix_bloom_scan_multiple_ssts_exact() {
+        let db = open();
+        let cf = db.default_cf();
+
+        // Three disjoint 16-byte prefixes, one SST each (flush between).
+        let prefixes: [&[u8; 16]; 3] =
+            [b"joinkeyAAAAAAAA1", b"joinkeyBBBBBBBB2", b"joinkeyCCCCCCCC3"];
+        for (i, p) in prefixes.iter().enumerate() {
+            for s in 0..3u8 {
+                let mut k = p.to_vec();
+                k.extend_from_slice(format!("-row{s}").as_bytes());
+                db.put(&cf, &k, format!("v{i}{s}").as_bytes()).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flush produced sst");
+        }
+        // A tombstone for one B-row lands in a FOURTH SST: the scan must
+        // still consult it (the B-prefix bloom hits) and mask the old value.
+        let mut dead = prefixes[1].to_vec();
+        dead.extend_from_slice(b"-row1");
+        db.delete(&cf, &dead).unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flush produced sst");
+
+        // Scan each prefix: exact rows, nothing lost, tombstone honored.
+        for (i, p) in prefixes.iter().enumerate() {
+            let iter = db.prefix_scan_iter_owned(&cf, &p[..]).unwrap();
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> =
+                iter.collect::<ForstResult<Vec<_>>>().unwrap();
+            out.sort_by(|l, r| l.0.cmp(&r.0));
+            let expect = if i == 1 { 2 } else { 3 };
+            assert_eq!(out.len(), expect, "prefix {i}: wrong row count {out:?}");
+            for (k, v) in &out {
+                assert!(k.starts_with(&p[..]), "row outside prefix: {k:?}");
+                assert!(v.starts_with(format!("v{i}").as_bytes()));
+            }
+        }
+        // A completely absent (bloom-prunable) prefix returns nothing.
+        let none = db
+            .prefix_scan_iter_owned(&cf, b"joinkeyZZZZZZZZ9")
+            .unwrap()
+            .collect::<ForstResult<Vec<_>>>()
+            .unwrap();
+        assert!(none.is_empty());
     }
 
     /// CORRECTNESS GATE for the parallel join read path (q7/q9/q20):

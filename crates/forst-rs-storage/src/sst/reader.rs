@@ -37,7 +37,9 @@ use super::bloom_filter::Sbbf;
 use super::data_block::decode_data_block_zerocopy;
 use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
 use super::kv_block::KvBlock;
-use super::schema::{BLOCK_TYPE_DATA, BLOCK_TYPE_DATA_KV, FILE_HEADER_SIZE, SST_MAGIC};
+use super::schema::{
+    BLOCK_TYPE_DATA, BLOCK_TYPE_DATA_KV, FILE_HEADER_SIZE, PREFIX_BLOOM_LEN, SST_MAGIC,
+};
 use super::sparse_index::{decode_index, search_index, BlockStats, SparseIndexEntry};
 
 /// A decoded SST data block — either a v1 Arrow `RecordBatch` or a v2 KV block
@@ -162,6 +164,10 @@ pub struct SstReaderImpl {
     #[allow(dead_code)] // Stored for future range-scan and compaction support.
     index_stats: Vec<BlockStats>,
     bloom_filter: Sbbf,
+    /// v3 prefix bloom over PREFIX_BLOOM_LEN-byte key prefixes; `None` for
+    /// pre-v3 SSTs or SSTs with no key reaching the prefix length. See
+    /// [`Self::may_contain_prefix`].
+    prefix_bloom: Option<Sbbf>,
     /// 2026-05-30 DECODED-BLOCK CACHE: optional shared L1 cache of DECODED data
     /// blocks (`CacheEntry::DecodedBatch`), keyed by `(file_number, block_offset)`.
     /// `read_data_block` checks it before reading+decompressing — eliminating the
@@ -280,6 +286,26 @@ impl SstReaderImpl {
         read_at_exact(file.as_ref(), footer.index_offset, &mut index_buf)?;
         let (index_entries, index_stats) = decode_index(&index_buf)?;
 
+        // Step 5 (v3): read and decode the PREFIX bloom, if present. v1/v2
+        // SSTs (and v3 SSTs whose keys never reached PREFIX_BLOOM_LEN) carry
+        // 0/0 → `None` → prefix pruning is skipped for this SST.
+        let prefix_bloom = if footer.prefix_bloom_size > 0 {
+            let pb_end = (footer.prefix_bloom_offset)
+                .checked_add(footer.prefix_bloom_size as u64)
+                .ok_or_else(|| ForstError::corruption("SST prefix_bloom offset+size overflow"))?;
+            if pb_end > file_size {
+                return Err(ForstError::corruption(format!(
+                    "SST prefix_bloom range [{}, {}) exceeds file_size {}",
+                    footer.prefix_bloom_offset, pb_end, file_size
+                )));
+            }
+            let mut pb_buf = vec![0u8; footer.prefix_bloom_size as usize];
+            read_at_exact(file.as_ref(), footer.prefix_bloom_offset, &mut pb_buf)?;
+            Some(Sbbf::decode(&pb_buf)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             file,
             file_size,
@@ -287,10 +313,26 @@ impl SstReaderImpl {
             index_entries,
             index_stats,
             bloom_filter,
+            prefix_bloom,
             block_cache: None,
             cache_file_id: 0,
             blocks_read: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// v3 prefix bloom: returns `false` only when this SST PROVABLY contains
+    /// no key whose first [`PREFIX_BLOOM_LEN`] bytes equal the probe's. Probes
+    /// shorter than the filter length — and SSTs without a prefix bloom
+    /// (pre-v3, or no key reached the length) — return `true` (conservative).
+    /// The filter is built over ALL entries including tombstones and merges,
+    /// so a `false` answer is safe for MVCC scans at any sequence.
+    pub fn may_contain_prefix(&self, probe_prefix: &[u8]) -> bool {
+        match &self.prefix_bloom {
+            Some(pb) if probe_prefix.len() >= PREFIX_BLOOM_LEN => {
+                pb.check_hash(Sbbf::hash_key(&probe_prefix[..PREFIX_BLOOM_LEN]))
+            }
+            _ => true,
+        }
     }
 
     /// 2026-05-30 DECODED-BLOCK CACHE: attach the process-shared decoded-block
