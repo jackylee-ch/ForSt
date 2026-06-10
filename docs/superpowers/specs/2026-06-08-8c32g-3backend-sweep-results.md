@@ -1041,3 +1041,15 @@ has a real RACE; single-run out_rows verdicts are unreliable for executor work.
   when already on mailbox) and can re-enter the AEC/active-container during the inline
   phase — vs the latch path where completions queue as mails. Instrument that re-entrancy
   first (count offers-into-active-container during inline execute).
+
+# q8 race: RE-ENTRANCY REFUTED (2026-06-10 final probe)
+FRS_REENTRY_DIAG run: corruption reproduced (q8 adaptive = 2,186,285) with ZERO
+re-entrant executeBatchRequests calls. NEXT CANDIDATE (sharper): callback-inlining
+asymmetry — InternalAsyncFuture.complete() from the MAILBOX thread may run user
+callbacks INLINE-IMMEDIATELY (CallbackRunnerWrapper same-thread path) → user code
+(window emit/cleanup, setCurrentNamespace, statebuf staging) runs MID-BATCH during
+inline execution; worker-thread completions enqueue as mails instead. Adaptive MIXES
+both regimes per batch → callback ordering differs from both pure modes (depth-1
+all-inline ✓, routing all-enqueued ✓). NEXT: instrument WHERE per-row callbacks
+execute (thread + during-batch flag) under each mode; compare orderings on the 40s
+full-scale repro. Probe committed as FRS_REENTRY_DIAG (extend it).
