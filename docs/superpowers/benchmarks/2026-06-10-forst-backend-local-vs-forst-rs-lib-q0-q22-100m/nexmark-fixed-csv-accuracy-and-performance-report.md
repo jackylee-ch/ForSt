@@ -74,14 +74,42 @@ Q9 can execute in streaming mode with native ForSt state, but the 1M streaming f
 
 ## Performance Status
 
-Full Q0-Q22 100M performance comparison has not been rerun after the corrected accuracy pass. The old Q12-only 100M reference is retained only as historical context and must not be treated as the requested final Q0-Q22 performance result.
+The 100M performance run was restarted with the corrected environment: JDK17, jemalloc loaded through `LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2`, checkpointing disabled, one TaskManager with 8 slots and 32GB process memory, and one benchmark container at a time. The benchmark runner now waits for bounded jobs to reach `FINISHED` unless a diagnostic run intentionally uses `MAXSEC`.
 
-| Query | Variant | Runs | Avg seconds | Source rows/s | Speedup |
-| --- | --- | ---: | ---: | ---: | ---: |
-| q12 | ForSt local | 2 | 126.493 | 728,571 | 1.000x |
-| q12 | ForSt backend + forst-rs lib | 2 | 121.813 | 755,278 | 1.038x |
+The full Q0-Q22 100M matrix is currently blocked by Q4. Q0-Q2 finish at 100M, but the forst-rs JNI replacement does not show a speedup there. Q4 is already unable to finish at 1M under the 8C/32G envelope, even after validating jemalloc, async state, mini-batch, and a write-heavy ForSt tuning profile. Running Q4 at 100M would be an unbounded time sink and would not produce the requested defensible comparison.
 
-Next required step: run the full 100M performance matrix under the 8C/32G TM envelope now that the accuracy matrix has a defensible query-specific policy.
+### Completed 100M Runs
+
+Throughput below is computed as `100,000,000 / wall_seconds`. The REST `src_out` metric is not used as the denominator because it has query-dependent semantics in the fused SQL plan.
+
+| Query | ForSt local seconds | forst-rs lib seconds | ForSt local events/s | forst-rs lib events/s | Speedup | Run label |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| q0 | 60.987 | 60.627 | 1,639,693 | 1,649,430 | 1.006x | `perf100m-q0q1q2q4q5-jemalloc-20260610180554` |
+| q1 | 61.513 | 64.404 | 1,625,673 | 1,552,699 | 0.955x | `perf100m-q0q1q2q4q5-jemalloc-20260610180554` |
+| q2 | 53.398 | 54.973 | 1,872,729 | 1,819,076 | 0.971x | `perf100m-q0q1q2q4q5-jemalloc-20260610180554` |
+
+### Q3 Diagnostic
+
+Q3 is a long-running stateful join. A 100M run was stopped after discovering the earlier run did not actually preload jemalloc and that the `expected_src` heuristic was invalid for q3. After enabling jemalloc, 10M diagnostics show only a small forst-rs-lib advantage.
+
+| Query | Events | Variant | Mode | Seconds | Output rows | Native evidence | Run label |
+| --- | ---: | --- | --- | ---: | ---: | --- | --- |
+| q3 | 10,000,000 | ForSt local | FINISHED | 244.590 | 220,284 | community JNI | `diag-q3-10m-jemalloc-20260610175344` |
+| q3 | 10,000,000 | forst-rs lib | FINISHED | 240.493 | 219,595 | forst-rs JNI | `diag-q3-10m-rslib-jemalloc-20260610175959` |
+
+Q3 10M speedup is `1.017x`, so it does not support a 1.5x claim.
+
+### Q4 Blocker
+
+Q4 is the current blocker for a full Q0-Q22 100M run. It is a join plus two GroupAggregate operators. REST vertex metrics showed the source operator backpressured by the join/aggregate chain. The following 1M runs were used to avoid wasting the 100M resource envelope.
+
+| Query | Events | Variant | Config | Mode | Wall seconds | Source rows | Expected source rows | Output rows | Run label |
+| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| q4 | 1,000,000 | ForSt local | mini-batch, no write-heavy profile | TIMEOUT | 604.748 | 891,932 | 980,000 | 1,273 | `tune-q4-1m-minibatch-jemalloc-20260610182954` |
+| q4 | 1,000,000 | ForSt local | mini-batch + write-heavy profile | TIMEOUT | 903.809 | 980,000 | 980,000 | 2,760 | `tune-q4-1m-minibatch-writeheavy-20260610184342` |
+| q4 | 1,000,000 | forst-rs lib | mini-batch + write-heavy profile | TIMEOUT | 904.050 | 980,000 | 980,000 | 2,174 | `tune-q4-1m-rslib-minibatch-writeheavy-20260610185952` |
+
+Interpretation: forst-rs-lib is essentially tied with the community JNI path on Q4. The current bottleneck is not fixed by the JNI replacement, jemalloc, async state, mini-batch, or larger ForSt write buffers. The next useful step is code-level profiling of the Q4 join/aggregate state path, especially per-record state get/update serialization and ForSt write path batching.
 
 ## Artifacts
 
@@ -90,6 +118,14 @@ Next required step: run the full 100M performance matrix under the 8C/32G TM env
 | Q12 corrected compare | `artifacts/q12-1m-p8-monitor2-debug-20260610164456.accuracy-compare.tsv` |
 | Q6 corrected compare | `artifacts/q6-1m-batch-stable-accuracy-20260610170032.accuracy-compare.tsv` |
 | Q9 streaming smoke compare | `artifacts/q9-1k-stream-debug-20260610165239.accuracy-compare.tsv` |
-| Updated runner | `scripts/run-matrix.sh` |
+| Q0-Q2 100M performance TSV | `artifacts/perf100m-q0q1q2q4q5-jemalloc-20260610180554.tsv` |
+| Q3 10M local diagnostic TSV | `artifacts/diag-q3-10m-jemalloc-20260610175344.tsv` |
+| Q3 10M forst-rs-lib diagnostic TSV | `artifacts/diag-q3-10m-rslib-jemalloc-20260610175959.tsv` |
+| Q4 1M mini-batch diagnostic TSV | `artifacts/tune-q4-1m-minibatch-jemalloc-20260610182954.tsv` |
+| Q4 1M local write-heavy diagnostic TSV | `artifacts/tune-q4-1m-minibatch-writeheavy-20260610184342.tsv` |
+| Q4 1M forst-rs-lib write-heavy diagnostic TSV | `artifacts/tune-q4-1m-rslib-minibatch-writeheavy-20260610185952.tsv` |
+| Updated matrix runner | `scripts/run-matrix.sh` |
+| Full-run container runner | `scripts/run-one-full.sh` |
+| Full-run SQL measurement script | `scripts/measure-sql-full.sh` |
 | Updated CSV accuracy runner | `scripts/measure-sql-csv-accuracy.sh` |
 | Updated compare script | `scripts/compare-accuracy-output.py` |

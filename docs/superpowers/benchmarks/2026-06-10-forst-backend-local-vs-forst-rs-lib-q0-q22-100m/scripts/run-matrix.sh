@@ -62,6 +62,10 @@ for q in $QUERIES_STR; do
       -e TM_SLOTS="${TM_SLOTS:-${PARALLELISM:-8}}" \
       -e RUNTIME_MODE="${RUNTIME_MODE:-STREAMING}" \
       -e ASYNC_STATE_ENABLED="${ASYNC_STATE_ENABLED:-true}" \
+      -e MINI_BATCH_ENABLED="${MINI_BATCH_ENABLED:-false}" \
+      -e MINI_BATCH_ALLOW_LATENCY="${MINI_BATCH_ALLOW_LATENCY:-1 s}" \
+      -e MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-5000}" \
+      -e FORST_TUNING_PROFILE="${FORST_TUNING_PROFILE:-}" \
       -e CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-30 s}" \
       -e RUN_ID="$run_id" \
       -e MEASURE_SCRIPT="${MEASURE_SCRIPT:-/bench/scripts/measure-sql-full.sh}" \
