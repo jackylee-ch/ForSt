@@ -1439,3 +1439,15 @@ signal measures the wrong population.
 3. This replaces the flush-ratio condition (wrong population, proven by profile).
 Then: re-validate q17/q3/q8@100M no-regress → default the drain (the q9 2001s/q20
 1477s wins become DEFAULT-path results). Queue order: gate-v2 → OPT-N16 → OPT-N04.
+
+# GATE-V2 A/B VERDICT (2026-06-11 06:30): level-density REVERTED — both signals bracket the truth
+| gate signal | q17 (live-rich levels) | q9 (garbage-dominated) |
+|---|---|---|
+| flush-ratio (v1) | ✗ over-drains (190-268s) | ✓ drains |
+| L1 stored-density (v2) | ~ (228.9s — re-enqueue spin found+fixed) | ✗ STARVES (DNF@2300 vs 2001s) |
+Mechanism: compaction annihilation strips tombstones from L1 outputs while the dead
+VALUES hide in deeper levels → L1 density under-reads garbage. CORRECT DESIGN (next
+session, building block shipped): RocksDB-style COMPENSATED FILE SIZES — footer-v4
+tombstone_count (now persisted, 832 tests) weighted by shadowed-data estimates feeds
+candidate selection. Behavior reverted to the PROVEN opt-in config; re-enqueue
+busy-loop fixed (was spinning the compaction worker on gate refusal). Default OFF.
