@@ -1067,3 +1067,27 @@ the mailbox during inline execution that workers later read). NEXT-SESSION TOOLI
 extend FRS_REENTRY_DIAG to log per-row (requestType, keyGroup, completing-thread,
 batch-seq) on the 40s repro for BOTH modes and DIFF the streams — find the first
 divergent row family, then trace that state primitive's thread-sensitivity.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# q7/q9/q20 READ-VOLUME LEVER DECIDED: SST PREFIX BLOOM (2026-06-10)
+# ═══════════════════════════════════════════════════════════════════════════
+q9@50M FRS_BULK_SAMPLE=1000 decay-phase DECAY_ATTR (per-probe ns, sampled):
+  win@8192  probe=1579 | A_fanout=707(sstloop=668,n_ovl=1) C_activeseek=646 B_resident=0
+  win@32768 probe=5256 | A_fanout=3034(sstloop=2898,n_ovl=2[L0=1,deep=1]) C=1078 B=0
+- GET path HEALTHY: n_ovl 1-3, cost 1.5-5µs, bloom/locate working, resident shadow moot,
+  compaction shape fine. Gets are NOT the binder.
+- Binder = PREFIX-SCAN (iter) path: point blooms cannot prune RANGE scans → every
+  overlapping SST pays index+data-block preads per probe even when it contains ZERO keys
+  for that join-key prefix (READ_AT: 182µs mean preads, 26% cold, ~0.6/record).
+- ALSO: prior run's 16× slowdown explained = mis-set FRS_CURSOR_DIAG=1 (K=sampling divisor,
+  1=time EVERY seek). Healthy rerun tracks the 813.5s baseline. No regression.
+
+## LEVER: RocksDB-style PREFIX BLOOM (engine, config-free, helps all prefix-scan queries)
+Add a second per-SST Sbbf over FIXED-length key prefixes (P bytes, e.g. 16: covers
+kg+stateId+joinKey); consult at prefix-scan open — skip SSTs whose prefix bloom rejects
+the probe's first P bytes (scans with prefix < P bytes bypass the filter, conservative).
+Expected: scan preads cut 2-3× (n_ovl 2-3 → ~1 true-containing SST) → q9 ~2600→
+~1300-1600s (bar 1776 PASS), q20/q7 similar direction. Implementation: SST writer
+(collect distinct P-prefixes → Sbbf, format-versioned footer field), reader (load+expose),
+scan-open SST selection (may_contain_prefix), FFI untouched (engine-internal), UTs +
+format round-trip + q9@50M A/B vs 813.5s baseline.
