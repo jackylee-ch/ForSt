@@ -12704,28 +12704,34 @@ mod tests {
         let cf = db.default_cf();
 
         // Three disjoint 16-byte prefixes, one SST each (flush between).
-        let prefixes: [&[u8; 16]; 3] =
-            [b"joinkeyAAAAAAAA1", b"joinkeyBBBBBBBB2", b"joinkeyCCCCCCCC3"];
+        let prefixes: [&[u8; 16]; 3] = [
+            b"joinkeyAAAAAAAA1",
+            b"joinkeyBBBBBBBB2",
+            b"joinkeyCCCCCCCC3",
+        ];
         for (i, p) in prefixes.iter().enumerate() {
             for s in 0..3u8 {
                 let mut k = p.to_vec();
                 k.extend_from_slice(format!("-row{s}").as_bytes());
                 db.put(&cf, &k, format!("v{i}{s}").as_bytes()).unwrap();
             }
-            db.switch_and_flush(&cf).unwrap().expect("flush produced sst");
+            db.switch_and_flush(&cf)
+                .unwrap()
+                .expect("flush produced sst");
         }
         // A tombstone for one B-row lands in a FOURTH SST: the scan must
         // still consult it (the B-prefix bloom hits) and mask the old value.
         let mut dead = prefixes[1].to_vec();
         dead.extend_from_slice(b"-row1");
         db.delete(&cf, &dead).unwrap();
-        db.switch_and_flush(&cf).unwrap().expect("flush produced sst");
+        db.switch_and_flush(&cf)
+            .unwrap()
+            .expect("flush produced sst");
 
         // Scan each prefix: exact rows, nothing lost, tombstone honored.
         for (i, p) in prefixes.iter().enumerate() {
             let iter = db.prefix_scan_iter_owned(&cf, &p[..]).unwrap();
-            let mut out: Vec<(Vec<u8>, Vec<u8>)> =
-                iter.collect::<ForstResult<Vec<_>>>().unwrap();
+            let mut out: Vec<(Vec<u8>, Vec<u8>)> = iter.collect::<ForstResult<Vec<_>>>().unwrap();
             out.sort_by(|l, r| l.0.cmp(&r.0));
             let expect = if i == 1 { 2 } else { 3 };
             assert_eq!(out.len(), expect, "prefix {i}: wrong row count {out:?}");

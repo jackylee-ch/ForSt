@@ -996,8 +996,11 @@ mod tests {
 
         // One SHORT key (< PREFIX_BLOOM_LEN, sorts first) + three distinct
         // 16-byte prefixes (PREFIX_BLOOM_LEN), several keys each, sorted order.
-        let prefixes: [&[u8; 16]; 3] =
-            [b"prefixAAAAAAAAA1", b"prefixBBBBBBBBB2", b"prefixCCCCCCCCC3"];
+        let prefixes: [&[u8; 16]; 3] = [
+            b"prefixAAAAAAAAA1",
+            b"prefixBBBBBBBBB2",
+            b"prefixCCCCCCCCC3",
+        ];
         let suffixes: [&[u8]; 3] = [b"-k1", b"-k2", b"-k3"];
         let mut writer = SstWriterImpl::new();
         writer.add(b"abc", Some(b"v"), 100, 0).unwrap();
@@ -1022,7 +1025,10 @@ mod tests {
             let mut probe = p.to_vec();
             probe.extend_from_slice(b"-anything");
             assert!(reader.may_contain_prefix(&probe), "present prefix must hit");
-            assert!(reader.may_contain_prefix(&p[..]), "exact-length probe must hit");
+            assert!(
+                reader.may_contain_prefix(&p[..]),
+                "exact-length probe must hit"
+            );
         }
         // Short probes bypass (conservative true).
         assert!(reader.may_contain_prefix(b"short"));
@@ -1034,7 +1040,10 @@ mod tests {
                 misses += 1;
             }
         }
-        assert!(misses >= 60, "expected >=60/64 absent-prefix misses, got {misses}");
+        assert!(
+            misses >= 60,
+            "expected >=60/64 absent-prefix misses, got {misses}"
+        );
     }
 
     #[test]
