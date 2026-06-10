@@ -1283,3 +1283,12 @@ kills the dependent GET per record), executor parallel retest, lazy probe (OPT-N
   experimentally refuted (user's skepticism was correct).
 - Shipped today: prefix bloom v3, N14 depth-gated, garbage-drain v1+continuous,
   classifier-pool leak fix, FRS_REENTRY/STREAM diag, kill-switches, harness env fixes.
+
+# q7@100M lever stack: REGRESSION caught + RATIO GATE fix (2026-06-10 night)
+q7 DNF@1700 at 79.5M vs pre-lever 1441.6s FINISH — outside the ±10% band. Mechanism:
+the drain's ABSOLUTE tombstone trigger fired on q7 (many tombstones but far larger
+live set) → L1→L2 drains rewrote big live spans for little reclaim → write-amp stole
+read I/O. FIX (7ebe51daa): ratio gate — drain only when tombstones >= 20% of entries
+flushed since last drain (q9-class drains, q7-class skips; never-rob by construction).
+VALIDATION running: q7@1700 (must restore ~1441-class) then q9@2700 (must keep the
+2484.4s finish — q9's delete ratio is high so the gate stays open for it).
