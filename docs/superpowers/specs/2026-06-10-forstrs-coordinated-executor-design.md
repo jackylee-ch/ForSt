@@ -106,16 +106,46 @@ Cache stays (load-bearing for q11/q12/q19 incl. the committed findRow fix) but:
   shard, always in batch order. q8's breakage (key-agnostic routing + shared
   cache) is eliminated structurally, not by synchronization.
 
-### 3.3 Stage 2 — engine levers, evidence-gated (no code before profile)
+### 3.3 Stage 2 — engine direct-local-read fast path (VERIFIED 2026-06-10, promoted to co-primary)
 
-- **q9**: from the 2400s run's decay diag → either (i) per-request constant cost
-  (levers: request-object pooling, fused get+iter ops, interval-join probe
-  batching) or (ii) LSM scan amp (engine lever). Bar is only ≤1776s; ForSt
-  already beaten (DNF).
-- **q20**: profile whether join probes hit bloom/range pruning on the prefix
-  path; if not, wire prefix-bloom into the probe path. Target 1610 → ≤1074.
-- **q7**: re-measure after Stage 1 (mailbox overlap + backpressure + worker-side
-  serialization expected to close most of 1052 vs 587) before any engine work.
+Verification run (q9, 100M, MAXSEC=2400, decay diag + /proc CPU + 2× thread dumps;
+full data in the sweep doc "q9 DEEP PROFILE" section) established:
+- q9 true finish ≈ 2600s (cut at 2400s @ ~91M); LSM HEALTHY during decay (L0≤3).
+- Box ~8% CPU, opendal pool near idle, join task threads 20% duty cycle →
+  LATENCY-bound, not CPU/disk/compaction-bound.
+- Stacks (all 4 join threads, both dumps): RUNNABLE inside one synchronous FFM
+  downcall (frsVecIterPrefixOpen / vectorizedBatchGet) under
+  `AsyncExecutionController.drainInflightRecords ← processWatermark` — every
+  watermark forces a full inline SERIAL drain of pending probes.
+- Engine: every non-resident block read = `handle.block_on(opendal read)`
+  (`forst-rs-io/src/opendal_backend.rs:478-485,683,699`) — a tokio handoff
+  round-trip per op EVEN ON LOCAL DISK. The write path had this same disease and
+  was fixed by coalescing ~500× (:823-827); the read path is still per-op.
+- Per-record cost ≈ 120µs (33K/s ÷ 4 threads). Throughput = 1/latency; decays as
+  deeper state adds block reads per seek. Explains ForSt's q9 DNF (parallelism
+  alone can't fix a high per-op floor) and RocksDB's finish (sync in-process
+  block-cache reads, µs-class floor).
+
+**Stage-2 lever (now co-primary with Stage 1): direct-local-read** — serve
+local-cache/local-disk block reads synchronously on the calling thread, bypassing
+the block_on/tokio handoff; keep the async path for genuinely remote reads.
+Engine-only, benefits all read-heavy queries (q9/q19/q7/q20/q4), config untouched.
+
+Deferred follow-ups (re-rank after Stage 1 + direct-local-read land): q20
+prefix-bloom probe pruning; decode-per-entry allocations; mailbox serialization.
+
+### 3.4 Estimated post-fix performance (A = Stage-1 executor, B = direct-local-read)
+
+| q   | today        | A only        | A + B        | bar     |
+|-----|--------------|---------------|--------------|---------|
+| q7  | 1441.6s      | ~750-1000s    | ~500-700s    | <586.8s |
+| q9  | ~2600s true  | ~1100-1500s   | ~700-1200s   | ≤1776s  |
+| q20 | 1610s (par)  | ~1200-1450s   | ~700-1000s   | ≤1074s  |
+| q11 | 264.8s       | ~134.7s (measured floor) | ≤134.7s | ≤132.6s |
+
+A-only floors are MEASURED (opt-in parallel results); A improves on them
+(non-blocking overlap + backpressure + worker serialization). B's magnitude is
+estimated from the latency arithmetic; its direction is verified. GO on A+B.
 
 ## 4. Rollout, gates, PR slicing
 
