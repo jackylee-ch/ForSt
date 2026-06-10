@@ -8084,7 +8084,15 @@ impl DbImpl {
         let l0_disjoint = l0_files
             .windows(2)
             .all(|w| w[0].min_sequence > w[1].max_sequence);
-        if !l0_files.is_empty() && l0_disjoint {
+        // Depth threshold (A/B 2026-06-10): with a SHALLOW L0 (compaction keeping
+        // up — q9 runs at L0 1-3) the key-major walk saves nothing and its extra
+        // per-(key,file) reader-cache lookups cost ~4% (q9@50M pair: 844.6s
+        // file-major vs 880.7s key-major). The short-circuit pays off when L0 is
+        // DEEP (q4-class write-stall regimes hold 40-64 files). Use key-major only
+        // from 8 files up; below that the file-major path's O(L0) reads are ≤7
+        // anyway.
+        const L0_SHORTCIRCUIT_MIN_FILES: usize = 8;
+        if l0_files.len() >= L0_SHORTCIRCUIT_MIN_FILES && l0_disjoint {
             for (i, k) in keys.iter().enumerate() {
                 if resolved[i].is_some() {
                     continue;
