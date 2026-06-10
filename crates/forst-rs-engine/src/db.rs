@@ -222,17 +222,14 @@ fn garbage_drain_threshold() -> u64 {
 /// AND tombstones >= 20% of entries flushed since the last drain — q9-class
 /// (delete-heavy, garbage-dominated) still drains; q7-class (delete-light
 /// relative to live volume) does not. Never-rob by construction.
+/// GATE-V2 (2026-06-11): the flush-ratio condition was REMOVED — it measured
+/// the wrong population (q17: tombstone-rich flushes, live-rich levels →
+/// drains rewrote live data; 87%-of-box compaction profile). The drain site
+/// now checks the LEVEL's stored-tombstone density from footer-v4
+/// tombstone_count instead. This fn keeps only the volume threshold.
 fn garbage_drain_due() -> bool {
     let t = garbage_drain_threshold();
-    if t == 0 {
-        return false;
-    }
-    let tombs = TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed);
-    if tombs < t {
-        return false;
-    }
-    let total = ENTRIES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed);
-    total == 0 || tombs.saturating_mul(5) >= total
+    t > 0 && TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed) >= t
 }
 
 /// Consume ONE threshold's worth of pressure (saturating subtract, NOT zero):
@@ -9823,23 +9820,37 @@ impl CompactionExecutor for DbImpl {
             // size-budget trigger handles growth, and big-state queries
             // (q9 L1 = GBs) pass this floor trivially.
             const GARBAGE_DRAIN_MIN_L1_BYTES: u64 = 512 * 1024 * 1024;
-            let garbage_due = garbage_drain_due()
-                && self
-                    .version_set
-                    .current()
-                    .levels
-                    .get(1)
-                    .is_some_and(|l| {
-                        let mut bytes = 0u64;
-                        let mut any = false;
-                        for f in &l.files {
-                            if f.cf_id == cf_id {
-                                any = true;
-                                bytes = bytes.saturating_add(f.file_size);
-                            }
+            // GATE-V2 (2026-06-11): additionally require the LEVEL's STORED
+            // tombstone density (footer-v4 tombstone_count / total_entries over
+            // the CF's L1 files) ≥ 20% — the population the flush-ratio gate got
+            // wrong (q17: tombstone-rich flushes but live-rich levels → drains
+            // rewrote GBs of live data; 87%-of-box compaction profile). Pre-v4
+            // SSTs decode tombstone_count=0 → density underestimates →
+            // conservative (no drain). Footer reads come from cached reader
+            // handles and run only on the compaction worker after the count
+            // threshold trips.
+            let garbage_due = garbage_drain_due() && {
+                let version = self.version_set.current();
+                version.levels.get(1).is_some_and(|l| {
+                    let mut bytes = 0u64;
+                    let mut tombs = 0u64;
+                    let mut entries = 0u64;
+                    for f in &l.files {
+                        if f.cf_id != cf_id {
+                            continue;
                         }
-                        any && bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
-                    });
+                        bytes = bytes.saturating_add(f.file_size);
+                        if let Ok(reader) = self.get_or_open_sst_reader(f) {
+                            let ft = reader.footer();
+                            tombs = tombs.saturating_add(ft.tombstone_count);
+                            entries = entries.saturating_add(ft.total_entries);
+                        }
+                    }
+                    bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
+                        && entries > 0
+                        && tombs.saturating_mul(5) >= entries
+                })
+            };
             if over || garbage_due {
                 let _ = self.compact_level_for_cf(cf_data, 1);
                 drained_l1 = true;

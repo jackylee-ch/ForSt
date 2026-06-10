@@ -157,6 +157,9 @@ pub struct SstWriterImpl {
     prefix_hashes: Vec<u64>,
     /// Last prefix pushed into `prefix_hashes` (dedup state).
     last_prefix: Option<Vec<u8>>,
+    /// v4: count of Delete/SingleDelete entries — persisted in the footer as
+    /// the stored-tombstone-density signal (garbage-drain gate-v2).
+    tombstone_entries: u64,
     /// C (2026-06-04): per-instance override for the v2 KV block-format flag.
     /// `None` (production default) defers to [`super::kv_block::sst_write_kv_format`]
     /// (the `FRS_SST_KV_BLOCK_FORMAT` env gate); tests set it explicitly via
@@ -206,6 +209,7 @@ impl SstWriterImpl {
             key_hashes: Vec::new(),
             prefix_hashes: Vec::new(),
             last_prefix: None,
+            tombstone_entries: 0,
             kv_format_override: None,
         }
     }
@@ -281,6 +285,12 @@ impl SstWriterImpl {
         }
         self.sequence_builder.append_value(sequence);
         self.op_type_builder.append_value(op_type);
+        // v4 tombstone density signal (OpType reprs: Delete=0, SingleDelete=7).
+        if op_type == forst_rs_common::OpType::Delete as u8
+            || op_type == forst_rs_common::OpType::SingleDelete as u8
+        {
+            self.tombstone_entries += 1;
+        }
 
         let entry_size = key.len() + value.map_or(0, |v| v.len());
         self.current_estimated_size += entry_size;
@@ -495,6 +505,7 @@ impl SstWriterImpl {
             cf_id: self.options.cf_id,
             prefix_bloom_offset,
             prefix_bloom_size,
+            tombstone_count: self.tombstone_entries,
         };
         let footer_bytes = footer.encode();
         out.append(&footer_bytes)?;
@@ -846,6 +857,7 @@ impl<'a, W: WritableFile + ?Sized> StreamingSstWriter<'a, W> {
             cf_id: inner.options.cf_id,
             prefix_bloom_offset,
             prefix_bloom_size,
+            tombstone_count: inner.tombstone_entries,
         };
         let footer_bytes = footer.encode();
         self.sink.out.append(&footer_bytes)?;

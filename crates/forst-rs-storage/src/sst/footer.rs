@@ -66,9 +66,13 @@ pub const FOOTER_FIXED_FIELDS_SIZE_V2: usize = 80;
 /// scan-path pruning lever, 2026-06-10).
 pub const FOOTER_FIXED_FIELDS_SIZE_V3: usize = 92;
 
+/// Size in bytes of the v4 fixed-field portion (adds tombstone_count: u64 —
+/// the stored-tombstone-density signal for garbage-drain gate-v2, 2026-06-11).
+pub const FOOTER_FIXED_FIELDS_SIZE_V4: usize = 100;
+
 /// Backwards-compatible alias for callers that expect the current writer-
-/// side size. Always equals the v3 size since v3 is the writer's emit format.
-pub const FOOTER_FIXED_FIELDS_SIZE: usize = FOOTER_FIXED_FIELDS_SIZE_V3;
+/// side size. Always equals the v4 size since v4 is the writer's emit format.
+pub const FOOTER_FIXED_FIELDS_SIZE: usize = FOOTER_FIXED_FIELDS_SIZE_V4;
 
 /// Size in bytes of the footer tail: checksum (4) + length (4) + magic (4).
 pub const FOOTER_TAIL_SIZE: usize = 12;
@@ -153,6 +157,13 @@ pub struct FooterV1 {
     pub prefix_bloom_offset: u64,
     /// Size in bytes of the prefix bloom section (v3+; 0 = absent).
     pub prefix_bloom_size: u32,
+    /// Number of tombstone entries (Delete/SingleDelete) in this SST (v4+;
+    /// 0 for pre-v4 files = unknown → density underestimates → drains stay
+    /// conservative). The garbage-drain gate-v2 signal: drain a level only
+    /// when Σ tombstone_count / Σ total_entries is high — the flush-ratio
+    /// gate measured the WRONG population (q17: tombstone-rich flushes,
+    /// live-rich levels → drains rewrote live data, 87%-of-box profile).
+    pub tombstone_count: u64,
 }
 
 impl FooterV1 {
@@ -173,7 +184,7 @@ impl FooterV1 {
         // `max_key_offset` are relative to the emitted fixed-field size so
         // decoders parse the keys at the correct location regardless of which
         // trailing fields they understand.
-        let fixed_size = FOOTER_FIXED_FIELDS_SIZE_V3;
+        let fixed_size = FOOTER_FIXED_FIELDS_SIZE_V4;
         let total_size = fixed_size + self.min_key.len() + self.max_key.len() + FOOTER_TAIL_SIZE;
 
         let mut buf = Vec::with_capacity(total_size);
@@ -206,6 +217,10 @@ impl FooterV1 {
         put_fixed64(&mut buf, self.prefix_bloom_offset);
         put_fixed32(&mut buf, self.prefix_bloom_size);
         debug_assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE_V3);
+
+        // v4+: tombstone count at offset 92.
+        put_fixed64(&mut buf, self.tombstone_count);
+        debug_assert_eq!(buf.len(), FOOTER_FIXED_FIELDS_SIZE_V4);
 
         // Variable-length keys
         buf.extend_from_slice(&self.min_key);
@@ -339,6 +354,16 @@ impl FooterV1 {
             (0u64, 0u32)
         };
 
+        // v4+: tombstone count at offset 92, same min_key_offset discriminator.
+        let tombstone_count = if (min_key_offset as usize) >= FOOTER_FIXED_FIELDS_SIZE_V4
+            && data.len() >= FOOTER_FIXED_FIELDS_SIZE_V4 + FOOTER_TAIL_SIZE
+        {
+            let (tc, _) = get_fixed64(&data[FOOTER_FIXED_FIELDS_SIZE_V3..])?;
+            tc
+        } else {
+            0u64
+        };
+
         // Validate compression type
         let compression = match compression_byte {
             0 => CompressionType::None,
@@ -393,6 +418,7 @@ impl FooterV1 {
             cf_id,
             prefix_bloom_offset,
             prefix_bloom_size,
+            tombstone_count,
         })
     }
 }
@@ -425,7 +451,14 @@ mod tests {
             cf_id: DEFAULT_CF_ID,
             prefix_bloom_offset: 20480,
             prefix_bloom_size: 256,
+            tombstone_count: 777,
         }
+    }
+
+    #[test]
+    fn test_tombstone_count_round_trip() {
+        let decoded = FooterV1::decode(&sample_footer().encode()).unwrap();
+        assert_eq!(decoded.tombstone_count, 777);
     }
 
     #[test]
@@ -603,11 +636,12 @@ mod tests {
 
     #[test]
     fn test_fixed_fields_size() {
-        // v3: writer emits the 92-byte fixed-field area (cf_id + prefix-bloom ptr).
-        assert_eq!(FOOTER_FIXED_FIELDS_SIZE, 92);
+        // v4: writer emits the 100-byte fixed-field area (+ tombstone_count).
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE, 100);
         assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V1, 76);
         assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V2, 80);
         assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V3, 92);
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE_V4, 100);
     }
 
     #[test]
@@ -617,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_min_size() {
-        assert_eq!(FOOTER_FIXED_FIELDS_SIZE + FOOTER_TAIL_SIZE, 104);
+        assert_eq!(FOOTER_FIXED_FIELDS_SIZE + FOOTER_TAIL_SIZE, 112);
     }
 
     /// R49-H1: a v1-encoded footer (no cf_id) decodes with
