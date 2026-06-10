@@ -1121,3 +1121,18 @@ metadata with tighter locality).
   from this afternoon are unreliable; only BACK-TO-BACK pairs count from here.
 - Next: rebuild .so with OPT-N14 (L0 batch short-circuit, committed b59042dc2) and run a
   CONSECUTIVE q9@50M pair (bloom-only re-baseline, then bloom+N14) for a clean A/B.
+
+# OPT-N14 back-to-back A/B (q9@50M, 2026-06-10 PM) + depth gate
+| run (consecutive, same box) | wall | out_rows |
+|---|---|---|
+| bloom-only re-baseline | 844.6s | 45,904,788 ✓ |
+| bloom + N14 key-major  | 880.7s | 45,904,788 ✓ |
+N14 cost q9 4.3%: q9 runs at L0 1-3 (compaction keeps up) — the short-circuit saves
+nothing and the per-(key,file) reader lookups add overhead. The doc's 40-64-file
+premise = q4-class write-stall regimes. FIXED (dd17ef60d): key-major only when
+L0 >= 8 files; below, the original file-major path (O(L0)<=7 reads) runs. No loser.
+ALSO: box drift quantified — morning bloom-only 765.6s vs afternoon 844.6s (+10%)
+on identical code → only back-to-back pairs are valid A/B today.
+NEXT: OPT-N18 (value-carrying merge bypassed for memtable-resident keys — the
+scan-path per-row get_internal re-walk; q7/q9/q20's write-then-read joins hit it
+on the COMMON path).
