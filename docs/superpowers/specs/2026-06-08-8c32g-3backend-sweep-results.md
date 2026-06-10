@@ -1351,3 +1351,19 @@ Pre-levers routing HURT q9 (cache-off robbed it; DNF 79.2M@1284). The engine lev
 flipped the math: less cold-read time → cache matters less, parallel latency-hiding
 wins. COMBINED probe launched (routing + drain 500K; estimate ~2200s; bar 1776).
 q9 determinism: FOUR identical out_rows across executors/drain settings.
+
+# ★ q9@100M LEVER COMPOSITION COMPLETE (2026-06-11 02:00)
+| configuration | wall | out_rows |
+|---|---|---|
+| pre-levers (any build, ever) | DNF | — |
+| depth-1, drain 2M | 2484.4s | 91,813,372 |
+| routing, drain 2M | 2378.5s | 91,813,372 |
+| depth-1, drain 500K | 2311.5s | 91,813,372 |
+| **routing + drain 500K** | **2199.2s** | 91,813,372 (5th identical) |
+Levers compose ADDITIVELY (−106 + −173 ≈ −285 measured −285). Bar 1776s gap = 423s
+(1.55× RDB 1420.5). Determinism: five identical out_rows across executors+settings.
+Q9 STRATEGY (next session priorities): (1) drain threshold probe below 500K (the
+curve hasn't flattened), (2) OPT-N16 zero-copy batch-get (engine to_vec at every
+tier — the warm-path CPU), (3) executor read-pool width (routing N=3 → probe 4-6;
+engine is no longer the bottleneck), (4) block locality. q20 = OPT-N04 merge-op
+(operator-level, biggest q20 lever). q7 = jar-vs-day attribution run first.
