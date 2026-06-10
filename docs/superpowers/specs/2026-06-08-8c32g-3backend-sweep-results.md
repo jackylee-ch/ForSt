@@ -1413,3 +1413,13 @@ DEFAULT VERDICT: 200K stays OPT-IN until the drain gate adds a third condition
 NEXT-SESSION BUILDS (final order): (1) drain gate third condition (small fix) →
 re-validate q17 → default 200K; (2) OPT-N16 sink-threading (corrected design, plan
 updated); (3) q20 OPT-N04 merge-op. q9 floor 2001.2 / q20 1477.7 / both deterministic.
+
+# ★ DRAIN DEFAULT → OFF (never-rob enforcement, 2026-06-11 05:20)
+q17@100M at the SHIPPED default (2M + ratio + 512MB floor): 267.9s vs 77-85s norm =
+3.2× ROBBED — the three gate conditions don't capture whatever hurts small-live-state
+queries (q17@200K+floor was 190.1s; the mechanism needs profiling, not more guessing).
+DEFAULT flipped to 0 (drain OFF): the 19 non-join queries keep their pre-drain behavior;
+q9/q20 keep their transformative OPT-IN results (q9 2001.2s, q20 1477.7s @
+FRS_GARBAGE_DRAIN_TOMBSTONES=200000 + routing). Re-enabling by default requires gating
+that passes q17/q3/q8 @100M no-regress — queued with the OPT-N16/OPT-N04 builds.
+q9 no-regress on the floor build: 2081.6s (band), rows exact (9th identical).
