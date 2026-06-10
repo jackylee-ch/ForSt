@@ -1101,3 +1101,14 @@ format round-trip + q9@50M A/B vs 813.5s baseline.
 phase unchanged, as expected — bloom prunes SST scan fan-out only). At 100M the
 decay phase dominates → expect a larger total win. 534 Java + 831 Rust tests green;
 ForSt pushed. 100M gates launching: q9 (bar ≤1776s), q20 (≤1074s), q7 (<587s).
+
+# q9@100M with PREFIX BLOOM (2026-06-10): 94.8M@2389s (MAXSEC 2400) — ✗ bar, but ahead
+vs pre-bloom 90.1M@2313 (~91M@2400, true ~2600s): consistently ahead (70M@1525 vs ~1670s,
+late rate 2× mid-run), but the advantage COMPRESSED in the last 10M (rate 18-27K/s) —
+extrapolated true ~2600s, bar ≤1776s NOT met. READING: bloom prunes FALSE-overlap SSTs;
+late-q9 probes hit mostly TRUE-positive SSTs (an auction's bids accumulate across many
+SSTs over its lifetime) whose cold preads remain. q9's NEXT lever = locality for
+true-positive data: compaction clustering (leveled merge brings one auction's bids into
+one block — how RocksDB sustains 70K/s here) and/or block sizing. Prefix bloom stays
+(free win where prefixes are absent; q20/q7 may benefit more — their joins probe auction
+metadata with tighter locality).
