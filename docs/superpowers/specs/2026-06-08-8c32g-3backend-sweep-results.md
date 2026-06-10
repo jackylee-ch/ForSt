@@ -1007,3 +1007,22 @@ per-executor/per-classifier state coupling not yet identified — needs instrume
 q17 cost ladder: depth-1 77s | defer-1-classifier 117.7 | full-split-inline 148.8 |
 latch-offload 271.8 → the kg-splitting of cheap batches costs ~35-70s on q17; the
 correct-and-fast-q17 design needs the affinity puzzle solved first.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FINAL adaptive verdict (2026-06-10 session end): NONDETERMINISTIC race — FLAKY
+# ═══════════════════════════════════════════════════════════════════════════
+q8 on the offer-time-restored adaptive (@6bfd4354683, semantically = the config that
+once measured 3,064,493): **2,328,053 (−24%)**. The earlier in-band pass was LUCK.
+q8-adaptive across runs: 2,537,233 / 3,064,493 / 1,441,352* / 2,147,792* / 1,831,340* /
+2,328,053 (*=different designs). CONCLUSION: the inline-fast-path+worker mixed regime
+has a real RACE; single-run out_rows verdicts are unreliable for executor work.
+- MULTI-RUN-VERIFIED modes only: depth-1 inline (default, always in band) and
+  routing all-latch (3,064,457 / 3,064,514 / 3,064,485 = three independent passes).
+- The "offer-time serialization law" and "kg-affinity law" were derived from single
+  runs — treat as HYPOTHESES, not laws, until a deterministic repro exists.
+- NEXT SESSION MUST build a DETERMINISTIC q8 repro first (controlled-replay harness,
+  sorted CSV input, p=1, byte-compare — the 2026-06-02 /tmp/corr-q5 pattern) before
+  ANY further executor iteration. Then bisect inline-vs-latch with it.
+- STATE: default depth-1 SAFE+correct; adaptive/coordinated OPT-IN, adaptive FLAKY
+  (do not use for benchmarks); routing OPT-IN correct (the measured q11/q20/q7 wins).
+  All pushed @6bfd4354683, 534 UTs green.
