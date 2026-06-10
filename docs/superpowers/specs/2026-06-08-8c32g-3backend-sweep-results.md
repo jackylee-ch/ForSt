@@ -942,3 +942,32 @@ has MVCC + snapshot_view): capture/pin seq per batch on the mailbox at dispatch,
 read as-of-seq, release after batch. Restores exact depth-1 visibility semantics under
 any scheduling. Required for ANY parallel default (incl. opt-in routing? NO — routing
 blocks the mailbox, no run-ahead, proven correct).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADAPTIVE-mode gates (2026-06-10, jar @b1f4a936dd8) — FAILED, two NEW findings
+# ═══════════════════════════════════════════════════════════════════════════
+| run               | result                       | verdict |
+|-------------------|------------------------------|---------|
+| q17 adaptive      | WEDGED src_out=0 → MAXSEC300 | ✗ job never progresses (startup wedge) |
+| q8  adaptive      | 40.6s, out_rows=2,537,233    | ✗ −17% — SAME family as coordinated-N3 |
+| q11 adaptive      | killed early (run aborted)   | — |
+
+KEY IMPLICATION: q8 corrupts under adaptive even though its iter batches use the
+EXACT blocking dispatch that measured CORRECT under routing (3,064,485, same jar).
+The corruption is therefore NOT unique to non-blocking run-ahead; the INLINE
+fast-path for iter-free batches (or its interleaving with worker batches) is
+implicated. The run-ahead theory for coordinated-N3 q8 needs re-examination too —
+the common factor across BOTH wrong modes is mailbox-executed iter-free batches
+coexisting with worker-executed iter batches... but routing (all-on-workers) and
+inline (all-on-mailbox) are each correct. NEXT DEBUG STEP: thread-dump a wedged
+q17-adaptive TM (task thread stack at src_out=0) — the wedge is likely the same
+defect as the corruption, and it is 100% reproducible in ~60s.
+
+BONUS FINDING (q11, from the wedge investigation dump): GroupWindowAggregate runs
+on the V1 SYNC ForStRsMapState via ForStRsInternalKvStateAdapters, and burns its
+CPU in MergingWindowSet.initializeCache → ForStRsMapState.forEachEntry(:763) PER
+ELEMENT — a full session-window map iteration per record (O(N)/record). This is a
+REAL q11 lever INDEPENDENT of the executor (cache it per key / avoid re-drain).
+
+STATE: default = depth-1 inline (untouched, safe); adaptive+coordinated+routing all
+env-gated opt-in; 534 unit tests + GHA ci-forst-rs green @b1f4a936dd8.
