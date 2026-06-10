@@ -1472,3 +1472,17 @@ lever cost from box state; then the drain default question is decidable with val
 baselines. Feedback-gate q9 validation: 2105.2s in band, rows exact (10th identical).
 LESSON (recorded for methodology): never judge a lever against a different-build,
 different-day baseline — the control run must come FIRST.
+
+# ★★★ ENGINE REGRESSION ISOLATED (2026-06-11 07:40): today's levers cost q17 2.7×
+Back-to-back, same box, drain OFF both:
+| q17@100M | wall |
+|---|---|
+| PRE-BLOOM .so (7f4767f8c) | **99.8s** |
+| CURRENT .so (all of today's engine) | **272.9s** |
+The earlier "norm" comparisons were right by accident — there IS a 2.7× engine
+regression hiding in today's lever commits, masked all day by the (refuted) drain
+attribution. BISECTING by commit: 30cde2fc6 (bloom only) next — write-path suspects:
+prefix-hash collection per key in add_internal (incl. a per-distinct-prefix Vec alloc
+— q17's agg keys are ALL distinct prefixes → alloc+hash per key on every flush AND
+every compaction rewrite). q9/q20 absorbed it (read-bound); q17 (1.15M rec/s
+write-bound) pays full price.
