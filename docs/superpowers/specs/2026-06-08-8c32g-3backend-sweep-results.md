@@ -1451,3 +1451,24 @@ session, building block shipped): RocksDB-style COMPENSATED FILE SIZES — foote
 tombstone_count (now persisted, 832 tests) weighted by shadowed-data estimates feeds
 candidate selection. Behavior reverted to the PROVEN opt-in config; re-enqueue
 busy-loop fixed (was spinning the compaction worker on gate refusal). Default OFF.
+
+# ★★★ ATTRIBUTION REVERSAL (2026-06-11 07:25): THE DRAIN NEVER ROBBED q17
+| q17@100M today (depth-1) | wall |
+|---|---|
+| drain 200K + ratio gate | 190.1s |
+| drain 200K + level-density gate | 228.9s |
+| drain 2M default (pre-flip) | 267.9s |
+| drain 200K + feedback gate | 280.0s |
+| **drain FULLY OFF (control)** | **228.1s ← same band** |
+All variants land 190-280s regardless of drain settings → q17's ~2.5-3× elevation vs
+its 77-85s norm is NOT the drain. The norm came from the PRE-BLOOM engine on a fresher
+box; today's q17 runs all sit on the bloom+v4 engine after ~30h of continuous box load.
+CONSEQUENCES: (1) the default-OFF flip rested on a misattributed comparison — the drain
+MAY be defaultable; (2) the gate iterations (ratio/density/feedback) were chasing
+variance, though each produced durable machinery (footer-v4 counts, reclaim feedback,
+spin fix); (3) NEXT SESSION OPENS WITH THE CLEAN ATTRIBUTION PAIR on a fresh box:
+q17 back-to-back on pre-bloom .so vs current .so, drain off both → separates engine-
+lever cost from box state; then the drain default question is decidable with valid
+baselines. Feedback-gate q9 validation: 2105.2s in band, rows exact (10th identical).
+LESSON (recorded for methodology): never judge a lever against a different-build,
+different-day baseline — the control run must come FIRST.
