@@ -1212,3 +1212,9 @@ bar verdicts await the REBOOTED-box re-run with the CONTINUOUS drain (f716a70fc)
 SESSION CLOSE STATE: levers shipped+pushed (prefix bloom v3, N14 depth-gated,
 garbage-drain v1+continuous); all exactness-verified; box unfit for bar judgments
 (+25% drift); next session = reboot → q9/q20/q7 @100M verdicts → full 3-backend sweep.
+
+# q9@100M garbage curve, drain v1 (final sampler harvest): PLATEAU not climb
+16.5→35GB with drain saw-teeth, peak 46GB, plateau ~32-35GB through the back half —
+v1 CONTAINS garbage at 100M (vs the unbounded pre-drain climb) but doesn't shrink it
+(zeroed counter forfeits backlog). Continuous mode (f716a70fc) targets exactly this:
+expect a materially lower plateau on the rebooted-box re-run.
