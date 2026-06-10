@@ -1188,3 +1188,18 @@ Tombstone-triggered L1→L2 drain (FRS_GARBAGE_DRAIN_TOMBSTONES=2M default) boun
 garbage at ~10GB vs 27GB — the confirmed decay mechanism is neutralized at 50M; the
 wall gain is partial at 50M (drain costs write-amp) but the 100M decay-dominated
 regime should gain much more. Correctness EXACT. q9@100M bar attempt next.
+
+# q9@100M GARBAGE-DRAIN v1 (2026-06-10 evening): SOURCE-COMPLETE 98M@2388s
+The three-lever architecture progression at the SAME 2400s cutoff, on a box that
+degraded +25% across the day:
+| build | records @2400s |
+|---|---|
+| pre-bloom | ~91M |
+| + prefix bloom v3 | 94.8M |
+| + garbage-drain v1 | **98.0M = SOURCE COMPLETE, drain-tail running** |
+Dir curve at 100M: 31-40GB with visible reclaims (39.9→31.3GB) — drain fires but
+zeroing the counter forfeited backlog under sustained deletes → CONTINUOUS mode
+committed (f716a70fc): saturating-subtract + re-enqueue while pressure remains.
+NEXT: REBOOTED-box q9@100M with continuous drain — positioned for the 1776s bar
+(today's run would have finished ~2450s on a +25%-degraded box). Then q20 (bar
+1074; gd-v1 result pending in task bbhj8ucce) and q7.
