@@ -1,0 +1,18 @@
+ForStBackend local vs ForStBackend + forst-rs compat JNI local
+Date: 2026-06-09
+Image: flink:2.2.1-jdk17-forst-bench-tools-20260609
+Base image: flink:2.2.1-jdk17-forst-rs-jemalloc-20260608142656 / Flink 2.2.1 / JDK17
+Docker run limits: --cpus=8 --memory=40g --memory-swap=40g
+Flink TM: 1 TM, 8 slots, taskmanager.memory.process.size=32768m
+Query: Nexmark q12, EVENTS_NUM=100000000, TPS=10000000
+Completion: SOURCE_DONE when src_out reaches expected bid records=92000000
+
+forst-local run a: 131755 ms, 698266 rec/s, src=92000000, out=92000000
+forst-local run b: 121232 ms, 758876 rec/s, src=92000000, out=92000000
+forst-local avg: 126493.5 ms, 728571 rec/s
+
+forst-rs-lib run a: 122476 ms, 751168 rec/s, src=92000000, out=92000000
+forst-rs-lib run b: 121150 ms, 759389 rec/s, src=92000000, out=92000000
+forst-rs-lib avg: 121813.0 ms, 755278 rec/s
+
+Speedup by avg time: 1.0384x, +3.84% faster for forst-rs-lib
