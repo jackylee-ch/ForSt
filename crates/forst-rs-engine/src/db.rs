@@ -206,8 +206,27 @@ fn garbage_drain_due() -> bool {
     t > 0 && TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed) >= t
 }
 
-fn garbage_drain_reset() {
-    TOMBSTONES_FLUSHED_SINCE_DRAIN.store(0, std::sync::atomic::Ordering::Relaxed);
+/// Consume ONE threshold's worth of pressure (saturating subtract, NOT zero):
+/// under sustained delete load the counter refills while a drain runs — zeroing
+/// forfeited that backlog and let garbage outpace the drain at 100M scale
+/// (dir 31-40GB vs the 50M run's flat 10GB). Keeping the remainder makes the
+/// next maintenance tick drain again until production falls below one
+/// threshold per drain.
+fn garbage_drain_consume() {
+    let t = garbage_drain_threshold();
+    let mut cur = TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let next = cur.saturating_sub(t);
+        match TOMBSTONES_FLUSHED_SINCE_DRAIN.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(now) => cur = now,
+        }
+    }
 }
 
 fn bulk_sample_k() -> usize {
@@ -9774,10 +9793,13 @@ impl CompactionExecutor for DbImpl {
                 let _ = self.compact_level_for_cf(cf_data, 1);
                 drained_l1 = true;
                 if garbage_due {
-                    garbage_drain_reset();
+                    garbage_drain_consume();
                 }
-                // still over budget? re-enqueue for the next tick.
-                if self.pick_compaction_level_for_cf(cf_id) == Some(1) {
+                // Re-enqueue while over the size budget OR while tombstone
+                // pressure remains (sustained delete load refills the counter
+                // during the drain — continuous draining is what keeps garbage
+                // bounded at 100M scale).
+                if self.pick_compaction_level_for_cf(cf_id) == Some(1) || garbage_drain_due() {
                     self.enqueue_compaction(cf_data.clone());
                 }
             }
