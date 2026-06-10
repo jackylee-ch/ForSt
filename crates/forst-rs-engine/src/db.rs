@@ -9829,28 +9829,32 @@ impl CompactionExecutor for DbImpl {
             // conservative (no drain). Footer reads come from cached reader
             // handles and run only on the compaction worker after the count
             // threshold trips.
-            let garbage_due = garbage_drain_due() && {
-                let version = self.version_set.current();
-                version.levels.get(1).is_some_and(|l| {
-                    let mut bytes = 0u64;
-                    let mut tombs = 0u64;
-                    let mut entries = 0u64;
-                    for f in &l.files {
-                        if f.cf_id != cf_id {
-                            continue;
+            // GATE-V2 LEVEL-DENSITY REVERTED (2026-06-11 06:30): it refused
+            // q9's needed drains (DNF@2300 vs 2001s) — compaction outputs carry
+            // FEW tombstones (annihilation consumes them) while the dead VALUES
+            // hide in deeper levels, so L1 stored density under-reads garbage.
+            // Flush-ratio over-drained q17; level-density starves q9: both
+            // single signals wrong. The correct design = RocksDB-style
+            // COMPENSATED FILE SIZES (per-file tombstone_count — now persisted
+            // in footer v4 — weighted by the data it shadows); next session.
+            // Behavior restored to the PROVEN config: count threshold + floor.
+            let garbage_due = garbage_drain_due()
+                && self
+                    .version_set
+                    .current()
+                    .levels
+                    .get(1)
+                    .is_some_and(|l| {
+                        let mut bytes = 0u64;
+                        let mut any = false;
+                        for f in &l.files {
+                            if f.cf_id == cf_id {
+                                any = true;
+                                bytes = bytes.saturating_add(f.file_size);
+                            }
                         }
-                        bytes = bytes.saturating_add(f.file_size);
-                        if let Ok(reader) = self.get_or_open_sst_reader(f) {
-                            let ft = reader.footer();
-                            tombs = tombs.saturating_add(ft.tombstone_count);
-                            entries = entries.saturating_add(ft.total_entries);
-                        }
-                    }
-                    bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
-                        && entries > 0
-                        && tombs.saturating_mul(5) >= entries
-                })
-            };
+                        any && bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
+                    });
             if over || garbage_due {
                 let _ = self.compact_level_for_cf(cf_data, 1);
                 drained_l1 = true;
@@ -9858,10 +9862,12 @@ impl CompactionExecutor for DbImpl {
                     garbage_drain_consume();
                 }
                 // Re-enqueue while over the size budget OR while tombstone
-                // pressure remains (sustained delete load refills the counter
-                // during the drain — continuous draining is what keeps garbage
-                // bounded at 100M scale).
-                if self.pick_compaction_level_for_cf(cf_id) == Some(1) || garbage_drain_due() {
+                // pressure remains AND the floor still passes (re-enqueueing on
+                // the raw counter alone spun the compaction worker forever when
+                // the gate refused — a busy-loop that itself robbed the box).
+                if self.pick_compaction_level_for_cf(cf_id) == Some(1)
+                    || (garbage_drain_due() && garbage_due)
+                {
                     self.enqueue_compaction(cf_data.clone());
                 }
             }
