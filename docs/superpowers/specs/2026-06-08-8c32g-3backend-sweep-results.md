@@ -1341,3 +1341,13 @@ More frequent reclaim → less garbage → −173s vs best. Bar 1776 now 535s aw
 RDB). Ratio gate keeps q7 safe at any count threshold (its delete ratio fails the
 gate). NOTE: threshold is an ENV today — if 500K (or lower) proves universal, fold
 into the default. Routing-executor retest in flight (~69K/s early).
+
+# q9 routing-executor RETEST on drained engine (2026-06-11): now HELPS
+| q9@100M (drain 2M) | wall | out_rows |
+|---|---|---|
+| depth-1 | 2484.4s | 91,813,372 |
+| ROUTING (FRS_RS_EXECUTOR=routing) | **2378.5s (−4.3%)** | 91,813,372 (4th identical) |
+Pre-levers routing HURT q9 (cache-off robbed it; DNF 79.2M@1284). The engine levers
+flipped the math: less cold-read time → cache matters less, parallel latency-hiding
+wins. COMBINED probe launched (routing + drain 500K; estimate ~2200s; bar 1776).
+q9 determinism: FOUR identical out_rows across executors/drain settings.
