@@ -1400,3 +1400,16 @@ The final 225s to the 1776 bar = the OPT-N16 BUILD: wire the existing zero-copy
 batch_get_arrow into the default executor path (round-2 doc: engine copies every value
 to_vec at EVERY tier + a second FFM copy, while the zero-copy path exists unwired).
 Plan: docs/superpowers/plans/2026-06-11-optn16-zero-copy-gets.md.
+
+# ★★ DRAIN-200K VALIDATION MATRIX (2026-06-11 04:30) — q20 FIRST FINISH; q17 gate leak
+| query @100M | drain 2M (prior) | drain 200K + routing | verdict |
+|---|---|---|---|
+| q9  | 2378.5s | 2001.2s | ✓ best |
+| q20 | DNF 86.5M@1800 | **FINISHED 1477.7s, rows 93,201,404 EXACT — BEATS ForSt 1535.9** | ✓ first finish; "faster than ForSt" bar condition MET |
+| q17 | ~77-85s | >300s (src done, tail dragged) | ✗ ROBBED — ratio gate leaks for q17-class |
+q20 status vs full bar: beats ForSt ✓; 0.8×RDB (≤1074s) still needs OPT-N04.
+DEFAULT VERDICT: 200K stays OPT-IN until the drain gate adds a third condition
+(minimum level-size / live-volume floor so small-state queries never drain-thrash).
+NEXT-SESSION BUILDS (final order): (1) drain gate third condition (small fix) →
+re-validate q17 → default 200K; (2) OPT-N16 sink-threading (corrected design, plan
+updated); (3) q20 OPT-N04 merge-op. q9 floor 2001.2 / q20 1477.7 / both deterministic.
