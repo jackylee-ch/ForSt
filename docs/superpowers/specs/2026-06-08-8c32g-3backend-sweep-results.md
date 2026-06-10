@@ -1392,3 +1392,11 @@ width 4-6, block locality. BEFORE folding 200K into defaults: validate q7 (ratio
 gate should hold) + q17/q20 at the winning setting. q9's bar is now ONE build-lever
 away — the architecture campaign converted an unfinishable query into a tuned,
 deterministic, near-bar pipeline.
+
+# q9 ENV-PROBE SPACE CLOSED (2026-06-11 03:45): pool width saturated
+pool=6 → 2002.9s ≈ pool=3's 2001.2s (8 cores shared with compaction/flush; latency-
+hiding exhausted). 8th identical out_rows. TUNING FLOOR = 2001s (routing-3 + drain-200K).
+The final 225s to the 1776 bar = the OPT-N16 BUILD: wire the existing zero-copy
+batch_get_arrow into the default executor path (round-2 doc: engine copies every value
+to_vec at EVERY tier + a second FFM copy, while the zero-copy path exists unwired).
+Plan: docs/superpowers/plans/2026-06-11-optn16-zero-copy-gets.md.
