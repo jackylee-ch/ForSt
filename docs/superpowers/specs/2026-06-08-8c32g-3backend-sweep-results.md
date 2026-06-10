@@ -1053,3 +1053,17 @@ both regimes per batch → callback ordering differs from both pure modes (depth
 all-inline ✓, routing all-enqueued ✓). NEXT: instrument WHERE per-row callbacks
 execute (thread + during-batch flag) under each mode; compare orderings on the 40s
 full-scale repro. Probe committed as FRS_REENTRY_DIAG (extend it).
+
+# q8 race: CALLBACK-INLINING ASYMMETRY ALSO REFUTED (2026-06-10, code-level)
+CallbackRunnerWrapper.submit ALWAYS mailboxExecutor.execute()s — no same-thread inline
+path exists. User callbacks never run mid-batch on ANY thread. Both mechanism candidates
+(re-entrancy: 0 probe hits; callback inlining: impossible by code) are DEAD.
+Remaining knowns: the ONLY code delta routing(✓×3) vs adaptive(✗6/7) is WHICH THREAD
+executes iter-free batches (mailbox vs worker); completions always enqueue as mails in
+both; both complete before return. The corruption mechanism is therefore something
+thread-identity-sensitive INSIDE the engine/FFM/state layer (e.g., thread-affine caches,
+thread-id-keyed structures, or memory-visibility on state-level structures touched by
+the mailbox during inline execution that workers later read). NEXT-SESSION TOOLING:
+extend FRS_REENTRY_DIAG to log per-row (requestType, keyGroup, completing-thread,
+batch-seq) on the 40s repro for BOTH modes and DIFF the streams — find the first
+divergent row family, then trace that state primitive's thread-sensitivity.
