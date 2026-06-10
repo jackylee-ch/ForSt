@@ -808,3 +808,54 @@ WRONG (confirms historical q5 nondeterminism/under-emit). MUST FIX before its pe
 (correctness non-negotiable). Note q5 frs=41.6s (fast but WRONG).
 => frs already WINS q7/q15/q16/q18 vs RocksDB. Genuine remaining: q5 (correctness), q9/q11/q19/q20 (perf,
 multi-PR levers), q4 (+marginal). 3-backend: ForSt sweep next to complete the matrix.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CURRENT STATUS — complete same-session 3-backend q0-q22 sweep (2026-06-10)
+# ═══════════════════════════════════════════════════════════════════════════
+forst-rs = committed DEFAULT (depth-1, opt-in OPT-01). All three on the same box/session (8c/32g).
+Goal per query: frs ≥0.8× RocksDB AND ≤50s regression AND strictly faster than ForSt AND correct.
+
+| q  | forst-rs | RocksDB | ForSt   | vs RDB | vs ForSt | VERDICT |
+|----|----------|---------|---------|--------|----------|---------|
+| q0 | 30.9s    | 31.8s   | 30.7s   | faster | +0.2s    | ~PASS (ForSt parity, 0.2s) |
+| q1 | 29.3s    | 30.1s   | 30.1s   | faster | faster   | PASS |
+| q2 | 27.8s    | 28.2s   | 28.2s   | faster | faster   | PASS |
+| q3 | 35.6s    | 35.0s   | 37.2s   | 0.98×  | faster   | PASS |
+| q4 | 373.0s   | 302.7s  | 1042.2s | +70.3s | faster   | FAIL RDB (>50s); out_rows retract-cadence (25.8M vs 177.6M) needs final-result check |
+| q5 | 41.6s    | 162.5s  | DNF@400 | —      | —        | ✗✗ CORRECTNESS: 808,765 vs RDB 29,988,416 (−97%) — WRONG |
+| q7 | 1441.6s  | DNF     | 586.8s  | BEATS  | slower   | FAIL ForSt (frs 1441 > ForSt 587); beats RocksDB |
+| q8 | 43.6s    | 42.5s   | 39.2s   | 0.97×  | +4.4s    | FAIL ForSt (4.4s) |
+| q9 | DNF      | 1420.5s | DNF     | DNF    | par      | FAIL RDB (RocksDB finishes, frs DNF) |
+| q10| 124.2s   | 129.5s  | 129.3s  | faster | faster   | PASS |
+| q11| 264.8s   | 106.1s  | 134.9s  | 0.40×  | slower   | FAIL both |
+| q12| 49.6s    | 41.4s   | 39.7s   | 0.83×  | +9.9s    | FAIL ForSt |
+| q13| 28.5s    | 29.3s   | 29.5s   | faster | faster   | PASS |
+| q14| 29.4s    | 29.6s   | 29.2s   | faster | +0.2s    | ~PASS (ForSt parity, 0.2s) |
+| q15| 161.8s   | 229.7s  | 206.8s  | faster | faster   | PASS (beats both) |
+| q16| 323.9s   | 374.1s  | 331.7s  | faster | faster   | PASS (beats both) |
+| q17| 77.7s    | 72.8s   | 253.0s  | 0.94×  | faster   | PASS |
+| q18| 222.9s   | 366.4s  | DNF@400 | faster | BEATS    | PASS (beats both) |
+| q19| 527.9s   | 310.2s  | 308.1s  | 0.59×  | slower   | FAIL both |
+| q20| DNF      | 859.7s  | 1535.9s | DNF    | (1610 par)| FAIL RDB (DNF; finishes 1610s EXACT under opt-in parallel) |
+| q21| 53.9s    | 60.0s   | 58.3s   | faster | faster   | PASS |
+| q22| 43.6s    | 44.2s   | 46.3s   | faster | faster   | PASS |
+
+## SUMMARY (current state, committed default)
+- PASS (beat RocksDB+ForSt, correct): q1,q2,q3,q10,q13,q15,q16,q17,q18,q21,q22 = **11 clear**.
+  (q15/q16/q18 beat BOTH; q7/q18 finish where a competitor DNFs.)
+- ~PASS marginal (ForSt parity ±0.2s): q0, q14.
+- FAIL — slower than ForSt only (beats RocksDB): q7 (big), q8 (+4.4s), q12 (+9.9s).
+- FAIL — RocksDB perf: q4 (+70s), q9 (DNF), q11 (0.40×), q19 (0.59×), q20 (DNF).
+- FAIL — CORRECTNESS: q5 (−97% under-emit, windowed-agg bug) — TOP PRIORITY.
+
+## REMAINING WORK to close Phase 1 (precisely scoped)
+1. **q5 CORRECTNESS** (top priority): windowed-agg under-emit (−97%). Fix the sliding-window merge/fire.
+2. **q11/q20** (and q7-vs-ForSt): universal OPT-01 = non-blocking async executor + LOCK-FREE per-worker
+   cache (parallel sweep proved q11→134.7s, q20→1610s EXACT; the executor-block robs q17-class + the
+   single-thread cache races — both must be fixed for a default).
+3. **q9**: OPT-02 (non-blocking/parallel FFM) — DNF even under parallel.
+4. **q19**: diffuse serde+engine read-path (post-findRow profile).
+5. **q8/q12 vs ForSt**: small gaps (4-10s) — ForSt's windowed-agg path is faster; investigate.
+6. **q4**: −20s+ to clear ≤50s (box-marginal; rigorous best 340s passes).
+All committed levers (zero-copy, q19 findRow, deadlock-free routing, OPT-01 opt-in) are GHA-green; the
+remaining are multi-PR architectural changes for a healthy box. Phase 1 NOT met: 11 pass, ~12 fail/marginal.
