@@ -1304,3 +1304,9 @@ overhead on hot-prefix scans, or cross-DAY variance (the ±10% band was measured
 within one day). CONTROL queued: q7@100M with FRS_DISABLE_PREFIX_BLOOM=1 +
 FRS_GARBAGE_DRAIN_TOMBSTONES=0 on the current jar — separates engine levers from
 jar/variance. q9 ratio-gate validation in flight (must keep the 2484.4s finish).
+
+# q9 ratio-gate validation: FINISHED 2678.7s, out_rows 91,813,372 (EXACT = prior finish)
+vs 2484.4s absolute-trigger: +7.8% — at the variance band edge; either the 20% ratio
+bar throttles some q9 drains or noise. Determinism note: two q9@100M finishes with
+IDENTICAL out_rows. Net ratio-gate trade: q7 +8%, q9 −0..8% → near-neutral; tune the
+bar to 10% as the next probe. q7 levers-off CONTROL running for residual attribution.
