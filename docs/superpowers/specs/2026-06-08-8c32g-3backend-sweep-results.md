@@ -1203,3 +1203,12 @@ committed (f716a70fc): saturating-subtract + re-enqueue while pressure remains.
 NEXT: REBOOTED-box q9@100M with continuous drain — positioned for the 1776s bar
 (today's run would have finished ~2450s on a +25%-degraded box). Then q20 (bar
 1074; gd-v1 result pending in task bbhj8ucce) and q7.
+
+# q20@100M garbage-drain v1 (2026-06-10 session close): 84.6M@1788s cutoff
+vs pre-drain 80.75M@1800 (same MAXSEC, less-degraded box earlier) — ~4M ahead on a
+worse box. Effect smaller than q9's (q20's tombstone volume is lower: count-map
+retractions vs interval-join cleanup), direction consistent. Both q9 and q20 100M
+bar verdicts await the REBOOTED-box re-run with the CONTINUOUS drain (f716a70fc).
+SESSION CLOSE STATE: levers shipped+pushed (prefix bloom v3, N14 depth-gated,
+garbage-drain v1+continuous); all exactness-verified; box unfit for bar judgments
+(+25% drift); next session = reboot → q9/q20/q7 @100M verdicts → full 3-backend sweep.
