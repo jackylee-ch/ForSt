@@ -1026,3 +1026,18 @@ has a real RACE; single-run out_rows verdicts are unreliable for executor work.
 - STATE: default depth-1 SAFE+correct; adaptive/coordinated OPT-IN, adaptive FLAKY
   (do not use for benchmarks); routing OPT-IN correct (the measured q11/q20/q7 wins).
   All pushed @6bfd4354683, 534 UTs green.
+
+# q8 race characterization (2026-06-10 session end)
+- Reduced-scale probes ALL deterministic+identical: 1M ×4 (inline ref + adaptive ×3) =
+  30,390 exact; 10M ×3 (adaptive ×2 + inline) = 306,016 exact. Race is LOAD-DEPENDENT —
+  needs full-100M sustained pressure (AEC in-flight saturation + checkpoint overlap +
+  watermark drain cadence; reduced runs finish in 3-7s).
+- Full-scale q8 = ~40s/run → the repro IS the full-scale run (~3 min cycle).
+- VARIABLE ISOLATED: routing (=adaptive minus inline fast-path, all else identical) is
+  correct ×3; adaptive wrong in 5/6 full-scale runs (1.44-3.06M spread). The racy
+  ingredient = INLINE execution of iter-free batches on the mailbox interleaved (in time)
+  with latch-dispatched iter batches. Mechanism candidate for next session: inline
+  per-row completions run SYNCHRONOUSLY mid-batch on the mailbox (callbackRunner inline
+  when already on mailbox) and can re-enter the AEC/active-container during the inline
+  phase — vs the latch path where completions queue as mails. Instrument that re-entrancy
+  first (count offers-into-active-container during inline execute).
