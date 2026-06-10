@@ -238,6 +238,21 @@ fn garbage_drain_due() -> bool {
 /// (dir 31-40GB vs the 50M run's flat 10GB). Keeping the remainder makes the
 /// next maintenance tick drain again until production falls below one
 /// threshold per drain.
+/// ADAPTIVE FEEDBACK GATE (2026-06-11, replaces both refuted predictive
+/// signals): consecutive garbage drains that reclaimed almost nothing. The
+/// model-based gates failed their A/Bs — flush-ratio over-drained q17
+/// (live-rich levels), L1 stored-density starved q9 (annihilation strips L1
+/// tombstones while dead values hide deeper). Instead of PREDICTING reclaim,
+/// MEASURE it: after each garbage drain compare the CF's L1+L2 bytes before
+/// vs after; <5% reclaimed = a wasted rewrite → suppress further garbage
+/// drains after GARBAGE_DRAIN_MAX_WASTED consecutive wastes (q17-class pays
+/// for at most 2 probe drains per run, then never again); any productive
+/// drain resets the counter (q9-class reclaims GBs each time → never backs
+/// off).
+static GARBAGE_DRAIN_WASTED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+const GARBAGE_DRAIN_MAX_WASTED: u32 = 2;
+
 fn garbage_drain_consume() {
     // Scale the entries counter down proportionally so the ratio gate keeps
     // reflecting RECENT flush composition rather than the whole run's.
@@ -9838,7 +9853,25 @@ impl CompactionExecutor for DbImpl {
             // COMPENSATED FILE SIZES (per-file tombstone_count — now persisted
             // in footer v4 — weighted by the data it shadows); next session.
             // Behavior restored to the PROVEN config: count threshold + floor.
-            let garbage_due = garbage_drain_due()
+            // Per-CF L1+L2 bytes — the before/after delta measures ACTUAL
+            // reclaim for the adaptive feedback gate.
+            let cf_deep_bytes = |version: &Version| -> u64 {
+                let mut b = 0u64;
+                for lvl in 1..version.num_levels() {
+                    if let Some(l) = version.levels.get(lvl) {
+                        for f in &l.files {
+                            if f.cf_id == cf_id {
+                                b = b.saturating_add(f.file_size);
+                            }
+                        }
+                    }
+                }
+                b
+            };
+            let backoff = GARBAGE_DRAIN_WASTED.load(std::sync::atomic::Ordering::Relaxed)
+                >= GARBAGE_DRAIN_MAX_WASTED;
+            let garbage_due = !backoff
+                && garbage_drain_due()
                 && self
                     .version_set
                     .current()
@@ -9856,18 +9889,34 @@ impl CompactionExecutor for DbImpl {
                         any && bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
                     });
             if over || garbage_due {
+                let before = if garbage_due {
+                    cf_deep_bytes(&self.version_set.current())
+                } else {
+                    0
+                };
                 let _ = self.compact_level_for_cf(cf_data, 1);
                 drained_l1 = true;
                 if garbage_due {
                     garbage_drain_consume();
+                    // FEEDBACK: a drain that reclaimed <5% of the deep bytes was
+                    // a wasted rewrite of live data (q17-class) — count it;
+                    // productive drains (q9-class reclaim GBs) reset the count.
+                    let after = cf_deep_bytes(&self.version_set.current());
+                    let reclaimed = before.saturating_sub(after);
+                    if before > 0 && reclaimed.saturating_mul(20) < before {
+                        GARBAGE_DRAIN_WASTED
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        GARBAGE_DRAIN_WASTED.store(0, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // Re-enqueue while over the size budget OR while tombstone
-                // pressure remains AND the floor still passes (re-enqueueing on
-                // the raw counter alone spun the compaction worker forever when
-                // the gate refused — a busy-loop that itself robbed the box).
-                if self.pick_compaction_level_for_cf(cf_id) == Some(1)
-                    || (garbage_drain_due() && garbage_due)
-                {
+                // pressure remains AND the gate (incl. backoff) still passes.
+                let still_due = GARBAGE_DRAIN_WASTED.load(std::sync::atomic::Ordering::Relaxed)
+                    < GARBAGE_DRAIN_MAX_WASTED
+                    && garbage_drain_due()
+                    && garbage_due;
+                if self.pick_compaction_level_for_cf(cf_id) == Some(1) || still_due {
                     self.enqueue_compaction(cf_data.clone());
                 }
             }
