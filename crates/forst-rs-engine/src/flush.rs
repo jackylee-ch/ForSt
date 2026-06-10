@@ -233,7 +233,7 @@ impl FlushJob {
                             || o == forst_rs_common::OpType::SingleDelete as u8
                     })
                     .count() as u64;
-                crate::db::note_flushed_tombstones(tombs);
+                crate::db::note_flushed_tombstones(tombs, ops.len() as u64);
                 writer.add_batch(keys, values, seqs, ops)?;
             }
 

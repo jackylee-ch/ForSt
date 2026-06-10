@@ -181,9 +181,15 @@ fn prefix_bloom_enabled() -> bool {
 static TOMBSTONES_FLUSHED_SINCE_DRAIN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn note_flushed_tombstones(n: u64) {
-    if n > 0 {
-        TOMBSTONES_FLUSHED_SINCE_DRAIN.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+static ENTRIES_FLUSHED_SINCE_DRAIN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_flushed_tombstones(tombs: u64, total: u64) {
+    if tombs > 0 {
+        TOMBSTONES_FLUSHED_SINCE_DRAIN.fetch_add(tombs, std::sync::atomic::Ordering::Relaxed);
+    }
+    if total > 0 {
+        ENTRIES_FLUSHED_SINCE_DRAIN.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -201,9 +207,25 @@ fn garbage_drain_threshold() -> u64 {
     })
 }
 
+/// RATIO GATE (2026-06-10 night, q7 regression fix): an ABSOLUTE tombstone count
+/// fired drains on q7-class workloads too — many tombstones but a far larger
+/// live set, so each L1→L2 drain rewrote big live spans for little reclaim and
+/// the write-amp stole I/O from reads (q7 lever-stack DNF@1700 at 79.5M vs its
+/// pre-lever 1441.6s finish). Require BOTH: tombstone volume over the threshold
+/// AND tombstones >= 20% of entries flushed since the last drain — q9-class
+/// (delete-heavy, garbage-dominated) still drains; q7-class (delete-light
+/// relative to live volume) does not. Never-rob by construction.
 fn garbage_drain_due() -> bool {
     let t = garbage_drain_threshold();
-    t > 0 && TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed) >= t
+    if t == 0 {
+        return false;
+    }
+    let tombs = TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed);
+    if tombs < t {
+        return false;
+    }
+    let total = ENTRIES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed);
+    total == 0 || tombs.saturating_mul(5) >= total
 }
 
 /// Consume ONE threshold's worth of pressure (saturating subtract, NOT zero):
@@ -213,6 +235,9 @@ fn garbage_drain_due() -> bool {
 /// next maintenance tick drain again until production falls below one
 /// threshold per drain.
 fn garbage_drain_consume() {
+    // Scale the entries counter down proportionally so the ratio gate keeps
+    // reflecting RECENT flush composition rather than the whole run's.
+    ENTRIES_FLUSHED_SINCE_DRAIN.store(0, std::sync::atomic::Ordering::Relaxed);
     let t = garbage_drain_threshold();
     let mut cur = TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed);
     loop {
