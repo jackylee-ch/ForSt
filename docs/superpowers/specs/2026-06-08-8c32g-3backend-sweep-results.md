@@ -1264,3 +1264,22 @@ continuous drain was ~1.7× v1's at matching points (43K vs 25K @1866s). Remaini
 q9 levers: drain-threshold tuning (lower than 2M), executor parallel retest (engine
 is now much faster → the latency-hiding math changed), block/locality. 10M-scale
 correctness EXACT (9,177,252 == RocksDB). q20@100M MAXSEC 1800 queued on same .so.
+
+# q20@100M continuous drain (night close): DNF@1800 at 86.5M
+Progression: 80.75M (pre-drain) → 84.6M (v1) → 86.5M (continuous); extrap finish
+~2300s vs bar 1074s. q20's residual gap is dominated by OPERATOR-level costs the
+engine levers can't reach (round-2 doc: no-UK join = full asyncEntries bucket scan
+per probe + cnt-replicated materialization + per-record GET→PUT RMW on the count
+map). q20's named next levers: OPT-N04 (engine merge operator for the count map —
+kills the dependent GET per record), executor parallel retest, lazy probe (OPT-N01).
+
+# ═══ 2026-06-10 NIGHT CLOSE — campaign summary ═══
+- ★ q9@100M FIRST FINISH 2484.4s (was DNF on every prior build); bar 1776 gap 700s.
+- q20: 86.5M@1800 (steady lever gains, operator-level levers next).
+- Correctness: 20/22 EXACT vs RocksDB @10M incl q7/q9/q20; ZERO regressions from
+  today's stack (3-step bisect); q4@10M = pre-existing wedge (own ticket, RDB=19.9s);
+  q5 = pre-existing churn artifact.
+- Variance ruling: ±10% intrinsic; Mac-degradation AND scratch-junk theories both
+  experimentally refuted (user's skepticism was correct).
+- Shipped today: prefix bloom v3, N14 depth-gated, garbage-drain v1+continuous,
+  classifier-pool leak fix, FRS_REENTRY/STREAM diag, kill-switches, harness env fixes.
