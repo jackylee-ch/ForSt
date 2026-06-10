@@ -1136,3 +1136,18 @@ on identical code → only back-to-back pairs are valid A/B today.
 NEXT: OPT-N18 (value-carrying merge bypassed for memtable-resident keys — the
 scan-path per-row get_internal re-walk; q7/q9/q20's write-then-read joins hit it
 on the COMMON path).
+
+# OPT-N18 REASSESSED + the GARBAGE-RETENTION hypothesis (2026-06-10 end)
+- OPT-N18 (value-carrying merge for memtable sources): the Fallback is ALREADY
+  memtable-cheap (get_internal short-circuits at the active memtable, db.rs:8399-8424);
+  the win is a SECOND memtable probe + Arc alloc per row = ~100s ns CPU. Today's decay
+  profile (8% CPU, 182µs cold preads) says the q9/q20 wall is I/O, not CPU → N18 demoted
+  for the decay regime (still valid micro-opt for warm/CPU-bound phases).
+- ★ NEW TOP HYPOTHESIS — GARBAGE RETENTION: q9 writes 36-45GB scratch while LIVE
+  interval-join state is a few GB. If compaction lags reclaiming tombstoned ranges,
+  probes read through garbage-diluted blocks → the cold-pread volume; RocksDB's leveled
+  compaction reclaims aggressively → 70K/s sustained on identical hardware; bloom's gain
+  compressing late = garbage accumulating. DISCRIMINATOR (cheap): during q9 decay compare
+  engine-dir bytes vs live-state estimate (DECAY_DIAG state= per flush already prints) +
+  count tombstones per scanned block. If confirmed → lever = tombstone-priority compaction
+  (architectural, helps q9/q20/q4, config untouched).
