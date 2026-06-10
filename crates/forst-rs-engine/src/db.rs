@@ -9807,13 +9807,32 @@ impl CompactionExecutor for DbImpl {
             // dead data piled up (q9: dir 2.4→28GB vs plateaued live state =
             // the probe-read decay). The drain annihilates tombstones against
             // older L1/L2 data. Delete-light workloads never trip this.
+            // THIRD GATE CONDITION (2026-06-11, q17 leak fix): require a
+            // MINIMUM L1 volume before garbage-draining. At drain-200K, q17
+            // (small live state, window/TTL tombstones passing the 20% ratio
+            // on small flush volumes) drain-thrashed its tiny levels — source
+            // done in ~180s but the job dragged past 300s vs its 77s norm.
+            // With < 512MB in L1 there is nothing worth a forced rewrite; the
+            // size-budget trigger handles growth, and big-state queries
+            // (q9 L1 = GBs) pass this floor trivially.
+            const GARBAGE_DRAIN_MIN_L1_BYTES: u64 = 512 * 1024 * 1024;
             let garbage_due = garbage_drain_due()
                 && self
                     .version_set
                     .current()
                     .levels
                     .get(1)
-                    .is_some_and(|l| l.files.iter().any(|f| f.cf_id == cf_id));
+                    .is_some_and(|l| {
+                        let mut bytes = 0u64;
+                        let mut any = false;
+                        for f in &l.files {
+                            if f.cf_id == cf_id {
+                                any = true;
+                                bytes = bytes.saturating_add(f.file_size);
+                            }
+                        }
+                        any && bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
+                    });
             if over || garbage_due {
                 let _ = self.compact_level_for_cf(cf_data, 1);
                 drained_l1 = true;
