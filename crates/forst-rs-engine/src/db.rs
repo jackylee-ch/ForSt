@@ -170,6 +170,46 @@ fn prefix_bloom_enabled() -> bool {
     })
 }
 
+/// FRS-GARBAGE-DRAIN (2026-06-10): tombstone entries flushed to L0 since the
+/// last forced deep (L1→L2) drain. The 2026-06-10 q9 discriminator showed the
+/// engine dir growing 2.4→28GB while live state plateaued — size-budget
+/// compaction triggers never fire on tombstone-laden under-budget levels, so
+/// dead data accumulates and every probe reads garbage-diluted blocks (the
+/// q9/q20 decay). When the counter crosses the threshold, the maintenance
+/// drain runs regardless of the size budget and the counter resets.
+/// Delete-light queries never trip it (structurally never-rob).
+static TOMBSTONES_FLUSHED_SINCE_DRAIN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn note_flushed_tombstones(n: u64) {
+    if n > 0 {
+        TOMBSTONES_FLUSHED_SINCE_DRAIN.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Threshold (flushed tombstone ENTRIES) that forces a deep drain.
+/// `FRS_GARBAGE_DRAIN_TOMBSTONES` overrides; `0` disables. Default 2M entries
+/// (≈ GBs of dead data at typical join row sizes).
+fn garbage_drain_threshold() -> u64 {
+    use std::sync::OnceLock;
+    static T: OnceLock<u64> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("FRS_GARBAGE_DRAIN_TOMBSTONES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2_000_000)
+    })
+}
+
+fn garbage_drain_due() -> bool {
+    let t = garbage_drain_threshold();
+    t > 0 && TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed) >= t
+}
+
+fn garbage_drain_reset() {
+    TOMBSTONES_FLUSHED_SINCE_DRAIN.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn bulk_sample_k() -> usize {
     use std::sync::OnceLock;
     static K: OnceLock<usize> = OnceLock::new();
@@ -9717,9 +9757,25 @@ impl CompactionExecutor for DbImpl {
                 .pick_compaction_level_for_cf(cf_id)
                 .map(|lvl| lvl == 1)
                 .unwrap_or(false);
-            if over {
+            // FRS-GARBAGE-DRAIN (2026-06-10): ALSO drain when accumulated
+            // flushed tombstones cross the threshold, even UNDER the size
+            // budget — size triggers never fire on tombstone-laden levels, so
+            // dead data piled up (q9: dir 2.4→28GB vs plateaued live state =
+            // the probe-read decay). The drain annihilates tombstones against
+            // older L1/L2 data. Delete-light workloads never trip this.
+            let garbage_due = garbage_drain_due()
+                && self
+                    .version_set
+                    .current()
+                    .levels
+                    .get(1)
+                    .is_some_and(|l| l.files.iter().any(|f| f.cf_id == cf_id));
+            if over || garbage_due {
                 let _ = self.compact_level_for_cf(cf_data, 1);
                 drained_l1 = true;
+                if garbage_due {
+                    garbage_drain_reset();
+                }
                 // still over budget? re-enqueue for the next tick.
                 if self.pick_compaction_level_for_cf(cf_id) == Some(1) {
                     self.enqueue_compaction(cf_data.clone());

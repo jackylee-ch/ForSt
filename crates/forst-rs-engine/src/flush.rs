@@ -222,6 +222,18 @@ impl FlushJob {
                 // input is sorted ASC) out of the per-row interleave.
                 // Block-boundary flush is still respected by the writer.
                 let _ = rows;
+                // FRS-GARBAGE-DRAIN: count tombstones entering L0 (vectorized
+                // u8 scan, ~free) so the maintenance drain can force deep
+                // compaction when dead data accumulates (the q9/q20 decay).
+                let tombs = ops
+                    .values()
+                    .iter()
+                    .filter(|&&o| {
+                        o == forst_rs_common::OpType::Delete as u8
+                            || o == forst_rs_common::OpType::SingleDelete as u8
+                    })
+                    .count() as u64;
+                crate::db::note_flushed_tombstones(tombs);
                 writer.add_batch(keys, values, seqs, ops)?;
             }
 
