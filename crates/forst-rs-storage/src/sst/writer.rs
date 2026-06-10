@@ -155,8 +155,13 @@ pub struct SstWriterImpl {
     /// v3 prefix bloom: hashes of distinct PREFIX_BLOOM_LEN-byte key prefixes
     /// (sorted append order makes last-prefix comparison exact dedup).
     prefix_hashes: Vec<u64>,
-    /// Last prefix pushed into `prefix_hashes` (dedup state).
-    last_prefix: Option<Vec<u8>>,
+    /// Last prefix pushed into `prefix_hashes` (dedup state). Fixed-size
+    /// buffer — the previous `Option<Vec<u8>>` heap-allocated per DISTINCT
+    /// prefix, which on distinct-prefix workloads (q17: every agg key its own
+    /// prefix) meant an alloc per key on every flush AND compaction rewrite
+    /// (part of the 2.7× q17 regression, 99.8→263.9s bisect 2026-06-11).
+    last_prefix: [u8; PREFIX_BLOOM_LEN],
+    last_prefix_set: bool,
     /// v4: count of Delete/SingleDelete entries — persisted in the footer as
     /// the stored-tombstone-density signal (garbage-drain gate-v2).
     tombstone_entries: u64,
@@ -208,7 +213,8 @@ impl SstWriterImpl {
             last_added_key: None,
             key_hashes: Vec::new(),
             prefix_hashes: Vec::new(),
-            last_prefix: None,
+            last_prefix: [0u8; PREFIX_BLOOM_LEN],
+            last_prefix_set: false,
             tombstone_entries: 0,
             kv_format_override: None,
         }
@@ -326,9 +332,10 @@ impl SstWriterImpl {
         // and are skipped entirely.
         if key.len() >= PREFIX_BLOOM_LEN {
             let p = &key[..PREFIX_BLOOM_LEN];
-            if self.last_prefix.as_deref() != Some(p) {
+            if !self.last_prefix_set || self.last_prefix != *p {
                 self.prefix_hashes.push(Sbbf::hash_key(p));
-                self.last_prefix = Some(p.to_vec());
+                self.last_prefix.copy_from_slice(p);
+                self.last_prefix_set = true;
             }
         }
         sst_prof_add(&SST_BUFFER_NS, _buf_t0.elapsed().as_nanos() as u64);
@@ -444,7 +451,15 @@ impl SstWriterImpl {
         // prefix scans can skip SSTs containing no keys for the probe's
         // prefix. Absent (0/0 in the footer) when no key reached the prefix
         // length — readers then skip pruning for this SST (conservative).
-        let (prefix_bloom_offset, prefix_bloom_size) = if self.prefix_hashes.is_empty() {
+        // DEGENERATE-SKIP (2026-06-11): when distinct prefixes ≈ total entries
+        // (q17-class: every key its own prefix) the prefix bloom is a SECOND
+        // full key bloom — multi-million-hash build + bytes per SST with ZERO
+        // pruning value (unique prefixes are already handled by the key-range
+        // check). Skip it; readers see 0/0 → conservative. Join states (many
+        // keys per prefix → small distinct set) keep the bloom and the pruning.
+        let prefix_useful = !self.prefix_hashes.is_empty()
+            && (self.prefix_hashes.len() as u64).saturating_mul(2) <= self.total_entries;
+        let (prefix_bloom_offset, prefix_bloom_size) = if !prefix_useful {
             (0u64, 0u32)
         } else {
             let off = self.bytes_written;
@@ -805,7 +820,9 @@ impl<'a, W: WritableFile + ?Sized> StreamingSstWriter<'a, W> {
         inner.bytes_written += bloom_bytes.len() as u64;
 
         // --- Write Prefix Bloom Section (v3, mirrors the buffered finish) ---
-        let (prefix_bloom_offset, prefix_bloom_size) = if inner.prefix_hashes.is_empty() {
+        let prefix_useful = !inner.prefix_hashes.is_empty()
+            && (inner.prefix_hashes.len() as u64).saturating_mul(2) <= inner.total_entries;
+        let (prefix_bloom_offset, prefix_bloom_size) = if !prefix_useful {
             (0u64, 0u32)
         } else {
             let off = inner.bytes_written;
