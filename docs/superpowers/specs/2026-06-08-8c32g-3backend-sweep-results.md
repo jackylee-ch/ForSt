@@ -1112,3 +1112,12 @@ true-positive data: compaction clustering (leveled merge brings one auction's bi
 one block — how RocksDB sustains 70K/s here) and/or block sizing. Prefix bloom stays
 (free win where prefixes are absent; q20/q7 may benefit more — their joins probe auction
 metadata with tighter locality).
+
+# q20/q7@100M prefix-bloom gates (2026-06-10 afternoon) — ⚠ BOX-DEGRADATION CAVEAT
+- q20: DNF@1800s at 80.75M (extrap ~2300s; bar 1074). Pre-bloom depth-1 also DNF.
+- q7: running SLOWER than its pre-bloom 1441.6s finish (71.2M@1423s) — the bloom cannot
+  hurt q7 (hot price prefixes pass the filter; overhead = 1 hash/SST), so this indicates
+  the BOX has degraded across ~3h of continuous heavy runs. ⚠ Cross-session A/B deltas
+  from this afternoon are unreliable; only BACK-TO-BACK pairs count from here.
+- Next: rebuild .so with OPT-N14 (L0 batch short-circuit, committed b59042dc2) and run a
+  CONSECUTIVE q9@50M pair (bloom-only re-baseline, then bloom+N14) for a clean A/B.
