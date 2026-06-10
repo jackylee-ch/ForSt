@@ -859,3 +859,41 @@ Goal per query: frs ≥0.8× RocksDB AND ≤50s regression AND strictly faster t
 6. **q4**: −20s+ to clear ≤50s (box-marginal; rigorous best 340s passes).
 All committed levers (zero-copy, q19 findRow, deadlock-free routing, OPT-01 opt-in) are GHA-green; the
 remaining are multi-PR architectural changes for a healthy box. Phase 1 NOT met: 11 pass, ~12 fail/marginal.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# q9 DEEP PROFILE — verify-before-build campaign (2026-06-10)
+# ═══════════════════════════════════════════════════════════════════════════
+Run: q9 frs default (depth-1), 100M, MAXSEC=2400, FRS_DECAY_DIAG+FRS_RSS_SAMPLE.
+- Curve: 65K/s avg to 622s (40.3M) → oscillating decay 18.8-45K/s → 90.1M@2313s,
+  cut at 2400s (~91M). TRUE FINISH ≈ 2600s vs bar 1776s (0.8× RDB 1420.5) → needs ~1.47×.
+- LSM HEALTHY during decay: L0≤3, sub-GiB/CF (DECAY_DIAG) → NOT compaction/L0 pileup.
+- CPU (12s /proc window, deep decay): box ~8% utilized. Compaction 2×~25%-core,
+  datagen 4×~3%, opendal pool ~1.4%×10+, join task threads <0.5% in-window;
+  cumulative join-thread CPU = 415s/2085s elapsed = 20% duty cycle.
+- Thread dumps (×2, all 4 join threads identical signature): RUNNABLE inside ONE
+  synchronous FFM downcall — frsVecIterPrefixOpen (ForStRsLinker:3949 ←
+  ForStRsDBIterRequest.process:300 ← VectorizedExecutor.drainIterSerial:1460) and
+  vectorizedBatchGet (ForStRsLinker:2607 ← executeGets:1235) — invoked from
+  AsyncExecutionController.drainInflightRecords ← processWatermark. I.e. EVERY
+  watermark forces a FULL inline serial drain of all pending probes on the task thread.
+- Engine code: every non-resident block read = handle.block_on(opendal read)
+  (forst-rs-io/src/opendal_backend.rs:478-485,683,699) = tokio handoff round-trip
+  per op EVEN ON LOCAL DISK (same disease the SST WRITE path had and fixed by
+  coalescing ~500× — see :823-827 comment; read path still per-op).
+
+## VERDICT: q9 (and the q7/q20 family) is LATENCY-bound, not CPU/disk/compaction-bound
+Per-record cost ≈ 120µs (33K/s ÷ 4 threads) = serial synchronous engine round-trips
+× async-dispatch latency floor. Throughput = 1/latency; decays as deeper state adds
+block reads per seek. ForSt q9 DNF too (parallel executor alone insufficient);
+RocksDB finishes because sync in-process block-cache reads have a µs-class floor.
+
+## Reordered optimization program (verified)
+1. ENGINE direct-local-read fast path: bypass block_on/tokio for local-cache/disk
+   hits → per-op µs-class. Benefits ALL read queries (q9/q19/q7/q20/q4). NEW co-primary.
+2. Coordinated executor (approved design, unchanged): ×~3 latency hiding + non-blocking
+   mailbox + backpressure; measured floors q11 134.7 / q20 1610 / q7 1052.
+3. Batched iter-open (one FFM call, engine parallel seek) — folded into #2's iter dispatch.
+4. Micro-levers (decode allocs, mailbox serialization) — re-rank after 1+2 land.
+Estimates (A=executor, B=direct-read): q7 1441→A ~750-1000 → A+B ~500-700 (bar <587);
+q9 ~2600→A ~1100-1500 → A+B ~700-1200 (bar 1776); q20 1610(par)→A ~1200-1450 →
+A+B ~700-1000 (bar 1074); q11 134.7 measured (bar 132.6). GO on A+B.
