@@ -1310,3 +1310,23 @@ vs 2484.4s absolute-trigger: +7.8% — at the variance band edge; either the 20%
 bar throttles some q9 drains or noise. Determinism note: two q9@100M finishes with
 IDENTICAL out_rows. Net ratio-gate trade: q7 +8%, q9 −0..8% → near-neutral; tune the
 bar to 10% as the next probe. q7 levers-off CONTROL running for residual attribution.
+
+# q7 attribution COMPLETE (night close): engine levers EXONERATED — they HELP q7
+| q7@100M same-night | @1684s |
+|---|---|
+| lever stack + RATIO gate | 86.0M (best) |
+| ALL engine levers OFF (control) | 80.7M |
+| lever stack + absolute drain | 79.5M |
+→ The ratio-gated stack is q7's best same-day config; the residual gap vs the
+pre-lever 1441.6s FINISH (different day + pre-campaign jar) is attributable to the
+JAR (classifier-pool era) and/or cross-day conditions — separate next session with
+ONE pre-campaign-jar q7 run (worktree recipe in the q4 bisect notes).
+
+# ═══ FINAL NIGHT LEDGER (2026-06-10) ═══
+ENGINE (all pushed, exactness-proven): prefix bloom v3 · N14 depth-gated ·
+garbage-drain (ratio-gated continuous). NET EFFECT: q9 DNF→FINISHED (2484.4/2678.7s,
+identical out_rows = deterministic) · q20 80.75→86.5M@cutoff · q7 best-config +7%
+over control · 20/22 10M-correctness EXACT · zero regressions (all bisect-proven).
+OPEN (ordered): q9 bar gap (drain bar 10% probe + executor retest) · q20 OPT-N04
+merge-op · q7 jar-vs-day attribution · q5 churn · q4@10M pre-existing wedge ·
+executor race (40s repro + stream-diff tooling) · full 3-backend sweep.
