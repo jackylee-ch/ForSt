@@ -8058,13 +8058,99 @@ impl DbImpl {
         // ONCE and probed for every grouped key.
         let cf_id = cf_data.handle().id();
 
-        // L0 walk.
-        let l0_files: Vec<&SstFileMeta> = version
+        // L0 walk — FRS-L0-SHORTCIRCUIT for the BATCH path (OPT-N14, 2026-06-10):
+        // mirror sst_get's newest-first lazy walk (max_sequence DESC sort +
+        // disjoint-range premise — see the rationale block at sst_get). The old
+        // batch code was FILE-major: it probed EVERY L0 file for every pending
+        // key, then sorted hits per key — a hot key present in all ~40-64 L0
+        // files (write_controller stall triggers) paid O(L0) data-block reads
+        // per probe. Now KEY-major: walk files newest-first, STOP at the first
+        // Put/Delete base → ONE data-block read for the hot-overwrite case.
+        // Merge semantics unchanged (any Merge operand defers the key to
+        // get_internal, exactly like the old path). Reader handles come from
+        // the get_or_open cache, so key-major order costs no extra opens.
+        // Overlapping L0 sequence ranges (externally ingested SSTs) fall back
+        // to the original collect + global-sort walk.
+        let mut l0_files: Vec<&SstFileMeta> = version
             .l0_files()
             .iter()
             .filter(|m| m.cf_id == cf_id)
             .collect();
-        if !l0_files.is_empty() {
+        l0_files.sort_by(|a, b| {
+            b.max_sequence
+                .cmp(&a.max_sequence)
+                .then_with(|| b.file_number.value().cmp(&a.file_number.value()))
+        });
+        let l0_disjoint = l0_files
+            .windows(2)
+            .all(|w| w[0].min_sequence > w[1].max_sequence);
+        if !l0_files.is_empty() && l0_disjoint {
+            for (i, k) in keys.iter().enumerate() {
+                if resolved[i].is_some() {
+                    continue;
+                }
+                let mut had_merge_operand = false;
+                'l0_files: for sst in &l0_files {
+                    if (**k).as_ref() < sst.smallest_key.as_slice()
+                        || (**k).as_ref() > sst.largest_key.as_slice()
+                    {
+                        continue;
+                    }
+                    let reader = self.get_or_open_sst_reader(sst)?;
+                    let mut versions = reader.get_versions(k)?;
+                    if versions.is_empty() {
+                        continue; // bloom / range miss — no data block read
+                    }
+                    // Within-file newest-first (matches the L1+ path's per-file
+                    // sort; across files the max_sequence DESC file order plus
+                    // the disjointness premise gives the global order).
+                    versions.sort_by_key(|x| std::cmp::Reverse(x.sequence));
+                    for res in versions {
+                        match res.op_type {
+                            OpType::Put => {
+                                if res.value.is_none() {
+                                    return Err(ForstError::corruption(
+                                        "batch_get_vectorized: L0 Put missing value payload",
+                                    ));
+                                }
+                                if had_merge_operand {
+                                    resolved[i] =
+                                        Some(self.get_internal(&cf_data, keys[i], read_seq)?);
+                                } else {
+                                    resolved[i] = Some(res.value);
+                                }
+                                break 'l0_files;
+                            }
+                            OpType::Delete | OpType::SingleDelete => {
+                                if res.value.is_some() {
+                                    return Err(ForstError::corruption(
+                                        "batch_get_vectorized: L0 tombstone carries value payload",
+                                    ));
+                                }
+                                if had_merge_operand {
+                                    resolved[i] =
+                                        Some(self.get_internal(&cf_data, keys[i], read_seq)?);
+                                } else {
+                                    resolved[i] = Some(None);
+                                }
+                                break 'l0_files;
+                            }
+                            OpType::Merge => {
+                                had_merge_operand = true;
+                            }
+                        }
+                    }
+                }
+                if resolved[i].is_none() && had_merge_operand {
+                    // L0 had only Merge entries — chain may continue down to
+                    // L1+. Delegate the whole resolution to get_internal.
+                    resolved[i] = Some(self.get_internal(&cf_data, keys[i], read_seq)?);
+                }
+            }
+            if !any_pending(&resolved) {
+                return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+            }
+        } else if !l0_files.is_empty() {
             // For each L0 file, collect hits keyed by slot index. Then merge
             // across files per slot, ordered by (sequence desc, file_number desc).
             // l0_hits_per_key[i] = list of (sequence, file_number, LookupResult)
