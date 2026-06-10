@@ -19,6 +19,8 @@ Scope: compare Flink ForSt backend with the community ForSt JNI library against 
 
 The fixed CSV source is now used for all accuracy checks. Deterministic streaming queries are compared by materialized changelog hash. Q12 uses a query-specific processing-time invariant because wall-clock processing-time windows are not deterministic across runs. Q6 is validated in batch mode because the upstream Nexmark SQL comments already mark the streaming shape unsupported by Flink SQL.
 
+Accuracy runs intentionally use a separate 1M input policy: generate the Nexmark datagen stream once into `person`, `auction`, and `bid` CSV files, then run both variants from that exact filesystem source. This keeps input ordering and content identical across variants. CSV-source runs are used only for correctness; they are not mixed into the 100M performance numbers because filesystem source overhead would distort the ForSt backend comparison. The current fixed CSV dataset has these hashes: person `8a1f48051ff6722457d77cfa5d022681a88efa9dde36c7d681daea272dce9ef2`, auction `85e7468372f078e89f529943911f1b2f65a57387c4376c804d0bc5441bf19863`, bid `5c147de8cf14bcf4f8d3d5f44aece33e62012239c1b85fffb81d6727a2023cb6`.
+
 | Query | Status | Validation mode | Materialized rows / invariant | Native evidence | Run label / note |
 | --- | --- | --- | --- | --- | --- |
 | q0 | PASS | 1M streaming hash | 920000 / 920000 | unknown / unknown | prior fixed-CSV accuracy run |
@@ -109,7 +111,30 @@ Q4 is the current blocker for a full Q0-Q22 100M run. It is a join plus two Grou
 | q4 | 1,000,000 | ForSt local | mini-batch + write-heavy profile | TIMEOUT | 903.809 | 980,000 | 980,000 | 2,760 | `tune-q4-1m-minibatch-writeheavy-20260610184342` |
 | q4 | 1,000,000 | forst-rs lib | mini-batch + write-heavy profile | TIMEOUT | 904.050 | 980,000 | 980,000 | 2,174 | `tune-q4-1m-rslib-minibatch-writeheavy-20260610185952` |
 
-Interpretation: forst-rs-lib is essentially tied with the community JNI path on Q4. The current bottleneck is not fixed by the JNI replacement, jemalloc, async state, mini-batch, or larger ForSt write buffers. The next useful step is code-level profiling of the Q4 join/aggregate state path, especially per-record state get/update serialization and ForSt write path batching.
+Interpretation: forst-rs-lib is essentially tied with the community JNI path on Q4. The current bottleneck is not fixed by the JNI replacement, jemalloc, async state, mini-batch, or larger ForSt write buffers.
+
+#### Q4 JFR Diagnosis
+
+A focused 1M Q4 JFR run (`profile-q4-1m-local-jfr-20260610192347`) was captured with the same 8C/40G container envelope, JDK17 image, jemalloc preload, checkpointing disabled, mini-batch enabled, and write-heavy ForSt tuning. It timed out at 264.914s with 619,050 of 980,000 source rows consumed. JFR samples showed the hottest Java/native path in `Join[12] -> Calc[13] -> LocalGroupAggregate[14]`, especially:
+
+- `org.forstdb.RocksDB.iterator`: 5,275 samples,
+- `ForStSyncMapState$RocksDBMapIterator.loadCache`: 5,502 samples,
+- `ForStSyncMapState$RocksDBMapIterator.hasNext`: 5,276 samples,
+- `ForStOperationUtils.getForStIterator`: 5,275 samples,
+- `RocksIterator.disposeInternal`: 226 samples.
+
+The first attempted backend fix made the synchronous `MapState` iterator cache size configurable and raised the benchmark profile to `state.backend.forst.map-state.iterator-cache-size: 4096`. The patch was committed in Flink branch `forst-rs-jdk25` as `691ac31c19e` and benchmarked by installing a patched `flink-statebackend-forst-2.2.1.jar` over the JDK17 image jar.
+
+#### Q4 Patched Backend Retest
+
+The patched backend jar used for this retest had sha256 `039d28c734a6d1c6c901fa23d1c849182b19d2902f165a5b78e71fe984d04d9a`. The image-original backend jar hash was `a4cd9b71fdbccd4de4d913f5a428e0942d96a542c4a4d0b1abd830802ef14a98`. Both variants used the same patched backend jar, JDK17, jemalloc, disabled checkpoints, mini-batch, write-heavy ForSt config, and 8C/40G container envelope.
+
+| Query | Events | Variant | Backend jar | Mode | Matrix wall seconds | Source target seconds | Source rows | Output rows | Native evidence | Run label |
+| --- | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| q4 | 1,000,000 | ForSt local | patched map-cache jar | SOURCE_DONE | 807.920 | 807.920 | 980,000 | 2,004 | community JNI from jar extraction | `mapcache-q4-1m-20260610195301` |
+| q4 | 1,000,000 | forst-rs lib | patched map-cache jar | SOURCE_PLATEAU | 853.754 | 818.272 | 980,000 | 2,214 | `/bench/native/libforstjni.so` | `mapcache-q4-1m-20260610195301` |
+
+The 4096-entry cache setting did not materially improve Q4. ForSt local reached the 980k source target in 807.920s, while forst-rs-lib reached it in 818.272s. Using the source-target timestamp, forst-rs-lib is `0.987x` of local on this run; using the matrix wall seconds, it is `0.946x`. This disproves the idea that increasing iterator refill cache alone can unlock the requested 1.5x result. The JFR hotspot should be reinterpreted as many small MapState scans creating native iterators, not only large scans refilling every 128 entries. The next useful optimization point is reducing native iterator creation per MapState scan or changing the SQL aggregate state access pattern; continuing to tune JNI get/put or the current cache batch size is unlikely to close the gap.
 
 ## Artifacts
 
@@ -124,6 +149,7 @@ Interpretation: forst-rs-lib is essentially tied with the community JNI path on 
 | Q4 1M mini-batch diagnostic TSV | `artifacts/tune-q4-1m-minibatch-jemalloc-20260610182954.tsv` |
 | Q4 1M local write-heavy diagnostic TSV | `artifacts/tune-q4-1m-minibatch-writeheavy-20260610184342.tsv` |
 | Q4 1M forst-rs-lib write-heavy diagnostic TSV | `artifacts/tune-q4-1m-rslib-minibatch-writeheavy-20260610185952.tsv` |
+| Q4 1M patched map-cache backend TSV | `artifacts/mapcache-q4-1m-20260610195301.tsv` |
 | Updated matrix runner | `scripts/run-matrix.sh` |
 | Full-run container runner | `scripts/run-one-full.sh` |
 | Full-run SQL measurement script | `scripts/measure-sql-full.sh` |

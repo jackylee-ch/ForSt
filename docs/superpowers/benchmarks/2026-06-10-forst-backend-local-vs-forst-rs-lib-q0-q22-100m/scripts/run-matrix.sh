@@ -66,6 +66,10 @@ for q in $QUERIES_STR; do
       -e MINI_BATCH_ALLOW_LATENCY="${MINI_BATCH_ALLOW_LATENCY:-1 s}" \
       -e MINI_BATCH_SIZE="${MINI_BATCH_SIZE:-5000}" \
       -e FORST_TUNING_PROFILE="${FORST_TUNING_PROFILE:-}" \
+      -e JFR_ENABLED="${JFR_ENABLED:-0}" \
+      -e JFR_DELAY="${JFR_DELAY:-20s}" \
+      -e JFR_DURATION="${JFR_DURATION:-${MAXSEC}s}" \
+      -e JFR_SETTINGS="${JFR_SETTINGS:-profile}" \
       -e CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-30 s}" \
       -e RUN_ID="$run_id" \
       -e MEASURE_SCRIPT="${MEASURE_SCRIPT:-/bench/scripts/measure-sql-full.sh}" \
@@ -85,6 +89,8 @@ for q in $QUERIES_STR; do
       -e Q3_PRINT_OUTPUT="${Q3_PRINT_OUTPUT:-}" \
       -e ACCURACY_FILE_OUTPUT="${ACCURACY_FILE_OUTPUT:-0}" \
       -e ACCURACY_FLUSH_EVERY="${ACCURACY_FLUSH_EVERY:-1024}" \
+      -e INSTALL_FLINK_FORST_BACKEND_JAR="${INSTALL_FLINK_FORST_BACKEND_JAR:-1}" \
+      -e FLINK_FORST_BACKEND_JAR="${FLINK_FORST_BACKEND_JAR:-}" \
       "$IMAGE" /bench/scripts/run-one-full.sh 2>&1 | tee "$outer_log"
     rc=${PIPESTATUS[0]}
     set -e
