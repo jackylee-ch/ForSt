@@ -989,3 +989,21 @@ the iter sub-batches to workers. q17 → byte-identical to depth-1; iter queries
 Then gates: q17≤85, q8 band, q11≤140, q20, q9-noregress → default flip.
 ⚠ depth-1 DEFAULT also leaked on jars built from d82427efb1c..b1f4a936dd8 (≈1h window,
 fixed by 1a95d0a010f) — any perf runs on those jars are SUSPECT; re-measure on fixed jar.
+
+# ADAPTIVE design iterations (2026-06-10 late) — phase-split REFUTED ×2, affinity puzzle
+| variant (jar) | q17 | q8 | verdict |
+|---|---|---|---|
+| full-split + inline subs (1a95d0a010f) | 148.8s | 3,064,493 ✓ | CORRECT, q17 ✗ bar |
+| split-iters, main-first (4ec61c554ae)  | 112.7s | 1,441,352 ✗ −53% | fire-then-purge inverted |
+| split-iters, iters-first (a11ac06a8c0) | — | 2,147,792 ✗ −30% | reverse hazard real too |
+| defer-classify 1-classifier (f4c9d99b468) | 117.7s | 1,831,340 ✗ −40% | kg-UNAFFINE cheap batches corrupt |
+| kg-affine restored (8fd6edddea7) | TBD | verifying | = full-split semantics, deferred offers |
+LAW (empirical): q8 correct ⟺ EVERY batch executes through per-key-group-affine
+classifiers in offer order (routing ✓, full-split ✓). ANY kg-unaffine execution of
+cheap batches corrupts — even inline, lockstep, cache-off. ROOT CAUSE OPEN (suspect:
+per-executor/per-classifier state coupling not yet identified — needs instrumented
+1M-scale q8 bisect next session). Phase-splitting iters from deletes is unsound
+(windowed fire-purge emits same-key ITER/CLEAR in both orders).
+q17 cost ladder: depth-1 77s | defer-1-classifier 117.7 | full-split-inline 148.8 |
+latch-offload 271.8 → the kg-splitting of cheap batches costs ~35-70s on q17; the
+correct-and-fast-q17 design needs the affinity puzzle solved first.
