@@ -21,6 +21,8 @@ The fixed CSV source is now used for all accuracy checks. Deterministic streamin
 
 Accuracy runs intentionally use a separate 1M input policy: generate the Nexmark datagen stream once into `person`, `auction`, and `bid` CSV files, then run both variants from that exact filesystem source. This keeps input ordering and content identical across variants. CSV-source runs are used only for correctness; they are not mixed into the 100M performance numbers because filesystem source overhead would distort the ForSt backend comparison. The current fixed CSV dataset has these hashes: person `8a1f48051ff6722457d77cfa5d022681a88efa9dde36c7d681daea272dce9ef2`, auction `85e7468372f078e89f529943911f1b2f65a57387c4376c804d0bc5441bf19863`, bid `5c147de8cf14bcf4f8d3d5f44aece33e62012239c1b85fffb81d6727a2023cb6`.
 
+The consolidated manifest `artifacts/consolidated-q0-q22-fixed-csv-accuracy-20260610.tsv` selects the authoritative fixed-CSV evidence for each query and verifies all Q0-Q22 entries as PASS. It uses normal materialized changelog hash equality for deterministic queries, the corrected batch rewrite for Q6, the 1M batch parity plus 1k streaming native smoke for Q9, and the continuous-source processing-time invariant for Q12.
+
 | Query | Status | Validation mode | Materialized rows / invariant | Native evidence | Run label / note |
 | --- | --- | --- | --- | --- | --- |
 | q0 | PASS | 1M streaming hash | 920000 / 920000 | unknown / unknown | prior fixed-CSV accuracy run |
@@ -154,4 +156,5 @@ The 4096-entry cache setting did not materially improve Q4. ForSt local reached 
 | Full-run container runner | `scripts/run-one-full.sh` |
 | Full-run SQL measurement script | `scripts/measure-sql-full.sh` |
 | Updated CSV accuracy runner | `scripts/measure-sql-csv-accuracy.sh` |
+| Consolidated Q0-Q22 fixed-CSV accuracy manifest | `artifacts/consolidated-q0-q22-fixed-csv-accuracy-20260610.tsv` |
 | Updated compare script | `scripts/compare-accuracy-output.py` |
