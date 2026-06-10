@@ -1151,3 +1151,28 @@ on the COMMON path).
   engine-dir bytes vs live-state estimate (DECAY_DIAG state= per flush already prints) +
   count tombstones per scanned block. If confirmed → lever = tombstone-priority compaction
   (architectural, helps q9/q20/q4, config untouched).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GARBAGE RETENTION CONFIRMED — the q9/q20 decay root cause (2026-06-10 end)
+# ═══════════════════════════════════════════════════════════════════════════
+q9@50M (FRS_DECAY_DIAG + 20s engine-dir sampler): dir grows 2.4→28GB saw-toothed
+across the run while LIVE interval-join state plateaus by design (bounded event-time
+window; DECAY_DIAG ≈880MiB/CF scale) → garbage ratio ~4-8× in the decay phase,
+climbing exactly when throughput decays; compaction reclaims (saw-teeth, and 28→16.7GB
+at run END when writes stop) but lags the tombstone production rate during the run.
+This explains: cold-pread volume (probes read garbage-diluted blocks), RocksDB's
+sustained 70K/s on identical hardware (leveled compaction prioritizes reclaim), and
+the prefix-bloom gain compressing late (garbage scatters live prefixes over more SSTs).
+Run also: 739.4s finish (vs 844.6 same code 90min prior) — box swings ±13%; bars only
+after reboot.
+
+## LEVER (next build): GARBAGE-PRIORITY COMPACTION (engine policy, not config)
+Pick compaction candidates by RECLAIMABLE-GARBAGE estimate, not just level fullness:
+(a) per-SST tombstone density (writer already counts ops; persist tombstone_count in
+the v3 footer — cheap addition), (b) age-weighted: oldest SSTs overlapping ranges with
+many newer tombstones first, (c) raise compaction priority/parallelism when
+dir_bytes/live_estimate exceeds a ratio. RocksDB analog: kByCompensatedSize +
+delete-triggered compaction (CompactOnDeletionCollector). All engine-internal policy —
+config (write_buffer 1G, noflush=false) untouched; benefits q9/q20/q4 (write+delete-heavy)
+and is neutral for read-only/append-only queries (policy only changes WHICH compaction
+runs first). Verify with the same dir-sampler + back-to-back A/B pair.
