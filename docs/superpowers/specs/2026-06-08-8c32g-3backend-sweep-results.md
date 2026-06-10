@@ -1176,3 +1176,15 @@ delete-triggered compaction (CompactOnDeletionCollector). All engine-internal po
 config (write_buffer 1G, noflush=false) untouched; benefits q9/q20/q4 (write+delete-heavy)
 and is neutral for read-only/append-only queries (policy only changes WHICH compaction
 runs first). Verify with the same dir-sampler + back-to-back A/B pair.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FRS-GARBAGE-DRAIN VALIDATED (back-to-back q9@50M pair, 2026-06-10, 9b3f84d72)
+# ═══════════════════════════════════════════════════════════════════════════
+| run | wall | out_rows | engine-dir curve |
+|---|---|---|---|
+| pre-drain (n14 .so)  | 981.8s | 45,904,788 ✓ | 9→27GB climb |
+| GARBAGE-DRAIN        | 860.7s (−12.3%) | 45,904,788 ✓ | FLAT ~8-10GB |
+Tombstone-triggered L1→L2 drain (FRS_GARBAGE_DRAIN_TOMBSTONES=2M default) bounds
+garbage at ~10GB vs 27GB — the confirmed decay mechanism is neutralized at 50M; the
+wall gain is partial at 50M (drain costs write-amp) but the 100M decay-dominated
+regime should gain much more. Correctness EXACT. q9@100M bar attempt next.
