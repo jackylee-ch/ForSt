@@ -1091,3 +1091,13 @@ Expected: scan preads cut 2-3× (n_ovl 2-3 → ~1 true-containing SST) → q9 ~2
 (collect distinct P-prefixes → Sbbf, format-versioned footer field), reader (load+expose),
 scan-open SST selection (may_contain_prefix), FFI untouched (engine-internal), UTs +
 format round-trip + q9@50M A/B vs 813.5s baseline.
+
+# PREFIX BLOOM A/B (q9@50M, depth-1, 2026-06-10, engine 30cde2fc6)
+| build | wall | out_rows | decay rate @40M |
+|---|---|---|---|
+| baseline (pre-v3)   | 813.5s | 45,904,788 | ~19K/s |
+| prefix bloom (v3)   | 765.6s | 45,904,788 ✓ EXACT | ~28-37K/s (≈1.7×) |
+−5.9% wall at 50M; gain concentrated in the DECAY phase (memtable-resident early
+phase unchanged, as expected — bloom prunes SST scan fan-out only). At 100M the
+decay phase dominates → expect a larger total win. 534 Java + 831 Rust tests green;
+ForSt pushed. 100M gates launching: q9 (bar ≤1776s), q20 (≤1074s), q7 (<587s).
