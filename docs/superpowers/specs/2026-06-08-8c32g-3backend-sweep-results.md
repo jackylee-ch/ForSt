@@ -1692,3 +1692,15 @@ as plain PUT; fold = framework GET→callback→PUT, offer-serialized).
 routing-async × 1 worker removes the q9 latch wait (the profile-proven gate) without
 multi-worker. q8 canary n=3 + q9@100M A/B (vs 2215.6s control; out_rows 91,813,372 = its
 own correctness gate) RUNNING.
+
+### ✗ B-config REVISED (2026-06-11 ~11:30): r3 = 692,757 (−77%) — single-worker NOT safe
+The 2/2 exact was luck; the race is TIMING-dependent (1 worker narrows the window, doesn't
+close it). Cross-worker conclusion WITHDRAWN. Flink-runtime exonerated by code evidence
+(Explore agent): watermark = SERIAL_BETWEEN_EPOCH drainInflightRecords(0) BEFORE trigger
+(EpochManager.java:134; default AbstractAsyncStateStreamOperator.java:91); timer callbacks
+carry RecordContext key-accounting (InternalTimerServiceAsyncImpl.java:136). The race is in
+OUR backend's pipelined execution of the window-join op mix (LIST_ADD append / ITER at fire /
+CLEAR). NEXT DIAGNOSTIC (after q9 A/B frees the box): FRS_REENTRY_DIAG=2 STREAM_STATS
+differential — compare per-kind op counts between an exact and a corrupt q8 B-config run:
+appends differ ⇒ writes lost (offer/dispatch side); appends equal + iter rows differ ⇒
+reads lost (fire side). q9@100M B-config A/B still RUNNING (its out_rows is its own gate).
