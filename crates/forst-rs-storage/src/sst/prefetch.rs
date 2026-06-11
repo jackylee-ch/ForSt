@@ -76,6 +76,13 @@ const LOCAL_RAMP_AFTER: u32 = 2;
 const REMOTE_RAMP_AFTER: u32 = 1;
 /// Ramped prefetch inserts at `Bottom` once the window is at least this deep.
 const BOTTOM_PRIORITY_RA: u32 = 4;
+/// H1 (2026-06-11 PMC review): generous upper bound `next_decoded` may wait
+/// for an in-flight window before giving up. Pool workers survive job panics
+/// (catch_unwind), so this only fires on a queued-but-never-run / wedged job;
+/// it converts a would-be infinite hang of the consuming (FFI/task) thread
+/// into a `ForstError::TimedOut`. 300s is far above any legitimate window
+/// fetch (µs-ms local, ms-class remote) yet below an operator-visible wedge.
+const POOL_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Runtime kill-switch: `FRS_RS_BLOCK_PREFETCH=0|false` disables speculation
 /// entirely (every block demand-fetched — the pre-§2.1 behaviour, modulo the
@@ -129,7 +136,14 @@ impl ReadIoPool {
                             q = sh.cv.wait(q).unwrap_or_else(|p| p.into_inner());
                         }
                     };
-                    job();
+                    // H1 (2026-06-11 PMC review): a panicking window job must
+                    // not kill the worker — a fixed-size pool with dead
+                    // workers eventually strands queued jobs forever, hanging
+                    // every consumer blocked in `next_decoded`. The panic is
+                    // contained; the job's oneshot `SyncSender` is dropped
+                    // during unwind, so the waiting consumer observes a
+                    // disconnect and converts it to a `ForstError`.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                 })
                 .expect("failed to spawn frs-readahead worker");
         }
@@ -262,9 +276,30 @@ impl BlockPrefetcher {
         // 2. Claim the in-flight window, then immediately submit the next one
         //    (production of N+1 overlaps consumption of N).
         if let Some(handle) = self.inflight.take() {
-            let produced = handle.rx.recv().map_err(|_| {
-                ForstError::internal("BlockPrefetcher: read-I/O pool worker dropped its window")
-            })?;
+            // H1: the pool workers survive job panics (catch_unwind in the
+            // worker loop), so a disconnect here means the window job itself
+            // panicked; the timeout is the last-resort guard against a
+            // queued-but-never-run job (wedged pool) hanging the consumer
+            // (ultimately the Flink task thread inside the FFI) forever.
+            // Either way the source must PARK AT EOF before erroring —
+            // `next_block` was already advanced past the lost window at
+            // submit time, so resuming on the demand path would silently
+            // skip the window's blocks.
+            let produced = match handle.rx.recv_timeout(POOL_JOIN_TIMEOUT) {
+                Ok(p) => p,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.terminate();
+                    return Err(ForstError::internal(
+                        "BlockPrefetcher: read-I/O pool worker dropped its window",
+                    ));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    self.terminate();
+                    return Err(ForstError::timed_out(
+                        "BlockPrefetcher: prefetch window not produced within join timeout",
+                    ));
+                }
+            };
             match produced {
                 Ok(blocks) => {
                     debug_assert_eq!(blocks.len(), handle.range.1 - handle.range.0);
@@ -837,6 +872,51 @@ mod tests {
         assert!(pf.next_decoded().unwrap().is_some());
         pf.terminate();
         assert!(pf.next_decoded().unwrap().is_none());
+        assert!(pf.next_decoded().unwrap().is_none());
+    }
+
+    /// H1 (i)+(iii): a panicking job does not kill a read-I/O pool worker —
+    /// with a SINGLE worker, jobs submitted after the panic still run, and
+    /// nothing hangs.
+    #[test]
+    fn pool_worker_survives_panicking_job() {
+        let pool = ReadIoPool::new(1);
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
+        pool.submit(Box::new(|| panic!("deliberate test panic")));
+        let tx2 = tx.clone();
+        pool.submit(Box::new(move || {
+            let _ = tx2.send(7);
+        }));
+        drop(tx);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("worker died after a panicking job (or hang)"),
+            7
+        );
+    }
+
+    /// H1 (ii): a window job whose sender is dropped (the unwind path of a
+    /// panicking job) surfaces as `Err` on the consumer — and the source
+    /// parks at EOF instead of silently skipping the lost window's blocks.
+    #[test]
+    fn dropped_window_sender_errors_and_parks_at_eof() {
+        let data = build_sst(400);
+        let (reader, _file) = open_reader(&data, None, &data);
+        let mut pf = BlockPrefetcher::new(Arc::clone(&reader), 0, None).with_regime(true, true);
+        // Simulate a panicked window job: receiver installed, sender gone.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WindowResult>(1);
+        drop(tx);
+        pf.inflight = Some(PrefetchHandle { rx, range: (0, 2) });
+        pf.next_block = 2; // as maybe_submit_window would have left it
+        let err = match pf.next_decoded() {
+            Err(e) => e,
+            Ok(_) => panic!("dropped sender must error"),
+        };
+        assert!(
+            matches!(err, ForstError::Internal(_)),
+            "unexpected error kind: {err:?}"
+        );
+        // Parked at EOF — never resumes past the lost window.
         assert!(pf.next_decoded().unwrap().is_none());
     }
 

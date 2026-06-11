@@ -87,7 +87,16 @@ fn worker_loop(shared: Arc<Shared>) {
             }
         };
         // Run OUTSIDE the lock so other workers can pull concurrently.
-        job();
+        //
+        // H1 (2026-06-11 PMC review): a panicking job must NOT kill the
+        // worker — with a fixed-size pool every dead worker permanently
+        // shrinks background capacity, and once all workers are dead queued
+        // jobs never run, hanging any caller joining on a job's channel
+        // (e.g. `batch_open_prefix_iters_parallel*` in db.rs). The panic is
+        // contained here; the job's result channel signals the failure to
+        // the submitter (its `Sender` is dropped during unwind, so the
+        // joining `recv` observes a disconnect and converts it to an error).
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
     }
 }
 
@@ -168,5 +177,41 @@ mod tests {
         }
         assert_eq!(ran.load(Ordering::SeqCst), JOBS);
         assert_eq!(max_seen.load(Ordering::SeqCst), CAP);
+    }
+
+    /// H1: a panicking job (i) does not kill its worker — subsequent jobs on
+    /// the SAME (single) worker still run; (ii) surfaces to the submitter as
+    /// a channel disconnect (its `Sender` clone is dropped during unwind), so
+    /// the batch-join pattern in db.rs converts it to an `Err` slot; (iii)
+    /// nothing hangs — the whole sequence completes within the test timeout.
+    #[test]
+    fn panicking_job_does_not_kill_worker_and_signals_channel() {
+        let pool = WorkerPool::new(1, "test-bg-panic");
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, &'static str)>();
+
+        // Job 0 panics; its tx clone is dropped during unwind (never sends).
+        let tx0 = tx.clone();
+        pool.submit(Box::new(move || {
+            let _keep = tx0; // moved into the job like the db.rs batch paths
+            panic!("deliberate test panic");
+        }));
+        // Job 1 must still run on the same single worker.
+        let tx1 = tx.clone();
+        pool.submit(Box::new(move || {
+            let _ = tx1.send((1, "ok"));
+        }));
+        drop(tx); // only job-owned clones remain
+
+        // (i)+(iii): the post-panic job completes (worker survived, no hang).
+        let got = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("worker died after a panicking job (or hang)");
+        assert_eq!(got, (1, "ok"));
+        // (ii): once every job-owned sender is gone the channel disconnects —
+        // the panicked job's slot is observable as Err, never a silent hang.
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            other => panic!("expected Disconnected after panic, got {other:?}"),
+        }
     }
 }

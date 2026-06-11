@@ -6221,21 +6221,34 @@ impl DbImpl {
         let mut out: Vec<Option<ForstResult<Vec<(Vec<u8>, Vec<u8>)>>>> =
             (0..k).map(|_| None).collect();
         let mut filled = 0usize;
+        let mut timed_out = false;
         while filled < k {
-            match rx.recv() {
+            match rx.recv_timeout(POOL_JOIN_TIMEOUT) {
                 Ok((i, r)) => {
                     out[i] = Some(r);
                     filled += 1;
                 }
-                Err(_) => break, // all senders dropped (a worker panicked) — fill the rest with errors
+                // All senders dropped (a worker panicked) — fill the rest with errors.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                // H1: a queued-but-never-run job must not hang the caller.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    break;
+                }
             }
         }
         out.into_iter()
             .map(|o| {
                 o.unwrap_or_else(|| {
-                    Err(ForstError::internal(
-                        "batch_prefix_scan: a read-pool worker dropped its probe result",
-                    ))
+                    if timed_out {
+                        Err(ForstError::timed_out(
+                            "batch_prefix_scan: read-pool probe result not delivered within join timeout",
+                        ))
+                    } else {
+                        Err(ForstError::internal(
+                            "batch_prefix_scan: a read-pool worker dropped its probe result",
+                        ))
+                    }
                 })
             })
             .collect()
@@ -6285,21 +6298,33 @@ impl DbImpl {
             >,
         > = (0..k).map(|_| None).collect();
         let mut filled = 0usize;
+        let mut timed_out = false;
         while filled < k {
-            match rx.recv() {
+            match rx.recv_timeout(POOL_JOIN_TIMEOUT) {
                 Ok((i, r)) => {
                     out[i] = Some(r);
                     filled += 1;
                 }
-                Err(_) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                // H1: never hang the FFI-calling thread on a wedged pool.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    break;
+                }
             }
         }
         out.into_iter()
             .map(|o| {
                 o.unwrap_or_else(|| {
-                    Err(ForstError::internal(
-                        "batch_open_prefix_iters_parallel: a read-pool worker dropped its result",
-                    ))
+                    if timed_out {
+                        Err(ForstError::timed_out(
+                            "batch_open_prefix_iters_parallel: read-pool result not delivered within join timeout",
+                        ))
+                    } else {
+                        Err(ForstError::internal(
+                            "batch_open_prefix_iters_parallel: a read-pool worker dropped its result",
+                        ))
+                    }
                 })
             })
             .collect()
@@ -6320,8 +6345,9 @@ impl DbImpl {
     /// the drain, not just the build.
     ///
     /// Results are returned in INPUT ORDER. `None` marks a probe whose pool
-    /// worker dropped its result (worker panic) — the caller maps it to an
-    /// internal error, mirroring the sibling method's behaviour. `f` must be
+    /// worker dropped its result (job panic) or whose result never arrived
+    /// within [`POOL_JOIN_TIMEOUT`] — the caller maps it to an internal
+    /// error, mirroring the sibling method's behaviour. `f` must be
     /// `Sync` (shared across workers via `Arc`) and is invoked exactly once
     /// per probe with the probe's index into `prefixes`.
     pub fn batch_open_prefix_iters_parallel_map<R, F>(
@@ -6377,12 +6403,18 @@ impl DbImpl {
         let mut out: Vec<Option<R>> = (0..k).map(|_| None).collect();
         let mut filled = 0usize;
         while filled < k {
-            match rx.recv() {
+            match rx.recv_timeout(POOL_JOIN_TIMEOUT) {
                 Ok((i, r)) => {
                     out[i] = Some(r);
                     filled += 1;
                 }
-                Err(_) => break, // all senders dropped (a worker panicked)
+                // All senders dropped (a worker panicked) — remaining slots
+                // stay `None`; the caller maps them to errors.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                // H1: a queued-but-never-run job (wedged pool) must not hang
+                // the FFI-calling task thread; `None` slots become errors at
+                // the caller exactly like the panic path.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
             }
         }
         out
@@ -10215,6 +10247,16 @@ fn bg_read_pool() -> &'static crate::bg_pool::WorkerPool {
         crate::bg_pool::WorkerPool::new(n, "forst-rs-read")
     })
 }
+
+/// H1 (2026-06-11 PMC review): generous upper bound a batch-join may wait for
+/// ONE pool result before giving up. The pool workers now survive panics
+/// (`bg_pool::worker_loop` catch_unwind), so under normal operation every
+/// queued job eventually reports; this timeout is the last-resort guard that
+/// converts a queued-but-never-run / wedged job into a `ForstError::TimedOut`
+/// instead of hanging the Flink task thread inside the FFI forever. 300s is
+/// far above any legitimate probe build (µs-ms class) yet far below an
+/// operator-visible deadlock.
+const POOL_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Process-global COMPACTION pool (RocksDB's LOW Env pool analogue). Bounded
 /// worker count — THE q4 decay fix: total background compaction CPU is capped
