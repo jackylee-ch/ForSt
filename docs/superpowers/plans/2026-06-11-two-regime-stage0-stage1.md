@@ -628,7 +628,7 @@ In `RoutingStateExecutor.java`:
 ```java
     /** Total requests offered into this classifier (all kinds). */
     public int totalRequestCount() {
-        return getCount() + putCount() + deleteCount() + appendMergeCount() + iterCount();
+        return getCount() + putCount() + deleteCount() + appendMergeCount() + iterRequests.size();
     }
 ```
    (verify each sub-count accessor exists with
@@ -708,10 +708,10 @@ already use for linker/db/cf (they receive those at construction — extend the 
         for (ForStRsAsyncListStateV2<?, ?, ?> s : registeredListStatesV2) {
             s.flushPreSnapshot();
         }
-        for (ForStRsAsyncReducingStateV2<?, ?, ?> s : registeredReducingStatesV2) {
+        for (ForStRsAsyncReducingStateV2<?, ?, ?> s : registeredAsyncReducingStates) {
             s.flushOnBarrier();
         }
-        for (ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?> s : registeredAggStatesV2) {
+        for (ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?> s : registeredAsyncAggregatingStates) {
             s.flushOnBarrier();
         }
     }
