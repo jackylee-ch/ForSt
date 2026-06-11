@@ -53,9 +53,9 @@ Criterion C ABI benchmark:
 
 | Hot path | Baseline | Optimized path | Baseline p50-ish | Optimized p50-ish | Signal |
 | --- | --- | --- | ---: | ---: | ---: |
-| WriteBatch translation | per-entry put | `frs_batch_put` | 236.08 us / 512 rows | 93.962 us / 512 rows | 2.51x faster |
-| Join probe multiGet | per-key get | `frs_batch_get` | 195.34 us / 1024 rows | 183.46 us / 1024 rows | 1.06x faster |
-| Compacted join probe | per-key get | `frs_batch_get` | 481.93 us / 1024 rows | 426.12 us / 1024 rows | 1.13x faster |
+| WriteBatch translation | per-entry put | `frs_batch_put` | 262.29 us / 512 rows | 131.42 us / 512 rows | 2.00x faster |
+| Join probe multiGet | per-key get | `frs_batch_get` | 202.59 us / 1024 rows | 190.08 us / 1024 rows | 1.07x faster |
+| Compacted join probe | per-key get | `frs_batch_get` | 520.77 us / 1024 rows | 519.58 us / 1024 rows | neutral |
 
 Internal compat-JNI release smoke:
 
@@ -73,9 +73,12 @@ materially faster than per-entry dispatch on ForStBackend-shaped state updates.
 
 The multiGet signal is positive but modest for a pure in-memory memtable
 workload. That supports keeping the existing JNI guard that avoids forcing
-small batches through the batch path too early. After flush and compaction,
-batch get improves more, so Nexmark queries with SST-backed join/session state
-should still prefer grouped batch get once batch size is large enough.
+small batches through the batch path too early. In the latest local
+flush/compaction probe, batch get is effectively tied with per-key get, so this
+microbench should not be used to claim a large read-path gain by itself. Nexmark
+queries with SST-backed join/session state still need the fixed-input accuracy
+run and the 100M performance run before the read-path policy is considered
+validated.
 
 The next required gate is the fixed-input 1M Q0-Q22 accuracy run, followed by
 the 100M Q0-Q22 8C/32G Docker performance comparison.
