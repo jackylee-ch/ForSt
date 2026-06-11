@@ -1891,3 +1891,10 @@ mechanisms, but were not the q8 corruption. The instrumented descent (11 instrum
 each eliminating a layer) was the cost of the truth; the fix is 20 lines.
 NEXT: multi-worker routing-async ×3 post-fix (if exact, the q9 lever = multi-worker
 pipelining is ALREADY correctness-viable → q9@100M immediately), then Stage-1 gates.
+
+### ★★ MULTI-WORKER routing-async q8 ×3 POST-FIX: 3/3 EXACT (3,064,473/698/445)
+Full multi-worker (3 workers, ForSt-matched default) non-blocking pipelining is CORRECT.
+The two-regime design's Stage-2 "cross-worker race" never existed — it was the timer bug.
+**q9@100M BAR RUN LAUNCHED**: routing-async (3 workers) + drain200K. Same-day reference:
+2215.6s (today's control, perf-overhead included); cross-day band 2001-2105; bar 1776s.
+Correctness gate rides along: out_rows must equal 91,813,372 (12th identical).
