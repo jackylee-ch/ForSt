@@ -2119,3 +2119,8 @@ q3 point-get guard pair running.
 ### ROUND-2 gate 3 PASS: q3 point-get guard 1.16× (frs 142.1 / rdb 122.6) <1.4×
 Prefetcher costs point-gets nothing measurable; q3 also inside the 1.25× bar.
 All control gates green → q17 ×3, then q9/q20 drain-verdict pairs.
+
+### ROUND-2: q17 ×3 = 418.3/422.6/387.3 (median 418.3, ±4.5%), rows exact ×3
+First remote q17 baseline; the box is measurement-grade (Mac q17 swung 3×).
+Drain-ON shows no q17 regression risk (control gate intent satisfied). q9 frs
+(drain verdict run) started — model ~2030-2180s vs round-1 2421.2.
