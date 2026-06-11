@@ -1047,6 +1047,90 @@ pub extern "system" fn Java_org_forstdb_Options_setCreateIfMissing<'local>(
     )
 }
 
+/// `org.forstdb.Options.setWriteBufferSize(long, long)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setWriteBufferSize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.opts.write_buffer_size = value as usize;
+                }
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Options.setMaxWriteBufferNumber(long, int)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setMaxWriteBufferNumber<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.opts.max_write_buffer_number = value as usize;
+                }
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Options.setMaxBackgroundCompactions(long, int)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setMaxBackgroundCompactions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.opts.max_background_compactions = value as usize;
+                }
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Options.setMaxBackgroundFlushes(long, int)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setMaxBackgroundFlushes<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.opts.max_background_flushes = value as usize;
+                }
+            }
+        },
+    )
+}
+
 #[no_mangle]
 pub extern "system" fn Java_org_forstdb_Options_createIfMissing<'local>(
     mut env: JNIEnv<'local>,
@@ -10765,6 +10849,19 @@ mod tests {
             // JNI load path calls RocksDB.version() immediately after
             // NativeLibraryLoader resolves libforstjni.
             "Java_org_forstdb_RocksDB_version",
+            // P0 — combined Options class.
+            "Java_org_forstdb_Options_newOptions__",
+            "Java_org_forstdb_Options_newOptions__JJ",
+            "Java_org_forstdb_Options_copyOptions",
+            "Java_org_forstdb_Options_disposeInternal",
+            "Java_org_forstdb_Options_setCreateIfMissing",
+            "Java_org_forstdb_Options_createIfMissing",
+            "Java_org_forstdb_Options_setCreateMissingColumnFamilies",
+            "Java_org_forstdb_Options_createMissingColumnFamilies",
+            "Java_org_forstdb_Options_setWriteBufferSize",
+            "Java_org_forstdb_Options_setMaxWriteBufferNumber",
+            "Java_org_forstdb_Options_setMaxBackgroundCompactions",
+            "Java_org_forstdb_Options_setMaxBackgroundFlushes",
             // DBOptions default constructor keeps a default Env reference.
             "Java_org_forstdb_Env_getDefaultEnvInternal",
             "Java_org_forstdb_Env_setBackgroundThreads",
@@ -10988,12 +11085,16 @@ mod tests {
         // SAFETY: handle came from `into_raw` immediately above, no aliasing.
         let opts_ref =
             unsafe { DbOptionsHandle::from_raw_ref(h) }.expect("non-null handle should resolve");
+        opts_ref.opts.write_buffer_size = 512 * 1024 * 1024;
+        opts_ref.opts.max_write_buffer_number = 6;
         opts_ref.opts.max_background_compactions = 8;
         opts_ref.opts.max_background_flushes = 4;
 
         // Re-borrow to verify the write took.
         let opts_ref2 =
             unsafe { DbOptionsHandle::from_raw_ref(h) }.expect("non-null handle should resolve");
+        assert_eq!(opts_ref2.opts.write_buffer_size, 512 * 1024 * 1024);
+        assert_eq!(opts_ref2.opts.max_write_buffer_number, 6);
         assert_eq!(opts_ref2.opts.max_background_compactions, 8);
         assert_eq!(opts_ref2.opts.max_background_flushes, 4);
 
