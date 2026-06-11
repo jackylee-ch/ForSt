@@ -1781,3 +1781,14 @@ Verified first-hand (file:line):
    difference remains in our executor — continue the diff with a narrowed search space.
 (Box note: Docker Desktop daemon went 500-unhealthy mid-fork-test after the day's container
 churn; restarted; ForSt ×2 reruns queued.)
+
+### ★★ FORK RESOLVED: ForSt-async q8@100M EXACT ×2 (3,064,473 / 3,064,453)
+Same runtime, same AEC, same incomplete-future executor contract ⇒ NOT an upstream bug in
+practice; flink-runtime stays FROZEN (user's conditional access doesn't trigger). The race
+is a BEHAVIORAL DIFFERENCE of our executor vs ForStStateExecutor. Narrowed comparative
+surface: (a) offer-time serialization (ours: state-object keyOut → classifier columnar
+buffers on the mailbox) vs ForSt's execution-time request conversion (pollDb*Requests on
+the coordinator); (b) fullyLoaded semantics (ours: outstanding batches ≥ 2×workers; ForSt:
+ongoing READ ops only — writes never block triggering); (c) executeRequestSync routing
+(ours: worker-FIFO submit().get(); ForSt: direct); (d) per-row completion threading
+(ours: the single worker; ForSt: read/write pools). Comparative audit in progress.
