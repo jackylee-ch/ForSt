@@ -2077,3 +2077,7 @@ FAILS remotely; RocksDB FINISHES q7 here (Mac: DNF) — NVMe changes its profile
 Streaming P0/prefetcher alone insufficient for q7 remote; S2 loser-tree +
 compaction-windowed (promoted in roadmap §5 recalibration) are the next levers.
 q9 pair started 02:01:54.
+
+### REMOTE round-1: q9 frs = 2421.2s, rows EXACT (canonical 91,813,372 — 17th identical, cross-arch)
+q9@100M frs (no-drain tip): FINISHED 2421.2s. Correctness: byte-count exact across
+Mac arm64 single-topo AND remote x86 split-topo. q9-rdb pair in flight (02:43:30).
