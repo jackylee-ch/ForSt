@@ -97,9 +97,9 @@ use crate::{
     frs_db_close, frs_db_create_cf, frs_db_create_cf_with_merge, frs_db_default_cf, frs_db_open,
     frs_db_open_cf, frs_db_open_from_checkpoint, frs_delete, frs_flush, frs_flush_cf, frs_get,
     frs_iterator_close, frs_iterator_next, frs_iterator_open, frs_iterator_seek, frs_l0_file_count,
-    frs_lookup_kv, frs_merge, frs_prefix_lookup_close, frs_prefix_lookup_open, frs_put,
-    frs_sequence_number, FrsBytes, FrsCfHandle, FrsDb, FrsIterator, FRS_STATUS_INVALID_ARGUMENT,
-    FRS_STATUS_NOT_FOUND, FRS_STATUS_NULL_ARG, FRS_STATUS_OK,
+    frs_lookup_kv, frs_merge, frs_prefix_lookup_close, frs_prefix_lookup_open, frs_sequence_number,
+    FrsBytes, FrsCfHandle, FrsDb, FrsIterator, FRS_STATUS_INVALID_ARGUMENT, FRS_STATUS_NOT_FOUND,
+    FRS_STATUS_NULL_ARG, FRS_STATUS_OK,
 };
 
 static DB_PATH_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
@@ -1258,6 +1258,37 @@ fn cf_from_java_handle(env: &mut JNIEnv, cf_handle: jlong, context: &str) -> Opt
     Some(cf.frs_handle)
 }
 
+unsafe fn db_ref_from_java_handle<'a>(handle: jlong) -> Option<&'a Arc<DbImpl>> {
+    if handle == 0 {
+        return None;
+    }
+    Some(&*(handle as *const Arc<DbImpl>))
+}
+
+unsafe fn cf_ref_from_frs_handle<'a>(handle: FrsCfHandle) -> Option<&'a ColumnFamilyHandle> {
+    if handle.is_null() {
+        return None;
+    }
+    Some(&*(handle as *const ColumnFamilyHandle))
+}
+
+fn db_and_cf_refs<'a>(
+    env: &mut JNIEnv,
+    db_handle: jlong,
+    cf_handle: FrsCfHandle,
+    context: &str,
+) -> Option<(&'a Arc<DbImpl>, &'a ColumnFamilyHandle)> {
+    let Some(db) = (unsafe { db_ref_from_java_handle(db_handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null DB handle"));
+        return None;
+    };
+    let Some(cf) = (unsafe { cf_ref_from_frs_handle(cf_handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null ColumnFamilyHandle"));
+        return None;
+    };
+    Some((db, cf))
+}
+
 fn cf_from_java_or_default(
     env: &mut JNIEnv,
     db_handle: jlong,
@@ -1323,17 +1354,12 @@ fn put_bytes(
     let Some(v) = read_byte_slice(env, val, val_off, val_len) else {
         return;
     };
-    let status = unsafe {
-        frs_put(
-            handle as FrsDb,
-            cf_handle,
-            k.as_ptr(),
-            k.len(),
-            v.as_ptr(),
-            v.len(),
-        )
+    let Some((db, cf)) = db_and_cf_refs(env, handle, cf_handle, context) else {
+        return;
     };
-    check_status(env, status, context);
+    if let Err(e) = db.put(cf, &k, &v) {
+        throw_rocksdb(env, &format!("{context}: {e}"));
+    }
 }
 
 fn get_bytes(
@@ -1348,39 +1374,26 @@ fn get_bytes(
     let Some(k) = read_byte_slice(env, key, key_off, key_len) else {
         return ptr::null_mut();
     };
-    let mut out = FrsBytes {
-        data: ptr::null_mut(),
-        len: 0,
-        capacity: 0,
+    let Some((db, cf)) = db_and_cf_refs(env, handle, cf_handle, context) else {
+        return ptr::null_mut();
     };
-    let status = unsafe { frs_get(handle as FrsDb, cf_handle, k.as_ptr(), k.len(), &mut out) };
-    if status == FRS_STATUS_NOT_FOUND {
-        return ptr::null_mut();
-    }
-    if check_status(env, status, context) {
-        return ptr::null_mut();
-    }
-    if out.data.is_null() {
-        return ptr::null_mut();
-    }
-    let slice = unsafe { std::slice::from_raw_parts(out.data, out.len) };
-    let java_arr = match env.byte_array_from_slice(slice) {
-        Ok(a) => a.into_raw(),
-        Err(e) => {
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
+    match db.get(cf, &k) {
+        Ok(Some(v)) => match env.byte_array_from_slice(&v) {
+            Ok(a) => a.into_raw(),
+            Err(e) => {
+                throw_rocksdb(
+                    env,
+                    &format!("{context}: byte_array_from_slice failed: {e}"),
+                );
+                ptr::null_mut()
             }
-            throw_rocksdb(
-                env,
-                &format!("{context}: byte_array_from_slice failed: {e}"),
-            );
-            return ptr::null_mut();
+        },
+        Ok(None) => ptr::null_mut(),
+        Err(e) => {
+            throw_rocksdb(env, &format!("{context}: {e}"));
+            ptr::null_mut()
         }
-    };
-    unsafe {
-        let _ = crate::frs_bytes_free(&mut out);
     }
-    java_arr
 }
 
 fn delete_bytes(
@@ -1395,8 +1408,12 @@ fn delete_bytes(
     let Some(k) = read_byte_slice(env, key, key_off, key_len) else {
         return;
     };
-    let status = unsafe { frs_delete(handle as FrsDb, cf_handle, k.as_ptr(), k.len()) };
-    check_status(env, status, context);
+    let Some((db, cf)) = db_and_cf_refs(env, handle, cf_handle, context) else {
+        return;
+    };
+    if let Err(e) = db.delete(cf, &k) {
+        throw_rocksdb(env, &format!("{context}: {e}"));
+    }
 }
 
 /// `org.forstdb.RocksDB.put(long handle, byte[] key,
