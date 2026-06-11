@@ -1950,3 +1950,9 @@ wiring (one mixed FFI crossing per batch); (4) post-fix re-profile of q9 AND q20
 never profiled!) with FRS_PERF → next levers (scan-open dedupe, AEC buffer-timeout audit,
 per-prefix iterator reuse — the engine read path is 33% CPU); (5) same-day RDB re-pin for
 the 1.05× verdicts. Runtime stays FROZEN.
+
+### q9@100M pipelined + cache-merge opt: 2398.5s, EXACT (14th identical)
+Recovered only ~25s of the +364s fix tax ⇒ the tax lives mainly in the EMPTY-CACHE floor
+path (engine re-read spans), not the live-cache within-window branch the merge covers.
+Profile-driven next step. Ledger: blocking/pre-fix 2215.6 | blocking/fix 2579.8 |
+pipelined/fix 2423.4 | pipelined/fix+merge 2398.5. Target 1491.5 (1.05× RDB 1420.5).
