@@ -2089,3 +2089,7 @@ Rows: frs = canonical 91,813,372 EXACT; rdb = 91,813,229 (−143; suspect rdb
 finish-boundary sink sampling — verify round 2; frs correctness unaffected).
 Round-1 is the NO-drain tip — round-2 (drain-ON + S2 later) aims at ≤1.05×.
 q20 pair started 03:20:01.
+
+### REMOTE round-1: q20 frs = 2026.5s (out==src 93,199,688; remote datagen
+sharding shifts absolute counts vs Mac — pair validity = rdb arm must match
+this count). q20 rdb started 03:54:56 (last run of round 1).
