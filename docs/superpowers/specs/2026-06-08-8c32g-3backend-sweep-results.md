@@ -2025,3 +2025,20 @@ background session). x86_64, kernel 5.10, 28c/251G (containers capped), docker
 19.03, /ssd2 NVMe 3.6T. Workflow: local dev+UT → push origin → remote agent pulls
 worktrees to /ssd2/jackylee/frs-bench, builds forst-bench:x86 + .so in-image,
 runs split-topo NexMark (q8 canary, q7 io_uring A/B, q7/q9/q20 vs RDB).
+
+### TIMER-INDEX CHAIN COMPLETE — q9 pair (final): frs 2349.3 vs RDB 1437.6 = 1.63×
+Rows byte-equal (91,813,372, 15th/16th identical). Index recovered only ~50-75s
+of q9 (2423.4→2349.3 vs pipelined/fix) ⇒ TIMER LAYER WAS NEVER THE q9/q20 GAP.
+Scoreboard vs 1.05× bar: q9 1.63× (need ≤1509), q20 1.98× (need ≤1086).
+PMC ROADMAP (docs/superpowers/specs/2026-06-12-q9-q20-longscan-roadmap.md):
+① fix H1 pool-panic hang + M2/M3 prefetcher guards → ② garbage-drain third gate
+→ default 200K (recorded q9 −377s / q20 −568s) → ③ FRS_RS_MIXED_BATCH flip +
+OPT-N04 merge-RMW → ④ S2 pinned rows/loser tree → ⑤ compaction windowed reads
+(19.3% q20 share, NOT prefetcher-eligible today) → ⑥ P2 ring (q9 insurance).
+Modeled landing: q9 ~1430-1600s (0.99-1.10×), q20 ~920-1060s (0.89-1.03×).
+LAST LOCAL NEXMARK RUN — all NexMark henceforth on the remote x86 box.
+
+### REMOTE BOX BLOCKER FOUND: docker 19.03 cannot pull eclipse-temurin (OCI
+manifest error) + apt Ign inside build. Host internet OK (rustup 200). Unblock:
+build .so on HOST (native cargo), base containers on the EXISTING
+flink:2.2.1-jdk17-forst-bench-tools-20260609 image + bind-mounted host JDK25.
