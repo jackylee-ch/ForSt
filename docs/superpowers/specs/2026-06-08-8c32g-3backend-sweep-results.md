@@ -1520,3 +1520,109 @@ the monotone 8-run composition curve, and the 20/22 exactness gate.
 NEXT SESSION: decide the drain default on a FRESH box with n≥3 runs per cell;
 then OPT-N16 sink-threading; then OPT-N04. The box, not the engine, is now the
 binding constraint on fine-grained bar verdicts.
+
+# ★★★ q9@100M SYMBOLIZED NATIVE PROFILE (2026-06-11): the TM is LATENCY-bound, not CPU-bound
+Tooling shipped: `FRS_PERF=1` hook in run-8c32g.sh (perf record -g vs the TM inside the
+container, seccomp relaxed only when profiling; reports → target-linux/perf-<q>-{flat,graph}.txt),
+plus a symbol-bearing .so build recipe (CARGO_PROFILE_RELEASE_STRIP=none DEBUG=2 — codegen-identical).
+Window: 180s at t≈700s of a q9@100M run under the proven config (routing + drain 200K).
+
+## The one number that re-aims the campaign
+60K samples @199Hz/180s = ~302s CPU = **the TM averaged 1.7 of 8 cores**. q9's wall-clock is
+gated by the mailbox⇄executor⇄engine round-trip serialization, NOT by engine CPU. 6+ cores idle.
+
+## CPU shares (of the 1.7 busy cores, --children)
+| Path | Share |
+|---|---|
+| prefix-scan iterators total (frs_vec_iter_prefix_open) | 32.8% — open/stream-build 17.2% (may_contain_range 4.55% SELF, memcmp 4.78%, BTree find_key_index 3.69%), drain fill_chunk 15.0%, TierKeySource::peek 9.6% |
+| compaction thread (drain working as designed) | 12.0% |
+| opendal I/O threads | 7.2% |
+| **frs_vectorized_batch_get (entire GET path)** | **6.5%** |
+| Join-thread wake/signal (Unsafe_Unpark + pthread_cond_signal → futex) | ~6% (the all-latch barrier cost) |
+
+## Verdicts
+- **OPT-N16 (zero-copy GETs): NO-GO.** Entire GET path = 6.5% of 1.7 cores ≈ 0.11 cores;
+  deleting EVERY copy buys ~20-40s of the 225s bar gap. The plan's ≤1850s target was
+  unreachable. (User's profile-before-build directive caught this before any code was written.)
+- Scan-open micro-levers (dedupe the double search_index in may_contain_range+first_block_ge,
+  cheaper index layout): real but small (~0.1-0.2 cores) — not bar-closing.
+- Prefix bloom IS active on q9 (prefix_len=37 ≥ 16) — not the issue.
+- **THE lever: remove the executor's mailbox barrier.** RoutingStateExecutor blocks the task
+  thread in latch.await per batch (pipeline depth 1). The VectorizedExecutor doc block itself
+  records that the AEC ignores the container future (community ForSt returns early from a
+  coordinator thread) and lists 4 blockers — ALL now dissolved: classifier-pool private buffers,
+  worker-side self-release, per-row CallbackRunnerWrapper completion, and fullyLoaded() as the
+  backpressure hook (AEC consults it at trigger time).
+
+## FRS-ROUTING-ASYNC (built 2026-06-11, gated FRS_RS_EXECUTOR=routing-async)
+Non-blocking routing: same kg-affine per-worker FIFOs as proven routing, but
+executeBatchRequests dispatches and returns a TRUTHFUL aggregate future immediately
+(no latch); fullyLoaded() = outstanding ≥ FRS_RS_MAX_INFLIGHT_BATCHES (default 2×workers).
+Why safe where 2026-06-10's non-blocking attempt corrupted q8 (−18%): that variant executed
+iter-free batches INLINE on the mailbox while earlier ops sat in worker queues
+("statebuf writes overtook queued reads"). routing-async has NO inline path — every request
+queues through its key-group's single-thread FIFO, so overtaking is structurally impossible;
+AEC's KeyAccountingUnit serializes same-key records; checkpoint consistency via AEC's
+in-flight-records drain. MapStateCache off under routing-async (same as routing).
+Contract UTs added (RoutingStateExecutorAsyncTest, stub workers): incomplete-at-return,
+truthful completion, FIFO no-overtaking, fullyLoaded cap, failure path, blocking-mode regression.
+GATES (pending): 534 Java UTs → q8@10M exactness ×3 → q9@100M back-to-back vs today's
+control → q17 pair. Estimate: q9 2001s → 1500-1800s band IF overlap converts idle cores
+(precedent: thread-unsafe parallel spike gave q20 1610s, q11 134.7s).
+
+# ▶ CURRENT STATUS (2026-06-11, mid-session refresh)
+## Done today
+1. **OPT-N16 profiling gate executed and OPT-N16 KILLED before build** (user directive honored:
+   profile-verify before code). Evidence above: GET path 6.5% of a 1.7-core-busy TM.
+2. **Root architecture problem of q9 IDENTIFIED with hard data**: the TM uses 1.7/8 cores —
+   the blocking executor's per-batch mailbox barrier (latch.await) is the wall-clock gate.
+   q9's engine CPU (scans 33%) is NOT the binding constraint; idle cores are.
+3. **FRS-ROUTING-ASYNC BUILT** (flink-statebackend-forst-rs): non-blocking RoutingStateExecutor
+   mode, gated FRS_RS_EXECUTOR=routing-async + FRS_RS_MAX_INFLIGHT_BATCHES (default 2×workers).
+   Design + safety argument in the section above. 6 contract UTs added (stub workers, no FFI).
+   NOT yet compiled/committed — gates pending.
+4. **Profiling infrastructure shipped**: FRS_PERF hook (run-8c32g.sh) + symbolized-.so recipe —
+   reusable for every future bottleneck question.
+5. **q9@100M control run n+1** (symbolized .so = codegen-identical, routing+drain200K):
+   src 98M done at 1946s, sink-drain tail in progress at write time — tracking the
+   2001–2105s band; exact RESULT + out_rows recorded below on completion.
+
+## Next (this session, in order)
+1. jar build + 534-UT suite (incl. new RoutingStateExecutorAsyncTest).
+2. q8@10M exactness ×3 under routing-async (the corruption canary that killed every prior
+   non-blocking attempt — must be EXACT 3/3 or the mode is dead).
+3. q9@100M routing-async+drain200K BACK-TO-BACK vs today's control (±10% protocol).
+4. q17@100M routing-async vs blocking pair (same-day, direction-only verdict per noise rule).
+5. If gates pass: q20/q7 under routing-async; record; GHA; commit.
+
+## Standing results (unchanged)
+q9 2001–2105s (10× exact rows, was DNF-forever) | q20 1477.7s beats ForSt 1535.9 (exact) |
+q7 best 1441.6s (ForSt bar 587 — open) | 20/22 10M exactness | q4 wedge + q5 churn pre-existing.
+Bars: q9 RDB 1420.5→0.8× bar 1776s | q20 RDB 1074→bar 1342.5 | q17 noise-ruled.
+
+## q9@100M control n+1 RESULT (2026-06-11, symbolized .so, routing+drain200K, FRS_PERF active)
+**2215.6s, out_rows=91,813,372 — EXACT (11th consecutive byte-identical q9 output).**
+Wall slightly above the 2001–2105 band; run carried the 180s perf-sampling window +
+container tool install, and the box noise rule applies — rows-exactness is the signal.
+This is the baseline for the routing-async back-to-back A/B.
+
+## ✗ FRS-ROUTING-ASYNC q8@100M CANARY: FAILED (2026-06-11) — mode parked experimental
+| run | outcome |
+|---|---|
+| q8@10M smoke | FINISHED 7.6s (out 306,016 — scale too small to exercise depth; smoke only) |
+| q8@100M r1 | WEDGE: src done 3,065,051@60s, windows never fired, rate=0 → MAXSEC@600 |
+| q8@100M r2 | FINISHED 36.7s but out_rows=1,285,415 vs band 3,064,4xx = −58% UNDER-EMIT |
+VERDICT: nondeterministic wedge-or-corrupt = data race. ROOT CAUSE (mechanism): the
+executor-level design is sound (classifier buffers per-batch private, kg-FIFO ordering holds),
+but the PER-STATE off-heap staging buffers (MapStateV2 Arrow buffer / ListStateArrowBuffer /
+statebufs) are long-lived per state object: mailbox APPENDS at offer time while a worker DRAINS
+at execution time. All proven modes are lockstep, so these buffers are single-threaded by
+construction; ANY non-blocking executor overlaps the phases and tears them. This RE-EXPLAINS the
+2026-06-10 coordinated corruption (it was never inline-specific) and confirms the original
+author's deferred scope: per-batch buffer ownership ("refactor of the C1 design") is THE
+structural prerequisite for pipelining. The q9 motivation STANDS (1.7/8 cores, latch-capped);
+the next architectural unit is seal/swap per-state buffers at dispatch, then re-gate.
+Code state: routing-async ships gated FRS_RS_EXECUTOR=routing-async, javadoc carries the
+failed-canary warning, defaults untouched (inline default; blocking routing/adaptive unaffected);
+543 UTs green incl. 6 new contract tests (they validate dispatch mechanics, which are correct —
+the race is in the state-buffer layer the UTs don't reach).

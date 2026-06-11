@@ -49,7 +49,12 @@ case "$cmd" in
     [ -f "$SO" ] || { echo "missing $SO — run: $0 build"; exit 1; }
     OUT="/tmp/${TAG}-$Q-$CFG.out"
     echo "== 8c/32g run: $Q [$CFG] MAXSEC=$MS tag=$TAG =="
-    docker run --rm --cpus=8 --memory=32g --memory-swap=32g "${DKR_COMMON[@]}" \
+    # FRS_PERF (2026-06-11): native-frame CPU profiling of the TM. Needs
+    # perf_event_open which Docker's default seccomp profile blocks → relax
+    # seccomp only when profiling is requested (benchmarks stay confined).
+    PERF_OPTS=()
+    [ -n "${FRS_PERF:-}" ] && PERF_OPTS=(--security-opt seccomp=unconfined --cap-add SYS_ADMIN)
+    docker run --rm --cpus=8 --memory=32g --memory-swap=32g ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" \
       -e QUERY="$Q" -e CONFIG="$CFG" -e MAXSEC="$MS" -e EVENTS_NUM="${EVENTS_NUM:-}" -e TPS="${TPS:-}" \
       -e S3_ENDPOINT=x -e S3_ACCESS_KEY=x -e S3_SECRET_KEY=x -e S3_BUCKET=x -e S3_REGION=x -e S3_PREFIX=x \
       -e FRS_BLOCK_SIZE_KB=8 -e FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-none}" \
@@ -61,9 +66,10 @@ case "$cmd" in
       -e FRS_CURSOR_DIAG="${FRS_CURSOR_DIAG:-}" -e FRS_SCAN_STATS="${FRS_SCAN_STATS:-}" \
       -e FRS_RESIDENT_BYPASS="${FRS_RESIDENT_BYPASS:-}" -e FRS_RESIDENT_SHADOW_TOTAL_MB="${FRS_RESIDENT_SHADOW_TOTAL_MB:-}" \
       -e FRS_RS_PARALLEL_EXECUTOR="${FRS_RS_PARALLEL_EXECUTOR:-}" -e FRS_RS_READ_IO_PARALLELISM="${FRS_RS_READ_IO_PARALLELISM:-}" \
-      -e FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-}" \
+      -e FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-}" -e FRS_RS_MAX_INFLIGHT_BATCHES="${FRS_RS_MAX_INFLIGHT_BATCHES:-}" \
       -e FRS_RS_PARALLEL_ITER="${FRS_RS_PARALLEL_ITER:-}" -e FRS_ITER_DISPATCH_DIAG="${FRS_ITER_DISPATCH_DIAG:-}" \
       -e FRS_RSS_SAMPLE="${FRS_RSS_SAMPLE:-}" -e FRS_JFR="${FRS_JFR:-}" \
+      -e FRS_PERF="${FRS_PERF:-}" -e FRS_PERF_DELAY="${FRS_PERF_DELAY:-}" -e FRS_PERF_DUR="${FRS_PERF_DUR:-}" \
       -e MALLOC_CONF="${MALLOC_CONF:-}" -e _RJEM_MALLOC_CONF="${_RJEM_MALLOC_CONF:-}" \
       -e FRS_MEM_DIAG="${FRS_MEM_DIAG:-}" -e FRS_MEM_DIAG_FILE="${FRS_MEM_DIAG_FILE:-}" \
       -e FRS_DISABLE_MAPSTATE_CACHE="${FRS_DISABLE_MAPSTATE_CACHE:-}" \
@@ -74,6 +80,7 @@ case "$cmd" in
         mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
         nproc && free -g | head -2 &&
         if [ -n \"\$FRS_RSS_SAMPLE\" ]; then ( RL=$REPO/target-linux/rss-\$QUERY.log; : > \$RL; while :; do p=\$(for j in \$(pgrep -x java); do echo \"\$(awk '/VmRSS/{print \$2}' /proc/\$j/status 2>/dev/null) \$j\"; done | sort -rn | head -1 | awk '{print \$2}'); if [ -n \"\$p\" ]; then a=\$(awk '/^Anonymous:/{an+=\$2} /^Rss:/{r+=\$2} END{print r,an}' /proc/\$p/smaps 2>/dev/null); echo \"t=\$(date +%s) pid=\$p rssKB_anonKB=\$a vmRSS=\$(awk '/VmRSS/{print \$2}' /proc/\$p/status 2>/dev/null)\" >> \$RL; n=\$((\${n:-0}+1)); if [ \$((n % 6)) -eq 0 ]; then echo \"--- NMT t=\$(date +%s) ---\" >> \$RL.nmt; jcmd \$p VM.native_memory summary 2>/dev/null | grep -E \"Total:|reserved=|- \" | head -40 >> \$RL.nmt; fi; fi; sleep 5; done & ) ; fi
+        if [ -n \"\$FRS_PERF\" ]; then ( apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq linux-tools-generic >/dev/null 2>&1; PF=\$(find /usr/lib/linux-tools* -name perf 2>/dev/null | head -1); sleep \"\${FRS_PERF_DELAY:-700}\"; p=\$(for j in \$(pgrep -x java); do echo \"\$(awk '/VmRSS/{print \$2}' /proc/\$j/status 2>/dev/null) \$j\"; done | sort -rn | head -1 | awk '{print \$2}'); if [ -n \"\$p\" ] && [ -n \"\$PF\" ]; then echo \"=== FRS_PERF start pid=\$p dur=\${FRS_PERF_DUR:-180}s ===\"; \$PF record -F 199 -g --call-graph fp -o /tmp/\$QUERY-perf.data -p \$p -- sleep \${FRS_PERF_DUR:-180} 2>&1 | tail -2; \$PF report -i /tmp/\$QUERY-perf.data --stdio --no-children --percent-limit 0.3 > $REPO/target-linux/perf-\$QUERY-flat.txt 2>/dev/null; \$PF report -i /tmp/\$QUERY-perf.data --stdio --children --percent-limit 1 > $REPO/target-linux/perf-\$QUERY-graph.txt 2>/dev/null; echo \"=== FRS_PERF done ===\"; fi ) & fi
         if [ -n \"\$FRS_JFR\" ]; then ( sleep \"\${FRS_JFR_DELAY:-180}\"; p=\$(for j in \$(pgrep -x java); do echo \"\$(awk '/VmRSS/{print \$2}' /proc/\$j/status 2>/dev/null) \$j\"; done | sort -rn | head -1 | awk '{print \$2}'); if [ -n \"\$p\" ]; then echo \"=== FRS_JFR start pid=\$p dur=\${FRS_JFR_DUR:-120}s ===\"; /opt/java/openjdk/bin/jcmd \$p JFR.start duration=\${FRS_JFR_DUR:-120}s filename=/tmp/\$QUERY-flame.jfr settings=profile 2>&1; fi ) & fi
         bash scripts/measure-sql.sh
       " 2>&1 | tee "$OUT"
