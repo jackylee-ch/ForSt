@@ -6461,6 +6461,70 @@ impl DbImpl {
         out
     }
 
+    /// S2: stream-building twin of
+    /// [`Self::batch_open_prefix_iters_parallel_map`] — identical pool
+    /// fan-out, input-order results and join semantics, but each probe builds
+    /// a push-style [`PrefixScanStream`] (mode = the S2 flag) instead of a
+    /// boxed Arc-pair iterator, so the FFI batch open drives `fill_into`
+    /// directly (no compat-adapter tax on the q7/q9/q20 probe path).
+    pub fn batch_open_prefix_streams_parallel_map<R, F>(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefixes: &[&[u8]],
+        f: F,
+    ) -> Vec<Option<R>>
+    where
+        R: Send + 'static,
+        F: Fn(usize, ForstResult<PrefixScanStream>) -> R + Send + Sync + 'static,
+    {
+        let k = prefixes.len();
+        if k == 0 {
+            return Vec::new();
+        }
+        // Single probe: run inline — fan-out + channel overhead would only cost.
+        if k == 1 {
+            let r =
+                self.prefix_scan_stream_with_error_slot(cf, prefixes[0], Arc::new(Mutex::new(None)));
+            return vec![Some(f(0, r))];
+        }
+        let pool = bg_read_pool();
+        let f = Arc::new(f);
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, p) in prefixes.iter().enumerate() {
+            let me = Arc::clone(self);
+            let cf = cf.clone();
+            let prefix = p.to_vec();
+            let tx = tx.clone();
+            let f = Arc::clone(&f);
+            pool.submit(Box::new(move || {
+                let built = me.prefix_scan_stream_with_error_slot(
+                    &cf,
+                    &prefix,
+                    Arc::new(Mutex::new(None)),
+                );
+                let r = f(i, built);
+                let _ = tx.send((i, r));
+            }));
+        }
+        drop(tx);
+        let mut out: Vec<Option<R>> = (0..k).map(|_| None).collect();
+        let mut filled = 0usize;
+        while filled < k {
+            match rx.recv_timeout(POOL_JOIN_TIMEOUT) {
+                Ok((i, r)) => {
+                    out[i] = Some(r);
+                    filled += 1;
+                }
+                // All senders dropped (a worker panicked) — remaining slots
+                // stay `None`; the caller maps them to errors.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                // H1: never hang the FFI-calling thread on a wedged pool.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            }
+        }
+        out
+    }
+
     /// Streaming form of [`Self::prefix_scan`].
     ///
     /// PR-B5-H2 / C8-H1: lazy k-way merge across ALL three LSM tiers
@@ -6619,6 +6683,20 @@ impl DbImpl {
         // CF-map lookup + lock acquisition. Holding the `Arc<ColumnFamilyData>`
         // for the iterator's lifetime is also strictly safer than re-looking-up
         // each call (the CF cannot be reclaimed mid-scan).
+        // S2 (flag ON): the Arc-pair compat adapter implemented OVER
+        // `fill_into`, so every in-process consumer of this API exercises the
+        // pinned replenish + push-style merge (the q0-q22 byte-equiv harness
+        // A/Bs the two paths through this one switch). Default OFF keeps the
+        // legacy path below byte-for-byte untouched.
+        if s2_pinned_enabled() {
+            let stream = self.prefix_scan_stream_with_mode(cf, prefix, error_slot, true)?;
+            return Ok(Box::new(ArcPairAdapter {
+                stream,
+                done: false,
+                buf: std::collections::VecDeque::new(),
+                budget: 1,
+            }));
+        }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
         let mut inner = self.build_lazy_prefix_key_stream(cf, prefix)?;
         inner.set_shared_error_slot(error_slot);
@@ -6664,6 +6742,20 @@ impl DbImpl {
         &self,
         cf: &ColumnFamilyHandle,
         prefix: &[u8],
+    ) -> ForstResult<LazyPrefixIter> {
+        self.build_lazy_prefix_key_stream_mode(cf, prefix, s2_pinned_enabled())
+    }
+
+    /// S2: explicit-mode variant of [`Self::build_lazy_prefix_key_stream`] —
+    /// `pinned` selects the legacy (`buffered` Arc rows) vs pinned
+    /// (`SstBlockBuf`) SST replenish for every source of this iterator, so
+    /// in-process A/B fixtures can compare both paths without touching the
+    /// process-wide flag.
+    fn build_lazy_prefix_key_stream_mode(
+        &self,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+        pinned: bool,
     ) -> ForstResult<LazyPrefixIter> {
         // FRS-ITER-DIAG: gated timing of the prefix-stream build. Set
         // FRS_ITER_DIAG=1 to log slow builds (>1ms) with tier + result-size
@@ -6984,6 +7076,9 @@ impl DbImpl {
                 upper: upper.clone(),
                 buffered: Vec::new(),
                 pos: 0,
+                pinned,
+                pbuf: Box::new(SstBlockBuf::default()),
+                mat_allocs: std::cell::Cell::new(0),
             });
         }
 
@@ -7058,7 +7153,7 @@ impl DbImpl {
             );
         }
 
-        LazyPrefixIter::new(sources)
+        LazyPrefixIter::new(sources, pinned)
     }
 
     /// B-R7-NEW-H1: range counterpart of [`Self::build_lazy_prefix_key_stream`].
@@ -7074,6 +7169,18 @@ impl DbImpl {
         cf: &ColumnFamilyHandle,
         lower: &[u8],
         upper: Option<&[u8]>,
+    ) -> ForstResult<LazyRangeIter> {
+        self.build_lazy_range_key_stream_mode(cf, lower, upper, s2_pinned_enabled())
+    }
+
+    /// S2: explicit-mode variant of [`Self::build_lazy_range_key_stream`]
+    /// (see the prefix-path sister method).
+    fn build_lazy_range_key_stream_mode(
+        &self,
+        cf: &ColumnFamilyHandle,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        pinned: bool,
     ) -> ForstResult<LazyRangeIter> {
         let upper_owned: Option<Vec<u8>> = upper.map(|u| u.to_vec());
         let cf_data = self.lookup_cf_by_id(cf.id())?;
@@ -7119,10 +7226,13 @@ impl DbImpl {
                 upper: upper_owned.clone(),
                 buffered: Vec::new(),
                 pos: 0,
+                pinned,
+                pbuf: Box::new(SstBlockBuf::default()),
+                mat_allocs: std::cell::Cell::new(0),
             });
         }
 
-        LazyRangeIter::new(sources)
+        LazyRangeIter::new(sources, pinned)
     }
 
     /// B-R7-NEW-H1: streaming form of [`Self::scan`].
@@ -7179,6 +7289,17 @@ impl DbImpl {
         // (key ASC, seq DESC) newest version, tier precedence preserved
         // (memtable newer than SST; max-seq SST wins; tombstones hide). Fallback
         // (Merge-chains / memtable-tier winners) still resolves via get_internal.
+        // S2 (flag ON): Arc-pair compat adapter over `fill_into` — see the
+        // prefix-path sister comment.
+        if s2_pinned_enabled() {
+            let stream = self.range_scan_stream_with_mode(cf, lower, upper, error_slot, true)?;
+            return Ok(Box::new(ArcPairAdapter {
+                stream,
+                done: false,
+                buf: std::collections::VecDeque::new(),
+                budget: 1,
+            }));
+        }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
         let mut inner = self.build_lazy_range_key_stream(cf, lower, upper)?;
         inner.set_shared_error_slot(error_slot);
@@ -7209,6 +7330,76 @@ impl DbImpl {
             results.push(self.prefix_scan(cf, prefix)?);
         }
         Ok(results)
+    }
+
+    // ---------------------------------------------------------------
+    // S2 (pinned-rows design W1c): push-style scan streams
+    // ---------------------------------------------------------------
+
+    /// S2: opens a prefix scan as a push-style [`PrefixScanStream`] (mode =
+    /// the `FRS_RS_S2_PINNED` flag). The FFI chunked-iterator path drives
+    /// `fill_into` on it directly — zero per-row allocations on SST-Put
+    /// rows, SST bytes → chunk in exactly one copy. Tier-peek errors land in
+    /// `error_slot` (same channel as the iterator API).
+    pub fn prefix_scan_stream_with_error_slot(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+        error_slot: Arc<Mutex<Option<ForstError>>>,
+    ) -> ForstResult<PrefixScanStream> {
+        self.prefix_scan_stream_with_mode(cf, prefix, error_slot, s2_pinned_enabled())
+    }
+
+    /// S2: explicit-mode variant of
+    /// [`Self::prefix_scan_stream_with_error_slot`] for in-process A/B
+    /// fixtures and the direct-`fill_into` bench cell.
+    pub fn prefix_scan_stream_with_mode(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+        error_slot: Arc<Mutex<Option<ForstError>>>,
+        pinned: bool,
+    ) -> ForstResult<PrefixScanStream> {
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let mut inner = self.build_lazy_prefix_key_stream_mode(cf, prefix, pinned)?;
+        inner.set_shared_error_slot(error_slot);
+        Ok(PrefixScanStream {
+            db: Arc::clone(self),
+            cf_data,
+            inner,
+        })
+    }
+
+    /// S2: range counterpart of [`Self::prefix_scan_stream_with_error_slot`]
+    /// (backs `frs_vec_iter_range_open` when the flag is ON).
+    pub fn range_scan_stream_with_error_slot(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        error_slot: Arc<Mutex<Option<ForstError>>>,
+    ) -> ForstResult<PrefixScanStream> {
+        self.range_scan_stream_with_mode(cf, lower, upper, error_slot, s2_pinned_enabled())
+    }
+
+    /// S2: explicit-mode variant of
+    /// [`Self::range_scan_stream_with_error_slot`].
+    pub fn range_scan_stream_with_mode(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        error_slot: Arc<Mutex<Option<ForstError>>>,
+        pinned: bool,
+    ) -> ForstResult<PrefixScanStream> {
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let mut inner = self.build_lazy_range_key_stream_mode(cf, lower, upper, pinned)?;
+        inner.set_shared_error_slot(error_slot);
+        Ok(PrefixScanStream {
+            db: Arc::clone(self),
+            cf_data,
+            inner,
+        })
     }
 
     // ---------------------------------------------------------------
@@ -10549,6 +10740,47 @@ fn wbm_stall_enabled() -> bool {
     })
 }
 
+/// S2 (pinned-rows + loser-tree design, 2026-06-12): test/bench override for
+/// [`s2_pinned_enabled`]. 0 = unset (read the env), 1 = forced OFF,
+/// 2 = forced ON. Programmatic (not env) so in-process A/B fixtures and the
+/// direct-`fill_into` bench cell can select the mode without racing the
+/// `OnceLock` env cache.
+static S2_PINNED_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// S2: force the pinned read path on/off (`Some(_)`) or restore the env-flag
+/// behaviour (`None`). Affects iterators built AFTER the call.
+pub fn set_s2_pinned_override(v: Option<bool>) {
+    S2_PINNED_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// S2 flag (`FRS_RS_S2_PINNED=1`, DEFAULT OFF): selects the pinned-block
+/// replenish + push-style emit (and, stage 3, the loser-tree merge) for the
+/// streaming scan read path. One flag for the whole S2 unit — the A/B stays
+/// two-way. Flipping the default ON is a separate, gated decision commit
+/// (work-order §6.5), NOT this code.
+pub fn s2_pinned_enabled() -> bool {
+    use std::sync::OnceLock;
+    match S2_PINNED_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_RS_S2_PINNED").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
 /// FRS-RESIDENT-BYPASS toggle (`FRS_RESIDENT_BYPASS=1`, off by default), cached.
 /// When set, the Tier-2 resident-shadow loop is skipped entirely — reads go
 /// memtable + SST (block cache) like RocksDB. Local-safe (write-through SSTs are
@@ -10760,7 +10992,85 @@ enum TierKeySource {
         upper: Option<Vec<u8>>,
         buffered: Vec<SstHeadRow>,
         pos: usize,
+        /// S2 (pinned-rows design §2.1 W1): when `pinned`, the replenish path
+        /// fills `pbuf` (pin + offsets, ZERO per-row allocations) instead of
+        /// `buffered` (2 `Arc::from` heap allocations per accepted row).
+        /// Selected once at iterator build by [`s2_pinned_enabled`]; both
+        /// fields coexist so the legacy path stays byte-for-byte untouched
+        /// when the flag (default OFF) is clear.
+        pinned: bool,
+        pbuf: Box<SstBlockBuf>,
+        /// W3 diag: emit/merge-path Arc/Vec materialisations attributable to
+        /// this source (legacy replenish `Arc::from` pairs; pinned-mode
+        /// `peek_arc`/`head_sst_info` compat materialisations). The S2 gate:
+        /// this reads 0 for a pinned drain through `fill_into`.
+        /// `Cell` because the compat accessors are `&self`.
+        mat_allocs: std::cell::Cell<u64>,
     },
+}
+
+/// S2 (pinned-rows design §2.1): one decoded block's accepted rows, alloc-free
+/// after warm-up. Replaces `buffered: Vec<SstHeadRow>` + `pos` on the pinned
+/// path: the decoded block is PINNED (Arc refcount / batch buffers held) and
+/// rows are `(offset, len)` references into it (values; v1 keys) or into the
+/// per-block `key_arena` (v2 keys — mandatory per D2: `KvBlock` reconstructs
+/// prefix-compressed keys into a reused scratch, so block-payload key refs
+/// would dangle).
+#[derive(Default)]
+struct SstBlockBuf {
+    /// Pin: keeps the decoded payload alive (`Arc<KvBlock>` refcount or the
+    /// `RecordBatch`'s Arc'd buffers). Replaced wholesale per block; dropped
+    /// at source exhaustion (eager free).
+    pin: Option<forst_rs_storage::sst::reader::DecodedBlock>,
+    /// v2 keys delta-decoded once per block, back-to-back. `clear()`ed and
+    /// re-extended per block — capacity stabilises after the first blocks, so
+    /// steady-state cost is the (already-paid-today) key byte copy with ZERO
+    /// allocations. Left empty for v1 Arrow blocks.
+    key_arena: Vec<u8>,
+    /// Accepted-row metadata (reused `Vec`, cleared per block).
+    rows: Vec<PinnedRowMeta>,
+    /// Cursor into `rows`.
+    pos: usize,
+}
+
+/// S2: row metadata for [`SstBlockBuf`] — the offsets-only counterpart of
+/// [`SstHeadRow`] (24-byte class, no heap ownership).
+struct PinnedRowMeta {
+    key: forst_rs_storage::sst::SliceRef,
+    /// `None` for a tombstone (Delete/SingleDelete).
+    val: Option<forst_rs_storage::sst::SliceRef>,
+    sequence: u64,
+    op_type: OpType,
+}
+
+impl SstBlockBuf {
+    /// The pinned block's stable `(key_buffer, value_buffer)` pair (see
+    /// `DecodedBlock::key_value_buffers`). The schema was validated when the
+    /// replenish walked the block, so the downcast cannot fail here.
+    fn bufs(&self) -> (&[u8], &[u8]) {
+        self.pin
+            .as_ref()
+            .expect("SstBlockBuf::bufs called with no pinned block")
+            .key_value_buffers()
+            .expect("block schema validated at replenish")
+    }
+
+    /// Resolves row `i`'s key bytes. Valid until the next replenish of this
+    /// source (which cannot happen before the current merge step's emit
+    /// completes — the §2.1 W1c borrow-soundness argument).
+    fn key_at(&self, i: usize) -> &[u8] {
+        let (key_buf, _) = self.bufs();
+        self.rows[i].key.resolve(&self.key_arena, key_buf)
+    }
+
+    /// Resolves row `i`'s value bytes (`None` = tombstone).
+    fn val_at(&self, i: usize) -> Option<&[u8]> {
+        let (_, val_buf) = self.bufs();
+        self.rows[i]
+            .val
+            .as_ref()
+            .map(|v| v.resolve(&self.key_arena, val_buf))
+    }
 }
 
 /// FRS-VALUE-CARRYING-MERGE (2026-06-06): the newest version of one user-key
@@ -10795,7 +11105,15 @@ impl TierKeySource {
                 upper,
                 buffered,
                 pos,
+                pinned,
+                pbuf,
+                mat_allocs,
             } => {
+                // S2: the pinned replenish fills `pbuf` via the ranges
+                // visitor — same filter order, zero per-row allocations.
+                if *pinned {
+                    return Self::peek_pinned(fetcher, lower, upper.as_deref(), pbuf);
+                }
                 // Replenish the buffer until either we find a usable key
                 // or we've exhausted the SST.
                 loop {
@@ -10862,6 +11180,11 @@ impl TierKeySource {
                         // replaces the alloc the eliminated per-key
                         // `get_internal` would have paid.
                         if buffered.last().map(|r| r.key.as_ref()) != Some(view.key) {
+                            // S2 W3 diag: the legacy path's per-row alloc
+                            // pair (key Arc::from + value Arc::from) — the
+                            // exact cost the pinned path eliminates.
+                            mat_allocs
+                                .set(mat_allocs.get() + 1 + u64::from(view.value.is_some()));
                             buffered.push(SstHeadRow {
                                 key: Arc::<[u8]>::from(view.key),
                                 value: view.value.map(Arc::<[u8]>::from),
@@ -10889,11 +11212,103 @@ impl TierKeySource {
         }
     }
 
+    /// S2 pinned replenish (W1b): identical filter pipeline to the legacy
+    /// loop above — below-`lower` skip → upper-bound `hit_upper` +
+    /// `fetcher.terminate()` contract → within-block user-key dedup — but
+    /// rows are captured as offsets into the PINNED block (+ per-block key
+    /// arena for v2 keys, mandatory per D2). ZERO heap allocations per row
+    /// at steady state (the arena/rows `Vec` capacities stabilise after the
+    /// first blocks).
+    fn peek_pinned<'a>(
+        fetcher: &mut forst_rs_storage::sst::prefetch::BlockPrefetcher,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        pbuf: &'a mut SstBlockBuf,
+    ) -> ForstResult<Option<&'a [u8]>> {
+        loop {
+            if pbuf.pos < pbuf.rows.len() {
+                return Ok(Some(pbuf.key_at(pbuf.pos)));
+            }
+            let Some(block) = fetcher.next_decoded()? else {
+                // Source exhausted — eager-release the pin (the §2.3 bound:
+                // ≤ 1 pinned block per LIVE source, none once drained).
+                pbuf.pin = None;
+                pbuf.rows.clear();
+                pbuf.key_arena.clear();
+                pbuf.pos = 0;
+                return Ok(None);
+            };
+            // Pin replaces wholesale; the previous block's refcount drops.
+            pbuf.rows.clear();
+            pbuf.key_arena.clear();
+            pbuf.pos = 0;
+            pbuf.pin = Some(block);
+            let pin = pbuf.pin.as_ref().expect("pin just set");
+            // Validate the block schema ONCE per block so emit-time
+            // resolution (`key_at`/`val_at`) cannot fail.
+            let (key_buf, _val_buf) = pin.key_value_buffers()?;
+            let rows = &mut pbuf.rows;
+            let mut hit_upper = false;
+            // Within-block user-key dedup state: the last ACCEPTED row's key
+            // ref (mirror of the legacy `buffered.last()` compare).
+            let mut last_accepted: Option<forst_rs_storage::sst::SliceRef> = None;
+            // S2-3: seek-aware + early-stopping visitor — rows below `lower`
+            // are skipped INSIDE the block walk (restart-point seek, ≤ one
+            // interval of throwaway prefix-chain work, no arena traffic) and
+            // the walk STOPS at the first key >= `upper` instead of decoding
+            // the block's tail. Bounds the replenish to the probed window
+            // (the +54 % deep-fan-out probe regression of the full-walk cut).
+            pin.for_each_row_ranges_from(lower, &mut pbuf.key_arena, |arena, rr| {
+                let key = rr.key.resolve(arena, key_buf);
+                if let Some(hi) = upper {
+                    if key >= hi {
+                        hit_upper = true;
+                        return Ok(false); // stop the walk
+                    }
+                }
+                // SST rows are `(key ASC, sequence DESC)`: keep only the
+                // FIRST (newest) version of each user-key in this block.
+                if let Some(prev) = last_accepted {
+                    if prev.resolve(arena, key_buf) == key {
+                        return Ok(true);
+                    }
+                }
+                rows.push(PinnedRowMeta {
+                    key: rr.key,
+                    val: rr.value,
+                    sequence: rr.sequence,
+                    op_type: rr.op_type,
+                });
+                last_accepted = Some(rr.key);
+                Ok(true)
+            })?;
+            if hit_upper {
+                // No later block can contain an in-range key — terminate the
+                // prefetcher (same contract as the legacy path). Rows
+                // accepted BEFORE the bound in this block still drain via the
+                // fast path above; then `next_decoded()` returns None.
+                fetcher.terminate();
+            }
+            // Loop: an entirely out-of-range/empty block peeks the next one.
+        }
+    }
+
     /// Consumes the currently-peeked key and advances the cursor.
     fn advance(&mut self) {
         match self {
             TierKeySource::MemCursor { cursor } => cursor.advance(),
-            TierKeySource::Sst { pos, .. } => *pos += 1,
+            TierKeySource::Sst {
+                pos, pinned, pbuf, ..
+            } => {
+                // Pos bump only — NO replenish: the advanced-past row's bytes
+                // stay pinned until the next `peek` replenish, which is the
+                // §2.1 W1c borrow-soundness contract emit relies on.
+                if *pinned {
+                    pbuf.pos += 1;
+                } else {
+                    *pos += 1;
+                }
+            }
         }
     }
 
@@ -10903,11 +11318,31 @@ impl TierKeySource {
     ///
     /// Precondition: caller must have just successfully `peek`-ed `Some(_)`
     /// from this source; otherwise returns `None`.
+    ///
+    /// S2: on a pinned source this MATERIALISES an `Arc` from the pinned
+    /// bytes (compat for the keys-only `Iterator` path; counted as a W3
+    /// alloc). The pinned merge (`next_step_pinned`) never calls it.
     fn peek_arc(&self) -> Option<Arc<[u8]>> {
         match self {
             TierKeySource::MemCursor { cursor } => cursor.peek_arc(),
-            TierKeySource::Sst { buffered, pos, .. } => {
-                buffered.get(*pos).map(|r| Arc::clone(&r.key))
+            TierKeySource::Sst {
+                buffered,
+                pos,
+                pinned,
+                pbuf,
+                mat_allocs,
+                ..
+            } => {
+                if *pinned {
+                    if pbuf.pos < pbuf.rows.len() {
+                        mat_allocs.set(mat_allocs.get() + 1);
+                        Some(Arc::<[u8]>::from(pbuf.key_at(pbuf.pos)))
+                    } else {
+                        None
+                    }
+                } else {
+                    buffered.get(*pos).map(|r| Arc::clone(&r.key))
+                }
             }
         }
     }
@@ -10921,12 +11356,137 @@ impl TierKeySource {
     /// user-key forces the safe `get_internal` fallback (a cheap memtable hit,
     /// no SST I/O). `Some(..)` lets the merge resolve an SST-resident `Put`
     /// inline. Precondition: caller has just `peek`-ed `Some(_)`.
+    ///
+    /// S2: on a pinned source the value `Arc` is MATERIALISED (compat for the
+    /// legacy `next_with_value`; counted as a W3 alloc). The pinned merge
+    /// uses [`Self::head_info`] + [`Self::pinned_row_value`] instead.
     fn head_sst_info(&self) -> Option<(u64, OpType, Option<Arc<[u8]>>)> {
         match self {
             TierKeySource::MemCursor { .. } => None,
-            TierKeySource::Sst { buffered, pos, .. } => buffered
-                .get(*pos)
-                .map(|r| (r.sequence, r.op_type, r.value.clone())),
+            TierKeySource::Sst {
+                buffered,
+                pos,
+                pinned,
+                pbuf,
+                mat_allocs,
+                ..
+            } => {
+                if *pinned {
+                    pbuf.rows.get(pbuf.pos).map(|r| {
+                        let val = pbuf.val_at(pbuf.pos).map(|v| {
+                            mat_allocs.set(mat_allocs.get() + 1);
+                            Arc::<[u8]>::from(v)
+                        });
+                        (r.sequence, r.op_type, val)
+                    })
+                } else {
+                    buffered
+                        .get(*pos)
+                        .map(|r| (r.sequence, r.op_type, r.value.clone()))
+                }
+            }
+        }
+    }
+
+    /// S2: non-replenishing, NON-mutating head-key view. Valid only after a
+    /// `peek()` established the head (the merge's ensure pass); `None` =
+    /// drained (or errored-as-drained) this pass. Immutable so the merge can
+    /// compare heads across sources without `peek_arc` materialisation.
+    fn head_key(&self) -> Option<&[u8]> {
+        match self {
+            TierKeySource::MemCursor { cursor } => cursor.peek(),
+            TierKeySource::Sst {
+                buffered,
+                pos,
+                pinned,
+                pbuf,
+                ..
+            } => {
+                if *pinned {
+                    (pbuf.pos < pbuf.rows.len()).then(|| pbuf.key_at(pbuf.pos))
+                } else {
+                    buffered.get(*pos).map(|r| r.key.as_ref())
+                }
+            }
+        }
+    }
+
+    /// S2: head decision info WITHOUT value materialisation — `None` for a
+    /// memtable source (its presence forces Fallback), `Some((sequence,
+    /// op_type, has_value))` for an SST head. Same precondition as
+    /// [`Self::head_key`].
+    fn head_info(&self) -> Option<(u64, OpType, bool)> {
+        match self {
+            TierKeySource::MemCursor { .. } => None,
+            TierKeySource::Sst {
+                buffered,
+                pos,
+                pinned,
+                pbuf,
+                ..
+            } => {
+                if *pinned {
+                    pbuf.rows
+                        .get(pbuf.pos)
+                        .map(|r| (r.sequence, r.op_type, r.val.is_some()))
+                } else {
+                    buffered
+                        .get(*pos)
+                        .map(|r| (r.sequence, r.op_type, r.value.is_some()))
+                }
+            }
+        }
+    }
+
+    /// S2: the head row's index in this source's buffer — captured BEFORE
+    /// `advance()` so a Put winner's bytes can be resolved at emit time
+    /// (post-advance the row is at `index`, still pinned).
+    fn head_row_index(&self) -> usize {
+        match self {
+            TierKeySource::MemCursor { .. } => 0,
+            TierKeySource::Sst {
+                pos, pinned, pbuf, ..
+            } => {
+                if *pinned {
+                    pbuf.pos
+                } else {
+                    *pos
+                }
+            }
+        }
+    }
+
+    /// S2: resolves pinned row `row`'s value bytes (`None` = tombstone or
+    /// not a pinned SST source). `row` must come from [`Self::head_row_index`]
+    /// captured during the SAME merge step — the bytes stay valid until this
+    /// source's next replenish, which cannot happen before the emit completes.
+    fn pinned_row_value(&self, row: usize) -> Option<&[u8]> {
+        match self {
+            TierKeySource::Sst {
+                pinned: true, pbuf, ..
+            } if row < pbuf.rows.len() => pbuf.val_at(row),
+            _ => None,
+        }
+    }
+
+    /// W3 diag: emit/merge-path materialisation allocs attributed to this
+    /// source (0 for memtable cursors).
+    fn mat_allocs(&self) -> u64 {
+        match self {
+            TierKeySource::MemCursor { .. } => 0,
+            TierKeySource::Sst { mat_allocs, .. } => mat_allocs.get(),
+        }
+    }
+
+    /// S2-3: comparator components for the tournament tree —
+    /// `(tier_rank, sequence)`. Rank 0 for memtable cursors (a memtable is
+    /// ALWAYS newer than any SST for a key it holds), 1 for SSTs; memtable
+    /// sequence is `u64::MAX` (ties among memtable cursors break on source
+    /// index). Same precondition as [`Self::head_key`].
+    fn head_rank_seq(&self) -> (u8, u64) {
+        match self {
+            TierKeySource::MemCursor { .. } => (0, u64::MAX),
+            TierKeySource::Sst { .. } => (1, self.head_info().map_or(0, |(s, _, _)| s)),
         }
     }
 }
@@ -10976,16 +11536,542 @@ pub struct LazyPrefixIter {
     /// `None` preserves the in-process API where callers (engine tests,
     /// `prefix_scan` collector) consult `take_last_error()` directly.
     shared_error_slot: Option<Arc<Mutex<Option<ForstError>>>>,
+    /// S2: mode selected at iterator build ([`s2_pinned_enabled`] or the
+    /// explicit `_mode` constructors). When `true`, SST sources replenish
+    /// into pinned [`SstBlockBuf`]s and the merge runs `next_step_pinned`
+    /// (zero per-row heap traffic) instead of the Arc-based phases.
+    pinned: bool,
+    /// S2 (W1c): reused last-emitted scratch for the pinned path — the
+    /// ~key-length copy-into replaces the legacy `Arc` clone (zero alloc).
+    /// Doubles as the emitted key's bytes for the current step.
+    last_emitted_buf: Vec<u8>,
+    /// Whether `last_emitted_buf` holds an emitted key yet.
+    last_emitted_set: bool,
+    /// W3 diag: keys emitted by this iterator (Put + Fallback decisions).
+    rows_emitted: u64,
+    /// W3 diag: merge key-comparisons performed (the stage-3 loser-tree gate
+    /// compares this `2n + dup·n` linear count against `(1+dups)·log₂ n`).
+    merge_comparisons: u64,
+    /// S2-3 (W2): tournament tree, built lazily on the first pinned step when
+    /// `sources.len() >= S2_TREE_MIN_SOURCES` (and not test-disabled).
+    tree: Option<TournamentTree>,
+    /// S2-3: a Put winner's re-fight is DEFERRED to the next step — its
+    /// `ensure_head` may replenish (dropping the pinned block) and the emit
+    /// still needs the winning row's bytes (W1c borrow-soundness).
+    deferred_refight: Option<u32>,
+    /// Test knob: force the linear pinned merge regardless of fan-out (the
+    /// §6.4 comparison-counter gate measures linear-vs-tree on one fixture).
+    tree_disabled: bool,
+    /// S2-3 adaptive guard: dup-drain re-fights performed by the tree (one
+    /// per source advanced past an already-emitted key). The tree pays
+    /// `log₂ n` per dup while the linear pass amortises every dup into its
+    /// single O(n) scan — so a DUP-DOMINATED merge (every source holding
+    /// every key: the hot_prefix_churn / TopN-rewrite shape, measured +14.5%
+    /// tree-vs-linear) crosses over. When the running dup density exceeds
+    /// ~n/2 per emitted key the tree is ABANDONED for the rest of the scan
+    /// (one-way; the linear merge is the identical decision procedure, so
+    /// this is purely a cost dispatch).
+    tree_dup_drains: u64,
+    /// Whether the adaptive guard dropped the tree mid-scan.
+    tree_abandoned: bool,
+}
+
+/// S2-3 (W2): sources at or below this count keep the LINEAR pinned merge —
+/// tiny fan-outs are common for q3/q4-class probes, the linear scan wins
+/// there, and this branch caps regression risk for R-short (falsifier §4.3:
+/// an ssts_1/8 regression means THIS threshold is wrong, not S2).
+const S2_TREE_MIN_SOURCES: usize = 5;
+
+/// S2-3 sentinel: an empty tree slot (padding leaf / not-yet-fought node).
+const TREE_NONE: u32 = u32::MAX;
+
+/// S2-3 (W2): tournament tree over source indices, keyed
+/// `(head_key, tier_rank, sequence DESC, source index)` — memtable cursors
+/// (rank 0) surface before SSTs (rank 1) at equal keys, max-sequence SST
+/// first among SSTs, so the ROOT winner directly encodes the linear Phase-B
+/// decision (mem presence → Fallback; else max-seq SST). Winner-stored
+/// variant: `nodes[j]` holds the winning source index of node `j`'s subtree;
+/// a re-fight after advancing one source recomputes only its leaf-to-root
+/// path — `log₂ n` comparisons — collapsing the linear `2n + dup·n` scan to
+/// `(1 + dups)·log₂ n` per emitted key.
+struct TournamentTree {
+    /// `nodes[1..2m)`: winner source index per node (`TREE_NONE` = empty).
+    /// Leaves at `[m, m+n)` are fixed to their source index; `[m+n, 2m)` is
+    /// `TREE_NONE` padding.
+    nodes: Vec<u32>,
+    /// Leaf base: `n.next_power_of_two()`.
+    m: usize,
+}
+
+impl TournamentTree {
+    /// Builds the tree over `sources` (heads must already be ensured).
+    /// O(n) fights.
+    fn build(sources: &[TierKeySource], comparisons: &mut u64) -> Self {
+        let n = sources.len();
+        let m = n.next_power_of_two().max(2);
+        let mut nodes = vec![TREE_NONE; 2 * m];
+        for (i, slot) in nodes[m..m + n].iter_mut().enumerate() {
+            *slot = i as u32;
+        }
+        let mut tree = Self { nodes, m };
+        for j in (1..m).rev() {
+            tree.nodes[j] = Self::fight(
+                tree.nodes[2 * j],
+                tree.nodes[2 * j + 1],
+                sources,
+                comparisons,
+            );
+        }
+        tree
+    }
+
+    /// The current overall winner (`TREE_NONE` only when no source exists;
+    /// callers additionally check the winner's head for drained-ness).
+    fn winner(&self) -> u32 {
+        self.nodes[1]
+    }
+
+    /// Re-fights the path from `leaf`'s slot to the root after that source
+    /// advanced/drained — exactly one fight per level (`log₂ m`).
+    fn replay(&mut self, leaf: usize, sources: &[TierKeySource], comparisons: &mut u64) {
+        let mut j = (self.m + leaf) / 2;
+        loop {
+            self.nodes[j] = Self::fight(
+                self.nodes[2 * j],
+                self.nodes[2 * j + 1],
+                sources,
+                comparisons,
+            );
+            if j == 1 {
+                break;
+            }
+            j /= 2;
+        }
+    }
+
+    /// One match: the LESSER head under `(key, tier_rank, seq DESC, idx)`
+    /// wins; a drained head (or empty slot) always loses.
+    fn fight(a: u32, b: u32, sources: &[TierKeySource], comparisons: &mut u64) -> u32 {
+        if a == TREE_NONE {
+            return b;
+        }
+        if b == TREE_NONE {
+            return a;
+        }
+        let (ka, kb) = (
+            sources[a as usize].head_key(),
+            sources[b as usize].head_key(),
+        );
+        match (ka, kb) {
+            (None, _) => b,
+            (Some(_), None) => a,
+            (Some(ka), Some(kb)) => {
+                *comparisons += 1;
+                let (ra, sa) = sources[a as usize].head_rank_seq();
+                let (rb, sb) = sources[b as usize].head_rank_seq();
+                let ord = ka
+                    .cmp(kb)
+                    .then_with(|| ra.cmp(&rb))
+                    .then_with(|| sb.cmp(&sa)) // sequence DESC
+                    .then_with(|| a.cmp(&b)); // determinism
+                if ord == std::cmp::Ordering::Greater {
+                    b
+                } else {
+                    a
+                }
+            }
+        }
+    }
+}
+
+/// S2: outcome of one pinned merge step ([`LazyPrefixIter::next_step_pinned`]).
+/// The winning user key is in `last_emitted_buf`.
+enum PinnedStep {
+    /// Newest version is an SST-resident Put pinned in `sources[src]` at row
+    /// index `row` — resolve via [`TierKeySource::pinned_row_value`].
+    Put {
+        /// Winning source index.
+        src: usize,
+        /// Row index within the winning source's pinned buffer.
+        row: usize,
+    },
+    /// Resolve via `get_internal` (memtable winner / merge chain / corrupt
+    /// Put) — the correctness path, allocs allowed.
+    Fallback,
+}
+
+/// S2: sticky-FIRST tier-peek error recording shared by the legacy
+/// (`record_peek_error`) and pinned (`ensure_head_pinned`) paths — a free
+/// function over the destructured fields so the pinned merge's split borrows
+/// stay disjoint.
+fn record_peek_error_into(
+    slot: &Option<Arc<Mutex<Option<ForstError>>>>,
+    local: &mut Option<ForstError>,
+    e: ForstError,
+) {
+    if let Some(slot) = slot.as_ref() {
+        let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            *guard = Some(e);
+        }
+    } else if local.is_none() {
+        *local = Some(e);
+    }
+}
+
+/// S2: per-source "ensure a usable head": replenish (`peek`) + dedup past
+/// the last-emitted key + sticky error recording (an errored source is
+/// treated as drained for this scan — same as the legacy Phase A). Counts
+/// dedup comparisons into `comparisons` (W3).
+fn ensure_head_pinned(
+    source: &mut TierKeySource,
+    last_emitted: Option<&[u8]>,
+    shared_error_slot: &Option<Arc<Mutex<Option<ForstError>>>>,
+    local_error: &mut Option<ForstError>,
+    comparisons: &mut u64,
+) {
+    loop {
+        match source.peek() {
+            Ok(Some(head)) => {
+                if let Some(le) = last_emitted {
+                    *comparisons += 1;
+                    if head <= le {
+                        source.advance();
+                        continue;
+                    }
+                }
+                return;
+            }
+            Ok(None) => return,
+            Err(e) => {
+                record_peek_error_into(shared_error_slot, local_error, e);
+                return;
+            }
+        }
+    }
 }
 
 impl LazyPrefixIter {
-    fn new(sources: Vec<TierKeySource>) -> ForstResult<Self> {
+    fn new(sources: Vec<TierKeySource>, pinned: bool) -> ForstResult<Self> {
         Ok(Self {
             sources,
             last_emitted: None,
             last_error: None,
             shared_error_slot: None,
+            pinned,
+            last_emitted_buf: Vec::new(),
+            last_emitted_set: false,
+            rows_emitted: 0,
+            merge_comparisons: 0,
+            tree: None,
+            deferred_refight: None,
+            tree_disabled: false,
+            tree_dup_drains: 0,
+            tree_abandoned: false,
         })
+    }
+
+    /// W3 diag counters: `(rows_emitted, merge_comparisons, mat_allocs)`.
+    /// `mat_allocs` sums the per-source emit/merge-path materialisations —
+    /// the S2 falsifier-1 gate: ~0 on a pinned `fill_into` drain whose
+    /// winners are SST Puts.
+    pub fn diag_counters(&self) -> (u64, u64, u64) {
+        let allocs: u64 = self.sources.iter().map(|s| s.mat_allocs()).sum();
+        (self.rows_emitted, self.merge_comparisons, allocs)
+    }
+
+    /// S2 (W1c): one merge step on the pinned path. Mirrors
+    /// [`Self::next_with_value`]'s Phase A/B/C decision procedure EXACTLY —
+    /// per-source dedup past `last_emitted`, lex-smallest head, memtable
+    /// presence forces Fallback, max-sequence SST wins, tombstone winners
+    /// skipped internally — but with zero per-step heap traffic: the winning
+    /// key is COPIED into the reused `last_emitted_buf` scratch and an
+    /// SST-Put winner returns `(source, row)` indices whose bytes stay
+    /// pinned until that source's next replenish (which cannot happen before
+    /// the caller's emit completes). `None` = all sources drained.
+    ///
+    /// S2-3 dispatch: fan-outs of `S2_TREE_MIN_SOURCES`+ run the tournament
+    /// tree (`(1+dups)·log₂ n` comparisons per key); smaller fan-outs keep
+    /// the linear scan (it wins there — the R-short guard).
+    fn next_step_pinned(&mut self) -> Option<PinnedStep> {
+        if self.sources.len() >= S2_TREE_MIN_SOURCES
+            && !self.tree_disabled
+            && !self.tree_abandoned
+        {
+            return self.next_step_pinned_tree();
+        }
+        self.next_step_pinned_linear()
+    }
+
+    /// S2-3 (W2): tournament-tree merge step — decision-equivalent to the
+    /// linear phases: the comparator surfaces, among equal keys, the memtable
+    /// source first (→ Fallback, exactly `mem_present`), else the
+    /// max-sequence SST (→ the linear Phase-B `best`); duplicate sources at
+    /// the emitted key drain on subsequent re-fights via the
+    /// dedup-past-`last_emitted` skip (each drain = one `ensure` + one
+    /// `log₂ n` replay). Errored sources record sticky-first and fight as
+    /// drained — same semantics as Phase A.
+    fn next_step_pinned_tree(&mut self) -> Option<PinnedStep> {
+        // Adaptive dup guard (see `tree_dup_drains`): past the warm-up,
+        // a dup-dominated merge (> ~n/2 dup drains per emitted key) is
+        // cheaper on the linear pass — abandon the tree one-way. Dropping
+        // the deferred refight is safe: the linear Phase A ensures EVERY
+        // source's head (incl. the dedup-past-last_emitted skip) each step.
+        if self.rows_emitted >= 16
+            && self.tree_dup_drains
+                > self.rows_emitted * (self.sources.len() as u64 / 2)
+        {
+            self.tree = None;
+            self.deferred_refight = None;
+            self.tree_abandoned = true;
+            return self.next_step_pinned_linear();
+        }
+        let mut comparisons = 0u64;
+        let step;
+        {
+            let Self {
+                sources,
+                tree,
+                deferred_refight,
+                last_emitted_buf,
+                last_emitted_set,
+                shared_error_slot,
+                last_error,
+                tree_dup_drains,
+                ..
+            } = self;
+            if tree.is_none() {
+                // First step: ensure every head, then one O(n) build.
+                let le = last_emitted_set.then(|| last_emitted_buf.as_slice());
+                for src in sources.iter_mut() {
+                    ensure_head_pinned(src, le, shared_error_slot, last_error, &mut comparisons);
+                }
+                *tree = Some(TournamentTree::build(sources, &mut comparisons));
+            } else if let Some(w) = deferred_refight.take() {
+                // The previous step's Put winner: its emit is complete, so
+                // replenish is safe now.
+                let le = last_emitted_set.then(|| last_emitted_buf.as_slice());
+                ensure_head_pinned(
+                    &mut sources[w as usize],
+                    le,
+                    shared_error_slot,
+                    last_error,
+                    &mut comparisons,
+                );
+                tree.as_mut()
+                    .expect("tree exists when a refight is deferred")
+                    .replay(w as usize, sources, &mut comparisons);
+            }
+            let t = tree.as_mut().expect("tree built above");
+            step = loop {
+                let w = t.winner();
+                if w == TREE_NONE {
+                    break None;
+                }
+                let wi = w as usize;
+                let Some(head) = sources[wi].head_key() else {
+                    // Winner has no head ⇒ every source is drained (a live
+                    // head always beats a drained one in `fight`).
+                    break None;
+                };
+                // Duplicate of the previously emitted key (a dup source that
+                // surfaced after the winner's deferred refight): drain it.
+                let is_dup = *last_emitted_set && {
+                    comparisons += 1;
+                    head <= last_emitted_buf.as_slice()
+                };
+                if is_dup {
+                    *tree_dup_drains += 1;
+                    ensure_head_pinned(
+                        &mut sources[wi],
+                        Some(last_emitted_buf.as_slice()),
+                        shared_error_slot,
+                        last_error,
+                        &mut comparisons,
+                    );
+                    t.replay(wi, sources, &mut comparisons);
+                    continue;
+                }
+                // New minimum: copy into the reused scratch (emit key + the
+                // dedup boundary for the dup-drain above).
+                last_emitted_buf.clear();
+                last_emitted_buf.extend_from_slice(head);
+                *last_emitted_set = true;
+                // Decision from the FIRST surfaced head — the comparator
+                // guarantees it encodes the linear Phase-B winner.
+                match sources[wi].head_info() {
+                    None => {
+                        // Memtable winner → Fallback. No pinned bytes needed
+                        // for the emit (key is in the scratch), so refight now.
+                        sources[wi].advance();
+                        ensure_head_pinned(
+                            &mut sources[wi],
+                            Some(last_emitted_buf.as_slice()),
+                            shared_error_slot,
+                            last_error,
+                            &mut comparisons,
+                        );
+                        t.replay(wi, sources, &mut comparisons);
+                        break Some(PinnedStep::Fallback);
+                    }
+                    Some((_, op, has_val)) => {
+                        let row = sources[wi].head_row_index();
+                        sources[wi].advance();
+                        match (op, has_val) {
+                            (OpType::Put, true) => {
+                                // Defer the winner's refight: `ensure` could
+                                // REPLENISH (dropping the pin) and the emit
+                                // still needs `rows[row]`'s bytes.
+                                *deferred_refight = Some(w);
+                                break Some(PinnedStep::Put { src: wi, row });
+                            }
+                            (OpType::Delete, _) | (OpType::SingleDelete, _) => {
+                                // Tombstone winner hides the key — skip.
+                                ensure_head_pinned(
+                                    &mut sources[wi],
+                                    Some(last_emitted_buf.as_slice()),
+                                    shared_error_slot,
+                                    last_error,
+                                    &mut comparisons,
+                                );
+                                t.replay(wi, sources, &mut comparisons);
+                                continue;
+                            }
+                            // Merge chain or corrupt Put (no payload).
+                            _ => {
+                                ensure_head_pinned(
+                                    &mut sources[wi],
+                                    Some(last_emitted_buf.as_slice()),
+                                    shared_error_slot,
+                                    last_error,
+                                    &mut comparisons,
+                                );
+                                t.replay(wi, sources, &mut comparisons);
+                                break Some(PinnedStep::Fallback);
+                            }
+                        }
+                    }
+                }
+            };
+        }
+        self.merge_comparisons += comparisons;
+        if step.is_some() {
+            self.rows_emitted += 1;
+        }
+        step
+    }
+
+    /// S2 stage-2 linear pinned merge (the `n < S2_TREE_MIN_SOURCES` branch).
+    fn next_step_pinned_linear(&mut self) -> Option<PinnedStep> {
+        let n = self.sources.len();
+        let mut comparisons = 0u64;
+        let step = loop {
+            // Phase A.1: ensure heads (replenish + dedup + error-as-drained).
+            {
+                let Self {
+                    sources,
+                    last_emitted_buf,
+                    last_emitted_set,
+                    shared_error_slot,
+                    last_error,
+                    ..
+                } = self;
+                let le = last_emitted_set.then(|| last_emitted_buf.as_slice());
+                for src in sources.iter_mut() {
+                    ensure_head_pinned(src, le, shared_error_slot, last_error, &mut comparisons);
+                }
+            }
+            // Phase A.2: lex-smallest head (immutable pass, no materialising).
+            let mut min_idx: Option<usize> = None;
+            for i in 0..n {
+                let Some(k) = self.sources[i].head_key() else {
+                    continue;
+                };
+                match min_idx {
+                    None => min_idx = Some(i),
+                    Some(m) => {
+                        comparisons += 1;
+                        if k < self.sources[m].head_key().expect("min head present") {
+                            min_idx = Some(i);
+                        }
+                    }
+                }
+            }
+            let Some(min_idx) = min_idx else {
+                break None;
+            };
+            // The winning key: copy-into the reused scratch (emit key AND the
+            // next step's dedup boundary; ~32-byte memcpy class, zero alloc).
+            {
+                let Self {
+                    sources,
+                    last_emitted_buf,
+                    ..
+                } = self;
+                let k = sources[min_idx].head_key().expect("min head present");
+                last_emitted_buf.clear();
+                last_emitted_buf.extend_from_slice(k);
+            }
+            self.last_emitted_set = true;
+
+            // Phase B: among all sources whose head == min, pick the winner
+            // (memtable presence → Fallback; else max-sequence SST) and
+            // advance EVERY source at min (cross-tier dedup). `advance` only
+            // bumps `pos` — the winner's bytes stay pinned for the emit.
+            let mut mem_present = false;
+            // (src, row, sequence, op_type, has_value) of the best SST head.
+            let mut best: Option<(usize, usize, u64, OpType, bool)> = None;
+            for i in 0..n {
+                let at_min = {
+                    let Self {
+                        sources,
+                        last_emitted_buf,
+                        ..
+                    } = self;
+                    match sources[i].head_key() {
+                        Some(k) => {
+                            comparisons += 1;
+                            k == last_emitted_buf.as_slice()
+                        }
+                        None => false,
+                    }
+                };
+                if !at_min {
+                    continue;
+                }
+                match self.sources[i].head_info() {
+                    None => mem_present = true,
+                    Some((seq, op, has_val)) => {
+                        let row = self.sources[i].head_row_index();
+                        if best.is_none_or(|(_, _, bseq, _, _)| seq > bseq) {
+                            best = Some((i, row, seq, op, has_val));
+                        }
+                    }
+                }
+                self.sources[i].advance();
+            }
+
+            // Phase C: decide — identical table to `next_with_value`.
+            if mem_present {
+                break Some(PinnedStep::Fallback);
+            }
+            break match best {
+                Some((src, row, _, OpType::Put, true)) => Some(PinnedStep::Put { src, row }),
+                // Corrupt SST Put (no payload): let get_internal raise it.
+                Some((_, _, _, OpType::Put, false)) => Some(PinnedStep::Fallback),
+                Some((_, _, _, OpType::Delete, _)) | Some((_, _, _, OpType::SingleDelete, _)) => {
+                    continue;
+                }
+                Some((_, _, _, OpType::Merge, _)) => Some(PinnedStep::Fallback),
+                // No head info though min came from a source — conservative.
+                None => Some(PinnedStep::Fallback),
+            };
+        };
+        self.merge_comparisons += comparisons;
+        if step.is_some() {
+            self.rows_emitted += 1;
+        }
+        step
     }
 
     /// R17-M1: install a shared error slot. When set, tier-peek errors are
@@ -11014,14 +12100,7 @@ impl LazyPrefixIter {
     /// the local `last_error`). Factored out so `next_with_value` surfaces
     /// errors through the identical channel without duplicating the block.
     fn record_peek_error(&mut self, e: ForstError) {
-        if let Some(slot) = self.shared_error_slot.as_ref() {
-            let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-            if guard.is_none() {
-                *guard = Some(e);
-            }
-        } else if self.last_error.is_none() {
-            self.last_error = Some(e);
-        }
+        record_peek_error_into(&self.shared_error_slot, &mut self.last_error, e);
     }
 
     /// FRS-VALUE-CARRYING-MERGE (2026-06-06): the k-way merge variant that
@@ -11149,6 +12228,212 @@ enum ValueDecision {
     Put(Arc<[u8]>),
     /// Resolve via `get_internal` (memtable tier, merge-chain, or corrupt Put).
     Fallback,
+}
+
+// ============================================================================
+// S2 (pinned-rows design §2.1 W1c, D1-locked): push-style emit boundary
+// ============================================================================
+
+/// S2 push-style row consumer for [`PrefixScanStream::fill_into`].
+///
+/// D1 (locked): push-style is THE emit boundary — the borrowed slices are
+/// valid ONLY for the duration of the `push` call (the borrow scope is
+/// syntactically enclosed; no escape possible), so the sink must copy what it
+/// keeps. The FFI sink memcpys straight into the chunk buffer — SST bytes →
+/// chunk stays exactly ONE copy, with zero intervening allocations or
+/// refcounts.
+///
+/// Returning `false` stops the fill AFTER this row (chunk full → the existing
+/// backpressure). The row has been DELIVERED either way: a sink that signals
+/// `false` without having written the row must stash it itself (the FFI sink
+/// copies it into reused pending buffers).
+pub trait RowSink {
+    /// Receives one `(key, value)` row. See the trait docs for the borrow
+    /// and `false`-return contracts.
+    fn push(&mut self, key: &[u8], value: &[u8]) -> bool;
+}
+
+/// S2: outcome of one [`PrefixScanStream::fill_into`] drive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillOutcome {
+    /// The sink reported full; more rows may remain.
+    SinkFull,
+    /// The scan is exhausted; no further rows will be produced.
+    Exhausted,
+}
+
+/// S2 (W1c): a prefix/range scan as a push-style stream over the lazy k-way
+/// tier merge — the zero-alloc emit boundary the FFI chunked iterator drives
+/// directly. Owns the value-resolution context (`get_internal` fallback for
+/// memtable winners / merge chains / corrupt Puts), so `fill_into` yields
+/// FINAL `(key, value)` rows with the exact visibility semantics of
+/// [`DbImpl::prefix_scan_iter_owned_arc_with_error_slot`].
+pub struct PrefixScanStream {
+    /// Captured engine (the stream outlives the originating FFI call).
+    db: Arc<DbImpl>,
+    /// Hoisted CF data (FRS-PREFIX-CFHOIST — no per-key CF re-resolution).
+    cf_data: Arc<ColumnFamilyData>,
+    /// The lazy k-way merge.
+    inner: LazyPrefixIter,
+}
+
+impl PrefixScanStream {
+    /// Drives the merge, pushing rows into `sink` until it reports full
+    /// (`Ok(SinkFull)`) or the scan completes (`Ok(Exhausted)`). Tier-peek
+    /// errors land in the shared error slot (errored source = drained, same
+    /// as the iterator path); fallback-resolution errors return `Err`.
+    pub fn fill_into(&mut self, sink: &mut dyn RowSink) -> ForstResult<FillOutcome> {
+        loop {
+            if self.inner.pinned {
+                let Some(step) = self.inner.next_step_pinned() else {
+                    return Ok(FillOutcome::Exhausted);
+                };
+                match step {
+                    PinnedStep::Put { src, row } => {
+                        // Zero-alloc emit: key from the reused scratch, value
+                        // from the still-pinned block (W1c borrow-soundness:
+                        // `advance` only bumped `pos`; the next replenish
+                        // cannot happen before this push returns).
+                        let inner = &self.inner;
+                        let value = inner.sources[src].pinned_row_value(row).ok_or_else(|| {
+                            ForstError::internal("S2: pinned Put winner lost its value")
+                        })?;
+                        if !sink.push(inner.last_emitted_buf.as_slice(), value) {
+                            return Ok(FillOutcome::SinkFull);
+                        }
+                    }
+                    PinnedStep::Fallback => {
+                        // Correctness path (memtable winner / merge chain /
+                        // corrupt Put): owned resolution, allocs allowed.
+                        let resolved = self.db.get_internal(
+                            &self.cf_data,
+                            self.inner.last_emitted_buf.as_slice(),
+                            u64::MAX,
+                        )?;
+                        match resolved {
+                            Some(value) => {
+                                if !sink.push(self.inner.last_emitted_buf.as_slice(), &value) {
+                                    return Ok(FillOutcome::SinkFull);
+                                }
+                            }
+                            // Hidden by an upper tier — skip.
+                            None => continue,
+                        }
+                    }
+                }
+            } else {
+                // Legacy-mode drive (compat/A-B harness; not the S2 perf
+                // path) — byte-identical decision procedure via the Arc merge.
+                let Some((key_arc, decision)) = self.inner.next_with_value() else {
+                    return Ok(FillOutcome::Exhausted);
+                };
+                match decision {
+                    ValueDecision::Put(v) => {
+                        if !sink.push(key_arc.as_ref(), v.as_ref()) {
+                            return Ok(FillOutcome::SinkFull);
+                        }
+                    }
+                    ValueDecision::Fallback => {
+                        match self
+                            .db
+                            .get_internal(&self.cf_data, key_arc.as_ref(), u64::MAX)?
+                        {
+                            Some(v) => {
+                                if !sink.push(key_arc.as_ref(), &v) {
+                                    return Ok(FillOutcome::SinkFull);
+                                }
+                            }
+                            None => continue,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// W3 diag counters: `(rows_emitted, merge_comparisons, mat_allocs)`.
+    pub fn diag_counters(&self) -> (u64, u64, u64) {
+        self.inner.diag_counters()
+    }
+
+    /// Installs (replaces) the shared tier-peek error slot — used by the FFI
+    /// batch open, whose per-probe slots are created on the pool worker AFTER
+    /// the engine-side build (errors only flow during `fill_into`, so a
+    /// post-build install observes every error).
+    pub fn set_shared_error_slot(&mut self, slot: Arc<Mutex<Option<ForstError>>>) {
+        self.inner.set_shared_error_slot(slot);
+    }
+
+    /// Diag: number of tier sources in this scan's merge.
+    pub fn debug_source_count(&self) -> usize {
+        self.inner.sources.len()
+    }
+}
+
+/// S2 compat shim (W1c): an `Arc`-pair iterator implemented OVER
+/// [`PrefixScanStream::fill_into`] for the in-process consumers (engine
+/// tests, `prefix_scan` collector, the q0-q22 byte-equiv harness) when the
+/// flag is ON. Materialises the two `Arc`s per row — the same pair the legacy
+/// replenish paid. Buffering is ADAPTIVE: the fill budget starts at 1 row
+/// (R-short probes pay no batching machinery — a fixed 64-row `VecDeque` cut
+/// measured +9% on `join_probe_open/ssts_1`) and doubles per refill up to 64
+/// (long drains amortise the per-`fill_into` dispatch — a strict one-row
+/// sink measured +20% on the 1000-row `hot_prefix_churn` drain). The FFI
+/// paths drive the chunk sink directly and never see this type.
+struct ArcPairAdapter {
+    stream: PrefixScanStream,
+    done: bool,
+    /// Reused row buffer (drained front-to-back via `pos`).
+    buf: std::collections::VecDeque<(Arc<[u8]>, Arc<[u8]>)>,
+    /// Rows requested from the next refill (1 → 2 → … → 64).
+    budget: usize,
+}
+
+/// Adaptive upper bound for [`ArcPairAdapter::budget`].
+const ADAPTER_MAX_BATCH_ROWS: usize = 64;
+
+/// Sink half of [`ArcPairAdapter`]: materialises up to `budget` rows.
+struct AdapterSink<'a> {
+    buf: &'a mut std::collections::VecDeque<(Arc<[u8]>, Arc<[u8]>)>,
+    budget: usize,
+}
+
+impl RowSink for AdapterSink<'_> {
+    fn push(&mut self, key: &[u8], value: &[u8]) -> bool {
+        self.buf
+            .push_back((Arc::<[u8]>::from(key), Arc::<[u8]>::from(value)));
+        self.budget -= 1;
+        self.budget > 0
+    }
+}
+
+impl Iterator for ArcPairAdapter {
+    type Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(row) = self.buf.pop_front() {
+                return Some(Ok(row));
+            }
+            if self.done {
+                return None;
+            }
+            let budget = self.budget;
+            self.budget = (self.budget * 2).min(ADAPTER_MAX_BATCH_ROWS);
+            let mut sink = AdapterSink {
+                buf: &mut self.buf,
+                budget,
+            };
+            match self.stream.fill_into(&mut sink) {
+                Ok(FillOutcome::SinkFull) => {}
+                Ok(FillOutcome::Exhausted) => self.done = true,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
 }
 
 impl Iterator for LazyPrefixIter {
@@ -16167,5 +17452,628 @@ mod tests {
             "expected Internal error past 56-bit sequence limit, got {:?}",
             err
         );
+    }
+
+    // =======================================================================
+    // S2 stage-2 gates (pinned replenish + sink emit, work-order §6.3)
+    // =======================================================================
+
+    /// A `RowSink` collecting owned rows (test helper).
+    struct S2Collect(Vec<(Vec<u8>, Vec<u8>)>);
+    impl RowSink for S2Collect {
+        fn push(&mut self, k: &[u8], v: &[u8]) -> bool {
+            self.0.push((k.to_vec(), v.to_vec()));
+            true
+        }
+    }
+
+    /// Builds the §6.3 multi-tier fixture on a merge-operator CF: L1 (two
+    /// flush waves + compact_l0), L0 (a third flushed wave), plus active
+    /// memtable rows; duplicate user keys across ALL tiers, tombstones
+    /// (incl. delete-then-rewrite), merge-op chains spanning tiers, and keys
+    /// outside the probed prefix.
+    fn s2_multi_tier_fixture() -> (Arc<DbImpl>, ColumnFamilyHandle) {
+        let db = open();
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("s2-fixture")
+                    .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma())),
+            )
+            .unwrap();
+        let key = |b: u32, i: u32| format!("p:{b:02}:{i:04}").into_bytes();
+
+        // Wave 1 + wave 2 → two L0 SSTs → compact to L1.
+        for wave in 0..2u32 {
+            for b in 0..4u32 {
+                for i in 0..40u32 {
+                    let k = key(b, i);
+                    match (i + wave) % 5 {
+                        0 => {
+                            db.merge(&cf, &k, format!("m{wave}-{i}").as_bytes()).unwrap();
+                        }
+                        1 => {
+                            db.delete(&cf, &k).unwrap();
+                        }
+                        _ => {
+                            db.put(&cf, &k, format!("w{wave}-{i}").as_bytes()).unwrap();
+                        }
+                    }
+                }
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        db.compact_l0(&cf).unwrap().expect("L0→L1 rollup");
+
+        // Wave 3 → one L0 SST overlapping L1 (dup keys, more deletes/merges).
+        for b in 0..4u32 {
+            for i in (0..40u32).step_by(2) {
+                let k = key(b, i);
+                match i % 7 {
+                    0 => {
+                        db.merge(&cf, &k, b"l0-merge").unwrap();
+                    }
+                    1 => {
+                        db.delete(&cf, &k).unwrap();
+                    }
+                    _ => {
+                        db.put(&cf, &k, format!("l0-{i}").as_bytes()).unwrap();
+                    }
+                }
+            }
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        // Memtable rows on top (dups of flushed keys + fresh keys).
+        for b in 0..4u32 {
+            for i in (0..48u32).step_by(3) {
+                let k = key(b, i);
+                if i % 9 == 0 {
+                    db.delete(&cf, &k).unwrap();
+                } else {
+                    db.put(&cf, &k, format!("mem-{i}").as_bytes()).unwrap();
+                }
+            }
+        }
+        // Rows outside the probed prefixes (filter coverage).
+        db.put(&cf, b"zz:tail", b"outside").unwrap();
+        db.put(&cf, b"a:head", b"outside").unwrap();
+        (db, cf)
+    }
+
+    /// Drains one prefix through `fill_into` in the requested mode.
+    fn s2_drain_prefix(
+        db: &Arc<DbImpl>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+        pinned: bool,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut stream = db
+            .prefix_scan_stream_with_mode(cf, prefix, Arc::new(Mutex::new(None)), pinned)
+            .unwrap();
+        let mut sink = S2Collect(Vec::new());
+        assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+        sink.0
+    }
+
+    /// §6.3 gate: flag-ON vs flag-OFF byte-equality over the multi-tier
+    /// fixture (memtable + L0 + L1, dups, tombstones, merge ops), for BOTH
+    /// the prefix and range paths, plus tiny-sink backpressure equivalence
+    /// and the Arc-pair compat adapter.
+    #[test]
+    fn s2_pinned_vs_legacy_byte_equality_multi_tier() {
+        let (db, cf) = s2_multi_tier_fixture();
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            let legacy = s2_drain_prefix(&db, &cf, &prefix, false);
+            let pinned = s2_drain_prefix(&db, &cf, &prefix, true);
+            assert!(!legacy.is_empty(), "fixture must yield rows for {b}");
+            assert_eq!(pinned, legacy, "prefix {b}: pinned != legacy");
+            // Cross-check against the reference collector API.
+            let reference = db.prefix_scan(&cf, &prefix).unwrap();
+            assert_eq!(pinned, reference, "prefix {b}: pinned != prefix_scan");
+            // Compat adapter (what in-process callers get when the flag is
+            // ON): identical row stream through the Iterator face.
+            let stream = db
+                .prefix_scan_stream_with_mode(&cf, &prefix, Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            let adapter = ArcPairAdapter {
+                stream,
+                done: false,
+                buf: std::collections::VecDeque::new(),
+                budget: 1,
+            };
+            let via_adapter: Vec<(Vec<u8>, Vec<u8>)> = adapter
+                .map(|r| {
+                    let (k, v) = r.unwrap();
+                    (k.as_ref().to_vec(), v.as_ref().to_vec())
+                })
+                .collect();
+            assert_eq!(via_adapter, legacy, "prefix {b}: adapter != legacy");
+        }
+
+        // Range path (engine timer-drain shape): full + bounded windows.
+        for (lo, hi) in [
+            (b"p:".as_ref(), None),
+            (b"p:01:".as_ref(), Some(b"p:02:0020".as_ref())),
+        ] {
+            let mk = |pinned: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
+                let mut stream = db
+                    .range_scan_stream_with_mode(&cf, lo, hi, Arc::new(Mutex::new(None)), pinned)
+                    .unwrap();
+                let mut sink = S2Collect(Vec::new());
+                assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+                sink.0
+            };
+            let legacy = mk(false);
+            let pinned = mk(true);
+            assert!(!legacy.is_empty());
+            assert_eq!(pinned, legacy, "range {lo:?}..{hi:?}: pinned != legacy");
+        }
+
+        // Sink backpressure: a full-after-every-row sink across many
+        // fill_into resumes must reassemble the exact same row sequence.
+        struct OneRow(Vec<(Vec<u8>, Vec<u8>)>);
+        impl RowSink for OneRow {
+            fn push(&mut self, k: &[u8], v: &[u8]) -> bool {
+                self.0.push((k.to_vec(), v.to_vec()));
+                false
+            }
+        }
+        let prefix = b"p:00:".to_vec();
+        let mut stream = db
+            .prefix_scan_stream_with_mode(&cf, &prefix, Arc::new(Mutex::new(None)), true)
+            .unwrap();
+        let mut sink = OneRow(Vec::new());
+        while let FillOutcome::SinkFull = stream.fill_into(&mut sink).unwrap() {}
+        assert_eq!(sink.0, s2_drain_prefix(&db, &cf, &prefix, false));
+    }
+
+    /// §6.3 / falsifier §4.1 gate: the W3 alloc counter reads 0 on the
+    /// SST-Put path flag-ON (a pinned `fill_into` drain over flushed-only
+    /// state performs ZERO emit/merge-path materialisations), while the
+    /// legacy path pays its 2-allocs-per-row pair.
+    #[test]
+    fn s2_alloc_counter_zero_on_pinned_put_path() {
+        let db = open();
+        let cf = db.default_cf();
+        for i in 0..200u32 {
+            db.put(
+                &cf,
+                format!("alloc:{i:04}").as_bytes(),
+                format!("value-{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        // Everything flushed: all winners are SST-resident Puts.
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        struct Count(u64);
+        impl RowSink for Count {
+            fn push(&mut self, _k: &[u8], _v: &[u8]) -> bool {
+                self.0 += 1;
+                true
+            }
+        }
+
+        // Pinned: zero materialisation allocs.
+        let mut stream = db
+            .prefix_scan_stream_with_mode(&cf, b"alloc:", Arc::new(Mutex::new(None)), true)
+            .unwrap();
+        let mut sink = Count(0);
+        assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+        assert_eq!(sink.0, 200, "pinned drain must yield every row");
+        let (rows, comps, allocs) = stream.diag_counters();
+        assert_eq!(rows, 200);
+        assert!(comps > 0, "comparison counter must be live (stage-3 gate)");
+        assert_eq!(
+            allocs, 0,
+            "S2 falsifier-1: pinned SST-Put drain must perform 0 allocs"
+        );
+
+        // Legacy: the per-row Arc::from pair is counted (>0).
+        let mut stream = db
+            .prefix_scan_stream_with_mode(&cf, b"alloc:", Arc::new(Mutex::new(None)), false)
+            .unwrap();
+        let mut sink = Count(0);
+        assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+        assert_eq!(sink.0, 200);
+        let (_, _, legacy_allocs) = stream.diag_counters();
+        assert_eq!(
+            legacy_allocs, 400,
+            "legacy replenish pays exactly key+value Arc::from per row"
+        );
+    }
+
+    /// §6.3 leak gate: dropping the stream mid-drain releases the pinned
+    /// `Arc<KvBlock>` (no pin outstanding past drop / FFI drop_inner, which
+    /// drops the stream the same way).
+    #[test]
+    fn s2_pin_released_on_mid_drain_drop() {
+        let db = open();
+        let cf = db.default_cf();
+        for i in 0..500u32 {
+            db.put(
+                &cf,
+                format!("leak:{i:04}").as_bytes(),
+                vec![0x5A; 64].as_slice(),
+            )
+            .unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        struct One(u64);
+        impl RowSink for One {
+            fn push(&mut self, _k: &[u8], _v: &[u8]) -> bool {
+                self.0 += 1;
+                false
+            }
+        }
+        let mut stream = db
+            .prefix_scan_stream_with_mode(&cf, b"leak:", Arc::new(Mutex::new(None)), true)
+            .unwrap();
+        let mut sink = One(0);
+        assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::SinkFull);
+        assert_eq!(sink.0, 1, "mid-drain: exactly one row emitted");
+
+        // Reach into the source and downgrade the pinned block's Arc.
+        let weak = stream
+            .inner
+            .sources
+            .iter()
+            .find_map(|s| match s {
+                TierKeySource::Sst {
+                    pinned: true, pbuf, ..
+                } => match pbuf.pin.as_ref() {
+                    Some(forst_rs_storage::sst::reader::DecodedBlock::Kv(arc)) => {
+                        Some(Arc::downgrade(arc))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a pinned v2 block must be held mid-drain");
+        let strong_before = weak.strong_count();
+        assert!(strong_before >= 1);
+        drop(stream);
+        assert_eq!(
+            weak.strong_count(),
+            strong_before - 1,
+            "dropping the stream must release exactly the pin's reference"
+        );
+    }
+
+    // =======================================================================
+    // S2 stage-3 gates (loser tree, work-order §6.4)
+    // =======================================================================
+
+    /// §6.4 G1: tree-vs-linear merge equivalence over randomized multi-tier
+    /// fixtures crossing the `S2_TREE_MIN_SOURCES` branch both ways —
+    /// same-key cross-tier with memtable presence, max-seq SST tie-breaks,
+    /// tombstones, merge-op fallback, dedup-past-last_emitted; verified
+    /// against the legacy (flag-OFF) merge AND the independent `prefix_scan`
+    /// collector, for prefix and range drains.
+    #[test]
+    fn s2_tree_vs_linear_randomized_equivalence() {
+        // rounds = flushed-SST count; +1 memtable tier on top. The keyspace
+        // is shared by EVERY round (join_probe shape: no SST prunable).
+        for &rounds in &[1usize, 3, 4, 6, 16, 48] {
+            let db = open();
+            let cf = db
+                .create_column_family(
+                    ColumnFamilyDescriptor::new(format!("s2-tree-{rounds}"))
+                        .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma())),
+                )
+                .unwrap();
+            let mut lcg: u64 = 0xDEAD_BEEF ^ (rounds as u64).wrapping_mul(0x9E37_79B9);
+            let mut next = move || {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                lcg >> 33
+            };
+            let key = |b: u64, i: u64| format!("t:{b:02}:{i:03}").into_bytes();
+            for _round in 0..rounds {
+                for b in 0..3u64 {
+                    for i in 0..24u64 {
+                        if next() % 3 == 0 {
+                            continue; // not every key in every SST
+                        }
+                        let k = key(b, i);
+                        match next() % 6 {
+                            0 => {
+                                db.delete(&cf, &k).unwrap();
+                            }
+                            1 => {
+                                db.merge(&cf, &k, format!("m{}", next() % 100).as_bytes())
+                                    .unwrap();
+                            }
+                            _ => {
+                                db.put(&cf, &k, format!("v{}", next() % 1000).as_bytes())
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+                db.switch_and_flush(&cf).unwrap().unwrap();
+            }
+            // Memtable tier on top (unflushed dups + tombstones).
+            for b in 0..3u64 {
+                for i in (0..24u64).step_by(2) {
+                    let k = key(b, i);
+                    if next() % 4 == 0 {
+                        db.delete(&cf, &k).unwrap();
+                    } else {
+                        db.put(&cf, &k, format!("mem{}", next() % 100).as_bytes())
+                            .unwrap();
+                    }
+                }
+            }
+
+            for b in 0..3u64 {
+                let prefix = format!("t:{b:02}:").into_bytes();
+                let legacy = s2_drain_prefix(&db, &cf, &prefix, false);
+                let pinned = s2_drain_prefix(&db, &cf, &prefix, true);
+                assert_eq!(
+                    pinned, legacy,
+                    "rounds={rounds} bucket={b}: tree/linear-pinned != legacy"
+                );
+                let reference = db.prefix_scan(&cf, &prefix).unwrap();
+                assert_eq!(
+                    pinned, reference,
+                    "rounds={rounds} bucket={b}: pinned != prefix_scan"
+                );
+            }
+            // Range window crossing buckets.
+            let mk = |pinned: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
+                let mut stream = db
+                    .range_scan_stream_with_mode(
+                        &cf,
+                        b"t:00:010",
+                        Some(b"t:02:015"),
+                        Arc::new(Mutex::new(None)),
+                        pinned,
+                    )
+                    .unwrap();
+                let mut sink = S2Collect(Vec::new());
+                assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+                sink.0
+            };
+            assert_eq!(mk(true), mk(false), "rounds={rounds}: range drain differs");
+
+            // Branch-crossing sanity: the tree must actually engage for the
+            // deep fixtures and stay off for the shallow ones.
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, b"t:00:", Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            let mut sink = S2Collect(Vec::new());
+            let _ = stream.fill_into(&mut sink).unwrap();
+            let n_sources = stream.inner.sources.len();
+            // Tree engaged for n>=5 (possibly later ABANDONED by the dup
+            // guard — these random fixtures are dup-heavy); never for n<5.
+            assert_eq!(
+                stream.inner.tree.is_some() || stream.inner.tree_abandoned,
+                n_sources >= S2_TREE_MIN_SOURCES,
+                "rounds={rounds}: tree engagement must follow the n>=5 branch (n={n_sources})"
+            );
+        }
+    }
+
+    /// §6.4 gate: the W3 comparison counter shows the `(1+dups)·log₂ n` vs
+    /// `2n + dup·n` drop on a 64-source fixture — mechanical confirmation
+    /// the tree is engaged and doing the predicted work.
+    #[test]
+    fn s2_tree_comparison_counter_log2_drop() {
+        let db = open();
+        let cf = db.default_cf();
+        // 64 overlapping SSTs in the join_probe / q20 interval-join shape:
+        // every SST spans the probed prefix range (the locator cannot
+        // prune), but each contributes DISTINCT user keys (state rows are
+        // [join-key][entry-id], entry-id unique per round) — the fan-out
+        // regime the §6.1 ssts_64/128 cells measure and the one where
+        // O(sources)-twice vs log₂ separates.
+        for round in 0..64u32 {
+            for k in 0..48u32 {
+                db.put(
+                    &cf,
+                    format!("c:{k:03}:{round:02}").as_bytes(),
+                    format!("r{round}").as_bytes(),
+                )
+                .unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+
+        let drain = |force_linear: bool| -> (u64, u64, usize) {
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, b"c:", Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            stream.inner.tree_disabled = force_linear;
+            let mut sink = S2Collect(Vec::new());
+            assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+            let (rows, comps, _) = stream.diag_counters();
+            (rows, comps, sink.0.len())
+        };
+
+        let (rows_lin, comps_lin, n_lin) = drain(true);
+        let (rows_tree, comps_tree, n_tree) = drain(false);
+        assert_eq!(n_lin, 48 * 64);
+        assert_eq!(n_tree, 48 * 64);
+        assert_eq!(rows_lin, rows_tree);
+        assert!(
+            comps_tree * 3 <= comps_lin,
+            "tree must cut comparisons by >=3x on 64 sources: tree={comps_tree} linear={comps_lin}"
+        );
+        println!(
+            "s2 comparison counters @64 sources (distinct-keys join shape): \
+             linear={comps_lin} tree={comps_tree} ratio={:.1}x \
+             (model: 2n+dup*n vs (1+dups)*log2 n)",
+            comps_lin as f64 / comps_tree as f64
+        );
+        // KNOWN CHARACTERISTIC (recorded, not gated): in the OPPOSITE
+        // extreme — every source holding EVERY key (dups = n-1 per emitted
+        // key) — the tree pays log₂ n per dup-drain while the linear pass
+        // amortises dups into its O(n) scan, so the comparison count
+        // inverts (~3x more). That shape is bounded by per-key VERSION
+        // fan-out (not SST fan-out) and the ADAPTIVE dup guard abandons the
+        // tree there (see s2_tree_abandons_on_dup_dominated_churn).
+    }
+
+    /// S2-3 adaptive guard: a dup-dominated churn merge (every source holds
+    /// every key — the hot_prefix_churn / TopN-rewrite shape, measured
+    /// +14.5% tree-vs-linear) must abandon the tree mid-scan AND stay
+    /// byte-identical to the legacy merge.
+    #[test]
+    fn s2_tree_abandons_on_dup_dominated_churn() {
+        let db = open();
+        let cf = db.default_cf();
+        // Churn: 16 rounds of delete+rewrite over the same 64 keys → every
+        // SST holds every key (dups/key = #sources).
+        for r in 0..16u32 {
+            for i in 0..64u32 {
+                let k = format!("ch:{i:04}");
+                if r > 0 {
+                    db.delete(&cf, k.as_bytes()).unwrap();
+                }
+                db.put(&cf, k.as_bytes(), format!("v{r}").as_bytes())
+                    .unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        let pinned = s2_drain_prefix(&db, &cf, b"ch:", true);
+        let legacy = s2_drain_prefix(&db, &cf, b"ch:", false);
+        assert_eq!(pinned.len(), 64);
+        assert_eq!(pinned, legacy, "churn: pinned != legacy");
+        // Re-drain holding the stream to inspect the abandon flag.
+        let mut stream = db
+            .prefix_scan_stream_with_mode(&cf, b"ch:", Arc::new(Mutex::new(None)), true)
+            .unwrap();
+        let mut sink = S2Collect(Vec::new());
+        assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+        assert_eq!(sink.0, legacy);
+        if stream.inner.sources.len() >= S2_TREE_MIN_SOURCES {
+            assert!(
+                stream.inner.tree_abandoned,
+                "dup-dominated merge must abandon the tree (n={})",
+                stream.inner.sources.len()
+            );
+        }
+    }
+
+    /// §6.4 G1: a source erroring MID-STREAM (corrupt data block) is treated
+    /// as drained with the error recorded sticky-first — identical surviving
+    /// rows in legacy, pinned-linear and pinned-tree modes.
+    #[test]
+    fn s2_source_error_mid_stream_treated_as_drained() {
+        use forst_rs_io::filesystem::RandomAccessFile;
+        use forst_rs_storage::sst::writer::{SstWriterImpl, SstWriterOptions};
+        use forst_rs_storage::sst::{BLOCK_HEADER_SIZE, FILE_HEADER_SIZE};
+
+        struct MemFile(Arc<Vec<u8>>);
+        impl RandomAccessFile for MemFile {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
+                let start = offset as usize;
+                if start >= self.0.len() {
+                    return Ok(0);
+                }
+                let end = std::cmp::min(start + buf.len(), self.0.len());
+                buf[..end - start].copy_from_slice(&self.0[start..end]);
+                Ok(end - start)
+            }
+            fn file_size(&self) -> ForstResult<u64> {
+                Ok(self.0.len() as u64)
+            }
+        }
+
+        let build_sst = |tag: &str, corrupt: bool| -> Arc<forst_rs_storage::sst::SstReaderImpl> {
+            let mut w = SstWriterImpl::with_options(SstWriterOptions {
+                block_size: 1024,
+                compression: forst_rs_common::CompressionType::None,
+                cf_id: forst_rs_common::DEFAULT_CF_ID,
+            });
+            for i in 0..200u32 {
+                w.add(
+                    format!("e:{tag}:{i:04}").as_bytes(),
+                    Some(format!("v{i}").as_bytes()),
+                    u64::from(i) + 1,
+                    1,
+                )
+                .unwrap();
+            }
+            let (mut data, _) = w.finish().unwrap();
+            if corrupt {
+                // Flip a byte INSIDE the first data block's payload — the
+                // checksum gate rejects it at first read (mid-stream error;
+                // open() only decodes footer/index/bloom, which stay intact).
+                data[FILE_HEADER_SIZE + BLOCK_HEADER_SIZE + 8] ^= 0xFF;
+            }
+            Arc::new(
+                forst_rs_storage::sst::SstReaderImpl::open(Box::new(MemFile(Arc::new(data))))
+                    .unwrap(),
+            )
+        };
+
+        // 6 sources (>= S2_TREE_MIN_SOURCES so the tree engages): source "bb"
+        // is corrupt; the others must survive. Distinct key namespaces per
+        // source make the expected row set exact.
+        let tags = ["aa", "bb", "cc", "dd", "ee", "ff"];
+        let make_sources = |pinned: bool| -> Vec<TierKeySource> {
+            tags.iter()
+                .map(|t| TierKeySource::Sst {
+                    fetcher: forst_rs_storage::sst::prefetch::BlockPrefetcher::new(
+                        build_sst(t, *t == "bb"),
+                        0,
+                        None,
+                    ),
+                    lower: Vec::new(),
+                    upper: None,
+                    buffered: Vec::new(),
+                    pos: 0,
+                    pinned,
+                    pbuf: Box::new(SstBlockBuf::default()),
+                    mat_allocs: std::cell::Cell::new(0),
+                })
+                .collect()
+        };
+
+        let expected_keys: Vec<Vec<u8>> = {
+            let mut v: Vec<Vec<u8>> = tags
+                .iter()
+                .filter(|t| **t != "bb")
+                .flat_map(|t| (0..200u32).map(move |i| format!("e:{t}:{i:04}").into_bytes()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        // Pinned (tree engaged at n=6) and pinned-linear-forced.
+        for force_linear in [false, true] {
+            let mut iter = LazyPrefixIter::new(make_sources(true), true).unwrap();
+            iter.tree_disabled = force_linear;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            while let Some(step) = iter.next_step_pinned() {
+                match step {
+                    PinnedStep::Put { .. } | PinnedStep::Fallback => {
+                        keys.push(iter.last_emitted_buf.clone());
+                    }
+                }
+            }
+            assert_eq!(
+                keys, expected_keys,
+                "force_linear={force_linear}: surviving rows wrong"
+            );
+            assert!(
+                iter.take_last_error().is_some(),
+                "force_linear={force_linear}: corrupt source must record an error"
+            );
+        }
+
+        // Legacy reference: identical surviving keys + recorded error.
+        let mut iter = LazyPrefixIter::new(make_sources(false), false).unwrap();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        while let Some((k, _decision)) = iter.next_with_value() {
+            keys.push(k.as_ref().to_vec());
+        }
+        assert_eq!(keys, expected_keys, "legacy: surviving rows wrong");
+        assert!(iter.take_last_error().is_some());
     }
 }

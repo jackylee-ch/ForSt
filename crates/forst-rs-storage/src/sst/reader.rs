@@ -36,7 +36,7 @@ use crate::cache::{BlockCache, CacheEntry, CacheKey, CachePriority};
 use super::bloom_filter::Sbbf;
 use super::data_block::decode_data_block_zerocopy;
 use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
-use super::kv_block::KvBlock;
+use super::kv_block::{KvBlock, RowRanges, SliceRef};
 use super::schema::{
     BLOCK_TYPE_DATA, BLOCK_TYPE_DATA_KV, FILE_HEADER_SIZE, PREFIX_BLOOM_LEN, SST_MAGIC,
 };
@@ -64,6 +64,67 @@ impl DecodedBlock {
         match self {
             DecodedBlock::Arrow(batch) => for_each_row_in_batch(batch, cb),
             DecodedBlock::Kv(kv) => kv.for_each_row(cb),
+        }
+    }
+
+    /// S2-1: range-exposing twin of [`Self::for_each_row`] — yields each row
+    /// as offsets ([`RowRanges`]) instead of borrowed slices, so the caller
+    /// can capture row positions and resolve the bytes later against this
+    /// (pinned) block plus the caller-owned `arena`.
+    ///
+    /// Format split (D2, locked): v2 KV blocks append every reconstructed key
+    /// into `arena` ([`SliceRef::Arena`]) and reference values in the payload
+    /// ([`SliceRef::Block`]); v1 Arrow blocks reference BOTH key and value in
+    /// the batch's stable `BinaryArray` buffers (`Block` refs; `arena` is
+    /// passed through untouched). Resolve `Block` refs against
+    /// [`Self::key_value_buffers`].
+    pub fn for_each_row_ranges<F>(&self, arena: &mut Vec<u8>, mut cb: F) -> ForstResult<()>
+    where
+        F: FnMut(&[u8], RowRanges) -> ForstResult<()>,
+    {
+        match self {
+            DecodedBlock::Arrow(batch) => {
+                for_each_row_ranges_in_batch(batch, |row| cb(arena.as_slice(), row))
+            }
+            DecodedBlock::Kv(kv) => kv.for_each_row_ranges(arena, cb),
+        }
+    }
+
+    /// S2-3: seek-aware, early-stopping twin of [`Self::for_each_row_ranges`]
+    /// — yields only rows with key `>= lower`; the callback returns
+    /// `Ok(false)` to stop the walk (upper-bound early termination). See
+    /// `KvBlock::for_each_row_ranges_from` for the rationale (bounds the
+    /// per-block walk to the probed window instead of the whole block).
+    pub fn for_each_row_ranges_from<F>(
+        &self,
+        lower: &[u8],
+        arena: &mut Vec<u8>,
+        mut cb: F,
+    ) -> ForstResult<()>
+    where
+        F: FnMut(&[u8], RowRanges) -> ForstResult<bool>,
+    {
+        match self {
+            DecodedBlock::Arrow(batch) => {
+                for_each_row_ranges_in_batch_from(batch, lower, |row| cb(arena.as_slice(), row))
+            }
+            DecodedBlock::Kv(kv) => kv.for_each_row_ranges_from(lower, arena, cb),
+        }
+    }
+
+    /// S2-1: the stable `(key_buffer, value_buffer)` pair that
+    /// [`SliceRef::Block`] refs from [`Self::for_each_row_ranges`] resolve
+    /// against — `key` field refs index the first slice, `value` field refs
+    /// the second. For v2 KV blocks both are the decompressed payload; for v1
+    /// Arrow blocks they are the key/value columns' `BinaryArray` values
+    /// buffers. Stable for this block's lifetime.
+    pub fn key_value_buffers(&self) -> ForstResult<(&[u8], &[u8])> {
+        match self {
+            DecodedBlock::Arrow(batch) => batch_key_value_data(batch),
+            DecodedBlock::Kv(kv) => {
+                let p = kv.payload_bytes();
+                Ok((p, p))
+            }
         }
     }
 }
@@ -1132,6 +1193,159 @@ where
     Ok(())
 }
 
+/// S2-1: the stable `(key_buffer, value_buffer)` backing pair of a v1 Arrow
+/// SST data-block batch — the key column's and value column's `BinaryArray`
+/// values buffers. [`SliceRef::Block`] ranges produced by
+/// [`for_each_row_ranges_in_batch`] index these buffers (key refs → first,
+/// value refs → second). Kept here so the BinaryArray offset math lives in
+/// exactly one place (work-order §6.2).
+pub fn batch_key_value_data(batch: &RecordBatch) -> ForstResult<(&[u8], &[u8])> {
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
+    let values = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
+    Ok((keys.value_data(), values.value_data()))
+}
+
+/// S2-1: range-exposing twin of [`for_each_row_in_batch`] for v1 Arrow
+/// blocks. Yields each row's key/value as [`SliceRef::Block`] ranges into the
+/// respective `BinaryArray` values buffers (see [`batch_key_value_data`]) —
+/// Arrow key bytes are stable in the batch buffers, so no arena is needed
+/// (D2: the arena is a v2-only requirement).
+pub fn for_each_row_ranges_in_batch<F>(batch: &RecordBatch, mut cb: F) -> ForstResult<()>
+where
+    F: FnMut(RowRanges) -> ForstResult<()>,
+{
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
+    let values = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
+    let sequences = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
+    let op_types = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
+
+    // `value_offsets()` are absolute indices into `value_data()` (arrow keeps
+    // offsets un-rebased for sliced arrays), so the ranges below pair exactly
+    // with the buffers `batch_key_value_data` hands out.
+    let key_offsets = keys.value_offsets();
+    let value_offsets = values.value_offsets();
+    for row in 0..batch.num_rows() {
+        let ks = key_offsets[row] as usize;
+        let ke = key_offsets[row + 1] as usize;
+        let value = if values.is_null(row) {
+            None
+        } else {
+            let vs = value_offsets[row] as usize;
+            let ve = value_offsets[row + 1] as usize;
+            Some(SliceRef::block(vs, ve - vs)?)
+        };
+        let op_byte = op_types.value(row);
+        let op_type = OpType::from_u8(op_byte).ok_or_else(|| {
+            ForstError::corruption(format!("invalid op_type in SST batch: {}", op_byte))
+        })?;
+        cb(RowRanges {
+            key: SliceRef::block(ks, ke - ks)?,
+            value,
+            sequence: sequences.value(row),
+            op_type,
+        })?;
+    }
+    Ok(())
+}
+
+/// S2-3: seek-aware, early-stopping ranges twin for v1 Arrow blocks —
+/// binary-searches the first row with key `>= lower` (keys are sorted ASC),
+/// then yields rows until exhaustion or the callback returns `Ok(false)`.
+pub fn for_each_row_ranges_in_batch_from<F>(
+    batch: &RecordBatch,
+    lower: &[u8],
+    mut cb: F,
+) -> ForstResult<()>
+where
+    F: FnMut(RowRanges) -> ForstResult<bool>,
+{
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
+    let values = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
+    let sequences = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
+    let op_types = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
+
+    // Lower-bound binary search: first row with key >= lower.
+    let num_rows = batch.num_rows();
+    let mut lo = 0usize;
+    let mut hi = num_rows;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if keys.value(mid) < lower {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let key_offsets = keys.value_offsets();
+    let value_offsets = values.value_offsets();
+    for row in lo..num_rows {
+        let ks = key_offsets[row] as usize;
+        let ke = key_offsets[row + 1] as usize;
+        let value = if values.is_null(row) {
+            None
+        } else {
+            let vs = value_offsets[row] as usize;
+            let ve = value_offsets[row + 1] as usize;
+            Some(SliceRef::block(vs, ve - vs)?)
+        };
+        let op_byte = op_types.value(row);
+        let op_type = OpType::from_u8(op_byte).ok_or_else(|| {
+            ForstError::corruption(format!("invalid op_type in SST batch: {}", op_byte))
+        })?;
+        let keep_going = cb(RowRanges {
+            key: SliceRef::block(ks, ke - ks)?,
+            value,
+            sequence: sequences.value(row),
+            op_type,
+        })?;
+        if !keep_going {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// FRS-ZERO-COPY-MERGE (2026-06-05): a pull cursor over an ENTIRE SST file,
 /// yielding every row (all versions) in on-disk `(key ASC, seq DESC)` order by
 /// reference. This is the per-input iterator for the streaming k-way compaction
@@ -1948,5 +2162,225 @@ mod tests {
             .unwrap();
         assert_eq!(borrowed_count, owned.len());
         assert_eq!(borrowed_count, 100);
+    }
+
+    // =======================================================================
+    // S2-1 G1: v1 ranges twin vs for_each_row_in_batch byte-equality
+    // =======================================================================
+
+    /// Builds an SST-schema batch with shared prefixes, duplicate user keys
+    /// (multi-version), tombstones, empty-present values and merge ops.
+    fn s2_v1_test_batch() -> RecordBatch {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        let mut vals: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut seqs: Vec<u64> = Vec::new();
+        let mut ops: Vec<u8> = Vec::new();
+        for i in 0..60u64 {
+            let key = format!("user:{:04}", i / 2).into_bytes(); // dup keys
+            let (val, op): (Option<Vec<u8>>, u8) = match i % 5 {
+                0 => (None, 0),                                      // Delete
+                1 => (Some(Vec::new()), 1),                          // empty Put
+                2 => (Some(format!("merge-{i}").into_bytes()), 2),   // Merge
+                _ => (Some(format!("value-{i}-xx").into_bytes()), 1) // Put
+            };
+            keys.push(key);
+            vals.push(val);
+            seqs.push(1000 - i);
+            ops.push(op);
+        }
+        RecordBatch::try_new(
+            Arc::new(sst_schema()),
+            vec![
+                Arc::new(BinaryArray::from_iter_values(keys.iter())),
+                Arc::new(BinaryArray::from_iter(
+                    vals.iter().map(|v| v.as_deref()),
+                )),
+                Arc::new(UInt64Array::from(seqs)),
+                Arc::new(UInt8Array::from(ops)),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// D2 post-walk assertion: capture ALL ranges first, resolve only after
+    /// the walk completes, then compare byte-for-byte with `for_each_row`.
+    #[test]
+    fn s2_ranges_twin_matches_for_each_row_in_batch_v1() {
+        let batch = s2_v1_test_batch();
+
+        let mut want: Vec<SstScanRow> = Vec::new();
+        for_each_row_in_batch(&batch, |v| {
+            want.push((
+                v.key.to_vec(),
+                v.value.map(|b| b.to_vec()),
+                v.sequence,
+                v.op_type,
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert!(!want.is_empty());
+
+        let mut metas: Vec<RowRanges> = Vec::new();
+        for_each_row_ranges_in_batch(&batch, |row| {
+            // v1: BOTH key and value must be Block refs (arena unused, D2).
+            assert!(matches!(row.key, SliceRef::Block { .. }));
+            if let Some(v) = row.value {
+                assert!(matches!(v, SliceRef::Block { .. }));
+            }
+            metas.push(row);
+            Ok(())
+        })
+        .unwrap();
+
+        let (key_buf, val_buf) = batch_key_value_data(&batch).unwrap();
+        let got: Vec<_> = metas
+            .iter()
+            .map(|m| {
+                (
+                    m.key.resolve(&[], key_buf).to_vec(),
+                    m.value.map(|v| v.resolve(&[], val_buf).to_vec()),
+                    m.sequence,
+                    m.op_type,
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// S2-3 G1: the v1 seek-aware twin yields exactly the `key >= lower`
+    /// suffix of the full walk, and the stop-callback truncates it.
+    #[test]
+    fn s2_ranges_from_twin_matches_filtered_full_walk_v1() {
+        let batch = s2_v1_test_batch();
+        let (key_buf, val_buf) = batch_key_value_data(&batch).unwrap();
+        let mut all: Vec<SstScanRow> = Vec::new();
+        for_each_row_in_batch(&batch, |v| {
+            all.push((
+                v.key.to_vec(),
+                v.value.map(|b| b.to_vec()),
+                v.sequence,
+                v.op_type,
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        for lower in [
+            b"".as_ref(),
+            b"user:0005".as_ref(),
+            b"user:0005x".as_ref(),
+            b"zzzz".as_ref(),
+        ] {
+            let want: Vec<SstScanRow> = all
+                .iter()
+                .filter(|r| r.0.as_slice() >= lower)
+                .cloned()
+                .collect();
+            let mut metas: Vec<RowRanges> = Vec::new();
+            for_each_row_ranges_in_batch_from(&batch, lower, |row| {
+                metas.push(row);
+                Ok(true)
+            })
+            .unwrap();
+            let got: Vec<SstScanRow> = metas
+                .iter()
+                .map(|m| {
+                    (
+                        m.key.resolve(&[], key_buf).to_vec(),
+                        m.value.map(|v| v.resolve(&[], val_buf).to_vec()),
+                        m.sequence,
+                        m.op_type,
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "lower={lower:?}");
+
+            // Stop truncation.
+            if want.len() > 1 {
+                let stop_after = want.len() / 2;
+                let mut n = 0usize;
+                for_each_row_ranges_in_batch_from(&batch, lower, |_row| {
+                    n += 1;
+                    Ok(n < stop_after)
+                })
+                .unwrap();
+                assert_eq!(n, stop_after);
+            }
+        }
+    }
+
+    /// `DecodedBlock` dispatch: the Arrow arm must leave the caller's arena
+    /// untouched (v1 keys are batch-stable), and `key_value_buffers` must
+    /// hand out the buffers the Block refs resolve against — for BOTH block
+    /// formats, byte-equal to `for_each_row`.
+    #[test]
+    fn s2_decoded_block_ranges_dispatch_both_formats() {
+        // v1 Arrow arm.
+        let block = DecodedBlock::Arrow(s2_v1_test_batch());
+        let mut arena = b"CALLER-OWNED".to_vec();
+        let arena_before = arena.clone();
+        let mut metas: Vec<RowRanges> = Vec::new();
+        block
+            .for_each_row_ranges(&mut arena, |_, row| {
+                metas.push(row);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(arena, arena_before, "v1 walk must not touch the arena");
+        let mut want: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        block
+            .for_each_row(|v| {
+                want.push((v.key.to_vec(), v.value.map(|b| b.to_vec())));
+                Ok(())
+            })
+            .unwrap();
+        let (kb, vb) = block.key_value_buffers().unwrap();
+        let got: Vec<_> = metas
+            .iter()
+            .map(|m| {
+                (
+                    m.key.resolve(&arena, kb).to_vec(),
+                    m.value.map(|v| v.resolve(&arena, vb).to_vec()),
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
+
+        // v2 KV arm (via the kv encoder; keys land in the arena APPENDED
+        // after the pre-seed).
+        let kv_bytes = crate::sst::kv_block::encode_kv_data_block(
+            &s2_v1_test_batch(),
+            CompressionType::Lz4,
+        )
+        .unwrap();
+        let kv = crate::sst::kv_block::KvBlock::decode(&kv_bytes, true).unwrap();
+        let block = DecodedBlock::Kv(Arc::new(kv));
+        let mut arena = b"PRESEED".to_vec();
+        let mut metas: Vec<RowRanges> = Vec::new();
+        block
+            .for_each_row_ranges(&mut arena, |_, row| {
+                metas.push(row);
+                Ok(())
+            })
+            .unwrap();
+        let mut want: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        block
+            .for_each_row(|v| {
+                want.push((v.key.to_vec(), v.value.map(|b| b.to_vec())));
+                Ok(())
+            })
+            .unwrap();
+        let (kb, vb) = block.key_value_buffers().unwrap();
+        let got: Vec<_> = metas
+            .iter()
+            .map(|m| {
+                (
+                    m.key.resolve(&arena, kb).to_vec(),
+                    m.value.map(|v| v.resolve(&arena, vb).to_vec()),
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
     }
 }

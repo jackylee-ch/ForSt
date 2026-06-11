@@ -93,6 +93,107 @@ pub fn sst_write_kv_format() -> bool {
     })
 }
 
+/// S2-1 (pinned-rows design §2.1 W1a): a borrowed-bytes *reference* to a row
+/// field, expressed as an `(offset, len)` range into one of two stable backing
+/// stores instead of a borrowed slice — so callers can capture row positions
+/// during a block walk and resolve the bytes LATER, while the block (and the
+/// caller-owned key arena) stay alive.
+///
+/// Resolution contract (D2, locked):
+/// * `Arena` — indexes the caller-owned `key_arena` passed to
+///   [`KvBlock::for_each_row_ranges`]. v2 KV-block KEYS are always `Arena`
+///   refs: prefix-compressed keys are reconstructed by appending into the
+///   arena exactly once (the same byte copy `for_each_row`'s scratch pays),
+///   because the block payload does NOT contain contiguous full keys.
+/// * `Block` — indexes a stable backing buffer owned by the decoded block:
+///   the [`KvBlock`] decompressed payload ([`KvBlock::payload_bytes`]) for v2
+///   values, or the respective Arrow `BinaryArray` values buffer for v1 keys
+///   AND values (`batch_key_value_data` in `reader.rs`). Whether a `Block`
+///   ref means "key buffer" or "value buffer" is positional: the `key` field
+///   resolves against the key buffer, the `value` field against the value
+///   buffer (for v2 both are the payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceRef {
+    /// Range into the caller-owned key arena.
+    Arena {
+        /// Byte offset into the arena.
+        offset: u32,
+        /// Length in bytes.
+        len: u32,
+    },
+    /// Range into the decoded block's stable backing buffer.
+    Block {
+        /// Byte offset into the block buffer.
+        offset: u32,
+        /// Length in bytes.
+        len: u32,
+    },
+}
+
+impl SliceRef {
+    /// Checked constructor for an `Arena` ref (u32 framing guard).
+    pub fn arena(offset: usize, len: usize) -> ForstResult<Self> {
+        Ok(SliceRef::Arena {
+            offset: u32::try_from(offset)
+                .map_err(|_| ForstError::corruption("SliceRef arena offset exceeds u32"))?,
+            len: u32::try_from(len)
+                .map_err(|_| ForstError::corruption("SliceRef arena len exceeds u32"))?,
+        })
+    }
+
+    /// Checked constructor for a `Block` ref (u32 framing guard).
+    pub fn block(offset: usize, len: usize) -> ForstResult<Self> {
+        Ok(SliceRef::Block {
+            offset: u32::try_from(offset)
+                .map_err(|_| ForstError::corruption("SliceRef block offset exceeds u32"))?,
+            len: u32::try_from(len)
+                .map_err(|_| ForstError::corruption("SliceRef block len exceeds u32"))?,
+        })
+    }
+
+    /// Length in bytes of the referenced slice.
+    pub fn len(&self) -> usize {
+        match self {
+            SliceRef::Arena { len, .. } | SliceRef::Block { len, .. } => *len as usize,
+        }
+    }
+
+    /// Whether the referenced slice is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Resolves the reference against the two backing stores. `arena` is the
+    /// caller-owned key arena; `block` is the stable block buffer appropriate
+    /// for the FIELD this ref came from (see the type docs). Offsets are
+    /// produced by the visitors in this crate over bounds-checked entry
+    /// parses, so out-of-range here is an internal logic error (panics).
+    pub fn resolve<'a>(&self, arena: &'a [u8], block: &'a [u8]) -> &'a [u8] {
+        match *self {
+            SliceRef::Arena { offset, len } => &arena[offset as usize..(offset + len) as usize],
+            SliceRef::Block { offset, len } => &block[offset as usize..(offset + len) as usize],
+        }
+    }
+}
+
+/// S2-1: one row yielded by the range-exposing visitors
+/// ([`KvBlock::for_each_row_ranges`] / `for_each_row_ranges_in_batch`) — the
+/// offsets-only counterpart of [`RowView`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowRanges {
+    /// The full user key (v2: `Arena` ref into the caller's key arena;
+    /// v1: `Block` ref into the key column's values buffer).
+    pub key: SliceRef,
+    /// The value (`Block` ref), or `None` for a tombstone. An empty-but-
+    /// present value yields `Some` with `len == 0` (never collapses to
+    /// `None`).
+    pub value: Option<SliceRef>,
+    /// Sequence number.
+    pub sequence: u64,
+    /// Operation type.
+    pub op_type: OpType,
+}
+
 /// Length of the longest common byte prefix of `a` and `b`.
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let max = a.len().min(b.len());
@@ -368,6 +469,71 @@ impl KvBlock {
         self.payload.len()
     }
 
+    /// S2-1: the stable decompressed payload bytes — the backing store every
+    /// [`SliceRef::Block`] produced by [`Self::for_each_row_ranges`] resolves
+    /// against. Stable for the lifetime of this `KvBlock` (the struct owns the
+    /// `Vec`); value ranges always fall inside the entries region (before the
+    /// restart trailer).
+    pub fn payload_bytes(&self) -> &[u8] {
+        &self.payload
+    }
+
+    /// S2-1 (pinned-rows design §2.1 W1a): like [`Self::for_each_row`], but
+    /// (a) reconstructs each full key APPENDED into the caller-owned `arena`
+    /// (never cleared by this method), yielding its range as a
+    /// [`SliceRef::Arena`], and (b) yields the value as a [`SliceRef::Block`]
+    /// range into [`Self::payload_bytes`] (`None` for tombstones), plus
+    /// sequence and op-type. One pass, the same decode work as
+    /// [`Self::for_each_row`] — strictly additive API.
+    ///
+    /// The callback receives `(arena_so_far, row)`: an immutable view of the
+    /// arena (so callers can compare the current key against earlier arena
+    /// rows during the walk) and the row's ranges. Ranges remain valid after
+    /// the walk completes as long as the arena is only appended to and the
+    /// block stays alive — that is the whole point (the engine's pinned
+    /// `SstBlockBuf` resolves them at emit time).
+    pub fn for_each_row_ranges<F>(&self, arena: &mut Vec<u8>, mut cb: F) -> ForstResult<()>
+    where
+        F: FnMut(&[u8], RowRanges) -> ForstResult<()>,
+    {
+        let mut pos = 0usize;
+        // (offset, len) of the previous row's full key inside `arena` — the
+        // prefix-chain source for the next row's shared bytes.
+        let mut prev: Option<(usize, usize)> = None;
+        while pos < self.restarts_start {
+            let e = self.parse_entry(pos)?;
+            let (prev_off, prev_len) = prev.unwrap_or((arena.len(), 0));
+            if e.shared > prev_len {
+                return Err(ForstError::corruption(
+                    "KV entry shared-prefix len exceeds previous key",
+                ));
+            }
+            let key_off = arena.len();
+            // Shared prefix from the previous key's arena bytes, then the
+            // non-shared tail straight from the payload. Identical bytes to
+            // the `for_each_row` scratch reconstruction.
+            arena.extend_from_within(prev_off..prev_off + e.shared);
+            arena.extend_from_slice(&self.payload[e.key_range.0..e.key_range.1]);
+            let key_len = arena.len() - key_off;
+            let op_type = OpType::from_u8(e.op_byte).ok_or_else(|| {
+                ForstError::corruption(format!("invalid op_type in KV block: {}", e.op_byte))
+            })?;
+            let row = RowRanges {
+                key: SliceRef::arena(key_off, key_len)?,
+                value: match e.value_range {
+                    None => None,
+                    Some((s, en)) => Some(SliceRef::block(s, en - s)?),
+                },
+                sequence: e.sequence,
+                op_type,
+            };
+            cb(arena, row)?;
+            prev = Some((key_off, key_len));
+            pos = e.next;
+        }
+        Ok(())
+    }
+
     /// Highest-sequence visible row for *exactly* `key` (or `None`). Mirrors the
     /// v1 `get` semantics: returns the raw value (`None` for a tombstone) of the
     /// max-sequence matching row. Early-terminates once the scan passes `key`.
@@ -508,6 +674,107 @@ impl KvBlock {
             op_type,
         })?;
         Ok(e.next)
+    }
+
+    /// S2-3: seek-aware, early-stopping twin of [`Self::for_each_row_ranges`]
+    /// — the ranges counterpart of [`Self::for_each_row_from`]. Binary-seeks
+    /// the restart points, reconstructs the (skipped) prefix-chain keys
+    /// before `lower` into a LOCAL scratch (never the caller's arena — at
+    /// most one restart interval of throwaway work), then yields every row
+    /// whose key is `>= lower` with the key APPENDED into `arena` exactly as
+    /// the full visitor does. The callback returns `Ok(true)` to continue or
+    /// `Ok(false)` to stop the walk (the caller's upper-bound early
+    /// termination — the remaining rows are not decoded at all).
+    ///
+    /// This exists because the engine's pinned replenish probes are often
+    /// point-shaped: walking (and arena-copying) a whole ~64 KiB block to
+    /// accept a handful of rows measured +54 % on the deep-fan-out probe
+    /// cell; this visitor bounds the waste to `< KV_RESTART_INTERVAL` rows.
+    pub fn for_each_row_ranges_from<F>(
+        &self,
+        lower: &[u8],
+        arena: &mut Vec<u8>,
+        mut cb: F,
+    ) -> ForstResult<()>
+    where
+        F: FnMut(&[u8], RowRanges) -> ForstResult<bool>,
+    {
+        let mut pos = self.seek_restart(lower)?;
+        // Prefix-chain scratch for rows BEFORE `lower` (skipped, not yielded).
+        let mut scratch: Vec<u8> = Vec::new();
+        // (offset, len) of the previous YIELDED row's key inside `arena`.
+        let mut prev_arena: Option<(usize, usize)> = None;
+        let mut started = false;
+        while pos < self.restarts_start {
+            let e = self.parse_entry(pos)?;
+            if !started {
+                if e.shared > scratch.len() {
+                    return Err(ForstError::corruption(
+                        "KV entry shared-prefix len exceeds previous key",
+                    ));
+                }
+                scratch.truncate(e.shared);
+                scratch.extend_from_slice(&self.payload[e.key_range.0..e.key_range.1]);
+                if scratch.as_slice() < lower {
+                    // Reconstructed for prefix-chain continuity, but skipped.
+                    pos = e.next;
+                    continue;
+                }
+                started = true;
+                // First in-range key: copy the scratch into the arena so the
+                // yielded ref obeys the D2 contract (Arena, stable).
+                let key_off = arena.len();
+                arena.extend_from_slice(&scratch);
+                let key_len = scratch.len();
+                let row = RowRanges {
+                    key: SliceRef::arena(key_off, key_len)?,
+                    value: match e.value_range {
+                        None => None,
+                        Some((s, en)) => Some(SliceRef::block(s, en - s)?),
+                    },
+                    sequence: e.sequence,
+                    op_type: OpType::from_u8(e.op_byte).ok_or_else(|| {
+                        ForstError::corruption(format!(
+                            "invalid op_type in KV block: {}",
+                            e.op_byte
+                        ))
+                    })?,
+                };
+                prev_arena = Some((key_off, key_len));
+                if !cb(arena, row)? {
+                    return Ok(());
+                }
+                pos = e.next;
+                continue;
+            }
+            let (prev_off, prev_len) = prev_arena.expect("set when started");
+            if e.shared > prev_len {
+                return Err(ForstError::corruption(
+                    "KV entry shared-prefix len exceeds previous key",
+                ));
+            }
+            let key_off = arena.len();
+            arena.extend_from_within(prev_off..prev_off + e.shared);
+            arena.extend_from_slice(&self.payload[e.key_range.0..e.key_range.1]);
+            let key_len = arena.len() - key_off;
+            let row = RowRanges {
+                key: SliceRef::arena(key_off, key_len)?,
+                value: match e.value_range {
+                    None => None,
+                    Some((s, en)) => Some(SliceRef::block(s, en - s)?),
+                },
+                sequence: e.sequence,
+                op_type: OpType::from_u8(e.op_byte).ok_or_else(|| {
+                    ForstError::corruption(format!("invalid op_type in KV block: {}", e.op_byte))
+                })?,
+            };
+            prev_arena = Some((key_off, key_len));
+            if !cb(arena, row)? {
+                return Ok(());
+            }
+            pos = e.next;
+        }
+        Ok(())
     }
 
     /// Parses the fixed-size header + spans of one entry starting at `pos`
@@ -1003,5 +1270,260 @@ mod tests {
         let kv = KvBlock::decode(&block, true).unwrap();
         assert_eq!(collect(&kv).len(), 0);
         assert!(collect_from(&kv, b"anything").is_empty());
+    }
+
+    // =======================================================================
+    // S2-1 G1: ranges-visitor vs for_each_row byte-equality (property test)
+    // =======================================================================
+
+    /// Deterministic xorshift64* (no external deps).
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    /// Builds a random sorted `(key ASC, seq DESC)` row set designed to
+    /// exercise the prefix-compression edges: long shared prefixes, a
+    /// shared-prefix length GREATER than the previous key's non-shared tail
+    /// (forcing `extend_from_within` across the previous key's full arena
+    /// span), restart boundaries (>16 and >32 rows), duplicate user keys
+    /// (multi-version), tombstones, merge ops, and empty-but-present values.
+    fn random_rows(seed: u64) -> Vec<OwnedTestRow> {
+        let mut s = seed;
+        let n_keys = 1 + (xorshift(&mut s) % 60) as usize;
+        // Tiny alphabet + nested key shapes → deep shared prefixes.
+        let mut keys: Vec<Vec<u8>> = (0..n_keys)
+            .map(|_| {
+                let len = 1 + (xorshift(&mut s) % 38) as usize;
+                (0..len)
+                    .map(|_| b"ab"[(xorshift(&mut s) % 2) as usize])
+                    .collect()
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let mut rows: Vec<OwnedTestRow> = Vec::new();
+        for key in keys {
+            let versions = 1 + (xorshift(&mut s) % 3);
+            let base_seq = 1000 + (xorshift(&mut s) % 1000);
+            for v in 0..versions {
+                let op = match xorshift(&mut s) % 4 {
+                    0 => OpType::Delete,
+                    1 => OpType::Merge,
+                    _ => OpType::Put,
+                };
+                let value = if op == OpType::Delete {
+                    None
+                } else {
+                    // Includes the empty-but-present value edge.
+                    let vlen = (xorshift(&mut s) % 50) as usize;
+                    Some(
+                        (0..vlen)
+                            .map(|_| (xorshift(&mut s) & 0xFF) as u8)
+                            .collect::<Vec<u8>>(),
+                    )
+                };
+                rows.push((key.clone(), value, base_seq - v, op));
+            }
+        }
+        rows
+    }
+
+    /// Walks `kv` via the ranges visitor and resolves AFTER the full walk
+    /// completes (per the D2 gate construction: a v2 key that escaped as a
+    /// `Block` ref, or an arena range corrupted by later appends, fails the
+    /// post-walk byte equality — a per-row assert could not catch it).
+    fn collect_ranges_post_walk(kv: &KvBlock, arena_preseed: &[u8]) -> Vec<OwnedTestRow> {
+        let mut arena: Vec<u8> = arena_preseed.to_vec();
+        let mut metas: Vec<RowRanges> = Vec::new();
+        kv.for_each_row_ranges(&mut arena, |arena_view, row| {
+            // The in-walk view must already resolve the CURRENT key (the
+            // engine's replenish compares against it for dedup).
+            assert_eq!(
+                row.key.resolve(arena_view, kv.payload_bytes()),
+                &arena_view[arena_view.len() - row.key.len()..],
+                "current key must be the arena tail during the walk"
+            );
+            // D2 trap arm: a v2 key must NEVER be a Block ref.
+            assert!(
+                matches!(row.key, SliceRef::Arena { .. }),
+                "v2 KV-block key escaped as a Block ref (D2 violation)"
+            );
+            metas.push(row);
+            Ok(())
+        })
+        .unwrap();
+        // Post-walk resolution (the actual G1 equality input).
+        metas
+            .into_iter()
+            .map(|m| {
+                (
+                    m.key.resolve(&arena, kv.payload_bytes()).to_vec(),
+                    m.value
+                        .map(|v| v.resolve(&arena, kv.payload_bytes()).to_vec()),
+                    m.sequence,
+                    m.op_type,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn s2_ranges_visitor_matches_for_each_row_property() {
+        for seed in 1..=40u64 {
+            let rows = random_rows(seed.wrapping_mul(0x9E3779B97F4A7C15));
+            let refs: Vec<TestRow<'_>> = rows
+                .iter()
+                .map(|(k, v, s, o)| (k.as_slice(), v.as_deref(), *s, *o))
+                .collect();
+            let batch = make_batch(&refs);
+            for compression in [CompressionType::None, CompressionType::Lz4] {
+                let block = encode_kv_data_block(&batch, compression).unwrap();
+                let kv = KvBlock::decode(&block, true).unwrap();
+                let want = collect(&kv);
+                // Pre-seeded arena: the visitor must APPEND (caller-owned,
+                // not cleared) and ranges must account for the preseed.
+                let got = collect_ranges_post_walk(&kv, b"PRESEED");
+                assert_eq!(
+                    got, want,
+                    "seed={seed} compression={compression:?}: ranges walk != for_each_row"
+                );
+            }
+        }
+    }
+
+    /// S2-3 G1: the seek-aware `for_each_row_ranges_from` yields, for every
+    /// target, EXACTLY the rows `for_each_row_from` yields (byte-equality,
+    /// resolved post-walk per D2), and the stop-callback truncates the walk.
+    #[test]
+    fn s2_ranges_from_visitor_matches_for_each_row_from_property() {
+        for seed in 1..=25u64 {
+            let rows = random_rows(seed.wrapping_mul(0xA24B_AED4_963E_E407));
+            let refs: Vec<TestRow<'_>> = rows
+                .iter()
+                .map(|(k, v, s, o)| (k.as_slice(), v.as_deref(), *s, *o))
+                .collect();
+            let batch = make_batch(&refs);
+            for compression in [CompressionType::None, CompressionType::Lz4] {
+                let block = encode_kv_data_block(&batch, compression).unwrap();
+                let kv = KvBlock::decode(&block, true).unwrap();
+                // Targets: before-all, an existing key, a between-keys probe,
+                // after-all.
+                let mut targets: Vec<Vec<u8>> = vec![Vec::new(), b"zzzzzz".to_vec()];
+                if let Some((k, ..)) = rows.first() {
+                    targets.push(k.clone());
+                }
+                if let Some((k, ..)) = rows.get(rows.len() / 2) {
+                    targets.push(k.clone());
+                    let mut between = k.clone();
+                    between.push(0x00);
+                    targets.push(between);
+                }
+                for target in targets {
+                    let mut want: Vec<OwnedTestRow> = Vec::new();
+                    kv.for_each_row_from(&target, |v| {
+                        want.push((
+                            v.key.to_vec(),
+                            v.value.map(|b| b.to_vec()),
+                            v.sequence,
+                            v.op_type,
+                        ));
+                        Ok(())
+                    })
+                    .unwrap();
+
+                    let mut arena = b"PRESEED".to_vec();
+                    let mut metas: Vec<RowRanges> = Vec::new();
+                    kv.for_each_row_ranges_from(&target, &mut arena, |_, row| {
+                        assert!(matches!(row.key, SliceRef::Arena { .. }), "D2");
+                        metas.push(row);
+                        Ok(true)
+                    })
+                    .unwrap();
+                    let got: Vec<OwnedTestRow> = metas
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.key.resolve(&arena, kv.payload_bytes()).to_vec(),
+                                m.value
+                                    .map(|v| v.resolve(&arena, kv.payload_bytes()).to_vec()),
+                                m.sequence,
+                                m.op_type,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        got, want,
+                        "seed={seed} compression={compression:?} target={target:?}"
+                    );
+
+                    // Stop-callback: cb returning false after k rows yields a
+                    // strict prefix of `want`.
+                    if want.len() > 1 {
+                        let stop_after = want.len() / 2;
+                        let mut arena = Vec::new();
+                        let mut metas: Vec<RowRanges> = Vec::new();
+                        kv.for_each_row_ranges_from(&target, &mut arena, |_, row| {
+                            metas.push(row);
+                            Ok(metas.len() < stop_after)
+                        })
+                        .unwrap();
+                        assert_eq!(metas.len(), stop_after, "stop must truncate the walk");
+                        let got_keys: Vec<Vec<u8>> = metas
+                            .iter()
+                            .map(|m| m.key.resolve(&arena, kv.payload_bytes()).to_vec())
+                            .collect();
+                        let want_keys: Vec<Vec<u8>> =
+                            want[..stop_after].iter().map(|r| r.0.clone()).collect();
+                        assert_eq!(got_keys, want_keys);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn s2_ranges_visitor_edge_blocks() {
+        // Single-row block.
+        let one: Vec<TestRow<'_>> = vec![(b"solo", Some(b"v".as_ref()), 7, OpType::Put)];
+        let kv = KvBlock::decode(
+            &encode_kv_data_block(&make_batch(&one), CompressionType::None).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(collect_ranges_post_walk(&kv, &[]), collect(&kv));
+
+        // Empty block.
+        let kv = KvBlock::decode(
+            &encode_kv_data_block(&make_batch(&[]), CompressionType::None).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(collect_ranges_post_walk(&kv, &[]).is_empty());
+
+        // 50-row multi-restart block (restart entries at 0/16/32/48 reset
+        // shared=0 mid-walk).
+        let kv = KvBlock::decode(&big_block(), true).unwrap();
+        let want = collect(&kv);
+        assert_eq!(want.len(), 50);
+        assert_eq!(collect_ranges_post_walk(&kv, &[]), want);
+
+        // Tombstone + empty-present-value discrimination.
+        let rows: Vec<TestRow<'_>> = vec![
+            (b"user:1", Some(b"".as_ref()), 9, OpType::Put),
+            (b"user:2", None, 8, OpType::Delete),
+        ];
+        let kv = KvBlock::decode(
+            &encode_kv_data_block(&make_batch(&rows), CompressionType::None).unwrap(),
+            true,
+        )
+        .unwrap();
+        let got = collect_ranges_post_walk(&kv, &[]);
+        assert_eq!(got[0].1, Some(Vec::new()), "empty value stays Some");
+        assert_eq!(got[1].1, None, "tombstone stays None");
     }
 }

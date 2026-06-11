@@ -30,11 +30,11 @@
 //! This isolates the per-open bookkeeping cost (live-SST-set build, resident
 //! visible-entry clone, per-source seek) as a function of LSM depth.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use forst_rs_bench::open_in_memory;
-use forst_rs_engine::DbImpl;
+use forst_rs_engine::{DbImpl, FillOutcome, RowSink};
 
 /// Join-key namespace prefix for join key `jk`: 8-byte big-endian so prefixes
 /// sort in the same order as the keys, mirroring the Flink composite-key
@@ -117,5 +117,54 @@ fn bench_join_probe_open(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_join_probe_open);
+/// S2 stage-2 (work-order §6.1/§6.3): the SAME probe shape driven through the
+/// raw push-style `PrefixScanStream::fill_into` (pinned mode forced, sink =
+/// byte-counting no-op) — measured ALONGSIDE the continuity series above
+/// (which drains via `prefix_scan_iter_owned_arc` and therefore measures the
+/// Arc-pair COMPAT ADAPTER when the flag is ON), so the adapter tax is itself
+/// observable. Do not rewire the cells above.
+fn bench_join_probe_fill_into(c: &mut Criterion) {
+    /// Byte-counting no-op sink (no copies, no allocs).
+    struct CountBytes(u64);
+    impl RowSink for CountBytes {
+        fn push(&mut self, key: &[u8], value: &[u8]) -> bool {
+            self.0 += (key.len() + value.len()) as u64;
+            true
+        }
+    }
+
+    let num_keys = 4096u32;
+    let mut group = c.benchmark_group("join_probe_open_fill_into");
+    for &num_ssts in &[1u32, 8, 32, 64, 128] {
+        let db = build_db(num_keys, num_ssts);
+        let cf = db.default_cf();
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("ssts_{}", num_ssts)),
+            &num_ssts,
+            |b, &_n| {
+                let mut jk = 0u32;
+                b.iter(|| {
+                    let prefix = ns_prefix(jk % num_keys);
+                    let mut stream = db
+                        .prefix_scan_stream_with_mode(
+                            &cf,
+                            &prefix,
+                            Arc::new(Mutex::new(None)),
+                            true, // pinned (the S2 path under test)
+                        )
+                        .expect("open prefix stream");
+                    let mut sink = CountBytes(0);
+                    let outcome = stream.fill_into(&mut sink).expect("fill_into");
+                    assert_eq!(outcome, FillOutcome::Exhausted);
+                    jk = jk.wrapping_add(1);
+                    black_box(sink.0);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_join_probe_open, bench_join_probe_fill_into);
 criterion_main!(benches);
