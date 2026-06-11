@@ -1792,3 +1792,23 @@ the coordinator); (b) fullyLoaded semantics (ours: outstanding batches ≥ 2×wo
 ongoing READ ops only — writes never block triggering); (c) executeRequestSync routing
 (ours: worker-FIFO submit().get(); ForSt: direct); (d) per-row completion threading
 (ours: the single worker; ForSt: read/write pools). Comparative audit in progress.
+
+### ★★ q5 CORRECTNESS CLOSED (verified 2026-06-11, parallel workstream)
+Root cause: ForStRsValueState off-heap encoding omitted the NAMESPACE SUFFIX → all HOP
+window namespaces collapsed onto one physical key. FIXED in flink commit 80015d2cfaa +
+regression test ForStRsValueStateOffheapTest.namespaceSuffixPartitionsValues. Evidence:
+1M fixed-CSV materialized-changelog hash EQUAL to ForSt baseline (54/54 rows, was 169),
+deterministic across q0-q22 (doc: benchmarks/2026-06-10-.../forstrs-backend-fixed-csv-
+accuracy-20260611.md). Residual out_rows ratio vs RocksDB at bench scale = benign HOP
+emission cadence. PHASE-1 CORRECTNESS EXCEPTIONS NOW: q4@10M wedge ONLY (pre-existing,
+bisect-proven, @100M unaffected).
+
+### STAGE-0 cbran instrument: exact-run baseline + thenAccept fast-path facts
+Exact runs: cbran == completed == created (to the unit) — clean baseline. Corrupt-specimen
+hunt continues (instrument shifts timing; Heisenbug). Runtime facts pinned (file:line):
+AsyncFutureImpl.thenAccept has an isDone() FAST PATH running the action INLINE on the
+calling thread ("this branch must be invoked in task thread when expected") with a
+SILENT-SKIP if .get() throws, and inline callbacks bypass CallbackRunnerWrapper's
+currentCallbacks accounting. For mailbox-completed sync points inline==mailbox (safe);
+the corrupt-run cbran arithmetic decides whether the loss is pre-callback (registration/
+fast-path edge) or post-callback (operator-internal).
