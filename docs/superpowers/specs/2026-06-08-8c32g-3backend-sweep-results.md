@@ -1845,3 +1845,17 @@ impossible (per-channel FIFO) — the metric poll on a corrupt specimen decides;
 would mean the q8 canary has been measuring SOURCE-SKEW SENSITIVITY, not an executor race,
 relocating the fix entirely (watermark generation/idleness at the NexMark source or
 two-phase agg ordering) and CORRECTNESS-EXONERATING routing-async itself.
+
+### ★★★★ STAGE-0 ROOT CAUSE CONVICTED: ForStRsKeyGroupedInternalPriorityQueue LOSES TIMERS
+Per-task timer accounting, corrupt specimen (out=1,617,567):
+g7Add=2,000,000 (COMPLETE registration) vs g7Poll=1,055,800 → **944K registered timers never
+polled**; g14: 1,064,680 vs 561,767 (−503K). Internal consistency seals it:
+g7Poll+g14Poll ≈ 1.62M == GWA emissions == join input == jnAdd == out_rows.
+**The backend's OWN timer queue silently drops registered timers; unfired windows never emit.**
+routing-async is the TRIGGER, not the cause: it reshapes engine flush/compaction timing,
+and the queue's engine-backed resume-cursor refill machinery (the 2026-06-03 O(N²)-fix
+design: resume cursor + seekHint floor + pendingBuffer merge; file's own comments call
+cursor-invalidating refills "bounded-risk") loses entries under the altered timing.
+PRE-EXISTING, TIMING-TRIGGERED, IN-SCOPE (our backend). Exonerates: executor dispatch, AEC,
+flink-runtime, the join, staging buffers (those were real lockstep-only hazards but not THIS
+bug). Audit of poll/refill for the exact skip in progress; fix lands in the timer queue.
