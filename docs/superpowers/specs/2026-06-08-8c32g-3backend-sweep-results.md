@@ -2143,3 +2143,9 @@ itself jitters across runs (91,813,229 r1 / 91,813,374 r2 vs canonical 372) ⇒
 the frs +24 may be sink-sampling jitter, not true extra rows — r2b nodrain run
 (auto-queued) answers both (wall ≈2421 ⇒ drain culpable; rows exact ⇒ jitter).
 q20 pair running (systemic-vs-q9-specific check). Drain default flip BLOCKED.
+
+### ROUND-2 q20 frs: 2011.1s ≈ r1 2026.5 (−0.8%) ⇒ drain regression is q9-SPECIFIC
+Drain-ON: q9 +19%, q20 ±0 on this box — the Mac-recorded drain wins (q9 −377s /
+q20 −568s) do NOT transfer to NVMe (no tombstone read-amp to reclaim; only the
+drain's compaction cost remains, and q9's write pattern pays it). q20-rdb pair
+running; r2b nodrain q9 auto-fires after.
