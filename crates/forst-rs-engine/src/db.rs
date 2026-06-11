@@ -193,16 +193,25 @@ pub(crate) fn note_flushed_tombstones(tombs: u64, total: u64) {
     }
 }
 
+/// DEFAULT garbage-drain threshold: 200K flushed tombstone entries — the
+/// recorded q9/q20 configuration (roadmap L1,
+/// `2026-06-12-q9-q20-longscan-roadmap.md`).
+const GARBAGE_DRAIN_DEFAULT_TOMBSTONES: u64 = 200_000;
+
 /// Threshold (flushed tombstone ENTRIES) that forces a deep drain.
 /// `FRS_GARBAGE_DRAIN_TOMBSTONES` overrides; `0` disables.
-/// DEFAULT = 0 (OFF) as of 2026-06-11: at the 2M default + ratio gate +
-/// 512MB L1 floor, q17@100M still regressed 3.2× (267.9s vs 77-85s norm) —
-/// the drain's forced rewrites hurt small-live-state queries in ways the
-/// three gate conditions don't yet capture. The lever is PROVEN and
-/// transformative as an OPT-IN for delete-dominated big-state joins
-/// (q9: DNF→2001s @200K; q20: DNF→1477.7s @200K) — set the env for those
-/// runs. Re-enable by default only after gating that passes q17/q3/q8
-/// no-regress at 100M.
+///
+/// DEFAULT = 200K, ON (2026-06-11, roadmap L1 step ②). History: the earlier
+/// "default OFF" call (7c3521716) rested on a q17@100M 3.2× regression that
+/// the CONTROL RUN later overturned — q17 landed in the SAME 190-280s band
+/// with the drain FULLY OFF (attribution reversal, 90d9fcbdf: the elevation
+/// was box-state + engine-revision, not the drain). The recorded, exact-rows
+/// deterministic effect at 200K is transformative for delete-dominated
+/// big-state joins: q9 2378.5→2001.2s (−377s), q20 DNF→1477.7s. The gate is
+/// now threefold (see [`garbage_drain_gate`]): tombstone volume ≥ threshold,
+/// the 512MB L1 live-volume floor (third condition — q17-class small-state
+/// queries never drain-thrash), and the adaptive reclaim-feedback backoff
+/// (≤2 wasted probe drains per run). Retune or disable (`=0`) via the env.
 fn garbage_drain_threshold() -> u64 {
     use std::sync::OnceLock;
     static T: OnceLock<u64> = OnceLock::new();
@@ -210,7 +219,7 @@ fn garbage_drain_threshold() -> u64 {
         std::env::var("FRS_GARBAGE_DRAIN_TOMBSTONES")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2_000_000)
+            .unwrap_or(GARBAGE_DRAIN_DEFAULT_TOMBSTONES)
     })
 }
 
@@ -251,6 +260,38 @@ fn garbage_drain_due() -> bool {
 /// off).
 static GARBAGE_DRAIN_WASTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const GARBAGE_DRAIN_MAX_WASTED: u32 = 2;
+
+/// THIRD GATE CONDITION (2026-06-11, the q17 drain-thrash fix that makes the
+/// 200K default safe): minimum per-CF L1 volume before a garbage drain is
+/// allowed. With < 512MB in L1 there is nothing worth a forced rewrite — the
+/// size-budget trigger handles growth, and big-state queries (q9 L1 = GBs)
+/// pass this floor trivially.
+const GARBAGE_DRAIN_MIN_L1_BYTES: u64 = 512 * 1024 * 1024;
+
+/// THE composite garbage-drain gate — pure so the boundaries are unit-tested
+/// (`tests::garbage_drain_gate_boundaries`). ALL conditions must hold:
+/// 1. threshold enabled (`> 0`; `FRS_GARBAGE_DRAIN_TOMBSTONES=0` disables);
+/// 2. tombstone PRESSURE: entries flushed since the last drain ≥ threshold
+///    (delete-light workloads structurally never trip this);
+/// 3. adaptive FEEDBACK: fewer than [`GARBAGE_DRAIN_MAX_WASTED`] consecutive
+///    drains that reclaimed <5% (q17-class pays for at most 2 probe drains
+///    per run; productive q9-class drains reset the counter);
+/// 4. the CF has L1 files at all;
+/// 5. live-volume FLOOR: the CF's L1 ≥ [`GARBAGE_DRAIN_MIN_L1_BYTES`]
+///    (small-state queries never drain-thrash their tiny levels).
+fn garbage_drain_gate(
+    threshold: u64,
+    flushed_tombstones: u64,
+    wasted_drains: u32,
+    cf_has_l1_file: bool,
+    cf_l1_bytes: u64,
+) -> bool {
+    threshold > 0
+        && flushed_tombstones >= threshold
+        && wasted_drains < GARBAGE_DRAIN_MAX_WASTED
+        && cf_has_l1_file
+        && cf_l1_bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
+}
 
 fn garbage_drain_consume() {
     // Scale the entries counter down proportionally so the ratio gate keeps
@@ -9952,14 +9993,13 @@ impl CompactionExecutor for DbImpl {
             // the probe-read decay). The drain annihilates tombstones against
             // older L1/L2 data. Delete-light workloads never trip this.
             // THIRD GATE CONDITION (2026-06-11, q17 leak fix): require a
-            // MINIMUM L1 volume before garbage-draining. At drain-200K, q17
-            // (small live state, window/TTL tombstones passing the 20% ratio
-            // on small flush volumes) drain-thrashed its tiny levels — source
-            // done in ~180s but the job dragged past 300s vs its 77s norm.
-            // With < 512MB in L1 there is nothing worth a forced rewrite; the
-            // size-budget trigger handles growth, and big-state queries
-            // (q9 L1 = GBs) pass this floor trivially.
-            const GARBAGE_DRAIN_MIN_L1_BYTES: u64 = 512 * 1024 * 1024;
+            // MINIMUM L1 volume before garbage-draining — see
+            // `GARBAGE_DRAIN_MIN_L1_BYTES` / `garbage_drain_gate` (module
+            // top), the pure composite gate this site now routes through.
+            // At drain-200K, q17 (small live state, window/TTL tombstones
+            // passing the 20% ratio on small flush volumes) drain-thrashed
+            // its tiny levels — source done in ~180s but the job dragged
+            // past 300s vs its 77s norm.
             // GATE-V2 (2026-06-11): additionally require the LEVEL's STORED
             // tombstone density (footer-v4 tombstone_count / total_entries over
             // the CF's L1 files) ≥ 20% — the population the flush-ratio gate got
@@ -9993,21 +10033,37 @@ impl CompactionExecutor for DbImpl {
                 }
                 b
             };
-            let backoff = GARBAGE_DRAIN_WASTED.load(std::sync::atomic::Ordering::Relaxed)
-                >= GARBAGE_DRAIN_MAX_WASTED;
-            let garbage_due = !backoff
-                && garbage_drain_due()
-                && self.version_set.current().levels.get(1).is_some_and(|l| {
-                    let mut bytes = 0u64;
-                    let mut any = false;
-                    for f in &l.files {
-                        if f.cf_id == cf_id {
-                            any = true;
-                            bytes = bytes.saturating_add(f.file_size);
-                        }
-                    }
-                    any && bytes >= GARBAGE_DRAIN_MIN_L1_BYTES
-                });
+            // The decision routes through the pure `garbage_drain_gate`
+            // (unit-tested boundaries). Two-step evaluation preserves the
+            // original short-circuit: the L1 file list is only walked once
+            // the cheap pressure/feedback conditions already pass (floor
+            // inputs forced to trivially-true for the pre-check).
+            let drain_threshold = garbage_drain_threshold();
+            let drain_pressure =
+                TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed);
+            let drain_wasted = GARBAGE_DRAIN_WASTED.load(std::sync::atomic::Ordering::Relaxed);
+            let garbage_due =
+                garbage_drain_gate(drain_threshold, drain_pressure, drain_wasted, true, u64::MAX)
+                    && {
+                        let (any, bytes) = self
+                            .version_set
+                            .current()
+                            .levels
+                            .get(1)
+                            .map(|l| {
+                                let mut bytes = 0u64;
+                                let mut any = false;
+                                for f in &l.files {
+                                    if f.cf_id == cf_id {
+                                        any = true;
+                                        bytes = bytes.saturating_add(f.file_size);
+                                    }
+                                }
+                                (any, bytes)
+                            })
+                            .unwrap_or((false, 0));
+                        garbage_drain_gate(drain_threshold, drain_pressure, drain_wasted, any, bytes)
+                    };
             if over || garbage_due {
                 let before = if garbage_due {
                     cf_deep_bytes(&self.version_set.current())
@@ -11219,6 +11275,54 @@ mod tests {
 
     fn open() -> Arc<DbImpl> {
         DbImpl::open_default().expect("open")
+    }
+
+    /// Step ② (roadmap L1): boundary coverage of the composite garbage-drain
+    /// gate — every condition tested at its exact edge, around an all-pass
+    /// reference at the shipped 200K default.
+    #[test]
+    fn garbage_drain_gate_boundaries() {
+        const T: u64 = GARBAGE_DRAIN_DEFAULT_TOMBSTONES; // 200K shipped default
+        const FLOOR: u64 = GARBAGE_DRAIN_MIN_L1_BYTES;
+
+        // All-pass reference (exactly AT every boundary).
+        assert!(garbage_drain_gate(T, T, 0, true, FLOOR));
+
+        // 1. Threshold 0 = disabled, regardless of any pressure/volume.
+        assert!(!garbage_drain_gate(0, u64::MAX, 0, true, u64::MAX));
+
+        // 2. Tombstone pressure: one below the threshold refuses; at passes.
+        assert!(!garbage_drain_gate(T, T - 1, 0, true, FLOOR));
+        assert!(garbage_drain_gate(T, T, 0, true, FLOOR));
+
+        // 3. Adaptive feedback backoff: below MAX_WASTED passes; at refuses.
+        assert!(garbage_drain_gate(
+            T,
+            T,
+            GARBAGE_DRAIN_MAX_WASTED - 1,
+            true,
+            FLOOR
+        ));
+        assert!(!garbage_drain_gate(
+            T,
+            T,
+            GARBAGE_DRAIN_MAX_WASTED,
+            true,
+            FLOOR
+        ));
+
+        // 4. No L1 files at all refuses (even with a huge claimed volume).
+        assert!(!garbage_drain_gate(T, T, 0, false, u64::MAX));
+
+        // 5. L1 live-volume floor (THIRD gate): one byte under refuses; at
+        //    passes — q17-class small-state CFs never drain-thrash.
+        assert!(!garbage_drain_gate(T, T, 0, true, FLOOR - 1));
+        assert!(garbage_drain_gate(T, T, 0, true, FLOOR));
+
+        // Pre-check form used at the call site (floor inputs trivially true):
+        // refusal must come only from the cheap conditions.
+        assert!(garbage_drain_gate(T, T, 0, true, u64::MAX));
+        assert!(!garbage_drain_gate(T, T - 1, 0, true, u64::MAX));
     }
 
     /// FRS-COMPACT-MICROBENCH (2026-06-05): an IN-PROCESS, substrate-independent
