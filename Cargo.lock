@@ -1098,6 +1098,7 @@ dependencies = [
  "criterion",
  "forst-rs-common",
  "forst-rs-engine",
+ "forst-rs-ffi",
  "forst-rs-io",
  "forst-rs-storage",
  "rocksdb",
