@@ -1859,3 +1859,19 @@ cursor-invalidating refills "bounded-risk") loses entries under the altered timi
 PRE-EXISTING, TIMING-TRIGGERED, IN-SCOPE (our backend). Exonerates: executor dispatch, AEC,
 flink-runtime, the join, staging buffers (those were real lockstep-only hazards but not THIS
 bug). Audit of poll/refill for the exact skip in progress; fix lands in the timer queue.
+
+### ★★★★★ STAGE-0 FIX IMPLEMENTED: timer-queue refill-floor min-merge
+THE BUG (ForStRsKeyGroupedInternalPriorityQueue ~line 2128): the post-flush one-shot refill
+FLOOR was installed with a plain put(). When a SECOND flush touched the same kg before its
+next refill (cache empty → headTs=MAX → floor=minAdd₂), the put OVERWROTE a lower
+outstanding floor — every engine timer row in [floor₁, floor₂) was permanently skipped
+(refill seeks from the floor; the kept resume cursor is overridden) — and could also set a
+floor PAST the cursor baseline, skipping [cursor, floor). Lost rows = registered-but-never-
+polled timers = unfired windows = q8's under-emit. TIMING-SHAPED exactly as observed:
+fast ingest (routing-async) ⇒ multiple flushes per kg between poll turns ⇒ loss; slow runs
+refill in between ⇒ exact. **LATENT IN DEFAULT MODE TOO** (window narrow, not zero) — the
+fix benefits all queries/modes.
+THE FIX: adopt a new floor ONLY if it LOWERS the effective refill start
+(existing floor, else successor(resume cursor), else kg-prefix start which is already
+lowest) — the start may only move backward until consumed. ~20 lines + the forensic
+comment. Canary ×5 running.
