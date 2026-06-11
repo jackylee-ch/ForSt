@@ -148,3 +148,63 @@ flush_stress -- --secs 60 --wbuf-mib 128 --value-bytes 256 [--delete-pct 30]
 | B3 compaction_throughput | ~200 LoC | 2 — feeds L4 before/after |
 | B2 flush_stress | ~250 LoC | 3 |
 | B4 capture | ~80 LoC shared module | with whichever bin lands first |
+
+---
+
+## 5. Evidence — B1 first baseline (Mac-population; one run, n=1)
+
+**Status: B1 `ffi_vectorized` IMPLEMENTED** (`crates/forst-rs-bench/benches/ffi_vectorized.rs`,
+`cargo bench -p forst-rs-bench --bench ffi_vectorized`). B2/B3/B4-bins still open.
+
+Run: 2026-06-12, engine SHA `81903a5ed` (post E1/E3), Apple M5 Pro / 64 GiB,
+macOS, system allocator (jemalloc compile-gated off on Mac), LocalFileSystem
+tempdir, default `EngineOptions` (64 MiB write buffer), RawConcat bench CF.
+**Mac-population caveat (binding):** same-box A/B regressions only; absolute
+numbers do NOT transfer to the Linux deployment. Single run — per methodology
+rule 1, no cross-change claims until n≥3.
+
+Criterion medians, paired FFI-vs-engine-direct arms over IDENTICAL prebuilt
+batches (per-row tax = ffi − engine at the same cell):
+
+| group | cell | ffi ns/row | engine ns/row | tax ns/row |
+|---|---|---|---|---|
+| put | r64_v64 | 173.3 | 177.5 | −4.2 |
+| put | r64_v256 | 234.0 | 278.1 | −44.1 |
+| put | r64_v1024 | 603.2 | 592.4 | +10.8 |
+| put | r256_v64 | 177.1 | 174.3 | +2.8 |
+| put | r256_v256 | 239.3 | 245.3 | −6.0 |
+| put | r256_v1024 | 565.0 | 586.4 | −21.3 |
+| put | r1024_v64 | 155.9 | 156.4 | −0.5 |
+| put | r1024_v256 | 235.9 | 217.6 | +18.3 |
+| put | r1024_v1024 | 514.8 | 525.1 | −10.3 |
+| mixed (m=0/20%) | 18 cells r{64,256,1024}×v{64,256,1024} | 155–527 | 155–513 | −13.4…+44.7 |
+| get_warm | 64 | 86.1 | 82.2 | +3.9 |
+| get_warm | 256 | 100.4 | 96.0 | +4.3 |
+| get_warm | 1024 | 113.0 | 108.8 | +4.2 |
+| get_multisst (8×L0) | 256 | 444.7 | 328.5 | +116.3 † |
+| iter_drain (100×1000, 64 KiB chunks) | — | 155.5 | — | 6.43 Melem/s |
+| iter_open_batch parallel | K=64 | 107.3 µs/probe (open+first-chunk fill ~750 rows) | — | — |
+
+† get_multisst ffi arm was the noisiest cell of the run (criterion mean CI
+86.9–100.8 µs vs median 113.9 µs — heavily skewed samples); treat the +116
+as UNCONFIRMED until n≥3. All other cells had tight CIs.
+
+Iter chunking shape (printed by the bench): 1000-row prefixes at 87 B/row
+drain in **4 FFI crossings/prefix** (open + 1 refill + EOF-next + close),
+250 rows/crossing average — the FRS_CHUNK_EOF auto-close path is exercised
+by the K=64 batched open (every probe's first chunk holds ~750 rows).
+
+**Headline finding (this box, this run):** the per-row boundary tax of the
+vectorized FFI surface is **≈0 on the write path** (put/mixed taxes are
+within ±5 % noise of the engine-direct arm at every size — the offset-walk +
+slice-rebuild glue is fully amortized at batch ≥64) and **≈4 ns/row on the
+warm read path** (output offsets/validity/value-copy; ~4 % at v=64 B). The
+4.6 µs/call class number from the q3 era is per-CALL, not per-row: at 64+
+rows/crossing the crossing itself is no longer the lever — consistent with
+the design's expectation that Stage-3/L2a moves per-row work, not crossing
+count. The bench's in-process median-of-30 "boundary-tax summary" footer is
+noisier than the criterion arms at small rep counts; use the criterion
+paired arms for claims.
+
+B4 capture (Mac fallback): RSS peak 2212 MiB / end 1683 MiB (1 Hz sampler);
+rule header printed by the bench.

@@ -30,6 +30,9 @@ path = "src/lib.rs"
 [dependencies]
 forst-rs-common = { workspace = true }
 forst-rs-engine = { workspace = true }
+# B1 ffi_vectorized boundary-tax bench: links the REAL `frs_*` extern "C"
+# entry points (the crate also builds as rlib).
+forst-rs-ffi = { workspace = true }
 forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
 # Optional RocksDB comparison baseline. Pulled in only when the
@@ -97,4 +100,10 @@ harness = false
 
 [[bench]]
 name = "join_probe_open"
+harness = false
+
+# B1 (2026-06-12 local FFI/flush/compaction bench design): boundary-tax
+# bench over the real frs_* FFI entry points vs engine-direct equivalents.
+[[bench]]
+name = "ffi_vectorized"
 harness = false
