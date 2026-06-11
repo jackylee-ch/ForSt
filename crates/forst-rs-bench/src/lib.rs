@@ -21,6 +21,8 @@
 //! - `benches/batch_ops.rs` — BM-1.2 Batch put/get scaling
 //! - `benches/write_throughput.rs` — BM-1.3 Sustained write throughput
 //! - `benches/checkpoint.rs` — BM-1.4 Checkpoint/restore timing
+//! - `benches/compat_jni_forst_backend_hotpaths.rs` — ForStBackend-shaped
+//!   compat-JNI batch/write/compacted-read hot paths
 //!
 //! Run individual benchmarks via:
 //!

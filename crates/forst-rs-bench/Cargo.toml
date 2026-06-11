@@ -103,3 +103,7 @@ harness = false
 [[bench]]
 name = "nexmark_compat_hotpaths"
 harness = false
+
+[[bench]]
+name = "compat_jni_forst_backend_hotpaths"
+harness = false
