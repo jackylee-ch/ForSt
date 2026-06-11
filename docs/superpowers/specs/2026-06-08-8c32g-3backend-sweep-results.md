@@ -2136,3 +2136,10 @@ check). DISAMBIGUATION (round-2b, after matrix): same tip +
 FRS_GARBAGE_DRAIN_TOMBSTONES=0 q9 → rows canonical ⇒ drain culpable ⇒ revert
 default + root-cause the gate; else jar-swap bisect (r1 jar + r2 engine).
 CORRECTNESS IS NON-NEGOTIABLE — drain default flip is BLOCKED until resolved.
+
+### ROUND-2 q9 pair: rdb control 2175.3 (box STABLE) ⇒ frs +450s regression REAL (1.32×)
+Drain-ON cost q9 ~+19% instead of the modeled −10-16%. Row-count refinement: rdb
+itself jitters across runs (91,813,229 r1 / 91,813,374 r2 vs canonical 372) ⇒
+the frs +24 may be sink-sampling jitter, not true extra rows — r2b nodrain run
+(auto-queued) answers both (wall ≈2421 ⇒ drain culpable; rows exact ⇒ jitter).
+q20 pair running (systemic-vs-q9-specific check). Drain default flip BLOCKED.
