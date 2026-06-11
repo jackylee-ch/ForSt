@@ -195,9 +195,10 @@ drain in **4 FFI crossings/prefix** (open + 1 refill + EOF-next + close),
 by the K=64 batched open (every probe's first chunk holds ~750 rows).
 
 **Headline finding (this box, this run):** the per-row boundary tax of the
-vectorized FFI surface is **≈0 on the write path** (put/mixed taxes are
-within ±5 % noise of the engine-direct arm at every size — the offset-walk +
-slice-rebuild glue is fully amortized at batch ≥64) and **≈4 ns/row on the
+vectorized FFI surface is **≈0 on the write path** (put/mixed median |tax| ≤
+~5 %; worst cell −16 % i.e. FFI-*favoring*, which is noise — a same-shape
+wrapper cannot beat its callee — per PMC B1-W1; n=1, superseded by the n=3
+rerun in §5b) and **≈4 ns/row on the
 warm read path** (output offsets/validity/value-copy; ~4 % at v=64 B). The
 4.6 µs/call class number from the q3 era is per-CALL, not per-row: at 64+
 rows/crossing the crossing itself is no longer the lever — consistent with
@@ -208,3 +209,51 @@ paired arms for claims.
 
 B4 capture (Mac fallback): RSS peak 2212 MiB / end 1683 MiB (1 Hz sampler);
 rule header printed by the bench.
+
+## 5b. Evidence — B1 n=3 rerun (median-of-3; Mac-population)
+
+Run: 2026-06-12, post-E5-fix tree (E5 scan-locator soundness fix + the
+af8b8ea4f bench, sequential runs ×3, same box as §5: Apple M5 Pro / 64 GiB,
+macOS, system allocator, LocalFileSystem tempdir). Median-of-3 of the
+per-run criterion medians; same paired-arm methodology. **Mac-population
+caveat unchanged:** same-box A/B regressions only.
+
+| group | cell | ffi ns/row (med-of-3) | engine ns/row | tax ns/row | per-run ffi spread |
+|---|---|---|---|---|---|
+| get_multisst (8×L0) | 256 | 361.4 | 323.4 | **+38.0** | 362.5 / 358.3 / 361.4 (tight) |
+| get_warm | 64 | 86.2 | 82.8 | +3.4 | 86.2 / 88.5 / 84.9 |
+| get_warm | 256 | 100.6 | 96.8 | +3.9 | 100.6 / 105.6 / 98.9 |
+| get_warm | 1024 | 113.3 | 109.7 | +3.5 | 115.6 / 113.3 / 112.6 |
+| put | 9 cells r{64,256,1024}×v{64,256,1024} | 191–667 | 193–652 | −6.8…+16.2 | tight (≤±2 %) |
+| mixed m=0 | 9 cells | 167–555 | 165–555 | −6.3…+12.1 | tight |
+| mixed m=20 | 9 cells | 172–978 | 170–971 | −3.8…+6.7 except v1024 cells † | see † |
+| iter_drain (100×1000) | — | **151.8** | — | — | 156.7 / 151.8 / 151.6 |
+| iter_open_batch parallel | K=64 | 104.2 µs/probe | — | — | 106.8 / 102.6 / 104.2 µs |
+
+† The two large-value merge cells are the run's only high-variance cells:
+`r1024_v1024_m20` tax +141.6 and `r64_v1024_m20` +56.2 ns/row median-of-3,
+but with per-run ffi spreads of 822.8–958.7 and 863.5–974.0 ns/row (±8 %) —
+the same-key-rewrite memtable-deepening artifact B1's methodology audit
+already flagged, amplified by 1 KiB merge operands. Direction is consistent
+(ffi slower) so a real few-% large-merge tax cannot be excluded, but the
+cell does not support a ns-precise claim; everything else is tight.
+
+**n=3 verdicts:**
+
+1. **get_multisst +116 ns/row (n=1) is RETIRED as a skew artifact** — the
+   confirmed tax is **+38 ns/row (~12 % at v=64 B over 8 L0 SSTs)**, with
+   tight per-run agreement (the n=1 ffi arm's 444.7 was the outlier; the
+   engine arm reproduced within 2 % of n=1). Cold-ish multi-SST point reads
+   pay a measurably larger boundary tax than warm reads (+38 vs +4) but
+   nothing resembling the n=1 number.
+2. **Warm-read tax ≈ +3.4–3.9 ns/row confirmed** (B1's ≈4 ns/row claim
+   stands at n=3).
+3. **Write-path tax ≈ 0 confirmed** with the honest reword PMC B1-W1 asked
+   for: median |tax| ≲ 5 %, worst tight cell +16.2 ns on 580 (+2.8 %); the
+   only larger cells are the † noisy large-merge ones.
+4. **E5 scan-locator fix = zero scan-path regression (measured):**
+   iter_drain median-of-3 151.8 ns/row vs 155.5 pre-fix n=1 (−2.4 %, noise
+   level), iter_open_batch 104.2 µs/probe vs 107.3 — the per-Version
+   OnceLock soundness-flag load + one cached-bool branch per level is
+   invisible, as the by-inspection argument predicts (single-CF levels
+   always take the unchanged binary-search arm).

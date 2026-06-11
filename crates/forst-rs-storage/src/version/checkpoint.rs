@@ -362,7 +362,7 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
     }
 
     Ok(VersionSetSnapshot {
-        version: std::sync::Arc::new(Version { levels }),
+        version: std::sync::Arc::new(Version::from_levels(levels)),
         next_file_number,
         last_sequence,
         cf_descriptors,
