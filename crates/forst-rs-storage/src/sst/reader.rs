@@ -382,7 +382,16 @@ impl SstReaderImpl {
     /// `block_size` (Sweep R3 H by Reviewers 2 + 5). The `file_size`
     /// is cached at `open()` so this check costs no syscall on the
     /// hot lookup path.
-    fn read_decoded_block(&self, block_offset: u64, block_size: u32) -> ForstResult<DecodedBlock> {
+    ///
+    /// §2.1: `pub(crate)` so [`crate::sst::prefetch::BlockPrefetcher`] can use
+    /// it as its DEMAND (cold-state) fetch — byte-identical to today's
+    /// demand-paged path, including the cache-first check and the
+    /// `CachePriority::Low` insert.
+    pub(crate) fn read_decoded_block(
+        &self,
+        block_offset: u64,
+        block_size: u32,
+    ) -> ForstResult<DecodedBlock> {
         // 2026-05-30 DECODED-BLOCK CACHE: serve a decoded block from the shared
         // L1 cache when present — skips the `serial_read_at` + decompress +
         // decode chain that dominated the q9 prefix-iterator profile. Cloning a
@@ -779,6 +788,163 @@ impl SstReaderImpl {
             }
         }
         true
+    }
+
+    // -----------------------------------------------------------------------
+    // §2.1 BlockPrefetcher support (streaming-read redesign)
+    // -----------------------------------------------------------------------
+
+    /// `(block_offset, block_size)` of data block `block_idx` from the sparse
+    /// index, or `None` past EOF. Used by the prefetcher to build multi-block
+    /// contiguous read windows (blocks are laid out back-to-back by the
+    /// writer; the prefetcher still verifies physical contiguity defensively).
+    pub fn block_region(&self, block_idx: usize) -> Option<(u64, u32)> {
+        self.index_entries
+            .get(block_idx)
+            .map(|e| (e.block_offset, e.block_size))
+    }
+
+    /// §2.1.5 clamp: the first block index in `[start, count)` that provably
+    /// holds NO key `< upper` (its per-block `min_key >= upper` ⇒ every key in
+    /// it and all later blocks sorts `>= upper`). The prefetcher never reads
+    /// at/past this index. Conservative: unbounded `upper` or missing
+    /// per-block stats ⇒ `index_entry_count()` (no clamp).
+    pub fn end_block_for_upper(&self, start: usize, upper: Option<&[u8]>) -> usize {
+        let count = self.index_entries.len();
+        let Some(hi) = upper else { return count };
+        if self.index_stats.len() != count {
+            return count; // stats unavailable — no clamp (never changes results)
+        }
+        // Blocks are key-ascending; binary-search the first min_key >= hi.
+        let mut lo = start.min(count);
+        let mut hi_idx = count;
+        while lo < hi_idx {
+            let mid = lo + (hi_idx - lo) / 2;
+            if self.index_stats[mid].min_key.as_slice() >= hi {
+                hi_idx = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        hi_idx
+    }
+
+    /// Whether this reader's file currently serves from local storage — picks
+    /// the prefetcher's readahead regime (see `RandomAccessFile::is_local`).
+    pub fn is_local_file(&self) -> bool {
+        self.file.is_local()
+    }
+
+    /// Decodes ONE data block from already-read raw bytes (the prefetcher's
+    /// multi-block pread hands each block its slice of the window buffer).
+    /// v2 KV blocks decode straight from the borrowed slice (`KvBlock::decode`
+    /// copies the payload out exactly like the demand path's scratch — same
+    /// copy count as today). v1 Arrow blocks need an owned buffer for the
+    /// zero-copy `Buffer` wrap, so they pay one slice-to-Vec copy here (v1 is
+    /// the legacy format; v2 is default-on).
+    pub(crate) fn decode_block_from_slice(&self, bytes: &[u8]) -> ForstResult<DecodedBlock> {
+        if bytes.is_empty() {
+            return Err(ForstError::corruption("empty SST data block"));
+        }
+        let verify = super::data_block::sst_read_verify_checksum();
+        match bytes[0] {
+            BLOCK_TYPE_DATA => {
+                let block_buf = arrow::buffer::Buffer::from_vec(bytes.to_vec());
+                Ok(DecodedBlock::Arrow(decode_data_block_zerocopy(
+                    &block_buf, verify,
+                )?))
+            }
+            BLOCK_TYPE_DATA_KV => Ok(DecodedBlock::Kv(Arc::new(KvBlock::decode(bytes, verify)?))),
+            other => Err(ForstError::corruption(format!(
+                "unknown SST data block_type 0x{other:02X}"
+            ))),
+        }
+    }
+
+    /// Decoded-block cache lookup for the prefetcher's cache-first window
+    /// splitting (§2.1: cached blocks are removed from the I/O window).
+    pub(crate) fn cache_get_decoded(&self, block_offset: u64) -> Option<DecodedBlock> {
+        let cache = self.block_cache.as_ref()?;
+        let key = CacheKey::new(self.cache_file_id, block_offset);
+        match cache.get(&key)?.as_ref() {
+            CacheEntry::DecodedBatch(batch) => Some(DecodedBlock::Arrow((**batch).clone())),
+            CacheEntry::DecodedKv(kv) => Some(DecodedBlock::Kv(Arc::clone(kv))),
+            CacheEntry::RawBlock(_) => None,
+        }
+    }
+
+    /// Decoded-block cache insert at an explicit priority. §2.1: demand blocks
+    /// insert at `Low` (today's behaviour); deep-ramp prefetch blocks insert
+    /// at `Bottom` so a streaming scan is the first evicted and never
+    /// displaces hot point-get blocks. NEVER bypassed entirely — re-probes of
+    /// recently scanned windows (interval joins) are common and the decoded
+    /// hit is the cheapest read.
+    pub(crate) fn cache_insert_decoded(
+        &self,
+        block_offset: u64,
+        decoded: &DecodedBlock,
+        priority: CachePriority,
+    ) {
+        let Some(cache) = self.block_cache.as_ref() else {
+            return;
+        };
+        let key = CacheKey::new(self.cache_file_id, block_offset);
+        match decoded {
+            DecodedBlock::Arrow(batch) => {
+                let arc = Arc::new(batch.clone());
+                let charge = CacheEntry::DecodedBatch(Arc::clone(&arc)).charge();
+                cache.insert(key, CacheEntry::DecodedBatch(arc), charge, priority);
+            }
+            DecodedBlock::Kv(kv) => {
+                let charge = CacheEntry::DecodedKv(Arc::clone(kv)).charge();
+                cache.insert(key, CacheEntry::DecodedKv(Arc::clone(kv)), charge, priority);
+            }
+        }
+    }
+
+    /// Vectored window read for the prefetcher: every `(offset, len)` region
+    /// is read FULLY into `buf`, packed back-to-back in order (short read ⇒
+    /// corruption — regions come from the sparse index). Backend selection
+    /// (io_uring stage): when the file currently serves from a LOCAL fd and
+    /// the io_uring backend is available (Linux + kernel probe +
+    /// `FRS_IO_URING` gate, see `forst-rs-io-uring`), all regions go down as
+    /// ONE ring submission; otherwise the portable serial-pread
+    /// [`forst_rs_io::PreadBlockIo`] fallback runs — bit-identical results.
+    pub(crate) fn read_block_regions(
+        &self,
+        regions: &[(u64, usize)],
+        buf: &mut [u8],
+    ) -> ForstResult<()> {
+        // SECURITY: bound every region against file_size (same rationale as
+        // read_decoded_block — the sparse index is untrusted input).
+        for &(off, len) in regions {
+            let end = off
+                .checked_add(len as u64)
+                .ok_or_else(|| ForstError::corruption("SST window offset+len overflow"))?;
+            if end > self.file_size {
+                return Err(ForstError::corruption(format!(
+                    "SST window [{}, {}) exceeds file_size {}",
+                    off, end, self.file_size
+                )));
+            }
+        }
+        if let Some(handle) = self.file.local_file_handle() {
+            if let Some(uring) = forst_rs_io_uring::UringBlockIo::new(handle) {
+                use forst_rs_io::BlockIo as _;
+                return uring.read_at_vectored(regions, buf);
+            }
+        }
+        use forst_rs_io::BlockIo as _;
+        forst_rs_io::PreadBlockIo(self.file.as_ref()).read_at_vectored(regions, buf)
+    }
+
+    /// Bumps the `blocks_read` diagnostic counter — the prefetcher calls this
+    /// once per block DELIVERED to its consumer, preserving the counter's
+    /// "blocks the scan actually consumed" semantics (`for_each_row_in_block`
+    /// bumps it on the legacy demand path).
+    pub(crate) fn note_block_read(&self) {
+        self.blocks_read
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Reads and decodes the data block at `block_idx` (0-based). Returns the

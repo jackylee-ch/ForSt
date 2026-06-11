@@ -120,6 +120,31 @@ pub trait RandomAccessFile: Send + Sync {
 
     /// Returns the total file size in bytes.
     fn file_size(&self) -> ForstResult<u64>;
+
+    /// §2.1 (streaming-read redesign): whether reads are CURRENTLY served from
+    /// local storage (µs-class preads) as opposed to a remote object store
+    /// (ms-class round-trips). The block prefetcher uses this to pick its
+    /// readahead regime: local caps the window at 256 KiB and ramps after 2
+    /// sequential blocks; remote caps at 4 MiB and ramps after the FIRST block
+    /// (a GetObject has high fixed cost). Default `true` (local) — only
+    /// remote/object-store backed files override. Implementations may answer
+    /// per-call (e.g. a local-first cache file answers per current serving
+    /// tier), so callers should treat it as a hint, not an invariant.
+    fn is_local(&self) -> bool {
+        true
+    }
+
+    /// io_uring backend (streaming-read redesign): the underlying LOCAL
+    /// regular-file handle when this reader currently serves from one, used
+    /// by `UringBlockIo` to submit vectored block reads against the raw fd.
+    /// Default `None` (remote / in-memory / synthetic backends) — callers
+    /// fall back to [`crate::block_io::PreadBlockIo`] over `read_at`.
+    /// Like [`Self::is_local`], the answer may change per call (local-first
+    /// cache files); the returned handle stays valid regardless (write-once
+    /// files; an open fd outlives eviction/unlink on Unix).
+    fn local_file_handle(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        None
+    }
 }
 
 /// A file opened for sequential (append-only) writes.

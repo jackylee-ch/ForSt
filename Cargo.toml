@@ -19,6 +19,7 @@ members = [
     "crates/forst-rs-engine",
     "crates/forst-rs-ffi",
     "crates/forst-rs-io",
+    "crates/forst-rs-io-uring",
     "crates/forst-rs-storage",
     "crates/forst-rs-test-harness",
     "crates/forst-rs-test-utils",
@@ -42,6 +43,7 @@ forst-rs-common = { path = "crates/forst-rs-common" }
 forst-rs-engine = { path = "crates/forst-rs-engine" }
 forst-rs-ffi = { path = "crates/forst-rs-ffi" }
 forst-rs-io = { path = "crates/forst-rs-io" }
+forst-rs-io-uring = { path = "crates/forst-rs-io-uring" }
 forst-rs-storage = { path = "crates/forst-rs-storage" }
 forst-rs-test-harness = { path = "crates/forst-rs-test-harness" }
 forst-rs-test-utils = { path = "crates/forst-rs-test-utils" }

@@ -1164,6 +1164,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "forst-rs-io-uring"
+version = "0.1.0"
+dependencies = [
+ "forst-rs-common",
+ "forst-rs-io",
+ "io-uring",
+ "tempfile",
+]
+
+[[package]]
 name = "forst-rs-storage"
 version = "0.1.0"
 dependencies = [
@@ -1173,6 +1183,7 @@ dependencies = [
  "crossbeam-skiplist",
  "forst-rs-common",
  "forst-rs-io",
+ "forst-rs-io-uring",
  "forst-rs-test-utils",
  "lz4_flex",
  "rustc-hash 2.1.2",
@@ -1755,6 +1766,17 @@ dependencies = [
  "hashbrown 0.17.0",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]

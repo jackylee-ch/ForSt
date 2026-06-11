@@ -762,6 +762,22 @@ impl RandomAccessFile for LocalFirstSstFile {
     fn file_size(&self) -> ForstResult<u64> {
         Ok(self.file_size)
     }
+
+    /// §2.1 (streaming-read redesign): answers per CURRENT serving tier — the
+    /// write-through local copy is usually present (µs-class preads → shallow
+    /// readahead); once LRU-evicted, reads fall back to the remote backend
+    /// (ms-class round-trips → the prefetcher's deep 4 MiB regime).
+    fn is_local(&self) -> bool {
+        self.cache.contains(&self.key)
+    }
+
+    /// io_uring backend: the write-through copy's shared fd when locally
+    /// resident (FRS-FDCACHE handle — stays valid across later eviction;
+    /// write-once bytes). `None` once evicted → callers pread the remote
+    /// fallback path instead.
+    fn local_file_handle(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        self.cache.file_handle(&self.key)
+    }
 }
 
 impl LocalFirstSstFile {

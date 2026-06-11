@@ -6305,6 +6305,89 @@ impl DbImpl {
             .collect()
     }
 
+    /// P1 (streaming-read redesign §2.3): parallel batched prefix-iterator
+    /// open **plus per-probe post-processing on the pool thread**.
+    ///
+    /// [`Self::batch_open_prefix_iters_parallel`] fans out only the iterator
+    /// BUILD; its caller (the FFI batch-open) then drained every probe's
+    /// first chunk SERIALLY on the single FFI-calling thread — i.e. all block
+    /// I/O + decompression + k-way merge + memcpy of the dominant
+    /// exhausted-in-one-chunk probe ran on 1 core. This variant runs the
+    /// caller-supplied `f(probe_index, build_result)` INSIDE the same pool
+    /// job, immediately after the build, so the first-chunk fill executes on
+    /// the read pool too (`min(cores,4)` workers, `FRS_RS_READ_IO_PARALLELISM`)
+    /// — the engine-side equivalent of ForSt's `read-io-parallelism` covering
+    /// the drain, not just the build.
+    ///
+    /// Results are returned in INPUT ORDER. `None` marks a probe whose pool
+    /// worker dropped its result (worker panic) — the caller maps it to an
+    /// internal error, mirroring the sibling method's behaviour. `f` must be
+    /// `Sync` (shared across workers via `Arc`) and is invoked exactly once
+    /// per probe with the probe's index into `prefixes`.
+    pub fn batch_open_prefix_iters_parallel_map<R, F>(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefixes: &[&[u8]],
+        f: F,
+    ) -> Vec<Option<R>>
+    where
+        R: Send + 'static,
+        F: Fn(
+                usize,
+                ForstResult<
+                    Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>,
+                >,
+            ) -> R
+            + Send
+            + Sync
+            + 'static,
+    {
+        let k = prefixes.len();
+        if k == 0 {
+            return Vec::new();
+        }
+        // Single probe: run inline — fan-out + channel overhead would only cost.
+        if k == 1 {
+            let r = self.prefix_scan_iter_owned_arc(cf, prefixes[0]);
+            return vec![Some(f(0, r))];
+        }
+        let pool = bg_read_pool();
+        let f = Arc::new(f);
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, p) in prefixes.iter().enumerate() {
+            let me = Arc::clone(self);
+            let cf = cf.clone();
+            // Own the prefix bytes so the job is 'static (small composite state
+            // key — the only copy on this path).
+            let prefix = p.to_vec();
+            let tx = tx.clone();
+            let f = Arc::clone(&f);
+            pool.submit(Box::new(move || {
+                // Build (eager locate + reader open) AND the caller's
+                // post-processing (FFI: first-chunk fill + EOF decision) both
+                // run here, on the pool worker.
+                let built = me.prefix_scan_iter_owned_arc(&cf, &prefix);
+                let r = f(i, built);
+                // The receiver drains exactly K results below, so send only
+                // fails if the receiver bailed early (worker-panic path).
+                let _ = tx.send((i, r));
+            }));
+        }
+        drop(tx);
+        let mut out: Vec<Option<R>> = (0..k).map(|_| None).collect();
+        let mut filled = 0usize;
+        while filled < k {
+            match rx.recv() {
+                Ok((i, r)) => {
+                    out[i] = Some(r);
+                    filled += 1;
+                }
+                Err(_) => break, // all senders dropped (a worker panicked)
+            }
+        }
+        out
+    }
+
     /// Streaming form of [`Self::prefix_scan`].
     ///
     /// PR-B5-H2 / C8-H1: lazy k-way merge across ALL three LSM tiers
@@ -6814,11 +6897,18 @@ impl DbImpl {
             // prefix cannot match and reading them was the q7-ckpt-on hotspot
             // (executeIters ~95% of dispatch once state flushed to SSTs).
             let start_block = reader.first_block_ge(prefix);
+            // §2.1: the per-source BlockPrefetcher owns the block cursor —
+            // demand-paged while cold (R-short probes never speculate),
+            // double-buffered multi-block readahead once consumption proves
+            // sequential, clamped at the sparse-index block for `upper`.
             sources.push(TierKeySource::Sst {
-                reader,
+                fetcher: forst_rs_storage::sst::prefetch::BlockPrefetcher::new(
+                    reader,
+                    start_block,
+                    upper_slice,
+                ),
                 lower: prefix.to_vec(),
                 upper: upper.clone(),
-                next_block: start_block,
                 buffered: Vec::new(),
                 pos: 0,
             });
@@ -6945,11 +7035,15 @@ impl DbImpl {
             // FRS-PREFIX-SEEK: seek to the first index block >= lower (see sister
             // site in prefix_scan_iter_owned*) instead of scanning from block 0.
             let start_block = reader.first_block_ge(lower);
+            // §2.1: per-source BlockPrefetcher (see the prefix-path sister site).
             sources.push(TierKeySource::Sst {
-                reader,
+                fetcher: forst_rs_storage::sst::prefetch::BlockPrefetcher::new(
+                    reader,
+                    start_block,
+                    upper,
+                ),
                 lower: lower.to_vec(),
                 upper: upper_owned.clone(),
-                next_block: start_block,
                 buffered: Vec::new(),
                 pos: 0,
             });
@@ -10495,10 +10589,14 @@ enum TierKeySource {
     MemCursor {
         cursor: forst_rs_storage::memtable::sharded::MemTierCursor,
     },
-    /// Overlapping SST. Blocks are read one at a time via
-    /// `read_block_at(next_block)`; per-block keys are buffered as
-    /// `Vec<Arc<[u8]>>` (a single block is bounded by `block_size`, default
-    /// 4 KiB — small constant, not multiplied by tier count).
+    /// Overlapping SST. Blocks are delivered in index order by the per-source
+    /// [`BlockPrefetcher`] (§2.1 streaming-read redesign — replaces the raw
+    /// `next_block: usize` demand cursor): cold sources demand-fetch one
+    /// block exactly like the legacy path; sequential consumption ramps a
+    /// double-buffered multi-block readahead window produced on the shared
+    /// read-I/O pool. Per-block keys are buffered as `Vec<SstHeadRow>` (a
+    /// single block is bounded by `block_size` — small constant, not
+    /// multiplied by tier count).
     ///
     /// C9-H2: buffer element type is `Arc<[u8]>` rather than `Vec<u8>`.
     /// The `Arc::<[u8]>::from(view.key)` step still pays exactly ONE
@@ -10514,10 +10612,9 @@ enum TierKeySource {
     /// streaming filter at `peek()` already performs `[lower, upper)`
     /// truncation regardless of whether `lower` is a true prefix.
     Sst {
-        reader: Arc<SstReaderImpl>,
+        fetcher: forst_rs_storage::sst::prefetch::BlockPrefetcher,
         lower: Vec<u8>,
         upper: Option<Vec<u8>>,
-        next_block: usize,
         buffered: Vec<SstHeadRow>,
         pos: usize,
     },
@@ -10550,10 +10647,9 @@ impl TierKeySource {
         match self {
             TierKeySource::MemCursor { cursor } => Ok(cursor.peek()),
             TierKeySource::Sst {
-                reader,
+                fetcher,
                 lower,
                 upper,
-                next_block,
                 buffered,
                 pos,
             } => {
@@ -10563,12 +10659,15 @@ impl TierKeySource {
                     if *pos < buffered.len() {
                         return Ok(Some(buffered[*pos].key.as_ref()));
                     }
-                    if *next_block >= reader.index_entry_count() {
+                    // §2.1: the BlockPrefetcher replaces the legacy one-pread-
+                    // per-replenish demand loop. `next_decoded()` serves cold
+                    // sources by an identical synchronous demand fetch and
+                    // ramped sources from the double-buffered readahead
+                    // window; `None` = source exhausted (incl. the sparse-
+                    // index `end_block` clamp computed from `upper`).
+                    let Some(block) = fetcher.next_decoded()? else {
                         return Ok(None);
-                    }
-                    // Range-skip empty blocks before paying decompression.
-                    let block_idx = *next_block;
-                    *next_block += 1;
+                    };
                     buffered.clear();
                     *pos = 0;
                     // 2026-06-02 q7 SECOND-wall FIX: upper-bound early termination.
@@ -10581,7 +10680,7 @@ impl TierKeySource {
                     // whole SST tail: measured 46 ms/probe returning 0 rows over 1 SST
                     // source — the q7 ckpt-ON ~100/s join-throughput collapse.
                     let mut hit_upper = false;
-                    reader.for_each_row_in_block(block_idx, |view| {
+                    block.for_each_row(|view| {
                         if hit_upper {
                             // Already past the upper bound; remaining rows in this
                             // block are all >= upper (ASC). Cheap skip; we mark the
@@ -10630,16 +10729,18 @@ impl TierKeySource {
                         Ok(())
                     })?;
                     if hit_upper {
-                        // No later block can contain an in-range key — mark this SST
-                        // source drained. Any keys buffered BEFORE the upper bound in
-                        // this block are still returned by the `*pos < buffered.len()`
-                        // fast path on the next loop iteration; once they drain, the
-                        // EOF check returns None.
-                        *next_block = reader.index_entry_count();
+                        // No later block can contain an in-range key — terminate
+                        // this SST source's prefetcher (drops any in-flight
+                        // readahead window; its result is discarded on the dead
+                        // handle). Any keys buffered BEFORE the upper bound in
+                        // this block are still returned by the `*pos <
+                        // buffered.len()` fast path on the next loop iteration;
+                        // once they drain, `next_decoded()` returns None.
+                        fetcher.terminate();
                     }
                     // Loop: if this block was entirely out-of-range or
                     // contained no rows, peek the next block (unless we just
-                    // hit the upper bound, in which case next_block == EOF).
+                    // hit the upper bound, in which case the fetcher is EOF).
                 }
             }
         }
