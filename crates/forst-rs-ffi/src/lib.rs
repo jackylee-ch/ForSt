@@ -88,7 +88,8 @@ use forst_rs_engine::{
 };
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
 use forst_rs_storage::merge_operator::{
-    ListAppendMergeOperator, MergeOperator, NumericAddMergeOperator, RawConcatMergeOperator,
+    ListAppendMergeOperator, MergeOperator, NumericAddBeMergeOperator, NumericAddMergeOperator,
+    RawConcatMergeOperator,
 };
 
 /// Defense-in-depth cap on `count` (or row count) passed to FFI batch
@@ -1229,6 +1230,9 @@ pub unsafe extern "C" fn frs_db_create_cf(
 /// - `"ListAppendMergeOperator"` — comma-separated concatenation
 /// - `"RawConcatMergeOperator"` — byte-for-byte concatenation
 /// - `"NumericAddMergeOperator"` — 8-byte little-endian i64 saturating sum
+/// - `"NumericAddBeMergeOperator"` — 8-byte big-endian i64 WRAPPING sum
+///   (byte-equivalent to Java `long +` over Flink `LongSerializer` bytes;
+///   OPT-N04 §4 — the operator merge-routed Reducing states bind by name)
 #[no_mangle]
 pub unsafe extern "C" fn frs_db_create_cf_with_merge(
     handle: FrsDb,
@@ -1255,6 +1259,7 @@ pub unsafe extern "C" fn frs_db_create_cf_with_merge(
                 "ListAppendMergeOperator" => Arc::new(ListAppendMergeOperator::with_comma()),
                 "RawConcatMergeOperator" => Arc::new(RawConcatMergeOperator::new()),
                 "NumericAddMergeOperator" => Arc::new(NumericAddMergeOperator::new()),
+                "NumericAddBeMergeOperator" => Arc::new(NumericAddBeMergeOperator::new()),
                 _ => return FRS_STATUS_INVALID_ARGUMENT,
             };
             desc = desc.with_merge_operator(op);
@@ -6737,6 +6742,43 @@ mod tests {
             frs_get(db, cf, k.as_ptr(), k.len(), &mut out);
             let slice = slice::from_raw_parts(out.data, out.len);
             assert_eq!(slice, b"a,b,c");
+            frs_bytes_free(&mut out);
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
+    fn test_merge_with_numeric_add_be() {
+        // OPT-N04 §4: backend binds the BE wrapping operator BY NAME via
+        // `frs_db_create_cf_with_merge` — this is the name-match arm test.
+        // Bytes are big-endian (Flink DataOutputSerializer.writeLong order)
+        // and addition wraps (Java `long +`).
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            frs_db_open_memory(&mut db);
+
+            let name = CString::new("agg-merge-i64").unwrap();
+            let op_name = CString::new("NumericAddBeMergeOperator").unwrap();
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(
+                frs_db_create_cf_with_merge(db, name.as_ptr(), op_name.as_ptr(), &mut cf,),
+                FRS_STATUS_OK
+            );
+
+            let k = b"acc";
+            let base = 5i64.to_be_bytes();
+            let d1 = 1i64.to_be_bytes();
+            let d2 = (-2i64).to_be_bytes();
+            frs_put(db, cf, k.as_ptr(), k.len(), base.as_ptr(), base.len());
+            frs_merge(db, cf, k.as_ptr(), k.len(), d1.as_ptr(), d1.len());
+            frs_merge(db, cf, k.as_ptr(), k.len(), d2.as_ptr(), d2.len());
+
+            let mut out = FrsBytes::NULL;
+            frs_get(db, cf, k.as_ptr(), k.len(), &mut out);
+            let slice = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(slice, &4i64.to_be_bytes());
             frs_bytes_free(&mut out);
 
             frs_cf_close(cf);

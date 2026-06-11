@@ -28,6 +28,10 @@
 //!   operands byte-for-byte without a delimiter.
 //! - [`NumericAddMergeOperator`] — a built-in operator that sums 8-byte
 //!   little-endian `i64` deltas (supports retraction via negative deltas).
+//! - [`NumericAddBeMergeOperator`] — a built-in operator that sums 8-byte
+//!   BIG-endian `i64` deltas with WRAPPING two's-complement addition
+//!   (byte-equivalent to Java `long +` over `DataOutputSerializer.writeLong`
+//!   bytes; supports retraction via negative deltas).
 
 use forst_rs_common::{ForstError, ForstResult};
 
@@ -269,6 +273,87 @@ impl MergeOperator for NumericAddMergeOperator {
         // Identity contract (R46-L2): this name is compared by the cross-CF
         // homogeneity check — it must stay stable across releases.
         "NumericAddMergeOperator".to_string()
+    }
+}
+
+/// A merge operator that sums 8-byte **big-endian** `i64` deltas with
+/// **wrapping** two's-complement addition (OPT-N04 §4).
+///
+/// This is the operator for Flink `Long` accumulator state: Flink's
+/// `LongSerializer` writes longs via `DataOutputSerializer.writeLong` in
+/// network order (MSB first), and Java `long +` wraps on overflow. The
+/// little-endian, saturating [`NumericAddMergeOperator`] is the wrong fold
+/// for those bytes on two counts:
+///
+/// 1. **Endianness** — it would sum byte-swapped garbage.
+/// 2. **Saturation is not associative near the rails**
+///    (`sat(sat(MAX,1),-1) = MAX-1 != sat(sat(MAX,-1),1) = MAX`), so
+///    compaction's freedom to `partial_merge` any adjacent operand pair
+///    (order-independence) would change results. `wrapping_add` is fully
+///    associative and commutative, the exact guarantee Java's wrapping `+`
+///    gives the GET→fold→PUT path this operator replaces.
+///
+/// Semantics:
+/// - `full_merge("k", Some(5), [+1, -2])` produces `4`
+/// - `full_merge("k", None, [+1, +1, -1])` produces `1` (retraction =
+///   negative deltas; no special casing)
+/// - `partial_merge("k", a, b)` produces `a.wrapping_add(b)`
+/// - a base or operand whose length is not exactly 8 bytes yields a
+///   [`ForstError::Corruption`] (never a panic) — same contract as the
+///   LE twin.
+pub struct NumericAddBeMergeOperator;
+
+impl NumericAddBeMergeOperator {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Decodes an 8-byte big-endian `i64`, or returns a corruption error.
+    fn decode_i64(bytes: &[u8]) -> ForstResult<i64> {
+        let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+            ForstError::corruption(format!(
+                "NumericAddBeMergeOperator: expected 8-byte big-endian i64, got {} bytes",
+                bytes.len()
+            ))
+        })?;
+        Ok(i64::from_be_bytes(arr))
+    }
+}
+
+impl Default for NumericAddBeMergeOperator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MergeOperator for NumericAddBeMergeOperator {
+    fn full_merge(
+        &self,
+        _key: &[u8],
+        base_value: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> ForstResult<Vec<u8>> {
+        let mut sum = match base_value {
+            Some(base) => Self::decode_i64(base)?,
+            None => 0,
+        };
+        for op in operands {
+            sum = sum.wrapping_add(Self::decode_i64(op)?);
+        }
+        Ok(sum.to_be_bytes().to_vec())
+    }
+
+    fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> ForstResult<Vec<u8>> {
+        let sum = Self::decode_i64(left)?.wrapping_add(Self::decode_i64(right)?);
+        Ok(sum.to_be_bytes().to_vec())
+    }
+
+    fn name(&self) -> String {
+        // Identity contract (R46-L2): cross-checkpoint identity — compared
+        // by the restore-by-name match and the cross-CF homogeneity check.
+        // Fixed string, never versioned-by-config (it has no config) —
+        // OPT-N04 §3.3 name-stability requirement.
+        "NumericAddBeMergeOperator".to_string()
     }
 }
 
@@ -540,5 +625,290 @@ mod tests {
         let flat = op.full_merge(b"key", Some(&base), &[&a, &b, &c]).unwrap();
         assert_eq!(combined, flat);
         assert_eq!(combined, le(107));
+    }
+
+    // --- NumericAddBeMergeOperator tests (OPT-N04 §4) ---
+
+    fn be(v: i64) -> Vec<u8> {
+        v.to_be_bytes().to_vec()
+    }
+
+    /// Deterministic xorshift64* PRNG — no test-only deps needed.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn next_i64(&mut self) -> i64 {
+            self.next() as i64
+        }
+        /// Random index in `0..n`.
+        fn next_idx(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn test_numeric_add_be_name_is_stable() {
+        let op = NumericAddBeMergeOperator::new();
+        assert_eq!(op.name(), "NumericAddBeMergeOperator");
+        // Must be distinct from the LE twin's identity.
+        assert_ne!(op.name(), NumericAddMergeOperator::new().name());
+    }
+
+    #[test]
+    fn test_numeric_add_be_byte_layout_is_big_endian() {
+        // Byte-equivalence gate with Flink: DataOutputSerializer.writeLong
+        // stores network order (MSB first). 1 + 2 == 3 in BE bytes.
+        let op = NumericAddBeMergeOperator::new();
+        let (a, b) = (be(1), be(2));
+        let result = op.full_merge(b"key", None, &[&a, &b]).unwrap();
+        assert_eq!(result, vec![0, 0, 0, 0, 0, 0, 0, 3]);
+        // Sanity: BE bytes of 1 are NOT the LE bytes of 1.
+        assert_ne!(be(1), le(1));
+    }
+
+    #[test]
+    fn test_numeric_add_be_sums_positive_deltas_no_base() {
+        let op = NumericAddBeMergeOperator::new();
+        let (a, b, c) = (be(1), be(2), be(3));
+        let result = op.full_merge(b"key", None, &[&a, &b, &c]).unwrap();
+        assert_eq!(result, be(6));
+    }
+
+    #[test]
+    fn test_numeric_add_be_retraction() {
+        let op = NumericAddBeMergeOperator::new();
+        let (p1, p2, m1) = (be(1), be(1), be(-1));
+        let result = op.full_merge(b"key", None, &[&p1, &p2, &m1]).unwrap();
+        assert_eq!(result, be(1));
+    }
+
+    #[test]
+    fn test_numeric_add_be_retraction_below_zero() {
+        // Retraction past zero is just a negative i64 — no clamping.
+        let op = NumericAddBeMergeOperator::new();
+        let base = be(5);
+        let m = be(-8);
+        let result = op.full_merge(b"key", Some(&base), &[&m]).unwrap();
+        assert_eq!(result, be(-3));
+    }
+
+    #[test]
+    fn test_numeric_add_be_base_plus_operands() {
+        let op = NumericAddBeMergeOperator::new();
+        let base = be(10);
+        let (a, b) = (be(5), be(-3));
+        let result = op.full_merge(b"key", Some(&base), &[&a, &b]).unwrap();
+        assert_eq!(result, be(12));
+    }
+
+    #[test]
+    fn test_numeric_add_be_no_operands_returns_base() {
+        let op = NumericAddBeMergeOperator::new();
+        let base = be(42);
+        let result = op.full_merge(b"key", Some(&base), &[]).unwrap();
+        assert_eq!(result, be(42));
+    }
+
+    #[test]
+    fn test_numeric_add_be_no_base_no_operands_is_zero() {
+        let op = NumericAddBeMergeOperator::new();
+        let result = op.full_merge(b"key", None, &[]).unwrap();
+        assert_eq!(result, be(0));
+    }
+
+    #[test]
+    fn test_numeric_add_be_wraps_at_max() {
+        // WRAPPING, not saturating — byte-equivalent to Java `long +`.
+        let op = NumericAddBeMergeOperator::new();
+        let base = be(i64::MAX);
+        let one = be(1);
+        let result = op.full_merge(b"key", Some(&base), &[&one]).unwrap();
+        assert_eq!(result, be(i64::MIN)); // Long.MAX_VALUE + 1L == Long.MIN_VALUE
+    }
+
+    #[test]
+    fn test_numeric_add_be_wraps_at_min() {
+        let op = NumericAddBeMergeOperator::new();
+        let base = be(i64::MIN);
+        let neg = be(-1);
+        let result = op.full_merge(b"key", Some(&base), &[&neg]).unwrap();
+        assert_eq!(result, be(i64::MAX)); // Long.MIN_VALUE - 1L == Long.MAX_VALUE
+    }
+
+    #[test]
+    fn test_numeric_add_be_partial_merge_sums() {
+        let op = NumericAddBeMergeOperator::new();
+        let result = op.partial_merge(b"key", &be(7), &be(-2)).unwrap();
+        assert_eq!(result, be(5));
+    }
+
+    #[test]
+    fn test_numeric_add_be_partial_merge_wraps() {
+        let op = NumericAddBeMergeOperator::new();
+        let result = op.partial_merge(b"key", &be(i64::MAX), &be(1)).unwrap();
+        assert_eq!(result, be(i64::MIN));
+    }
+
+    #[test]
+    fn test_numeric_add_be_malformed_operand_is_corruption() {
+        let op = NumericAddBeMergeOperator::new();
+        let short: &[u8] = b"abc";
+        let err = op.full_merge(b"key", None, &[short]).unwrap_err();
+        assert!(err.is_corruption(), "expected Corruption, got {err:?}");
+    }
+
+    #[test]
+    fn test_numeric_add_be_malformed_base_is_corruption() {
+        let op = NumericAddBeMergeOperator::new();
+        let err = op.full_merge(b"key", Some(b"too-long-9"), &[]).unwrap_err();
+        assert!(err.is_corruption(), "expected Corruption, got {err:?}");
+    }
+
+    #[test]
+    fn test_numeric_add_be_associativity_at_overflow() {
+        // The exact hazard that disqualifies the saturating twin (OPT-N04
+        // §4): near the rails, fold order must not matter.
+        //   wrap(wrap(MAX, 1), -1) == wrap(MAX, wrap(1, -1)) == MAX
+        // whereas sat(sat(MAX,1),-1) = MAX-1 != sat(MAX, sat(1,-1)) = MAX.
+        let op = NumericAddBeMergeOperator::new();
+        let (max, p1, m1) = (be(i64::MAX), be(1), be(-1));
+
+        // Left-fold via partial_merge: ((MAX + 1) + -1)
+        let max_p1 = op.partial_merge(b"k", &max, &p1).unwrap();
+        let left = op.partial_merge(b"k", &max_p1, &m1).unwrap();
+        // Right-fold via partial_merge: (MAX + (1 + -1))
+        let p1_m1 = op.partial_merge(b"k", &p1, &m1).unwrap();
+        let right = op.partial_merge(b"k", &max, &p1_m1).unwrap();
+        // Flat full_merge.
+        let flat = op.full_merge(b"k", Some(&max), &[&p1, &m1]).unwrap();
+
+        assert_eq!(left, right);
+        assert_eq!(left, flat);
+        assert_eq!(left, be(i64::MAX));
+
+        // Demonstrate the LE/saturating twin really IS order-dependent here
+        // (regression tripwire: if it is ever made wrapping, the BE twin is
+        // no longer the only safe fold and this doc claim must be revised).
+        let sat = NumericAddMergeOperator::new();
+        let (smax, sp1, sm1) = (le(i64::MAX), le(1), le(-1));
+        let s_left = {
+            let t = sat.partial_merge(b"k", &smax, &sp1).unwrap();
+            sat.partial_merge(b"k", &t, &sm1).unwrap()
+        };
+        let s_right = {
+            let t = sat.partial_merge(b"k", &sp1, &sm1).unwrap();
+            sat.partial_merge(b"k", &smax, &t).unwrap()
+        };
+        assert_ne!(s_left, s_right, "saturating add must be non-associative at the rail");
+    }
+
+    #[test]
+    fn test_numeric_add_be_property_full_merge_matches_java_wrapping_fold() {
+        // G1 property test: random (base, deltas[]) — full_merge must equal
+        // a plain Java-style wrapping left-fold, byte-for-byte (BE).
+        let op = NumericAddBeMergeOperator::new();
+        let mut rng = XorShift(0x9E3779B97F4A7C15);
+        for case in 0..200 {
+            let has_base = case % 3 != 0;
+            let base_v = rng.next_i64();
+            let n = rng.next_idx(17); // 0..=16 operands
+            let deltas: Vec<i64> = (0..n).map(|_| rng.next_i64()).collect();
+
+            let mut expected: i64 = if has_base { base_v } else { 0 };
+            for d in &deltas {
+                expected = expected.wrapping_add(*d);
+            }
+
+            let base_bytes = be(base_v);
+            let operand_bytes: Vec<Vec<u8>> = deltas.iter().map(|d| be(*d)).collect();
+            let operand_refs: Vec<&[u8]> =
+                operand_bytes.iter().map(|v| v.as_slice()).collect();
+            let result = op
+                .full_merge(
+                    b"key",
+                    if has_base { Some(base_bytes.as_slice()) } else { None },
+                    &operand_refs,
+                )
+                .unwrap();
+            assert_eq!(result, be(expected), "case {case} diverged from wrapping fold");
+        }
+    }
+
+    #[test]
+    fn test_numeric_add_be_property_partial_merge_order_independence() {
+        // G1 property test: compaction may partial_merge ANY adjacent pair
+        // in any order. Repeatedly collapse a random adjacent pair until one
+        // operand remains; every collapse order must produce the same bytes
+        // as the flat full_merge.
+        let op = NumericAddBeMergeOperator::new();
+        let mut rng = XorShift(0xDEADBEEFCAFEF00D);
+        for case in 0..100 {
+            let n = 2 + rng.next_idx(9); // 2..=10 operands
+            let deltas: Vec<i64> = (0..n)
+                .map(|_| {
+                    // Mix extreme values in so wrap-around actually happens.
+                    match rng.next_idx(4) {
+                        0 => i64::MAX,
+                        1 => i64::MIN,
+                        _ => rng.next_i64(),
+                    }
+                })
+                .collect();
+
+            let operand_bytes: Vec<Vec<u8>> = deltas.iter().map(|d| be(*d)).collect();
+            let operand_refs: Vec<&[u8]> =
+                operand_bytes.iter().map(|v| v.as_slice()).collect();
+            let flat = op.full_merge(b"key", None, &operand_refs).unwrap();
+
+            // 5 random collapse orders per operand set.
+            for _ in 0..5 {
+                let mut chain = operand_bytes.clone();
+                while chain.len() > 1 {
+                    let i = rng.next_idx(chain.len() - 1);
+                    let merged = op.partial_merge(b"key", &chain[i], &chain[i + 1]).unwrap();
+                    chain[i] = merged;
+                    chain.remove(i + 1);
+                }
+                let collapsed_ref: &[u8] = &chain[0];
+                let via_partial = op.full_merge(b"key", None, &[collapsed_ref]).unwrap();
+                assert_eq!(
+                    via_partial, flat,
+                    "case {case}: partial_merge collapse order changed the result"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_numeric_add_be_property_commutativity() {
+        // Shuffle-invariance of the operand SET (commutativity + assoc):
+        // any permutation of the deltas full_merges to the same bytes.
+        let op = NumericAddBeMergeOperator::new();
+        let mut rng = XorShift(0x123456789ABCDEF1);
+        for case in 0..100 {
+            let n = 2 + rng.next_idx(9);
+            let mut deltas: Vec<i64> = (0..n).map(|_| rng.next_i64()).collect();
+            let bytes = |ds: &[i64]| -> Vec<Vec<u8>> { ds.iter().map(|d| be(*d)).collect() };
+            let merge = |obs: &[Vec<u8>]| -> Vec<u8> {
+                let refs: Vec<&[u8]> = obs.iter().map(|v| v.as_slice()).collect();
+                op.full_merge(b"key", None, &refs).unwrap()
+            };
+            let baseline = merge(&bytes(&deltas));
+            // Fisher-Yates shuffle, 3 permutations.
+            for _ in 0..3 {
+                for i in (1..deltas.len()).rev() {
+                    let j = rng.next_idx(i + 1);
+                    deltas.swap(i, j);
+                }
+                assert_eq!(merge(&bytes(&deltas)), baseline, "case {case}: permutation diverged");
+            }
+        }
     }
 }

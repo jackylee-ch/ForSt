@@ -35,7 +35,10 @@ use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSyst
 use forst_rs_storage::cache::clock::ShardedClockCache;
 use forst_rs_storage::cached_fs::CachedFileSystem;
 use forst_rs_storage::local_cache::LocalCache;
-use forst_rs_storage::merge_operator::{ListAppendMergeOperator, RawConcatMergeOperator};
+use forst_rs_storage::merge_operator::{
+    ListAppendMergeOperator, NumericAddBeMergeOperator, NumericAddMergeOperator,
+    RawConcatMergeOperator,
+};
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
 use forst_rs_storage::version::{
     SstFileMeta, Version, VersionEdit, VersionSetImpl, VersionSetSnapshot,
@@ -5178,6 +5181,14 @@ impl DbImpl {
                     ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
                         .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma()))
                 }
+                // OPT-N04 E2: numeric-add operators restore by name —
+                // checkpoints holding CFs with these operators must be
+                // restorable (without this arm any checkpoint taken with
+                // merge-RMW routing ON would be permanently unreadable).
+                "NumericAddBeMergeOperator" => ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
+                    .with_merge_operator(Arc::new(NumericAddBeMergeOperator::new())),
+                "NumericAddMergeOperator" => ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
+                    .with_merge_operator(Arc::new(NumericAddMergeOperator::new())),
                 other => {
                     return Err(ForstError::invalid_argument(format!(
                         "checkpoint cf_descriptor for default CF references unknown merge operator '{}'",
@@ -5218,6 +5229,15 @@ impl DbImpl {
                 }
                 "ListAppendMergeOperator" | "ListAppendMergeOperator(delim=44)" => {
                     desc.with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma()))
+                }
+                // OPT-N04 E2: the agg-merge-i64 CF (merge-routed Reducing
+                // states) carries the BE wrapping operator; restore it by
+                // name. The LE twin is recognised for completeness.
+                "NumericAddBeMergeOperator" => {
+                    desc.with_merge_operator(Arc::new(NumericAddBeMergeOperator::new()))
+                }
+                "NumericAddMergeOperator" => {
+                    desc.with_merge_operator(Arc::new(NumericAddMergeOperator::new()))
                 }
                 other => {
                     return Err(ForstError::invalid_argument(format!(
@@ -11815,6 +11835,113 @@ mod tests {
     }
 
     #[test]
+    fn test_noflush_checkpoint_restore_numeric_add_be_live_merge_chain() {
+        // OPT-N04 E2 (§3.3 + §7.2 gate): a CF carrying the BE wrapping
+        // numeric-add operator must restore BY NAME from a checkpoint blob
+        // — without the restore arm, `open_from_incremental` errors with
+        // "unknown merge operator" and any checkpoint taken with merge-RMW
+        // routing ON is permanently unreadable.
+        //
+        // Live-chain gate: write Put(5), Merge(+1), Merge(+2) → noflush
+        // ckpt → restore → GET == 8; then flush+compact → GET == 8.
+        let be = |v: i64| v.to_be_bytes().to_vec();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("db");
+        let art_dir = tmp.path().join("artifacts");
+        let restore_dir = tmp.path().join("restored");
+
+        let manifest_path;
+        let sst_files: Vec<String>;
+        let agg_cf_id;
+        {
+            let fs: Arc<dyn FileSystem> = Arc::new(forst_rs_io::LocalFileSystem::new());
+            let opts = EngineOptions {
+                db_path: db_path.to_string_lossy().to_string(),
+                ..EngineOptions::default()
+            };
+            let db = DbImpl::open_with_fs(opts, fs).unwrap();
+
+            let agg_cf = db
+                .create_column_family(
+                    ColumnFamilyDescriptor::new("agg-merge-i64")
+                        .with_merge_operator(Arc::new(NumericAddBeMergeOperator::new())),
+                )
+                .unwrap();
+            agg_cf_id = agg_cf.id();
+            assert_ne!(agg_cf_id, DEFAULT_CF_ID);
+
+            // The spec's literal gate chain: Put(5) base + two live deltas.
+            db.put(&agg_cf, b"acc/with-base", &be(5)).unwrap();
+            db.merge(&agg_cf, b"acc/with-base", &be(1)).unwrap();
+            db.merge(&agg_cf, b"acc/with-base", &be(2)).unwrap();
+            // A base-less chain (pure deltas, incl. a retraction).
+            db.merge(&agg_cf, b"acc/no-base", &be(7)).unwrap();
+            db.merge(&agg_cf, b"acc/no-base", &be(-3)).unwrap();
+
+            let snap = db.snapshot();
+            let result = db
+                .create_incremental_checkpoint_noflush(&snap, 1, 0)
+                .unwrap();
+            let arts = db.snapshot_memtables_to_dir(&art_dir, None).unwrap();
+            assert!(
+                arts.iter().any(|(cf_id, _)| *cf_id == agg_cf_id.0),
+                "the agg CF's live memtable (pending Merge operands) must be captured"
+            );
+
+            manifest_path = result.manifest_path.to_string_lossy().to_string();
+            sst_files = result
+                .new_ssts
+                .iter()
+                .chain(result.shared_ssts.iter())
+                .map(|f| f.path.to_string_lossy().to_string())
+                .collect();
+        } // drop db1
+
+        // Restore via the exact path the Java backend uses. This call is the
+        // E2 regression line: it fails with "unknown merge operator
+        // 'NumericAddBeMergeOperator'" without the restore-by-name arm.
+        let db2 = DbImpl::open_from_incremental(
+            &restore_dir.to_string_lossy(),
+            &manifest_path,
+            &sst_files,
+        )
+        .unwrap();
+        db2.replay_memtable_artifacts_from_dir(&art_dir).unwrap();
+
+        let agg_cf2 = db2
+            .column_family("agg-merge-i64")
+            .expect("agg-merge-i64 CF must be re-registered on restore");
+        assert_eq!(
+            agg_cf2.id(),
+            agg_cf_id,
+            "restored agg CF must preserve its original cf_id"
+        );
+
+        // GET folds the restored chain through the restored operator.
+        assert_eq!(
+            db2.get(&agg_cf2, b"acc/with-base").unwrap(),
+            Some(be(8)),
+            "Put(5)+Merge(+1)+Merge(+2) must fold to 8 after noflush restore"
+        );
+        assert_eq!(
+            db2.get(&agg_cf2, b"acc/no-base").unwrap(),
+            Some(be(4)),
+            "Merge(+7)+Merge(-3) with no base must fold to 4 after restore"
+        );
+
+        // Then compact: flush the replayed chain into an SST and compact it —
+        // compaction's full_merge must collapse to the same bytes.
+        db2.switch_and_flush(&agg_cf2).unwrap();
+        db2.compact_range(&agg_cf2).unwrap();
+        assert_eq!(
+            db2.get(&agg_cf2, b"acc/with-base").unwrap(),
+            Some(be(8)),
+            "value changed after flush+compact of the restored merge chain"
+        );
+        assert_eq!(db2.get(&agg_cf2, b"acc/no-base").unwrap(), Some(be(4)));
+    }
+
+    #[test]
     fn test_default_cf_accessor() {
         let db = open();
         let h = db.default_cf();
@@ -14114,6 +14241,53 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_checkpoint_restore_numeric_add_be_cf_round_trip() {
+        // OPT-N04 E2, flush-based-checkpoint leg (G2): create the
+        // agg-merge-i64 CF with the BE wrapping operator, leave a merge
+        // chain split across an SST and the active memtable, checkpoint,
+        // restore via `open_from_checkpoint`, and verify the fold — then
+        // compact on the restored engine and verify again.
+        use forst_rs_io::MemoryFileSystem;
+        let be = |v: i64| v.to_be_bytes().to_vec();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+
+        let agg_cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("agg-merge-i64")
+                    .with_merge_operator(Arc::new(NumericAddBeMergeOperator::new())),
+            )
+            .unwrap();
+        // SST-resident part of the chain: Put(10) + Merge(+5), then flush.
+        db.put(&agg_cf, b"acc/k", &be(10)).unwrap();
+        db.merge(&agg_cf, b"acc/k", &be(5)).unwrap();
+        db.switch_and_flush(&agg_cf).unwrap();
+        // Memtable-resident continuation: Merge(-3) (retraction).
+        db.merge(&agg_cf, b"acc/k", &be(-3)).unwrap();
+
+        db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
+
+        let opts = EngineOptions {
+            db_path: "/ckpt".to_string(),
+            ..EngineOptions::default()
+        };
+        // E2 regression line: errors "unknown merge operator" without the arm.
+        let restored = DbImpl::open_from_checkpoint(opts, fs).unwrap();
+        let rcf = restored
+            .column_family("agg-merge-i64")
+            .expect("agg-merge-i64 CF must be restored by name");
+        assert_eq!(
+            restored.get(&rcf, b"acc/k").unwrap(),
+            Some(be(12)),
+            "Put(10)+Merge(+5)+Merge(-3) must fold to 12 after checkpoint restore"
+        );
+
+        // Compaction on the restored engine must collapse to the same bytes.
+        restored.compact_range(&rcf).unwrap();
+        assert_eq!(restored.get(&rcf, b"acc/k").unwrap(), Some(be(12)));
     }
 
     /// Recording filesystem wrapper: delegates everything to an inner FS but
