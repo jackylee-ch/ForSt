@@ -2110,3 +2110,8 @@ gap (S2 loser-tree in build + compaction-windowed next); (5) correctness: frs
 canonical-exact on q9 cross-arch; rdb −143 q9 rows (investigate round 2).
 ROUND 2 (gate matrix 2026-06-12-remote-gate-matrix.md): drain-ON+E5 tip,
 control-first q17, q3 point-get guard, q9/q20 pairs — launching.
+
+### REMOTE ROUND-2 (drain-ON+E5+alloc tip 06549d967/72607e110): gates 1-2 PASS
+q1 smoke 4.0s rows exact | q8 canary 168.0s rows 3,065,198 in-band (drain-ON
+first 100M = correctness-clean; wall in round-1 band ⇒ no q8-class drain cost).
+q3 point-get guard pair running.
