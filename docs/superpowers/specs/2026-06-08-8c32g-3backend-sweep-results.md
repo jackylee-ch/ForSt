@@ -1910,3 +1910,18 @@ gates) while the control had staging ON; (c) pipelining itself. FALSIFIED: the
 DE-CONFOUND NEXT: q9 BLOCKING routing post-fix (control config + fix) isolates the fix's
 cost. q9's real levers revert to: chain-shortening (OPT-N04 merge-op kills the dependent
 GET→PUT), staging absorption under load, iterator cost — the banked Stage-3 work.
+
+### ★★ q9 DE-CONFOUNDED (3-way, same-day, rows EXACT in all — 13 consecutive identical)
+| config | q9@100M |
+|---|---|
+| blocking + PRE-fix (control) | 2215.6s |
+| blocking + fix | 2579.8s ⇒ TIMER FIX COSTS ~+364s (+16%) on q9 |
+| PIPELINED + fix | 2423.4s ⇒ pipelining = REAL −156s (−6%) de-confounded |
+REVISED: multi-worker non-blocking pipelining HELPS q9 (modest; per-key chains bind the
+rest). The fix's COST is the floor-refill ENGINE RE-READ of the orphaned span — but the
+dropped cache entries are IN MEMORY at drop time. OPTIMIZATION (next): on the
+within-window-add invalidation path, BINARY-MERGE the flushed adds into the existing
+cached deque (sorted by ts) instead of dropping + re-reading — O(adds) vs O(span), no
+floor, cursor intact. Benefits ALL timer-heavy queries (q5/q8/q11/q17 included).
+q9 bar math: pipelined minus fix-tax ≈ ~2060s vs bar 1776 ⇒ Stage-3 chain-killers
+(OPT-N04 merge-op) remain q9's path regardless.
