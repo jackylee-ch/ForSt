@@ -387,6 +387,8 @@ pub struct ColumnFamilyData {
     /// ingest). One atomic bundle = readers never block on a switch AND always observe a consistent
     /// (active, imms) snapshot (no key ever invisible mid-switch). Mirrors the `sst_readers` ArcSwap.
     memtables: ArcSwap<MemtableSet>,
+    // Amortizes precise active-memtable switch checks on the single-write path.
+    switch_check_debt_bytes: AtomicUsize,
     cached_snapshot_view: ArcSwap<SnapshotView>,
     /// Serializes per-CF flush operations so concurrent callers cannot
     /// flush the same oldest imm twice.
@@ -489,6 +491,7 @@ impl ColumnFamilyData {
                 active: memtable,
                 imms: Arc::new(Vec::new()),
             }),
+            switch_check_debt_bytes: AtomicUsize::new(0),
             cached_snapshot_view: ArcSwap::new(initial_snapshot),
             flush_mutex: Mutex::new(()),
             shard_count,
@@ -561,6 +564,18 @@ impl ColumnFamilyData {
         self.memtables.load().active.clone()
     }
 
+    #[inline]
+    pub fn add_switch_check_debt(&self, bytes: usize) -> usize {
+        self.switch_check_debt_bytes
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes)
+    }
+
+    #[inline]
+    pub fn clear_switch_check_debt(&self) {
+        self.switch_check_debt_bytes.store(0, Ordering::Relaxed);
+    }
+
     /// Returns a cloned snapshot of the immutable memtable list (oldest first).
     pub fn imm_memtables(&self) -> Vec<SharedMemTable> {
         // Lock-free load; clone the (typically tiny) list out of the immutable snapshot.
@@ -603,6 +618,7 @@ impl ColumnFamilyData {
                 imms: Arc::new(imms),
             }
         });
+        self.clear_switch_check_debt();
         // `prev.active` is the now-frozen memtable that just moved to the immutable queue.
         prev.active.clone()
     }

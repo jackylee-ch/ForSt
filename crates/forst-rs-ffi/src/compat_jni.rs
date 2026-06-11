@@ -483,8 +483,10 @@ pub(crate) mod handles {
 
     impl Default for DbOptionsHandle {
         fn default() -> Self {
+            let mut opts = EngineOptions::default();
+            opts.write_buffer_size = 256 * 1024 * 1024;
             Self {
-                opts: EngineOptions::default(),
+                opts,
                 // RocksDB's Java default is unlimited/open-as-needed. forst-rs
                 // does not expose a table file cache knob yet, but callers may
                 // still round-trip this value through DBOptions tests.
@@ -865,20 +867,28 @@ fn read_byte_slice(env: &mut JNIEnv, arr: &JByteArray, off: jint, len: jint) -> 
         throw_rocksdb(env, "negative offset/length");
         return None;
     }
-    let full = match env.convert_byte_array(arr) {
-        Ok(v) => v,
+    let array_len = match env.get_array_length(arr) {
+        Ok(n) => n as usize,
         Err(e) => {
-            throw_rocksdb(env, &format!("convert_byte_array failed: {e}"));
+            throw_rocksdb(env, &format!("get_array_length failed: {e}"));
             return None;
         }
     };
     let off = off as usize;
     let len = len as usize;
-    if off.checked_add(len).is_none_or(|end| end > full.len()) {
+    if off.checked_add(len).is_none_or(|end| end > array_len) {
         throw_rocksdb(env, "offset+length exceeds array bounds");
         return None;
     }
-    Some(full[off..off + len].to_vec())
+
+    let mut out = vec![0u8; len];
+    let out_jbytes =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<jbyte>(), out.len()) };
+    if let Err(e) = env.get_byte_array_region(arr, off as jint, out_jbytes) {
+        throw_rocksdb(env, &format!("get_byte_array_region failed: {e}"));
+        return None;
+    }
+    Some(out)
 }
 
 /// Convert a `JString` to a Rust `String`. Throws and returns `None` on
@@ -6965,6 +6975,59 @@ fn apply_resolved_write_batch_entries_fast(db_handle: jlong, entries: &[WriteBat
     let Some(db) = (unsafe { crate::db_from_handle(db_handle as FrsDb) }) else {
         return FRS_STATUS_NULL_ARG;
     };
+    if entries.is_empty() {
+        return FRS_STATUS_OK;
+    }
+
+    let first_cf = match &entries[0] {
+        WriteBatchEntry::Put { cf, .. }
+        | WriteBatchEntry::Merge { cf, .. }
+        | WriteBatchEntry::Delete { cf, .. } => *cf,
+    };
+    let mut can_use_single_cf_borrowed_batch = true;
+    for entry in entries {
+        match entry {
+            WriteBatchEntry::Put { cf, .. } | WriteBatchEntry::Delete { cf, .. } => {
+                if *cf != first_cf {
+                    can_use_single_cf_borrowed_batch = false;
+                    break;
+                }
+            }
+            WriteBatchEntry::Merge { .. } => {
+                can_use_single_cf_borrowed_batch = false;
+                break;
+            }
+        }
+    }
+
+    if can_use_single_cf_borrowed_batch {
+        let Some(cf) = (unsafe { crate::cf_ref(&first_cf) }) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(entries.len());
+        let mut values: Vec<Option<&[u8]>> = Vec::with_capacity(entries.len());
+        let mut op_types: Vec<u8> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                WriteBatchEntry::Put { key, value, .. } => {
+                    keys.push(key);
+                    values.push(Some(value));
+                    op_types.push(1u8);
+                }
+                WriteBatchEntry::Delete { key, .. } => {
+                    keys.push(key);
+                    values.push(None);
+                    op_types.push(0u8);
+                }
+                WriteBatchEntry::Merge { .. } => unreachable!(),
+            }
+        }
+        return match db.batch_put_borrowed_single_cf(cf, &keys, &values, &op_types) {
+            Ok(_) => FRS_STATUS_OK,
+            Err(e) => crate::error_to_status(&e),
+        };
+    }
+
     let mut batch = WriteBatch::with_capacity(entries.len());
     for entry in entries {
         match entry {

@@ -195,6 +195,11 @@ pub struct VectorizedMemTable {
     /// is the follow-on for ultimate perf; BTreeMap first validates the cache fix.)
     index: std::collections::BTreeMap<InternalKey, RowIndex>,
 
+    latest_row_key: Option<KeyBuf>,
+    latest_row: Option<RowIndex>,
+    latest_row_epoch: u64,
+    mutation_epoch: u64,
+
     // FRS-C2 (spec C2): the `hash_index: HashMap<KeyBuf, HashEntry>` field is
     // REMOVED. It was a second full copy of every key plus a per-key HashEntry
     // (~56 B/key + the HashMap buckets) — pure memory duplication of the sorted
@@ -237,6 +242,10 @@ impl VectorizedMemTable {
             sequences: Vec::with_capacity(INIT_ROWS_HINT),
             op_types: Vec::with_capacity(INIT_ROWS_HINT),
             index: std::collections::BTreeMap::new(),
+            latest_row_key: None,
+            latest_row: None,
+            latest_row_epoch: 0,
+            mutation_epoch: 0,
             next_sequence: 1,
             memory_used: 0,
             frozen: false,
@@ -348,6 +357,10 @@ impl VectorizedMemTable {
         // genuinely new (the `entry()` API consumes the key unconditionally).
         // For per-key aggregations this saves an allocation per repeat.
         self.index_insert(key, row_index);
+        self.invalidate_latest_row_cache();
+        if matches!(op_type, OpType::Delete | OpType::SingleDelete) {
+            self.remember_latest_row(key, row_index);
+        }
 
         // FRS-C2 (spec C2): the redundant `hash_index` (a second full copy of
         // every key + a per-key HashEntry) is GONE — point lookups now resolve
@@ -429,6 +442,18 @@ impl VectorizedMemTable {
     fn index_insert(&mut self, user_key: &[u8], row: RowIndex) {
         self.index
             .insert(InternalKey::new(user_key, row.sequence), row);
+    }
+
+    #[inline]
+    fn remember_latest_row(&mut self, user_key: &[u8], row: RowIndex) {
+        self.latest_row_key = Some(KeyBuf::from_slice(user_key));
+        self.latest_row = Some(row);
+        self.latest_row_epoch = self.mutation_epoch;
+    }
+
+    #[inline]
+    fn invalidate_latest_row_cache(&mut self) {
+        self.mutation_epoch = self.mutation_epoch.wrapping_add(1);
     }
 
     /// No-op retained for API compatibility: the lock-free `index` skiplist is
@@ -1077,6 +1102,10 @@ impl VectorizedMemTable {
         }
 
         let count = keys.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        self.invalidate_latest_row_cache();
         // Keep `next_sequence` monotonically ahead of any externally-supplied
         // range so legacy callers that self-allocate cannot collide.
         let end_seq = base_seq.saturating_add(count as u64);
@@ -1195,6 +1224,7 @@ impl VectorizedMemTable {
         if count == 0 {
             return Ok(0);
         }
+        self.invalidate_latest_row_cache();
         // Bump next_sequence to one past the highest seq we'll write.
         let max_seq = *seqs.iter().max().expect("count > 0");
         if self.next_sequence <= max_seq {
@@ -1283,6 +1313,7 @@ impl VectorizedMemTable {
         if count == 0 {
             return Ok(0);
         }
+        self.invalidate_latest_row_cache();
         // Validate every op_type byte (atomic — rejects the whole batch on first invalid byte).
         for (k, &idx) in indices.iter().enumerate() {
             if idx >= op_types.len() {
@@ -1433,6 +1464,7 @@ impl VectorizedMemTable {
         if count == 0 {
             return Ok(0);
         }
+        self.invalidate_latest_row_cache();
         if batch.num_columns() != 3 {
             return Err(forst_rs_common::ForstError::invalid_argument(format!(
                 "batch_put_arrow_indices: expected 3 columns; got {}",
@@ -1586,6 +1618,7 @@ impl VectorizedMemTable {
         if count == 0 {
             return Ok(0);
         }
+        self.invalidate_latest_row_cache();
         if keys.len() != count || values.len() != count || ops.len() != count {
             return Err(forst_rs_common::ForstError::invalid_argument(
                 "batch_put_arrow: column lengths disagree with batch.num_rows()",
@@ -1717,6 +1750,13 @@ impl VectorizedMemTable {
     /// the old `hash_index` + `find_latest` (which selected max-seq ≤ read_seq).
     #[inline]
     fn idx_newest_visible(&self, user_key: &[u8], read_seq: u64) -> Option<RowIndex> {
+        if self.latest_row_epoch == self.mutation_epoch {
+            if let (Some(k), Some(ri)) = (&self.latest_row_key, self.latest_row) {
+                if ri.sequence <= read_seq && k.as_slice() == user_key {
+                    return Some(ri);
+                }
+            }
+        }
         for (ik, ri) in self.index.range(InternalKey::range_start(user_key)..) {
             if ik.user_key.as_slice() != user_key {
                 return None; // walked past every version of this user key

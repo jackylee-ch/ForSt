@@ -2981,11 +2981,6 @@ impl DbImpl {
         }
         wbm_guard.commit();
 
-        let needs_flush = {
-            let _writer = self.write_mutex.lock().expect("lock poisoned");
-            self.maybe_switch_memtable_in_lock(&cf_data)?
-        };
-
         // Phase 2 (outside write_mutex): enqueue the imm memtable for the
         // background flush worker. Backpressure is handled by the
         // WriteController stall above — when imm count >= cap the next
@@ -2994,6 +2989,20 @@ impl DbImpl {
         // B-Prod-P7 §6d: when WBM is over budget, force a flush so the
         // background worker can drain bytes back below the cap.
         let wbm_over = self.write_buffer_manager.over_budget();
+        let threshold = cf_data.options().effective_write_buffer_size(&self.options);
+        let charge_usize = usize::try_from(charge).unwrap_or(usize::MAX);
+        let check_budget = (threshold / 64).max(1);
+        let switch_debt = cf_data.add_switch_check_debt(charge_usize);
+        let should_check_switch = wbm_over || switch_debt >= check_budget;
+
+        let needs_flush = if should_check_switch {
+            cf_data.clear_switch_check_debt();
+            let _writer = self.write_mutex.lock().expect("lock poisoned");
+            self.maybe_switch_memtable_in_lock(&cf_data)?
+        } else {
+            false
+        };
+
         if needs_flush || wbm_over {
             self.enqueue_flush(cf_data.clone())?;
         }
