@@ -165,6 +165,11 @@ pub struct SstWriterImpl {
     /// v4: count of Delete/SingleDelete entries — persisted in the footer as
     /// the stored-tombstone-density signal (garbage-drain gate-v2).
     tombstone_entries: u64,
+    /// FRS_DISABLE_PREFIX_BLOOM=1 now ALSO skips the writer-side prefix
+    /// collection + bloom emit (previously only the scan-side check) — the
+    /// q17-regression A/B knob (bisected to the bloom commit, 99.8→263.9s;
+    /// the residual mechanism needs the writer-vs-reader split).
+    prefix_bloom_enabled: bool,
     /// C (2026-06-04): per-instance override for the v2 KV block-format flag.
     /// `None` (production default) defers to [`super::kv_block::sst_write_kv_format`]
     /// (the `FRS_SST_KV_BLOCK_FORMAT` env gate); tests set it explicitly via
@@ -216,6 +221,16 @@ impl SstWriterImpl {
             last_prefix: [0u8; PREFIX_BLOOM_LEN],
             last_prefix_set: false,
             tombstone_entries: 0,
+            prefix_bloom_enabled: {
+                use std::sync::OnceLock;
+                static E: OnceLock<bool> = OnceLock::new();
+                *E.get_or_init(|| {
+                    !matches!(
+                        std::env::var("FRS_DISABLE_PREFIX_BLOOM").ok().as_deref(),
+                        Some("1") | Some("true")
+                    )
+                })
+            },
             kv_format_override: None,
         }
     }
@@ -330,7 +345,7 @@ impl SstWriterImpl {
         // comparing against the last pushed prefix is exact dedup. Keys
         // shorter than the prefix length never match a probe of that length
         // and are skipped entirely.
-        if key.len() >= PREFIX_BLOOM_LEN {
+        if self.prefix_bloom_enabled && key.len() >= PREFIX_BLOOM_LEN {
             let p = &key[..PREFIX_BLOOM_LEN];
             if !self.last_prefix_set || self.last_prefix != *p {
                 self.prefix_hashes.push(Sbbf::hash_key(p));
