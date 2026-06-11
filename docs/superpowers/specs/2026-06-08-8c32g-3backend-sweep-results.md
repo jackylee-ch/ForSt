@@ -1753,3 +1753,31 @@ SERIAL_BETWEEN_EPOCH's drain should prevent watermark-overtake, so either the el
 code (incl. lateness check) defers past advanceWatermark under load, or the drain's
 in-flight accounting misses a class of records when completions arrive from worker threads.
 The fix must land BACKEND-side (flink code frozen per scope rule).
+
+### STAGE-0 audit (Task 4): mechanism chain pinned to flink-runtime sync-point ordering
+Verified first-hand (file:line):
+1. The element user code (incl. the lateness check) is NOT run at mailbox arrival — it is
+   wrapped via preserveRecordOrderAndProcess → AEC.syncPointRequestWithCallback
+   (AsyncExecutionController.java:416-421): a SyncPointRequest whose future, when the key
+   is FREE, completes immediately (insertActiveBuffer: request.getFuture().complete(null));
+   when the key is OCCUPIED, the request parks in the blocking buffer and the user code is
+   DEFERRED until the key's holder completes.
+2. Blocked records ARE counted in inFlightRecordNum (seizeCapacity's isKeyOccupied
+   early-return covers a record's 2nd+ request, not blocked records — the Explore agent's
+   contrary claim was a misreading; corrected).
+3. The residual gap: a record's accounting can release at sync-point FUTURE completion
+   while its CALLBACK (the user code) is still queued on the mailbox — so the watermark's
+   drain can observe count==0, run advanceWatermark, and the deferred lateness check then
+   reads the ADVANCED watermark → late-drop. Manifests only with executors that complete
+   batch futures asynchronously (lockstep closes the window by construction).
+4. The fix CANNOT live in flink-runtime (scope rule). Fork in progress: community ForSt's
+   executor presents the IDENTICAL contract (incomplete futures, off-mailbox completions,
+   coordinator thread; ForStStateExecutor.java:149-235; fullyLoaded counts READ ops only).
+   ForSt-async q8@100M out_rows was never byte-verified in the matrix (time-only row) —
+   ForSt q8 ×2 exactness check is the decisive fork: ForSt corrupt ⇒ UPSTREAM Flink
+   async-window bug (all async backends affected; lockstep semantics is the only safe mode
+   in current Flink) ⇒ our two-regime LIGHT path is the correctness floor and HEAVY must
+   preserve watermark-record ordering by construction. ForSt exact ⇒ a real behavioral
+   difference remains in our executor — continue the diff with a narrowed search space.
+(Box note: Docker Desktop daemon went 500-unhealthy mid-fork-test after the day's container
+churn; restarted; ForSt ×2 reruns queued.)
