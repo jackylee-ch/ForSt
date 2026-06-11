@@ -11650,26 +11650,25 @@ mod tests {
         let cf_list = vec![cf; count];
         let key_slices: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
 
+        let repeats = 8usize;
+
         let old_start = std::time::Instant::now();
         let mut old_hits = 0usize;
-        for key in &key_slices {
-            let mut out = FrsBytes::NULL;
-            let st = unsafe { frs_get(db, cf, key.as_ptr(), key.len(), &mut out) };
-            assert_eq!(st, FRS_STATUS_OK);
-            if !out.data.is_null() {
-                old_hits += 1;
-            }
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
-            }
+        for _ in 0..repeats {
+            let results = compat_multi_get_per_key(db as jlong, &cf_list, &key_slices)
+                .expect("per-key compat multiGet must succeed");
+            old_hits += results.iter().filter(|v| v.is_some()).count();
         }
         let old_elapsed = old_start.elapsed();
 
         let new_start = std::time::Instant::now();
-        let grouped = compat_multi_get_grouped(db as jlong, &cf_list, &key_slices)
-            .expect("grouped batch get must succeed");
+        let mut new_hits = 0usize;
+        for _ in 0..repeats {
+            let grouped = compat_multi_get_grouped(db as jlong, &cf_list, &key_slices)
+                .expect("grouped batch get must succeed");
+            new_hits += grouped.iter().filter(|v| v.is_some()).count();
+        }
         let new_elapsed = new_start.elapsed();
-        let new_hits = grouped.iter().filter(|v| v.is_some()).count();
 
         eprintln!(
             "compat_multi_get small-batch guard: per_key={:?}, guarded={:?}, ratio={:.3}x",
@@ -11677,8 +11676,8 @@ mod tests {
             new_elapsed,
             old_elapsed.as_nanos() as f64 / new_elapsed.as_nanos().max(1) as f64
         );
-        assert_eq!(old_hits, count);
-        assert_eq!(new_hits, count);
+        assert_eq!(old_hits, count * repeats);
+        assert_eq!(new_hits, count * repeats);
         assert!(
             new_elapsed <= old_elapsed + (old_elapsed / 4),
             "small compat multiGet should stay near the per-key loop instead of forcing the slower batch_get path"
