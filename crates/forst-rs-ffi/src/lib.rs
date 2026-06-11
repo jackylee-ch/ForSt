@@ -4961,9 +4961,13 @@ unsafe fn fill_chunk_from_iter(
 /// - `*out_row_count` is set to the number of rows in the first chunk.
 /// - `*out_bytes_used` is set to the number of bytes written to the buffer.
 ///
-/// On exhaustion, `*out_row_count == 0` and `*out_bytes_used == 0`.
-/// The handle is still valid — caller should call `frs_vec_iter_prefix_close`
-/// to release it.
+/// P0 EOF + AUTO-CLOSE (streaming-read redesign §2.3): when the FIRST chunk
+/// already exhausts the iterator and no error is pending, the engine
+/// auto-closes it and sets `*out_handle = 0` — the rows are still in the
+/// chunk. The caller may skip the trailing `_next` and `_close` crossings;
+/// callers that issue them anyway observe normal 0-row exhaustion (`_next`)
+/// and a no-op (`_close`). A non-zero handle is returned ONLY when more
+/// chunks (or a deferred error) remain.
 ///
 /// # Returns
 /// - `FrsErrorCode::Ok` (0) on success.
@@ -5108,6 +5112,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         //       pulling more rows. Pre-fix the open path zeroed
         //       row_count/bytes_used and discarded the already-serialised
         //       rows — silent data loss for rows the caller had bytes for.
+        let mut deferred_error_stashed = false;
         if let Some(err) = handle_state.take_last_error() {
             if row_count == 0 {
                 *out_row_count = 0;
@@ -5118,6 +5123,22 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
             // Partial chunk path: defer the error to the next `_next` call so
             // the caller drains the in-flight rows first.
             handle_state.set_deferred_error(err);
+            deferred_error_stashed = true;
+        }
+
+        // P0 EOF + AUTO-CLOSE (streaming-read redesign §2.3): the first chunk
+        // already exhausted the iterator and no error is pending — do NOT
+        // register a dead shell. `*out_handle = 0` is the single-shot EOF
+        // signal (the batched paths use `FrsChunk::_reserved` instead, which
+        // this ABI lacks). Old callers that still issue the mandatory trailing
+        // `_next(0)` get the normal 0-row exhaustion (unknown handles are
+        // EOF, see `frs_vec_iter_prefix_next`), and `_close(0)` is a no-op —
+        // new callers skip both crossings entirely.
+        if iter_exhausted && !deferred_error_stashed {
+            *out_handle = 0;
+            *out_row_count = row_count;
+            *out_bytes_used = bytes_used;
+            return FrsErrorCode::Ok as i32;
         }
 
         // Register the iterator on a sharded registry.  Shard is selected
@@ -5147,9 +5168,17 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
 /// When `*out_row_count == 0` the iterator is exhausted; call
 /// `frs_vec_iter_prefix_close` to release the handle.
 ///
+/// P0 AUTO-CLOSE NOTE (streaming-read redesign §2.3): handles whose first
+/// chunk exhausted the iterator are auto-closed at open time (single-shot
+/// opens return `handle == 0`; batched opens return a non-zero UNREGISTERED
+/// handle + the `FRS_CHUNK_EOF` flag). A `_next` on such a handle — or any
+/// unknown handle — returns `Ok` with an empty chunk (EOF semantics), NOT
+/// `IterCursorInvalid`, so flag-unaware callers that always issue the
+/// mandatory trailing `_next` observe the same exhaustion they did before.
+///
 /// # Returns
-/// - `FrsErrorCode::Ok` (0) always on success (even exhaustion).
-/// - `FrsErrorCode::IterCursorInvalid` (201) if `handle` is unknown.
+/// - `FrsErrorCode::Ok` (0) always on success (even exhaustion, and for
+///   auto-closed/unknown handles — see above).
 /// - `FrsErrorCode::BatchHeaderMalformed` (110) on null out-pointers.
 /// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
 #[no_mangle]
@@ -5170,7 +5199,18 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
         let mut guard = shard_for(handle).lock().unwrap_or_else(|p| p.into_inner());
         let iter = match guard.get_mut(&handle) {
             Some(it) => it,
-            None => return FrsErrorCode::IterCursorInvalid as i32,
+            // P0 AUTO-CLOSE: an unregistered handle is an auto-closed
+            // (exhausted-at-open) iterator — report clean EOF so old callers'
+            // mandatory trailing `_next` keeps working. Pre-P0 this returned
+            // `IterCursorInvalid` (201); with auto-close the registry can no
+            // longer distinguish "never existed" from "exhausted at open", and
+            // EOF is the correct answer for the latter. (`_abort` keeps the
+            // 201 contract — the watchdog only aborts handles it saw open.)
+            None => {
+                *out_row_count = 0;
+                *out_bytes_used = 0;
+                return FrsErrorCode::Ok as i32;
+            }
         };
         // R18-M4: if a prior `_next` surfaced a deferred error and marked
         // the iterator terminal, return EOF without pulling further rows.
@@ -5232,9 +5272,10 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
 
 /// Release an iterator handle opened by `frs_vec_iter_prefix_open`.
 ///
-/// After this call the handle is invalid; passing it to next/abort returns
-/// `FrsErrorCode::IterCursorInvalid`. Safe to call with `handle == 0`
-/// (no-op, returns `Ok`).
+/// After this call the handle is invalid; passing it to `_abort` returns
+/// `FrsErrorCode::IterCursorInvalid`, and `_next` reports clean EOF (P0
+/// auto-close semantics — see `frs_vec_iter_prefix_next`). Safe to call with
+/// `handle == 0` or an auto-closed (never-registered) handle (no-op, `Ok`).
 ///
 /// # Returns
 /// - `FrsErrorCode::Ok` (0) always.
@@ -5308,7 +5349,8 @@ pub extern "C" fn frs_vec_iter_prefix_abort(handle: u64) -> i32 {
 /// - `buf_cap`     — **input**: capacity of `buf_ptr` in bytes (caller-supplied).
 /// - `row_count`   — **output**: rows written to `buf_ptr` (0 on failure/empty).
 /// - `bytes_used`  — **output**: bytes written to `buf_ptr` (0 on failure/empty).
-/// - `_reserved`   — explicit padding for u64-alignment and ABI stability.
+/// - `_reserved`   — **output**: flag word (was padding; old callers that never
+///   read it are unaffected). Bit 0 = [`FRS_CHUNK_EOF`].
 ///
 /// Each per-iter chunk follows the same wire format as
 /// `frs_vec_iter_prefix_open`: rows packed as `[klen u32 LE][vlen u32 LE]
@@ -5321,6 +5363,23 @@ pub struct FrsChunk {
     pub bytes_used: u32,
     pub _reserved: u32,
 }
+
+/// P0 (streaming-read redesign §2.3): bit 0 of [`FrsChunk::_reserved`].
+///
+/// Set by the batched open paths when the FIRST chunk already exhausted the
+/// iterator AND no error is pending. When set, the engine has AUTO-CLOSED the
+/// iterator: no registry entry exists for the returned handle, so the caller
+/// may (and should) skip both the trailing `frs_vec_iter_prefix_next` and the
+/// `frs_vec_iter_prefix_close` crossings — the two guaranteed-wasted crossings
+/// of the dominant exhausted-in-one-chunk probe (q7-class).
+///
+/// The flag is ADVISORY and fully backward compatible: a caller that ignores
+/// it still gets a non-zero (but unregistered) handle; `_next` on an
+/// unregistered handle returns the normal 0-row exhaustion (`Ok`), and
+/// `_close` on it is a safe no-op. The flag is NEVER set when a deferred
+/// error is stashed (partial-chunk-then-error probes keep the registered
+/// handle so `_next` can surface the error).
+pub const FRS_CHUNK_EOF: u32 = 1;
 
 /// Batched open of N prefix iterators in a single FFI crossing.
 ///
@@ -5409,6 +5468,9 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
             let buf_cap = chunk.buf_cap;
             chunk.row_count = 0;
             chunk.bytes_used = 0;
+            // P0: `_reserved` is now an OUTPUT flag word (bit 0 = FRS_CHUNK_EOF);
+            // the caller never initialises it, so zero it explicitly per row.
+            chunk._reserved = 0;
 
             // Per-row offset validation.
             let ks = offs[i] as usize;
@@ -5514,7 +5576,9 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
             // error, stash the error on the handle so the next `_next` call
             // surfaces it AFTER the caller drains the partial chunk. Pre-fix,
             // batch-open could lose rows on a mid-chunk error.
+            let mut error_pending = false;
             if let Some(err) = handle_state.take_last_error() {
+                error_pending = true;
                 if row_count == 0 {
                     if first_err == FrsErrorCode::Ok as i32 {
                         first_err = error_to_frs_code(&err);
@@ -5537,14 +5601,27 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch(
                 }
             }
 
-            // Register on the shared sharded registry — same path as the
-            // single-shot open so subsequent _next/_close/_abort calls work
-            // transparently.
+            // P0 EOF + AUTO-CLOSE: the first chunk drained the whole probe and
+            // no error is pending — flag EOF in `_reserved` and skip the
+            // registry insert entirely (no dead shell, no shard mutex op).
+            // The returned handle is a fresh NON-ZERO id that was never
+            // registered: flag-aware callers skip `_next`/`_close`; legacy
+            // callers that still call them get clean EOF (`_next` on an
+            // unknown handle, see frs_vec_iter_prefix_next) and a no-op close.
+            // Non-zero matters: legacy batch consumers treat `handle == 0` as
+            // a per-row open failure.
             let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            shard_for(handle_id)
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(handle_id, handle_state);
+            if iter_exhausted && !error_pending {
+                chunk._reserved = FRS_CHUNK_EOF;
+            } else {
+                // Register on the shared sharded registry — same path as the
+                // single-shot open so subsequent _next/_close/_abort calls work
+                // transparently.
+                shard_for(handle_id)
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(handle_id, handle_state);
+            }
 
             handles_out[i] = handle_id;
             chunk.row_count = row_count;
@@ -5626,6 +5703,8 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
             let buf_ptr = chunk.buf_ptr;
             chunk.row_count = 0;
             chunk.bytes_used = 0;
+            // P0: `_reserved` is an OUTPUT flag word (bit 0 = FRS_CHUNK_EOF).
+            chunk._reserved = 0;
             let ks = offs[i] as usize;
             let ke = offs[i + 1] as usize;
             if ke < ks
@@ -5691,7 +5770,9 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
                     if iter_exhausted {
                         handle_state.drop_inner();
                     }
+                    let mut error_pending = false;
                     if let Some(err) = handle_state.take_last_error() {
+                        error_pending = true;
                         if row_count == 0 {
                             if first_err == FrsErrorCode::Ok as i32 {
                                 first_err = error_to_frs_code(&err);
@@ -5701,11 +5782,21 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
                             handle_state.set_deferred_error(err);
                         }
                     }
+                    // P0 EOF + AUTO-CLOSE — same contract as the serial
+                    // `frs_vec_iter_prefix_open_batch` drain above: flag EOF,
+                    // return a fresh non-zero UNREGISTERED handle, skip the
+                    // registry insert. EOF is never flagged with an error
+                    // pending (deferred-error probes keep the registered
+                    // handle so `_next` surfaces the error).
                     let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    shard_for(handle_id)
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .insert(handle_id, handle_state);
+                    if iter_exhausted && !error_pending {
+                        chunk._reserved = FRS_CHUNK_EOF;
+                    } else {
+                        shard_for(handle_id)
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(handle_id, handle_state);
+                    }
                     handles_out[i] = handle_id;
                     chunk.row_count = row_count;
                     chunk.bytes_used = bytes_used;
@@ -5843,6 +5934,7 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
         // R16-M2 + R17-M3: partial-chunk state machine matches the prefix
         // path. Error with NO rows -> fail open(); error after some rows
         // -> register the handle and stash the error for the next _next.
+        let mut deferred_error_stashed = false;
         if let Some(err) = handle_state.take_last_error() {
             if row_count == 0 {
                 *out_row_count = 0;
@@ -5851,6 +5943,18 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
                 return error_to_frs_code(&err);
             }
             handle_state.set_deferred_error(err);
+            deferred_error_stashed = true;
+        }
+
+        // P0 EOF + AUTO-CLOSE — same single-shot contract as
+        // `frs_vec_iter_prefix_open`: first chunk exhausted the scan and no
+        // error is pending → `*out_handle = 0`, nothing registered; the
+        // caller may skip the trailing `_next` + `_close` crossings.
+        if iter_exhausted && !deferred_error_stashed {
+            *out_handle = 0;
+            *out_row_count = row_count;
+            *out_bytes_used = bytes_used;
+            return FrsErrorCode::Ok as i32;
         }
 
         // Register - shares the same sharded registry as prefix iterators.
@@ -5873,8 +5977,8 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
 /// to the shared handle registry.
 ///
 /// # Returns
-/// - `FrsErrorCode::Ok` (0) always on success (even exhaustion).
-/// - `FrsErrorCode::IterCursorInvalid` (201) if `handle` is unknown.
+/// - `FrsErrorCode::Ok` (0) always on success (even exhaustion; unknown /
+///   auto-closed handles report clean EOF — P0 auto-close semantics).
 /// - `FrsErrorCode::BatchHeaderMalformed` (110) on null out-pointers.
 /// - `FrsErrorCode::PanicCaught` (900) on unexpected panic.
 #[no_mangle]
@@ -8680,8 +8784,10 @@ mod tests {
     }
 
     /// Open/close round trip with 3 prefix-matching keys + 1 outside prefix.
-    /// Verifies: handle is non-zero, first chunk contains the 3 rows,
-    /// second chunk is empty, and close returns Ok.
+    /// P0 auto-close: the first chunk exhausts the iterator, so open returns
+    /// `handle == 0` (auto-closed, nothing registered) with the 3 rows in the
+    /// chunk; a legacy trailing `_next(0)` still reports clean EOF and
+    /// `_close(0)` stays a no-op.
     #[test]
     fn vec_iter_prefix_open_close_round_trip() {
         unsafe {
@@ -8721,7 +8827,10 @@ mod tests {
                 &mut bytes_used,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32, "open should return Ok");
-            assert_ne!(handle, 0, "handle should be non-zero");
+            assert_eq!(
+                handle, 0,
+                "P0 auto-close: exhausted-in-first-chunk open returns handle 0"
+            );
             assert_eq!(row_count, 3, "first chunk should contain 3 rows");
 
             // Decode and verify the rows came back.
@@ -8732,7 +8841,8 @@ mod tests {
                 assert!(k.starts_with(b"p1/"), "unexpected key {:?}", k);
             }
 
-            // Second chunk should be empty (iterator exhausted).
+            // Legacy drain compatibility: a trailing next() on the auto-closed
+            // handle reports clean EOF (empty chunk, rc=Ok).
             let rc = frs_vec_iter_prefix_next(
                 handle,
                 chunk_buf.as_mut_ptr(),
@@ -8755,13 +8865,16 @@ mod tests {
         }
     }
 
-    /// `frs_vec_iter_prefix_next` on an unknown handle returns
-    /// `FrsErrorCode::IterCursorInvalid` (201).
+    /// P0 auto-close: `frs_vec_iter_prefix_next` on an unknown (or
+    /// auto-closed) handle reports clean EOF — `Ok` with an empty chunk —
+    /// instead of the pre-P0 `IterCursorInvalid` (201). This is what keeps
+    /// flag-unaware callers' mandatory trailing `next()` working after the
+    /// engine auto-closes exhausted-at-open iterators.
     #[test]
-    fn vec_iter_prefix_next_unknown_handle_returns_cursor_invalid() {
+    fn vec_iter_prefix_next_unknown_handle_reports_eof() {
         let mut chunk_buf = vec![0u8; 64];
-        let mut row_count: u32 = 0;
-        let mut bytes_used: u32 = 0;
+        let mut row_count: u32 = 7;
+        let mut bytes_used: u32 = 7;
         let rc = unsafe {
             frs_vec_iter_prefix_next(
                 u64::MAX, // non-existent handle
@@ -8771,7 +8884,9 @@ mod tests {
                 &mut bytes_used,
             )
         };
-        assert_eq!(rc, FrsErrorCode::IterCursorInvalid as i32);
+        assert_eq!(rc, FrsErrorCode::Ok as i32);
+        assert_eq!(row_count, 0, "unknown handle must report EOF (0 rows)");
+        assert_eq!(bytes_used, 0);
     }
 
     /// Null out-pointers return `BatchHeaderMalformed` (110).
@@ -8830,7 +8945,11 @@ mod tests {
                 );
             }
 
-            let mut chunk_buf = vec![0u8; 4096];
+            // P0: cap the first chunk to ONE row (8B header + 4B key + 4B val
+            // = 16B) so the open does NOT exhaust the iterator — an exhausted
+            // open auto-closes and returns handle 0, which would leave nothing
+            // to abort. 24B holds exactly one 16B row (a second wouldn't fit).
+            let mut chunk_buf = vec![0u8; 24];
             let mut handle: u64 = 0;
             let mut row_count: u32 = 0;
             let mut bytes_used: u32 = 0;
@@ -8848,7 +8967,8 @@ mod tests {
                 &mut bytes_used,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
-            assert_ne!(handle, 0);
+            assert_ne!(handle, 0, "non-exhausted open must register a handle");
+            assert_eq!(row_count, 1, "24B chunk holds exactly one row");
 
             // Abort: ok return.
             assert_eq!(frs_vec_iter_prefix_abort(handle), FrsErrorCode::Ok as i32);
@@ -9106,6 +9226,157 @@ mod tests {
         }
     }
 
+    /// P0 EOF flag + auto-close on the batched open paths: exhausted-in-first-
+    /// chunk probes carry `FRS_CHUNK_EOF` in `_reserved`, their (non-zero)
+    /// handles are NOT registered (next → clean EOF, close → no-op), while a
+    /// probe that does NOT exhaust keeps `_reserved == 0` and a registered,
+    /// drainable handle. Runs the same matrix against BOTH the serial and the
+    /// parallel batched open.
+    #[test]
+    fn vec_iter_prefix_open_batch_eof_flag_and_autoclose() {
+        type BatchOpenFn = unsafe extern "C" fn(
+            FrsDb,
+            FrsCfHandle,
+            *const u32,
+            *const u8,
+            u32,
+            *mut u64,
+            *mut FrsChunk,
+            u32,
+        ) -> i32;
+        let variants: [(&str, BatchOpenFn); 2] = [
+            ("serial", frs_vec_iter_prefix_open_batch),
+            ("parallel", frs_vec_iter_prefix_open_batch_parallel),
+        ];
+        for (variant, open_batch) in variants {
+            unsafe {
+                let mut db: FrsDb = ptr::null_mut();
+                assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+                let mut cf: FrsCfHandle = ptr::null_mut();
+                assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+                // Probe 0 ("pS/"): 2 small rows → exhausts in the first chunk.
+                // Probe 1 ("pL/"): 8 rows of 24B (8 hdr + 4 key + 12 val) =
+                // 192B > CHUNK_CAP=100 → does NOT exhaust at open.
+                for sfx in [&b"x"[..], &b"y"[..]] {
+                    let mut k = b"pS/".to_vec();
+                    k.extend_from_slice(sfx);
+                    assert_eq!(
+                        frs_put(db, cf, k.as_ptr(), k.len(), b"v".as_ptr(), 1),
+                        FRS_STATUS_OK
+                    );
+                }
+                for i in 0..8u8 {
+                    let k = format!("pL/{}", i);
+                    let v = format!("value-{:06}", i);
+                    assert_eq!(
+                        frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                        FRS_STATUS_OK
+                    );
+                }
+
+                let prefixes: [&[u8]; 2] = [b"pS/", b"pL/"];
+                let mut offs: Vec<u32> = vec![0];
+                let mut data: Vec<u8> = Vec::new();
+                for p in &prefixes {
+                    data.extend_from_slice(p);
+                    offs.push(data.len() as u32);
+                }
+
+                const CHUNK_CAP: u32 = 100;
+                let mut chunk_storage: Vec<Vec<u8>> =
+                    (0..2).map(|_| vec![0u8; CHUNK_CAP as usize]).collect();
+                let mut chunks: Vec<FrsChunk> = (0..2)
+                    .map(|i| FrsChunk {
+                        buf_ptr: chunk_storage[i].as_mut_ptr(),
+                        buf_cap: CHUNK_CAP,
+                        row_count: 0,
+                        bytes_used: 0,
+                        // Poison the flag word: the engine must overwrite it.
+                        _reserved: 0xDEAD_BEEF,
+                    })
+                    .collect();
+                let mut handles: Vec<u64> = vec![0; 2];
+
+                let rc = open_batch(
+                    db,
+                    cf,
+                    offs.as_ptr(),
+                    data.as_ptr(),
+                    2,
+                    handles.as_mut_ptr(),
+                    chunks.as_mut_ptr(),
+                    CHUNK_CAP,
+                );
+                assert_eq!(rc, FrsErrorCode::Ok as i32, "[{variant}] batch open Ok");
+
+                // Probe 0: exhausted → EOF flag set, handle non-zero but
+                // auto-closed (unregistered).
+                assert_eq!(
+                    chunks[0]._reserved, FRS_CHUNK_EOF,
+                    "[{variant}] exhausted probe must carry FRS_CHUNK_EOF"
+                );
+                assert_ne!(handles[0], 0, "[{variant}] EOF probe handle stays non-zero");
+                assert_eq!(chunks[0].row_count, 2);
+                let rows = decode_chunk_buf(&chunk_storage[0], chunks[0].bytes_used, 2);
+                assert!(rows.iter().all(|(k, _)| k.starts_with(b"pS/")));
+                // Legacy drain on the auto-closed handle: next → clean EOF.
+                let mut rc2_rows: u32 = 7;
+                let mut rc2_bytes: u32 = 7;
+                let rc2 = frs_vec_iter_prefix_next(
+                    handles[0],
+                    chunk_storage[0].as_mut_ptr(),
+                    CHUNK_CAP,
+                    &mut rc2_rows,
+                    &mut rc2_bytes,
+                );
+                assert_eq!(rc2, FrsErrorCode::Ok as i32, "[{variant}] next on auto-closed");
+                assert_eq!(rc2_rows, 0, "[{variant}] auto-closed handle reports EOF");
+                // close-after-auto-close: safe no-op.
+                assert_eq!(
+                    frs_vec_iter_prefix_close(handles[0]),
+                    FrsErrorCode::Ok as i32,
+                    "[{variant}] close on auto-closed handle is a no-op"
+                );
+
+                // Probe 1: NOT exhausted → no EOF flag, registered handle that
+                // continues to drain the remaining rows.
+                assert_eq!(
+                    chunks[1]._reserved, 0,
+                    "[{variant}] non-exhausted probe must NOT carry FRS_CHUNK_EOF"
+                );
+                assert_ne!(handles[1], 0);
+                let mut total =
+                    decode_chunk_buf(&chunk_storage[1], chunks[1].bytes_used, chunks[1].row_count)
+                        .len();
+                loop {
+                    let mut n_rows: u32 = 0;
+                    let mut n_bytes: u32 = 0;
+                    let rcn = frs_vec_iter_prefix_next(
+                        handles[1],
+                        chunk_storage[1].as_mut_ptr(),
+                        CHUNK_CAP,
+                        &mut n_rows,
+                        &mut n_bytes,
+                    );
+                    assert_eq!(rcn, FrsErrorCode::Ok as i32);
+                    if n_rows == 0 {
+                        break;
+                    }
+                    total += decode_chunk_buf(&chunk_storage[1], n_bytes, n_rows).len();
+                }
+                assert_eq!(total, 8, "[{variant}] continuation drains all 8 rows");
+                assert_eq!(
+                    frs_vec_iter_prefix_close(handles[1]),
+                    FrsErrorCode::Ok as i32
+                );
+
+                assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+                assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+            }
+        }
+    }
+
     /// PR-E3: `frs_vec_iter_prefix_open_batch` with `n == 0` returns Ok and
     /// is a no-op (no panic, no allocation).
     #[test]
@@ -9191,7 +9462,11 @@ mod tests {
                     let cf = cf_ptr.0 as FrsCfHandle;
                     let prefix = format!("t{}/", t);
 
-                    let mut chunk_buf = vec![0u8; 4096];
+                    // P0: each row is 8B header + 6B key + 10B value = 24B; a
+                    // 100B chunk holds 4 of the 8 rows, so the open does NOT
+                    // exhaust (an exhausted open would auto-close → handle 0,
+                    // defeating this test's registry-shard purpose).
+                    let mut chunk_buf = vec![0u8; 100];
                     let mut handle: u64 = 0;
                     let mut row_count: u32 = 0;
                     let mut bytes_used: u32 = 0;
@@ -9211,37 +9486,43 @@ mod tests {
                     };
                     assert_eq!(rc, FrsErrorCode::Ok as i32, "thread {} open failed", t);
                     assert_ne!(handle, 0, "thread {} got zero handle", t);
-                    assert_eq!(
-                        row_count as usize, ROWS_PER_THREAD_PREFIX,
-                        "thread {} expected {} rows, got {}",
-                        t, ROWS_PER_THREAD_PREFIX, row_count
-                    );
 
-                    // Verify every key in this iterator starts with this
-                    // thread's prefix — confirms shards stay isolated and
-                    // we never see another thread's rows.
-                    let rows = decode_chunk_buf(&chunk_buf, bytes_used, row_count);
-                    for (k, _) in &rows {
-                        assert!(
-                            k.starts_with(prefix.as_bytes()),
-                            "thread {} saw foreign key {:?}",
-                            t,
-                            k
-                        );
+                    // Drain: first chunk from open + continuation chunks via
+                    // next() until exhaustion; verify every key carries this
+                    // thread's prefix — confirms shards stay isolated and we
+                    // never see another thread's rows.
+                    let mut total_rows = 0usize;
+                    let mut rows = decode_chunk_buf(&chunk_buf, bytes_used, row_count);
+                    loop {
+                        total_rows += rows.len();
+                        for (k, _) in &rows {
+                            assert!(
+                                k.starts_with(prefix.as_bytes()),
+                                "thread {} saw foreign key {:?}",
+                                t,
+                                k
+                            );
+                        }
+                        let rc = unsafe {
+                            frs_vec_iter_prefix_next(
+                                handle,
+                                chunk_buf.as_mut_ptr(),
+                                chunk_buf.len() as u32,
+                                &mut row_count,
+                                &mut bytes_used,
+                            )
+                        };
+                        assert_eq!(rc, FrsErrorCode::Ok as i32);
+                        if row_count == 0 {
+                            break;
+                        }
+                        rows = decode_chunk_buf(&chunk_buf, bytes_used, row_count);
                     }
-
-                    // Exhaustion: next chunk is empty.
-                    let rc = unsafe {
-                        frs_vec_iter_prefix_next(
-                            handle,
-                            chunk_buf.as_mut_ptr(),
-                            chunk_buf.len() as u32,
-                            &mut row_count,
-                            &mut bytes_used,
-                        )
-                    };
-                    assert_eq!(rc, FrsErrorCode::Ok as i32);
-                    assert_eq!(row_count, 0);
+                    assert_eq!(
+                        total_rows, ROWS_PER_THREAD_PREFIX,
+                        "thread {} expected {} rows, got {}",
+                        t, ROWS_PER_THREAD_PREFIX, total_rows
+                    );
 
                     assert_eq!(frs_vec_iter_prefix_close(handle), FrsErrorCode::Ok as i32);
 
@@ -9903,7 +10184,10 @@ mod tests {
                 &mut bytes_used,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32, "open should return Ok");
-            assert_ne!(handle, 0, "handle must be non-zero");
+            assert_eq!(
+                handle, 0,
+                "P0 auto-close: exhausted-in-first-chunk range open returns handle 0"
+            );
             assert_eq!(row_count, 3, "expect 3 keys in [b, d)");
 
             let rows = decode_chunk_buf(&chunk_buf, bytes_used, row_count);
@@ -9913,7 +10197,7 @@ mod tests {
                 assert!(k.as_slice() < b"d".as_slice(), "key {:?} at/above hi", k);
             }
 
-            // Second chunk is empty.
+            // Legacy trailing next() on the auto-closed handle: clean EOF.
             let rc2 = frs_vec_iter_range_next(
                 handle,
                 chunk_buf.as_mut_ptr(),
@@ -9930,12 +10214,13 @@ mod tests {
         }
     }
 
-    /// next on an unknown range handle returns IterCursorInvalid.
+    /// P0 auto-close: next on an unknown (or auto-closed) range handle
+    /// reports clean EOF (`Ok` + 0 rows) — mirrors the prefix-path contract.
     #[test]
-    fn vec_iter_range_next_unknown_handle_returns_cursor_invalid() {
+    fn vec_iter_range_next_unknown_handle_reports_eof() {
         let mut chunk_buf = vec![0u8; 64];
-        let mut row_count: u32 = 0;
-        let mut bytes_used: u32 = 0;
+        let mut row_count: u32 = 7;
+        let mut bytes_used: u32 = 7;
         let rc = unsafe {
             frs_vec_iter_range_next(
                 u64::MAX,
@@ -9945,7 +10230,9 @@ mod tests {
                 &mut bytes_used,
             )
         };
-        assert_eq!(rc, FrsErrorCode::IterCursorInvalid as i32);
+        assert_eq!(rc, FrsErrorCode::Ok as i32);
+        assert_eq!(row_count, 0, "unknown range handle must report EOF");
+        assert_eq!(bytes_used, 0);
     }
 
     /// Abort a range iterator: subsequent next returns empty chunk.
@@ -9966,7 +10253,10 @@ mod tests {
                 );
             }
 
-            let mut chunk_buf = vec![0u8; 4096];
+            // P0: rows are 8B header + 5B key + 2B value = 15B; a 20B chunk
+            // holds exactly one row so the open does NOT exhaust (an
+            // exhausted open auto-closes → handle 0 → nothing to abort).
+            let mut chunk_buf = vec![0u8; 20];
             let mut handle: u64 = 0;
             let mut row_count: u32 = 0;
             let mut bytes_used: u32 = 0;
@@ -9988,7 +10278,8 @@ mod tests {
                 &mut bytes_used,
             );
             assert_eq!(rc, FrsErrorCode::Ok as i32);
-            assert_ne!(handle, 0);
+            assert_ne!(handle, 0, "non-exhausted open must register a handle");
+            assert_eq!(row_count, 1, "20B chunk holds exactly one row");
 
             assert_eq!(frs_vec_iter_range_abort(handle), FrsErrorCode::Ok as i32);
 
