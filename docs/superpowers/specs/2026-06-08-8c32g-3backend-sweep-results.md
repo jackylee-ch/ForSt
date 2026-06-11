@@ -1825,3 +1825,23 @@ zero late-drops ×deployed print; zero lost completions ×accounting):
 operator's record processor.** Note: most-corrupt run = FASTEST (35.6s).
 NEXT: join-vertex numRecordsIn (standard metric) vs SP_CREATED in a corrupt run —
 splits in-task wrapper-level loss from network/upstream-chain loss. Poller running.
+
+### STAGE-0: topology revelation + two more eliminations + the timing reframe
+All-vertex counters (corrupt specimen, no exceptions/restarts):
+Source out=3,065,001 | GWA[7] in=2,000,000→out=1,536,400 ✗ | GWA[14] in=1,065,001→out=1,064,409 |
+Join in=2,600,809→out=2,600,809 ✓ (perfect 1:1; in == GWA7+GWA14 exactly).
+**THE JOIN WAS NEVER THE BUG — q8's under-emit is GlobalWindowAggregate[7] (persons side)
+swallowing ~25% of its window results.** GWA inputs are COMPLETE (2,000,000 exactly =
+deterministic persons count). TM logs: only the JOIN announces async state ⇒ the GWAs are
+SYNC-state operators; the V1 sync path has ZERO FRS_RS_EXECUTOR sensitivity (grep-verified).
+Eliminations: sync-direct executeRequestSync (ForSt-mirror, dedicated executor instance)
+corrupt 4/4 ⇒ diff (c) dead; cbran==completed==created in corrupt specimens ⇒ all AEC
+machinery dead.
+REFRAME UNDER TEST: a sync GWA can only vary with this env via TIMING (routing-async ⇒
+fastest join consumption ⇒ different backpressure/scheduling across the 8 cores ⇒ source-
+subtask skew) ⇒ candidate mechanism = GENUINE LATE-DATA DROPS at the sync window agg
+(its own numLateRecordsDropped metric exists). In-band watermarks should make this
+impossible (per-channel FIFO) — the metric poll on a corrupt specimen decides; ≈460K drops
+would mean the q8 canary has been measuring SOURCE-SKEW SENSITIVITY, not an executor race,
+relocating the fix entirely (watermark generation/idleness at the NexMark source or
+two-phase agg ordering) and CORRECTNESS-EXONERATING routing-async itself.
