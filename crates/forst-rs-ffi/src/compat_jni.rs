@@ -2406,11 +2406,15 @@ pub extern "system" fn Java_org_forstdb_RocksDB_iteratorOpen<'local>(
         &mut env,
         || 0_i64,
         |env| {
+            let Some(frs_cf) =
+                cf_from_java_or_default(env, handle, cf_handle, "RocksDB.iteratorOpen")
+            else {
+                return 0_i64;
+            };
             let mut iter: FrsIterator = ptr::null_mut();
             // SAFETY: handles came from prior open / create calls; out_iter is
             // a stack local.
-            let status =
-                unsafe { frs_iterator_open(handle as FrsDb, cf_handle as FrsCfHandle, &mut iter) };
+            let status = unsafe { frs_iterator_open(handle as FrsDb, frs_cf, &mut iter) };
             if check_status(env, status, "RocksDB.iteratorOpen") {
                 return 0;
             }
@@ -2632,6 +2636,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_lookupKv<'local>(
         &mut env,
         || ptr::null_mut() as jbyteArray,
         |env| -> jbyteArray {
+            let Some(frs_cf) = cf_from_java_or_default(env, handle, cf_handle, "RocksDB.lookupKv")
+            else {
+                return ptr::null_mut();
+            };
             let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
                 return ptr::null_mut();
             };
@@ -2642,15 +2650,8 @@ pub extern "system" fn Java_org_forstdb_RocksDB_lookupKv<'local>(
             };
             // SAFETY: out is stack-local; engine populates data/len/capacity
             // on hit, leaves NULL/0/0 on miss (per frs_lookup_kv contract).
-            let status = unsafe {
-                frs_lookup_kv(
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    k.as_ptr(),
-                    k.len(),
-                    &mut out,
-                )
-            };
+            let status =
+                unsafe { frs_lookup_kv(handle as FrsDb, frs_cf, k.as_ptr(), k.len(), &mut out) };
             if status == FRS_STATUS_NOT_FOUND {
                 return ptr::null_mut();
             }
@@ -2937,6 +2938,9 @@ fn batch_put_inner<'env, 'arr>(
     let Some(vs) = read_byte_matrix(env, &values, &format!("{label}.values")) else {
         return;
     };
+    let Some(frs_cf) = cf_from_java_or_default(env, handle, cf_handle, label) else {
+        return;
+    };
     if ks.len() != vs.len() {
         throw_rocksdb(
             env,
@@ -2958,7 +2962,7 @@ fn batch_put_inner<'env, 'arr>(
     let status = unsafe {
         frs_batch_put(
             handle as FrsDb,
-            cf_handle as FrsCfHandle,
+            frs_cf,
             key_ptrs.as_ptr(),
             key_lens.as_ptr(),
             val_ptrs.as_ptr(),
@@ -3014,6 +3018,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_batchGet<'local>(
             let Some(ks) = read_byte_matrix(env, &keys, "RocksDB.batchGet.keys") else {
                 return ptr::null_mut();
             };
+            let Some(frs_cf) = cf_from_java_or_default(env, handle, cf_handle, "RocksDB.batchGet")
+            else {
+                return ptr::null_mut();
+            };
             let count = ks.len();
             let key_ptrs: Vec<*const u8> = ks.iter().map(|k| k.as_ptr()).collect();
             let key_lens: Vec<usize> = ks.iter().map(|k| k.len()).collect();
@@ -3030,7 +3038,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_batchGet<'local>(
             let status = unsafe {
                 frs_batch_get(
                     handle as FrsDb,
-                    cf_handle as FrsCfHandle,
+                    frs_cf,
                     key_ptrs.as_ptr(),
                     key_lens.as_ptr(),
                     count,
@@ -3156,6 +3164,11 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupOpen<'local>(
         &mut env,
         || 0_i64,
         |env| {
+            let Some(frs_cf) =
+                cf_from_java_or_default(env, handle, cf_handle, "RocksDB.prefixLookupOpen")
+            else {
+                return 0_i64;
+            };
             // null prefix or len==0 → full scan (matches FFI semantics).
             let prefix_obj: &JObject = prefix.as_ref();
             let is_empty = prefix_obj.is_null() || prefix_len == 0;
@@ -3163,13 +3176,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupOpen<'local>(
             let status = if is_empty {
                 // SAFETY: NULL prefix is allowed by frs_prefix_lookup_open.
                 unsafe {
-                    frs_prefix_lookup_open(
-                        handle as FrsDb,
-                        cf_handle as FrsCfHandle,
-                        ptr::null(),
-                        0,
-                        &mut iter,
-                    )
+                    frs_prefix_lookup_open(handle as FrsDb, frs_cf, ptr::null(), 0, &mut iter)
                 }
             } else {
                 let Some(p) = read_byte_slice(env, &prefix, prefix_off, prefix_len) else {
@@ -3177,13 +3184,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupOpen<'local>(
                 };
                 // SAFETY: p is a stack-local Vec<u8>; engine copies bounds.
                 unsafe {
-                    frs_prefix_lookup_open(
-                        handle as FrsDb,
-                        cf_handle as FrsCfHandle,
-                        p.as_ptr(),
-                        p.len(),
-                        &mut iter,
-                    )
+                    frs_prefix_lookup_open(handle as FrsDb, frs_cf, p.as_ptr(), p.len(), &mut iter)
                 }
             };
             if check_status(env, status, "RocksDB.prefixLookupOpen") {

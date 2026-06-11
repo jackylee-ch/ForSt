@@ -23,8 +23,9 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use forst_rs_ffi::{
     frs_batch_get, frs_batch_put, frs_bytes_free, frs_cf_close, frs_compact_cf, frs_db_close,
-    frs_db_default_cf, frs_db_open_memory, frs_flush, frs_get, frs_put, FrsBytes, FrsCfHandle,
-    FrsDb, FRS_STATUS_OK,
+    frs_db_default_cf, frs_db_open_memory, frs_delete, frs_flush, frs_get, frs_prefix_lookup_close,
+    frs_prefix_lookup_next, frs_prefix_lookup_open, frs_put, FrsBytes, FrsCfHandle, FrsDb,
+    FrsIterator, FRS_STATUS_OK,
 };
 use std::ptr;
 use std::time::Duration;
@@ -32,6 +33,7 @@ use std::time::Duration;
 const WRITE_BATCH_ROWS: usize = 512;
 const JOIN_PROBE_ROWS: usize = 1_024;
 const JOIN_STATE_ROWS: usize = 8_192;
+const PREFIX_SCAN_ROWS: usize = 512;
 
 struct FfiDb {
     db: FrsDb,
@@ -82,6 +84,12 @@ fn make_keys(prefix: &str, count: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn make_prefixed_keys(prefix: &str, count: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|i| format!("{prefix}/user={:08}", i).into_bytes())
+        .collect()
+}
+
 fn make_values(count: usize, value_len: usize) -> Vec<Vec<u8>> {
     (0..count)
         .map(|i| {
@@ -108,6 +116,13 @@ fn get_one(db: FrsDb, cf: FrsCfHandle, key: &[u8]) -> usize {
     let len = out.len;
     assert_ok(unsafe { frs_bytes_free(&mut out) }, "frs_bytes_free(get)");
     len
+}
+
+fn delete_one(db: FrsDb, cf: FrsCfHandle, key: &[u8]) {
+    assert_ok(
+        unsafe { frs_delete(db, cf, key.as_ptr(), key.len()) },
+        "frs_delete",
+    );
 }
 
 fn batch_put(db: FrsDb, cf: FrsCfHandle, keys: &ByteBatch, values: &ByteBatch) {
@@ -158,6 +173,56 @@ fn preload(db: FrsDb, cf: FrsCfHandle, keys: &[Vec<u8>], values: &[Vec<u8>]) {
     let key_batch = ByteBatch::from_bytes(keys);
     let value_batch = ByteBatch::from_bytes(values);
     batch_put(db, cf, &key_batch, &value_batch);
+}
+
+fn prefix_scan(db: FrsDb, cf: FrsCfHandle, prefix: &[u8]) -> usize {
+    let mut iter: FrsIterator = ptr::null_mut();
+    assert_ok(
+        unsafe { frs_prefix_lookup_open(db, cf, prefix.as_ptr(), prefix.len(), &mut iter) },
+        "frs_prefix_lookup_open",
+    );
+    let mut rows = 0usize;
+    loop {
+        let mut key = FrsBytes::default();
+        let mut value = FrsBytes::default();
+        let mut valid = false;
+        assert_ok(
+            unsafe { frs_prefix_lookup_next(iter, &mut key, &mut value, &mut valid) },
+            "frs_prefix_lookup_next",
+        );
+        if !valid {
+            assert_ok(
+                unsafe { frs_bytes_free(&mut key) },
+                "frs_bytes_free(prefix exhausted key)",
+            );
+            assert_ok(
+                unsafe { frs_bytes_free(&mut value) },
+                "frs_bytes_free(prefix exhausted value)",
+            );
+            break;
+        }
+        if !key.data.is_null() {
+            let key_slice = unsafe { std::slice::from_raw_parts(key.data, key.len) };
+            assert!(
+                key_slice.starts_with(prefix),
+                "prefix iterator returned non-matching key"
+            );
+        }
+        rows += 1;
+        assert_ok(
+            unsafe { frs_bytes_free(&mut key) },
+            "frs_bytes_free(prefix key)",
+        );
+        assert_ok(
+            unsafe { frs_bytes_free(&mut value) },
+            "frs_bytes_free(prefix value)",
+        );
+    }
+    assert_ok(
+        unsafe { frs_prefix_lookup_close(iter) },
+        "frs_prefix_lookup_close",
+    );
+    rows
 }
 
 fn bench_forst_backend_write_batch_translation(c: &mut Criterion) {
@@ -254,6 +319,48 @@ fn bench_forst_backend_compacted_join_probe(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_forst_backend_delete_then_get(c: &mut Criterion) {
+    let key = b"q5-tombstone/key-group=0007/key=00000042".to_vec();
+    let value = make_values(1, 48).remove(0);
+
+    let mut group = c.benchmark_group("compat_jni_forst_backend/delete_then_get");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("put_delete_get_miss", |b| {
+        let ffi = FfiDb::open();
+        b.iter(|| {
+            put_one(ffi.db, ffi.cf, black_box(&key), black_box(&value));
+            delete_one(ffi.db, ffi.cf, black_box(&key));
+            let len = get_one(ffi.db, ffi.cf, black_box(&key));
+            assert_eq!(len, 0, "deleted key must read as missing");
+        });
+    });
+    group.finish();
+}
+
+fn bench_forst_backend_prefix_scan(c: &mut Criterion) {
+    let prefix = b"q11-map/key-group=0042/namespace=active/".to_vec();
+    let keys = make_prefixed_keys(
+        std::str::from_utf8(&prefix).expect("prefix is utf8"),
+        PREFIX_SCAN_ROWS,
+    );
+    let values = make_values(PREFIX_SCAN_ROWS, 64);
+
+    let mut group = c.benchmark_group("compat_jni_forst_backend/prefix_scan");
+    group.throughput(Throughput::Elements(PREFIX_SCAN_ROWS as u64));
+    group.bench_function(
+        BenchmarkId::new("open_drain_close", PREFIX_SCAN_ROWS),
+        |b| {
+            let ffi = FfiDb::open();
+            preload(ffi.db, ffi.cf, &keys, &values);
+            b.iter(|| {
+                let rows = prefix_scan(ffi.db, ffi.cf, black_box(&prefix));
+                assert_eq!(rows, PREFIX_SCAN_ROWS, "prefix scan row count");
+            });
+        },
+    );
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
@@ -263,6 +370,8 @@ criterion_group! {
     targets =
         bench_forst_backend_write_batch_translation,
         bench_forst_backend_join_probe_multiget,
-        bench_forst_backend_compacted_join_probe
+        bench_forst_backend_compacted_join_probe,
+        bench_forst_backend_delete_then_get,
+        bench_forst_backend_prefix_scan
 }
 criterion_main!(benches);
