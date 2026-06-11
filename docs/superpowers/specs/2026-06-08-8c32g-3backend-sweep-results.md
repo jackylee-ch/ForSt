@@ -2124,3 +2124,15 @@ All control gates green → q17 ×3, then q9/q20 drain-verdict pairs.
 First remote q17 baseline; the box is measurement-grade (Mac q17 swung 3×).
 Drain-ON shows no q17 regression risk (control gate intent satisfied). q9 frs
 (drain verdict run) started — model ~2030-2180s vs round-1 2421.2.
+
+### ★★ ROUND-2 ALARM: q9 frs 2872.8s (+18.7% vs r1) AND out_rows 91,813,396 = +24 vs CANONICAL
+Drain-ON model predicted −10-16%; got +18.7% AND a CORRECTNESS deviation (+24
+rows — resurrection-shaped). Suspects in r2 tip vs r1: (1) drain-ON default
+(tombstone drop too early ⇒ deleted keys resurrect ⇒ extra ROW_NUMBER emits +
+extra compaction work explains the slowdown) — PRIME; (2) Java V1 timer
+peek/poll alloc fix (its flagged lockstep gate never ran); (3) E5 fallback
+(unlikely: single-CF levels stay monotonic). q9-rdb control in flight (box-state
+check). DISAMBIGUATION (round-2b, after matrix): same tip + 
+FRS_GARBAGE_DRAIN_TOMBSTONES=0 q9 → rows canonical ⇒ drain culpable ⇒ revert
+default + root-cause the gate; else jar-swap bisect (r1 jar + r2 engine).
+CORRECTNESS IS NON-NEGOTIABLE — drain default flip is BLOCKED until resolved.
