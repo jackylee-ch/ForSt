@@ -2057,3 +2057,10 @@ read stack WITHOUT drain-default (one variable at a time; drain lands next round
 Matrix queued (nohup, logs /ssd2/jackylee/frs-bench/logs/SUMMARY.md): q7 uring-on
 → q7 uring-off → q7 rocksdb → q9 frs/rdb → q20 frs/rdb. REMOTE numbers are a NEW
 population — never compare to Mac pins.
+
+### REMOTE round-1 (streaming stack, NO drain-default): q7 uring-ON = 2376.4s
+q7@100M forst-rs FRS_IO_URING=on: FINISHED 2376.4s, out_rows 92,000,002 (src
+92,000,316). Remote population — per-core slower than Mac (q8 153-170s vs Mac
+~48s class); cross-population q7-vs-ForSt-587s comparisons INVALID pending a
+remote ForSt pin. The uring-off arm (started 00:56) gives the io_uring delta;
+the rocksdb arm gives the remote ratio. Second q8 canary: 170.1s rows-in-band.
