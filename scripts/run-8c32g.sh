@@ -87,8 +87,14 @@ case "$cmd" in
       NET=frs-net
       docker network create "$NET" >/dev/null 2>&1 || true
       docker rm -f frs-jm frs-tm1 frs-tm2 >/dev/null 2>&1 || true
+      # TM JVM allocator: jemalloc via LD_PRELOAD (uniform across ALL backends —
+      # an environment property of the box, like the kernel). The engine's own
+      # jemalloc is statically bundled in the .so and unaffected (prefixed symbols).
+      TM_PRELOAD=()
+      [ "${FRS_TM_JEMALLOC:-1}" = "1" ] && TM_PRELOAD=(-e LD_PRELOAD=/usr/local/lib/libjemalloc-preload.so)
       for i in 1 2; do
         docker run -d --name "frs-tm$i" --network "$NET" --cpus=4 --memory=16g --memory-swap=16g \
+          ${TM_PRELOAD[@]+"${TM_PRELOAD[@]}"} \
           "${DKR_COMMON[@]}" "${ENVS[@]}" "$IMG" bash -lc "
             mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
             cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&

@@ -5,8 +5,12 @@ FROM eclipse-temurin:25-jdk-jammy
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       openjdk-17-jdk-headless build-essential curl ca-certificates \
-      python3 gettext-base procps findutils git pkg-config && \
+      python3 gettext-base procps findutils git pkg-config libjemalloc2 && \
     rm -rf /var/lib/apt/lists/*
+# TM-process allocator (engine bundles its own _rjem_-prefixed jemalloc in the
+# .so; this one governs the JVM's native allocations — FFM arenas → malloc).
+# Arch-independent path for LD_PRELOAD across x86_64/aarch64 images.
+RUN ln -s /usr/lib/*-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc-preload.so
 # JDK25 from the temurin base; JDK17 from Ubuntu repo.
 ENV JDK25=/opt/java/openjdk
 # arch-dependent: java-17-openjdk-arm64 on arm64, -amd64 on x86_64
