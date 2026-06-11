@@ -1956,3 +1956,11 @@ Recovered only ~25s of the +364s fix tax ⇒ the tax lives mainly in the EMPTY-C
 path (engine re-read spans), not the live-cache within-window branch the merge covers.
 Profile-driven next step. Ledger: blocking/pre-fix 2215.6 | blocking/fix 2579.8 |
 pipelined/fix 2423.4 | pipelined/fix+merge 2398.5. Target 1491.5 (1.05× RDB 1420.5).
+
+### ★★ SAME-HOUR 1.05×-TARGET SCOREBOARD (2026-06-11 evening; rows byte-equal both sides)
+q9: frs 2398.5 vs RDB 1449.5 = **1.65×** (need ≤1522s) | q20: frs 2021.6 vs RDB 963.3 =
+**2.10×** (need ≤1011s). RDB stable vs matrix ⇒ box fine ⇒ regressions are OURS.
+TIMER-FIX TAX SCALES WITH TIMER DENSITY: q17 +300% (77→310s class), q20 +37%, q9 +16% —
+the fix is the dominant regression and its cost path did NOT appear in q20's CPU profile
+(suspect: wait-time or a path the 180s window missed). NEXT: q17 lockstep + FRS_PERF —
+cheap (~300s), tax-dominated ⇒ directly exposes the cost path; then kill it.
