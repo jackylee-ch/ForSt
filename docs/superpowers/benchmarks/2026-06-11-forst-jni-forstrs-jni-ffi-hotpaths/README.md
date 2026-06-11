@@ -29,13 +29,15 @@ FORST_RS_LIB=/private/tmp/forst-compat-jni-forst-backend/target/release/libforst
 Community ForSt JNI:
 
 ```text
-/Library/Java/JavaVirtualMachines/zulu-25.jdk/Contents/Home/bin/javac --release 21 ...
+jar xf /Users/lijunqing/.m2/repository/com/ververica/forstjni/0.1.8/forstjni-0.1.8.jar \
+  libforstjni-osx-arm64.jnilib
+BENCH_WARMUP_S=1 BENCH_MEASURE_S=2 \
+  FORST_LIB=/tmp/forstjni-0.1.8-extract/libforstjni-osx-arm64.jnilib \
+  ./run-jmh-3way.sh forst hotpaths
 ```
 
-The community Java hot-path class compiles. Runtime was not executed locally
-because `/tmp/forstjni-community.dylib` is absent and Maven is mirrored to
-`https://maven.baidu-int.com/nexus/content/groups/public`, which does not
-provide `com.ververica:forstjni:0.1.8:jar:osx-aarch_64`.
+The community Java hot-path class compiles and runs locally with the native
+library extracted from the cached `com.ververica:forstjni:0.1.8` jar.
 
 ## ForSt-RS JNI Smoke
 
@@ -54,6 +56,32 @@ Library: local `libforst_rs_ffi.dylib` rebuilt with `--features compat-jni`
 | multiGet | 1,931,264 rows | 2.001 s | 965,253 rows/s |
 | prefixScan | 1,633,792 rows | 2.000 s | 816,719 rows/s |
 | flushCompactRead | 4 ops | 2.051 s | 2 ops/s |
+
+## Community ForSt JNI Smoke
+
+JDK: Zulu 25.0.3
+Window: 1s warmup, 2s measurement
+Library: `/tmp/forstjni-0.1.8-extract/libforstjni-osx-arm64.jnilib`
+
+| Workload | Units | Time | Throughput |
+|---|---:|---:|---:|
+| openClose | 41 ops | 2.032 s | 20 ops/s |
+| pointGet | 4,933,240 ops | 2.000 s | 2,466,586 ops/s |
+| pointPut | 718,534 ops | 2.000 s | 359,265 ops/s |
+| deleteThenGet | 433,029 ops | 2.000 s | 216,514 ops/s |
+| writeBatch | 2,400,768 rows | 2.001 s | 1,200,030 rows/s |
+| multiGet | 1,763,328 rows | 2.001 s | 881,249 rows/s |
+
+## JNI Hot-Path Comparison
+
+| Workload | ForSt JNI | ForSt-RS JNI | ForSt-RS / ForSt |
+|---|---:|---:|---:|
+| openClose | 20 ops/s | 193 ops/s | 9.65x |
+| pointGet | 2,466,586 ops/s | 2,408,651 ops/s | 0.98x |
+| pointPut | 359,265 ops/s | 761,710 ops/s | 2.12x |
+| deleteThenGet | 216,514 ops/s | 594,597 ops/s | 2.75x |
+| batch/writeBatch | 1,200,030 rows/s | 1,312,210 rows/s | 1.09x |
+| multiGet | 881,249 rows/s | 965,253 rows/s | 1.10x |
 
 ## ForSt-RS FFI Criterion Smoke
 
@@ -85,6 +113,10 @@ compat_multi_get single-CF shortcut benchmark: legacy_reorder=4.14275ms, single_
 
 - The new ForSt-RS JNI hot-path smoke runs end to end after fixing compact-JNI
   CF handle resolution for batch/prefix/iterator paths.
+- The local community ForSt JNI comparison now runs from the cached
+  `forstjni-0.1.8` native library. In this low-resource JVM smoke, ForSt-RS JNI
+  is near-parity on point get and faster on put/delete/batch/multi-get bridge
+  paths, but this is still a hot-path smoke rather than a Nexmark result.
 - ForSt-RS FFI batch put is faster than per-entry put, but only 1.19x in this
   criterion smoke; the separate ignored compat bench still shows a stronger
   4.327x write-batch win.
@@ -95,10 +127,9 @@ compat_multi_get single-CF shortcut benchmark: legacy_reorder=4.14275ms, single_
 - Prefix iteration remains the clearest bridge win: lazy prefix iterator is
   41.077x faster than the full-open-seek path in the targeted compat bench, and
   the new FFI prefix scan drains 512 rows at a 136.56 us median.
-- Community ForSt JNI comparison still needs a runnable community native
-  library on this machine or on the remote Linux server. The Java benchmark
-  source compiles, so the remaining blocker is environment packaging, not Java
-  code shape.
+- Local reruns should respect the 40G memory reservation. During the latest
+  local check, `memory_pressure -Q` showed only about 31G free, so the
+  ForSt-RS side was not rerun after the community ForSt JNI smoke.
 
 ## Next Gate
 
