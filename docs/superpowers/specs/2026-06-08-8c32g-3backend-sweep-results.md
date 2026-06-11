@@ -1486,3 +1486,19 @@ prefix-hash collection per key in add_internal (incl. a per-distinct-prefix Vec 
 — q17's agg keys are ALL distinct prefixes → alloc+hash per key on every flush AND
 every compaction rewrite). q9/q20 absorbed it (read-bound); q17 (1.15M rec/s
 write-bound) pays full price.
+
+# Degenerate-skip validation (2026-06-11 08:10): q9 BEST-EVER; q17 residual remains
+| run | result |
+|---|---|
+| q9@50M routing+200K (fixed .so) | **727.3s — campaign best** (prior best 765.6), rows EXACT |
+| q17@100M drain-off (fixed .so) | still MAXSEC@300 — degenerate-skip insufficient |
+READING: the alloc-free collector + emit-skip HELPED q9's writes (765.6→727.3) but q17's
+16B prefixes are evidently NOT >50% distinct (shared auction-id bytes keep its bloom
+alive) — the residual q17 cost inside the bloom commit (99.8→263.9s bisect) is NOT yet
+mechanistically identified. NEXT (profile, don't theorize): (1) writer-side kill-switch
+(FRS_DISABLE_PREFIX_BLOOM must also skip COLLECTION+EMIT — today it only gates the scan
+check) → q17 A/B isolates writer-vs-reader cost; (2) FRS_PROF_DIAG sub-cost attribution
+on a q17 flush (SST_BUFFER/ENCODE/SINKWRITE counters already exist) → pinpoints whether
+the cost is bloom build, file-size growth (2nd bloom → I/O), or reader-open bloom loads.
+STATE: every shipped lever is correctness-exact; q9/q20 wins intact and improved;
+q17's regression is bisected to one commit with a measurement plan to finish it.
