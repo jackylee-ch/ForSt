@@ -176,3 +176,50 @@ violation-free per the standing mandate, and de-noising future profiles.
 3. Lockstep exactness ×2 for anything touching poll/peek ordering (V1) —
    the Stage-0 timer-queue regression rule applies to ANY timer-path edit.
 4. q5 windowed-value byte-exactness (pane counts mask value bugs).
+
+---
+
+## Appendix A — Adversarial review of commits landed on forst-rs since 277158765
+(fresh-eyes pass, 2026-06-12; commits 7ad678d25, f164c35fd, dcc465b81,
+43a473315 / merge b1ea944de)
+
+**A1. `43a473315` garbage-drain DEFAULT ON @200K (roadmap L1) — rewrite
+FAITHFUL, measurement gate OUTSTANDING.** Verified against the pre-image:
+the old `garbage_drain_due()` was exactly `threshold > 0 && pressure >=
+threshold` (the flush-ratio gate was already removed by GATE-V2 — pre-image
+db.rs:217-233), so the new pure `garbage_drain_gate` 5-condition form drops
+NOTHING: conditions 1-2 = old `garbage_drain_due`, 3 = old `!backoff`,
+4-5 = old L1-floor closure. The two-step call passes the SAME captured
+locals to both gate invocations (no racy re-read), and the boundary UT
+covers every edge. **Finding (process, not code):** the roadmap's L1 gate
+("q17 @100M no-regress ×3, q3/q8 no-regress, exact-rows on q9/q20") has not
+been run for the flip itself; the commit relies on the 90d9fcbdf
+attribution-reversal for the q17 exoneration. The flip is reasonable, but
+the @100M validation set is now the FIRST thing the box must run — before
+any further default changes stack on top (attribution discipline).
+
+**A2. `7ad678d25` H1 catch_unwind + join timeouts — correct; two residuals.**
+`POOL_JOIN_TIMEOUT = 300 s` is generous (a wedged probe at 300 s is a dead
+query, not a false positive). Residual (i): on Timeout, a late-completing
+`batch_open_prefix_iters_parallel` job's built `IterHandle` is dropped via
+the failed channel send — engine-side resource release rides the handle's
+Drop; recommend one leak-watchdog UT for the timeout path specifically
+(panic path is tested, timeout path is not). Residual (ii): per-slot
+timeout errors must surface to Java as query failure (deferred-error
+machinery), never as empty probe results — covered by existing R15-M3/
+R17-M1 plumbing for the iter path, worth one assertion in the Java suite.
+
+**A3. `f164c35fd` M2 remote ramp ≥2 — matches the roadmap blocker exactly;
+the test was updated honestly (asserts cold after block 1, ramp after
+block 2, deep cap retained). No issues.
+
+**A4. `dcc465b81` M3 telemetry — observation only, no enforcement. The
+compaction-windowed spec (`2026-06-12-compaction-windowed-readpath-design
+.md` §2.3) should share ONE budget-constant home with this when its
+`FRS_COMPACT_PREFETCH_BUDGET` lands.
+
+**A5. Cross-spec impact on this session's docs:** the compaction spec's
+gate G2 (H1 catch_unwind prerequisite) is ALREADY SATISFIED by 7ad678d25.
+File:line citations in all four 2026-06-12 specs reference base 277158765;
+db.rs sites shifted by ~+60 lines after the merge — re-anchor during
+implementation, the cited code is unchanged.
