@@ -29,8 +29,11 @@
 //!    starts at `ra_blocks = 2`, doubling each window up to a cap:
 //!    - local files (`RandomAccessFile::is_local() == true`): cap 256 KiB
 //!      (4 × 64 KiB blocks), ramp after 2 consumed blocks;
-//!    - remote/evicted files: cap 4 MiB (64 blocks), ramp after the FIRST
-//!      block (a GetObject round-trip has high fixed cost).
+//!    - remote/evicted files: cap 4 MiB (64 blocks — a GetObject round-trip
+//!      has high fixed cost, so ramped windows go deep), ramp after 2
+//!      consumed blocks like local (M2: ramping after the FIRST block made
+//!      every 1-block probe over an evicted SST speculate remotely,
+//!      violating "R-short never speculates").
 //! 3. **Multi-block reads**: one positional read spanning the window's
 //!    physically contiguous blocks (the sparse index gives exact offset+size
 //!    per block); per-block regions are sliced out of the single buffer.
@@ -71,9 +74,14 @@ const REMOTE_CAP_BYTES: u64 = 4 * 1024 * 1024;
 /// additionally byte-trimmed against the caps above for other block sizes).
 const LOCAL_CAP_BLOCKS: u32 = 4;
 const REMOTE_CAP_BLOCKS: u32 = 64;
-/// Sequential blocks consumed before the ramp starts.
+/// Sequential blocks consumed before the ramp starts. BOTH regimes require 2
+/// consumed blocks (M2, 2026-06-11 PMC review): ramping remote after the
+/// FIRST block violated the "R-short never speculates" invariant on the
+/// evicted tier — every 1-block probe over an evicted SST issued a
+/// speculative 2-block remote read. The remote regime keeps its DEEPER cap
+/// (4 MiB / 64 blocks) once sequentiality is actually established.
 const LOCAL_RAMP_AFTER: u32 = 2;
-const REMOTE_RAMP_AFTER: u32 = 1;
+const REMOTE_RAMP_AFTER: u32 = 2;
 /// Ramped prefetch inserts at `Bottom` once the window is at least this deep.
 const BOTTOM_PRIORITY_RA: u32 = 4;
 /// H1 (2026-06-11 PMC review): generous upper bound `next_decoded` may wait
@@ -714,26 +722,33 @@ mod tests {
         assert_eq!(pf.ra_blocks(), LOCAL_CAP_BLOCKS, "local cap is 4 blocks");
     }
 
-    /// Remote regime enters the ramp after the FIRST block and doubles toward
-    /// the 4 MiB / 64-block cap.
+    /// Remote regime (M2): cold for the first 2 blocks exactly like local —
+    /// a 1-block probe over an evicted SST must NEVER speculate remotely —
+    /// then ramps and doubles toward the DEEPER 4 MiB / 64-block cap.
     #[test]
-    fn ramp_transitions_remote_after_first_block() {
+    fn ramp_transitions_remote_after_two_blocks() {
         let data = build_sst(400);
         let (reader, _file) = open_reader(&data, None, &data);
         let mut pf = BlockPrefetcher::new(Arc::clone(&reader), 0, None).with_regime(false, true);
+        // Block 1: cold — zero speculation (the R-short invariant on the
+        // evicted tier).
+        assert!(pf.next_decoded().unwrap().is_some());
+        assert_eq!(pf.ra_blocks(), 0, "remote stays cold after first block");
+        // Block 2: ramp entered (>= 2 consumed) — first window (2 blocks)
+        // submitted, ra doubled to 4 for the next window.
         assert!(pf.next_decoded().unwrap().is_some());
         assert_eq!(
             pf.ra_blocks(),
             4,
-            "remote ramps after block 1 (ra=2 submitted, doubled to 4)"
+            "remote ramps after block 2 (ra=2 submitted, doubled to 4)"
         );
-        let mut seen = 1;
+        let mut seen = 2;
         while pf.next_decoded().unwrap().is_some() {
             seen += 1;
         }
         assert_eq!(seen, reader.index_entry_count());
         assert!(pf.ra_blocks() <= REMOTE_CAP_BLOCKS);
-        assert!(pf.ra_blocks() >= 8, "remote keeps doubling past 4");
+        assert!(pf.ra_blocks() >= 8, "remote keeps doubling past the local cap");
     }
 
     /// §2.1.5 clamp: with an upper bound that cuts the keyspace in half, the
