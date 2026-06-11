@@ -100,6 +100,30 @@ pub struct CompactionJob {
 }
 
 impl CompactionJob {
+    /// OPT-N04 E1 (promotes the R49-H1 `debug_assert`): every input SST must
+    /// belong to this job's CF. Compaction is per-CF isolated (level picking,
+    /// input selection and output stamping are all cf_id-filtered in db.rs),
+    /// so a cross-CF input is a structural bug upstream. With the R45-H1
+    /// merge-operator homogeneity wall retired, this check is the
+    /// defense-in-depth guarantee that one CF's merge operator / compaction
+    /// filter can never be applied to another CF's rows — hence a hard
+    /// [`ForstError::Corruption`] in ALL build profiles, not a debug assert.
+    fn check_inputs_single_cf(&self) -> ForstResult<()> {
+        for (_, meta, _) in &self.inputs {
+            if meta.cf_id != self.cf_id {
+                return Err(ForstError::corruption(format!(
+                    "CompactionJob cf_id {:?} ≠ input file {} cf_id {:?} — cross-CF \
+                     compaction input (R49-H1/OPT-N04-E1); refusing to merge rows \
+                     across column families",
+                    self.cf_id,
+                    meta.file_number.value(),
+                    meta.cf_id,
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Runs the compaction synchronously and returns a [`VersionEdit`] that
     /// the caller should apply atomically to the [`forst_rs_storage::version::VersionSetImpl`].
     ///
@@ -125,22 +149,15 @@ impl CompactionJob {
             return self.run_streaming();
         }
 
-        // R49-H1 defense-in-depth: every input must already belong to the
-        // same CF as the compaction job. The engine-side caller (db.rs)
-        // builds compaction inputs by reading one CF's file list, so a
-        // cross-CF input here would be a structural bug — we trip a debug
-        // assertion and continue in release. Once the engine wires per-CF
-        // version lists this check becomes a hard error.
-        for (_, meta, _) in &self.inputs {
-            debug_assert_eq!(
-                meta.cf_id,
-                self.cf_id,
-                "CompactionJob cf_id {:?} ≠ input file {} cf_id {:?} — cross-CF input",
-                self.cf_id,
-                meta.file_number.value(),
-                meta.cf_id,
-            );
-        }
+        // R49-H1 defense-in-depth, promoted to a HARD error (OPT-N04 E1):
+        // every input must already belong to the same CF as the compaction
+        // job. The engine-side caller (db.rs) builds compaction inputs by
+        // reading one CF's file list, so a cross-CF input here is a
+        // structural bug. With the R45-H1 merge-operator homogeneity wall
+        // retired, this is the check that guarantees a compaction can never
+        // apply one CF's merge operator / compaction filter to another CF's
+        // rows — it must fail loudly in release builds too.
+        self.check_inputs_single_cf()?;
 
         // 1. Gather every entry from every input SST, tagging each with the
         //    source file_number so we can break ties when two SSTs use the
@@ -576,16 +593,8 @@ impl CompactionJob {
     /// Multi-file output (`target_file_size` / `additional_outputs`) rolls to the
     /// next slot at a user-key boundary, identical to the serial path in `run`.
     fn run_streaming(self) -> ForstResult<Option<VersionEdit>> {
-        for (_, meta, _) in &self.inputs {
-            debug_assert_eq!(
-                meta.cf_id,
-                self.cf_id,
-                "CompactionJob cf_id {:?} ≠ input file {} cf_id {:?} — cross-CF input",
-                self.cf_id,
-                meta.file_number.value(),
-                meta.cf_id,
-            );
-        }
+        // OPT-N04 E1: hard cross-CF input check (see `check_inputs_single_cf`).
+        self.check_inputs_single_cf()?;
 
         // One pull cursor per input; track each input's file_number for the
         // effective-seq tie-break (newer file dominates).
