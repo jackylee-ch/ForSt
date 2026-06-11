@@ -106,6 +106,41 @@ fn prefetch_enabled() -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// M3 (2026-06-11 PMC review): aggregate prefetch-memory TELEMETRY (no
+// enforcement yet). Tens of concurrently-open sources × (4 MiB ready +
+// 4 MiB inflight) is an uncounted ~0.5 GB/iterator worst case on the
+// 8c/32g box — this counter makes the budget observable on 100M runs.
+// ---------------------------------------------------------------------------
+
+/// Global aggregate of prefetcher-held bytes (on-disk block sizes), covering
+/// BOTH claimed-but-undelivered `ready` blocks and submitted in-flight
+/// windows, across every live [`BlockPrefetcher`] in the process.
+/// Incremented at window submit; balance moves from inflight to ready at
+/// claim (no net change); decremented at block delivery, window failure,
+/// [`BlockPrefetcher::terminate`], and prefetcher drop.
+static PREFETCH_BUFFERED_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Current aggregate of prefetcher ready+inflight bytes (M3 telemetry).
+/// Sizes are on-disk (pre-decompression) block bytes — the I/O-side budget.
+pub fn prefetch_buffered_bytes() -> usize {
+    PREFETCH_BUFFERED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Diag gate shared with the read-path instrumentation (`FRS_READ_AT_DIAG=1`,
+/// cached_fs.rs): when set, each window submit logs the aggregate so 100M
+/// runs can watch the prefetch memory budget.
+fn prefetch_diag() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_READ_AT_DIAG").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Shared read-I/O pool (§2.5 axis 2): `clamp(cores/2, 2, 6)` threads, env
 // override `FRS_RS_PREFETCH_THREADS`. Per-SST-source prefetch handles run
 // here, so a single long scan gets I/O parallelism = min(#sources, pool) even
@@ -196,6 +231,9 @@ struct PrefetchHandle {
     rx: Receiver<WindowResult>,
     /// `[start, end)` block indices this handle will produce.
     range: (usize, usize),
+    /// On-disk bytes of the submitted window — the inflight share charged to
+    /// [`PREFETCH_BUFFERED_BYTES`] (M3 telemetry).
+    bytes: usize,
 }
 
 /// Per-SST-source prefetch state machine. See the module docs.
@@ -209,8 +247,9 @@ pub struct BlockPrefetcher {
     blocks_consumed: u32,
     /// Current readahead window in blocks (0 = cold / readahead off).
     ra_blocks: u32,
-    /// Claimed-but-undelivered decoded blocks, in index order.
-    ready: VecDeque<DecodedBlock>,
+    /// Claimed-but-undelivered decoded blocks, in index order, each paired
+    /// with its ON-DISK size (the M3 telemetry charge released at delivery).
+    ready: VecDeque<(u32, DecodedBlock)>,
     /// In-flight window production, if any.
     inflight: Option<PrefetchHandle>,
     /// Regime: local (shallow ramp) vs remote (deep ramp).
@@ -260,8 +299,18 @@ impl BlockPrefetcher {
     /// §2.1.5: stop this source — the consumer hit the scan's upper bound
     /// mid-block. Drops the in-flight handle (the pool job's result is
     /// discarded on the dead channel) and parks the cursor at `end_block`.
+    /// Releases this source's entire M3 telemetry charge (idempotent).
     pub fn terminate(&mut self) {
         self.next_block = self.end_block;
+        let held: usize = self
+            .ready
+            .iter()
+            .map(|&(sz, _)| sz as usize)
+            .sum::<usize>()
+            + self.inflight.as_ref().map_or(0, |h| h.bytes);
+        if held > 0 {
+            PREFETCH_BUFFERED_BYTES.fetch_sub(held, std::sync::atomic::Ordering::Relaxed);
+        }
         self.ready.clear();
         self.inflight = None;
     }
@@ -273,7 +322,8 @@ impl BlockPrefetcher {
         // 1. Serve a claimed block. Double-buffering: if this drains `ready`
         //    and nothing is in flight, submit the next window BEFORE the
         //    consumer walks the delivered block's rows.
-        if let Some(block) = self.ready.pop_front() {
+        if let Some((sz, block)) = self.ready.pop_front() {
+            PREFETCH_BUFFERED_BYTES.fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
             self.on_delivered();
             if self.ready.is_empty() && self.inflight.is_none() {
                 self.maybe_submit_window();
@@ -295,27 +345,40 @@ impl BlockPrefetcher {
             // skip the window's blocks.
             let produced = match handle.rx.recv_timeout(POOL_JOIN_TIMEOUT) {
                 Ok(p) => p,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(e) => {
+                    // The handle was already taken — release its inflight M3
+                    // charge here (`terminate` only releases what it sees).
+                    PREFETCH_BUFFERED_BYTES
+                        .fetch_sub(handle.bytes, std::sync::atomic::Ordering::Relaxed);
                     self.terminate();
-                    return Err(ForstError::internal(
-                        "BlockPrefetcher: read-I/O pool worker dropped its window",
-                    ));
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    self.terminate();
-                    return Err(ForstError::timed_out(
-                        "BlockPrefetcher: prefetch window not produced within join timeout",
-                    ));
+                    return Err(match e {
+                        std::sync::mpsc::RecvTimeoutError::Disconnected => ForstError::internal(
+                            "BlockPrefetcher: read-I/O pool worker dropped its window",
+                        ),
+                        std::sync::mpsc::RecvTimeoutError::Timeout => ForstError::timed_out(
+                            "BlockPrefetcher: prefetch window not produced within join timeout",
+                        ),
+                    });
                 }
             };
             match produced {
                 Ok(blocks) => {
                     debug_assert_eq!(blocks.len(), handle.range.1 - handle.range.0);
-                    self.ready.extend(blocks);
+                    // M3: the inflight charge transfers to `ready` (each
+                    // block keeps its on-disk size) — no net counter change.
+                    for (j, block) in blocks.into_iter().enumerate() {
+                        let sz = self
+                            .reader
+                            .block_region(handle.range.0 + j)
+                            .map_or(0, |(_, s)| s);
+                        self.ready.push_back((sz, block));
+                    }
                     self.maybe_submit_window();
                     // Recurse once into the ready-serve path (never deeper:
                     // `ready` is now non-empty or the window was empty ⇒ EOF).
-                    if let Some(block) = self.ready.pop_front() {
+                    if let Some((sz, block)) = self.ready.pop_front() {
+                        PREFETCH_BUFFERED_BYTES
+                            .fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
                         self.on_delivered();
                         return Ok(Some(block));
                     }
@@ -324,7 +387,11 @@ impl BlockPrefetcher {
                 Err(e) => {
                     // A failed window aborts the source (same as a failed
                     // demand read on the legacy path). Park at EOF so retries
-                    // don't re-issue I/O on a known-bad region.
+                    // don't re-issue I/O on a known-bad region. The handle
+                    // was already taken, so release its inflight charge here
+                    // (`terminate` only releases what it can still see).
+                    PREFETCH_BUFFERED_BYTES
+                        .fetch_sub(handle.bytes, std::sync::atomic::Ordering::Relaxed);
                     self.terminate();
                     return Err(e);
                 }
@@ -413,9 +480,20 @@ impl BlockPrefetcher {
             // Receiver dropped (iterator closed/aborted) ⇒ result discarded.
             let _ = tx.send(result);
         }));
+        // M3 telemetry: charge the window at submit (released at delivery /
+        // failure / terminate / drop).
+        let agg = PREFETCH_BUFFERED_BYTES
+            .fetch_add(window_bytes as usize, std::sync::atomic::Ordering::Relaxed)
+            + window_bytes as usize;
+        if prefetch_diag() {
+            eprintln!(
+                "[PREFETCH_DIAG] window submit blocks=[{start},{end}) bytes={window_bytes} aggregate_buffered={agg}"
+            );
+        }
         self.inflight = Some(PrefetchHandle {
             rx,
             range: (start, end),
+            bytes: window_bytes as usize,
         });
         self.next_block = end;
         // Double toward the regime cap for the NEXT window.
@@ -425,6 +503,16 @@ impl BlockPrefetcher {
             REMOTE_CAP_BLOCKS
         };
         self.ra_blocks = (self.ra_blocks * 2).min(cap_blocks);
+    }
+}
+
+impl Drop for BlockPrefetcher {
+    /// M3: a dropped prefetcher releases its entire ready+inflight charge —
+    /// the aggregate counter never leaks from abandoned iterators.
+    /// (`terminate` is idempotent: after an explicit terminate the fields are
+    /// already empty and this subtracts nothing.)
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -921,7 +1009,11 @@ mod tests {
         // Simulate a panicked window job: receiver installed, sender gone.
         let (tx, rx) = std::sync::mpsc::sync_channel::<WindowResult>(1);
         drop(tx);
-        pf.inflight = Some(PrefetchHandle { rx, range: (0, 2) });
+        pf.inflight = Some(PrefetchHandle {
+            rx,
+            range: (0, 2),
+            bytes: 0,
+        });
         pf.next_block = 2; // as maybe_submit_window would have left it
         let err = match pf.next_decoded() {
             Err(e) => e,
@@ -933,6 +1025,42 @@ mod tests {
         );
         // Parked at EOF — never resumes past the lost window.
         assert!(pf.next_decoded().unwrap().is_none());
+    }
+
+    /// M3: the aggregate ready+inflight counter goes up while a ramped
+    /// prefetcher holds undelivered windows and is fully released once the
+    /// prefetcher is dropped mid-stream (no leak from abandoned iterators).
+    /// Tolerates concurrent tests by polling for release and asserting the
+    /// counter never wraps.
+    #[test]
+    fn buffered_bytes_charge_released_on_drop() {
+        let data = build_sst(400);
+        let (reader, _file) = open_reader(&data, None, &data);
+        let before = prefetch_buffered_bytes();
+        {
+            let mut pf =
+                BlockPrefetcher::new(Arc::clone(&reader), 0, None).with_regime(false, true);
+            // Consume past the ramp so windows are submitted (charged).
+            for _ in 0..6 {
+                assert!(pf.next_decoded().unwrap().is_some());
+            }
+            // pf dropped here mid-stream with ready and/or inflight bytes.
+        }
+        // The charge must drain back out (other tests may add their own
+        // transient charges, so poll until OUR contribution is gone).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = prefetch_buffered_bytes();
+            assert!(now < usize::MAX / 2, "counter wrapped (double release)");
+            if now <= before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prefetch buffered-bytes charge leaked: before={before} now={now}"
+            );
+            std::thread::yield_now();
+        }
     }
 
     /// Starting mid-file (seek target from first_block_ge) delivers exactly
