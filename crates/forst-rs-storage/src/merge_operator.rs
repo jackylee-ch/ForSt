@@ -24,8 +24,12 @@
 //! - [`MergeOperator`] — the trait that all merge operators implement.
 //! - [`ListAppendMergeOperator`] — a built-in operator that concatenates
 //!   values with a configurable delimiter (used by Flink `ListState`).
+//! - [`RawConcatMergeOperator`] — a built-in operator that concatenates
+//!   operands byte-for-byte without a delimiter.
+//! - [`NumericAddMergeOperator`] — a built-in operator that sums 8-byte
+//!   little-endian `i64` deltas (supports retraction via negative deltas).
 
-use forst_rs_common::ForstResult;
+use forst_rs_common::{ForstError, ForstResult};
 
 /// A merge operator combines multiple values for the same key.
 ///
@@ -203,6 +207,71 @@ impl MergeOperator for RawConcatMergeOperator {
     }
 }
 
+/// A merge operator that sums 8-byte little-endian `i64` deltas.
+///
+/// Both the base value and every operand are exactly 8 bytes encoding an
+/// `i64` in little-endian order. Negative deltas implement retraction:
+/// - `full_merge("k", Some(5), [+1, -2])` produces `4`
+/// - `full_merge("k", None, [+1, +1, -1])` produces `1`
+/// - `partial_merge("k", a, b)` produces `a + b`
+///
+/// Addition saturates at `i64::MAX` / `i64::MIN` rather than wrapping, and
+/// a base or operand whose length is not exactly 8 bytes yields a
+/// [`ForstError::Corruption`] (never a panic).
+pub struct NumericAddMergeOperator;
+
+impl NumericAddMergeOperator {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Decodes an 8-byte little-endian `i64`, or returns a corruption error.
+    fn decode_i64(bytes: &[u8]) -> ForstResult<i64> {
+        let arr: [u8; 8] = bytes.try_into().map_err(|_| {
+            ForstError::corruption(format!(
+                "NumericAddMergeOperator: expected 8-byte little-endian i64, got {} bytes",
+                bytes.len()
+            ))
+        })?;
+        Ok(i64::from_le_bytes(arr))
+    }
+}
+
+impl Default for NumericAddMergeOperator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MergeOperator for NumericAddMergeOperator {
+    fn full_merge(
+        &self,
+        _key: &[u8],
+        base_value: Option<&[u8]>,
+        operands: &[&[u8]],
+    ) -> ForstResult<Vec<u8>> {
+        let mut sum = match base_value {
+            Some(base) => Self::decode_i64(base)?,
+            None => 0,
+        };
+        for op in operands {
+            sum = sum.saturating_add(Self::decode_i64(op)?);
+        }
+        Ok(sum.to_le_bytes().to_vec())
+    }
+
+    fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> ForstResult<Vec<u8>> {
+        let sum = Self::decode_i64(left)?.saturating_add(Self::decode_i64(right)?);
+        Ok(sum.to_le_bytes().to_vec())
+    }
+
+    fn name(&self) -> String {
+        // Identity contract (R46-L2): this name is compared by the cross-CF
+        // homogeneity check — it must stay stable across releases.
+        "NumericAddMergeOperator".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +428,117 @@ mod tests {
         let op = RawConcatMergeOperator::new();
         let result = op.partial_merge(b"key", b"A", b"B").unwrap();
         assert_eq!(result, b"AB");
+    }
+
+    // --- NumericAddMergeOperator tests ---
+
+    fn le(v: i64) -> Vec<u8> {
+        v.to_le_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_numeric_add_name_is_stable() {
+        let op = NumericAddMergeOperator::new();
+        assert_eq!(op.name(), "NumericAddMergeOperator");
+    }
+
+    #[test]
+    fn test_numeric_add_sums_positive_deltas_no_base() {
+        let op = NumericAddMergeOperator::new();
+        let (a, b, c) = (le(1), le(2), le(3));
+        let result = op.full_merge(b"key", None, &[&a, &b, &c]).unwrap();
+        assert_eq!(result, le(6));
+    }
+
+    #[test]
+    fn test_numeric_add_retraction() {
+        let op = NumericAddMergeOperator::new();
+        let (p1, p2, m1) = (le(1), le(1), le(-1));
+        let result = op.full_merge(b"key", None, &[&p1, &p2, &m1]).unwrap();
+        assert_eq!(result, le(1));
+    }
+
+    #[test]
+    fn test_numeric_add_base_plus_operands() {
+        let op = NumericAddMergeOperator::new();
+        let base = le(10);
+        let (a, b) = (le(5), le(-3));
+        let result = op.full_merge(b"key", Some(&base), &[&a, &b]).unwrap();
+        assert_eq!(result, le(12));
+    }
+
+    #[test]
+    fn test_numeric_add_no_operands_returns_base() {
+        let op = NumericAddMergeOperator::new();
+        let base = le(42);
+        let result = op.full_merge(b"key", Some(&base), &[]).unwrap();
+        assert_eq!(result, le(42));
+    }
+
+    #[test]
+    fn test_numeric_add_no_base_no_operands_is_zero() {
+        let op = NumericAddMergeOperator::new();
+        let result = op.full_merge(b"key", None, &[]).unwrap();
+        assert_eq!(result, le(0));
+    }
+
+    #[test]
+    fn test_numeric_add_saturates_at_max() {
+        let op = NumericAddMergeOperator::new();
+        let base = le(i64::MAX);
+        let one = le(1);
+        let result = op.full_merge(b"key", Some(&base), &[&one]).unwrap();
+        assert_eq!(result, le(i64::MAX));
+    }
+
+    #[test]
+    fn test_numeric_add_saturates_at_min() {
+        let op = NumericAddMergeOperator::new();
+        let base = le(i64::MIN);
+        let neg = le(-1);
+        let result = op.full_merge(b"key", Some(&base), &[&neg]).unwrap();
+        assert_eq!(result, le(i64::MIN));
+    }
+
+    #[test]
+    fn test_numeric_add_malformed_operand_is_corruption() {
+        let op = NumericAddMergeOperator::new();
+        let short: &[u8] = b"abc";
+        let err = op.full_merge(b"key", None, &[short]).unwrap_err();
+        assert!(err.is_corruption(), "expected Corruption, got {err:?}");
+    }
+
+    #[test]
+    fn test_numeric_add_malformed_base_is_corruption() {
+        let op = NumericAddMergeOperator::new();
+        let err = op.full_merge(b"key", Some(b"too-long-9"), &[]).unwrap_err();
+        assert!(err.is_corruption(), "expected Corruption, got {err:?}");
+    }
+
+    #[test]
+    fn test_numeric_add_partial_merge_sums() {
+        let op = NumericAddMergeOperator::new();
+        let result = op.partial_merge(b"key", &le(7), &le(-2)).unwrap();
+        assert_eq!(result, le(5));
+    }
+
+    #[test]
+    fn test_numeric_add_partial_merge_saturates() {
+        let op = NumericAddMergeOperator::new();
+        let result = op.partial_merge(b"key", &le(i64::MAX), &le(1)).unwrap();
+        assert_eq!(result, le(i64::MAX));
+    }
+
+    #[test]
+    fn test_numeric_add_partial_then_full_matches_full() {
+        // Associativity: full(base, [partial(a,b), c]) == full(base, [a, b, c])
+        let op = NumericAddMergeOperator::new();
+        let base = le(100);
+        let (a, b, c) = (le(3), le(-7), le(11));
+        let ab = op.partial_merge(b"key", &a, &b).unwrap();
+        let combined = op.full_merge(b"key", Some(&base), &[&ab, &c]).unwrap();
+        let flat = op.full_merge(b"key", Some(&base), &[&a, &b, &c]).unwrap();
+        assert_eq!(combined, flat);
+        assert_eq!(combined, le(107));
     }
 }

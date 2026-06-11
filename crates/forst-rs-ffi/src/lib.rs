@@ -88,7 +88,7 @@ use forst_rs_engine::{
 };
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
 use forst_rs_storage::merge_operator::{
-    ListAppendMergeOperator, MergeOperator, RawConcatMergeOperator,
+    ListAppendMergeOperator, MergeOperator, NumericAddMergeOperator, RawConcatMergeOperator,
 };
 
 /// Defense-in-depth cap on `count` (or row count) passed to FFI batch
@@ -1228,6 +1228,7 @@ pub unsafe extern "C" fn frs_db_create_cf(
 /// Currently recognised merge operators:
 /// - `"ListAppendMergeOperator"` — comma-separated concatenation
 /// - `"RawConcatMergeOperator"` — byte-for-byte concatenation
+/// - `"NumericAddMergeOperator"` — 8-byte little-endian i64 saturating sum
 #[no_mangle]
 pub unsafe extern "C" fn frs_db_create_cf_with_merge(
     handle: FrsDb,
@@ -1253,6 +1254,7 @@ pub unsafe extern "C" fn frs_db_create_cf_with_merge(
             let op: Arc<dyn MergeOperator> = match op_name {
                 "ListAppendMergeOperator" => Arc::new(ListAppendMergeOperator::with_comma()),
                 "RawConcatMergeOperator" => Arc::new(RawConcatMergeOperator::new()),
+                "NumericAddMergeOperator" => Arc::new(NumericAddMergeOperator::new()),
                 _ => return FRS_STATUS_INVALID_ARGUMENT,
             };
             desc = desc.with_merge_operator(op);
