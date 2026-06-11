@@ -230,3 +230,121 @@ the recorded configs) are the regression sentinels.
   layer and lean on L3+L4, which alone model q20 ≈ 1.15-1.25× — then a second
   profile round (named candidates: lazy probe OPT-N01, per-source parallel
   drain §2.5-axis-2 widening) closes the rest.
+
+---
+
+## 5. Recalibration after B1 boundary-tax measurement (2026-06-12, PMC cycle 3)
+
+**New evidence (every number below traces to ONE of two sources):**
+(i) the B1 `ffi_vectorized` baseline recorded in
+`2026-06-12-local-ffi-flush-compaction-bench-design.md` §5 — **n=1,
+Mac-population, SHA 81903a5ed; binding caveat: same-box ranking evidence
+only, no absolute transfer to the Linux box, no cross-change claims until
+n≥3**; (ii) previously recorded runs already cited in §1-§2.
+
+What B1 measured (design doc §5 table):
+
+- **Write-path FFI boundary tax ≈ 0** at ≥64-row batches: put taxes
+  −44…+18 ns/row across all 9 cells (median |tax| within noise of the
+  engine-direct arm; the −44 cell is FFI-*faster*, i.e. noise), mixed
+  −13…+45 ns/row across 18 cells. The offset-walk + slice-rebuild glue is
+  fully amortized.
+- **Warm-read tax ≈ +4 ns/row (~4 % at v=64 B)** — stable across 64/256/1024
+  rows.
+- **Iter drain:** 4 FFI crossings per 1000-row prefix (open + 1 refill +
+  EOF-next + close), 6.43 Melem/s; batched parallel open ≈107 µs/probe
+  *including* the engine-side first-chunk fill (~750 rows) — i.e. the open
+  cost is dominated by engine scan-build work, not the crossing.
+- get_multisst +116 ns/row is UNCONFIRMED (skewed samples, n≥3 required) —
+  and even at face value the engine-direct arm rose in lockstep (328 vs 82
+  warm), so it is multi-SST walk cost, not boundary.
+
+### 5.1 What this does to the L2a model
+
+The roadmap's L2a row (§2-L2) already called the crossing win "small (3
+crossings → 1)"; B1 now **measures** it: at production batch sizes the
+crossing itself costs ~nothing on the write path, so the crossing-count
+benefit of the mixed-batch flip is **≈ nil — measured, no longer modeled**.
+The 4.6 µs/call number from the q3 era was per-CALL at per-record batch
+sizes; at ≥64 rows/crossing it is amortized away.
+
+L2a's REMAINING value, restated:
+1. **Ordering semantics** — one mixed batch preserves offer-order across
+   kinds where 3 per-kind batches cannot (the hazard-twin machinery rides it).
+2. **Carrier for L2b** — `MIXED_KIND_MERGE` rows need the mixed layout; the
+   merge-RMW chain-kill is impossible without it.
+
+⇒ L2a stays in the plan at the SAME position but its expected standalone
+q9/q20 delta is re-scored from "small" to **~0 % (measured)**. Its gates are
+unchanged (byte-identity, lockstep ×2, routing-async ×5) — it is now purely a
+semantics/enabler step and must be justified as such, not as a perf step.
+
+### 5.2 What this does to the L2b (OPT-N04) model for q9/q20
+
+Two compounding downgrades, both already foreshadowed and now binding:
+
+- The OPT-N04 spec's own scope note
+  (`2026-06-12-opt-n04-merge-rmw-backend-design.md` §2, "honest scope note")
+  records that q20's count RMW is **MapState-shaped in operator code**
+  (`JoinRecordStateViews$InputSideHasNoUniqueKey`) and q9's TopN accumulator
+  likewise — **backend-transparent merge routing cannot capture either**.
+  The spec's own falsifiable model: q12 −8..15 %, q8 −5..10 %,
+  **q9/q20 0..−5 % from this lever alone**.
+- B1 removes the last way L2a+L2b could have helped q9/q20 indirectly
+  (crossing-count reduction): measured ≈0.
+
+⇒ the §3 roadmap table's row 2 ("L2a→L2b: q9 −10-20 %, q20 −15-25 %") is
+**RETIRED for q9/q20** and replaced by: **q8/q12 −5..15 % (canaries,
+structurally certain), q9/q20 0..−5 %**. The running model after step 2
+therefore stays ≈ the L1 floors: **q9 ≈ 1900-2000 s, q20 ≈ 1400-1480 s** —
+still far from the bars (1522/1086).
+
+### 5.3 Re-ranked lever order for the q9/q20 bars
+
+The bar-relevant win must now come from levers anchored on **measured CPU
+shares** of the recorded q20 profile (§1.2: prefix-scan 21.6 %, compaction
+19.3 %), not from chain models:
+
+| New rank | Lever | Why it moves up/down | q9 / q20 model (unchanged anchors) |
+|---|---|---|---|
+| 0 | L0 measure shipped stack + H1/M2/M3 fixes | unchanged — still the mandatory baseline refresh | −0-10 % each |
+| 1 | L1 drain gate third condition → default | unchanged — biggest RECORDED lever (q9 −377 s, q20 −568 s) | floors ~2001 / ~1478 |
+| 2 | **L3 S2 pinned rows + loser tree — PROMOTED above L2b** | attacks the measured 21.6 % q20 scan share + B1's iter evidence that scan cost is engine-side (107 µs/probe open ≈ scan build, crossings ≈ free); design landed (`2026-06-12-s2-pinned-rows-loser-tree-design.md`) | q9 −4-8 %, q20 −9-13 % |
+| 3 | **L4 compaction-windowed reads + cache bypass — PROMOTED above L2b** | attacks the measured 19.3 % share + second-order join hit-rate; design landed (`2026-06-12-compaction-windowed-readpath-design.md`) | q9 −3-6 %, q20 −6-10 % |
+| 4 | L2a flip + L2b merge-RMW | semantics/enabler + q8/q12 canary win; **no longer on the q9/q20 critical path**; carries the new **E5 engine blocker** (PMC cycle-3 review `review-rounds/2026-06-12-pmc-review-e1-e3-b1.md` §E1-F2: cross-CF L1 range interleaving breaks the scan locator's partition_point premise — reproduced; debug_assert fires, release silently misses files). E1/E3/E2 are DONE; **E5 must land before any multi-CF flag-ON** | q8/q12 −5-15 %; q9/q20 0-5 % |
+| 5 | L5 P2 ring (+ L6 P3) | **demotion rationale STRENGTHENED by B1**: the ring's crossing-elimination value is measured ≈0 (4 crossings/1000-row prefix already); residual value is only producer/consumer overlap — keep as q9 insurance only | q9 −5-10 %, q20 −2-5 % |
+
+Running model with the re-ranked order (steps 0-3): q9 ≈ 1700-1850,
+q20 ≈ 1160-1300. **q20 bar (1086) is no longer crossed by the model
+mid-point without either** (a) the operator-visible count-map merge (the
+Flink-side lever the OPT-N04 scope note names — out of backend scope, needs
+PMC decision to open a Flink-side workstream), or (b) L5 + a second profile
+round (lazy probe OPT-N01, per-source parallel drain). The q9 bar (1522) is
+reachable at step 3-4 mid-point with L5 insurance. This is an honest
+worsening of §4's projection, traceable to: the q9/q20 share of L2b was
+model, not measurement, and the spec + B1 falsified the model's transfer to
+q9/q20.
+
+**Falsifier checkpoint kept:** if L1 lands < 60 % of its recorded win on the
+n≥3 rerun, STOP and re-profile before building L3 (unchanged rule from §3).
+
+### 5.4 Next RD work order (recommendation)
+
+1. **E5 — scan-locator multi-CF soundness** (engine, S): per-CF-filtered or
+   fallback-on-non-monotonic lower bound in `overlapping_ssts_in_range`
+   (version/mod.rs:381-431) + the reproduced 2-CF nested-range scan
+   regression test (both build profiles). It is a small, isolated
+   correctness fix and the LAST engine blocker before OPT-N04's J1-J5; doing
+   it now keeps the L2 lane unblocked while perf work proceeds. (From PMC
+   cycle-3 review §E1-F2.)
+2. **L0+L1 on the Linux box** (perf, S): n≥3 baseline of the shipped
+   streaming-read stack, then the drain-gate third condition → default-200K
+   flip with its q17 no-regress gate. These are the only recorded wins and
+   they re-anchor every model above.
+3. **L3 S2 implementation start** (engine, M-L): pinned rows + loser tree per
+   the landed design — now the top *modeled* q20 lever.
+4. B1 rerun n≥3 (Mac, same box) to confirm/retire the get_multisst +116 and
+   the put r64_v256 outlier; promote the evidence section from n=1 when done.
+
+L2b Java work (J1-J5) proceeds only after E5 lands and only with the q8/q12
+canary framing — it must NOT be sold as a q9/q20 lever.
