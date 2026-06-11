@@ -128,3 +128,29 @@ engine) adapted to keep forst-rs's measured inline advantage:
 - Regime flapping (L↔H churn) could thrash seals — hysteresis if observed (seal cost is a
   pointer swap; drain piggybacks on a batch already being dispatched).
 - Engine merge-chain read cost (OPT-N04) — must verify compaction collapse before default.
+
+## 7. PMC self-review (2026-06-11): coverage and non-goals — what this design does NOT fix
+
+Evidence update: q9 B-config A/B (routing-async × 1 worker) = DNF-bound (76M@2371s vs
+control 98M@1946s) — mailbox overlap WITHOUT multi-worker LOSES on q9. The q9 lever is
+Stage 2 (+ Stage 3), strictly behind Stage 0's open race. All §5 numbers are estimates.
+
+| failing query | covered? | lever | status |
+|---|---|---|---|
+| q9 | YES | Stage 2 multi-worker + Stage 3 | behind Stage 0 (race OPEN) |
+| q20 | PARTLY | Stage 3 OPT-N04 merge-op | bar itself unpinned (RDB 859.7 vs 1074 cross-day) |
+| q11 | MOSTLY | Stage 2 (134.7s measured) | 134.7 = 1.27× still misses 0.8× by ~2s — needs a small extra lever |
+| q7 vs ForSt | WEAKLY | heavy-regime iters got 1052s | remaining ~465s = engine iterator throughput — OWN root-cause needed (C2/C3 direction) |
+| q4 (+70s) | NO | unknown — never FRS_PERF-profiled | Stage 0b profile |
+| q19 (0.59×) | NO | unknown — "diffuse" label unverified by profile | Stage 0b profile |
+| q5 correctness | NO | separate workstream (churn artifact analysis) | open |
+| q8/q12 vs ForSt | MARGINAL | engine write-batch may trim seconds | unquantified |
+
+**Stage 0b (parallel, cheap, race-independent):** FRS_PERF symbolized profiles of q4, q19,
+q7 @100M (3 runs, ~25 min box time total) — classify each as executor-bound (this design
+helps) vs engine-bound (assign to the engine campaign). The same method killed OPT-N16 and
+found the latch; buy the same certainty before promising these queries.
+
+**Non-goals of this design:** q5 correctness; the q7 engine-iterator gap beyond what heavy-
+regime fan-out delivers; bar re-pinning (Stage 4 protocol: all three backends same-session,
+n≥3 on noise-prone queries).
