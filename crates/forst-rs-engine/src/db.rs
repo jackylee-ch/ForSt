@@ -193,25 +193,39 @@ pub(crate) fn note_flushed_tombstones(tombs: u64, total: u64) {
     }
 }
 
-/// DEFAULT garbage-drain threshold: 200K flushed tombstone entries — the
-/// recorded q9/q20 configuration (roadmap L1,
-/// `2026-06-12-q9-q20-longscan-roadmap.md`).
-const GARBAGE_DRAIN_DEFAULT_TOMBSTONES: u64 = 200_000;
+/// DEFAULT garbage-drain threshold: 0 = DISABLED (same semantics as
+/// `FRS_GARBAGE_DRAIN_TOMBSTONES=0`). Opt in by setting the env to a
+/// tombstone-entry count (the recorded Mac configuration was 200000).
+///
+/// POPULATION-DEPENDENT — why the 200K default was reverted (2026-06-12):
+/// the win that justified default-ON (43a473315) was Mac-recorded
+/// (q9 2378.5→2001.2s = −377s, q20 DNF→1477.7s) — a page-cache-starved Mac
+/// Docker box where tombstone read-amp forced real disk reads, so draining
+/// dead data paid for its compaction cost. The REMOTE round-2 A/B
+/// (box-stable, control-verified, NVMe) measured the production-like
+/// population: q9 +19% REGRESSION (2421.2→2872.8s, rocksdb control flat)
+/// and q20 ±0 (2026.5→2011.1s) — NVMe absorbs the tombstone read-amp, so
+/// only the drain's forced-rewrite compaction cost remains, and q9's write
+/// pattern pays it. The roadmap falsifier (<60% of model → revert) fired.
+/// RULE: the default must be safe for the production-like population;
+/// Mac-only wins live behind the env opt-in.
+const GARBAGE_DRAIN_DEFAULT_TOMBSTONES: u64 = 0;
 
 /// Threshold (flushed tombstone ENTRIES) that forces a deep drain.
 /// `FRS_GARBAGE_DRAIN_TOMBSTONES` overrides; `0` disables.
 ///
-/// DEFAULT = 200K, ON (2026-06-11, roadmap L1 step ②). History: the earlier
-/// "default OFF" call (7c3521716) rested on a q17@100M 3.2× regression that
-/// the CONTROL RUN later overturned — q17 landed in the SAME 190-280s band
-/// with the drain FULLY OFF (attribution reversal, 90d9fcbdf: the elevation
-/// was box-state + engine-revision, not the drain). The recorded, exact-rows
-/// deterministic effect at 200K is transformative for delete-dominated
-/// big-state joins: q9 2378.5→2001.2s (−377s), q20 DNF→1477.7s. The gate is
-/// now threefold (see [`garbage_drain_gate`]): tombstone volume ≥ threshold,
-/// the 512MB L1 live-volume floor (third condition — q17-class small-state
-/// queries never drain-thrash), and the adaptive reclaim-feedback backoff
-/// (≤2 wasted probe drains per run). Retune or disable (`=0`) via the env.
+/// DEFAULT = DISABLED (2026-06-12, remote round-2 falsifier — see
+/// [`GARBAGE_DRAIN_DEFAULT_TOMBSTONES`] for the A/B evidence). History: the
+/// earlier "default OFF" call (7c3521716) rested on a q17@100M 3.2×
+/// regression the CONTROL RUN overturned (90d9fcbdf); the subsequent
+/// default-ON @200K (43a473315) rested on Mac-recorded wins the REMOTE A/B
+/// overturned (q9 +19% regression, q20 ±0) — the win was specific to a
+/// page-cache-starved population. The gate machinery is kept fully intact
+/// for the env opt-in (see [`garbage_drain_gate`]): tombstone volume ≥
+/// threshold, the 512MB L1 live-volume floor (third condition — q17-class
+/// small-state queries never drain-thrash), and the adaptive
+/// reclaim-feedback backoff (≤2 wasted probe drains per run). Enable by
+/// setting the env to a count (Mac-recorded sweet spot: 200000).
 fn garbage_drain_threshold() -> u64 {
     use std::sync::OnceLock;
     static T: OnceLock<u64> = OnceLock::new();
@@ -270,7 +284,17 @@ const GARBAGE_DRAIN_MIN_L1_BYTES: u64 = 512 * 1024 * 1024;
 
 /// THE composite garbage-drain gate — pure so the boundaries are unit-tested
 /// (`tests::garbage_drain_gate_boundaries`). ALL conditions must hold:
-/// 1. threshold enabled (`> 0`; `FRS_GARBAGE_DRAIN_TOMBSTONES=0` disables);
+///
+/// DEFAULT-DISABLED (2026-06-12): condition 1 fails by default because
+/// [`GARBAGE_DRAIN_DEFAULT_TOMBSTONES`] = 0 — the remote round-2 A/B showed
+/// the drain's effect is POPULATION-SPECIFIC (Mac page-cache-starved:
+/// q9 −377s, q20 DNF→1477.7s; remote NVMe: q9 +19% regression 2421.2→2872.8s
+/// with rocksdb control flat, q20 ±0 at 2026.5→2011.1s). The gate logic
+/// below is unchanged and fully active when `FRS_GARBAGE_DRAIN_TOMBSTONES`
+/// opts in with a nonzero count.
+///
+/// 1. threshold enabled (`> 0`; the default, and
+///    `FRS_GARBAGE_DRAIN_TOMBSTONES=0`, disable);
 /// 2. tombstone PRESSURE: entries flushed since the last drain ≥ threshold
 ///    (delete-light workloads structurally never trip this);
 /// 3. adaptive FEEDBACK: fewer than [`GARBAGE_DRAIN_MAX_WASTED`] consecutive
@@ -12626,10 +12650,12 @@ mod tests {
 
     /// Step ② (roadmap L1): boundary coverage of the composite garbage-drain
     /// gate — every condition tested at its exact edge, around an all-pass
-    /// reference at the shipped 200K default.
+    /// reference at the env-opt-in 200K threshold (the Mac-recorded sweet
+    /// spot). The shipped DEFAULT is 0 = disabled (remote round-2 A/B:
+    /// q9 +19% regression on NVMe — population-specific win, env-only).
     #[test]
     fn garbage_drain_gate_boundaries() {
-        const T: u64 = GARBAGE_DRAIN_DEFAULT_TOMBSTONES; // 200K shipped default
+        const T: u64 = 200_000; // FRS_GARBAGE_DRAIN_TOMBSTONES=200000 opt-in
         const FLOOR: u64 = GARBAGE_DRAIN_MIN_L1_BYTES;
 
         // All-pass reference (exactly AT every boundary).
@@ -12637,6 +12663,16 @@ mod tests {
 
         // 1. Threshold 0 = disabled, regardless of any pressure/volume.
         assert!(!garbage_drain_gate(0, u64::MAX, 0, true, u64::MAX));
+        // The SHIPPED DEFAULT is exactly that disabled value (2026-06-12
+        // revert): no env ⇒ the gate can never fire.
+        assert_eq!(GARBAGE_DRAIN_DEFAULT_TOMBSTONES, 0);
+        assert!(!garbage_drain_gate(
+            GARBAGE_DRAIN_DEFAULT_TOMBSTONES,
+            u64::MAX,
+            0,
+            true,
+            u64::MAX
+        ));
 
         // 2. Tombstone pressure: one below the threshold refuses; at passes.
         assert!(!garbage_drain_gate(T, T - 1, 0, true, FLOOR));
