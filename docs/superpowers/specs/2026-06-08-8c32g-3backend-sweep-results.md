@@ -1704,3 +1704,9 @@ CLEAR). NEXT DIAGNOSTIC (after q9 A/B frees the box): FRS_REENTRY_DIAG=2 STREAM_
 differential — compare per-kind op counts between an exact and a corrupt q8 B-config run:
 appends differ ⇒ writes lost (offer/dispatch side); appends equal + iter rows differ ⇒
 reads lost (fire side). q9@100M B-config A/B still RUNNING (its out_rows is its own gate).
+
+### q9@100M B-config (routing-async × 1 worker) A/B: DNF-bound — 1-worker pipelining LOSES
+76.0M src @2371s vs control 98M done @1946s (~25%+ slower than 3-worker blocking).
+CONCLUSION: mailbox overlap alone is NOT q9's lever — q9 needs MULTI-WORKER heavy regime
+(intra-batch fan-out) + overlap. Stage 2 of the two-regime design is the q9 path; Stage 0
+(race root-cause) blocks it. Recorded in the design's §7 PMC self-review.
