@@ -1011,26 +1011,21 @@ impl DbImpl {
 
     /// Creates a new column family with the given descriptor.
     ///
-    /// # R45-H1: multi-CF + heterogeneous merge/filter restriction
+    /// # R45-H1 (filters) + OPT-N04 E1 (merge operators retired)
     ///
-    /// The engine's `VersionSet` and L0 layer are currently shared across
-    /// every CF: `compact_l0_for_cf` reads `version_set.current().l0_files()`
-    /// without a CF filter, so an L0 file produced by CF *b*'s flush can be
-    /// picked up and rewritten by a compaction job that captured CF *a*'s
-    /// merge operator and compaction filter. When the two CFs disagree on
-    /// either of those (e.g. CF *a* has TTL, CF *b* doesn't; or each uses a
-    /// different merge operator), this silently produces wrong results.
+    /// Merge operators may differ freely across CFs: compaction is per-CF
+    /// isolated (R49-H1 — `SstFileMeta.cf_id` tagging, cf_id-filtered level
+    /// picking/input selection, output stamping) and
+    /// `CompactionJob::check_inputs_single_cf` hard-errors on any cross-CF
+    /// input, so the original R45-H1 merge-operator hazard (one CF's
+    /// operator rewriting another CF's L0 rows) can no longer occur. The
+    /// merge-operator homogeneity wall was retired 2026-06-12 (OPT-N04 E1).
     ///
-    /// Until per-CF `Version` scoping lands (requires a manifest format
-    /// change — codec v2 — to tag every [`SstFileMeta`] with its
-    /// `ColumnFamilyId`), we refuse the configuration up front. A CF can
-    /// be created with a non-default merge operator OR a non-default
-    /// compaction filter only when every other CF carries the same
-    /// (operator name, filter name) pair. Equality is checked by name —
-    /// the trait's `name()` is the documented identity surface.
-    ///
-    /// Homogeneous multi-CF deployments (every CF default, or every CF
-    /// using the exact same merge/filter) remain fully supported.
+    /// Compaction FILTERS remain restricted: a CF can be created with a
+    /// non-default compaction filter only when every other non-default CF
+    /// carries the same filter name (the trait's `name()` is the
+    /// documented identity surface). The same per-CF audit has not yet
+    /// been done for filters, so the conservative wall stays for them.
     pub fn create_column_family(
         &self,
         desc: ColumnFamilyDescriptor,
@@ -1060,8 +1055,8 @@ impl DbImpl {
                 )));
             }
         }
-        // R45-H1: reject heterogeneous merge_operator / compaction_filter
-        // across CFs. See doc-comment above for the rationale.
+        // R45-H1 (filters only since OPT-N04 E1): reject heterogeneous
+        // compaction_filter across CFs. See doc-comment above.
         self.check_cf_homogeneity_locked(&_create_guard, None, &desc)?;
         let id = ColumnFamilyId(self.next_cf_id.fetch_add(1, Ordering::SeqCst));
         // `create_cf_with_id_locked` reuses the write guard we already hold
@@ -1094,28 +1089,41 @@ impl DbImpl {
         self.create_cf_with_id_locked(_create_guard, id, desc)
     }
 
-    /// R45-H1: validates that the new descriptor's merge_operator and
-    /// compaction_filter are compatible with every existing non-default
-    /// CF.
+    /// R45-H1: validates that the new descriptor's compaction_filter is
+    /// compatible with every existing non-default CF.
     ///
-    /// Compatibility rule (until per-CF Version scoping lands):
-    /// - the (merge_operator_name, compaction_filter_name) pair of the
-    ///   new CF must equal the pair of every existing non-default CF.
+    /// ## OPT-N04 E1 (2026-06-12): the merge-operator arm is RETIRED.
+    ///
+    /// The original R45-H1 hazard was "the engine's L0 layer is shared
+    /// across CFs, so a cross-CF compaction could apply one CF's merge
+    /// operator to another CF's rows". That premise is stale: compaction
+    /// is per-CF isolated end to end — level picking and input selection
+    /// filter by `cf_id` (`pick_compaction_level_for_cf` + the cf_id
+    /// filters in the job builders below), outputs are stamped with the
+    /// job's cf_id (R49-H1), and `CompactionJob::check_inputs_single_cf`
+    /// now rejects any cross-CF input with a HARD `Corruption` error in
+    /// all build profiles (promoted from a debug_assert as part of E1,
+    /// defense in depth). Heterogeneous merge operators across CFs are
+    /// therefore safe and ADMITTED — e.g. the timer CF (RawConcat) can
+    /// coexist with `agg-merge-i64` (NumericAddBe). The restore path
+    /// already resurrected mixed-operator CF sets unconditionally, so
+    /// this also removes a create/restore asymmetry.
+    ///
+    /// Compatibility rule for compaction FILTERS (kept until the same
+    /// per-CF audit is done for filters — they can observe and rewrite
+    /// values, so the blast radius of a routing bug is wider):
+    /// - the compaction_filter_name of the new CF must equal that of
+    ///   every existing non-default CF.
     ///
     /// The default CF is exempt: it is auto-created at `open` time with
     /// no merge_operator and no compaction_filter, and pre-existing
     /// `set_compaction_filter` callers (notably the FFI) rely on
     /// installing a non-default filter on user CFs while the default CF
-    /// stays empty. Users who actually write to BOTH the default CF and
-    /// a CF with a non-default policy still risk silent wrong results
-    /// when their L0 files end up shared — but that pattern is
-    /// undocumented and not exercised by any current binding.
+    /// stays empty.
     ///
     /// `None` is a distinct value from `Some("...")` — i.e. a non-default
-    /// CF with no merge operator is NOT compatible with another
-    /// non-default CF whose merge operator is `Some("StringAppend")`.
-    /// This catches the original R45-H1 hazard (two user CFs disagreeing
-    /// on policy) where the silent wrong-result risk is highest.
+    /// CF with no filter is NOT compatible with another non-default CF
+    /// whose filter is `Some("...")`.
     fn check_cf_homogeneity_locked(
         &self,
         cfs: &HashMap<ColumnFamilyId, Arc<ColumnFamilyData>>,
@@ -1129,9 +1137,11 @@ impl DbImpl {
         // R47-H1 / R47-H3: `name()` returns `String` and now encodes every
         // semantically-relevant config field (TTL, delimiter, etc.) into
         // the identity. The homogeneity comparison is by-value over those
-        // strings — two filters/operators that disagree on any encoded
-        // config field are NOT admitted as homogeneous.
-        let new_merge_name: Option<String> = desc.merge_operator().as_ref().map(|op| op.name());
+        // strings — two filters that disagree on any encoded config field
+        // are NOT admitted as homogeneous.
+        //
+        // OPT-N04 E1: merge operators are intentionally NOT compared here
+        // any more — see the doc-comment above.
         let new_filter_name: Option<String> = desc.compaction_filter().as_ref().map(|f| f.name());
 
         for cf in cfs.values() {
@@ -1142,22 +1152,8 @@ impl DbImpl {
             if Some(cf_id) == exclude_self {
                 continue;
             }
-            let exist_merge_name: Option<String> = cf.merge_operator().map(|op| op.name());
             let exist_filter_name: Option<String> =
                 cf.compaction_filter().as_ref().map(|f| f.name());
-            if exist_merge_name != new_merge_name {
-                return Err(ForstError::invalid_argument(format!(
-                    "column family '{}' has merge_operator {:?}, but existing CF '{}' \
-                     uses {:?}; the engine's L0 layer is shared across CFs and \
-                     heterogeneous merge operators would silently produce wrong \
-                     results during cross-CF compaction (R45-H1). Use the same \
-                     merge_operator on every non-default CF, or open separate engines.",
-                    desc.name(),
-                    new_merge_name,
-                    cf.handle().name(),
-                    exist_merge_name
-                )));
-            }
             if exist_filter_name != new_filter_name {
                 return Err(ForstError::invalid_argument(format!(
                     "column family '{}' has compaction_filter {:?}, but existing CF \
@@ -14949,26 +14945,148 @@ mod tests {
         .expect("second CF with same merge_operator name accepted");
     }
 
-    /// R45-H1 reject path: a second non-default CF with NO merge
-    /// operator is rejected when an earlier non-default CF already has
-    /// one. Pre-fix, `compact_l0_for_cf` would rewrite cf_b's L0 files
-    /// under cf_a's merge operator (silent wrong result).
+    /// OPT-N04 E1: the R45-H1 merge-operator homogeneity wall is RETIRED.
+    /// Heterogeneous merge operators across non-default CFs are now
+    /// admitted — compaction is per-CF isolated (R49-H1) and
+    /// `CompactionJob::check_inputs_single_cf` hard-errors on any cross-CF
+    /// input, so the original silent-wrong-result hazard cannot occur.
+    /// This test is the exact inverse of the pre-E1
+    /// `test_r45_h1_rejects_heterogeneous_merge_operator`.
     #[test]
-    fn test_r45_h1_rejects_heterogeneous_merge_operator() {
+    fn test_e1_accepts_heterogeneous_merge_operators() {
+        use forst_rs_storage::merge_operator::{NumericAddBeMergeOperator, RawConcatMergeOperator};
         let db = open();
         let op: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::with_comma());
         db.create_column_family(ColumnFamilyDescriptor::new("cf_merge").with_merge_operator(op))
             .expect("first non-default CF with merge accepted");
-        // Adding a non-default CF with no merge operator must be
-        // rejected (heterogeneous against the existing non-default CF).
-        let err = db
-            .create_column_family(ColumnFamilyDescriptor::new("cf_plain"))
-            .expect_err("heterogeneous CF must be rejected");
+        // A non-default CF with NO merge operator coexists.
+        db.create_column_family(ColumnFamilyDescriptor::new("cf_plain"))
+            .expect("E1: CF without merge operator must be accepted");
+        // The production pair from OPT-N04 §3.2: timer-CF shape (RawConcat)
+        // alongside agg-merge-i64 (NumericAddBe).
+        db.create_column_family(
+            ColumnFamilyDescriptor::new("timer-shape")
+                .with_merge_operator(Arc::new(RawConcatMergeOperator::new())),
+        )
+        .expect("E1: RawConcat CF must be accepted");
+        db.create_column_family(
+            ColumnFamilyDescriptor::new("agg-merge-i64")
+                .with_merge_operator(Arc::new(NumericAddBeMergeOperator::new())),
+        )
+        .expect("E1: NumericAddBe CF must coexist with RawConcat CF");
+    }
+
+    /// OPT-N04 E1 round-trip gate (spec §3.2 item (c)): two CFs with
+    /// DIFFERENT merge operators, interleaved writes, a full
+    /// flush + compact cycle on both, then byte-exact reads per CF —
+    /// proving each CF's chain folds under ITS OWN operator through
+    /// memtable, L0 and post-compaction reads.
+    #[test]
+    fn test_e1_heterogeneous_merge_ops_flush_compact_roundtrip() {
+        use forst_rs_storage::merge_operator::NumericAddBeMergeOperator;
+        let be = |v: i64| v.to_be_bytes().to_vec();
+        let db = open();
+        let cf_list = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cf_list")
+                    .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma())),
+            )
+            .unwrap();
+        let cf_add = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cf_add")
+                    .with_merge_operator(Arc::new(NumericAddBeMergeOperator::new())),
+            )
+            .unwrap();
+
+        // Interleaved writes: each CF gets a Put base + a Merge operand,
+        // then a flush, then MORE merges, then another flush — so each CF
+        // holds 2 L0 SSTs with the chain split across them.
+        db.put(&cf_list, b"k", b"a").unwrap();
+        db.put(&cf_add, b"acc", &be(10)).unwrap();
+        db.merge(&cf_list, b"k", b"b").unwrap();
+        db.merge(&cf_add, b"acc", &be(5)).unwrap();
+        db.switch_and_flush(&cf_list).unwrap().unwrap();
+        db.switch_and_flush(&cf_add).unwrap().unwrap();
+        db.merge(&cf_list, b"k", b"c").unwrap();
+        db.merge(&cf_add, b"acc", &be(-3)).unwrap();
+        db.switch_and_flush(&cf_list).unwrap().unwrap();
+        db.switch_and_flush(&cf_add).unwrap().unwrap();
+
+        let expect_reads = |stage: &str| {
+            assert_eq!(
+                db.get(&cf_list, b"k").unwrap().as_deref(),
+                Some(b"a,b,c".as_ref()),
+                "cf_list must fold under ListAppend ({stage})"
+            );
+            assert_eq!(
+                db.get(&cf_add, b"acc").unwrap(),
+                Some(be(12)),
+                "cf_add must fold 10+5-3 under NumericAddBe ({stage})"
+            );
+        };
+        expect_reads("pre-compaction, 2 L0 SSTs per CF");
+
+        // Full per-CF compaction cycle. Each compaction job captures ITS
+        // CF's operator; the cf_id input filter + hard E1 check guarantee
+        // no cross-CF rows are merged.
+        db.compact_l0(&cf_list).unwrap();
+        db.compact_l0(&cf_add).unwrap();
+        expect_reads("post compact_l0");
+        db.compact_range(&cf_list).unwrap();
+        db.compact_range(&cf_add).unwrap();
+        expect_reads("post compact_range");
+    }
+
+    /// OPT-N04 E1: the promoted cross-CF compaction-input check is a HARD
+    /// `Corruption` error (was a debug_assert). Forge an input meta whose
+    /// cf_id disagrees with the job's and verify `run()` refuses in every
+    /// build profile.
+    #[test]
+    fn test_e1_compaction_rejects_cross_cf_input_hard_error() {
+        let db = open();
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        // Open the reader against the TRUE meta (footer check passes),
+        // then forge the meta copy handed to the job.
+        let meta = db.version_set.current().l0_files()[0].clone();
+        let reader = db.get_or_open_sst_reader(&meta).unwrap();
+        let mut forged = meta.clone();
+        forged.cf_id = ColumnFamilyId(0xDEAD_BEEF);
+
+        let output_file_number = db.version_set.allocate_file_number();
+        let job = CompactionJob {
+            cf_id: DEFAULT_CF_ID,
+            inputs: vec![(0, forged, reader)],
+            output_level: 1,
+            output_file_number,
+            output_path: compaction_output_path(&db.db_path, output_file_number),
+            additional_outputs: Vec::new(),
+            target_file_size: 0,
+            writer_options: SstWriterOptions {
+                block_size: db.options.block_size,
+                compression: db.options.compression,
+                cf_id: DEFAULT_CF_ID,
+            },
+            fs: db.fs.clone(),
+            merge_operator: None,
+            compaction_filter: None,
+            is_bottommost: true,
+            min_active_snapshot: SequenceNumber(u64::MAX),
+        };
+        let err = job
+            .run()
+            .expect_err("cross-CF compaction input must hard-error");
+        assert!(
+            err.is_corruption(),
+            "expected Corruption, got: {err:?}"
+        );
         let msg = format!("{}", err);
         assert!(
-            msg.contains("R45-H1"),
-            "error must cite the constraint: {}",
-            msg
+            msg.contains("cross-CF"),
+            "error must name the hazard: {msg}"
         );
     }
 
@@ -15223,9 +15341,16 @@ mod tests {
     /// R47-H3: regression test for `ListAppendMergeOperator::name()`
     /// encoding the configured delimiter. Pre-fix the name was a
     /// constant so two operators with different delimiters (`,` vs `|`)
-    /// were admitted as homogeneous and the engine produced wrong
-    /// merge results during cross-CF compaction. Post-fix the
-    /// homogeneity check observes distinct names and rejects.
+    /// were indistinguishable by identity — `name()` is the
+    /// cross-checkpoint identity surface (restore-by-name), so it must
+    /// encode every semantically-relevant config field.
+    ///
+    /// OPT-N04 E1 update: the merge-operator homogeneity REJECTION this
+    /// test originally exercised is retired (heterogeneous operators
+    /// across CFs are admitted; compaction is per-CF isolated with a hard
+    /// cross-CF input error). The name-encoding property itself is still
+    /// load-bearing and asserted here; both CFs are now ADMITTED and each
+    /// folds under its own delimiter.
     #[test]
     fn test_r47_h3_list_append_name_encodes_delimiter() {
         use forst_rs_storage::merge_operator::ListAppendMergeOperator;
@@ -15235,18 +15360,18 @@ mod tests {
         let pipe: Arc<dyn MergeOperator> = Arc::new(ListAppendMergeOperator::new(b'|'));
         assert_ne!(comma.name(), pipe.name());
 
-        let _cf_a = db
+        let cf_a = db
             .create_column_family(ColumnFamilyDescriptor::new("cf_a").with_merge_operator(comma))
             .expect("cf_a accepted with comma-delimited merge");
-        let err = db
+        let cf_b = db
             .create_column_family(ColumnFamilyDescriptor::new("cf_b").with_merge_operator(pipe))
-            .expect_err("cf_b must be rejected — different delimiter is a different identity");
-        let msg = format!("{}", err);
-        assert!(
-            msg.contains("R45-H1"),
-            "error must cite the homogeneity constraint: {}",
-            msg
-        );
+            .expect("E1: cf_b with a different delimiter is admitted");
+        db.merge(&cf_a, b"k", b"x").unwrap();
+        db.merge(&cf_a, b"k", b"y").unwrap();
+        db.merge(&cf_b, b"k", b"x").unwrap();
+        db.merge(&cf_b, b"k", b"y").unwrap();
+        assert_eq!(db.get(&cf_a, b"k").unwrap().as_deref(), Some(b"x,y".as_ref()));
+        assert_eq!(db.get(&cf_b, b"k").unwrap().as_deref(), Some(b"x|y".as_ref()));
     }
 
     /// R47-H2: TOCTOU regression. Two concurrent `set_compaction_filter`
