@@ -80,7 +80,7 @@ Q9 can execute in streaming mode with native ForSt state, but the 1M streaming f
 
 The 100M performance run was restarted with the corrected environment: JDK17, jemalloc loaded through `LD_PRELOAD=/lib/x86_64-linux-gnu/libjemalloc.so.2`, checkpointing disabled, one TaskManager with 8 slots and 32GB process memory, and one benchmark container at a time. The benchmark runner now waits for bounded jobs to reach `FINISHED` unless a diagnostic run intentionally uses `MAXSEC`.
 
-The full Q0-Q22 100M matrix is currently blocked by Q4. Q0-Q2 finish at 100M, but the forst-rs JNI replacement does not show a speedup there. Q4 is already unable to finish at 1M under the 8C/32G envelope, even after validating jemalloc, async state, mini-batch, and a write-heavy ForSt tuning profile. Running Q4 at 100M would be an unbounded time sink and would not produce the requested defensible comparison.
+The full Q0-Q22 100M matrix is currently blocked by multiple state-heavy queries. Q0-Q2 finish at 100M, but the forst-rs JNI replacement does not show a speedup there. Q3 and Q5 both timed out in 100M reruns with the image-original ForSt backend jar, JDK17, jemalloc, disabled checkpoints, 8 slots, and 32GB TaskManager process memory. Q4 is already unable to finish at 1M under the same resource envelope, even after validating jemalloc, async state, mini-batch, and a write-heavy ForSt tuning profile. Continuing to run Q0-Q22 sequentially at 100M would spend hours per blocked query and would not produce a defensible 1.5x claim.
 
 ### Completed 100M Runs
 
@@ -92,6 +92,17 @@ Throughput below is computed as `100,000,000 / wall_seconds`. The REST `src_out`
 | q1 | 61.513 | 64.404 | 1,625,673 | 1,552,699 | 0.955x | `perf100m-q0q1q2q4q5-jemalloc-20260610180554` |
 | q2 | 53.398 | 54.973 | 1,872,729 | 1,819,076 | 0.971x | `perf100m-q0q1q2q4q5-jemalloc-20260610180554` |
 
+### 100M Timeout Evidence
+
+These runs used the image-original `flink-statebackend-forst-2.2.1.jar`, not the later map-cache patched backend jar. Both runs were stopped by the runner's `MAXSEC` guard and then cleaned up before launching additional containers.
+
+| Query | Events | Variant | Mode | Wall seconds | Source rows | Expected source rows | Output rows | Native evidence | Run label |
+| --- | ---: | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| q3 | 100,000,000 | ForSt local | TIMEOUT | 7205.328 | 1,158,773 | 8,000,000 | 961,741 | community JNI from jar extraction | `perf100m-q3q5-q22-jdk17-jemalloc-20260611062112` |
+| q5 | 100,000,000 | ForSt local | TIMEOUT | 3606.983 | 2,985,039 | 92,000,000 | 1,547,670 | community JNI from jar extraction | `perf100m-q5-q22-jdk17-jemalloc-20260611082429` |
+
+Interpretation: these are not marginal slowdowns. Q3 reached only 14.5% of its query-specific source target after two hours, and Q5 reached only 3.2% of its source target after one hour. Since the baseline ForSt local path itself cannot finish these 100M runs in the controlled envelope, a full Q0-Q22 100M speedup table would be misleading. The correct current conclusion is that the ForSt backend plus JNI-library replacement path is not yet in a state where a Nexmark-wide 1.5x target can be demonstrated.
+
 ### Q3 Diagnostic
 
 Q3 is a long-running stateful join. A 100M run was stopped after discovering the earlier run did not actually preload jemalloc and that the `expected_src` heuristic was invalid for q3. After enabling jemalloc, 10M diagnostics show only a small forst-rs-lib advantage.
@@ -102,6 +113,12 @@ Q3 is a long-running stateful join. A 100M run was stopped after discovering the
 | q3 | 10,000,000 | forst-rs lib | FINISHED | 240.493 | 219,595 | forst-rs JNI | `diag-q3-10m-rslib-jemalloc-20260610175959` |
 
 Q3 10M speedup is `1.017x`, so it does not support a 1.5x claim.
+
+The 2026-06-11 100M rerun reinforces that conclusion: ForSt local timed out at 7205.328s after processing only 1,158,773 of the expected 8,000,000 Q3 source rows. The forst-rs-lib Q3 100M run was intentionally stopped after the baseline timeout, because spending another two hours on the replacement library would not change the primary finding that Q3 is not viable at 100M in this envelope.
+
+### Q5 Blocker
+
+Q5 is also unable to finish at 100M in the same envelope. The source advanced to 2,985,039 rows by 122s, then remained backpressured while the window output continued to drain. At the 3606.983s guard, it had produced 1,547,670 output rows but still had consumed only 2,985,039 of the expected 92,000,000 source rows. The forst-rs-lib Q5 100M run was intentionally stopped after the baseline timeout for the same reason as Q3.
 
 ### Q4 Blocker
 
@@ -146,6 +163,8 @@ The 4096-entry cache setting did not materially improve Q4. ForSt local reached 
 | Q6 corrected compare | `artifacts/q6-1m-batch-stable-accuracy-20260610170032.accuracy-compare.tsv` |
 | Q9 streaming smoke compare | `artifacts/q9-1k-stream-debug-20260610165239.accuracy-compare.tsv` |
 | Q0-Q2 100M performance TSV | `artifacts/perf100m-q0q1q2q4q5-jemalloc-20260610180554.tsv` |
+| Q3 100M local timeout TSV | `artifacts/perf100m-q3-local-timeout-20260611062112.tsv` |
+| Q5 100M local timeout TSV | `artifacts/perf100m-q5-local-timeout-20260611082429.tsv` |
 | Q3 10M local diagnostic TSV | `artifacts/diag-q3-10m-jemalloc-20260610175344.tsv` |
 | Q3 10M forst-rs-lib diagnostic TSV | `artifacts/diag-q3-10m-rslib-jemalloc-20260610175959.tsv` |
 | Q4 1M mini-batch diagnostic TSV | `artifacts/tune-q4-1m-minibatch-jemalloc-20260610182954.tsv` |
