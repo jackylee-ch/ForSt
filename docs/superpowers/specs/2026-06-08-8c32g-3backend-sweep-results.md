@@ -2115,3 +2115,7 @@ control-first q17, q3 point-get guard, q9/q20 pairs — launching.
 q1 smoke 4.0s rows exact | q8 canary 168.0s rows 3,065,198 in-band (drain-ON
 first 100M = correctness-clean; wall in round-1 band ⇒ no q8-class drain cost).
 q3 point-get guard pair running.
+
+### ROUND-2 gate 3 PASS: q3 point-get guard 1.16× (frs 142.1 / rdb 122.6) <1.4×
+Prefetcher costs point-gets nothing measurable; q3 also inside the 1.25× bar.
+All control gates green → q17 ×3, then q9/q20 drain-verdict pairs.
