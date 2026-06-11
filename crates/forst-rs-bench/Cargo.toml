@@ -30,6 +30,7 @@ path = "src/lib.rs"
 [dependencies]
 forst-rs-common = { workspace = true }
 forst-rs-engine = { workspace = true }
+forst-rs-ffi = { workspace = true }
 forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
 # Optional RocksDB comparison baseline. Pulled in only when the
@@ -97,4 +98,12 @@ harness = false
 
 [[bench]]
 name = "join_probe_open"
+harness = false
+
+[[bench]]
+name = "nexmark_compat_hotpaths"
+harness = false
+
+[[bench]]
+name = "compat_jni_forst_backend_hotpaths"
 harness = false

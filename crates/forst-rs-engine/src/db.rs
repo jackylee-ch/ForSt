@@ -23,9 +23,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::thread::JoinHandle;
 
 use forst_rs_common::{
     ColumnFamilyId, EngineOptions, FileNumber, ForstError, ForstResult, InternalKey, OpType,
@@ -657,19 +656,6 @@ pub struct DbImpl {
     /// rather than blocking, matching RocksDB's `allow_stall=false`
     /// default.
     write_buffer_manager: Arc<WriteBufferManager>,
-    /// Background ticker that periodically calls
-    /// [`SnapshotRegistry::check_long_lived`] and emits a `tracing::warn!`
-    /// when a snapshot has exceeded its `max_age_ms` warn-line
-    /// (spec §6a.3). Per spec the engine NEVER auto-releases the
-    /// snapshot — this is a WARN-only path; the operator runbook is the
-    /// remediation surface. `Some` while the engine is alive; taken and
-    /// joined in [`Drop`] for clean shutdown.
-    snapshot_age_worker: Mutex<Option<JoinHandle<()>>>,
-    /// Signal that tells the snapshot-age ticker to stop and exit. The
-    /// ticker checks this between sleeps; setting it to `true` and
-    /// then joining drains the thread within the configured tick
-    /// interval (currently 1 second, see `SNAPSHOT_AGE_TICK_MS`).
-    snapshot_age_shutdown: Arc<std::sync::atomic::AtomicBool>,
     /// R44-H1: serializes ALL compactions globally. Per-CF `flush_mutex`
     /// is insufficient because the `VersionSet` is engine-global — SST
     /// inputs in `compact_l0_for_cf` / `compact_level_for_cf` are picked
@@ -696,6 +682,9 @@ pub struct DbImpl {
     /// foundation for the cheap-checkpoint path (sync WAL instead of forced
     /// flush) that closes the q4-vs-RocksDB gap. See `crate::wal`.
     wal: Mutex<Option<crate::wal::WalWriter>>,
+    /// Fast-path gate for the default WAL-off mode. This keeps the write hot path
+    /// from constructing WAL records or taking the WAL mutex when WAL is disabled.
+    wal_enabled: AtomicBool,
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): diagnostic counter — number of L0 SST
     /// data-block reads performed during point `get`s inside `Self::sst_get`.
     /// The L0 walk now visits files newest-first and STOPS at the first
@@ -837,17 +826,16 @@ impl DbImpl {
             db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
             block_cache,
             write_buffer_manager,
-            snapshot_age_worker: Mutex::new(None),
-            snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_mutex: Mutex::new(()),
             wal: Mutex::new(None),
+            wal_enabled: AtomicBool::new(false),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
 
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
         Self::init_self_weak(&db);
         db.maybe_init_wal();
-        Self::spawn_snapshot_age_worker(&db);
+        Self::register_snapshot_maintenance_worker(&db);
         Ok(db)
     }
 
@@ -2833,23 +2821,23 @@ impl DbImpl {
         // threads from compaction) so it drains while this writer parks; no lock is
         // held here (wbm_guard committed, write_mutex released) → no deadlock.
         //
-        // No fixed give-up backstop (the old 120s deadline RELEASED and let memtables
-        // overrun → OOM anyway): we wait until under budget. The ONLY escape is a
-        // progress-based DEFENSE — if the process-global memtable sum makes NO downward
-        // progress for `STALL_NO_PROGRESS`, we release (defends against a genuinely
-        // stuck flush rather than freezing forever; under normal flush the global sum
-        // drops within ms). Disable entirely with FRS_WBM_STALL=0.
+        // Stall only on the explicit process-global HARD cap. The soft per-instance
+        // and global WBM caps remain flush triggers, not writer stalls; otherwise a
+        // single hot DB can throttle on the default 512 MiB soft cap even though the
+        // hard cap is disabled. The escape is a progress-based defense — if the
+        // process-global memtable sum makes no downward progress for
+        // `STALL_NO_PROGRESS`, release rather than freeze forever.
         if !wbm_stall_enabled() {
             return;
         }
-        if !self.write_buffer_manager.over_budget() {
+        if !crate::runtime_tuning::over_global_hard_budget() {
             return;
         }
         const STALL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_secs(60);
         let stall_start = std::time::Instant::now(); // FRS_PROF_DIAG: attribute backpressure stall
         let mut last_used = crate::runtime_tuning::global_wbm_used_bytes();
         let mut last_progress = std::time::Instant::now();
-        while self.write_buffer_manager.over_budget() {
+        while crate::runtime_tuning::over_global_hard_budget() {
             std::thread::sleep(std::time::Duration::from_millis(1));
             let now_used = crate::runtime_tuning::global_wbm_used_bytes();
             if now_used < last_used {
@@ -2899,6 +2887,7 @@ impl DbImpl {
         match crate::wal::WalWriter::open(&path) {
             Ok(w) => {
                 *self.wal.lock().expect("wal lock poisoned") = Some(w);
+                self.wal_enabled.store(true, Ordering::Release);
                 tracing::info!(target: "forst_rs_engine::wal", "WAL enabled at {path:?}");
             }
             Err(e) => {
@@ -2995,13 +2984,15 @@ impl DbImpl {
         // BEFORE touching the memtable. Durability is established at checkpoint
         // (`wal_sync`), which is all Flink's exactly-once needs. No-op (zero
         // cost) when the WAL is disabled (default: `FRS_WAL_DIR` unset).
-        self.wal_append(&[crate::wal::WalRecord {
-            cf_id: cf.id().0,
-            sequence: seq,
-            op_type: op as u8,
-            key: key.to_vec(),
-            value: value.map(|v| v.to_vec()),
-        }])?;
+        if self.wal_enabled.load(Ordering::Relaxed) {
+            self.wal_append(&[crate::wal::WalRecord {
+                cf_id: cf.id().0,
+                sequence: seq,
+                op_type: op as u8,
+                key: key.to_vec(),
+                value: value.map(|v| v.to_vec()),
+            }])?;
+        }
 
         let charge = key.len() as u64
             + value.map(|v| v.len() as u64).unwrap_or(0)
@@ -3031,11 +3022,6 @@ impl DbImpl {
         }
         wbm_guard.commit();
 
-        let needs_flush = {
-            let _writer = self.write_mutex.lock().expect("lock poisoned");
-            self.maybe_switch_memtable_in_lock(&cf_data)?
-        };
-
         // Phase 2 (outside write_mutex): enqueue the imm memtable for the
         // background flush worker. Backpressure is handled by the
         // WriteController stall above — when imm count >= cap the next
@@ -3044,6 +3030,20 @@ impl DbImpl {
         // B-Prod-P7 §6d: when WBM is over budget, force a flush so the
         // background worker can drain bytes back below the cap.
         let wbm_over = self.write_buffer_manager.over_budget();
+        let threshold = cf_data.options().effective_write_buffer_size(&self.options);
+        let charge_usize = usize::try_from(charge).unwrap_or(usize::MAX);
+        let check_budget = (threshold / 64).max(1);
+        let switch_debt = cf_data.add_switch_check_debt(charge_usize);
+        let should_check_switch = wbm_over || switch_debt >= check_budget;
+
+        let needs_flush = if should_check_switch {
+            cf_data.clear_switch_check_debt();
+            let _writer = self.write_mutex.lock().expect("lock poisoned");
+            self.maybe_switch_memtable_in_lock(&cf_data)?
+        } else {
+            false
+        };
+
         if needs_flush || wbm_over {
             self.enqueue_flush(cf_data.clone())?;
         }
@@ -3559,7 +3559,7 @@ impl DbImpl {
         // is established at checkpoint via `wal_sync` (Flink replays the source
         // from the last checkpoint, so the WAL only needs to be durable there;
         // per-batch fsync was a ~170× throughput cliff). No-op when WAL disabled.
-        {
+        if self.wal_enabled.load(Ordering::Relaxed) {
             let mut guard = self.wal.lock().expect("wal lock poisoned");
             if let Some(w) = guard.as_mut() {
                 for i in 0..keys.len() {
@@ -5150,10 +5150,9 @@ impl DbImpl {
             db_id: DbId(NEXT_DB_ID.fetch_add(1, Ordering::Relaxed)),
             block_cache,
             write_buffer_manager,
-            snapshot_age_worker: Mutex::new(None),
-            snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_mutex: Mutex::new(()),
             wal: Mutex::new(None),
+            wal_enabled: AtomicBool::new(false),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
         db.maybe_init_wal();
@@ -5243,7 +5242,7 @@ impl DbImpl {
         }
 
         Self::init_self_weak(&db);
-        Self::spawn_snapshot_age_worker(&db);
+        Self::register_snapshot_maintenance_worker(&db);
         Ok(db)
     }
 
@@ -5321,8 +5320,7 @@ impl DbImpl {
         // restore side is WAL Phase 4 (replay the tail on open) — until then a
         // RESTORE from a WAL-mode checkpoint would drop the unflushed tail; this
         // override only activates when `FRS_WAL_DIR` is set (off by default).
-        let flush_memtables =
-            flush_memtables && self.wal.lock().expect("wal lock poisoned").is_none();
+        let flush_memtables = flush_memtables && !self.wal_enabled.load(Ordering::Acquire);
         if flush_memtables {
             self.flush_all()?;
             let cfs: Vec<Arc<ColumnFamilyData>> = {
@@ -7744,77 +7742,21 @@ impl DbImpl {
         let _ = db.self_weak.set(Arc::downgrade(db));
     }
 
-    /// Spawns the background snapshot-age ticker (spec §6a.3).
+    /// Registers this DB with the process-global snapshot / maintenance ticker.
     ///
-    /// The ticker runs at [`SNAPSHOT_AGE_TICK_MS`] cadence and emits a
-    /// `tracing::warn!` line for every period in which the snapshot
-    /// registry reports at least one snapshot past its `max_age_ms`
-    /// warn-line. Per spec the worker NEVER auto-releases the offending
-    /// snapshot — doing so would silently break the reader's correctness
-    /// contract (a `Snapshot` pinned at seq S guarantees its versions
-    /// remain readable for as long as the handle is alive; auto-releasing
-    /// would let compaction reclaim those versions while a Java-side
-    /// reader still references them). The remediation surface is the
-    /// operator runbook, which is exactly what the warn line points at.
-    ///
-    /// Exit path: the worker checks `snapshot_age_shutdown` between
-    /// sleeps; [`Drop`] sets the flag and joins, draining within one
-    /// tick (~1 s) of shutdown.
-    fn spawn_snapshot_age_worker(db: &Arc<Self>) {
-        let weak: Weak<DbImpl> = Arc::downgrade(db);
-        let shutdown = Arc::clone(&db.snapshot_age_shutdown);
-        let handle = std::thread::Builder::new()
-            .name("forst-rs-snap-age".to_string())
-            .spawn(move || {
-                loop {
-                    if shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    // Sleep first so a fresh-open engine doesn't fire a
-                    // spurious warn on the first tick before any
-                    // snapshot has had time to age.
-                    std::thread::sleep(std::time::Duration::from_millis(SNAPSHOT_AGE_TICK_MS));
-                    let Some(db) = weak.upgrade() else {
-                        return;
-                    };
-                    // 2026-05-30 OBSOLETE-FILE LIFETIME: drain deferred deletions
-                    // whose retiring versions have since lost their last reader.
-                    // Compaction queues a file while a reader still holds the old
-                    // version; the reader drops AFTER that compaction's own reap,
-                    // so without this periodic sweep the file would linger until
-                    // the next compaction. ~1 s cadence is ample (S3 storage is
-                    // cheap; the goal is timely reclamation, not instant).
-                    db.reap_pending_deletions();
-                    // FRS-COMPACT-MAINTENANCE (2026-06-04): trigger L0→L1
-                    // compaction for any CF whose L0 has grown to the trigger,
-                    // INDEPENDENT of the flush path. The only prior trigger was
-                    // `maybe_auto_compact` on the background flush worker, which
-                    // q4 rarely exercises (its write buffer seldom fills) — so
-                    // checkpoint-driven L0 SSTs accumulated uncompacted and the
-                    // per-probe SST fan-out decayed throughput unbounded. This
-                    // ~1 s poll keeps L0 shallow regardless of SST source.
-                    // Deduped + non-blocking (enqueue only); the actual rollup
-                    // runs on the dedicated compaction worker.
-                    db.enqueue_due_compactions();
-                    if let Some(w) = db.snapshot_registry.check_long_lived() {
-                        // Emit structured fields so a log aggregator can
-                        // index by seq / db_id. The Display impl gives a
-                        // human-readable summary; we include both so the
-                        // operator gets the runbook hint inline.
-                        tracing::warn!(
-                            seq = w.seq.value(),
-                            db_id = w.db_id.0,
-                            age_ms = w.age_ms,
-                            max_age_ms = w.max_age_ms,
-                            hint = w.hint,
-                            "{}",
-                            w
-                        );
-                    }
-                }
-            })
-            .expect("failed to spawn snapshot-age worker thread");
-        *db.snapshot_age_worker.lock().expect("lock poisoned") = Some(handle);
+    /// The ticker runs at [`SNAPSHOT_AGE_TICK_MS`] cadence and keeps the same
+    /// maintenance contract as the former per-DB worker: reap deferred
+    /// deletions, enqueue due L0 compactions, and emit long-lived snapshot
+    /// warnings. Keeping one process-global worker avoids paying a thread
+    /// spawn/join on every short-lived JNI `open`/`close` pair while preserving
+    /// the periodic maintenance surface for long-lived Flink backends.
+    fn register_snapshot_maintenance_worker(db: &Arc<Self>) {
+        let registry = snapshot_maintenance_registry();
+        registry
+            .lock()
+            .expect("lock poisoned")
+            .push(Arc::downgrade(db));
+        ensure_snapshot_maintenance_worker(registry);
     }
 
     /// Pushes a flush request onto the background queue. The writer never
@@ -10368,6 +10310,58 @@ fn shared_block_cache(cache_bytes: usize) -> std::sync::Arc<ShardedClockCache> {
     )
 }
 
+fn snapshot_maintenance_registry() -> Arc<Mutex<Vec<Weak<DbImpl>>>> {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<Arc<Mutex<Vec<Weak<DbImpl>>>>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(Mutex::new(Vec::new()))))
+}
+
+fn ensure_snapshot_maintenance_worker(registry: Arc<Mutex<Vec<Weak<DbImpl>>>>) {
+    use std::sync::OnceLock;
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("forst-rs-snap-age".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(SNAPSHOT_AGE_TICK_MS));
+                let live = {
+                    let mut guard = registry.lock().expect("lock poisoned");
+                    let mut live = Vec::with_capacity(guard.len());
+                    guard.retain(|weak| {
+                        if let Some(db) = weak.upgrade() {
+                            live.push(db);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    live
+                };
+                for db in live {
+                    // 2026-05-30 OBSOLETE-FILE LIFETIME: drain deferred deletions
+                    // whose retiring versions have since lost their last reader.
+                    db.reap_pending_deletions();
+                    // FRS-COMPACT-MAINTENANCE: keep checkpoint-driven L0 files
+                    // shallow even when the write path does not flush often enough
+                    // to trip compaction from the background flush worker.
+                    db.enqueue_due_compactions();
+                    if let Some(w) = db.snapshot_registry.check_long_lived() {
+                        tracing::warn!(
+                            seq = w.seq.value(),
+                            db_id = w.db_id.0,
+                            age_ms = w.age_ms,
+                            max_age_ms = w.max_age_ms,
+                            hint = w.hint,
+                            "{}",
+                            w
+                        );
+                    }
+                }
+            })
+            .expect("failed to spawn snapshot maintenance worker thread");
+    });
+}
+
 /// FRS_MEM_DIAG (2026-06-08): one process-global background thread logging the engine's resident
 /// native byte totals every 5s — pinpoints the join-OOM Rust-engine ~16GB (memtables vs resident
 /// shadow). Off unless FRS_MEM_DIAG=1. NMT does not track these (native-lib jemalloc), so this is
@@ -10604,27 +10598,6 @@ impl Drop for DbImpl {
                 error = %e,
                 "DbImpl::drop: compaction upload drain failed during shutdown",
             );
-        }
-
-        // 4. Signal the snapshot-age ticker to stop. The worker checks
-        //    this flag between sleeps so the join below resolves within
-        //    one tick (~1 s by default). Same panic-on-thread-poison
-        //    discipline as the flush worker: log instead of abort so
-        //    one bad thread doesn't tear down the whole runtime.
-        self.snapshot_age_shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-        let snap_handle = self
-            .snapshot_age_worker
-            .lock()
-            .ok()
-            .and_then(|mut g| g.take());
-        if let Some(h) = snap_handle {
-            if let Err(e) = h.join() {
-                eprintln!(
-                    "forst-rs: snapshot-age worker panicked during shutdown: {:?}",
-                    e
-                );
-            }
         }
     }
 }
@@ -13215,6 +13188,7 @@ mod tests {
         let db = open();
         let cf = db.default_cf();
         *db.wal.lock().unwrap() = Some(crate::wal::WalWriter::open(&path).unwrap());
+        db.wal_enabled.store(true, Ordering::Release);
 
         db.put(&cf, b"k1", b"v1").unwrap();
         db.put(&cf, b"k2", b"v2").unwrap();
@@ -13243,6 +13217,7 @@ mod tests {
         let db = open();
         let cf = db.default_cf();
         *db.wal.lock().unwrap() = Some(crate::wal::WalWriter::open(&path).unwrap());
+        db.wal_enabled.store(true, Ordering::Release);
 
         let keys: Vec<&[u8]> = vec![&b"a"[..], &b"b"[..], &b"c"[..]];
         let vals: Vec<Option<&[u8]>> = vec![Some(&b"1"[..]), Some(&b"2"[..]), None];

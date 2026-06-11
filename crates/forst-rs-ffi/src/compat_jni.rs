@@ -88,6 +88,7 @@ use jni::{JNIEnv, JavaVM};
 use forst_rs_common::{CfOptions, CompressionType, EngineOptions};
 use forst_rs_engine::{
     ColumnFamilyDescriptor, ColumnFamilyHandle, CompactionFilter, DbImpl, FlinkTtlCompactionFilter,
+    WriteBatch,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem};
 
@@ -96,14 +97,16 @@ use crate::{
     frs_db_close, frs_db_create_cf, frs_db_create_cf_with_merge, frs_db_default_cf, frs_db_open,
     frs_db_open_cf, frs_db_open_from_checkpoint, frs_delete, frs_flush, frs_flush_cf, frs_get,
     frs_iterator_close, frs_iterator_next, frs_iterator_open, frs_iterator_seek, frs_l0_file_count,
-    frs_lookup_kv, frs_merge, frs_prefix_lookup_close, frs_prefix_lookup_open, frs_put,
-    frs_sequence_number, FrsBytes, FrsCfHandle, FrsDb, FrsIterator, FRS_STATUS_NOT_FOUND,
-    FRS_STATUS_OK,
+    frs_lookup_kv, frs_merge, frs_prefix_lookup_close, frs_prefix_lookup_open, frs_sequence_number,
+    FrsBytes, FrsCfHandle, FrsDb, FrsIterator, FRS_STATUS_INVALID_ARGUMENT, FRS_STATUS_NOT_FOUND,
+    FRS_STATUS_NULL_ARG, FRS_STATUS_OK,
 };
 
 static DB_PATH_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
 static DB_LOG_REGISTRY: OnceLock<Mutex<HashMap<usize, CompatDbLogState>>> = OnceLock::new();
 static FLINK_ENV_BASE_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+
+const COMPAT_MULTI_GET_BATCH_MIN_KEYS: usize = 1024;
 
 struct CompatDbLogState {
     dir: String,
@@ -480,8 +483,10 @@ pub(crate) mod handles {
 
     impl Default for DbOptionsHandle {
         fn default() -> Self {
+            let mut opts = EngineOptions::default();
+            opts.write_buffer_size = 256 * 1024 * 1024;
             Self {
-                opts: EngineOptions::default(),
+                opts,
                 // RocksDB's Java default is unlimited/open-as-needed. forst-rs
                 // does not expose a table file cache knob yet, but callers may
                 // still round-trip this value through DBOptions tests.
@@ -639,9 +644,16 @@ pub(crate) mod handles {
     /// released by `Java_org_forstdb_RocksIterator_disposeInternal` (which
     /// closes the underlying `FrsIterator` and drops the box).
     pub(crate) struct RocksIteratorHandle {
+        /// Owning DB handle used to lazily open the engine iterator on first
+        /// seek. Keeping this here lets `RocksDB.iterator` stay cheap for
+        /// Flink ForStBackend's `newIterator(cf); seek(prefix)` hot path.
+        pub db: FrsDb,
+        /// Column family to iterate.
+        pub cf: FrsCfHandle,
         /// Underlying engine iterator. `*mut c_void` so we keep ownership
         /// of the `FrsIterator` alias and can pass it to `frs_iterator_*`
-        /// without dereferencing as a typed Rust pointer.
+        /// without dereferencing as a typed Rust pointer. This is NULL until
+        /// the first seek/seekToFirst opens a bounded iterator.
         pub frs_iter: FrsIterator,
         /// Last key materialised by the most recent `next0`/`prev0`/`seek*`.
         /// `None` after construction or when `valid == false`.
@@ -855,20 +867,28 @@ fn read_byte_slice(env: &mut JNIEnv, arr: &JByteArray, off: jint, len: jint) -> 
         throw_rocksdb(env, "negative offset/length");
         return None;
     }
-    let full = match env.convert_byte_array(arr) {
-        Ok(v) => v,
+    let array_len = match env.get_array_length(arr) {
+        Ok(n) => n as usize,
         Err(e) => {
-            throw_rocksdb(env, &format!("convert_byte_array failed: {e}"));
+            throw_rocksdb(env, &format!("get_array_length failed: {e}"));
             return None;
         }
     };
     let off = off as usize;
     let len = len as usize;
-    if off.checked_add(len).is_none_or(|end| end > full.len()) {
+    if off.checked_add(len).is_none_or(|end| end > array_len) {
         throw_rocksdb(env, "offset+length exceeds array bounds");
         return None;
     }
-    Some(full[off..off + len].to_vec())
+
+    let mut out = vec![0u8; len];
+    let out_jbytes =
+        unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<jbyte>(), out.len()) };
+    if let Err(e) = env.get_byte_array_region(arr, off as jint, out_jbytes) {
+        throw_rocksdb(env, &format!("get_byte_array_region failed: {e}"));
+        return None;
+    }
+    Some(out)
 }
 
 /// Convert a `JString` to a Rust `String`. Throws and returns `None` on
@@ -1022,6 +1042,90 @@ pub extern "system" fn Java_org_forstdb_Options_setCreateIfMissing<'local>(
         |_env| {
             if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
                 h.create_if_missing = value != JNI_FALSE;
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Options.setWriteBufferSize(long, long)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setWriteBufferSize<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.opts.write_buffer_size = value as usize;
+                }
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Options.setMaxWriteBufferNumber(long, int)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setMaxWriteBufferNumber<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.opts.max_write_buffer_number = value as usize;
+                }
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Options.setMaxBackgroundCompactions(long, int)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setMaxBackgroundCompactions<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.opts.max_background_compactions = value as usize;
+                }
+            }
+        },
+    )
+}
+
+/// `org.forstdb.Options.setMaxBackgroundFlushes(long, int)`
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_Options_setMaxBackgroundFlushes<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    value: jint,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |_env| {
+            if let Some(h) = unsafe { DbOptionsHandle::from_raw_ref(handle) } {
+                if value > 0 {
+                    h.opts.max_background_flushes = value as usize;
+                }
             }
         },
     )
@@ -1248,6 +1352,37 @@ fn cf_from_java_handle(env: &mut JNIEnv, cf_handle: jlong, context: &str) -> Opt
     Some(cf.frs_handle)
 }
 
+unsafe fn db_ref_from_java_handle<'a>(handle: jlong) -> Option<&'a Arc<DbImpl>> {
+    if handle == 0 {
+        return None;
+    }
+    Some(&*(handle as *const Arc<DbImpl>))
+}
+
+unsafe fn cf_ref_from_frs_handle<'a>(handle: FrsCfHandle) -> Option<&'a ColumnFamilyHandle> {
+    if handle.is_null() {
+        return None;
+    }
+    Some(&*(handle as *const ColumnFamilyHandle))
+}
+
+fn db_and_cf_refs<'a>(
+    env: &mut JNIEnv,
+    db_handle: jlong,
+    cf_handle: FrsCfHandle,
+    context: &str,
+) -> Option<(&'a Arc<DbImpl>, &'a ColumnFamilyHandle)> {
+    let Some(db) = (unsafe { db_ref_from_java_handle(db_handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null DB handle"));
+        return None;
+    };
+    let Some(cf) = (unsafe { cf_ref_from_frs_handle(cf_handle) }) else {
+        throw_rocksdb(env, &format!("{context}: null ColumnFamilyHandle"));
+        return None;
+    };
+    Some((db, cf))
+}
+
 fn cf_from_java_or_default(
     env: &mut JNIEnv,
     db_handle: jlong,
@@ -1313,17 +1448,12 @@ fn put_bytes(
     let Some(v) = read_byte_slice(env, val, val_off, val_len) else {
         return;
     };
-    let status = unsafe {
-        frs_put(
-            handle as FrsDb,
-            cf_handle,
-            k.as_ptr(),
-            k.len(),
-            v.as_ptr(),
-            v.len(),
-        )
+    let Some((db, cf)) = db_and_cf_refs(env, handle, cf_handle, context) else {
+        return;
     };
-    check_status(env, status, context);
+    if let Err(e) = db.put(cf, &k, &v) {
+        throw_rocksdb(env, &format!("{context}: {e}"));
+    }
 }
 
 fn get_bytes(
@@ -1338,39 +1468,26 @@ fn get_bytes(
     let Some(k) = read_byte_slice(env, key, key_off, key_len) else {
         return ptr::null_mut();
     };
-    let mut out = FrsBytes {
-        data: ptr::null_mut(),
-        len: 0,
-        capacity: 0,
+    let Some((db, cf)) = db_and_cf_refs(env, handle, cf_handle, context) else {
+        return ptr::null_mut();
     };
-    let status = unsafe { frs_get(handle as FrsDb, cf_handle, k.as_ptr(), k.len(), &mut out) };
-    if status == FRS_STATUS_NOT_FOUND {
-        return ptr::null_mut();
-    }
-    if check_status(env, status, context) {
-        return ptr::null_mut();
-    }
-    if out.data.is_null() {
-        return ptr::null_mut();
-    }
-    let slice = unsafe { std::slice::from_raw_parts(out.data, out.len) };
-    let java_arr = match env.byte_array_from_slice(slice) {
-        Ok(a) => a.into_raw(),
-        Err(e) => {
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
+    match db.get(cf, &k) {
+        Ok(Some(v)) => match env.byte_array_from_slice(&v) {
+            Ok(a) => a.into_raw(),
+            Err(e) => {
+                throw_rocksdb(
+                    env,
+                    &format!("{context}: byte_array_from_slice failed: {e}"),
+                );
+                ptr::null_mut()
             }
-            throw_rocksdb(
-                env,
-                &format!("{context}: byte_array_from_slice failed: {e}"),
-            );
-            return ptr::null_mut();
+        },
+        Ok(None) => ptr::null_mut(),
+        Err(e) => {
+            throw_rocksdb(env, &format!("{context}: {e}"));
+            ptr::null_mut()
         }
-    };
-    unsafe {
-        let _ = crate::frs_bytes_free(&mut out);
     }
-    java_arr
 }
 
 fn delete_bytes(
@@ -1385,8 +1502,12 @@ fn delete_bytes(
     let Some(k) = read_byte_slice(env, key, key_off, key_len) else {
         return;
     };
-    let status = unsafe { frs_delete(handle as FrsDb, cf_handle, k.as_ptr(), k.len()) };
-    check_status(env, status, context);
+    let Some((db, cf)) = db_and_cf_refs(env, handle, cf_handle, context) else {
+        return;
+    };
+    if let Err(e) = db.delete(cf, &k) {
+        throw_rocksdb(env, &format!("{context}: {e}"));
+    }
 }
 
 /// `org.forstdb.RocksDB.put(long handle, byte[] key,
@@ -2396,11 +2517,15 @@ pub extern "system" fn Java_org_forstdb_RocksDB_iteratorOpen<'local>(
         &mut env,
         || 0_i64,
         |env| {
+            let Some(frs_cf) =
+                cf_from_java_or_default(env, handle, cf_handle, "RocksDB.iteratorOpen")
+            else {
+                return 0_i64;
+            };
             let mut iter: FrsIterator = ptr::null_mut();
             // SAFETY: handles came from prior open / create calls; out_iter is
             // a stack local.
-            let status =
-                unsafe { frs_iterator_open(handle as FrsDb, cf_handle as FrsCfHandle, &mut iter) };
+            let status = unsafe { frs_iterator_open(handle as FrsDb, frs_cf, &mut iter) };
             if check_status(env, status, "RocksDB.iteratorOpen") {
                 return 0;
             }
@@ -2622,6 +2747,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_lookupKv<'local>(
         &mut env,
         || ptr::null_mut() as jbyteArray,
         |env| -> jbyteArray {
+            let Some(frs_cf) = cf_from_java_or_default(env, handle, cf_handle, "RocksDB.lookupKv")
+            else {
+                return ptr::null_mut();
+            };
             let Some(k) = read_byte_slice(env, &key, key_off, key_len) else {
                 return ptr::null_mut();
             };
@@ -2632,15 +2761,8 @@ pub extern "system" fn Java_org_forstdb_RocksDB_lookupKv<'local>(
             };
             // SAFETY: out is stack-local; engine populates data/len/capacity
             // on hit, leaves NULL/0/0 on miss (per frs_lookup_kv contract).
-            let status = unsafe {
-                frs_lookup_kv(
-                    handle as FrsDb,
-                    cf_handle as FrsCfHandle,
-                    k.as_ptr(),
-                    k.len(),
-                    &mut out,
-                )
-            };
+            let status =
+                unsafe { frs_lookup_kv(handle as FrsDb, frs_cf, k.as_ptr(), k.len(), &mut out) };
             if status == FRS_STATUS_NOT_FOUND {
                 return ptr::null_mut();
             }
@@ -2927,6 +3049,9 @@ fn batch_put_inner<'env, 'arr>(
     let Some(vs) = read_byte_matrix(env, &values, &format!("{label}.values")) else {
         return;
     };
+    let Some(frs_cf) = cf_from_java_or_default(env, handle, cf_handle, label) else {
+        return;
+    };
     if ks.len() != vs.len() {
         throw_rocksdb(
             env,
@@ -2948,7 +3073,7 @@ fn batch_put_inner<'env, 'arr>(
     let status = unsafe {
         frs_batch_put(
             handle as FrsDb,
-            cf_handle as FrsCfHandle,
+            frs_cf,
             key_ptrs.as_ptr(),
             key_lens.as_ptr(),
             val_ptrs.as_ptr(),
@@ -3004,6 +3129,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_batchGet<'local>(
             let Some(ks) = read_byte_matrix(env, &keys, "RocksDB.batchGet.keys") else {
                 return ptr::null_mut();
             };
+            let Some(frs_cf) = cf_from_java_or_default(env, handle, cf_handle, "RocksDB.batchGet")
+            else {
+                return ptr::null_mut();
+            };
             let count = ks.len();
             let key_ptrs: Vec<*const u8> = ks.iter().map(|k| k.as_ptr()).collect();
             let key_lens: Vec<usize> = ks.iter().map(|k| k.len()).collect();
@@ -3020,7 +3149,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_batchGet<'local>(
             let status = unsafe {
                 frs_batch_get(
                     handle as FrsDb,
-                    cf_handle as FrsCfHandle,
+                    frs_cf,
                     key_ptrs.as_ptr(),
                     key_lens.as_ptr(),
                     count,
@@ -3146,6 +3275,11 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupOpen<'local>(
         &mut env,
         || 0_i64,
         |env| {
+            let Some(frs_cf) =
+                cf_from_java_or_default(env, handle, cf_handle, "RocksDB.prefixLookupOpen")
+            else {
+                return 0_i64;
+            };
             // null prefix or len==0 → full scan (matches FFI semantics).
             let prefix_obj: &JObject = prefix.as_ref();
             let is_empty = prefix_obj.is_null() || prefix_len == 0;
@@ -3153,13 +3287,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupOpen<'local>(
             let status = if is_empty {
                 // SAFETY: NULL prefix is allowed by frs_prefix_lookup_open.
                 unsafe {
-                    frs_prefix_lookup_open(
-                        handle as FrsDb,
-                        cf_handle as FrsCfHandle,
-                        ptr::null(),
-                        0,
-                        &mut iter,
-                    )
+                    frs_prefix_lookup_open(handle as FrsDb, frs_cf, ptr::null(), 0, &mut iter)
                 }
             } else {
                 let Some(p) = read_byte_slice(env, &prefix, prefix_off, prefix_len) else {
@@ -3167,13 +3295,7 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupOpen<'local>(
                 };
                 // SAFETY: p is a stack-local Vec<u8>; engine copies bounds.
                 unsafe {
-                    frs_prefix_lookup_open(
-                        handle as FrsDb,
-                        cf_handle as FrsCfHandle,
-                        p.as_ptr(),
-                        p.len(),
-                        &mut iter,
-                    )
+                    frs_prefix_lookup_open(handle as FrsDb, frs_cf, p.as_ptr(), p.len(), &mut iter)
                 }
             };
             if check_status(env, status, "RocksDB.prefixLookupOpen") {
@@ -5886,6 +6008,92 @@ fn byte_to_compression(b: u8) -> CompressionType {
 // same crate and gets `pub(crate)` access.
 // ===========================================================================
 
+fn rocks_iterator_clear_cached_row(h: &mut RocksIteratorHandle) {
+    h.valid = false;
+    h.last_key = None;
+    h.last_value = None;
+}
+
+fn rocks_iterator_close_current(h: &mut RocksIteratorHandle) -> i32 {
+    if h.frs_iter.is_null() {
+        return FRS_STATUS_OK;
+    }
+    let status = unsafe { frs_iterator_close(h.frs_iter) };
+    h.frs_iter = ptr::null_mut();
+    rocks_iterator_clear_cached_row(h);
+    status
+}
+
+fn rocks_iterator_enable_rewind(iter: FrsIterator) {
+    if !iter.is_null() {
+        unsafe {
+            let state = &mut *(iter as *mut crate::IteratorState);
+            state.allow_rewind = true;
+        }
+    }
+}
+
+fn rocks_iterator_open_full_for_seek(h: &mut RocksIteratorHandle, key: &[u8]) -> i32 {
+    let mut iter: FrsIterator = ptr::null_mut();
+    let status = unsafe { frs_iterator_open(h.db, h.cf, &mut iter) };
+    if status != FRS_STATUS_OK {
+        return status;
+    }
+    rocks_iterator_enable_rewind(iter);
+    let status = unsafe {
+        frs_iterator_seek(
+            iter,
+            if key.is_empty() {
+                ptr::null()
+            } else {
+                key.as_ptr()
+            },
+            key.len(),
+        )
+    };
+    if status != FRS_STATUS_OK {
+        unsafe {
+            let _ = frs_iterator_close(iter);
+        }
+        return status;
+    }
+    h.frs_iter = iter;
+    rocks_iterator_clear_cached_row(h);
+    FRS_STATUS_OK
+}
+
+fn rocks_iterator_open_for_seek(h: &mut RocksIteratorHandle, key: &[u8]) -> i32 {
+    let close_status = rocks_iterator_close_current(h);
+    if close_status != FRS_STATUS_OK {
+        return close_status;
+    }
+    if key.is_empty() {
+        return rocks_iterator_open_full_for_seek(h, key);
+    }
+
+    let mut iter: FrsIterator = ptr::null_mut();
+    let status = unsafe { frs_prefix_lookup_open(h.db, h.cf, key.as_ptr(), key.len(), &mut iter) };
+    if status != FRS_STATUS_OK {
+        return status;
+    }
+    rocks_iterator_enable_rewind(iter);
+
+    let prefix_is_empty = unsafe {
+        let state = &*(iter as *mut crate::IteratorState);
+        state.rows.is_empty()
+    };
+    if prefix_is_empty {
+        unsafe {
+            let _ = frs_iterator_close(iter);
+        }
+        return rocks_iterator_open_full_for_seek(h, key);
+    }
+
+    h.frs_iter = iter;
+    rocks_iterator_clear_cached_row(h);
+    FRS_STATUS_OK
+}
+
 /// Helper: consume one `frs_iterator_next` row and store it in the caller's
 /// `RocksIteratorHandle`. Used by `seek*` and `next0`. Returns `true` if
 /// the call succeeded (regardless of whether a row was found; check
@@ -5987,26 +6195,10 @@ pub extern "system" fn Java_org_forstdb_RocksDB_iterator<'local>(
             let Some(frs_cf) = cf_from_java_handle(env, cf_handle, "RocksDB.iterator") else {
                 return 0_i64;
             };
-            let mut iter: FrsIterator = ptr::null_mut();
-            // SAFETY: db / cf came from prior open; out_iter is stack-local.
-            let status = unsafe { frs_iterator_open(handle as FrsDb, frs_cf, &mut iter) };
-            if check_status(env, status, "RocksDB.iterator") {
-                return 0_i64;
-            }
-            // R11A-H1 (post-B-C4R10): pre-flip allow_rewind=true at open. The
-            // JNI compat shim's RocksIterator ABI is bidirectional (seek0,
-            // seekToLast0, seekForPrev0, prev0 all rewind), so every next0
-            // MUST use clone() — never mem::take. Pre-fix the seek0/
-            // seekToFirst0 entries pre-flipped just-in-time, but a sequence
-            // like next0; next0; seek0 would have already corrupted rows[0..2]
-            // under the forward-only fast path before seek0 ran the
-            // binary_search.
-            unsafe {
-                let state = &mut *(iter as *mut crate::IteratorState);
-                state.allow_rewind = true;
-            }
             RocksIteratorHandle {
-                frs_iter: iter,
+                db: handle as FrsDb,
+                cf: frs_cf,
+                frs_iter: ptr::null_mut(),
                 last_key: None,
                 last_value: None,
                 valid: false,
@@ -6061,14 +6253,6 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seek0<'local>(
                 throw_rocksdb(env, "RocksIterator.seek0: null handle");
                 return;
             };
-            // A-C5R2-NEW-H1: null-check h.frs_iter BEFORE the raw deref
-            // (the allow_rewind pre-flip below is unsafe and would UB on
-            // NULL). Mirror seekToLast0/seekForPrev0/prev0 which already
-            // guard. compat_jni.rs:3491 has the same missed-sister gap.
-            if h.frs_iter.is_null() {
-                throw_rocksdb(env, "RocksIterator.seek0: null frs_iter");
-                return;
-            }
             // SAFETY: read_byte_slice requires offset+len bounds; we pass 0/key_len.
             let needle = if key_len <= 0 {
                 Vec::new()
@@ -6078,29 +6262,7 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seek0<'local>(
                 };
                 k
             };
-            // B-C4R10-H1: pre-set allow_rewind=true so frs_iterator_seek's
-            // D-C4R8-H1 guard does NOT reject a legitimate `iter.next();
-            // iter.seek(...);` RocksIterator ABI sequence. The guard is for
-            // forward-only callers whose mem::take has corrupted the row
-            // array; the JNI compat shim cannot be forward-only because
-            // RocksIterator exposes seek0 as a public API. Mirrors
-            // A-C4R5-H1's flip in seekToLast0/seekForPrev0/prev0.
-            unsafe {
-                let state = &mut *(h.frs_iter as *mut crate::IteratorState);
-                state.allow_rewind = true;
-            }
-            // SAFETY: frs_iter valid; needle pointer + len consistent.
-            let status = unsafe {
-                frs_iterator_seek(
-                    h.frs_iter,
-                    if needle.is_empty() {
-                        ptr::null()
-                    } else {
-                        needle.as_ptr()
-                    },
-                    needle.len(),
-                )
-            };
+            let status = rocks_iterator_open_for_seek(h, &needle);
             if check_status(env, status, "RocksIterator.seek0") {
                 return;
             }
@@ -6127,20 +6289,7 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seekToFirst0<'local>(
                 throw_rocksdb(env, "RocksIterator.seekToFirst0: null handle");
                 return;
             };
-            // A-C5R2-NEW-H1: null-check frs_iter BEFORE the raw deref.
-            if h.frs_iter.is_null() {
-                throw_rocksdb(env, "RocksIterator.seekToFirst0: null frs_iter");
-                return;
-            }
-            // B-C4R10-H1: see seek0 — pre-set allow_rewind to bypass the
-            // D-C4R8-H1 forward-only-only guard. RocksIterator's
-            // seekToFirst() can legitimately follow next() calls.
-            unsafe {
-                let state = &mut *(h.frs_iter as *mut crate::IteratorState);
-                state.allow_rewind = true;
-            }
-            // SAFETY: valid frs_iter; null + 0 means "seek to first".
-            let status = unsafe { frs_iterator_seek(h.frs_iter, ptr::null(), 0) };
+            let status = rocks_iterator_open_for_seek(h, &[]);
             if check_status(env, status, "RocksIterator.seekToFirst0") {
                 return;
             }
@@ -6173,8 +6322,10 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seekToLast0<'local>(
                 return;
             };
             if h.frs_iter.is_null() {
-                throw_rocksdb(env, "RocksIterator.seekToLast0: null frs_iter");
-                return;
+                let status = rocks_iterator_open_for_seek(h, &[]);
+                if check_status(env, status, "RocksIterator.seekToLast0(open)") {
+                    return;
+                }
             }
             // SAFETY: frs_iter is a valid `Box<crate::IteratorState>` raw
             // pointer obtained via Box::into_raw inside frs_iterator_open;
@@ -6224,10 +6375,6 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seekForPrev0<'local>(
                 throw_rocksdb(env, "RocksIterator.seekForPrev0: null handle");
                 return;
             };
-            if h.frs_iter.is_null() {
-                throw_rocksdb(env, "RocksIterator.seekForPrev0: null frs_iter");
-                return;
-            }
             let needle = if key_len <= 0 {
                 Vec::new()
             } else {
@@ -6236,6 +6383,12 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_seekForPrev0<'local>(
                 };
                 k
             };
+            if h.frs_iter.is_null() {
+                let status = rocks_iterator_open_for_seek(h, &[]);
+                if check_status(env, status, "RocksIterator.seekForPrev0(open)") {
+                    return;
+                }
+            }
             // SAFETY: see seekToLast0 — same-crate pub(crate) access to the
             // owning Box<IteratorState>.
             let state = unsafe { &mut *(h.frs_iter as *mut crate::IteratorState) };
@@ -6279,6 +6432,12 @@ pub extern "system" fn Java_org_forstdb_RocksIterator_next0<'local>(
                 throw_rocksdb(env, "RocksIterator.next0: null handle");
                 return;
             };
+            if h.frs_iter.is_null() {
+                let status = rocks_iterator_open_for_seek(h, &[]);
+                if check_status(env, status, "RocksIterator.next0(open)") {
+                    return;
+                }
+            }
             let _ = fetch_into_handle(env, h, "RocksIterator.next0");
         },
     )
@@ -6896,16 +7055,100 @@ pub extern "system" fn Java_org_forstdb_WriteBatch_getDataSize<'local>(
 // RocksDB.write0 — apply a WriteBatch
 // ---------------------------------------------------------------------------
 
+fn apply_resolved_write_batch_entries_fast(db_handle: jlong, entries: &[WriteBatchEntry]) -> i32 {
+    let Some(db) = (unsafe { crate::db_from_handle(db_handle as FrsDb) }) else {
+        return FRS_STATUS_NULL_ARG;
+    };
+    if entries.is_empty() {
+        return FRS_STATUS_OK;
+    }
+
+    let first_cf = match &entries[0] {
+        WriteBatchEntry::Put { cf, .. }
+        | WriteBatchEntry::Merge { cf, .. }
+        | WriteBatchEntry::Delete { cf, .. } => *cf,
+    };
+    let mut can_use_single_cf_borrowed_batch = true;
+    for entry in entries {
+        match entry {
+            WriteBatchEntry::Put { cf, .. } | WriteBatchEntry::Delete { cf, .. } => {
+                if *cf != first_cf {
+                    can_use_single_cf_borrowed_batch = false;
+                    break;
+                }
+            }
+            WriteBatchEntry::Merge { .. } => {
+                can_use_single_cf_borrowed_batch = false;
+                break;
+            }
+        }
+    }
+
+    if can_use_single_cf_borrowed_batch {
+        let Some(cf) = (unsafe { crate::cf_ref(&first_cf) }) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(entries.len());
+        let mut values: Vec<Option<&[u8]>> = Vec::with_capacity(entries.len());
+        let mut op_types: Vec<u8> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                WriteBatchEntry::Put { key, value, .. } => {
+                    keys.push(key);
+                    values.push(Some(value));
+                    op_types.push(1u8);
+                }
+                WriteBatchEntry::Delete { key, .. } => {
+                    keys.push(key);
+                    values.push(None);
+                    op_types.push(0u8);
+                }
+                WriteBatchEntry::Merge { .. } => unreachable!(),
+            }
+        }
+        return match db.batch_put_borrowed_single_cf(cf, &keys, &values, &op_types) {
+            Ok(_) => FRS_STATUS_OK,
+            Err(e) => crate::error_to_status(&e),
+        };
+    }
+
+    let mut batch = WriteBatch::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            WriteBatchEntry::Put { cf, key, value } => {
+                let Some(cf) = (unsafe { crate::cf_ref(cf) }) else {
+                    return FRS_STATUS_NULL_ARG;
+                };
+                batch.put(cf, key, value);
+            }
+            WriteBatchEntry::Merge { cf, key, value } => {
+                let Some(cf) = (unsafe { crate::cf_ref(cf) }) else {
+                    return FRS_STATUS_NULL_ARG;
+                };
+                batch.merge(cf, key, value);
+            }
+            WriteBatchEntry::Delete { cf, key } => {
+                let Some(cf) = (unsafe { crate::cf_ref(cf) }) else {
+                    return FRS_STATUS_NULL_ARG;
+                };
+                batch.delete(cf, key);
+            }
+        }
+    }
+    match db.batch_write(batch) {
+        Ok(_) => FRS_STATUS_OK,
+        Err(e) => crate::error_to_status(&e),
+    }
+}
+
 /// `org.forstdb.RocksDB.write0(long dbHandle, long woHandle, long wbHandle)`
 ///
 /// Java signature: `(JJJ)V`
 ///
-/// Drains the [`WriteBatchHandle`]'s buffered entries and dispatches each
-/// to the engine via the existing `frs_put` / `frs_merge` / `frs_delete`
-/// paths. The batch is left empty on success; partial-failure semantics
-/// (mid-batch error) drop the remaining entries to avoid surprise re-apply
-/// on retry — Java callers expecting transactional semantics should
-/// `clear0()` before retrying.
+/// Drains the [`WriteBatchHandle`]'s buffered entries and applies them through
+/// the engine's native `batch_write` path. The batch is left empty on success;
+/// failures also clear the Java-side buffer so retry semantics remain
+/// well-defined (caller must rebuild the batch before retrying).
 ///
 /// `wo_handle` (WriteOptions) is currently informational. The
 /// engine always durably writes; `disable_wal` is recorded but ignored.
@@ -6940,72 +7183,25 @@ pub extern "system" fn Java_org_forstdb_RocksDB_write0<'local>(
             // Drain entries so a successful apply leaves the batch empty;
             // a failure also clears so retry semantics are well-defined
             // (caller must rebuild the batch on retry).
-            let entries = std::mem::take(&mut wb.entries);
+            let mut entries = std::mem::take(&mut wb.entries);
             wb.data_size = 0;
-            for (i, entry) in entries.into_iter().enumerate() {
-                let label = format!("RocksDB.write0[{i}]");
-                let status = match entry {
-                    WriteBatchEntry::Put { cf, key, value } => {
-                        let cf = if cf.is_null() {
+            for (i, entry) in entries.iter_mut().enumerate() {
+                let label = format!("RocksDB.write0.resolveCf[{i}]");
+                match entry {
+                    WriteBatchEntry::Put { cf, .. }
+                    | WriteBatchEntry::Merge { cf, .. }
+                    | WriteBatchEntry::Delete { cf, .. } => {
+                        if cf.is_null() {
                             let Some(default_cf) = default_cf_for_db(env, db_handle, &label) else {
                                 return;
                             };
-                            default_cf
-                        } else {
-                            cf
-                        };
-                        // SAFETY: db_handle / cf came from prior open;
-                        // key / value vectors live for the duration of
-                        // the call and the engine copies internally.
-                        unsafe {
-                            crate::frs_put(
-                                db_handle as FrsDb,
-                                cf,
-                                key.as_ptr(),
-                                key.len(),
-                                value.as_ptr(),
-                                value.len(),
-                            )
+                            *cf = default_cf;
                         }
                     }
-                    WriteBatchEntry::Merge { cf, key, value } => {
-                        let cf = if cf.is_null() {
-                            let Some(default_cf) = default_cf_for_db(env, db_handle, &label) else {
-                                return;
-                            };
-                            default_cf
-                        } else {
-                            cf
-                        };
-                        // SAFETY: same as above.
-                        unsafe {
-                            frs_merge(
-                                db_handle as FrsDb,
-                                cf,
-                                key.as_ptr(),
-                                key.len(),
-                                value.as_ptr(),
-                                value.len(),
-                            )
-                        }
-                    }
-                    WriteBatchEntry::Delete { cf, key } => {
-                        let cf = if cf.is_null() {
-                            let Some(default_cf) = default_cf_for_db(env, db_handle, &label) else {
-                                return;
-                            };
-                            default_cf
-                        } else {
-                            cf
-                        };
-                        // SAFETY: same as above.
-                        unsafe { frs_delete(db_handle as FrsDb, cf, key.as_ptr(), key.len()) }
-                    }
-                };
-                if check_status(env, status, &label) {
-                    return;
                 }
             }
+            let status = apply_resolved_write_batch_entries_fast(db_handle, &entries);
+            check_status(env, status, "RocksDB.write0.batch_write");
         },
     )
 }
@@ -8835,6 +9031,151 @@ fn multi_get_cf_list<'env, 'arr>(
     Some(out)
 }
 
+fn compat_multi_get_grouped(
+    handle: jlong,
+    cf_list: &[FrsCfHandle],
+    keys: &[&[u8]],
+) -> Result<Vec<Option<Vec<u8>>>, i32> {
+    if cf_list.len() != keys.len() {
+        return Err(FRS_STATUS_INVALID_ARGUMENT);
+    }
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    if keys.len() < COMPAT_MULTI_GET_BATCH_MIN_KEYS {
+        return compat_multi_get_per_key(handle, cf_list, keys);
+    }
+    let first_cf = cf_list[0];
+    if first_cf.is_null() {
+        return Err(FRS_STATUS_NULL_ARG);
+    }
+    if cf_list.iter().all(|cf| *cf == first_cf) {
+        return compat_multi_get_single_cf(handle, first_cf, keys);
+    }
+
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, cf) in cf_list.iter().enumerate() {
+        if cf.is_null() {
+            return Err(FRS_STATUS_NULL_ARG);
+        }
+        groups.entry(*cf as usize).or_default().push(i);
+    }
+
+    let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+    for (cf_addr, idxs) in groups {
+        let cf = cf_addr as FrsCfHandle;
+        let key_ptrs: Vec<*const u8> = idxs.iter().map(|&i| keys[i].as_ptr()).collect();
+        let key_lens: Vec<usize> = idxs.iter().map(|&i| keys[i].len()).collect();
+        let mut out_values: Vec<FrsBytes> = (0..idxs.len()).map(|_| FrsBytes::NULL).collect();
+        let status = unsafe {
+            frs_batch_get(
+                handle as FrsDb,
+                cf,
+                key_ptrs.as_ptr(),
+                key_lens.as_ptr(),
+                idxs.len(),
+                out_values.as_mut_ptr(),
+            )
+        };
+        if status != FRS_STATUS_OK {
+            for out in out_values.iter_mut() {
+                unsafe {
+                    let _ = crate::frs_bytes_free(out);
+                }
+            }
+            return Err(status);
+        }
+
+        for (slot, mut out) in idxs.iter().copied().zip(out_values) {
+            if !out.data.is_null() {
+                let bytes = unsafe { std::slice::from_raw_parts(out.data, out.len).to_vec() };
+                results[slot] = Some(bytes);
+            }
+            unsafe {
+                let _ = crate::frs_bytes_free(&mut out);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn compat_multi_get_per_key(
+    handle: jlong,
+    cf_list: &[FrsCfHandle],
+    keys: &[&[u8]],
+) -> Result<Vec<Option<Vec<u8>>>, i32> {
+    let mut results = Vec::with_capacity(keys.len());
+    for (cf, key) in cf_list.iter().copied().zip(keys.iter().copied()) {
+        if cf.is_null() {
+            return Err(FRS_STATUS_NULL_ARG);
+        }
+        let mut out = FrsBytes::NULL;
+        let status = unsafe { frs_get(handle as FrsDb, cf, key.as_ptr(), key.len(), &mut out) };
+        if status != FRS_STATUS_OK && status != FRS_STATUS_NOT_FOUND {
+            unsafe {
+                let _ = crate::frs_bytes_free(&mut out);
+            }
+            return Err(status);
+        }
+        if out.data.is_null() {
+            results.push(None);
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(out.data, out.len).to_vec() };
+            results.push(Some(bytes));
+        }
+        unsafe {
+            let _ = crate::frs_bytes_free(&mut out);
+        }
+    }
+    Ok(results)
+}
+
+fn compat_multi_get_single_cf(
+    handle: jlong,
+    cf: FrsCfHandle,
+    keys: &[&[u8]],
+) -> Result<Vec<Option<Vec<u8>>>, i32> {
+    if cf.is_null() {
+        return Err(FRS_STATUS_NULL_ARG);
+    }
+    let key_ptrs: Vec<*const u8> = keys.iter().map(|key| key.as_ptr()).collect();
+    let key_lens: Vec<usize> = keys.iter().map(|key| key.len()).collect();
+    let mut out_values: Vec<FrsBytes> = (0..keys.len()).map(|_| FrsBytes::NULL).collect();
+    let status = unsafe {
+        frs_batch_get(
+            handle as FrsDb,
+            cf,
+            key_ptrs.as_ptr(),
+            key_lens.as_ptr(),
+            keys.len(),
+            out_values.as_mut_ptr(),
+        )
+    };
+    if status != FRS_STATUS_OK {
+        for out in out_values.iter_mut() {
+            unsafe {
+                let _ = crate::frs_bytes_free(out);
+            }
+        }
+        return Err(status);
+    }
+
+    let mut results = Vec::with_capacity(keys.len());
+    for mut out in out_values {
+        if out.data.is_null() {
+            results.push(None);
+        } else {
+            let bytes = unsafe { std::slice::from_raw_parts(out.data, out.len).to_vec() };
+            results.push(Some(bytes));
+        }
+        unsafe {
+            let _ = crate::frs_bytes_free(&mut out);
+        }
+    }
+    Ok(results)
+}
+
 fn multi_get_impl<'env, 'arr>(
     env: &mut JNIEnv<'env>,
     handle: jlong,
@@ -8866,37 +9207,25 @@ fn multi_get_impl<'env, 'arr>(
         }
     };
 
-    for (i, key) in ks.iter().enumerate() {
-        let mut out = FrsBytes {
-            data: ptr::null_mut(),
-            len: 0,
-            capacity: 0,
-        };
-        let st = unsafe {
-            frs_get(
-                handle as FrsDb,
-                cf_list[i],
-                key.as_ptr(),
-                key.len(),
-                &mut out,
-            )
-        };
-        if st == FRS_STATUS_NOT_FOUND {
-            continue;
-        }
-        if check_status(env, st, &format!("RocksDB.multiGet[{i}]")) {
+    let key_slices: Vec<&[u8]> = ks.iter().map(Vec::as_slice).collect();
+    let values = match compat_multi_get_grouped(handle, &cf_list, &key_slices) {
+        Ok(values) => values,
+        Err(st) => {
+            if check_status(env, st, "RocksDB.multiGet.batch") {
+                return ptr::null_mut();
+            }
+            throw_rocksdb(env, &format!("RocksDB.multiGet.batch: status {st}"));
             return ptr::null_mut();
         }
-        if out.data.is_null() {
+    };
+
+    for (i, value) in values.into_iter().enumerate() {
+        let Some(bytes) = value else {
             continue;
-        }
-        let s = unsafe { std::slice::from_raw_parts(out.data, out.len) };
-        let arr = match env.byte_array_from_slice(s) {
+        };
+        let arr = match env.byte_array_from_slice(&bytes) {
             Ok(a) => a,
             Err(e) => {
-                unsafe {
-                    let _ = crate::frs_bytes_free(&mut out);
-                }
                 throw_rocksdb(
                     env,
                     &format!("RocksDB.multiGet[{i}]: byte_array_from_slice: {e}"),
@@ -8905,17 +9234,11 @@ fn multi_get_impl<'env, 'arr>(
             }
         };
         if let Err(e) = env.set_object_array_element(&outer, i as jint, &arr) {
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
-            }
             throw_rocksdb(
                 env,
                 &format!("RocksDB.multiGet[{i}]: set_object_array_element: {e}"),
             );
             return ptr::null_mut();
-        }
-        unsafe {
-            let _ = crate::frs_bytes_free(&mut out);
         }
     }
     outer.into_raw()
@@ -10526,6 +10849,19 @@ mod tests {
             // JNI load path calls RocksDB.version() immediately after
             // NativeLibraryLoader resolves libforstjni.
             "Java_org_forstdb_RocksDB_version",
+            // P0 — combined Options class.
+            "Java_org_forstdb_Options_newOptions__",
+            "Java_org_forstdb_Options_newOptions__JJ",
+            "Java_org_forstdb_Options_copyOptions",
+            "Java_org_forstdb_Options_disposeInternal",
+            "Java_org_forstdb_Options_setCreateIfMissing",
+            "Java_org_forstdb_Options_createIfMissing",
+            "Java_org_forstdb_Options_setCreateMissingColumnFamilies",
+            "Java_org_forstdb_Options_createMissingColumnFamilies",
+            "Java_org_forstdb_Options_setWriteBufferSize",
+            "Java_org_forstdb_Options_setMaxWriteBufferNumber",
+            "Java_org_forstdb_Options_setMaxBackgroundCompactions",
+            "Java_org_forstdb_Options_setMaxBackgroundFlushes",
             // DBOptions default constructor keeps a default Env reference.
             "Java_org_forstdb_Env_getDefaultEnvInternal",
             "Java_org_forstdb_Env_setBackgroundThreads",
@@ -10749,12 +11085,16 @@ mod tests {
         // SAFETY: handle came from `into_raw` immediately above, no aliasing.
         let opts_ref =
             unsafe { DbOptionsHandle::from_raw_ref(h) }.expect("non-null handle should resolve");
+        opts_ref.opts.write_buffer_size = 512 * 1024 * 1024;
+        opts_ref.opts.max_write_buffer_number = 6;
         opts_ref.opts.max_background_compactions = 8;
         opts_ref.opts.max_background_flushes = 4;
 
         // Re-borrow to verify the write took.
         let opts_ref2 =
             unsafe { DbOptionsHandle::from_raw_ref(h) }.expect("non-null handle should resolve");
+        assert_eq!(opts_ref2.opts.write_buffer_size, 512 * 1024 * 1024);
+        assert_eq!(opts_ref2.opts.max_write_buffer_number, 6);
         assert_eq!(opts_ref2.opts.max_background_compactions, 8);
         assert_eq!(opts_ref2.opts.max_background_flushes, 4);
 
@@ -10981,6 +11321,8 @@ mod tests {
         let st = unsafe { frs_iterator_open(db, cf, &mut iter) };
         assert_eq!(st, FRS_STATUS_OK);
         let h = RocksIteratorHandle {
+            db,
+            cf,
             frs_iter: iter,
             last_key: None,
             last_value: None,
@@ -11128,6 +11470,8 @@ mod tests {
         let st = unsafe { frs_iterator_open(db, cf, &mut iter) };
         assert_eq!(st, FRS_STATUS_OK);
         let h = RocksIteratorHandle {
+            db,
+            cf,
             frs_iter: iter,
             last_key: None,
             last_value: None,
@@ -11216,6 +11560,68 @@ mod tests {
         }
     }
 
+    /// ForStBackend opens a RocksIterator and immediately seeks to a MapState
+    /// key prefix. The compat handle must stay lazy until seek(), then open a
+    /// prefix-bounded engine iterator instead of materialising the whole CF.
+    #[test]
+    fn test_rocks_iterator_lazy_seek_opens_prefix_bounded_iter() {
+        let seed: [(&[u8], &[u8]); 4] = [
+            (b"p/1", b"v1"),
+            (b"p/2", b"v2"),
+            (b"q/1", b"v3"),
+            (b"z/1", b"v4"),
+        ];
+        let (db, cf) = open_seeded_engine(&seed);
+
+        let mut h = RocksIteratorHandle {
+            db,
+            cf,
+            frs_iter: ptr::null_mut(),
+            last_key: None,
+            last_value: None,
+            valid: false,
+        };
+        assert!(
+            h.frs_iter.is_null(),
+            "RocksDB.iterator must not open/materialise the engine iterator before seek"
+        );
+
+        let status = rocks_iterator_open_for_seek(&mut h, b"p/");
+        assert_eq!(status, FRS_STATUS_OK);
+        assert!(
+            !h.frs_iter.is_null(),
+            "seek(prefix) must open the engine iterator lazily"
+        );
+
+        let mut keys = Vec::new();
+        loop {
+            let mut k = FrsBytes::NULL;
+            let mut v = FrsBytes::NULL;
+            let mut valid = false;
+            let st = unsafe { frs_iterator_next(h.frs_iter, &mut k, &mut v, &mut valid) };
+            assert_eq!(st, FRS_STATUS_OK);
+            if !valid {
+                break;
+            }
+            keys.push(unsafe { std::slice::from_raw_parts(k.data, k.len).to_vec() });
+            unsafe {
+                let _ = crate::frs_bytes_free(&mut k);
+                let _ = crate::frs_bytes_free(&mut v);
+            }
+        }
+        assert_eq!(keys, vec![b"p/1".to_vec(), b"p/2".to_vec()]);
+
+        if !h.frs_iter.is_null() {
+            unsafe {
+                let _ = frs_iterator_close(h.frs_iter);
+            }
+        }
+        unsafe {
+            let _ = crate::frs_cf_close(cf);
+            let _ = frs_db_close(db);
+        }
+    }
+
     /// WriteBatch lifecycle: ctor, multiple put, one delete, count, dispose.
     #[test]
     fn test_write_batch_lifecycle() {
@@ -11300,25 +11706,10 @@ mod tests {
             key: b"beta".to_vec(),
         });
 
-        // Drain & apply (mirror of write0 body).
-        // SAFETY: same-pattern access.
+        // Drain & apply through the same fast batch helper used by write0.
         let entries = std::mem::take(&mut href.entries);
-        for entry in entries {
-            let status = match entry {
-                WriteBatchEntry::Put { cf, key, value } => {
-                    // SAFETY: pointers live for the call.
-                    unsafe {
-                        crate::frs_put(db, cf, key.as_ptr(), key.len(), value.as_ptr(), value.len())
-                    }
-                }
-                WriteBatchEntry::Delete { cf, key } => {
-                    // SAFETY: same.
-                    unsafe { crate::frs_delete(db, cf, key.as_ptr(), key.len()) }
-                }
-                WriteBatchEntry::Merge { .. } => unreachable!("test does not use merge"),
-            };
-            assert_eq!(status, FRS_STATUS_OK);
-        }
+        let status = apply_resolved_write_batch_entries_fast(db as jlong, &entries);
+        assert_eq!(status, FRS_STATUS_OK);
 
         // Verify: alpha + gamma present, beta absent.
         for (key, expected) in [
@@ -11414,6 +11805,389 @@ mod tests {
         assert!(none.is_none());
         let none = unsafe { RocksIteratorHandle::from_raw_ref(0) };
         assert!(none.is_none());
+    }
+
+    #[test]
+    #[ignore = "small compat-JNI microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_compat_multi_get_small_batch_guard_stays_near_per_key_loop() {
+        let mut db: FrsDb = ptr::null_mut();
+        let st = unsafe { crate::frs_db_open_memory(&mut db) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let mut cf: FrsCfHandle = ptr::null_mut();
+        let st = unsafe { frs_db_default_cf(db, &mut cf) };
+        assert_eq!(st, FRS_STATUS_OK);
+
+        let count = 512usize;
+        let keys: Vec<Vec<u8>> = (0..count)
+            .map(|i| format!("bench-key-{i:04}").into_bytes())
+            .collect();
+        let values: Vec<Vec<u8>> = (0..count)
+            .map(|i| format!("bench-value-{i:04}").into_bytes())
+            .collect();
+        for (k, v) in keys.iter().zip(values.iter()) {
+            let st = unsafe { crate::frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()) };
+            assert_eq!(st, FRS_STATUS_OK);
+        }
+
+        let cf_list = vec![cf; count];
+        let key_slices: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+
+        let repeats = 8usize;
+
+        let old_start = std::time::Instant::now();
+        let mut old_hits = 0usize;
+        for _ in 0..repeats {
+            let results = compat_multi_get_per_key(db as jlong, &cf_list, &key_slices)
+                .expect("per-key compat multiGet must succeed");
+            old_hits += results.iter().filter(|v| v.is_some()).count();
+        }
+        let old_elapsed = old_start.elapsed();
+
+        let new_start = std::time::Instant::now();
+        let mut new_hits = 0usize;
+        for _ in 0..repeats {
+            let grouped = compat_multi_get_grouped(db as jlong, &cf_list, &key_slices)
+                .expect("grouped batch get must succeed");
+            new_hits += grouped.iter().filter(|v| v.is_some()).count();
+        }
+        let new_elapsed = new_start.elapsed();
+
+        eprintln!(
+            "compat_multi_get small-batch guard: per_key={:?}, guarded={:?}, ratio={:.3}x",
+            old_elapsed,
+            new_elapsed,
+            old_elapsed.as_nanos() as f64 / new_elapsed.as_nanos().max(1) as f64
+        );
+        assert_eq!(old_hits, count * repeats);
+        assert_eq!(new_hits, count * repeats);
+        assert!(
+            new_elapsed <= old_elapsed + (old_elapsed / 4),
+            "small compat multiGet should stay near the per-key loop instead of forcing the slower batch_get path"
+        );
+
+        unsafe {
+            let _ = crate::frs_cf_close(cf);
+            let _ = frs_db_close(db);
+        }
+    }
+
+    #[test]
+    #[ignore = "small compat-JNI microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_compat_multi_get_single_cf_shortcut_beats_legacy_reorder_path() {
+        fn legacy_single_cf_reorder_path(
+            handle: jlong,
+            cf: FrsCfHandle,
+            keys: &[&[u8]],
+        ) -> Result<Vec<Option<Vec<u8>>>, i32> {
+            let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+            for i in 0..keys.len() {
+                groups.entry(cf as usize).or_default().push(i);
+            }
+
+            let mut results: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+            for (cf_addr, idxs) in groups {
+                let cf = cf_addr as FrsCfHandle;
+                let key_ptrs: Vec<*const u8> = idxs.iter().map(|&i| keys[i].as_ptr()).collect();
+                let key_lens: Vec<usize> = idxs.iter().map(|&i| keys[i].len()).collect();
+                let mut out_values: Vec<FrsBytes> =
+                    (0..idxs.len()).map(|_| FrsBytes::NULL).collect();
+                let status = unsafe {
+                    frs_batch_get(
+                        handle as FrsDb,
+                        cf,
+                        key_ptrs.as_ptr(),
+                        key_lens.as_ptr(),
+                        idxs.len(),
+                        out_values.as_mut_ptr(),
+                    )
+                };
+                if status != FRS_STATUS_OK {
+                    for out in out_values.iter_mut() {
+                        unsafe {
+                            let _ = crate::frs_bytes_free(out);
+                        }
+                    }
+                    return Err(status);
+                }
+
+                for (slot, mut out) in idxs.iter().copied().zip(out_values) {
+                    if !out.data.is_null() {
+                        let bytes =
+                            unsafe { std::slice::from_raw_parts(out.data, out.len).to_vec() };
+                        results[slot] = Some(bytes);
+                    }
+                    unsafe {
+                        let _ = crate::frs_bytes_free(&mut out);
+                    }
+                }
+            }
+            Ok(results)
+        }
+
+        let mut db: FrsDb = ptr::null_mut();
+        let st = unsafe { crate::frs_db_open_memory(&mut db) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let mut cf: FrsCfHandle = ptr::null_mut();
+        let st = unsafe { frs_db_default_cf(db, &mut cf) };
+        assert_eq!(st, FRS_STATUS_OK);
+
+        let count = 4096usize;
+        let keys: Vec<Vec<u8>> = (0..count)
+            .map(|i| format!("bench-large-key-{i:06}").into_bytes())
+            .collect();
+        let values: Vec<Vec<u8>> = (0..count)
+            .map(|i| format!("bench-large-value-{i:06}").into_bytes())
+            .collect();
+        for (k, v) in keys.iter().zip(values.iter()) {
+            let st = unsafe { crate::frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()) };
+            assert_eq!(st, FRS_STATUS_OK);
+        }
+
+        let key_slices: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let repeats = 8usize;
+
+        let old_start = std::time::Instant::now();
+        let mut old_hits = 0usize;
+        for _ in 0..repeats {
+            let results = legacy_single_cf_reorder_path(db as jlong, cf, &key_slices)
+                .expect("legacy reorder path must succeed");
+            old_hits += results.iter().filter(|v| v.is_some()).count();
+        }
+        let old_elapsed = old_start.elapsed();
+
+        let new_start = std::time::Instant::now();
+        let mut new_hits = 0usize;
+        for _ in 0..repeats {
+            let results = compat_multi_get_single_cf(db as jlong, cf, &key_slices)
+                .expect("single-CF shortcut must succeed");
+            new_hits += results.iter().filter(|v| v.is_some()).count();
+        }
+        let new_elapsed = new_start.elapsed();
+
+        eprintln!(
+            "compat_multi_get single-CF shortcut benchmark: legacy_reorder={:?}, single_cf={:?}, speedup={:.3}x",
+            old_elapsed,
+            new_elapsed,
+            old_elapsed.as_nanos() as f64 / new_elapsed.as_nanos().max(1) as f64
+        );
+        assert_eq!(old_hits, count * repeats);
+        assert_eq!(new_hits, count * repeats);
+        assert!(
+            new_elapsed <= old_elapsed,
+            "single-CF compat multiGet shortcut should beat the legacy group+reorder path"
+        );
+
+        unsafe {
+            let _ = crate::frs_cf_close(cf);
+            let _ = frs_db_close(db);
+        }
+    }
+
+    #[test]
+    #[ignore = "small compat-JNI microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_compat_rocks_iterator_prefix_seek_beats_full_iterator_open() {
+        let mut db: FrsDb = ptr::null_mut();
+        let st = unsafe { crate::frs_db_open_memory(&mut db) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let mut cf: FrsCfHandle = ptr::null_mut();
+        let st = unsafe { frs_db_default_cf(db, &mut cf) };
+        assert_eq!(st, FRS_STATUS_OK);
+
+        let total = 4096usize;
+        let prefix_count = 16usize;
+        for i in 0..total {
+            let key = if i < prefix_count {
+                format!("p/{i:04}").into_bytes()
+            } else {
+                format!("q/{i:04}").into_bytes()
+            };
+            let value = format!("value-{i:04}").into_bytes();
+            let st = unsafe {
+                crate::frs_put(db, cf, key.as_ptr(), key.len(), value.as_ptr(), value.len())
+            };
+            assert_eq!(st, FRS_STATUS_OK);
+        }
+
+        let prefix = b"p/";
+        let old_start = std::time::Instant::now();
+        let mut full_iter: FrsIterator = ptr::null_mut();
+        let st = unsafe { frs_iterator_open(db, cf, &mut full_iter) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let st = unsafe { frs_iterator_seek(full_iter, prefix.as_ptr(), prefix.len()) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let mut old_count = 0usize;
+        loop {
+            let mut k = FrsBytes::NULL;
+            let mut v = FrsBytes::NULL;
+            let mut valid = false;
+            let st = unsafe { frs_iterator_next(full_iter, &mut k, &mut v, &mut valid) };
+            assert_eq!(st, FRS_STATUS_OK);
+            if !valid {
+                break;
+            }
+            let key = unsafe { std::slice::from_raw_parts(k.data, k.len) };
+            let keep_scanning = key.starts_with(prefix);
+            unsafe {
+                let _ = crate::frs_bytes_free(&mut k);
+                let _ = crate::frs_bytes_free(&mut v);
+            }
+            if !keep_scanning {
+                break;
+            }
+            old_count += 1;
+        }
+        let st = unsafe { frs_iterator_close(full_iter) };
+        assert_eq!(st, FRS_STATUS_OK);
+        let old_elapsed = old_start.elapsed();
+
+        let mut h = RocksIteratorHandle {
+            db,
+            cf,
+            frs_iter: ptr::null_mut(),
+            last_key: None,
+            last_value: None,
+            valid: false,
+        };
+        let new_start = std::time::Instant::now();
+        let status = rocks_iterator_open_for_seek(&mut h, prefix);
+        assert_eq!(status, FRS_STATUS_OK);
+        let mut new_count = 0usize;
+        loop {
+            let mut k = FrsBytes::NULL;
+            let mut v = FrsBytes::NULL;
+            let mut valid = false;
+            let st = unsafe { frs_iterator_next(h.frs_iter, &mut k, &mut v, &mut valid) };
+            assert_eq!(st, FRS_STATUS_OK);
+            if !valid {
+                break;
+            }
+            let key = unsafe { std::slice::from_raw_parts(k.data, k.len) };
+            assert!(key.starts_with(prefix));
+            new_count += 1;
+            unsafe {
+                let _ = crate::frs_bytes_free(&mut k);
+                let _ = crate::frs_bytes_free(&mut v);
+            }
+        }
+        let new_elapsed = new_start.elapsed();
+
+        eprintln!(
+            "compat_rocks_iterator prefix benchmark: full_open_seek={:?}, lazy_prefix={:?}, speedup={:.3}x",
+            old_elapsed,
+            new_elapsed,
+            old_elapsed.as_nanos() as f64 / new_elapsed.as_nanos().max(1) as f64
+        );
+        assert_eq!(old_count, prefix_count);
+        assert_eq!(new_count, prefix_count);
+        assert!(
+            new_elapsed <= old_elapsed,
+            "lazy prefix iterator should beat full iterator open+seek on the small smoke benchmark"
+        );
+
+        if !h.frs_iter.is_null() {
+            let st = unsafe { frs_iterator_close(h.frs_iter) };
+            assert_eq!(st, FRS_STATUS_OK);
+        }
+        unsafe {
+            let _ = crate::frs_cf_close(cf);
+            let _ = frs_db_close(db);
+        }
+    }
+
+    #[test]
+    #[ignore = "small compat-JNI microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_compat_write_batch_fast_beats_per_entry_loop() {
+        fn open_db() -> (FrsDb, FrsCfHandle) {
+            let mut db: FrsDb = ptr::null_mut();
+            let st = unsafe { crate::frs_db_open_memory(&mut db) };
+            assert_eq!(st, FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            let st = unsafe { frs_db_default_cf(db, &mut cf) };
+            assert_eq!(st, FRS_STATUS_OK);
+            (db, cf)
+        }
+
+        let count = 512usize;
+        let keys: Vec<Vec<u8>> = (0..count)
+            .map(|i| format!("wb-key-{i:04}").into_bytes())
+            .collect();
+        let values: Vec<Vec<u8>> = (0..count)
+            .map(|i| format!("wb-value-{i:04}").into_bytes())
+            .collect();
+
+        let (old_db, old_cf) = open_db();
+        let old_entries: Vec<WriteBatchEntry> = keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| WriteBatchEntry::Put {
+                cf: old_cf,
+                key: k.clone(),
+                value: v.clone(),
+            })
+            .collect();
+        let old_start = std::time::Instant::now();
+        for entry in &old_entries {
+            let status = match entry {
+                WriteBatchEntry::Put { cf, key, value } => unsafe {
+                    crate::frs_put(
+                        old_db,
+                        *cf,
+                        key.as_ptr(),
+                        key.len(),
+                        value.as_ptr(),
+                        value.len(),
+                    )
+                },
+                WriteBatchEntry::Merge { cf, key, value } => unsafe {
+                    frs_merge(
+                        old_db,
+                        *cf,
+                        key.as_ptr(),
+                        key.len(),
+                        value.as_ptr(),
+                        value.len(),
+                    )
+                },
+                WriteBatchEntry::Delete { cf, key } => unsafe {
+                    frs_delete(old_db, *cf, key.as_ptr(), key.len())
+                },
+            };
+            assert_eq!(status, FRS_STATUS_OK);
+        }
+        let old_elapsed = old_start.elapsed();
+
+        let (new_db, new_cf) = open_db();
+        let new_entries: Vec<WriteBatchEntry> = keys
+            .iter()
+            .zip(values.iter())
+            .map(|(k, v)| WriteBatchEntry::Put {
+                cf: new_cf,
+                key: k.clone(),
+                value: v.clone(),
+            })
+            .collect();
+        let new_start = std::time::Instant::now();
+        let status = apply_resolved_write_batch_entries_fast(new_db as jlong, &new_entries);
+        assert_eq!(status, FRS_STATUS_OK);
+        let new_elapsed = new_start.elapsed();
+
+        eprintln!(
+            "compat_write_batch benchmark: per_entry={:?}, batch_write={:?}, speedup={:.3}x",
+            old_elapsed,
+            new_elapsed,
+            old_elapsed.as_nanos() as f64 / new_elapsed.as_nanos().max(1) as f64
+        );
+        assert!(
+            new_elapsed <= old_elapsed,
+            "compat WriteBatch batch_write should beat per-entry dispatch on the small smoke benchmark"
+        );
+
+        unsafe {
+            let _ = crate::frs_cf_close(old_cf);
+            let _ = frs_db_close(old_db);
+            let _ = crate::frs_cf_close(new_cf);
+            let _ = frs_db_close(new_db);
+        }
     }
 
     // -------------------------------------------------------------------
@@ -11894,31 +12668,15 @@ mod tests {
         let st = unsafe { crate::frs_put(db, extra_cf, b"b".as_ptr(), 1, b"2".as_ptr(), 1) };
         assert_eq!(st, FRS_STATUS_OK);
 
-        // Mirror multiGet's per-pair frs_get loop.
-        let cf_list = [default_cf, extra_cf];
-        let keys: [&[u8]; 2] = [b"a", b"b"];
-        let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(2);
-        for (i, key) in keys.iter().enumerate() {
-            let mut out = FrsBytes {
-                data: ptr::null_mut(),
-                len: 0,
-                capacity: 0,
-            };
-            // SAFETY: pointers / out valid.
-            let st = unsafe { frs_get(db, cf_list[i], key.as_ptr(), key.len(), &mut out) };
-            assert!(st == FRS_STATUS_OK || st == FRS_STATUS_NOT_FOUND);
-            if st == FRS_STATUS_NOT_FOUND || out.data.is_null() {
-                results.push(None);
-            } else {
-                // SAFETY: out describes Rust-owned buffer.
-                let vec = unsafe { std::slice::from_raw_parts(out.data, out.len).to_vec() };
-                results.push(Some(vec));
-            }
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
-            }
-        }
-        assert_eq!(results, vec![Some(b"1".to_vec()), Some(b"2".to_vec())]);
+        // Drive the same grouped batch helper used by RocksDB.multiGet.
+        let cf_list = [extra_cf, default_cf, extra_cf, default_cf];
+        let keys: [&[u8]; 4] = [b"b", b"a", b"missing", b"z"];
+        let results = compat_multi_get_grouped(db as jlong, &cf_list, &keys)
+            .expect("grouped compat multiGet must succeed");
+        assert_eq!(
+            results,
+            vec![Some(b"2".to_vec()), Some(b"1".to_vec()), None, None,]
+        );
 
         // Cleanup.
         // SAFETY: handles came from prior calls.
