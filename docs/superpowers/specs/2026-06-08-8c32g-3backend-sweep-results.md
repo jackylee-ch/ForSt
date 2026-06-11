@@ -2081,3 +2081,11 @@ q9 pair started 02:01:54.
 ### REMOTE round-1: q9 frs = 2421.2s, rows EXACT (canonical 91,813,372 — 17th identical, cross-arch)
 q9@100M frs (no-drain tip): FINISHED 2421.2s. Correctness: byte-count exact across
 Mac arm64 single-topo AND remote x86 split-topo. q9-rdb pair in flight (02:43:30).
+
+### ★★ REMOTE round-1: q9 pair — frs 2421.2 vs rdb 2121.2 = 1.14× ⇒ ≥0.8× BAR PASS
+q9 remote ratio 1.14× (Mac was 1.63×) — the NVMe/io_uring/split population
+compresses the q9 gap; PASSES the per-query ≥0.8× RocksDB bar (≤1.25× wall).
+Rows: frs = canonical 91,813,372 EXACT; rdb = 91,813,229 (−143; suspect rdb
+finish-boundary sink sampling — verify round 2; frs correctness unaffected).
+Round-1 is the NO-drain tip — round-2 (drain-ON + S2 later) aims at ≤1.05×.
+q20 pair started 03:20:01.
