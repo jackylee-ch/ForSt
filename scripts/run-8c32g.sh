@@ -12,11 +12,13 @@
 # are overridden to Linux. The Linux .so lives at target-linux/release and is
 # copied into FLINK_HOME/lib at run time.
 set -u
-REPO=/Users/lijunqing/Code/stczwd/ForSt
-WORKENV=/Users/lijunqing/Downloads/workenv
-FLINK=$WORKENV/flink-2.2.1
-IMG=forst-bench:arm64
-PLAT=linux/arm64
+# All env-overridable so the SAME script drives the remote Linux box
+# (x86_64, repos under ~/code/stczwd, workenv under ~/workenv).
+REPO="${REPO:-/Users/lijunqing/Code/stczwd/ForSt}"
+WORKENV="${WORKENV:-/Users/lijunqing/Downloads/workenv}"
+FLINK="${FLINK:-$WORKENV/flink-2.2.1}"
+IMG="${IMG:-forst-bench:arm64}"
+PLAT="${PLAT:-linux/arm64}"
 
 DKR_COMMON=(--platform "$PLAT"
   -v "$REPO:$REPO" -v "$WORKENV:$WORKENV"
@@ -28,7 +30,7 @@ DKR_COMMON=(--platform "$PLAT"
   -v "$WORKENV/frs-tmp:/tmp"
   -v forst-cargo:/cargo-cache
   -e CARGO_HOME=/cargo-cache
-  -e JDK17=/usr/lib/jvm/java-17-openjdk-arm64
+  -e JDK17="${JDK17_IN_IMG:-/usr/lib/jvm/java-17-openjdk-arm64}"
   -e JDK25=/opt/java/openjdk
   -e TEMPLATES="${TEMPLATES:-$REPO/scripts/templates-linux}"
   -e HADOOP_HOME="$WORKENV/hadoop-3.4.3"

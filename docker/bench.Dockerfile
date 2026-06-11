@@ -9,7 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 # JDK25 from the temurin base; JDK17 from Ubuntu repo.
 ENV JDK25=/opt/java/openjdk
-ENV JDK17=/usr/lib/jvm/java-17-openjdk-arm64
+# arch-dependent: java-17-openjdk-arm64 on arm64, -amd64 on x86_64
+RUN ln -s /usr/lib/jvm/java-17-openjdk-* /usr/lib/jvm/java-17 
+ENV JDK17=/usr/lib/jvm/java-17
 # Rust toolchain (current stable; Ubuntu's is too old for the workspace edition).
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:/usr/bin:/bin:/usr/local/bin
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
