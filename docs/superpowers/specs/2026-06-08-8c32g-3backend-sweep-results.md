@@ -1724,3 +1724,20 @@ the job emits exactly the adds that landed before their windows fired. Wedge and
 offer→dispatch→per-row-completion chain under routing-async (amBuf/classifier-pool
 lifecycle + AEC trigger interaction). Next: per-run-isolated stats + completion-accounting
 diag + code audit of that one chain.
+
+### STAGE-0 completion accounting (FRS_REENTRY_DIAG=3, 4× q8 B-config + 1 probe run)
+| run | out_rows | final LIST_ADD | verdict |
+|---|---|---|---|
+| r1 | 3,064,741 ✓ | off=3,064,741 done=3,064,741 | EXACT; out_rows == LIST_ADD holds in correct runs too |
+| r2 | 1,842,502 ✗ | off=1,842,502 done=1,842,502 | adds NEVER OFFERED (balanced, plateaued) |
+| r3 | 2,096,523 ✗ | off=2,096,523 done=2,096,523 | same |
+| probe | 3,064,441 ✓ | (exact specimen) | nondeterminism confirmed |
+CLASSIFICATION (decision table): **TRIGGER-SIDE — no lost completions anywhere (fail=0
+throughout; transient off/done gaps = in-flight at dump time).** The missing ~1.2M records
+were consumed by the operator (src complete, job FINISHED) but never called asyncAdd ⇒ the
+WindowJoinHelper lateness gate (WindowJoinHelper.java:136 isWindowFired(windowEnd,
+windowTimerService.currentWatermark()) → drop + lateRecordsDroppedRate.markEvent()) is the
+prime suspect: watermark overtakes deeply-buffered records under pipelining. Operator base
+chain hardcodes SERIAL_BETWEEN_EPOCH (AbstractAsyncStateStreamOperator:91) which SHOULD
+prevent this — live lateRecordsDroppedRate.count probe running to confirm the drop site
+before auditing how the watermark passes records despite the serial drain.
