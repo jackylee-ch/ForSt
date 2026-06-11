@@ -1652,3 +1652,43 @@ the race). Standing bars unchanged: q9 needs ≤1776s (current band 2001–2105)
    drain-first + mailbox-owned reclaim + snapshot-barrier all-shard drain — restores staging
    coalescing/hit-serving under pipelining. Design doc to
    docs/superpowers/specs/2026-06-11-per-batch-buffer-ownership-design.md.
+
+## B-SPIKE iteration log (2026-06-11)
+### v1 (Map+List staging off): q8@100M canary 1/3 — race REDUCED, not eliminated
+r1 38.6s out=2,048,927 (−33%) | r2 44.7s out=3,064,566 ✓ IN BAND | r3 47.6s out=2,552,408 (−17%).
+No wedge (vs pre-spike wedge/−58%) — removing the Map/List buffers removed A race, not THE race.
+### Discovery: a THIRD staging mechanism the token-grep audit missed
+ForStRsAsyncReducingStateV2 + ForStRsAsyncAggregatingStateV2 carry a ReducingAggregatingCache
+(PR-C3 RMW cache): asyncAdd folds accumulators IN-MEMORY ON THE MAILBOX (completed future, never
+enters the executor) and dirty accumulators drain via flushHandler = linker.put FROM THE MAILBOX
+(flushOnBarrier + eviction). q8 = windowed aggregation → this is q8's hot state. Same
+lockstep-only pattern; same overtake race under pipelining.
+### v2 (spike extended): asyncAdd → super.asyncAdd under pipelinedExecutorActive in BOTH classes
+Cache never written ⇒ all other cache consults degrade to no-ops (probe miss → engine,
+barrier drain empty, gen bumps harmless). UTs green (no failing surefire report). Audit of
+remaining V2 surfaces: ValueStateV2 "cache" = namespace-bytes serialization cache
+(mailbox-confined ✓); MapStateV2 CLEAR rides the executor request path ✓; timer state is
+mailbox-confined in its own keyspace (workers never touch it) ✓.
+q8@100M ×3 canary running. The general lesson for Approach A: the audit class is
+"EVERY mailbox-side mechanism that defers/absorbs engine effects" — three found so far
+(Map buffer, List buffer, RMW caches); A must give ALL of them per-batch ownership.
+
+### Spike v2 (RMW caches also gated): q8 canary 1/3 — fourth race remained
+r1 38.7s out=1,700,379 (−44%) | r2 40.6s out=3,064,723 ✓ | r3 40.7s out=2,194,859 (−28%).
+### ★★ DIFFERENTIAL MATRIX (q8@100M, all staging gated): race is CROSS-WORKER
+| config | runs | verdict |
+|---|---|---|
+| A: routing-async, workers=3, FRS_RS_MAX_INFLIGHT_BATCHES=1 | 1,180,530 / 1,307,094 | BOTH WRONG (−57~61%) |
+| B: routing-async, workers=1, default depth | 3,064,477 / 3,064,676 | BOTH EXACT ✓ |
+READING: offer-phase-vs-execution overlap is SAFE (B pipelines fully with the mailbox live
+and is exact); the residual race REQUIRES multi-worker fan-out + live mailbox even at
+batch-depth 1 (blocking 3-worker fan-out is correct ×3, so concurrency alone isn't it
+either — the combination is). PRIME SUSPECT: out-of-order BATCH completion across workers
+(blocking and single-worker both guarantee completion order == dispatch order; 3-worker
+non-blocking does not) — some consumer of batch-completion order (epoch/watermark/timer
+sequencing) corrupts. REDUCING_ADD execution-time-serialization theory REFUTED (classifies
+as plain PUT; fold = framework GET→callback→PUT, offer-serialized).
+### ★ IMMEDIATE PAYOFF: B-config = correctness-viable PIPELINED mode TODAY
+routing-async × 1 worker removes the q9 latch wait (the profile-proven gate) without
+multi-worker. q8 canary n=3 + q9@100M A/B (vs 2215.6s control; out_rows 91,813,372 = its
+own correctness gate) RUNNING.
