@@ -1875,3 +1875,19 @@ THE FIX: adopt a new floor ONLY if it LOWERS the effective refill start
 (existing floor, else successor(resume cursor), else kg-prefix start which is already
 lowest) — the start may only move backward until consumed. ~20 lines + the forensic
 comment. Canary ×5 running.
+
+### ★★★★★ STAGE-0 CLOSED (2026-06-11)
+| gate | result |
+|---|---|
+| q8@100M routing-async (1 worker) ×5 | 5/5 EXACT (3,064,421-791 band) |
+| q8@100M lockstep default ×2 post-fix | 2/2 EXACT (3,064,421 / 3,064,453) — no default regression |
+| regression UT | reproduces the loss in 1s pre-fix ([400] vs [150,200,300,400]); green post-fix |
+| full suite | 114 surefire suites, 0 failures |
+| temp flink diagnostics | ALL reverted; dist jars pristine; commits: fix 1d9a844dd52 |
+THE DAY'S MISATTRIBUTION, OWNED: every "executor race" canary failure (routing-async v1,
+B-spike v1/v2, differential A/B, sync-direct) was THIS timer-queue bug varying with
+timing. The staging-overlap hazards remain real by construction for lockstep-only
+mechanisms, but were not the q8 corruption. The instrumented descent (11 instruments,
+each eliminating a layer) was the cost of the truth; the fix is 20 lines.
+NEXT: multi-worker routing-async ×3 post-fix (if exact, the q9 lever = multi-worker
+pipelining is ALREADY correctness-viable → q9@100M immediately), then Stage-1 gates.
