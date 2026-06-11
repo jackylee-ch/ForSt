@@ -1925,3 +1925,9 @@ cached deque (sorted by ts) instead of dropping + re-reading — O(adds) vs O(sp
 floor, cursor intact. Benefits ALL timer-heavy queries (q5/q8/q11/q17 included).
 q9 bar math: pipelined minus fix-tax ≈ ~2060s vs bar 1776 ⇒ Stage-3 chain-killers
 (OPT-N04 merge-op) remain q9's path regardless.
+
+### ★ STAGE-1 GATE: two-regime q8@100M ×5 = 5/5 EXACT (3,064,596/449/449/510/421)
+The two-regime executor (FRS_RS_EXECUTOR=two-regime, commit 0115a121a32) passes its
+correctness canary: LIGHT inline + HEAVY non-blocking + regime-gated staging + L→H flush
+all live in these runs. Walls 44.7-72.7s (band noise). Next: q17 ×3 pair (LIGHT-regime
+preservation, direction-only), 10M sweep.
