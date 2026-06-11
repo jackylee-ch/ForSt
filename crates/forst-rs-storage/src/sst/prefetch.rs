@@ -39,7 +39,7 @@
 //!    per block); per-block regions are sliced out of the single buffer.
 //! 4. **Double-buffered production**: the window fetch + decompress + decode
 //!    runs on a shared read-I/O pool; the consumer claims the completed
-//!    [`PrefetchHandle`] and the NEXT window is submitted before the claimed
+//!    `PrefetchHandle` and the NEXT window is submitted before the claimed
 //!    blocks are consumed — production of N+1 overlaps consumption of N.
 //! 5. **Clamping**: never reads at/past `end_block` (computed once from the
 //!    sparse index vs the scan's upper bound) nor past the file. Dropping the
@@ -194,11 +194,7 @@ impl ReadIoPool {
     }
 
     fn submit(&self, job: Job) {
-        let mut q = self
-            .shared
-            .queue
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut q = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
         q.push_back(job);
         drop(q);
         self.shared.cv.notify_one();
@@ -302,11 +298,7 @@ impl BlockPrefetcher {
     /// Releases this source's entire M3 telemetry charge (idempotent).
     pub fn terminate(&mut self) {
         self.next_block = self.end_block;
-        let held: usize = self
-            .ready
-            .iter()
-            .map(|&(sz, _)| sz as usize)
-            .sum::<usize>()
+        let held: usize = self.ready.iter().map(|&(sz, _)| sz as usize).sum::<usize>()
             + self.inflight.as_ref().map_or(0, |h| h.bytes);
         if held > 0 {
             PREFETCH_BUFFERED_BYTES.fetch_sub(held, std::sync::atomic::Ordering::Relaxed);
@@ -577,12 +569,7 @@ fn fetch_window(
         // Pass 4: per-block decode from slices of the packed buffer.
         let mut cursor = 0usize;
         for &(run_start, run_end) in &run_blocks {
-            for (j, &(off, size)) in regions
-                .iter()
-                .enumerate()
-                .take(run_end)
-                .skip(run_start)
-            {
+            for (j, &(off, size)) in regions.iter().enumerate().take(run_end).skip(run_start) {
                 let slice = &buf[cursor..cursor + size as usize];
                 cursor += size as usize;
                 let decoded = reader.decode_block_from_slice(slice)?;
@@ -836,7 +823,10 @@ mod tests {
         }
         assert_eq!(seen, reader.index_entry_count());
         assert!(pf.ra_blocks() <= REMOTE_CAP_BLOCKS);
-        assert!(pf.ra_blocks() >= 8, "remote keeps doubling past the local cap");
+        assert!(
+            pf.ra_blocks() >= 8,
+            "remote keeps doubling past the local cap"
+        );
     }
 
     /// §2.1.5 clamp: with an upper bound that cuts the keyspace in half, the
@@ -851,7 +841,10 @@ mod tests {
         let mut pf =
             BlockPrefetcher::new(Arc::clone(&reader), 0, Some(&upper)).with_regime(true, true);
         let end = pf.end_block();
-        assert!(end < total_blocks, "upper bound must clamp ({end} < {total_blocks})");
+        assert!(
+            end < total_blocks,
+            "upper bound must clamp ({end} < {total_blocks})"
+        );
         let mut delivered = 0;
         let mut rows = Vec::new();
         while let Some(b) = pf.next_decoded().unwrap() {
@@ -934,13 +927,13 @@ mod tests {
         // EVERY fetched block was inserted (cache never bypassed).
         assert_eq!(inserts.len(), blocks, "no block bypasses cache insertion");
         // Demand blocks (cold state: first 2) inserted at Low.
-        assert!(inserts[..2]
-            .iter()
-            .all(|&(_, p)| p == CachePriority::Low));
+        assert!(inserts[..2].iter().all(|&(_, p)| p == CachePriority::Low));
         // The first ramped window (ra=2 < 4) stays Low; deeper windows are
         // Bottom.
         assert!(
-            inserts[4..].iter().all(|&(_, p)| p == CachePriority::Bottom),
+            inserts[4..]
+                .iter()
+                .all(|&(_, p)| p == CachePriority::Bottom),
             "deep-ramp windows insert at Bottom: {:?}",
             &inserts[4..]
         );
@@ -1080,8 +1073,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let mut pf =
-            BlockPrefetcher::new(Arc::clone(&reader), start, None).with_regime(true, true);
+        let mut pf = BlockPrefetcher::new(Arc::clone(&reader), start, None).with_regime(true, true);
         let got = drain_rows(&mut pf);
         assert_eq!(got, expected);
     }

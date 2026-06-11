@@ -191,9 +191,7 @@ mod imp {
                     if res < 0 {
                         return Err(ForstError::internal(format!(
                             "io_uring read at offset {} len {} failed: errno {}",
-                            off,
-                            len,
-                            -res
+                            off, len, -res
                         )));
                     }
                     let got = res as usize;
@@ -222,7 +220,10 @@ mod imp {
         use std::os::unix::fs::FileExt;
         while filled < len {
             let n = file
-                .read_at(&mut buf[dst_off + filled..dst_off + len], off + filled as u64)
+                .read_at(
+                    &mut buf[dst_off + filled..dst_off + len],
+                    off + filled as u64,
+                )
                 .map_err(|e| {
                     ForstError::internal(format!("pread tail after short uring read: {e}"))
                 })?;
@@ -321,7 +322,10 @@ mod tests {
         let mut uring_buf = vec![0u8; total];
         uring.read_at_vectored(&regions, &mut uring_buf).unwrap();
 
-        assert_eq!(pread_buf, uring_buf, "io_uring bytes must equal pread bytes");
+        assert_eq!(
+            pread_buf, uring_buf,
+            "io_uring bytes must equal pread bytes"
+        );
         // And both must equal the source data per region.
         let mut cursor = 0;
         for &(off, len) in &regions {

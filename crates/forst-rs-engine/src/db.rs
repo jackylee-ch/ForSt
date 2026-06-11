@@ -6387,7 +6387,7 @@ impl DbImpl {
     ///
     /// Results are returned in INPUT ORDER. `None` marks a probe whose pool
     /// worker dropped its result (job panic) or whose result never arrived
-    /// within [`POOL_JOIN_TIMEOUT`] — the caller maps it to an internal
+    /// within `POOL_JOIN_TIMEOUT` — the caller maps it to an internal
     /// error, mirroring the sibling method's behaviour. `f` must be
     /// `Sync` (shared across workers via `Arc`) and is invoked exactly once
     /// per probe with the probe's index into `prefixes`.
@@ -10042,28 +10042,32 @@ impl CompactionExecutor for DbImpl {
             let drain_pressure =
                 TOMBSTONES_FLUSHED_SINCE_DRAIN.load(std::sync::atomic::Ordering::Relaxed);
             let drain_wasted = GARBAGE_DRAIN_WASTED.load(std::sync::atomic::Ordering::Relaxed);
-            let garbage_due =
-                garbage_drain_gate(drain_threshold, drain_pressure, drain_wasted, true, u64::MAX)
-                    && {
-                        let (any, bytes) = self
-                            .version_set
-                            .current()
-                            .levels
-                            .get(1)
-                            .map(|l| {
-                                let mut bytes = 0u64;
-                                let mut any = false;
-                                for f in &l.files {
-                                    if f.cf_id == cf_id {
-                                        any = true;
-                                        bytes = bytes.saturating_add(f.file_size);
-                                    }
-                                }
-                                (any, bytes)
-                            })
-                            .unwrap_or((false, 0));
-                        garbage_drain_gate(drain_threshold, drain_pressure, drain_wasted, any, bytes)
-                    };
+            let garbage_due = garbage_drain_gate(
+                drain_threshold,
+                drain_pressure,
+                drain_wasted,
+                true,
+                u64::MAX,
+            ) && {
+                let (any, bytes) = self
+                    .version_set
+                    .current()
+                    .levels
+                    .get(1)
+                    .map(|l| {
+                        let mut bytes = 0u64;
+                        let mut any = false;
+                        for f in &l.files {
+                            if f.cf_id == cf_id {
+                                any = true;
+                                bytes = bytes.saturating_add(f.file_size);
+                            }
+                        }
+                        (any, bytes)
+                    })
+                    .unwrap_or((false, 0));
+                garbage_drain_gate(drain_threshold, drain_pressure, drain_wasted, any, bytes)
+            };
             if over || garbage_due {
                 let before = if garbage_due {
                     cf_deep_bytes(&self.version_set.current())

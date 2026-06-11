@@ -113,7 +113,9 @@ mod tests {
         let f = MemFile(data.clone());
         let regions = [(10u64, 4usize), (100, 8), (0, 2)];
         let mut buf = vec![0u8; 14];
-        PreadBlockIo(&f).read_at_vectored(&regions, &mut buf).unwrap();
+        PreadBlockIo(&f)
+            .read_at_vectored(&regions, &mut buf)
+            .unwrap();
         assert_eq!(&buf[..4], &data[10..14]);
         assert_eq!(&buf[4..12], &data[100..108]);
         assert_eq!(&buf[12..], &data[0..2]);

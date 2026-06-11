@@ -9100,7 +9100,11 @@ mod tests {
                     "kind byte {bad_kind} must be rejected"
                 );
             }
-            assert_eq!(get_value(db, cf, key), None, "rejected batch must not write");
+            assert_eq!(
+                get_value(db, cf, key),
+                None,
+                "rejected batch must not write"
+            );
 
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
@@ -9315,7 +9319,11 @@ mod tests {
                 FrsErrorCode::BatchHeaderMalformed as i32,
                 "merge row on merge-less CF must be rejected"
             );
-            assert_eq!(get_value(db, cf, key), None, "rejected batch must not write");
+            assert_eq!(
+                get_value(db, cf, key),
+                None,
+                "rejected batch must not write"
+            );
 
             // Put-only mixed batch on the same CF → fine (operator guard is
             // only enforced when a merge row exists).
@@ -9898,7 +9906,9 @@ mod tests {
             // the pool-side fill exercises the block-streaming tier path.
             const N: usize = 16;
             const CHUNK_CAP: u32 = 128;
-            let prefixes: Vec<Vec<u8>> = (0..N).map(|i| format!("pp{:02}/", i).into_bytes()).collect();
+            let prefixes: Vec<Vec<u8>> = (0..N)
+                .map(|i| format!("pp{:02}/", i).into_bytes())
+                .collect();
             let rows_for = |i: usize| (i * 3) % 17;
             for (i, p) in prefixes.iter().enumerate() {
                 for r in 0..rows_for(i) {
@@ -10121,7 +10131,11 @@ mod tests {
                     &mut rc2_rows,
                     &mut rc2_bytes,
                 );
-                assert_eq!(rc2, FrsErrorCode::Ok as i32, "[{variant}] next on auto-closed");
+                assert_eq!(
+                    rc2,
+                    FrsErrorCode::Ok as i32,
+                    "[{variant}] next on auto-closed"
+                );
                 assert_eq!(rc2_rows, 0, "[{variant}] auto-closed handle reports EOF");
                 // close-after-auto-close: safe no-op.
                 assert_eq!(
