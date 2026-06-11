@@ -1741,3 +1741,15 @@ prime suspect: watermark overtakes deeply-buffered records under pipelining. Ope
 chain hardcodes SERIAL_BETWEEN_EPOCH (AbstractAsyncStateStreamOperator:91) which SHOULD
 prevent this — live lateRecordsDroppedRate.count probe running to confirm the drop site
 before auditing how the watermark passes records despite the serial drain.
+
+### ★★★ STAGE-0 ROOT CAUSE CONFIRMED (discriminator, 3× corrupt specimens)
+opAsyncAdd == LIST_ADD offers == out_rows EXACTLY (2,384,952 / 2,698,273): the WINDOW
+OPERATOR NEVER CALLED asyncAdd for the missing ~12-22% of records. Zero loss in our backend
+or AEC buffers (fail=0 everywhere, off==done). The only filter between record consumption
+and asyncAdd is WindowJoinHelper.java:136's lateness gate ⇒ **records are DROPPED AS LATE
+under routing-async: the operator's currentWatermark overtakes records that lockstep
+processes first.** Open sub-question (audit in flight): the exact deferral mechanism —
+SERIAL_BETWEEN_EPOCH's drain should prevent watermark-overtake, so either the element user
+code (incl. lateness check) defers past advanceWatermark under load, or the drain's
+in-flight accounting misses a class of records when completions arrive from worker threads.
+The fix must land BACKEND-side (flink code frozen per scope rule).
