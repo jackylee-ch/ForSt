@@ -3389,6 +3389,168 @@ pub unsafe extern "C" fn frs_vectorized_batch_delete(
     })
 }
 
+/// Vectorized MIXED write batch — puts, deletes, and merges in ONE FFI
+/// crossing with ONE atomic sequence allocation (Stage-3 Unit 2).
+///
+/// Sister of `frs_vectorized_batch_put` / `frs_vectorized_batch_delete`:
+/// instead of a homogeneous op column, the caller supplies a per-row
+/// `kinds` byte so a Flink write-buffer flush containing interleaved
+/// puts, deletes, and merge-appends needs a single boundary crossing
+/// and lands as ONE atomic engine batch (single seq-range allocation in
+/// `batch_put_borrowed_single_cf`).
+///
+/// # Input layout
+/// - `kinds`: `count` bytes, one per row — `0` = Delete, `1` = Put,
+///   `2` = Merge. These match the `forst_rs_common::types::OpType`
+///   discriminants and are forwarded verbatim as the engine `op_types`
+///   column (zero-copy, no per-row rebuild).
+/// - `key_offsets` / `key_data`: Arrow BinaryArray layout — `count + 1`
+///   i32 offsets; row `i`'s key is
+///   `key_data[key_offsets[i] .. key_offsets[i+1]]`.
+/// - `value_offsets` / `value_data`: same layout for values. Put rows
+///   carry the value, Merge rows carry the merge operand. Delete rows
+///   MUST have an empty value slice
+///   (`value_offsets[i] == value_offsets[i+1]`) — the engine receives
+///   `None` for them (mirrors `frs_vectorized_batch_delete`); a
+///   non-empty delete value indicates a caller layout bug and is
+///   rejected.
+///
+/// # Validation
+/// Mirrors the sister entries: null pointers, `count > MAX_BATCH_COUNT`,
+/// malformed/negative/non-monotonic offsets, per-column aggregate caps
+/// (`MAX_BATCH_BYTES`, C-R13-NEW-H1 rationale — same u32-rebase
+/// corruption vector), per-row `MAX_KEY_LEN`, per-row `MAX_VALUE_LEN`
+/// on Put/Merge rows, and an invalid `kinds` byte (> 2) all return
+/// `BatchHeaderMalformed`. If at least one Merge row is present the CF
+/// must have a merge operator (D-R8-NEW-H2 rationale, same guard as
+/// `frs_vec_merge_append_batch`); the check is skipped for batches
+/// without merge rows.
+///
+/// # Return codes
+/// Returns typed `FrsErrorCode` discriminants (spec §4):
+/// - `FrsErrorCode::Ok` (0)                  — all rows written atomically
+/// - `FrsErrorCode::BatchHeaderMalformed` (110) — validation failure (see above)
+/// - `FrsErrorCode::EngineIo` (300)           — engine I/O error (Fail-batch)
+/// - `FrsErrorCode::EngineCorrupted` (301)    — engine corruption (Fail-batch)
+/// - `FrsErrorCode::PanicCaught` (900)        — Rust panic at FFI boundary (Fail-process)
+///
+/// # Safety
+/// - `kinds` must point to at least `count` valid bytes.
+/// - `key_offsets` / `value_offsets` must each point to at least
+///   `count + 1` valid `i32`s.
+/// - `key_data` / `value_data` must point to at least `key_data_len` /
+///   `value_data_len` valid bytes respectively.
+/// - All buffers must remain valid for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn frs_vectorized_batch_mixed(
+    handle: FrsDb,
+    cf: FrsCfHandle,
+    kinds: *const u8,
+    count: usize,
+    key_offsets: *const i32,
+    key_data: *const u8,
+    key_data_len: usize,
+    value_offsets: *const i32,
+    value_data: *const u8,
+    value_data_len: usize,
+) -> i32 {
+    guarded_vec(|| {
+        let Some(db) = db_from_handle(handle) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if count == 0 {
+            return FrsErrorCode::Ok as i32;
+        }
+        if count > MAX_BATCH_COUNT {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if kinds.is_null() || key_offsets.is_null() || value_offsets.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let kind_col = slice::from_raw_parts(kinds, count);
+        let key_offs = slice::from_raw_parts(key_offsets, count + 1);
+        let val_offs = slice::from_raw_parts(value_offsets, count + 1);
+        let Some(total_keys) = validate_i32_offsets(key_offs) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(total_vals) = validate_i32_offsets(val_offs) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if total_keys > key_data_len || total_vals > value_data_len {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        // C-R13-NEW-H1 (mixed sister): aggregate-bytes cap on each column —
+        // same u32-rebase corruption vector as the put/delete sisters.
+        if total_keys > MAX_BATCH_BYTES || total_vals > MAX_BATCH_BYTES {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if (total_keys > 0 && key_data.is_null()) || (total_vals > 0 && value_data.is_null()) {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let key_buf: &[u8] = if total_keys == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(key_data, total_keys)
+        };
+        let val_buf: &[u8] = if total_vals == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(value_data, total_vals)
+        };
+        // C4R2-B-NEW-H1 (mixed sister): no WriteBatch construction — build
+        // the borrowed-slice columns directly during the offset walk and
+        // dispatch once via `batch_put_borrowed_single_cf`. The `kinds`
+        // column doubles as the engine `op_types` column (validated below,
+        // then forwarded as-is — no per-row copy).
+        let mut keys_slices: Vec<&[u8]> = Vec::with_capacity(count);
+        let mut value_slices: Vec<Option<&[u8]>> = Vec::with_capacity(count);
+        // D-R8-NEW-H2 (mixed sister): Merge rows require a CF merge
+        // operator; checked once, lazily, only when a Merge row exists.
+        let mut merge_operator_verified = false;
+        for i in 0..count {
+            let ks = key_offs[i] as usize;
+            let ke = key_offs[i + 1] as usize;
+            if ke - ks > MAX_KEY_LEN {
+                return FrsErrorCode::BatchHeaderMalformed as i32;
+            }
+            let vs = val_offs[i] as usize;
+            let ve = val_offs[i + 1] as usize;
+            match kind_col[i] {
+                // OpType::Delete = 0 — engine takes None; value slice must
+                // be empty (a non-empty slice indicates a layout bug).
+                0 => {
+                    if ve != vs {
+                        return FrsErrorCode::BatchHeaderMalformed as i32;
+                    }
+                    value_slices.push(None);
+                }
+                // OpType::Put = 1 / OpType::Merge = 2 — value carried.
+                1 | 2 => {
+                    if kind_col[i] == 2 && !merge_operator_verified {
+                        if !db.cf_has_merge_operator(cf) {
+                            return FrsErrorCode::BatchHeaderMalformed as i32;
+                        }
+                        merge_operator_verified = true;
+                    }
+                    if ve - vs > MAX_VALUE_LEN {
+                        return FrsErrorCode::BatchHeaderMalformed as i32;
+                    }
+                    value_slices.push(Some(&val_buf[vs..ve]));
+                }
+                _ => return FrsErrorCode::BatchHeaderMalformed as i32,
+            }
+            keys_slices.push(&key_buf[ks..ke]);
+        }
+        match db.batch_put_borrowed_single_cf(cf, &keys_slices, &value_slices, kind_col) {
+            Ok(_) => FrsErrorCode::Ok as i32,
+            Err(e) => error_to_frs_code(&e),
+        }
+    })
+}
+
 // --- Stub symbols (linker bind requires symbol exists; unused on Q3 hot path) ---
 
 pub type FrsWriteBatch = *mut c_void;
@@ -8584,6 +8746,414 @@ mod tests {
                 FrsErrorCode::BatchHeaderMalformed as i32,
                 "null key_offsets should return BatchHeaderMalformed (110)"
             );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Stage-3 Unit 2: frs_vectorized_batch_mixed
+    // -----------------------------------------------------------------
+
+    /// Helper: read a key back via `frs_get`; returns Some(bytes) if present.
+    unsafe fn get_value(db: FrsDb, cf: FrsCfHandle, key: &[u8]) -> Option<Vec<u8>> {
+        let mut out = FrsBytes::NULL;
+        assert_eq!(
+            frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+            FRS_STATUS_OK
+        );
+        if out.data.is_null() {
+            return None;
+        }
+        let v = slice::from_raw_parts(out.data, out.len).to_vec();
+        frs_bytes_free(&mut out);
+        Some(v)
+    }
+
+    /// Mixed put+delete+merge in ONE call: put k1, delete pre-existing k2,
+    /// merge two operands onto k3 (default CF has RawConcatMergeOperator) —
+    /// then read all three back.
+    #[test]
+    fn vec_batch_mixed_put_delete_merge_round_trip() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // Pre-existing key that the mixed batch will delete.
+            let k2 = b"mx-k2";
+            assert_eq!(
+                frs_put(db, cf, k2.as_ptr(), k2.len(), b"dead".as_ptr(), 4),
+                FRS_STATUS_OK
+            );
+
+            // Rows: [Put k1="v1", Delete k2, Merge k3+="A", Merge k3+="B"]
+            let key_data = b"mx-k1mx-k2mx-k3mx-k3";
+            let key_offs: [i32; 5] = [0, 5, 10, 15, 20];
+            let val_data = b"v1AB";
+            let val_offs: [i32; 5] = [0, 2, 2, 3, 4]; // delete row: empty slice
+            let kinds: [u8; 4] = [1, 0, 2, 2];
+
+            let rc = frs_vectorized_batch_mixed(
+                db,
+                cf,
+                kinds.as_ptr(),
+                4,
+                key_offs.as_ptr(),
+                key_data.as_ptr(),
+                key_data.len(),
+                val_offs.as_ptr(),
+                val_data.as_ptr(),
+                val_data.len(),
+            );
+            assert_eq!(rc, FrsErrorCode::Ok as i32, "expected FrsErrorCode::Ok (0)");
+
+            assert_eq!(get_value(db, cf, b"mx-k1").as_deref(), Some(&b"v1"[..]));
+            assert_eq!(get_value(db, cf, b"mx-k2"), None, "k2 must be deleted");
+            assert_eq!(
+                get_value(db, cf, b"mx-k3").as_deref(),
+                Some(&b"AB"[..]),
+                "raw-concat merge of operands A then B"
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// A pure-put batch routed through the mixed entry must produce the same
+    /// readable state as the same rows via `frs_vectorized_batch_put`.
+    #[test]
+    fn vec_batch_mixed_pure_put_matches_plain_batch_put() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let val_data = b"v-onev-two";
+            let val_offs: [i32; 3] = [0, 5, 10];
+
+            // Plain path: keys pa/pb.
+            let plain_keys = b"papb";
+            let key_offs: [i32; 3] = [0, 2, 4];
+            assert_eq!(
+                frs_vectorized_batch_put(
+                    db,
+                    cf,
+                    key_offs.as_ptr(),
+                    plain_keys.as_ptr(),
+                    plain_keys.len(),
+                    val_offs.as_ptr(),
+                    val_data.as_ptr(),
+                    val_data.len(),
+                    2,
+                ),
+                FrsErrorCode::Ok as i32
+            );
+
+            // Mixed path (kinds all Put): keys ma/mb, same values.
+            let mixed_keys = b"mamb";
+            let kinds: [u8; 2] = [1, 1];
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    kinds.as_ptr(),
+                    2,
+                    key_offs.as_ptr(),
+                    mixed_keys.as_ptr(),
+                    mixed_keys.len(),
+                    val_offs.as_ptr(),
+                    val_data.as_ptr(),
+                    val_data.len(),
+                ),
+                FrsErrorCode::Ok as i32
+            );
+
+            assert_eq!(get_value(db, cf, b"ma"), get_value(db, cf, b"pa"));
+            assert_eq!(get_value(db, cf, b"mb"), get_value(db, cf, b"pb"));
+            assert_eq!(get_value(db, cf, b"ma").as_deref(), Some(&b"v-one"[..]));
+            assert_eq!(get_value(db, cf, b"mb").as_deref(), Some(&b"v-two"[..]));
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Any kind byte outside {0, 1, 2} → BatchHeaderMalformed (110), and
+    /// nothing is written.
+    #[test]
+    fn vec_batch_mixed_invalid_kind_rejected() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"mx-bad";
+            let val = b"v";
+            let key_offs: [i32; 2] = [0, key.len() as i32];
+            let val_offs: [i32; 2] = [0, val.len() as i32];
+
+            for bad_kind in [3u8, 255u8] {
+                let kinds = [bad_kind];
+                let rc = frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    kinds.as_ptr(),
+                    1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                );
+                assert_eq!(
+                    rc,
+                    FrsErrorCode::BatchHeaderMalformed as i32,
+                    "kind byte {bad_kind} must be rejected"
+                );
+            }
+            assert_eq!(get_value(db, cf, key), None, "rejected batch must not write");
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Null-pointer, offset, count, and delete-with-value validation all
+    /// return BatchHeaderMalformed (110); count == 0 is Ok.
+    #[test]
+    fn vec_batch_mixed_null_and_offset_validation() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            let key = b"mx-val";
+            let val = b"v";
+            let key_offs: [i32; 2] = [0, key.len() as i32];
+            let val_offs: [i32; 2] = [0, val.len() as i32];
+            let kinds: [u8; 1] = [1];
+            let malformed = FrsErrorCode::BatchHeaderMalformed as i32;
+
+            // count == 0 → Ok fast path (pointers may be anything).
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    0,
+                ),
+                FrsErrorCode::Ok as i32
+            );
+
+            // null db handle
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    kinds.as_ptr(),
+                    1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                malformed
+            );
+            // null kinds
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    ptr::null(),
+                    1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                malformed
+            );
+            // null key_offsets
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    kinds.as_ptr(),
+                    1,
+                    ptr::null(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                malformed
+            );
+            // null value_offsets
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    kinds.as_ptr(),
+                    1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    ptr::null(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                malformed
+            );
+            // count > MAX_BATCH_COUNT
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    kinds.as_ptr(),
+                    MAX_BATCH_COUNT + 1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                malformed
+            );
+            // negative key offset rejected before slicing
+            let neg_offs: [i32; 2] = [0, -1];
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    kinds.as_ptr(),
+                    1,
+                    neg_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                malformed
+            );
+            // offsets exceeding declared data_len
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    kinds.as_ptr(),
+                    1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len() - 1, // declared shorter than offsets claim
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                malformed
+            );
+            // Delete row with a NON-empty value slice → layout bug, rejected.
+            let del_kinds: [u8; 1] = [0];
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    del_kinds.as_ptr(),
+                    1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(), // [0, 1] — non-empty value for delete
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                malformed
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// Merge rows on a CF WITHOUT a merge operator → BatchHeaderMalformed
+    /// (110); the same CF still accepts put/delete-only mixed batches.
+    #[test]
+    fn vec_batch_mixed_merge_without_operator_rejected() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            // CF created with merge_op_name = NULL → no merge operator.
+            let name = CString::new("no-merge-cf").unwrap();
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(
+                frs_db_create_cf_with_merge(db, name.as_ptr(), ptr::null(), &mut cf),
+                FRS_STATUS_OK
+            );
+
+            let key = b"mx-nm";
+            let val = b"v";
+            let key_offs: [i32; 2] = [0, key.len() as i32];
+            let val_offs: [i32; 2] = [0, val.len() as i32];
+
+            // Merge row → rejected.
+            let merge_kinds: [u8; 1] = [2];
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    merge_kinds.as_ptr(),
+                    1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                FrsErrorCode::BatchHeaderMalformed as i32,
+                "merge row on merge-less CF must be rejected"
+            );
+            assert_eq!(get_value(db, cf, key), None, "rejected batch must not write");
+
+            // Put-only mixed batch on the same CF → fine (operator guard is
+            // only enforced when a merge row exists).
+            let put_kinds: [u8; 1] = [1];
+            assert_eq!(
+                frs_vectorized_batch_mixed(
+                    db,
+                    cf,
+                    put_kinds.as_ptr(),
+                    1,
+                    key_offs.as_ptr(),
+                    key.as_ptr(),
+                    key.len(),
+                    val_offs.as_ptr(),
+                    val.as_ptr(),
+                    val.len(),
+                ),
+                FrsErrorCode::Ok as i32
+            );
+            assert_eq!(get_value(db, cf, key).as_deref(), Some(&b"v"[..]));
 
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
