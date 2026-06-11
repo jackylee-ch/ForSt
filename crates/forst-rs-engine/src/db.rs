@@ -15065,6 +15065,178 @@ mod tests {
         expect_reads("post compact_range");
     }
 
+    /// E5 (PMC cycle-3 §E1-F2) regression — the reproduced probe, kept
+    /// permanent: two CFs with disjoint key SETS but NESTED L1 key RANGES
+    /// (the OPT-N04 agg-CF-alongside-default shape). After flush +
+    /// compact_l0 on both, the shared `version.levels[1].files` array holds
+    /// per-CF files whose `largest_key` sequence is NON-monotonic, which
+    /// broke the scan locator's lower-bound `partition_point`:
+    ///   * debug pre-fix: first scan panicked at the monotonicity
+    ///     debug_assert (version/mod.rs);
+    ///   * release pre-fix: the assert compiled out and the binary search
+    ///     silently SKIPPED the scanned CF's own L1 file — scans below
+    ///     returned EMPTY for keys the CF holds (silent data loss).
+    /// Post-fix both CFs' scans must return exactly their own rows in both
+    /// build profiles.
+    #[test]
+    fn test_e5_multi_cf_nested_l1_ranges_scan_locator() {
+        let db = open();
+        let cf_a = db.default_cf();
+        let cf_b = db
+            .create_column_family(ColumnFamilyDescriptor::new("agg-shape"))
+            .unwrap();
+
+        // cf_a's range [a:1 .. z:1] NESTS cf_b's [m:1 .. m:2] strictly inside.
+        db.put(&cf_a, b"a:1", b"va").unwrap();
+        db.put(&cf_a, b"z:1", b"vz").unwrap();
+        db.put(&cf_b, b"m:1", b"vm1").unwrap();
+        db.put(&cf_b, b"m:2", b"vm2").unwrap();
+        db.switch_and_flush(&cf_a).unwrap().unwrap();
+        db.switch_and_flush(&cf_b).unwrap().unwrap();
+        db.compact_l0(&cf_a).unwrap().expect("cf_a L0→L1");
+        db.compact_l0(&cf_b).unwrap().expect("cf_b L0→L1");
+
+        // Fixture sanity: the shared L1 array must hold both CFs' files with
+        // a NON-monotonic largest_key sequence — otherwise this test is not
+        // exercising the E5 shape at all.
+        let version = db.version_set.current();
+        let l1 = &version.levels[1].files;
+        assert_eq!(l1.len(), 2, "expected exactly the two compacted L1 files");
+        assert_ne!(l1[0].cf_id, l1[1].cf_id, "L1 files must come from both CFs");
+        assert!(
+            l1.windows(2).any(|w| w[0].largest_key > w[1].largest_key),
+            "fixture must produce a non-monotonic largest_key L1 (nested ranges)"
+        );
+
+        // The killer probes: scan lower bounds PAST the nested cf_b file's
+        // largest_key — pre-fix release the partition_point skipped cf_a's
+        // own [a:1..z:1] file and these came back empty.
+        assert_eq!(
+            db.prefix_scan(&cf_a, b"z:").unwrap(),
+            vec![(b"z:1".to_vec(), b"vz".to_vec())],
+            "cf_a prefix scan must see its own L1 row past the nested cf_b range"
+        );
+        assert_eq!(
+            db.scan(&cf_a, b"n", None).unwrap(),
+            vec![(b"z:1".to_vec(), b"vz".to_vec())],
+            "cf_a range scan with lower past cf_b's largest must see z:1"
+        );
+        // Non-killer probes: full per-CF row sets, exact.
+        assert_eq!(
+            db.prefix_scan(&cf_a, b"a:").unwrap(),
+            vec![(b"a:1".to_vec(), b"va".to_vec())]
+        );
+        assert_eq!(
+            db.prefix_scan(&cf_b, b"m:").unwrap(),
+            vec![
+                (b"m:1".to_vec(), b"vm1".to_vec()),
+                (b"m:2".to_vec(), b"vm2".to_vec()),
+            ],
+            "cf_b must see exactly its own nested rows"
+        );
+        // Point reads unaffected either way (CF-aware locator) — guard rail.
+        assert_eq!(db.get(&cf_a, b"z:1").unwrap().as_deref(), Some(b"vz".as_ref()));
+        assert_eq!(db.get(&cf_b, b"m:2").unwrap().as_deref(), Some(b"vm2".as_ref()));
+    }
+
+    /// E5 fuzz-ish multi-CF scan exactness: three CFs share the level
+    /// arrays; key space is split into byte-interleaved BUCKETS owned by
+    /// exactly one CF (disjoint key sets — the standing backend invariant,
+    /// E1-F1), with one CF confined to MIDDLE buckets so its compacted L1
+    /// range nests inside the wide CFs' ranges (non-monotonic largest_key,
+    /// the E5 shape). Two flush waves per CF + compact_l0, then every
+    /// bucket's owner prefix-scans its bucket and must get EXACTLY its own
+    /// rows (deterministic LCG keys, byte-sorted).
+    #[test]
+    fn test_e5_multi_cf_interleaved_buckets_scan_exact_rows() {
+        use std::collections::BTreeMap;
+        let db = open();
+        let cf_wide_a = db.default_cf();
+        let cf_mid = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf-mid-nested"))
+            .unwrap();
+        let cf_wide_b = db
+            .create_column_family(ColumnFamilyDescriptor::new("cf-wide-b"))
+            .unwrap();
+
+        // Bucket ownership: buckets 0..60. b%3==0 → wide_a (whole space),
+        // b%3==1 AND 20<=b<40 → mid (nested inside wide_a), b%3==2 AND
+        // b>=30 → wide_b (upper half). Sorted by smallest_key the L1 array
+        // then reads [wide_a(000..057), mid(022..038), wide_b(032..059)] —
+        // largest_key [057,038,059] is non-monotonic AND the nested mid file
+        // sits at the partition_point's first probe, which is what steered
+        // the pre-fix binary search PAST wide_a's file for high-bucket
+        // lower bounds (the silent-miss shape, not just the assert).
+        let owner_of = |b: u32| -> Option<usize> {
+            match b % 3 {
+                0 => Some(0),
+                1 if (20..40).contains(&b) => Some(1),
+                2 if b >= 30 => Some(2),
+                _ => None,
+            }
+        };
+        let cfs = [&cf_wide_a, &cf_mid, &cf_wide_b];
+
+        // Deterministic LCG (no external deps).
+        let mut lcg_state: u64 = 0x5DEECE66D;
+        let mut lcg = move || {
+            lcg_state = lcg_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            lcg_state >> 33
+        };
+
+        // expected[cf_idx][bucket] = sorted key→value map.
+        let mut expected: Vec<BTreeMap<u32, BTreeMap<Vec<u8>, Vec<u8>>>> =
+            vec![BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
+        // Two waves: flush after each so every CF holds 2 L0 SSTs pre-compaction.
+        for wave in 0..2u32 {
+            for b in 0..60u32 {
+                let Some(cf_idx) = owner_of(b) else { continue };
+                for i in 0..4u32 {
+                    let key = format!("{b:03}:{:06}:{wave}{i}", lcg() % 1_000_000).into_bytes();
+                    let val = format!("v-{cf_idx}-{}", String::from_utf8_lossy(&key)).into_bytes();
+                    db.put(cfs[cf_idx], &key, &val).unwrap();
+                    expected[cf_idx]
+                        .entry(b)
+                        .or_default()
+                        .insert(key, val);
+                }
+            }
+            for cf in cfs {
+                db.switch_and_flush(cf).unwrap().unwrap();
+            }
+        }
+        for cf in cfs {
+            db.compact_l0(cf).unwrap().expect("L0→L1 rollup");
+        }
+
+        // Fixture sanity: nested mid-CF range ⇒ non-monotonic largest_key L1.
+        let version = db.version_set.current();
+        let l1 = &version.levels[1].files;
+        assert!(l1.len() >= 3, "expected ≥3 L1 files, got {}", l1.len());
+        assert!(
+            l1.windows(2).any(|w| w[0].largest_key > w[1].largest_key),
+            "fixture must produce a non-monotonic largest_key L1 (nested mid CF)"
+        );
+
+        // Every bucket: the owner's prefix scan returns EXACTLY its own rows,
+        // byte-sorted, values intact.
+        for b in 0..60u32 {
+            let Some(cf_idx) = owner_of(b) else { continue };
+            let prefix = format!("{b:03}:").into_bytes();
+            let got = db.prefix_scan(cfs[cf_idx], &prefix).unwrap();
+            let want: Vec<(Vec<u8>, Vec<u8>)> = expected[cf_idx][&b]
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            assert_eq!(
+                got, want,
+                "bucket {b} (cf {cf_idx}): prefix scan must return exactly the owner's rows"
+            );
+        }
+    }
+
     /// OPT-N04 E1: the promoted cross-CF compaction-input check is a HARD
     /// `Corruption` error (was a debug_assert). Forge an input meta whose
     /// cf_id disagrees with the job's and verify `run()` refuses in every

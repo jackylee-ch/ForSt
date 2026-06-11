@@ -22,7 +22,7 @@ pub mod checkpoint;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 use forst_rs_common::{
@@ -97,16 +97,63 @@ impl LevelMeta {
 }
 
 /// A single immutable version: the complete SST file layout at a point in time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Version {
     pub levels: Vec<LevelMeta>,
+    /// E5 (PMC cycle-3 §E1-F2): lazily-computed, per-level soundness flags
+    /// for the L1+ lower-bound binary search in
+    /// [`Self::overlapping_ssts_in_range`]. `true` iff that level's
+    /// `largest_key` sequence is monotonic non-decreasing in stored
+    /// (smallest_key-sorted) order — the EXACT premise the
+    /// `partition_point` on `largest_key` needs. Single-CF levels always
+    /// satisfy it (L1+ non-overlap); multi-CF levels with nested/
+    /// interleaved cross-CF ranges may not, and then the locator must
+    /// fall back to the linear left-skip (see E5 in
+    /// `overlapping_ssts_in_range`).
+    ///
+    /// Lazy + cached per Version: a `Version` is immutable once published
+    /// (ArcSwap install / restore), so the flags are computed at most once
+    /// (O(total files)) on the first scan and amortized across every scan
+    /// of that version. Deliberately NOT an eager field so that every
+    /// construction path (apply_edit, checkpoint restore's struct literal,
+    /// tests that build levels by direct mutation before first use) stays
+    /// correct without having to remember to recompute it.
+    scan_lower_bsearch_sound: OnceLock<Vec<bool>>,
 }
+
+// E5: manual impls — the OnceLock cache must not participate in
+// equality, and a clone starts with a FRESH (empty) cache so a
+// clone-then-mutate caller (e.g. `restore_version_set`'s
+// `(*snapshot.version).clone()`, or tests) can never observe flags
+// computed from the source's pre-mutation file layout.
+impl Clone for Version {
+    fn clone(&self) -> Self {
+        Self::from_levels(self.levels.clone())
+    }
+}
+
+impl PartialEq for Version {
+    fn eq(&self, other: &Self) -> bool {
+        self.levels == other.levels
+    }
+}
+
+impl Eq for Version {}
 
 impl Version {
     /// Creates a new empty Version with MAX_LEVELS empty levels.
     pub fn new() -> Self {
-        let levels = (0..MAX_LEVELS as u32).map(LevelMeta::new).collect();
-        Self { levels }
+        Self::from_levels((0..MAX_LEVELS as u32).map(LevelMeta::new).collect())
+    }
+
+    /// Creates a Version from an explicit level layout (restore path,
+    /// `apply_edit` output). The E5 scan-soundness cache starts empty and
+    /// is computed lazily from `levels` on first scan.
+    pub fn from_levels(levels: Vec<LevelMeta>) -> Self {
+        Self {
+            levels,
+            scan_lower_bsearch_sound: OnceLock::new(),
+        }
     }
 
     /// Returns the files at level 0.
@@ -244,7 +291,7 @@ impl Version {
                 .sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
         }
 
-        Ok(Version { levels: new_levels })
+        Ok(Version::from_levels(new_levels))
     }
 
     /// Collect all live SST file metadata across all levels.
@@ -378,12 +425,35 @@ impl Version {
     /// (the flat scan does none either — it relies on the byte-range check),
     /// so multi-CF deployments observe exactly the same files as before.
     /// `upper == None` means unbounded above (scan to each level's end).
+    ///
+    /// E5 (PMC cycle-3 §E1-F2): the LOWER-bound binary search additionally
+    /// requires `largest_key` to be monotonic across the level — true
+    /// per-CF (L1+ non-overlap) but NOT guaranteed across CFs sharing the
+    /// level array (nested/interleaved cross-CF ranges). The per-level
+    /// soundness flag (cached once per immutable Version, see
+    /// [`Self::scan_lower_bsearch_sound`]) gates the binary search; when a
+    /// level is non-monotonic the lower bound falls back to the L0-style
+    /// linear left-skip, which applies the flat path's own
+    /// `largest_key >= lower` predicate per file and therefore cannot miss
+    /// a file. Single-CF deployments always take the binary-search arm —
+    /// the hot path is unchanged except for one cached-bool branch per
+    /// level.
     pub fn overlapping_ssts_in_range<'a>(
         &'a self,
         lower: &[u8],
         upper: Option<&[u8]>,
         out: &mut Vec<&'a SstFileMeta>,
     ) {
+        let lower_bsearch_sound = self.scan_lower_bsearch_sound.get_or_init(|| {
+            self.levels
+                .iter()
+                .map(|lvl| {
+                    lvl.files
+                        .windows(2)
+                        .all(|w| w[0].largest_key <= w[1].largest_key)
+                })
+                .collect()
+        });
         for (lvl_idx, level) in self.levels.iter().enumerate() {
             let files = &level.files;
             // Binary-search the upper cut: first file whose smallest_key is
@@ -394,10 +464,20 @@ impl Version {
                 Some(hi) => files.partition_point(|f| f.smallest_key.as_slice() < hi),
                 None => files.len(),
             };
-            if lvl_idx == 0 {
+            if lvl_idx == 0 || !lower_bsearch_sound[lvl_idx] {
                 // L0 files may OVERLAP (flushed memtables) → largest_key is not
                 // monotonic, so the lower bound must be a linear left-skip. L0 is
                 // kept shallow by `l0_compaction_trigger`, so this stays bounded.
+                //
+                // E5: an L1+ level whose largest_key sequence is non-monotonic
+                // (multi-CF nested/interleaved cross-CF ranges) takes the SAME
+                // linear left-skip — the partition_point premise does not hold
+                // there, and pre-fix the binary search silently skipped
+                // overlapping files (release) or tripped a debug_assert. The
+                // linear arm applies the exact flat-path predicate per file, so
+                // the result set stays identical to the flat scan. Cost is
+                // O(files-before-range) only on such multi-CF levels; today's
+                // single-CF production layout never enters this arm at L1+.
                 for f in &files[..end] {
                     if f.largest_key.as_slice() < lower {
                         continue;
@@ -412,16 +492,9 @@ impl Version {
                 // driver: `overlapping_ssts_in_range` cost grew with accumulated
                 // L1+ files (thousands at the floor) even though only ~0-4 files
                 // actually overlap a narrow interval-join prefix. Now O(log +
-                // matched) per level. Sound iff the leveled non-overlap invariant
-                // holds (CF-prefixed keys are disjoint across CFs; leveled
-                // compaction keeps each L≥1 non-overlapping) — asserted in debug.
-                debug_assert!(
-                    files
-                        .windows(2)
-                        .all(|w| w[0].largest_key <= w[1].smallest_key),
-                    "L{lvl_idx} files overlap — binary-search lower bound is unsound; \
-                     falling back would be required"
-                );
+                // matched) per level. Sound iff largest_key is monotonic across
+                // the level — guaranteed here by the E5 per-level flag checked
+                // above (computed once per immutable Version), NOT assumed.
                 let start = files.partition_point(|f| f.largest_key.as_slice() < lower);
                 for f in &files[start.min(end)..end] {
                     out.push(f);
@@ -881,6 +954,92 @@ mod tests {
                 got_nums, want,
                 "range [{:?},{:?}) mismatch: locator returned a different SST set than the flat scan",
                 lower, upper
+            );
+        }
+    }
+
+    #[test]
+    fn test_overlapping_ssts_nested_cross_cf_ranges_e5() {
+        // E5 (PMC cycle-3 §E1-F2): with MULTIPLE CFs in the shared per-level
+        // file array, per-CF non-overlapping L1 files can have NESTED /
+        // INTERLEAVED byte ranges — `largest_key` is then NOT monotonic
+        // across the level, so the FRS-LOCATOR-LOWER-BSEARCH partition_point
+        // on `largest_key` is unsound. Pre-fix: debug builds panicked on the
+        // monotonicity debug_assert; release builds silently SKIPPED
+        // overlapping files (a scan could miss its own CF's L1 SSTs).
+        //
+        // Shape = the reproduced probe: cf_a L1 file [a..m] with cf_b's
+        // [c..c] nested strictly inside, plus an interleave at L2.
+        let cf_a = DEFAULT_CF_ID;
+        let cf_b = forst_rs_common::ColumnFamilyId(7);
+        let mk = |num: u64, cf: forst_rs_common::ColumnFamilyId, s: &[u8], l: &[u8]| SstFileMeta {
+            file_number: FileNumber(num),
+            cf_id: cf,
+            file_size: 1024,
+            smallest_key: s.to_vec(),
+            largest_key: l.to_vec(),
+            min_sequence: SequenceNumber(1),
+            max_sequence: SequenceNumber(100),
+            num_entries: 50,
+        };
+        let edit = VersionEdit {
+            new_files: vec![
+                // L1: cf_b's single file NESTS inside cf_a's range. Sorted by
+                // smallest_key the level reads [(a..m), (c..c), (p..t)] —
+                // largest_key sequence [m, c, t] is non-monotonic.
+                (1, mk(10, cf_a, b"a", b"m")),
+                (1, mk(11, cf_b, b"c", b"c")),
+                (1, mk(12, cf_a, b"p", b"t")),
+                // L2: interleaved (not nested): [(b..f), (d..h)] per-CF
+                // disjoint but cross-CF overlapping; largest monotonic here,
+                // smallest sorted — exercises the still-sound-bsearch shape.
+                (2, mk(20, cf_a, b"b", b"f")),
+                (2, mk(21, cf_b, b"d", b"h")),
+            ],
+            ..Default::default()
+        };
+        let v = Version::new().apply_edit(&edit).unwrap();
+
+        let flat = |lower: &[u8], upper: Option<&[u8]>| -> Vec<FileNumber> {
+            let mut nums: Vec<FileNumber> = v
+                .live_sst_files_iter()
+                .filter(|f| {
+                    f.largest_key.as_slice() >= lower
+                        && upper.is_none_or(|u| f.smallest_key.as_slice() < u)
+                })
+                .map(|f| f.file_number)
+                .collect();
+            nums.sort_by_key(|n| n.0);
+            nums
+        };
+
+        // The killer probes pre-fix:
+        //  * lower="f": L1 largest sequence [m, c, t] → predicate
+        //    (largest < "f") = [F, T, F] is NOT partitioned; partition_point
+        //    lands past file 10 → cf_a's own [a..m] file is MISSED.
+        //  * lower="m" (a key cf_a HOLDS, == file 10's largest): same skip.
+        let bounds: &[(&[u8], Option<&[u8]>)] = &[
+            (b"f", Some(b"g")),
+            (b"m", Some(b"n")),
+            (b"m", None),
+            (b"d", Some(b"e")),
+            (b"c", Some(b"d")),
+            (b"a", None),
+            (b"\x00", Some(b"\xff")),
+            (b"q", Some(b"r")),
+            (b"u", None),
+        ];
+        for (lower, upper) in bounds {
+            let mut got: Vec<&SstFileMeta> = Vec::new();
+            v.overlapping_ssts_in_range(lower, *upper, &mut got);
+            let mut got_nums: Vec<FileNumber> = got.iter().map(|f| f.file_number).collect();
+            got_nums.sort_by_key(|n| n.0);
+            assert_eq!(
+                got_nums,
+                flat(lower, *upper),
+                "E5 nested cross-CF range [{:?},{:?}): locator must equal flat scan",
+                lower,
+                upper
             );
         }
     }
