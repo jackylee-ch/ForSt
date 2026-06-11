@@ -1626,3 +1626,29 @@ Code state: routing-async ships gated FRS_RS_EXECUTOR=routing-async, javadoc car
 failed-canary warning, defaults untouched (inline default; blocking routing/adaptive unaffected);
 543 UTs green incl. 6 new contract tests (they validate dispatch mechanics, which are correct —
 the race is in the state-buffer layer the UTs don't reach).
+
+# ▶ STATUS REFRESH (2026-06-11 ~10:00) — post-canary direction locked
+## Performance numbers: no new bar-relevant results since the canary section above.
+Today's complete number set: q9@100M control 2215.6s/91,813,372 EXACT (11th identical, perf
+overhead included) | q8@100M routing-async r1 WEDGE@600 r2 36.7s out=1,285,415 (−58% WRONG —
+gate FAILED, mode parked) | q8@10M routing-async smoke 7.6s out=306,016 (scale too small for
+the race). Standing bars unchanged: q9 needs ≤1776s (current band 2001–2105), q20 needs
+≤1342.5 (current 1477.7), q7 needs FINISH + ≥0.8× RocksDB + faster than ForSt 587
+(frs best 1441.6 cross-day).
+## GHA (mandate gate): ForSt ci-security ✅ SUCCESS, ci-rust in_progress at write time
+(push 679248d83); flink backend commit 7ef52d53787 pushed, module UTs 543/0 local.
+## Direction locked with user (labeled-option approvals):
+1. (approved) Per-batch buffer ownership = full scope (Map+List staging buffers), entirely
+   inside flink-statebackend-forst-rs — NO Flink-runtime changes (AEC contract already
+   supports non-blocking; verified in code).
+2. (approved) Sequence = B-spike → A:
+   B SPIKE (today): gated bypass — under routing-async ONLY, MapStateV2/AsyncListStateV2 skip
+   their staging buffers; puts flow through the classifier's per-batch-private buffers
+   (executePuts-before-executeGets = same-batch read-your-writes; worker FIFO = cross-batch).
+   No shared mutable state ⇒ canary-plausible in ~20 lines. Gates: q8@100M ×3 exact, then
+   q9@100M A/B vs 2215.6s control. PURPOSE: hard e2e evidence that pipelining converts the
+   6.3 idle cores before the multi-day refactor.
+   A BUILD (next): per-worker-sharded staging (kg%N) + seal/swap at dispatch + worker
+   drain-first + mailbox-owned reclaim + snapshot-barrier all-shard drain — restores staging
+   coalescing/hit-serving under pipelining. Design doc to
+   docs/superpowers/specs/2026-06-11-per-batch-buffer-ownership-design.md.
