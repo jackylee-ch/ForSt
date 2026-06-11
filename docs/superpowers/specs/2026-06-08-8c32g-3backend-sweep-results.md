@@ -1812,3 +1812,16 @@ SILENT-SKIP if .get() throws, and inline callbacks bypass CallbackRunnerWrapper'
 currentCallbacks accounting. For mailbox-completed sync points inline==mailbox (safe);
 the corrupt-run cbran arithmetic decides whether the loss is pre-callback (registration/
 fast-path edge) or post-callback (operator-internal).
+
+### ★★★ STAGE-0: AEC SYNC-POINT MACHINERY EXONERATED — loss is ABOVE the operator wrapper
+cbran instrument, corrupt specimens (R4 out=703,216!; R5 out=2,303,816):
+**cbran == completed == created to the unit in every dump** — every sync point ever created
+runs its callback. The deficit is in CREATION: R4's last dump shows only ~1.05M sync points
+created for 3.06M source records (records + timer fires!) ⇒ ~2M records NEVER reached
+preserveRecordOrderAndProcess. Combined with all prior exonerations (disposal mailbox-
+confined ×verified-beacon; framework thread-airtight ×code-trace; ForSt-async exact ×2;
+zero late-drops ×deployed print; zero lost completions ×accounting):
+**the records vanish BETWEEN the source (provably emitted 3,064,673) and the join
+operator's record processor.** Note: most-corrupt run = FASTEST (35.6s).
+NEXT: join-vertex numRecordsIn (standard metric) vs SP_CREATED in a corrupt run —
+splits in-task wrapper-level loss from network/upstream-chain loss. Poller running.
