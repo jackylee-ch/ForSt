@@ -4952,8 +4952,38 @@ impl IterValue {
 /// prefix iterator path can pass keys through as `Arc<[u8]>` (zero
 /// `Vec::clone` per emit) while the range iterator path keeps its
 /// upstream `Vec<u8>` key as-is.
+/// S2 (pinned-rows design W1c): backing state of one registered FFI iterator.
+///
+/// `Boxed` is the legacy Arc-pair pull iterator (flag OFF, and every eager
+/// path). `Pinned` (flag `FRS_RS_S2_PINNED` ON) holds the engine's push-style
+/// [`forst_rs_engine::PrefixScanStream`] and drives `fill_into` straight into
+/// the caller's chunk buffer — zero per-row allocations/refcounts on the
+/// SST-Put path, SST bytes → chunk in exactly one `copy_nonoverlapping` per
+/// field.
+enum IterBackend {
+    /// Legacy boxed Arc-pair iterator.
+    Boxed(Box<dyn Iterator<Item = (IterKey, IterValue)> + Send>),
+    /// S2 push-style stream + its chunk-overflow stash.
+    Pinned(PinnedIter),
+}
+
+/// S2: pinned-stream backend state. The pending buffers are the chunk-full
+/// rollback: `RowSink::push` returning `false` means the sink kept the row —
+/// the overflow row is COPIED into these reused `Vec`s (one ~row-size memcpy
+/// per chunk boundary, zero steady-state allocation) and is written first by
+/// the next fill.
+struct PinnedIter {
+    stream: forst_rs_engine::PrefixScanStream,
+    /// The stream reported `Exhausted` (or a fill error was recorded).
+    exhausted: bool,
+    /// Overflow row stash (valid when `pending_set`).
+    pending_key: Vec<u8>,
+    pending_val: Vec<u8>,
+    pending_set: bool,
+}
+
 struct IterHandle {
-    inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send>,
+    inner: IterBackend,
     pending: Option<(IterKey, IterValue)>,
     aborted: AtomicBool,
     /// R18-M4: terminal flag set once a deferred error has been surfaced to the
@@ -5004,7 +5034,30 @@ impl IterHandle {
         last_error: Arc<Mutex<Option<forst_rs_common::ForstError>>>,
     ) -> Self {
         Self {
-            inner,
+            inner: IterBackend::Boxed(inner),
+            pending: None,
+            aborted: AtomicBool::new(false),
+            last_error,
+            deferred_error: None,
+            terminal: AtomicBool::new(false),
+        }
+    }
+
+    /// S2: construct over the engine's push-style stream (flag ON). The
+    /// shared error slot is the SAME channel the stream's tier-peek errors
+    /// land in (wired engine-side); fill errors are recorded there too.
+    fn new_pinned_with_error_slot(
+        stream: forst_rs_engine::PrefixScanStream,
+        last_error: Arc<Mutex<Option<forst_rs_common::ForstError>>>,
+    ) -> Self {
+        Self {
+            inner: IterBackend::Pinned(PinnedIter {
+                stream,
+                exhausted: false,
+                pending_key: Vec::new(),
+                pending_val: Vec::new(),
+                pending_set: false,
+            }),
             pending: None,
             aborted: AtomicBool::new(false),
             last_error,
@@ -5059,7 +5112,15 @@ impl IterHandle {
         if let Some(p) = self.pending.take() {
             return Some(p);
         }
-        self.inner.next()
+        match &mut self.inner {
+            IterBackend::Boxed(inner) => inner.next(),
+            // The pinned backend is drained exclusively through
+            // `fill_chunk_from_pinned` (push-style); pull is unreachable.
+            IterBackend::Pinned(_) => {
+                debug_assert!(false, "next_row called on a pinned iter backend");
+                None
+            }
+        }
     }
 
     /// Push a row back to be returned on the next `next_row()` call.
@@ -5094,7 +5155,11 @@ impl IterHandle {
     /// Sound: only called when `fill_chunk_from_iter` reported `exhausted == true`
     /// (upstream `next_row()` returned `None`), so no pending rows are dropped.
     fn drop_inner(&mut self) {
-        self.inner = Box::new(std::iter::empty());
+        // S2: for a Pinned backend this drops the PrefixScanStream — its
+        // tier sources release every pinned `DecodedBlock` (and the
+        // prefetchers' windows) transitively, so no `Arc<KvBlock>` outlives
+        // this call beyond the shared block cache's own reference.
+        self.inner = IterBackend::Boxed(Box::new(std::iter::empty()));
         self.pending = None;
         self.terminal
             .store(true, std::sync::atomic::Ordering::Release);
@@ -5150,6 +5215,13 @@ unsafe fn fill_chunk_from_iter(
     if iter.is_aborted() {
         return (0, 0, true);
     }
+    // S2: pinned backends are PUSH-style — the engine drives rows into a
+    // ChunkSink writing the wire format directly (no IterKey/IterValue, no
+    // Arc traffic). Split borrows: `inner` and `last_error` are disjoint
+    // fields.
+    if let IterBackend::Pinned(p) = &mut iter.inner {
+        return fill_chunk_from_pinned(p, &iter.last_error, buf, cap);
+    }
     let mut off = 0usize;
     let mut row_count = 0u32;
     loop {
@@ -5185,6 +5257,139 @@ unsafe fn fill_chunk_from_iter(
         std::ptr::copy_nonoverlapping(v.as_ptr(), buf.add(off), vlen);
         off += vlen;
         row_count += 1;
+    }
+}
+
+/// S2 (W1c): `RowSink` writing the FFI wire format
+/// `[klen u32 LE][vlen u32 LE][key][value]` straight into the caller's chunk
+/// buffer — the borrowed slices are memcpy'd within the `push` call (the D1
+/// borrow contract), so SST bytes → chunk is exactly one copy with zero
+/// intervening allocations. On overflow the row is copied into the reused
+/// pending buffers (delivered first by the next fill) and `false` stops the
+/// fill — the existing chunk-full backpressure, minus the Arc rollback.
+struct ChunkSink<'a> {
+    buf: *mut u8,
+    cap: usize,
+    off: usize,
+    rows: u32,
+    pending_key: &'a mut Vec<u8>,
+    pending_val: &'a mut Vec<u8>,
+    pending_set: &'a mut bool,
+}
+
+impl forst_rs_engine::RowSink for ChunkSink<'_> {
+    fn push(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let row_size = 8 + key.len() + value.len();
+        if self.off + row_size > self.cap {
+            // Chunk full: stash the delivered row (reused capacity — zero
+            // steady-state alloc; ~one row memcpy per chunk boundary).
+            self.pending_key.clear();
+            self.pending_key.extend_from_slice(key);
+            self.pending_val.clear();
+            self.pending_val.extend_from_slice(value);
+            *self.pending_set = true;
+            return false;
+        }
+        // SAFETY: `buf` points to at least `cap` writable bytes for the
+        // duration of the enclosing fill call (the
+        // `fill_chunk_from_pinned` contract), and `off + row_size <= cap`.
+        unsafe {
+            let klen = key.len() as u32;
+            let vlen = value.len() as u32;
+            std::ptr::copy_nonoverlapping(klen.to_le_bytes().as_ptr(), self.buf.add(self.off), 4);
+            std::ptr::copy_nonoverlapping(
+                vlen.to_le_bytes().as_ptr(),
+                self.buf.add(self.off + 4),
+                4,
+            );
+            std::ptr::copy_nonoverlapping(key.as_ptr(), self.buf.add(self.off + 8), key.len());
+            std::ptr::copy_nonoverlapping(
+                value.as_ptr(),
+                self.buf.add(self.off + 8 + key.len()),
+                value.len(),
+            );
+        }
+        self.off += row_size;
+        self.rows += 1;
+        true
+    }
+}
+
+/// S2: pinned-backend chunk fill — the push-style twin of the boxed loop in
+/// [`fill_chunk_from_iter`], same `(bytes_written, row_count, exhausted)`
+/// contract. The stashed overflow row (if any) is written first; fill errors
+/// are recorded sticky-FIRST into the shared error slot (the channel the
+/// open/next callers already drain) and the backend parks exhausted so the
+/// R17-M3/R18-M4 deferred-error state machine surfaces them exactly like the
+/// legacy path.
+///
+/// # Safety
+/// `buf` must point to at least `cap` writable bytes for the duration of the
+/// call.
+unsafe fn fill_chunk_from_pinned(
+    p: &mut PinnedIter,
+    last_error: &Arc<Mutex<Option<forst_rs_common::ForstError>>>,
+    buf: *mut u8,
+    cap: usize,
+) -> (u32, u32, bool) {
+    let mut off = 0usize;
+    let mut rows = 0u32;
+    // Deliver the chunk-overflow stash first (it was already produced).
+    if p.pending_set {
+        let row_size = 8 + p.pending_key.len() + p.pending_val.len();
+        if row_size > cap {
+            // Row larger than the whole chunk — same non-progress contract
+            // as the legacy put_back path (caller must supply a larger buf).
+            return (0, 0, false);
+        }
+        let klen = p.pending_key.len() as u32;
+        let vlen = p.pending_val.len() as u32;
+        std::ptr::copy_nonoverlapping(klen.to_le_bytes().as_ptr(), buf, 4);
+        std::ptr::copy_nonoverlapping(vlen.to_le_bytes().as_ptr(), buf.add(4), 4);
+        std::ptr::copy_nonoverlapping(p.pending_key.as_ptr(), buf.add(8), p.pending_key.len());
+        std::ptr::copy_nonoverlapping(
+            p.pending_val.as_ptr(),
+            buf.add(8 + p.pending_key.len()),
+            p.pending_val.len(),
+        );
+        off += row_size;
+        rows += 1;
+        p.pending_set = false;
+    }
+    if p.exhausted {
+        return (off as u32, rows, true);
+    }
+    let mut sink = ChunkSink {
+        buf,
+        cap,
+        off,
+        rows,
+        pending_key: &mut p.pending_key,
+        pending_val: &mut p.pending_val,
+        pending_set: &mut p.pending_set,
+    };
+    match p.stream.fill_into(&mut sink) {
+        Ok(forst_rs_engine::FillOutcome::Exhausted) => {
+            let (off, rows) = (sink.off, sink.rows);
+            p.exhausted = true;
+            (off as u32, rows, true)
+        }
+        Ok(forst_rs_engine::FillOutcome::SinkFull) => (sink.off as u32, sink.rows, false),
+        Err(e) => {
+            let (off, rows) = (sink.off, sink.rows);
+            // Sticky-FIRST into the shared slot (R18-M3 semantics); the
+            // open/next callers drain it and run the partial-chunk state
+            // machine. Park exhausted: after an error surfaces the iterator
+            // is terminal (R18-M4).
+            {
+                let mut guard = last_error.lock().unwrap_or_else(|p| p.into_inner());
+                if guard.is_none() {
+                    *guard = Some(e);
+                }
+            }
+            p.exhausted = true;
+            (off as u32, rows, true)
+        }
     }
 }
 
@@ -5274,48 +5479,63 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         };
         let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
             Arc::new(Mutex::new(None));
-        let owned_iter = match db_ref.prefix_scan_iter_owned_arc_with_error_slot(
-            cf_ref_,
-            prefix,
-            Arc::clone(&error_slot),
-        ) {
-            Ok(it) => it,
-            Err(_) => return FrsErrorCode::EngineIo as i32,
+        // S2 (flag ON): hold the engine's push-style PrefixScanStream and
+        // drive `fill_into` straight into the chunk buffer — the raw sink
+        // path (zero per-row allocations on SST-Put rows; no Arc traffic).
+        // Flag OFF keeps the legacy Arc-pair pull iterator byte-for-byte.
+        let mut handle_state = if forst_rs_engine::s2_pinned_enabled() {
+            match db_ref.prefix_scan_stream_with_error_slot(
+                cf_ref_,
+                prefix,
+                Arc::clone(&error_slot),
+            ) {
+                Ok(stream) => IterHandle::new_pinned_with_error_slot(stream, error_slot),
+                Err(_) => return FrsErrorCode::EngineIo as i32,
+            }
+        } else {
+            let owned_iter = match db_ref.prefix_scan_iter_owned_arc_with_error_slot(
+                cf_ref_,
+                prefix,
+                Arc::clone(&error_slot),
+            ) {
+                Ok(it) => it,
+                Err(_) => return FrsErrorCode::EngineIo as i32,
+            };
+            // R16-M2: replace the bare `r.ok()` (which silently dropped engine
+            // errors) with an error-tap closure that records each `Err(_)` in
+            // the IterHandle's shared error slot. The FFI consumer drains the
+            // slot via `take_last_error` after every chunk-get and translates a
+            // recorded error into an `FrsErrorCode` so the Java side observes
+            // the failure instead of seeing a clean end-of-iterator.
+            // R17-L2: tolerate a poisoned mutex (the only way to poison the lock
+            // is a panic while we hold it — recoverable by overwriting with the
+            // observed error).
+            let error_slot_inner = Arc::clone(&error_slot);
+            let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+                Box::new(owned_iter.filter_map(move |r| match r {
+                    Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                    Err(e) => {
+                        // R18-M3: sticky-FIRST. The FFI consumer drains via
+                        // `take_last_error()` after every chunk so within a
+                        // single chunk we MUST preserve the first error: a
+                        // later error may be a cascade of the first (e.g.,
+                        // tier-source IO failure → downstream merge errors)
+                        // and the first is the most diagnosable cause. Pre-
+                        // fix `*guard = Some(e)` overwrote unconditionally,
+                        // returning the LAST cascade error to the Java side
+                        // and burying the actual root cause. Tolerate a
+                        // poisoned mutex — overwriting a poisoned slot is
+                        // benign because we only write when empty.
+                        let mut guard = error_slot_inner.lock().unwrap_or_else(|p| p.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(e);
+                        }
+                        None
+                    }
+                }));
+            IterHandle::new_with_error_slot(inner, error_slot)
         };
         let probe_build_us = probe_t0.map(|t| t.elapsed().as_micros());
-        // R16-M2: replace the bare `r.ok()` (which silently dropped engine
-        // errors) with an error-tap closure that records each `Err(_)` in
-        // the IterHandle's shared error slot. The FFI consumer drains the
-        // slot via `take_last_error` after every chunk-get and translates a
-        // recorded error into an `FrsErrorCode` so the Java side observes
-        // the failure instead of seeing a clean end-of-iterator.
-        // R17-L2: tolerate a poisoned mutex (the only way to poison the lock
-        // is a panic while we hold it — recoverable by overwriting with the
-        // observed error).
-        let error_slot_inner = Arc::clone(&error_slot);
-        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
-            Box::new(owned_iter.filter_map(move |r| match r {
-                Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
-                Err(e) => {
-                    // R18-M3: sticky-FIRST. The FFI consumer drains via
-                    // `take_last_error()` after every chunk so within a
-                    // single chunk we MUST preserve the first error: a
-                    // later error may be a cascade of the first (e.g.,
-                    // tier-source IO failure → downstream merge errors)
-                    // and the first is the most diagnosable cause. Pre-
-                    // fix `*guard = Some(e)` overwrote unconditionally,
-                    // returning the LAST cascade error to the Java side
-                    // and burying the actual root cause. Tolerate a
-                    // poisoned mutex — overwriting a poisoned slot is
-                    // benign because we only write when empty.
-                    let mut guard = error_slot_inner.lock().unwrap_or_else(|p| p.into_inner());
-                    if guard.is_none() {
-                        *guard = Some(e);
-                    }
-                    None
-                }
-            }));
-        let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
 
         // Fill the first chunk lazily into the caller's buffer.
         let (bytes_used, row_count, iter_exhausted) =
@@ -6000,6 +6220,56 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
             build_failed: bool,
         }
 
+        /// Shared first-chunk fill + R16-M2/R17-M3/R18-M4 error state machine
+        /// (identical for the boxed and S2-pinned backends — the dispatch
+        /// lives inside `fill_chunk_from_iter`).
+        ///
+        /// # Safety
+        /// `buf_ptr` must be this probe's exclusive caller-owned buffer of at
+        /// least `buf_cap` bytes, valid for the duration of the call.
+        unsafe fn finish_probe_fill(
+            mut handle_state: IterHandle,
+            buf_ptr: *mut u8,
+            buf_cap: usize,
+        ) -> ProbeFill {
+            let (bytes_used, row_count, iter_exhausted) =
+                fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap);
+            if iter_exhausted {
+                handle_state.drop_inner();
+            }
+            let mut err_code = None;
+            let mut error_pending = false;
+            if let Some(err) = handle_state.take_last_error() {
+                error_pending = true;
+                if row_count == 0 {
+                    err_code = Some(error_to_frs_code(&err));
+                    handle_state.mark_terminal();
+                } else {
+                    handle_state.set_deferred_error(err);
+                }
+            }
+            let eof = iter_exhausted && !error_pending;
+            ProbeFill {
+                handle_state: if eof { None } else { Some(handle_state) },
+                row_count,
+                bytes_used,
+                eof,
+                err_code,
+                build_failed: false,
+            }
+        }
+
+        fn build_failed_probe(e: &forst_rs_common::ForstError) -> ProbeFill {
+            ProbeFill {
+                handle_state: None,
+                row_count: 0,
+                bytes_used: 0,
+                eof: false,
+                err_code: Some(error_to_frs_code(e)),
+                build_failed: true,
+            }
+        }
+
         let bufs: Arc<Vec<(SendMutPtr, usize)>> = Arc::new(
             valid_indices
                 .iter()
@@ -6010,75 +6280,73 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
                 .collect(),
         );
         let job_bufs = Arc::clone(&bufs);
-        let fills = db_ref.batch_open_prefix_iters_parallel_map(
-            cf_ref_,
-            &valid_prefixes,
-            move |vi, built| -> ProbeFill {
-                match built {
-                    Err(e) => ProbeFill {
-                        handle_state: None,
-                        row_count: 0,
-                        bytes_used: 0,
-                        eof: false,
-                        err_code: Some(error_to_frs_code(&e)),
-                        build_failed: true,
-                    },
-                    Ok(owned_iter) => {
-                        // IDENTICAL wrap + fill + error state machine to the
-                        // serial frs_vec_iter_prefix_open_batch drain (zero-copy
-                        // IterKey/Value::Arc, streamed; engine errors land in
-                        // the per-probe slot) — just running on a pool worker.
-                        let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
-                            Arc::new(Mutex::new(None));
-                        let slot_inner = Arc::clone(&error_slot);
-                        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
-                            Box::new(owned_iter.filter_map(move |r| match r {
-                                Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
-                                Err(e) => {
-                                    let mut guard =
-                                        slot_inner.lock().unwrap_or_else(|p| p.into_inner());
-                                    if guard.is_none() {
-                                        *guard = Some(e);
-                                    }
-                                    None
-                                }
-                            }));
-                        let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
-                        let (buf_ptr, buf_cap) = {
-                            let b = &job_bufs[vi];
-                            (b.0 .0, b.1)
-                        };
-                        // SAFETY: this probe's exclusive, caller-owned buffer
-                        // (see SendMutPtr rationale above); valid for the call.
-                        let (bytes_used, row_count, iter_exhausted) =
-                            unsafe { fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap) };
-                        if iter_exhausted {
-                            handle_state.drop_inner();
-                        }
-                        let mut err_code = None;
-                        let mut error_pending = false;
-                        if let Some(err) = handle_state.take_last_error() {
-                            error_pending = true;
-                            if row_count == 0 {
-                                err_code = Some(error_to_frs_code(&err));
-                                handle_state.mark_terminal();
-                            } else {
-                                handle_state.set_deferred_error(err);
-                            }
-                        }
-                        let eof = iter_exhausted && !error_pending;
-                        ProbeFill {
-                            handle_state: if eof { None } else { Some(handle_state) },
-                            row_count,
-                            bytes_used,
-                            eof,
-                            err_code,
-                            build_failed: false,
+        // S2 (flag ON): build push-style streams on the pool and drive
+        // `fill_into` straight into each probe's buffer — the raw sink path
+        // for the batch-open probe shape too (no Arc-pair adapter tax).
+        let fills = if forst_rs_engine::s2_pinned_enabled() {
+            db_ref.batch_open_prefix_streams_parallel_map(
+                cf_ref_,
+                &valid_prefixes,
+                move |vi, built| -> ProbeFill {
+                    match built {
+                        Err(e) => build_failed_probe(&e),
+                        Ok(mut stream) => {
+                            let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+                                Arc::new(Mutex::new(None));
+                            stream.set_shared_error_slot(Arc::clone(&error_slot));
+                            let handle_state =
+                                IterHandle::new_pinned_with_error_slot(stream, error_slot);
+                            let (buf_ptr, buf_cap) = {
+                                let b = &job_bufs[vi];
+                                (b.0 .0, b.1)
+                            };
+                            // SAFETY: this probe's exclusive caller-owned
+                            // buffer (see SendMutPtr rationale above).
+                            unsafe { finish_probe_fill(handle_state, buf_ptr, buf_cap) }
                         }
                     }
-                }
-            },
-        );
+                },
+            )
+        } else {
+            db_ref.batch_open_prefix_iters_parallel_map(
+                cf_ref_,
+                &valid_prefixes,
+                move |vi, built| -> ProbeFill {
+                    match built {
+                        Err(e) => build_failed_probe(&e),
+                        Ok(owned_iter) => {
+                            // IDENTICAL wrap + fill + error state machine to the
+                            // serial frs_vec_iter_prefix_open_batch drain (zero-copy
+                            // IterKey/Value::Arc, streamed; engine errors land in
+                            // the per-probe slot) — just running on a pool worker.
+                            let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+                                Arc::new(Mutex::new(None));
+                            let slot_inner = Arc::clone(&error_slot);
+                            let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+                                Box::new(owned_iter.filter_map(move |r| match r {
+                                    Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                                    Err(e) => {
+                                        let mut guard =
+                                            slot_inner.lock().unwrap_or_else(|p| p.into_inner());
+                                        if guard.is_none() {
+                                            *guard = Some(e);
+                                        }
+                                        None
+                                    }
+                                }));
+                            let handle_state = IterHandle::new_with_error_slot(inner, error_slot);
+                            let (buf_ptr, buf_cap) = {
+                                let b = &job_bufs[vi];
+                                (b.0 .0, b.1)
+                            };
+                            // SAFETY: this probe's exclusive, caller-owned buffer
+                            // (see SendMutPtr rationale above); valid for the call.
+                            unsafe { finish_probe_fill(handle_state, buf_ptr, buf_cap) }
+                        }
+                    }
+                },
+            )
+        };
 
         // Pass 3 (serial): registry insertion + out-descriptor writes ONLY —
         // everything heavy already happened on the pool. Same P0 EOF/auto-
@@ -6211,30 +6479,44 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
         // directly out of the Arc-owned bytes.
         let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
             Arc::new(Mutex::new(None));
-        let owned_iter = match db_ref.scan_iter_owned_arc_with_error_slot(
-            cf_ref_,
-            lo,
-            hi_opt,
-            Arc::clone(&error_slot),
-        ) {
-            Ok(it) => it,
-            Err(_) => return FrsErrorCode::EngineIo as i32,
-        };
-        let error_slot_inner = Arc::clone(&error_slot);
-        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
-            Box::new(owned_iter.filter_map(move |r| match r {
-                Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
-                Err(e) => {
-                    // R18-M3 sticky-FIRST: preserve the earliest error per
-                    // chunk so cascade errors don't bury the root cause.
-                    let mut guard = error_slot_inner.lock().unwrap_or_else(|p| p.into_inner());
-                    if guard.is_none() {
-                        *guard = Some(e);
+        // S2 (flag ON): push-style range stream — see the prefix-open sister
+        // comment.
+        let mut handle_state = if forst_rs_engine::s2_pinned_enabled() {
+            match db_ref.range_scan_stream_with_error_slot(
+                cf_ref_,
+                lo,
+                hi_opt,
+                Arc::clone(&error_slot),
+            ) {
+                Ok(stream) => IterHandle::new_pinned_with_error_slot(stream, error_slot),
+                Err(_) => return FrsErrorCode::EngineIo as i32,
+            }
+        } else {
+            let owned_iter = match db_ref.scan_iter_owned_arc_with_error_slot(
+                cf_ref_,
+                lo,
+                hi_opt,
+                Arc::clone(&error_slot),
+            ) {
+                Ok(it) => it,
+                Err(_) => return FrsErrorCode::EngineIo as i32,
+            };
+            let error_slot_inner = Arc::clone(&error_slot);
+            let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+                Box::new(owned_iter.filter_map(move |r| match r {
+                    Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                    Err(e) => {
+                        // R18-M3 sticky-FIRST: preserve the earliest error per
+                        // chunk so cascade errors don't bury the root cause.
+                        let mut guard = error_slot_inner.lock().unwrap_or_else(|p| p.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(e);
+                        }
+                        None
                     }
-                    None
-                }
-            }));
-        let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
+                }));
+            IterHandle::new_with_error_slot(inner, error_slot)
+        };
 
         // Fill the first chunk lazily into the caller's buffer.
         let (bytes_used, row_count, iter_exhausted) =
