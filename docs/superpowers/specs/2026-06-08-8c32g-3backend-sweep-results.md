@@ -1502,3 +1502,21 @@ on a q17 flush (SST_BUFFER/ENCODE/SINKWRITE counters already exist) → pinpoint
 the cost is bloom build, file-size growth (2nd bloom → I/O), or reader-open bloom loads.
 STATE: every shipped lever is correctness-exact; q9/q20 wins intact and improved;
 q17's regression is bisected to one commit with a measurement plan to finish it.
+
+# ★★★ TERMINAL VERDICT on the q17 arc (2026-06-11 08:30): NO REGRESSION — 3× BOX NOISE
+The pre-bloom .so REPEAT: >300s DNF — the SAME binary that ran 99.8s an hour earlier.
+Complete q17@100M table (today, all drain-off or equivalent):
+pre-bloom: 99.8s, >300s | bloom-commit: 263.9 | current incl. all gates/fixes:
+190.1/203.1/210.9(clean-build)/228.1/228.9/244.9/267.9/280.0/>300.
+CONCLUSIONS: (1) NO lever ever robbed q17 — drain AND bloom fully exonerated;
+(2) q17 single-run noise on this box spans 3× WITHIN a day (and yesterday's 77-85s
+norm was another box-day) — q17-class verdicts require a stable box + repeated runs;
+(3) the drain default-off flip and all gate iterations were chasing noise — each left
+durable machinery (footer-v4 counts, feedback gate, alloc-free collector,
+degenerate-skip, spin fix) but none was NEEDED for q17;
+(4) the TRUSTWORTHY campaign results are the noise-immune ones: q9 DNF→FINISH
+(2001-2105s, 10× identical rows), q20 DNF→FINISH 1477.7s beats ForSt (exact rows),
+the monotone 8-run composition curve, and the 20/22 exactness gate.
+NEXT SESSION: decide the drain default on a FRESH box with n≥3 runs per cell;
+then OPT-N16 sink-threading; then OPT-N04. The box, not the engine, is now the
+binding constraint on fine-grained bar verdicts.
