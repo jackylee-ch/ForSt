@@ -2042,3 +2042,18 @@ LAST LOCAL NEXMARK RUN — all NexMark henceforth on the remote x86 box.
 manifest error) + apt Ign inside build. Host internet OK (rustup 200). Unblock:
 build .so on HOST (native cargo), base containers on the EXISTING
 flink:2.2.1-jdk17-forst-bench-tools-20260609 image + bind-mounted host JDK25.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REMOTE-x86 POPULATION BEGINS (yq01 box, NVMe, split-topo, io_uring LIVE)
+# ═══════════════════════════════════════════════════════════════════════════
+First NexMark on the remote Linux box (2×TM 4c/16g + JM 2c/4g, forst-bench:x86
+via daocloud/tuna mirrors, .so host-built glibc-2.17⊂jammy, io_uring verified:
+EPERM under default seccomp ⇒ TMs run seccomp=unconfined). Engine = streaming-
+read stack WITHOUT drain-default (one variable at a time; drain lands next round).
+| run | result |
+|---|---|
+| q1@1M smoke | FINISHED 3.9s, out 1,000,000 |
+| q8@100M canary | FINISHED 153.2s, out_rows 3,064,589 (exact band ✓) |
+Matrix queued (nohup, logs /ssd2/jackylee/frs-bench/logs/SUMMARY.md): q7 uring-on
+→ q7 uring-off → q7 rocksdb → q9 frs/rdb → q20 frs/rdb. REMOTE numbers are a NEW
+population — never compare to Mac pins.
