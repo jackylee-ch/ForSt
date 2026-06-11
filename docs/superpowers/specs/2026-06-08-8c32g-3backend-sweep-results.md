@@ -1710,3 +1710,17 @@ reads lost (fire side). q9@100M B-config A/B still RUNNING (its out_rows is its 
 CONCLUSION: mailbox overlap alone is NOT q9's lever — q9 needs MULTI-WORKER heavy regime
 (intra-batch fan-out) + overlap. Stage 2 of the two-regime design is the q9 path; Stage 0
 (race root-cause) blocks it. Recorded in the design's §7 PMC self-review.
+
+### ★★ STAGE-0 STREAM_STATS DIFFERENTIAL (6× q8 B-config, FRS_REENTRY_DIAG=2): SIGNAL FOUND
+out_rows (all wrong this round): 2,047,837 / 1,933,614 / 2,039,100 / 2,254,920 / 2,691,677 / 2,760,648.
+TWO INDEPENDENT EXACT EQUALITIES: run1 out_rows == LIST_ADD == 2,047,837; run5 out_rows ==
+LIST_ADD == 2,691,677 (harvest mixed stale logs for runs 2-4 — per-run isolation needed —
+but the two clean specimens establish the relationship). LIST_ADD PLATEAUS mid-run while
+CLEAR/LIST_GET keep growing.
+READING: the race is an INPUT-SIDE STALL, not execution row-loss — record processing
+throttles (AEC in-flight cap waiting on lost/late completions) while timer fires continue;
+the job emits exactly the adds that landed before their windows fired. Wedge and under-emit
+= same bug, different severity. STAGE-0 SCOPE NARROWED to the LIST_ADD
+offer→dispatch→per-row-completion chain under routing-async (amBuf/classifier-pool
+lifecycle + AEC trigger interaction). Next: per-run-isolated stats + completion-accounting
+diag + code audit of that one chain.
