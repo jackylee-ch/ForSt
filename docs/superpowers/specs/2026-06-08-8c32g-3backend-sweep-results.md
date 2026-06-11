@@ -1939,3 +1939,14 @@ two-regime executor does NOT rob q17 (the design's defining requirement). Both m
 above yesterday's 77s class: box-day shift + timer-fix tax, equal in both arms ⇒ the
 comparison stands. STAGE-3 ENGINE UNITS MERGED (b5b85a9b9): NumericAddMergeOperator
 (13 tests) + frs_vectorized_batch_mixed (5 tests; ffi 104/0, storage 372/0).
+
+# ★ NEW HARD TARGET (user, 2026-06-11): q9/q20 ≤ 1.05× RocksDB
+Reference (matrix, to be re-pinned same-day at verdict time): q9 RDB 1420.5s ⇒ target
+≤1491.5s (current best de-confounded ≈2060s ≡ pipelined minus fix-tax ⇒ gap ≈ −28%);
+q20 RDB 859.7s ⇒ target ≤902.7s (current 1477.7s ⇒ gap ≈ −39%).
+IN-SCOPE LEVER STACK (yield order): (1) timer-fix tax recovery via cache-merge (−16% q9,
+all timer queries — implementing now); (2) pipelining (−6%, have); (3) Unit-2 backend
+wiring (one mixed FFI crossing per batch); (4) post-fix re-profile of q9 AND q20 (q20
+never profiled!) with FRS_PERF → next levers (scan-open dedupe, AEC buffer-timeout audit,
+per-prefix iterator reuse — the engine read path is 33% CPU); (5) same-day RDB re-pin for
+the 1.05× verdicts. Runtime stays FROZEN.
