@@ -2093,3 +2093,20 @@ q20 pair started 03:20:01.
 ### REMOTE round-1: q20 frs = 2026.5s (out==src 93,199,688; remote datagen
 sharding shifts absolute counts vs Mac — pair validity = rdb arm must match
 this count). q20 rdb started 03:54:56 (last run of round 1).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★ REMOTE ROUND-1 COMPLETE (x86/NVMe/split-topo/io_uring; NO-drain tip)
+# ═══════════════════════════════════════════════════════════════════════════
+| query | frs | rocksdb | ratio | bar ≤1.25× |
+|---|---|---|---|---|
+| q8 canary ×2 | 153.2 / 170.1s (rows in-band) | — | — | canary PASS |
+| q7 | uring-ON 2376.4 FINISH; uring-OFF DNF@2400 | 1367.6 | 1.74× | FAIL |
+| q9 | 2421.2 (rows canonical EXACT) | 2121.2 | **1.14×** | **PASS** |
+| q20 | 2026.5 (out==src) | 1545.3 (out==src) | **1.31×** | near-miss |
+HEADLINES: (1) q9 PASSES the ≥0.8× bar on the production-like population (Mac
+1.63× → 1.14×); (2) q20 1.98× → 1.31× — drain-ON (round 2) targets the flip;
+(3) io_uring = finish-vs-DNF on q7; (4) q7 1.74× = the remaining architectural
+gap (S2 loser-tree in build + compaction-windowed next); (5) correctness: frs
+canonical-exact on q9 cross-arch; rdb −143 q9 rows (investigate round 2).
+ROUND 2 (gate matrix 2026-06-12-remote-gate-matrix.md): drain-ON+E5 tip,
+control-first q17, q3 point-get guard, q9/q20 pairs — launching.
