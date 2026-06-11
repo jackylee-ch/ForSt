@@ -154,3 +154,15 @@ found the latch; buy the same certainty before promising these queries.
 **Non-goals of this design:** q5 correctness; the q7 engine-iterator gap beyond what heavy-
 regime fan-out delivers; bar re-pinning (Stage 4 protocol: all three backends same-session,
 n≥3 on noise-prone queries).
+
+## 8. User acceptance + implementation constraints (2026-06-11)
+APPROVED for implementation with these binding conditions:
+1. **Full A/B gate after the complete implementation**: same-session back-to-back A/B
+   (old default vs two-regime) proving BOTH speed-up AND correctness (out_rows exactness
+   per query) before any default flip — in addition to the per-stage gates in §4.
+2. **Hard architectural constraints apply to every new code path**: end-to-end
+   vectorization, ZERO memory copy (no byte[] round-trips — sealed-staging drains and
+   write-batch payloads stay off-heap MemorySegments end to end; the multi-kind
+   write-batch FFI passes Arrow-layout columnar buffers, not per-op copies), and
+   BATCH-ONLY execution (no per-key/per-record engine crossings in the heavy regime;
+   drains and commits are one vectorized FFI call per worker per batch).
