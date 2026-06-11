@@ -283,3 +283,145 @@ addresses (iii); S2 addresses (i)+(ii):
 scan path and keeps SST→chunk at exactly one memcpy; no new copies are
 introduced anywhere (the `last_emitted` 32-byte scratch copy replaces an
 atomic refcount pair — net win). Batch/crossing protocol untouched.
+
+---
+
+## 6. §work-order (PMC cycle 4 — RD GO-ORDER, roadmap §5.4 item 3)
+
+Status: **GO.** E5 landed and APPROVED (`review-rounds/2026-06-12-pmc-review-e5.md`);
+the L2 lane is unblocked and S2 is the top modeled q20 lever (roadmap §5.3
+rank 2). Three commit-sized stages, strictly ordered; each commit must leave
+the tree green with the flag default-OFF.
+
+### 6.0 Two locked decisions (so RD does not relitigate)
+
+**D1 — RowSink emit boundary: push-style `fill_into(&mut dyn RowSink)`
+(W1c as specced) is THE boundary. DECIDED.** Rationale against the two
+alternatives:
+- *Pull-style lending iterator* (`next() -> Option<(&[u8], &[u8])>`) is the
+  textbook shape but cannot be boxed as today's
+  `Box<dyn Iterator<Item = (IterKey, IterValue)>>` without GAT/lending
+  machinery, and it hands the caller a borrow that can dangle across the
+  next `next()` — exactly the bug class the kv_block scratch finding (§1)
+  punishes. Rejected.
+- *Keep Arc pairs at the boundary* re-pays the two per-row allocations at
+  emit, deleting W1's entire (ii) win. Rejected.
+- Push-style wins because the borrow scope is syntactically enclosed in the
+  `sink.push(key, value) -> bool` call (no escape possible — the §2.1 W1c
+  borrow-soundness argument only has to hold for the duration of one call);
+  the FFI consumer already memcpys immediately (`fill_chunk_from_iter`,
+  lib.rs:5071 — one `copy_nonoverlapping` per field), so SST→chunk stays
+  exactly one copy; and `push -> false` maps 1:1 onto the existing
+  chunk-full backpressure. In-process callers (engine tests, `prefix_scan`
+  collector, q0-q22 byte-equiv harness) use the Arc-pair compat adapter
+  OVER `fill_into` — off the hot path.
+
+**D2 — per-block key arena is MANDATORY for v2 KV blocks, not an
+optimization. DECIDED** (the §1 kv_block scratch finding):
+`KvBlock::for_each_row` reconstructs prefix-compressed keys into a reused
+scratch `key_buf` (kv_block.rs:308-317, `read_row_at` :485-488) — `view.key`
+is dead the moment the callback returns, so pinning the `DecodedBlock` alone
+is sound for VALUES only. Every stage-1/2 reviewer checklist item touching
+keys must verify: v2 keys → `SliceRef::Arena` (copied once into the
+caller-owned `key_arena`, §2.1 W1a), v2 values → `SliceRef::Block`
+(payload-stable, kv_block.rs:203-210), v1 Arrow keys AND values →
+`SliceRef::Block` (BinaryArray buffers are stable; arena stays empty).
+A stage that lets a v2 key escape as a Block ref is a memory-safety bug the
+G1 property test must be constructed to catch (assert byte-equality AFTER
+the full block walk completes, not per-row).
+
+### 6.1 The bench gates — which criterion benches proxy the 21.6 % share
+
+The recorded q20 prefix-scan share (roadmap §1.2) cannot be re-measured per
+commit; these four existing benches decompose it and are the per-stage gates
+(all in `crates/forst-rs-bench/benches/`, run n≥3 same-session, compare
+median):
+
+| Bench (criterion id) | What it proxies | S2 component it gates |
+|---|---|---|
+| `ffi_vectorized/iter_drain/ffi_chunked_drain_100x1000` (ffi_vectorized.rs:605) | per-row emit cost through the FULL path (merge → decision → fill_chunk → crossing); post-E5 baseline **151.8 ns/row** | (ii) the 2 allocs/row + W1c emit boundary |
+| `ffi_vectorized/iter_open_batch/ffi_open_batch_parallel_k64` (ffi_vectorized.rs:622) | probe-open + scan build (locator, source build, first replenish); baseline **104.2 µs/probe** | W1b replenish restructure must not bloat open |
+| `join_probe_open/ssts_{1,8,32,64,128}` (join_probe_open.rs:87) | the q20 interval-join probe shape with a FAN-OUT SWEEP — every SST spans the probed range so the locator can't prune; ssts_64/128 are the only micro cells where O(sources)-twice vs log₂ separates | (i) W2 loser tree (64/128 cells); the n≤4 linear-branch guard (1/8 cells) |
+| `rocksdb_compare/hot_prefix_churn` + `range_scan_multilevel` (rocksdb_compare.rs:329, :240) | dup/tombstone-heavy churn (Phase-B drain) and multilevel merge, with the rocksdb reference number alongside | W2 dup-drain; cross-check vs rocksdb does not regress |
+
+Known measurement gap, accepted: `join_probe_open` drains via
+`prefix_scan_iter_owned_arc` (the in-process Arc API), so post-W1c it
+measures the COMPAT ADAPTER, not the raw sink path. Stage 2 therefore adds
+one bench cell driving `fill_into` directly (sink = byte-counting no-op) so
+the adapter tax is itself measured — do NOT silently rewire the existing
+cell (it is the continuity series).
+
+### 6.2 Stage S2-1 — storage ranges visitor (W1a + W1a′), additive only
+
+- **Code:** `for_each_row_ranges` + `RowRanges` in
+  `crates/forst-rs-storage/src/sst/kv_block.rs` (~120 LoC), reusing the
+  `read_row_at` decode walk; v1 ranges twin over `RecordBatch` in
+  `sst/reader.rs` OR the engine-side downcast helper (~60 LoC — pick
+  whichever keeps the BinaryArray offset math in ONE place). No engine call
+  sites yet; zero behavior change.
+- **Tests (gate to commit):** G1 property test — ranges-visitor vs
+  `for_each_row` byte-equality over randomized blocks: v1+v2, compression
+  on/off, and the prefix-compression edges (shared-prefix > previous arena
+  tail; restart-point boundaries; single-row block; tombstone rows yield
+  `val=None`). Per D2: equality asserted after the full walk (arena offsets
+  resolved at the end), not per-row. Full storage suite green.
+- **Bench gate:** none (additive API, nothing calls it). Do not run the
+  matrix for this commit.
+
+### 6.3 Stage S2-2 — engine pinned replenish + sink emit (W1b + W1c), flag-gated
+
+- **Code:** `SstBlockBuf`/`RowMeta`/`SliceRef` replacing `buffered`/`pos` in
+  `TierKeySource::Sst` (db.rs:10614-10744, ~150 LoC); `fill_into`/`RowSink`,
+  `ValueDecision::Put(SourceIdx)`, `last_emitted` → reused `Vec<u8>`+`bool`,
+  Arc-pair compat adapter (db.rs:10808-11009 + ffi/lib.rs:5071/:5224,
+  ~200 LoC); flag `FRS_RS_S2_PINNED` default OFF selecting old/new at
+  iterator build. Preserve verbatim: replenish filter order
+  (below-lower skip → upper-bound `hit_upper` + `fetcher.terminate()`
+  contract → within-block dedup), Phase A/B/C decision procedure, sticky
+  `record_peek_error` semantics. W3 diag counters land HERE (rows emitted,
+  allocs-on-SST-Put-path, merge comparisons; behind `FRS_ITER_DIAG`) —
+  stage 3's gate needs the comparison counter pre-existing.
+- **Tests (gate to commit):** engine suite green BOTH flag states; a
+  flag-ON vs flag-OFF byte-equality engine test over a multi-tier fixture
+  (memtable + L0 + L1, dups, tombstones, merge ops — reuse the E5 fixture
+  builders); the W3 alloc counter reads 0 on the SST-Put path flag-ON
+  (falsifier §4.1); leak check — drop the iterator mid-drain and assert pin
+  release (no `Arc<KvBlock>` outstanding past `drop_inner`).
+- **Bench gates (flag ON vs OFF, n≥3):** `iter_drain` ≤ baseline (model
+  says measurably below 151.8; HARD gate is no-regress, report the delta);
+  `iter_open_batch` within noise of 104.2; `join_probe_open` ssts_1/8
+  within noise (adapter tax visible here — if ssts_1 regresses > noise the
+  adapter is too fat, fix before commit); NEW direct-`fill_into` cell added
+  per §6.1.
+
+### 6.4 Stage S2-3 — loser tree (W2)
+
+- **Code:** tournament tree keyed `(head_key, tier_rank, seq DESC)` (new
+  `loser_tree` module or inline, ~180 LoC); n≤4 build-time linear branch;
+  dup-drain by pop-while-equal; errored source = drained (sticky-first
+  recording unchanged). Flag stays `FRS_RS_S2_PINNED` (one flag for the
+  whole S2 unit — the tree only exists on the new path, so the A/B stays
+  two-way and the byte-equiv harness needs no third state).
+- **Tests (gate to commit):** G1 equivalence — loser-tree vs linear-scan
+  merge over randomized multi-tier fixtures (same-key cross-tier with
+  memtable-presence, max-seq SST tie-breaks, tombstones, merge-op fallback,
+  dedup-past-last_emitted, source error mid-stream, n∈{1..64} sources
+  crossing the n≤4 branch both ways); full suites both flag states.
+- **Bench gates (n≥3):** `join_probe_open` ssts_64/128 improved (the log₂
+  cells — model predicts ~3× on the merge step; HARD gate: ≥ measurable
+  improvement outside noise, report vs model); ssts_1/8 within noise (the
+  linear-branch guard — falsifier §4.3: a regression here means the
+  threshold is wrong, not S2); `iter_drain` + `hot_prefix_churn` no-regress;
+  W3 comparison counter shows the `(1+dups)·log₂n` vs `2n+dup·n` drop on a
+  64-source fixture (cheap mechanical confirmation the tree is actually
+  engaged).
+
+### 6.5 After stage 3 (not per-commit)
+
+G2 q0-q22 @5M byte-equiv sweep flag-ON vs OFF → then the Linux-box @100M
+program: G3 (q3/q4 no-regress ×3), G4 (RSS steady q9@100M — pins must not
+accumulate), G5 (q20/q9 ×3 A/B vs same-day baseline, report vs §4 model:
+q20 −9..13 %, q9 −4..8 %). Flag default-ON is a SEPARATE decision commit
+gated on G2-G5, per the L1-drain-gate precedent. §4 falsifier 2 stays
+binding: if q20 < −4 % and the scan share is still ≥ 15 %, STOP S2
+follow-ups (no SoA, no arena-on-pool §2.4) and run L4/L0 first.
