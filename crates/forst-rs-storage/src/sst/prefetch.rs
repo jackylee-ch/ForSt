@@ -53,7 +53,7 @@
 //! windows are common and the decoded cache hit is the cheapest read.
 
 use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use forst_rs_common::{ForstError, ForstResult};
@@ -164,11 +164,14 @@ fn read_io_pool() -> &'static ReadIoPool {
     })
 }
 
+/// Result type a window-production job sends back through its oneshot.
+type WindowResult = ForstResult<Vec<DecodedBlock>>;
+
 /// §2.1.4: oneshot slot for an in-flight window production. Dropping the
 /// receiver (iterator closed/aborted) makes the producer's `send` fail and
 /// the decoded window is discarded — safe cancellation.
 struct PrefetchHandle {
-    rx: Receiver<ForstResult<Vec<DecodedBlock>>>,
+    rx: Receiver<WindowResult>,
     /// `[start, end)` block indices this handle will produce.
     range: (usize, usize),
 }
@@ -361,10 +364,7 @@ impl BlockPrefetcher {
         };
         let reader = Arc::clone(&self.reader);
         // Rendezvous-free oneshot: capacity 1 so the producer never blocks.
-        let (tx, rx): (
-            SyncSender<ForstResult<Vec<DecodedBlock>>>,
-            Receiver<ForstResult<Vec<DecodedBlock>>>,
-        ) = std::sync::mpsc::sync_channel(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WindowResult>(1);
         read_io_pool().submit(Box::new(move || {
             let result = fetch_window(&reader, start, end, priority);
             // Receiver dropped (iterator closed/aborted) ⇒ result discarded.
