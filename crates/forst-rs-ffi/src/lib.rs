@@ -5726,82 +5726,160 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
             return first_err;
         }
 
-        // Pass 2 (PARALLEL, BUILD-ONLY): open every valid probe's iterator across the read pool.
-        // Returns LAZY iterators — no rows are drained/materialized here (zero-copy: the prior
-        // batch_prefix_scan_parallel full-drain materialized owned Vecs per entry, an alloc+copy
-        // that collapsed at scale and violated the zero-copy mandate). Only the eager BUILD
-        // (overlapping-SST locate + reader open = the `sstloop` cost) runs in parallel.
-        let iters = db_ref.batch_open_prefix_iters_parallel(cf_ref_, &valid_prefixes);
+        // Pass 2 (PARALLEL, BUILD + FIRST-CHUNK FILL — P1, streaming-read
+        // redesign §2.3): one pool job per valid probe does the iterator BUILD
+        // (overlapping-SST locate + reader open) AND the first-chunk fill
+        // (block I/O + decompress + k-way merge + memcpy into the probe's own
+        // caller buffer) AND the EOF/error decision. Pre-P1 only the build was
+        // parallel; the fill — the whole cost of the dominant exhausted-in-
+        // one-chunk probe — ran serially on this FFI thread.
+        //
+        // Safety of the cross-thread fill: each probe writes EXCLUSIVELY into
+        // its own caller-provided chunk buffer (`chunkData[i*cap..(i+1)*cap]`
+        // slices on the Java side — disjoint by construction); the buffers are
+        // valid for the whole call because we JOIN all jobs (drain exactly K
+        // results) before returning; the `IterHandle` is confined to its pool
+        // job until handed back through the channel, then registered serially
+        // in Pass 3. Out-descriptor (`FrsChunk`/handle array) writes stay
+        // SERIAL in Pass 3 — pool jobs never touch them.
+        struct SendMutPtr(*mut u8);
+        // SAFETY: the wrapped pointer is a caller-owned buffer that outlives
+        // the FFI call; each pointer is written by exactly ONE pool job
+        // (disjoint buffers), so sharing the (read-only) table is sound.
+        unsafe impl Send for SendMutPtr {}
+        unsafe impl Sync for SendMutPtr {}
 
-        // Pass 3 (serial): wrap each lazy iterator + fill its first chunk into the caller buffer +
-        // register — IDENTICAL to the serial frs_vec_iter_prefix_open_batch drain (zero-copy
-        // IterKey/Value::Arc, streamed; engine errors land in the per-probe slot). Unsafe pointer
-        // writes stay single-threaded; only the build above was parallel.
-        for (vi, res) in iters.into_iter().enumerate() {
-            let i = valid_indices[vi];
-            let chunk = &mut chunks_out[i];
-            let buf_ptr = chunk.buf_ptr;
-            let buf_cap = chunk.buf_cap as usize;
-            match res {
-                Err(e) => {
-                    if first_err == FrsErrorCode::Ok as i32 {
-                        first_err = error_to_frs_code(&e);
-                    }
-                }
-                Ok(owned_iter) => {
-                    let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
-                        Arc::new(Mutex::new(None));
-                    let slot_inner = Arc::clone(&error_slot);
-                    let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
-                        Box::new(owned_iter.filter_map(move |r| match r {
-                            Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
-                            Err(e) => {
-                                let mut guard =
-                                    slot_inner.lock().unwrap_or_else(|p| p.into_inner());
-                                if guard.is_none() {
-                                    *guard = Some(e);
+        /// Per-probe outcome computed on the pool worker; consumed serially in Pass 3.
+        struct ProbeFill {
+            /// `Some` ⇒ register on the shard registry (continuation or
+            /// deferred/terminal error); `None` ⇒ build error or auto-closed EOF.
+            handle_state: Option<IterHandle>,
+            row_count: u32,
+            bytes_used: u32,
+            /// Clean exhausted-in-first-chunk ⇒ FRS_CHUNK_EOF, unregistered handle.
+            eof: bool,
+            /// Error code to fold into `first_err` (build error or zero-row fill error).
+            err_code: Option<i32>,
+            /// Build failed ⇒ `handles_out[i]` stays 0 (legacy per-row failure marker).
+            build_failed: bool,
+        }
+
+        let bufs: Arc<Vec<(SendMutPtr, usize)>> = Arc::new(
+            valid_indices
+                .iter()
+                .map(|&i| {
+                    let c = &chunks_out[i];
+                    (SendMutPtr(c.buf_ptr), c.buf_cap as usize)
+                })
+                .collect(),
+        );
+        let job_bufs = Arc::clone(&bufs);
+        let fills = db_ref.batch_open_prefix_iters_parallel_map(
+            cf_ref_,
+            &valid_prefixes,
+            move |vi, built| -> ProbeFill {
+                match built {
+                    Err(e) => ProbeFill {
+                        handle_state: None,
+                        row_count: 0,
+                        bytes_used: 0,
+                        eof: false,
+                        err_code: Some(error_to_frs_code(&e)),
+                        build_failed: true,
+                    },
+                    Ok(owned_iter) => {
+                        // IDENTICAL wrap + fill + error state machine to the
+                        // serial frs_vec_iter_prefix_open_batch drain (zero-copy
+                        // IterKey/Value::Arc, streamed; engine errors land in
+                        // the per-probe slot) — just running on a pool worker.
+                        let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+                            Arc::new(Mutex::new(None));
+                        let slot_inner = Arc::clone(&error_slot);
+                        let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+                            Box::new(owned_iter.filter_map(move |r| match r {
+                                Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                                Err(e) => {
+                                    let mut guard =
+                                        slot_inner.lock().unwrap_or_else(|p| p.into_inner());
+                                    if guard.is_none() {
+                                        *guard = Some(e);
+                                    }
+                                    None
                                 }
-                                None
+                            }));
+                        let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
+                        let (buf_ptr, buf_cap) = {
+                            let b = &job_bufs[vi];
+                            (b.0 .0, b.1)
+                        };
+                        // SAFETY: this probe's exclusive, caller-owned buffer
+                        // (see SendMutPtr rationale above); valid for the call.
+                        let (bytes_used, row_count, iter_exhausted) =
+                            unsafe { fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap) };
+                        if iter_exhausted {
+                            handle_state.drop_inner();
+                        }
+                        let mut err_code = None;
+                        let mut error_pending = false;
+                        if let Some(err) = handle_state.take_last_error() {
+                            error_pending = true;
+                            if row_count == 0 {
+                                err_code = Some(error_to_frs_code(&err));
+                                handle_state.mark_terminal();
+                            } else {
+                                handle_state.set_deferred_error(err);
                             }
-                        }));
-                    let mut handle_state = IterHandle::new_with_error_slot(inner, error_slot);
-                    let (bytes_used, row_count, iter_exhausted) =
-                        fill_chunk_from_iter(&mut handle_state, buf_ptr, buf_cap);
-                    if iter_exhausted {
-                        handle_state.drop_inner();
-                    }
-                    let mut error_pending = false;
-                    if let Some(err) = handle_state.take_last_error() {
-                        error_pending = true;
-                        if row_count == 0 {
-                            if first_err == FrsErrorCode::Ok as i32 {
-                                first_err = error_to_frs_code(&err);
-                            }
-                            handle_state.mark_terminal();
-                        } else {
-                            handle_state.set_deferred_error(err);
+                        }
+                        let eof = iter_exhausted && !error_pending;
+                        ProbeFill {
+                            handle_state: if eof { None } else { Some(handle_state) },
+                            row_count,
+                            bytes_used,
+                            eof,
+                            err_code,
+                            build_failed: false,
                         }
                     }
-                    // P0 EOF + AUTO-CLOSE — same contract as the serial
-                    // `frs_vec_iter_prefix_open_batch` drain above: flag EOF,
-                    // return a fresh non-zero UNREGISTERED handle, skip the
-                    // registry insert. EOF is never flagged with an error
-                    // pending (deferred-error probes keep the registered
-                    // handle so `_next` surfaces the error).
-                    let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if iter_exhausted && !error_pending {
-                        chunk._reserved = FRS_CHUNK_EOF;
-                    } else {
-                        shard_for(handle_id)
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(handle_id, handle_state);
-                    }
-                    handles_out[i] = handle_id;
-                    chunk.row_count = row_count;
-                    chunk.bytes_used = bytes_used;
+                }
+            },
+        );
+
+        // Pass 3 (serial): registry insertion + out-descriptor writes ONLY —
+        // everything heavy already happened on the pool. Same P0 EOF/auto-
+        // close contract as the serial batch drain.
+        for (vi, fill) in fills.into_iter().enumerate() {
+            let i = valid_indices[vi];
+            let chunk = &mut chunks_out[i];
+            let Some(fill) = fill else {
+                // Pool worker dropped its result (panic) — mirror the engine
+                // sibling's internal-error mapping; per-row failure marker.
+                if first_err == FrsErrorCode::Ok as i32 {
+                    first_err = FrsErrorCode::EngineIo as i32;
+                }
+                continue;
+            };
+            if let Some(code) = fill.err_code {
+                if first_err == FrsErrorCode::Ok as i32 {
+                    first_err = code;
                 }
             }
+            if fill.build_failed {
+                // handles_out[i] stays 0 (pre-zeroed in Pass 1).
+                continue;
+            }
+            let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(handle_state) = fill.handle_state {
+                shard_for(handle_id)
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(handle_id, handle_state);
+            } else {
+                debug_assert!(fill.eof);
+                chunk._reserved = FRS_CHUNK_EOF;
+            }
+            handles_out[i] = handle_id;
+            chunk.row_count = fill.row_count;
+            chunk.bytes_used = fill.bytes_used;
         }
 
         first_err
@@ -9221,6 +9299,147 @@ mod tests {
             for h in &handles {
                 assert_eq!(frs_vec_iter_prefix_close(*h), FrsErrorCode::Ok as i32);
             }
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// P1 (parallel first-chunk fill): the batched-parallel open — whose
+    /// build AND first-chunk fill now run concurrently on the read pool —
+    /// must return results byte-identical to the serial batched open, in
+    /// input order, for a batch larger than the pool (16 probes > 4 workers)
+    /// whose probes mix: empty results, single-chunk (auto-closed EOF), and
+    /// multi-chunk continuations, over memtable + flushed-SST tiers. The
+    /// full drain (first chunk + continuation `next()`s) is compared
+    /// per-probe between the two paths.
+    #[test]
+    fn vec_iter_prefix_open_batch_parallel_fill_matches_serial_full_drain() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            // 16 probes: probe i gets `i * 3 % 17` rows (0..15×ish — includes
+            // empty, small, and >CHUNK_CAP multi-chunk result sets). Half the
+            // data is flushed to an SST, the rest stays in the memtable, so
+            // the pool-side fill exercises the block-streaming tier path.
+            const N: usize = 16;
+            const CHUNK_CAP: u32 = 128;
+            let prefixes: Vec<Vec<u8>> = (0..N).map(|i| format!("pp{:02}/", i).into_bytes()).collect();
+            let rows_for = |i: usize| (i * 3) % 17;
+            for (i, p) in prefixes.iter().enumerate() {
+                for r in 0..rows_for(i) {
+                    let mut k = p.clone();
+                    k.extend_from_slice(format!("{:04}", r).as_bytes());
+                    let v = format!("value-{:02}-{:04}", i, r);
+                    assert_eq!(
+                        frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len()),
+                        FRS_STATUS_OK
+                    );
+                }
+                if i == N / 2 {
+                    // Flush the first half into an SST tier.
+                    assert_eq!(frs_flush(db), FRS_STATUS_OK);
+                }
+            }
+
+            let mut offs: Vec<u32> = vec![0];
+            let mut data: Vec<u8> = Vec::new();
+            for p in &prefixes {
+                data.extend_from_slice(p);
+                offs.push(data.len() as u32);
+            }
+
+            // Full drain of one batched-open variant: open + per-probe
+            // continuation next()s + close (when not auto-closed).
+            type BatchOpenFn = unsafe extern "C" fn(
+                FrsDb,
+                FrsCfHandle,
+                *const u32,
+                *const u8,
+                u32,
+                *mut u64,
+                *mut FrsChunk,
+                u32,
+            ) -> i32;
+            let drain_all = |open_batch: BatchOpenFn| -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+                let mut chunk_storage: Vec<Vec<u8>> =
+                    (0..N).map(|_| vec![0u8; CHUNK_CAP as usize]).collect();
+                let mut chunks: Vec<FrsChunk> = (0..N)
+                    .map(|i| FrsChunk {
+                        buf_ptr: chunk_storage[i].as_mut_ptr(),
+                        buf_cap: CHUNK_CAP,
+                        row_count: 0,
+                        bytes_used: 0,
+                        _reserved: 0xABAD_1DEA,
+                    })
+                    .collect();
+                let mut handles: Vec<u64> = vec![0; N];
+                let rc = open_batch(
+                    db,
+                    cf,
+                    offs.as_ptr(),
+                    data.as_ptr(),
+                    N as u32,
+                    handles.as_mut_ptr(),
+                    chunks.as_mut_ptr(),
+                    CHUNK_CAP,
+                );
+                assert_eq!(rc, FrsErrorCode::Ok as i32);
+                let mut all = Vec::with_capacity(N);
+                for i in 0..N {
+                    assert_ne!(handles[i], 0, "probe {} handle", i);
+                    let mut rows = decode_chunk_buf(
+                        &chunk_storage[i],
+                        chunks[i].bytes_used,
+                        chunks[i].row_count,
+                    );
+                    let eof = chunks[i]._reserved & FRS_CHUNK_EOF != 0;
+                    if !eof {
+                        loop {
+                            let mut n_rows: u32 = 0;
+                            let mut n_bytes: u32 = 0;
+                            let rcn = frs_vec_iter_prefix_next(
+                                handles[i],
+                                chunk_storage[i].as_mut_ptr(),
+                                CHUNK_CAP,
+                                &mut n_rows,
+                                &mut n_bytes,
+                            );
+                            assert_eq!(rcn, FrsErrorCode::Ok as i32);
+                            if n_rows == 0 {
+                                break;
+                            }
+                            rows.extend(decode_chunk_buf(&chunk_storage[i], n_bytes, n_rows));
+                        }
+                        assert_eq!(
+                            frs_vec_iter_prefix_close(handles[i]),
+                            FrsErrorCode::Ok as i32
+                        );
+                    }
+                    all.push(rows);
+                }
+                all
+            };
+
+            let serial = drain_all(frs_vec_iter_prefix_open_batch);
+            let parallel = drain_all(frs_vec_iter_prefix_open_batch_parallel);
+            assert_eq!(serial.len(), N);
+            for i in 0..N {
+                assert_eq!(
+                    serial[i].len(),
+                    rows_for(i),
+                    "probe {} row count (serial)",
+                    i
+                );
+                assert_eq!(
+                    serial[i], parallel[i],
+                    "probe {} parallel fill must be byte-identical to serial",
+                    i
+                );
+            }
+
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }

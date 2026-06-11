@@ -6189,6 +6189,89 @@ impl DbImpl {
             .collect()
     }
 
+    /// P1 (streaming-read redesign §2.3): parallel batched prefix-iterator
+    /// open **plus per-probe post-processing on the pool thread**.
+    ///
+    /// [`Self::batch_open_prefix_iters_parallel`] fans out only the iterator
+    /// BUILD; its caller (the FFI batch-open) then drained every probe's
+    /// first chunk SERIALLY on the single FFI-calling thread — i.e. all block
+    /// I/O + decompression + k-way merge + memcpy of the dominant
+    /// exhausted-in-one-chunk probe ran on 1 core. This variant runs the
+    /// caller-supplied `f(probe_index, build_result)` INSIDE the same pool
+    /// job, immediately after the build, so the first-chunk fill executes on
+    /// the read pool too (`min(cores,4)` workers, `FRS_RS_READ_IO_PARALLELISM`)
+    /// — the engine-side equivalent of ForSt's `read-io-parallelism` covering
+    /// the drain, not just the build.
+    ///
+    /// Results are returned in INPUT ORDER. `None` marks a probe whose pool
+    /// worker dropped its result (worker panic) — the caller maps it to an
+    /// internal error, mirroring the sibling method's behaviour. `f` must be
+    /// `Sync` (shared across workers via `Arc`) and is invoked exactly once
+    /// per probe with the probe's index into `prefixes`.
+    pub fn batch_open_prefix_iters_parallel_map<R, F>(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefixes: &[&[u8]],
+        f: F,
+    ) -> Vec<Option<R>>
+    where
+        R: Send + 'static,
+        F: Fn(
+                usize,
+                ForstResult<
+                    Box<dyn Iterator<Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>> + Send + 'static>,
+                >,
+            ) -> R
+            + Send
+            + Sync
+            + 'static,
+    {
+        let k = prefixes.len();
+        if k == 0 {
+            return Vec::new();
+        }
+        // Single probe: run inline — fan-out + channel overhead would only cost.
+        if k == 1 {
+            let r = self.prefix_scan_iter_owned_arc(cf, prefixes[0]);
+            return vec![Some(f(0, r))];
+        }
+        let pool = bg_read_pool();
+        let f = Arc::new(f);
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (i, p) in prefixes.iter().enumerate() {
+            let me = Arc::clone(self);
+            let cf = cf.clone();
+            // Own the prefix bytes so the job is 'static (small composite state
+            // key — the only copy on this path).
+            let prefix = p.to_vec();
+            let tx = tx.clone();
+            let f = Arc::clone(&f);
+            pool.submit(Box::new(move || {
+                // Build (eager locate + reader open) AND the caller's
+                // post-processing (FFI: first-chunk fill + EOF decision) both
+                // run here, on the pool worker.
+                let built = me.prefix_scan_iter_owned_arc(&cf, &prefix);
+                let r = f(i, built);
+                // The receiver drains exactly K results below, so send only
+                // fails if the receiver bailed early (worker-panic path).
+                let _ = tx.send((i, r));
+            }));
+        }
+        drop(tx);
+        let mut out: Vec<Option<R>> = (0..k).map(|_| None).collect();
+        let mut filled = 0usize;
+        while filled < k {
+            match rx.recv() {
+                Ok((i, r)) => {
+                    out[i] = Some(r);
+                    filled += 1;
+                }
+                Err(_) => break, // all senders dropped (a worker panicked)
+            }
+        }
+        out
+    }
+
     /// Streaming form of [`Self::prefix_scan`].
     ///
     /// PR-B5-H2 / C8-H1: lazy k-way merge across ALL three LSM tiers
