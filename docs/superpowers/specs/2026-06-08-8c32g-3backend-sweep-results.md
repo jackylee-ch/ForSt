@@ -1898,3 +1898,15 @@ The two-regime design's Stage-2 "cross-worker race" never existed — it was the
 **q9@100M BAR RUN LAUNCHED**: routing-async (3 workers) + drain200K. Same-day reference:
 2215.6s (today's control, perf-overhead included); cross-day band 2001-2105; bar 1776s.
 Correctness gate rides along: out_rows must equal 91,813,372 (12th identical).
+
+### q9@100M multi-worker PIPELINED (post-timer-fix): 2423.4s, rows EXACT (12th identical)
+CORRECTNESS at 100M under full multi-worker non-blocking: ✓ (out_rows=91,813,372).
+PERF: SLOWER than the blocking same-day control 2215.6s (pre-fix). CONFOUNDED: (a) the
+timer fix honors more refill floors ⇒ re-read cost on timer-heavy queries (all post-fix
+runs trend slower); (b) staging buffers + caches are OFF under routing-async (B-spike
+gates) while the control had staging ON; (c) pipelining itself. FALSIFIED: the
+"6.3 idle cores" extrapolation — mailbox overlap cannot break q9's PER-KEY serial chains
+(KeyAccounting); the latch cost ceiling was the ~6% unpark share, not 20%.
+DE-CONFOUND NEXT: q9 BLOCKING routing post-fix (control config + fix) isolates the fix's
+cost. q9's real levers revert to: chain-shortening (OPT-N04 merge-op kills the dependent
+GET→PUT), staging absorption under load, iterator cost — the banked Stage-3 work.
