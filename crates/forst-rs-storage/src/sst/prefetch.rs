@@ -29,8 +29,11 @@
 //!    starts at `ra_blocks = 2`, doubling each window up to a cap:
 //!    - local files (`RandomAccessFile::is_local() == true`): cap 256 KiB
 //!      (4 × 64 KiB blocks), ramp after 2 consumed blocks;
-//!    - remote/evicted files: cap 4 MiB (64 blocks), ramp after the FIRST
-//!      block (a GetObject round-trip has high fixed cost).
+//!    - remote/evicted files: cap 4 MiB (64 blocks — a GetObject round-trip
+//!      has high fixed cost, so ramped windows go deep), ramp after 2
+//!      consumed blocks like local (M2: ramping after the FIRST block made
+//!      every 1-block probe over an evicted SST speculate remotely,
+//!      violating "R-short never speculates").
 //! 3. **Multi-block reads**: one positional read spanning the window's
 //!    physically contiguous blocks (the sparse index gives exact offset+size
 //!    per block); per-block regions are sliced out of the single buffer.
@@ -71,11 +74,23 @@ const REMOTE_CAP_BYTES: u64 = 4 * 1024 * 1024;
 /// additionally byte-trimmed against the caps above for other block sizes).
 const LOCAL_CAP_BLOCKS: u32 = 4;
 const REMOTE_CAP_BLOCKS: u32 = 64;
-/// Sequential blocks consumed before the ramp starts.
+/// Sequential blocks consumed before the ramp starts. BOTH regimes require 2
+/// consumed blocks (M2, 2026-06-11 PMC review): ramping remote after the
+/// FIRST block violated the "R-short never speculates" invariant on the
+/// evicted tier — every 1-block probe over an evicted SST issued a
+/// speculative 2-block remote read. The remote regime keeps its DEEPER cap
+/// (4 MiB / 64 blocks) once sequentiality is actually established.
 const LOCAL_RAMP_AFTER: u32 = 2;
-const REMOTE_RAMP_AFTER: u32 = 1;
+const REMOTE_RAMP_AFTER: u32 = 2;
 /// Ramped prefetch inserts at `Bottom` once the window is at least this deep.
 const BOTTOM_PRIORITY_RA: u32 = 4;
+/// H1 (2026-06-11 PMC review): generous upper bound `next_decoded` may wait
+/// for an in-flight window before giving up. Pool workers survive job panics
+/// (catch_unwind), so this only fires on a queued-but-never-run / wedged job;
+/// it converts a would-be infinite hang of the consuming (FFI/task) thread
+/// into a `ForstError::TimedOut`. 300s is far above any legitimate window
+/// fetch (µs-ms local, ms-class remote) yet below an operator-visible wedge.
+const POOL_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Runtime kill-switch: `FRS_RS_BLOCK_PREFETCH=0|false` disables speculation
 /// entirely (every block demand-fetched — the pre-§2.1 behaviour, modulo the
@@ -86,6 +101,41 @@ fn prefetch_enabled() -> bool {
         !matches!(
             std::env::var("FRS_RS_BLOCK_PREFETCH").ok().as_deref(),
             Some("0") | Some("false") | Some("FALSE")
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// M3 (2026-06-11 PMC review): aggregate prefetch-memory TELEMETRY (no
+// enforcement yet). Tens of concurrently-open sources × (4 MiB ready +
+// 4 MiB inflight) is an uncounted ~0.5 GB/iterator worst case on the
+// 8c/32g box — this counter makes the budget observable on 100M runs.
+// ---------------------------------------------------------------------------
+
+/// Global aggregate of prefetcher-held bytes (on-disk block sizes), covering
+/// BOTH claimed-but-undelivered `ready` blocks and submitted in-flight
+/// windows, across every live [`BlockPrefetcher`] in the process.
+/// Incremented at window submit; balance moves from inflight to ready at
+/// claim (no net change); decremented at block delivery, window failure,
+/// [`BlockPrefetcher::terminate`], and prefetcher drop.
+static PREFETCH_BUFFERED_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Current aggregate of prefetcher ready+inflight bytes (M3 telemetry).
+/// Sizes are on-disk (pre-decompression) block bytes — the I/O-side budget.
+pub fn prefetch_buffered_bytes() -> usize {
+    PREFETCH_BUFFERED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Diag gate shared with the read-path instrumentation (`FRS_READ_AT_DIAG=1`,
+/// cached_fs.rs): when set, each window submit logs the aggregate so 100M
+/// runs can watch the prefetch memory budget.
+fn prefetch_diag() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_READ_AT_DIAG").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
         )
     })
 }
@@ -129,7 +179,14 @@ impl ReadIoPool {
                             q = sh.cv.wait(q).unwrap_or_else(|p| p.into_inner());
                         }
                     };
-                    job();
+                    // H1 (2026-06-11 PMC review): a panicking window job must
+                    // not kill the worker — a fixed-size pool with dead
+                    // workers eventually strands queued jobs forever, hanging
+                    // every consumer blocked in `next_decoded`. The panic is
+                    // contained; the job's oneshot `SyncSender` is dropped
+                    // during unwind, so the waiting consumer observes a
+                    // disconnect and converts it to a `ForstError`.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                 })
                 .expect("failed to spawn frs-readahead worker");
         }
@@ -174,6 +231,9 @@ struct PrefetchHandle {
     rx: Receiver<WindowResult>,
     /// `[start, end)` block indices this handle will produce.
     range: (usize, usize),
+    /// On-disk bytes of the submitted window — the inflight share charged to
+    /// [`PREFETCH_BUFFERED_BYTES`] (M3 telemetry).
+    bytes: usize,
 }
 
 /// Per-SST-source prefetch state machine. See the module docs.
@@ -187,8 +247,9 @@ pub struct BlockPrefetcher {
     blocks_consumed: u32,
     /// Current readahead window in blocks (0 = cold / readahead off).
     ra_blocks: u32,
-    /// Claimed-but-undelivered decoded blocks, in index order.
-    ready: VecDeque<DecodedBlock>,
+    /// Claimed-but-undelivered decoded blocks, in index order, each paired
+    /// with its ON-DISK size (the M3 telemetry charge released at delivery).
+    ready: VecDeque<(u32, DecodedBlock)>,
     /// In-flight window production, if any.
     inflight: Option<PrefetchHandle>,
     /// Regime: local (shallow ramp) vs remote (deep ramp).
@@ -238,8 +299,18 @@ impl BlockPrefetcher {
     /// §2.1.5: stop this source — the consumer hit the scan's upper bound
     /// mid-block. Drops the in-flight handle (the pool job's result is
     /// discarded on the dead channel) and parks the cursor at `end_block`.
+    /// Releases this source's entire M3 telemetry charge (idempotent).
     pub fn terminate(&mut self) {
         self.next_block = self.end_block;
+        let held: usize = self
+            .ready
+            .iter()
+            .map(|&(sz, _)| sz as usize)
+            .sum::<usize>()
+            + self.inflight.as_ref().map_or(0, |h| h.bytes);
+        if held > 0 {
+            PREFETCH_BUFFERED_BYTES.fetch_sub(held, std::sync::atomic::Ordering::Relaxed);
+        }
         self.ready.clear();
         self.inflight = None;
     }
@@ -251,7 +322,8 @@ impl BlockPrefetcher {
         // 1. Serve a claimed block. Double-buffering: if this drains `ready`
         //    and nothing is in flight, submit the next window BEFORE the
         //    consumer walks the delivered block's rows.
-        if let Some(block) = self.ready.pop_front() {
+        if let Some((sz, block)) = self.ready.pop_front() {
+            PREFETCH_BUFFERED_BYTES.fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
             self.on_delivered();
             if self.ready.is_empty() && self.inflight.is_none() {
                 self.maybe_submit_window();
@@ -262,17 +334,51 @@ impl BlockPrefetcher {
         // 2. Claim the in-flight window, then immediately submit the next one
         //    (production of N+1 overlaps consumption of N).
         if let Some(handle) = self.inflight.take() {
-            let produced = handle.rx.recv().map_err(|_| {
-                ForstError::internal("BlockPrefetcher: read-I/O pool worker dropped its window")
-            })?;
+            // H1: the pool workers survive job panics (catch_unwind in the
+            // worker loop), so a disconnect here means the window job itself
+            // panicked; the timeout is the last-resort guard against a
+            // queued-but-never-run job (wedged pool) hanging the consumer
+            // (ultimately the Flink task thread inside the FFI) forever.
+            // Either way the source must PARK AT EOF before erroring —
+            // `next_block` was already advanced past the lost window at
+            // submit time, so resuming on the demand path would silently
+            // skip the window's blocks.
+            let produced = match handle.rx.recv_timeout(POOL_JOIN_TIMEOUT) {
+                Ok(p) => p,
+                Err(e) => {
+                    // The handle was already taken — release its inflight M3
+                    // charge here (`terminate` only releases what it sees).
+                    PREFETCH_BUFFERED_BYTES
+                        .fetch_sub(handle.bytes, std::sync::atomic::Ordering::Relaxed);
+                    self.terminate();
+                    return Err(match e {
+                        std::sync::mpsc::RecvTimeoutError::Disconnected => ForstError::internal(
+                            "BlockPrefetcher: read-I/O pool worker dropped its window",
+                        ),
+                        std::sync::mpsc::RecvTimeoutError::Timeout => ForstError::timed_out(
+                            "BlockPrefetcher: prefetch window not produced within join timeout",
+                        ),
+                    });
+                }
+            };
             match produced {
                 Ok(blocks) => {
                     debug_assert_eq!(blocks.len(), handle.range.1 - handle.range.0);
-                    self.ready.extend(blocks);
+                    // M3: the inflight charge transfers to `ready` (each
+                    // block keeps its on-disk size) — no net counter change.
+                    for (j, block) in blocks.into_iter().enumerate() {
+                        let sz = self
+                            .reader
+                            .block_region(handle.range.0 + j)
+                            .map_or(0, |(_, s)| s);
+                        self.ready.push_back((sz, block));
+                    }
                     self.maybe_submit_window();
                     // Recurse once into the ready-serve path (never deeper:
                     // `ready` is now non-empty or the window was empty ⇒ EOF).
-                    if let Some(block) = self.ready.pop_front() {
+                    if let Some((sz, block)) = self.ready.pop_front() {
+                        PREFETCH_BUFFERED_BYTES
+                            .fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
                         self.on_delivered();
                         return Ok(Some(block));
                     }
@@ -281,7 +387,11 @@ impl BlockPrefetcher {
                 Err(e) => {
                     // A failed window aborts the source (same as a failed
                     // demand read on the legacy path). Park at EOF so retries
-                    // don't re-issue I/O on a known-bad region.
+                    // don't re-issue I/O on a known-bad region. The handle
+                    // was already taken, so release its inflight charge here
+                    // (`terminate` only releases what it can still see).
+                    PREFETCH_BUFFERED_BYTES
+                        .fetch_sub(handle.bytes, std::sync::atomic::Ordering::Relaxed);
                     self.terminate();
                     return Err(e);
                 }
@@ -370,9 +480,20 @@ impl BlockPrefetcher {
             // Receiver dropped (iterator closed/aborted) ⇒ result discarded.
             let _ = tx.send(result);
         }));
+        // M3 telemetry: charge the window at submit (released at delivery /
+        // failure / terminate / drop).
+        let agg = PREFETCH_BUFFERED_BYTES
+            .fetch_add(window_bytes as usize, std::sync::atomic::Ordering::Relaxed)
+            + window_bytes as usize;
+        if prefetch_diag() {
+            eprintln!(
+                "[PREFETCH_DIAG] window submit blocks=[{start},{end}) bytes={window_bytes} aggregate_buffered={agg}"
+            );
+        }
         self.inflight = Some(PrefetchHandle {
             rx,
             range: (start, end),
+            bytes: window_bytes as usize,
         });
         self.next_block = end;
         // Double toward the regime cap for the NEXT window.
@@ -382,6 +503,16 @@ impl BlockPrefetcher {
             REMOTE_CAP_BLOCKS
         };
         self.ra_blocks = (self.ra_blocks * 2).min(cap_blocks);
+    }
+}
+
+impl Drop for BlockPrefetcher {
+    /// M3: a dropped prefetcher releases its entire ready+inflight charge —
+    /// the aggregate counter never leaks from abandoned iterators.
+    /// (`terminate` is idempotent: after an explicit terminate the fields are
+    /// already empty and this subtracts nothing.)
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -679,26 +810,33 @@ mod tests {
         assert_eq!(pf.ra_blocks(), LOCAL_CAP_BLOCKS, "local cap is 4 blocks");
     }
 
-    /// Remote regime enters the ramp after the FIRST block and doubles toward
-    /// the 4 MiB / 64-block cap.
+    /// Remote regime (M2): cold for the first 2 blocks exactly like local —
+    /// a 1-block probe over an evicted SST must NEVER speculate remotely —
+    /// then ramps and doubles toward the DEEPER 4 MiB / 64-block cap.
     #[test]
-    fn ramp_transitions_remote_after_first_block() {
+    fn ramp_transitions_remote_after_two_blocks() {
         let data = build_sst(400);
         let (reader, _file) = open_reader(&data, None, &data);
         let mut pf = BlockPrefetcher::new(Arc::clone(&reader), 0, None).with_regime(false, true);
+        // Block 1: cold — zero speculation (the R-short invariant on the
+        // evicted tier).
+        assert!(pf.next_decoded().unwrap().is_some());
+        assert_eq!(pf.ra_blocks(), 0, "remote stays cold after first block");
+        // Block 2: ramp entered (>= 2 consumed) — first window (2 blocks)
+        // submitted, ra doubled to 4 for the next window.
         assert!(pf.next_decoded().unwrap().is_some());
         assert_eq!(
             pf.ra_blocks(),
             4,
-            "remote ramps after block 1 (ra=2 submitted, doubled to 4)"
+            "remote ramps after block 2 (ra=2 submitted, doubled to 4)"
         );
-        let mut seen = 1;
+        let mut seen = 2;
         while pf.next_decoded().unwrap().is_some() {
             seen += 1;
         }
         assert_eq!(seen, reader.index_entry_count());
         assert!(pf.ra_blocks() <= REMOTE_CAP_BLOCKS);
-        assert!(pf.ra_blocks() >= 8, "remote keeps doubling past 4");
+        assert!(pf.ra_blocks() >= 8, "remote keeps doubling past the local cap");
     }
 
     /// §2.1.5 clamp: with an upper bound that cuts the keyspace in half, the
@@ -838,6 +976,91 @@ mod tests {
         pf.terminate();
         assert!(pf.next_decoded().unwrap().is_none());
         assert!(pf.next_decoded().unwrap().is_none());
+    }
+
+    /// H1 (i)+(iii): a panicking job does not kill a read-I/O pool worker —
+    /// with a SINGLE worker, jobs submitted after the panic still run, and
+    /// nothing hangs.
+    #[test]
+    fn pool_worker_survives_panicking_job() {
+        let pool = ReadIoPool::new(1);
+        let (tx, rx) = std::sync::mpsc::channel::<u8>();
+        pool.submit(Box::new(|| panic!("deliberate test panic")));
+        let tx2 = tx.clone();
+        pool.submit(Box::new(move || {
+            let _ = tx2.send(7);
+        }));
+        drop(tx);
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("worker died after a panicking job (or hang)"),
+            7
+        );
+    }
+
+    /// H1 (ii): a window job whose sender is dropped (the unwind path of a
+    /// panicking job) surfaces as `Err` on the consumer — and the source
+    /// parks at EOF instead of silently skipping the lost window's blocks.
+    #[test]
+    fn dropped_window_sender_errors_and_parks_at_eof() {
+        let data = build_sst(400);
+        let (reader, _file) = open_reader(&data, None, &data);
+        let mut pf = BlockPrefetcher::new(Arc::clone(&reader), 0, None).with_regime(true, true);
+        // Simulate a panicked window job: receiver installed, sender gone.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WindowResult>(1);
+        drop(tx);
+        pf.inflight = Some(PrefetchHandle {
+            rx,
+            range: (0, 2),
+            bytes: 0,
+        });
+        pf.next_block = 2; // as maybe_submit_window would have left it
+        let err = match pf.next_decoded() {
+            Err(e) => e,
+            Ok(_) => panic!("dropped sender must error"),
+        };
+        assert!(
+            matches!(err, ForstError::Internal(_)),
+            "unexpected error kind: {err:?}"
+        );
+        // Parked at EOF — never resumes past the lost window.
+        assert!(pf.next_decoded().unwrap().is_none());
+    }
+
+    /// M3: the aggregate ready+inflight counter goes up while a ramped
+    /// prefetcher holds undelivered windows and is fully released once the
+    /// prefetcher is dropped mid-stream (no leak from abandoned iterators).
+    /// Tolerates concurrent tests by polling for release and asserting the
+    /// counter never wraps.
+    #[test]
+    fn buffered_bytes_charge_released_on_drop() {
+        let data = build_sst(400);
+        let (reader, _file) = open_reader(&data, None, &data);
+        let before = prefetch_buffered_bytes();
+        {
+            let mut pf =
+                BlockPrefetcher::new(Arc::clone(&reader), 0, None).with_regime(false, true);
+            // Consume past the ramp so windows are submitted (charged).
+            for _ in 0..6 {
+                assert!(pf.next_decoded().unwrap().is_some());
+            }
+            // pf dropped here mid-stream with ready and/or inflight bytes.
+        }
+        // The charge must drain back out (other tests may add their own
+        // transient charges, so poll until OUR contribution is gone).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = prefetch_buffered_bytes();
+            assert!(now < usize::MAX / 2, "counter wrapped (double release)");
+            if now <= before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "prefetch buffered-bytes charge leaked: before={before} now={now}"
+            );
+            std::thread::yield_now();
+        }
     }
 
     /// Starting mid-file (seek target from first_block_ge) delivers exactly
