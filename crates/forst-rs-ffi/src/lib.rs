@@ -5320,9 +5320,13 @@ impl forst_rs_engine::RowSink for ChunkSink<'_> {
 /// [`fill_chunk_from_iter`], same `(bytes_written, row_count, exhausted)`
 /// contract. The stashed overflow row (if any) is written first; fill errors
 /// are recorded sticky-FIRST into the shared error slot (the channel the
-/// open/next callers already drain) and the backend parks exhausted so the
-/// R17-M3/R18-M4 deferred-error state machine surfaces them exactly like the
-/// legacy path.
+/// open/next callers already drain) and the fill CONTINUES past the errored
+/// key (F-1, PMC cycle-5) — the legacy boxed path's `filter_map` records the
+/// error and keeps scanning, so rows after the errored key are still
+/// delivered and the delivered-row prefix is identical in both modes. The
+/// R17-M3/R18-M4 deferred-error state machine surfaces the recorded error
+/// exactly like the legacy path (partial chunk first, error on the next
+/// call, then terminal).
 ///
 /// # Safety
 /// `buf` must point to at least `cap` writable bytes for the duration of the
@@ -5369,27 +5373,30 @@ unsafe fn fill_chunk_from_pinned(
         pending_val: &mut p.pending_val,
         pending_set: &mut p.pending_set,
     };
-    match p.stream.fill_into(&mut sink) {
-        Ok(forst_rs_engine::FillOutcome::Exhausted) => {
-            let (off, rows) = (sink.off, sink.rows);
-            p.exhausted = true;
-            (off as u32, rows, true)
-        }
-        Ok(forst_rs_engine::FillOutcome::SinkFull) => (sink.off as u32, sink.rows, false),
-        Err(e) => {
-            let (off, rows) = (sink.off, sink.rows);
-            // Sticky-FIRST into the shared slot (R18-M3 semantics); the
-            // open/next callers drain it and run the partial-chunk state
-            // machine. Park exhausted: after an error surfaces the iterator
-            // is terminal (R18-M4).
-            {
+    loop {
+        match p.stream.fill_into(&mut sink) {
+            Ok(forst_rs_engine::FillOutcome::Exhausted) => {
+                let (off, rows) = (sink.off, sink.rows);
+                p.exhausted = true;
+                return (off as u32, rows, true);
+            }
+            Ok(forst_rs_engine::FillOutcome::SinkFull) => {
+                return (sink.off as u32, sink.rows, false);
+            }
+            Err(e) => {
+                // Sticky-FIRST into the shared slot (R18-M3 semantics); the
+                // open/next callers drain it and run the partial-chunk state
+                // machine. F-1: do NOT park exhausted — `fill_into` has
+                // already advanced the merge PAST the errored key (every
+                // error path advances its source before surfacing), so
+                // looping here keeps delivering the rows after it, exactly
+                // like the legacy filter_map, and strictly approaches
+                // `Exhausted` (no spin).
                 let mut guard = last_error.lock().unwrap_or_else(|p| p.into_inner());
                 if guard.is_none() {
                     *guard = Some(e);
                 }
             }
-            p.exhausted = true;
-            (off as u32, rows, true)
         }
     }
 }
@@ -11868,5 +11875,109 @@ mod tests {
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
+    }
+
+    /// F-1 (PMC cycle-5): the pinned chunk fill must CONTINUE past a
+    /// fallback-resolution (`get_internal`) error — recording it sticky-FIRST
+    /// into the shared slot — instead of parking exhausted at the errored
+    /// key. Pre-fix, rows after the errored key were silently dropped while
+    /// the legacy boxed path (filter_map error tap) delivered them; the
+    /// delivered-row prefix must be identical in both modes.
+    #[test]
+    fn s2_pinned_chunk_fill_continues_past_fallback_error() {
+        use forst_rs_common::{ForstError, ForstResult};
+        use forst_rs_storage::merge_operator::MergeOperator;
+
+        /// Fails `full_merge` for one poison key; concatenates otherwise.
+        struct Poison(Vec<u8>);
+        impl MergeOperator for Poison {
+            fn full_merge(
+                &self,
+                key: &[u8],
+                base_value: Option<&[u8]>,
+                operands: &[&[u8]],
+            ) -> ForstResult<Vec<u8>> {
+                if key == self.0.as_slice() {
+                    return Err(ForstError::corruption("ffi poison merge"));
+                }
+                let mut out = base_value.map(<[u8]>::to_vec).unwrap_or_default();
+                for op in operands {
+                    out.extend_from_slice(op);
+                }
+                Ok(out)
+            }
+            fn partial_merge(
+                &self,
+                _key: &[u8],
+                _left: &[u8],
+                _right: &[u8],
+            ) -> ForstResult<Vec<u8>> {
+                Err(ForstError::internal("poison: no partial merge"))
+            }
+            fn name(&self) -> String {
+                "ffi-poison-merge".to_string()
+            }
+        }
+
+        let key = |i: u32| format!("q:{i:04}").into_bytes();
+        let poison_idx = 5u32;
+        let db = DbImpl::open_default().unwrap();
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("poison")
+                    .with_merge_operator(Arc::new(Poison(key(poison_idx)))),
+            )
+            .unwrap();
+        // One flushed SST of Puts + a memtable-resident poison Merge: the
+        // merge winner forces the `get_internal` fallback, which errors.
+        for i in 0..10u32 {
+            db.put(&cf, &key(i), format!("v-{i}").as_bytes()).unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.merge(&cf, &key(poison_idx), b"operand").unwrap();
+
+        let slot = Arc::new(Mutex::new(None));
+        let stream = db
+            .prefix_scan_stream_with_mode(&cf, b"q:", Arc::clone(&slot), true)
+            .unwrap();
+        let mut handle = IterHandle::new_pinned_with_error_slot(stream, Arc::clone(&slot));
+
+        // Small chunks: multiple fills + the pending-row stash in play.
+        let mut buf = vec![0u8; 64];
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        loop {
+            let (bytes_used, row_count, exhausted) = unsafe {
+                fill_chunk_from_iter(&mut handle, buf.as_mut_ptr(), buf.len())
+            };
+            let mut off = 0usize;
+            for _ in 0..row_count {
+                let klen =
+                    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                let vlen =
+                    u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()) as usize;
+                off += 8;
+                rows.push((buf[off..off + klen].to_vec(), buf[off + klen..off + klen + vlen].to_vec()));
+                off += klen + vlen;
+            }
+            assert_eq!(off, bytes_used as usize, "chunk wire format consistent");
+            if exhausted {
+                break;
+            }
+        }
+
+        // Rows BOTH before and after the errored key are delivered (the
+        // legacy delivered-row prefix); the poison key itself is absent.
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..10u32)
+            .filter(|i| *i != poison_idx)
+            .map(|i| (key(i), format!("v-{i}").into_bytes()))
+            .collect();
+        assert_eq!(rows, expected, "scan must continue past the fallback error");
+        // The error is recorded sticky-FIRST in the shared slot (drained
+        // once by the open/next deferred-error machine).
+        assert!(
+            handle.take_last_error().is_some(),
+            "fallback error must land in the shared slot"
+        );
+        assert!(handle.take_last_error().is_none(), "sticky error drains once");
     }
 }

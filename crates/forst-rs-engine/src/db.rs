@@ -6695,6 +6695,7 @@ impl DbImpl {
                 done: false,
                 buf: std::collections::VecDeque::new(),
                 budget: 1,
+                pending_err: None,
             }));
         }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
@@ -7298,6 +7299,7 @@ impl DbImpl {
                 done: false,
                 buf: std::collections::VecDeque::new(),
                 budget: 1,
+                pending_err: None,
             }));
         }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
@@ -12387,6 +12389,14 @@ struct ArcPairAdapter {
     buf: std::collections::VecDeque<(Arc<[u8]>, Arc<[u8]>)>,
     /// Rows requested from the next refill (1 → 2 → … → 64).
     budget: usize,
+    /// F-2 (PMC cycle-5): a `fill_into` error is STASHED here and surfaced
+    /// only after `buf` drains — rows pushed in the same fill BEFORE the
+    /// error are delivered ahead of it (the legacy in-band ordering: rows,
+    /// then `Err` at the errored key's sort position). The scan then
+    /// CONTINUES on the next pull, matching the legacy `from_fn` loop which
+    /// yields `Some(Err)` and keeps merging (F-1 alignment for in-process
+    /// consumers).
+    pending_err: Option<ForstError>,
 }
 
 /// Adaptive upper bound for [`ArcPairAdapter::budget`].
@@ -12415,6 +12425,14 @@ impl Iterator for ArcPairAdapter {
             if let Some(row) = self.buf.pop_front() {
                 return Some(Ok(row));
             }
+            // F-2: surface a stashed fill error only once the buffered rows
+            // (pushed before it in the same fill) have drained, then keep
+            // scanning — `fill_into` already advanced the merge past the
+            // errored key, so the next refill resumes after it (legacy
+            // `from_fn` semantics: rows, in-band `Err`, more rows).
+            if let Some(e) = self.pending_err.take() {
+                return Some(Err(e));
+            }
             if self.done {
                 return None;
             }
@@ -12427,10 +12445,7 @@ impl Iterator for ArcPairAdapter {
             match self.stream.fill_into(&mut sink) {
                 Ok(FillOutcome::SinkFull) => {}
                 Ok(FillOutcome::Exhausted) => self.done = true,
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
+                Err(e) => self.pending_err = Some(e),
             }
         }
     }
@@ -17581,6 +17596,7 @@ mod tests {
                 done: false,
                 buf: std::collections::VecDeque::new(),
                 budget: 1,
+                pending_err: None,
             };
             let via_adapter: Vec<(Vec<u8>, Vec<u8>)> = adapter
                 .map(|r| {
@@ -18075,5 +18091,171 @@ mod tests {
         }
         assert_eq!(keys, expected_keys, "legacy: surviving rows wrong");
         assert!(iter.take_last_error().is_some());
+    }
+
+    /// F-1/F-2 (PMC cycle-5): merge operator whose `full_merge` fails for ONE
+    /// poison key — injects a FALLBACK-resolution (`get_internal`) error
+    /// mid-scan, the error class the tier-peek test above cannot reach.
+    struct S2PoisonMergeOperator(Vec<u8>);
+    impl MergeOperator for S2PoisonMergeOperator {
+        fn full_merge(
+            &self,
+            key: &[u8],
+            base_value: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> ForstResult<Vec<u8>> {
+            if key == self.0.as_slice() {
+                return Err(ForstError::corruption("s2 poison merge"));
+            }
+            let mut out = base_value.map(<[u8]>::to_vec).unwrap_or_default();
+            for op in operands {
+                out.extend_from_slice(op);
+            }
+            Ok(out)
+        }
+        fn partial_merge(&self, _key: &[u8], _left: &[u8], _right: &[u8]) -> ForstResult<Vec<u8>> {
+            Err(ForstError::internal("s2 poison: no partial merge"))
+        }
+        fn name(&self) -> String {
+            "s2-poison-merge".to_string()
+        }
+    }
+
+    /// F-1/F-2 fixture: L1 (2 compacted waves) + 3 L0 SSTs + active memtable
+    /// = 5 sources (the tree engages; L0 stays below the auto-compaction
+    /// trigger of 4) over keys `q:0000..q:0029`, with a poison Merge entry
+    /// (memtable-resident, never compacted) on key index `poison_idx` whose
+    /// fallback resolution errors mid-scan. Returns `(db, cf, expected)`
+    /// where `expected` is the surviving sorted row set (poison key omitted —
+    /// its resolution errors in-band in every mode).
+    fn s2_poison_fallback_fixture(
+        poison_idx: u32,
+    ) -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<(Vec<u8>, Vec<u8>)>) {
+        let db = open();
+        let key = |i: u32| format!("q:{i:04}").into_bytes();
+        let poison = key(poison_idx);
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("s2-poison")
+                    .with_merge_operator(Arc::new(S2PoisonMergeOperator(poison.clone()))),
+            )
+            .unwrap();
+        for wave in 0..2u32 {
+            for i in 0..30u32 {
+                db.put(&cf, &key(i), format!("w{wave}-{i}").as_bytes()).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        db.compact_l0(&cf).unwrap().expect("L0→L1 rollup");
+        for wave in 2..5u32 {
+            for i in 0..30u32 {
+                db.put(&cf, &key(i), format!("w{wave}-{i}").as_bytes()).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        // Memtable on top: fresh Puts for every third key + the poison Merge
+        // (newest version of the poison key ⇒ Fallback ⇒ `get_internal` ⇒
+        // `full_merge` error, mid-prefix).
+        for i in (0..30u32).step_by(3) {
+            if i != poison_idx {
+                db.put(&cf, &key(i), format!("mem-{i}").as_bytes()).unwrap();
+            }
+        }
+        db.merge(&cf, &poison, b"operand").unwrap();
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = (0..30u32)
+            .filter(|i| *i != poison_idx)
+            .map(|i| {
+                let v = if i % 3 == 0 {
+                    format!("mem-{i}")
+                } else {
+                    format!("w4-{i}")
+                };
+                (key(i), v.into_bytes())
+            })
+            .collect();
+        (db, cf, expected)
+    }
+
+    /// F-1 (PMC cycle-5) missing test shape: a FALLBACK-resolution
+    /// (`get_internal`) error mid-scan — not a tier-peek error. `fill_into`
+    /// surfaces the error in-band with the merge already advanced past the
+    /// errored key, so re-driving it delivers the rows AFTER the error:
+    /// identical surviving rows + exactly one error in legacy, pinned-tree
+    /// and pinned-linear modes (the legacy `from_fn` continue-past-error
+    /// semantics).
+    #[test]
+    fn s2_fallback_error_mid_scan_continues_past_errored_key() {
+        let (db, cf, expected) = s2_poison_fallback_fixture(17);
+        for (pinned, force_linear) in [(false, false), (true, false), (true, true)] {
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, b"q:", Arc::new(Mutex::new(None)), pinned)
+                .unwrap();
+            stream.inner.tree_disabled = force_linear;
+            if pinned && !force_linear {
+                assert!(
+                    stream.debug_source_count() >= S2_TREE_MIN_SOURCES,
+                    "fixture must engage the tournament tree"
+                );
+            }
+            let mut sink = S2Collect(Vec::new());
+            let mut errors = 0u32;
+            loop {
+                match stream.fill_into(&mut sink) {
+                    Ok(FillOutcome::Exhausted) => break,
+                    Ok(FillOutcome::SinkFull) => unreachable!("collect sink never reports full"),
+                    Err(e) => {
+                        assert!(e.is_corruption(), "expected the poison merge error: {e:?}");
+                        errors += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                errors, 1,
+                "pinned={pinned} force_linear={force_linear}: exactly one fallback error"
+            );
+            assert_eq!(
+                sink.0, expected,
+                "pinned={pinned} force_linear={force_linear}: rows after the errored key must still be delivered"
+            );
+        }
+    }
+
+    /// F-2 (PMC cycle-5): the adaptive `ArcPairAdapter` must drain rows
+    /// buffered in the SAME fill before surfacing the stashed error, and then
+    /// CONTINUE the scan — the legacy in-band ordering (rows before the
+    /// errored key, one `Err` at its sort position, rows after it). Poison at
+    /// index 17: the doubling budget (1+2+4+8 = 15 rows) makes the budget-16
+    /// fill push rows 15 and 16 BEFORE the error, the exact orphaned-rows
+    /// shape.
+    #[test]
+    fn s2_adapter_in_order_error_delivery_and_continuation() {
+        let (db, cf, expected) = s2_poison_fallback_fixture(17);
+        let stream = db
+            .prefix_scan_stream_with_mode(&cf, b"q:", Arc::new(Mutex::new(None)), true)
+            .unwrap();
+        let adapter = ArcPairAdapter {
+            stream,
+            done: false,
+            buf: std::collections::VecDeque::new(),
+            budget: 1,
+            pending_err: None,
+        };
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut err_at: Option<usize> = None;
+        for item in adapter {
+            match item {
+                Ok((k, v)) => rows.push((k.as_ref().to_vec(), v.as_ref().to_vec())),
+                Err(e) => {
+                    assert!(e.is_corruption(), "expected the poison merge error: {e:?}");
+                    assert!(err_at.is_none(), "exactly one in-band error");
+                    err_at = Some(rows.len());
+                }
+            }
+        }
+        // In-band POSITION: the error surfaces at the poison key's sort
+        // position — after the 17 rows that precede it, before every row
+        // that follows it.
+        assert_eq!(err_at, Some(17), "error must surface in key order");
+        assert_eq!(rows, expected, "rows after the error must still be delivered");
     }
 }
