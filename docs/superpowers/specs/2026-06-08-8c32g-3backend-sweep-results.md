@@ -1964,3 +1964,64 @@ TIMER-FIX TAX SCALES WITH TIMER DENSITY: q17 +300% (77→310s class), q20 +37%, 
 the fix is the dominant regression and its cost path did NOT appear in q20's CPU profile
 (suspect: wait-time or a path the 180s window missed). NEXT: q17 lockstep + FRS_PERF —
 cheap (~300s), tax-dominated ⇒ directly exposes the cost path; then kill it.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MEMORY-RESIDENT TIMER INDEX — gate chain (2026-06-11 late, single-topo)
+# ═══════════════════════════════════════════════════════════════════════════
+Implementation: flink 1dc40a7b051 (rebased 7590cde1c1f) — cache/cursor/floor layer
+DELETED (~900 LOC); poll/peek = pure memory; engine = durable log; restore = bulk
+scan; FRS_TIMER_INDEX_MAX=8M spill valve. Review fixes: composite-byte heap
+tiebreak (deterministic equal-ts firing), Long.MAX_VALUE cleanup timers no longer
+dropped, remove() reports liveness. Pre-V1 @Disabled 11-test queue suite
+RE-ENABLED and green (old cache failed 8/11). Module 552/0 → 558/0 w/ Unit-2.
+
+### Gate results (jar = timer-index only; engine .so = pre-streaming):
+| gate | result | verdict |
+|---|---|---|
+| q8@100M ×3 (r3=routing-async) | 113.7/47.9/109.7s, out 3,064,469/453/473 | EXACT 3/3 ✓ |
+| q17@100M ×3 | 306.2/205.1/274.0s, rows 92,000,000 ×3 | EXACT; UNCHANGED vs yesterday |
+| q20 pair | frs 2045.8 vs RDB 1034.4 = 1.98× (rows 93,201,404 both) | EXACT; UNCHANGED (was 2.10×) |
+| q9 pair | (in flight) | — |
+
+### ★★ ATTRIBUTION REVISED: the "timer-fix tax" on q17/q20 was BOX-DAY SHIFT
+With the engine-read poll path deleted BY CONSTRUCTION, q17 (~306s class) and q20
+(1.98×) are unchanged from yesterday's post-fix numbers ⇒ the "+300% q17 / +37%
+q20 tax" was box-day noise misattributed to the floor fix (the recorded q17
+3×-within-day warning strikes again). The one same-day de-confounded tax
+measurement (q9 blocking pre/post fix: 2215.6→2579.8) gets its verdict from the
+in-flight q9 pair. IMPLICATION if q9 also unchanged: q9/q20's real gap is the
+ENGINE LONG-SCAN READ PATH (R-long regime) — the streaming-read campaign
+(prefetcher/P2) becomes the primary q9/q20 lever, not timers. The timer index
+stands on architecture+correctness merits regardless (3 bug-generations deleted,
+disabled suite revived, determinism).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# STREAMING-READ REDESIGN — IMPLEMENTED (merged c890c48a6, pushed 39df15248)
+# ═══════════════════════════════════════════════════════════════════════════
+P0 EOF-flag+auto-close (2045ea577): exhausted-at-open probes skip trailing
+next()+close() (2 crossings/probe saved — dominant q7 case); backward-compatible.
+P1 (e1aa00bcd): batched-open first-chunk fill on bg_read_pool (was serial).
+§2.1 BlockPrefetcher (c8663821e): cold=demand (R-short zero speculation), ramp
+2→cap (local 256KiB / remote 4MiB), multi-block preads, double-buffered decode on
+read pool, end_block clamp, cache-first window splitting, Bottom-priority for
+deep windows. DEFAULT-ON, kill switch FRS_RS_BLOCK_PREFETCH=0.
+io_uring (a2ee94e56): new crate forst-rs-io-uring (BlockIo trait; SQE batch per
+window; FRS_IO_URING default true on Linux + probe w/ silent pread fallback;
+kernel ≥5.6; docker seccomp may block → needs seccomp=unconfined on TMs).
+Java P0 drain: flink 725824ae9e9 (FRS_CHUNK_EOF honor; module 558/0).
+Engine tests 1058/0. GATES OWED: q7@100M (target ≤~550s vs ForSt 586.8),
+q3/q4 no-regress, q7 exactness, FRS_IO_URING A/B. Local box .so NOT yet rebuilt
+(pending ti-chain completion); remote x86 box building from origin now.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HARNESS: TOPO=split + REMOTE LINUX BOX (2026-06-11 user directives)
+# ═══════════════════════════════════════════════════════════════════════════
+TOPO=split (c6c44de6c): 8c/32g = TM-ONLY (2×TM docker 4c/16g + JM docker 2c/4g,
+JM 1600m + gateway + client outside the budget; 2 slots/TM ⇒ p=4 spreads 2+2).
+Default stays single until ti-chain ends; ALL pre-2026-06-11 pins are single-topo
+— cross-topology comparisons are INVALID, re-pin everything on flip.
+REMOTE: yq01-sys-hic-k8s-p40-0000 via relay bridge (fingerprint once, FIFO-driven
+background session). x86_64, kernel 5.10, 28c/251G (containers capped), docker
+19.03, /ssd2 NVMe 3.6T. Workflow: local dev+UT → push origin → remote agent pulls
+worktrees to /ssd2/jackylee/frs-bench, builds forst-bench:x86 + .so in-image,
+runs split-topo NexMark (q8 canary, q7 io_uring A/B, q7/q9/q20 vs RDB).
