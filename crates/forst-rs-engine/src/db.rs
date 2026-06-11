@@ -6693,6 +6693,8 @@ impl DbImpl {
             return Ok(Box::new(ArcPairAdapter {
                 stream,
                 done: false,
+                buf: std::collections::VecDeque::new(),
+                budget: 1,
             }));
         }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
@@ -7294,6 +7296,8 @@ impl DbImpl {
             return Ok(Box::new(ArcPairAdapter {
                 stream,
                 done: false,
+                buf: std::collections::VecDeque::new(),
+                budget: 1,
             }));
         }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
@@ -11248,27 +11252,25 @@ impl TierKeySource {
             // Within-block user-key dedup state: the last ACCEPTED row's key
             // ref (mirror of the legacy `buffered.last()` compare).
             let mut last_accepted: Option<forst_rs_storage::sst::SliceRef> = None;
-            pin.for_each_row_ranges(&mut pbuf.key_arena, |arena, rr| {
-                if hit_upper {
-                    // Already past the upper bound; remaining rows in this
-                    // block are all >= upper (ASC) — cheap skip.
-                    return Ok(());
-                }
+            // S2-3: seek-aware + early-stopping visitor — rows below `lower`
+            // are skipped INSIDE the block walk (restart-point seek, ≤ one
+            // interval of throwaway prefix-chain work, no arena traffic) and
+            // the walk STOPS at the first key >= `upper` instead of decoding
+            // the block's tail. Bounds the replenish to the probed window
+            // (the +54 % deep-fan-out probe regression of the full-walk cut).
+            pin.for_each_row_ranges_from(lower, &mut pbuf.key_arena, |arena, rr| {
                 let key = rr.key.resolve(arena, key_buf);
-                if key < lower {
-                    return Ok(());
-                }
                 if let Some(hi) = upper {
                     if key >= hi {
                         hit_upper = true;
-                        return Ok(());
+                        return Ok(false); // stop the walk
                     }
                 }
                 // SST rows are `(key ASC, sequence DESC)`: keep only the
                 // FIRST (newest) version of each user-key in this block.
                 if let Some(prev) = last_accepted {
                     if prev.resolve(arena, key_buf) == key {
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
                 rows.push(PinnedRowMeta {
@@ -11278,7 +11280,7 @@ impl TierKeySource {
                     op_type: rr.op_type,
                 });
                 last_accepted = Some(rr.key);
-                Ok(())
+                Ok(true)
             })?;
             if hit_upper {
                 // No later block can contain an in-range key — terminate the
@@ -11475,6 +11477,18 @@ impl TierKeySource {
             TierKeySource::Sst { mat_allocs, .. } => mat_allocs.get(),
         }
     }
+
+    /// S2-3: comparator components for the tournament tree —
+    /// `(tier_rank, sequence)`. Rank 0 for memtable cursors (a memtable is
+    /// ALWAYS newer than any SST for a key it holds), 1 for SSTs; memtable
+    /// sequence is `u64::MAX` (ties among memtable cursors break on source
+    /// index). Same precondition as [`Self::head_key`].
+    fn head_rank_seq(&self) -> (u8, u64) {
+        match self {
+            TierKeySource::MemCursor { .. } => (0, u64::MAX),
+            TierKeySource::Sst { .. } => (1, self.head_info().map_or(0, |(s, _, _)| s)),
+        }
+    }
 }
 
 /// Lazy k-way merge iterator over a `Vec<TierKeySource>`.
@@ -11538,6 +11552,136 @@ pub struct LazyPrefixIter {
     /// W3 diag: merge key-comparisons performed (the stage-3 loser-tree gate
     /// compares this `2n + dup·n` linear count against `(1+dups)·log₂ n`).
     merge_comparisons: u64,
+    /// S2-3 (W2): tournament tree, built lazily on the first pinned step when
+    /// `sources.len() >= S2_TREE_MIN_SOURCES` (and not test-disabled).
+    tree: Option<TournamentTree>,
+    /// S2-3: a Put winner's re-fight is DEFERRED to the next step — its
+    /// `ensure_head` may replenish (dropping the pinned block) and the emit
+    /// still needs the winning row's bytes (W1c borrow-soundness).
+    deferred_refight: Option<u32>,
+    /// Test knob: force the linear pinned merge regardless of fan-out (the
+    /// §6.4 comparison-counter gate measures linear-vs-tree on one fixture).
+    tree_disabled: bool,
+    /// S2-3 adaptive guard: dup-drain re-fights performed by the tree (one
+    /// per source advanced past an already-emitted key). The tree pays
+    /// `log₂ n` per dup while the linear pass amortises every dup into its
+    /// single O(n) scan — so a DUP-DOMINATED merge (every source holding
+    /// every key: the hot_prefix_churn / TopN-rewrite shape, measured +14.5%
+    /// tree-vs-linear) crosses over. When the running dup density exceeds
+    /// ~n/2 per emitted key the tree is ABANDONED for the rest of the scan
+    /// (one-way; the linear merge is the identical decision procedure, so
+    /// this is purely a cost dispatch).
+    tree_dup_drains: u64,
+    /// Whether the adaptive guard dropped the tree mid-scan.
+    tree_abandoned: bool,
+}
+
+/// S2-3 (W2): sources at or below this count keep the LINEAR pinned merge —
+/// tiny fan-outs are common for q3/q4-class probes, the linear scan wins
+/// there, and this branch caps regression risk for R-short (falsifier §4.3:
+/// an ssts_1/8 regression means THIS threshold is wrong, not S2).
+const S2_TREE_MIN_SOURCES: usize = 5;
+
+/// S2-3 sentinel: an empty tree slot (padding leaf / not-yet-fought node).
+const TREE_NONE: u32 = u32::MAX;
+
+/// S2-3 (W2): tournament tree over source indices, keyed
+/// `(head_key, tier_rank, sequence DESC, source index)` — memtable cursors
+/// (rank 0) surface before SSTs (rank 1) at equal keys, max-sequence SST
+/// first among SSTs, so the ROOT winner directly encodes the linear Phase-B
+/// decision (mem presence → Fallback; else max-seq SST). Winner-stored
+/// variant: `nodes[j]` holds the winning source index of node `j`'s subtree;
+/// a re-fight after advancing one source recomputes only its leaf-to-root
+/// path — `log₂ n` comparisons — collapsing the linear `2n + dup·n` scan to
+/// `(1 + dups)·log₂ n` per emitted key.
+struct TournamentTree {
+    /// `nodes[1..2m)`: winner source index per node (`TREE_NONE` = empty).
+    /// Leaves at `[m, m+n)` are fixed to their source index; `[m+n, 2m)` is
+    /// `TREE_NONE` padding.
+    nodes: Vec<u32>,
+    /// Leaf base: `n.next_power_of_two()`.
+    m: usize,
+}
+
+impl TournamentTree {
+    /// Builds the tree over `sources` (heads must already be ensured).
+    /// O(n) fights.
+    fn build(sources: &[TierKeySource], comparisons: &mut u64) -> Self {
+        let n = sources.len();
+        let m = n.next_power_of_two().max(2);
+        let mut nodes = vec![TREE_NONE; 2 * m];
+        for (i, slot) in nodes[m..m + n].iter_mut().enumerate() {
+            *slot = i as u32;
+        }
+        let mut tree = Self { nodes, m };
+        for j in (1..m).rev() {
+            tree.nodes[j] = Self::fight(
+                tree.nodes[2 * j],
+                tree.nodes[2 * j + 1],
+                sources,
+                comparisons,
+            );
+        }
+        tree
+    }
+
+    /// The current overall winner (`TREE_NONE` only when no source exists;
+    /// callers additionally check the winner's head for drained-ness).
+    fn winner(&self) -> u32 {
+        self.nodes[1]
+    }
+
+    /// Re-fights the path from `leaf`'s slot to the root after that source
+    /// advanced/drained — exactly one fight per level (`log₂ m`).
+    fn replay(&mut self, leaf: usize, sources: &[TierKeySource], comparisons: &mut u64) {
+        let mut j = (self.m + leaf) / 2;
+        loop {
+            self.nodes[j] = Self::fight(
+                self.nodes[2 * j],
+                self.nodes[2 * j + 1],
+                sources,
+                comparisons,
+            );
+            if j == 1 {
+                break;
+            }
+            j /= 2;
+        }
+    }
+
+    /// One match: the LESSER head under `(key, tier_rank, seq DESC, idx)`
+    /// wins; a drained head (or empty slot) always loses.
+    fn fight(a: u32, b: u32, sources: &[TierKeySource], comparisons: &mut u64) -> u32 {
+        if a == TREE_NONE {
+            return b;
+        }
+        if b == TREE_NONE {
+            return a;
+        }
+        let (ka, kb) = (
+            sources[a as usize].head_key(),
+            sources[b as usize].head_key(),
+        );
+        match (ka, kb) {
+            (None, _) => b,
+            (Some(_), None) => a,
+            (Some(ka), Some(kb)) => {
+                *comparisons += 1;
+                let (ra, sa) = sources[a as usize].head_rank_seq();
+                let (rb, sb) = sources[b as usize].head_rank_seq();
+                let ord = ka
+                    .cmp(kb)
+                    .then_with(|| ra.cmp(&rb))
+                    .then_with(|| sb.cmp(&sa)) // sequence DESC
+                    .then_with(|| a.cmp(&b)); // determinism
+                if ord == std::cmp::Ordering::Greater {
+                    b
+                } else {
+                    a
+                }
+            }
+        }
+    }
 }
 
 /// S2: outcome of one pinned merge step ([`LazyPrefixIter::next_step_pinned`]).
@@ -11619,6 +11763,11 @@ impl LazyPrefixIter {
             last_emitted_set: false,
             rows_emitted: 0,
             merge_comparisons: 0,
+            tree: None,
+            deferred_refight: None,
+            tree_disabled: false,
+            tree_dup_drains: 0,
+            tree_abandoned: false,
         })
     }
 
@@ -11640,7 +11789,180 @@ impl LazyPrefixIter {
     /// SST-Put winner returns `(source, row)` indices whose bytes stay
     /// pinned until that source's next replenish (which cannot happen before
     /// the caller's emit completes). `None` = all sources drained.
+    ///
+    /// S2-3 dispatch: fan-outs of `S2_TREE_MIN_SOURCES`+ run the tournament
+    /// tree (`(1+dups)·log₂ n` comparisons per key); smaller fan-outs keep
+    /// the linear scan (it wins there — the R-short guard).
     fn next_step_pinned(&mut self) -> Option<PinnedStep> {
+        if self.sources.len() >= S2_TREE_MIN_SOURCES
+            && !self.tree_disabled
+            && !self.tree_abandoned
+        {
+            return self.next_step_pinned_tree();
+        }
+        self.next_step_pinned_linear()
+    }
+
+    /// S2-3 (W2): tournament-tree merge step — decision-equivalent to the
+    /// linear phases: the comparator surfaces, among equal keys, the memtable
+    /// source first (→ Fallback, exactly `mem_present`), else the
+    /// max-sequence SST (→ the linear Phase-B `best`); duplicate sources at
+    /// the emitted key drain on subsequent re-fights via the
+    /// dedup-past-`last_emitted` skip (each drain = one `ensure` + one
+    /// `log₂ n` replay). Errored sources record sticky-first and fight as
+    /// drained — same semantics as Phase A.
+    fn next_step_pinned_tree(&mut self) -> Option<PinnedStep> {
+        // Adaptive dup guard (see `tree_dup_drains`): past the warm-up,
+        // a dup-dominated merge (> ~n/2 dup drains per emitted key) is
+        // cheaper on the linear pass — abandon the tree one-way. Dropping
+        // the deferred refight is safe: the linear Phase A ensures EVERY
+        // source's head (incl. the dedup-past-last_emitted skip) each step.
+        if self.rows_emitted >= 16
+            && self.tree_dup_drains
+                > self.rows_emitted * (self.sources.len() as u64 / 2)
+        {
+            self.tree = None;
+            self.deferred_refight = None;
+            self.tree_abandoned = true;
+            return self.next_step_pinned_linear();
+        }
+        let mut comparisons = 0u64;
+        let step;
+        {
+            let Self {
+                sources,
+                tree,
+                deferred_refight,
+                last_emitted_buf,
+                last_emitted_set,
+                shared_error_slot,
+                last_error,
+                tree_dup_drains,
+                ..
+            } = self;
+            if tree.is_none() {
+                // First step: ensure every head, then one O(n) build.
+                let le = last_emitted_set.then(|| last_emitted_buf.as_slice());
+                for src in sources.iter_mut() {
+                    ensure_head_pinned(src, le, shared_error_slot, last_error, &mut comparisons);
+                }
+                *tree = Some(TournamentTree::build(sources, &mut comparisons));
+            } else if let Some(w) = deferred_refight.take() {
+                // The previous step's Put winner: its emit is complete, so
+                // replenish is safe now.
+                let le = last_emitted_set.then(|| last_emitted_buf.as_slice());
+                ensure_head_pinned(
+                    &mut sources[w as usize],
+                    le,
+                    shared_error_slot,
+                    last_error,
+                    &mut comparisons,
+                );
+                tree.as_mut()
+                    .expect("tree exists when a refight is deferred")
+                    .replay(w as usize, sources, &mut comparisons);
+            }
+            let t = tree.as_mut().expect("tree built above");
+            step = loop {
+                let w = t.winner();
+                if w == TREE_NONE {
+                    break None;
+                }
+                let wi = w as usize;
+                let Some(head) = sources[wi].head_key() else {
+                    // Winner has no head ⇒ every source is drained (a live
+                    // head always beats a drained one in `fight`).
+                    break None;
+                };
+                // Duplicate of the previously emitted key (a dup source that
+                // surfaced after the winner's deferred refight): drain it.
+                let is_dup = *last_emitted_set && {
+                    comparisons += 1;
+                    head <= last_emitted_buf.as_slice()
+                };
+                if is_dup {
+                    *tree_dup_drains += 1;
+                    ensure_head_pinned(
+                        &mut sources[wi],
+                        Some(last_emitted_buf.as_slice()),
+                        shared_error_slot,
+                        last_error,
+                        &mut comparisons,
+                    );
+                    t.replay(wi, sources, &mut comparisons);
+                    continue;
+                }
+                // New minimum: copy into the reused scratch (emit key + the
+                // dedup boundary for the dup-drain above).
+                last_emitted_buf.clear();
+                last_emitted_buf.extend_from_slice(head);
+                *last_emitted_set = true;
+                // Decision from the FIRST surfaced head — the comparator
+                // guarantees it encodes the linear Phase-B winner.
+                match sources[wi].head_info() {
+                    None => {
+                        // Memtable winner → Fallback. No pinned bytes needed
+                        // for the emit (key is in the scratch), so refight now.
+                        sources[wi].advance();
+                        ensure_head_pinned(
+                            &mut sources[wi],
+                            Some(last_emitted_buf.as_slice()),
+                            shared_error_slot,
+                            last_error,
+                            &mut comparisons,
+                        );
+                        t.replay(wi, sources, &mut comparisons);
+                        break Some(PinnedStep::Fallback);
+                    }
+                    Some((_, op, has_val)) => {
+                        let row = sources[wi].head_row_index();
+                        sources[wi].advance();
+                        match (op, has_val) {
+                            (OpType::Put, true) => {
+                                // Defer the winner's refight: `ensure` could
+                                // REPLENISH (dropping the pin) and the emit
+                                // still needs `rows[row]`'s bytes.
+                                *deferred_refight = Some(w);
+                                break Some(PinnedStep::Put { src: wi, row });
+                            }
+                            (OpType::Delete, _) | (OpType::SingleDelete, _) => {
+                                // Tombstone winner hides the key — skip.
+                                ensure_head_pinned(
+                                    &mut sources[wi],
+                                    Some(last_emitted_buf.as_slice()),
+                                    shared_error_slot,
+                                    last_error,
+                                    &mut comparisons,
+                                );
+                                t.replay(wi, sources, &mut comparisons);
+                                continue;
+                            }
+                            // Merge chain or corrupt Put (no payload).
+                            _ => {
+                                ensure_head_pinned(
+                                    &mut sources[wi],
+                                    Some(last_emitted_buf.as_slice()),
+                                    shared_error_slot,
+                                    last_error,
+                                    &mut comparisons,
+                                );
+                                t.replay(wi, sources, &mut comparisons);
+                                break Some(PinnedStep::Fallback);
+                            }
+                        }
+                    }
+                }
+            };
+        }
+        self.merge_comparisons += comparisons;
+        if step.is_some() {
+            self.rows_emitted += 1;
+        }
+        step
+    }
+
+    /// S2 stage-2 linear pinned merge (the `n < S2_TREE_MIN_SOURCES` branch).
+    fn next_step_pinned_linear(&mut self) -> Option<PinnedStep> {
         let n = self.sources.len();
         let mut comparisons = 0u64;
         let step = loop {
@@ -12041,30 +12363,47 @@ impl PrefixScanStream {
     pub fn set_shared_error_slot(&mut self, slot: Arc<Mutex<Option<ForstError>>>) {
         self.inner.set_shared_error_slot(slot);
     }
+
+    /// Diag: number of tier sources in this scan's merge.
+    pub fn debug_source_count(&self) -> usize {
+        self.inner.sources.len()
+    }
 }
 
 /// S2 compat shim (W1c): an `Arc`-pair iterator implemented OVER
 /// [`PrefixScanStream::fill_into`] for the in-process consumers (engine
 /// tests, `prefix_scan` collector, the q0-q22 byte-equiv harness) when the
 /// flag is ON. Materialises the two `Arc`s per row — the same pair the legacy
-/// replenish paid — with NO other buffering (a one-row sink per `next`; the
-/// first adapter cut batched rows through a `VecDeque` and its alloc + queue
-/// churn measured +9% on `join_probe_open/ssts_1`, outside noise — too fat
-/// per the §6.3 gate). The FFI paths drive the sink directly and never see
-/// this type.
+/// replenish paid. Buffering is ADAPTIVE: the fill budget starts at 1 row
+/// (R-short probes pay no batching machinery — a fixed 64-row `VecDeque` cut
+/// measured +9% on `join_probe_open/ssts_1`) and doubles per refill up to 64
+/// (long drains amortise the per-`fill_into` dispatch — a strict one-row
+/// sink measured +20% on the 1000-row `hot_prefix_churn` drain). The FFI
+/// paths drive the chunk sink directly and never see this type.
 struct ArcPairAdapter {
     stream: PrefixScanStream,
     done: bool,
+    /// Reused row buffer (drained front-to-back via `pos`).
+    buf: std::collections::VecDeque<(Arc<[u8]>, Arc<[u8]>)>,
+    /// Rows requested from the next refill (1 → 2 → … → 64).
+    budget: usize,
 }
 
-/// Sink half of [`ArcPairAdapter`]: captures exactly one materialised row,
-/// then stops the fill.
-struct OneRowSink(Option<(Arc<[u8]>, Arc<[u8]>)>);
+/// Adaptive upper bound for [`ArcPairAdapter::budget`].
+const ADAPTER_MAX_BATCH_ROWS: usize = 64;
 
-impl RowSink for OneRowSink {
+/// Sink half of [`ArcPairAdapter`]: materialises up to `budget` rows.
+struct AdapterSink<'a> {
+    buf: &'a mut std::collections::VecDeque<(Arc<[u8]>, Arc<[u8]>)>,
+    budget: usize,
+}
+
+impl RowSink for AdapterSink<'_> {
     fn push(&mut self, key: &[u8], value: &[u8]) -> bool {
-        self.0 = Some((Arc::<[u8]>::from(key), Arc::<[u8]>::from(value)));
-        false
+        self.buf
+            .push_back((Arc::<[u8]>::from(key), Arc::<[u8]>::from(value)));
+        self.budget -= 1;
+        self.budget > 0
     }
 }
 
@@ -12072,21 +12411,26 @@ impl Iterator for ArcPairAdapter {
     type Item = ForstResult<(Arc<[u8]>, Arc<[u8]>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        let mut sink = OneRowSink(None);
-        match self.stream.fill_into(&mut sink) {
-            // SinkFull ⟺ exactly one row was pushed (the sink stops after it).
-            Ok(FillOutcome::SinkFull) => sink.0.map(Ok),
-            Ok(FillOutcome::Exhausted) => {
-                self.done = true;
-                debug_assert!(sink.0.is_none(), "Exhausted implies no pushed row");
-                None
+        loop {
+            if let Some(row) = self.buf.pop_front() {
+                return Some(Ok(row));
             }
-            Err(e) => {
-                self.done = true;
-                Some(Err(e))
+            if self.done {
+                return None;
+            }
+            let budget = self.budget;
+            self.budget = (self.budget * 2).min(ADAPTER_MAX_BATCH_ROWS);
+            let mut sink = AdapterSink {
+                buf: &mut self.buf,
+                budget,
+            };
+            match self.stream.fill_into(&mut sink) {
+                Ok(FillOutcome::SinkFull) => {}
+                Ok(FillOutcome::Exhausted) => self.done = true,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
             }
         }
     }
@@ -17235,6 +17579,8 @@ mod tests {
             let adapter = ArcPairAdapter {
                 stream,
                 done: false,
+                buf: std::collections::VecDeque::new(),
+                budget: 1,
             };
             let via_adapter: Vec<(Vec<u8>, Vec<u8>)> = adapter
                 .map(|r| {
@@ -17394,5 +17740,340 @@ mod tests {
             strong_before - 1,
             "dropping the stream must release exactly the pin's reference"
         );
+    }
+
+    // =======================================================================
+    // S2 stage-3 gates (loser tree, work-order §6.4)
+    // =======================================================================
+
+    /// §6.4 G1: tree-vs-linear merge equivalence over randomized multi-tier
+    /// fixtures crossing the `S2_TREE_MIN_SOURCES` branch both ways —
+    /// same-key cross-tier with memtable presence, max-seq SST tie-breaks,
+    /// tombstones, merge-op fallback, dedup-past-last_emitted; verified
+    /// against the legacy (flag-OFF) merge AND the independent `prefix_scan`
+    /// collector, for prefix and range drains.
+    #[test]
+    fn s2_tree_vs_linear_randomized_equivalence() {
+        // rounds = flushed-SST count; +1 memtable tier on top. The keyspace
+        // is shared by EVERY round (join_probe shape: no SST prunable).
+        for &rounds in &[1usize, 3, 4, 6, 16, 48] {
+            let db = open();
+            let cf = db
+                .create_column_family(
+                    ColumnFamilyDescriptor::new(format!("s2-tree-{rounds}"))
+                        .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma())),
+                )
+                .unwrap();
+            let mut lcg: u64 = 0xDEAD_BEEF ^ (rounds as u64).wrapping_mul(0x9E37_79B9);
+            let mut next = move || {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                lcg >> 33
+            };
+            let key = |b: u64, i: u64| format!("t:{b:02}:{i:03}").into_bytes();
+            for _round in 0..rounds {
+                for b in 0..3u64 {
+                    for i in 0..24u64 {
+                        if next() % 3 == 0 {
+                            continue; // not every key in every SST
+                        }
+                        let k = key(b, i);
+                        match next() % 6 {
+                            0 => {
+                                db.delete(&cf, &k).unwrap();
+                            }
+                            1 => {
+                                db.merge(&cf, &k, format!("m{}", next() % 100).as_bytes())
+                                    .unwrap();
+                            }
+                            _ => {
+                                db.put(&cf, &k, format!("v{}", next() % 1000).as_bytes())
+                                    .unwrap();
+                            }
+                        }
+                    }
+                }
+                db.switch_and_flush(&cf).unwrap().unwrap();
+            }
+            // Memtable tier on top (unflushed dups + tombstones).
+            for b in 0..3u64 {
+                for i in (0..24u64).step_by(2) {
+                    let k = key(b, i);
+                    if next() % 4 == 0 {
+                        db.delete(&cf, &k).unwrap();
+                    } else {
+                        db.put(&cf, &k, format!("mem{}", next() % 100).as_bytes())
+                            .unwrap();
+                    }
+                }
+            }
+
+            for b in 0..3u64 {
+                let prefix = format!("t:{b:02}:").into_bytes();
+                let legacy = s2_drain_prefix(&db, &cf, &prefix, false);
+                let pinned = s2_drain_prefix(&db, &cf, &prefix, true);
+                assert_eq!(
+                    pinned, legacy,
+                    "rounds={rounds} bucket={b}: tree/linear-pinned != legacy"
+                );
+                let reference = db.prefix_scan(&cf, &prefix).unwrap();
+                assert_eq!(
+                    pinned, reference,
+                    "rounds={rounds} bucket={b}: pinned != prefix_scan"
+                );
+            }
+            // Range window crossing buckets.
+            let mk = |pinned: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
+                let mut stream = db
+                    .range_scan_stream_with_mode(
+                        &cf,
+                        b"t:00:010",
+                        Some(b"t:02:015"),
+                        Arc::new(Mutex::new(None)),
+                        pinned,
+                    )
+                    .unwrap();
+                let mut sink = S2Collect(Vec::new());
+                assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+                sink.0
+            };
+            assert_eq!(mk(true), mk(false), "rounds={rounds}: range drain differs");
+
+            // Branch-crossing sanity: the tree must actually engage for the
+            // deep fixtures and stay off for the shallow ones.
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, b"t:00:", Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            let mut sink = S2Collect(Vec::new());
+            let _ = stream.fill_into(&mut sink).unwrap();
+            let n_sources = stream.inner.sources.len();
+            // Tree engaged for n>=5 (possibly later ABANDONED by the dup
+            // guard — these random fixtures are dup-heavy); never for n<5.
+            assert_eq!(
+                stream.inner.tree.is_some() || stream.inner.tree_abandoned,
+                n_sources >= S2_TREE_MIN_SOURCES,
+                "rounds={rounds}: tree engagement must follow the n>=5 branch (n={n_sources})"
+            );
+        }
+    }
+
+    /// §6.4 gate: the W3 comparison counter shows the `(1+dups)·log₂ n` vs
+    /// `2n + dup·n` drop on a 64-source fixture — mechanical confirmation
+    /// the tree is engaged and doing the predicted work.
+    #[test]
+    fn s2_tree_comparison_counter_log2_drop() {
+        let db = open();
+        let cf = db.default_cf();
+        // 64 overlapping SSTs in the join_probe / q20 interval-join shape:
+        // every SST spans the probed prefix range (the locator cannot
+        // prune), but each contributes DISTINCT user keys (state rows are
+        // [join-key][entry-id], entry-id unique per round) — the fan-out
+        // regime the §6.1 ssts_64/128 cells measure and the one where
+        // O(sources)-twice vs log₂ separates.
+        for round in 0..64u32 {
+            for k in 0..48u32 {
+                db.put(
+                    &cf,
+                    format!("c:{k:03}:{round:02}").as_bytes(),
+                    format!("r{round}").as_bytes(),
+                )
+                .unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+
+        let drain = |force_linear: bool| -> (u64, u64, usize) {
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, b"c:", Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            stream.inner.tree_disabled = force_linear;
+            let mut sink = S2Collect(Vec::new());
+            assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+            let (rows, comps, _) = stream.diag_counters();
+            (rows, comps, sink.0.len())
+        };
+
+        let (rows_lin, comps_lin, n_lin) = drain(true);
+        let (rows_tree, comps_tree, n_tree) = drain(false);
+        assert_eq!(n_lin, 48 * 64);
+        assert_eq!(n_tree, 48 * 64);
+        assert_eq!(rows_lin, rows_tree);
+        assert!(
+            comps_tree * 3 <= comps_lin,
+            "tree must cut comparisons by >=3x on 64 sources: tree={comps_tree} linear={comps_lin}"
+        );
+        println!(
+            "s2 comparison counters @64 sources (distinct-keys join shape): \
+             linear={comps_lin} tree={comps_tree} ratio={:.1}x \
+             (model: 2n+dup*n vs (1+dups)*log2 n)",
+            comps_lin as f64 / comps_tree as f64
+        );
+        // KNOWN CHARACTERISTIC (recorded, not gated): in the OPPOSITE
+        // extreme — every source holding EVERY key (dups = n-1 per emitted
+        // key) — the tree pays log₂ n per dup-drain while the linear pass
+        // amortises dups into its O(n) scan, so the comparison count
+        // inverts (~3x more). That shape is bounded by per-key VERSION
+        // fan-out (not SST fan-out) and the ADAPTIVE dup guard abandons the
+        // tree there (see s2_tree_abandons_on_dup_dominated_churn).
+    }
+
+    /// S2-3 adaptive guard: a dup-dominated churn merge (every source holds
+    /// every key — the hot_prefix_churn / TopN-rewrite shape, measured
+    /// +14.5% tree-vs-linear) must abandon the tree mid-scan AND stay
+    /// byte-identical to the legacy merge.
+    #[test]
+    fn s2_tree_abandons_on_dup_dominated_churn() {
+        let db = open();
+        let cf = db.default_cf();
+        // Churn: 16 rounds of delete+rewrite over the same 64 keys → every
+        // SST holds every key (dups/key = #sources).
+        for r in 0..16u32 {
+            for i in 0..64u32 {
+                let k = format!("ch:{i:04}");
+                if r > 0 {
+                    db.delete(&cf, k.as_bytes()).unwrap();
+                }
+                db.put(&cf, k.as_bytes(), format!("v{r}").as_bytes())
+                    .unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        let pinned = s2_drain_prefix(&db, &cf, b"ch:", true);
+        let legacy = s2_drain_prefix(&db, &cf, b"ch:", false);
+        assert_eq!(pinned.len(), 64);
+        assert_eq!(pinned, legacy, "churn: pinned != legacy");
+        // Re-drain holding the stream to inspect the abandon flag.
+        let mut stream = db
+            .prefix_scan_stream_with_mode(&cf, b"ch:", Arc::new(Mutex::new(None)), true)
+            .unwrap();
+        let mut sink = S2Collect(Vec::new());
+        assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+        assert_eq!(sink.0, legacy);
+        if stream.inner.sources.len() >= S2_TREE_MIN_SOURCES {
+            assert!(
+                stream.inner.tree_abandoned,
+                "dup-dominated merge must abandon the tree (n={})",
+                stream.inner.sources.len()
+            );
+        }
+    }
+
+    /// §6.4 G1: a source erroring MID-STREAM (corrupt data block) is treated
+    /// as drained with the error recorded sticky-first — identical surviving
+    /// rows in legacy, pinned-linear and pinned-tree modes.
+    #[test]
+    fn s2_source_error_mid_stream_treated_as_drained() {
+        use forst_rs_io::filesystem::RandomAccessFile;
+        use forst_rs_storage::sst::writer::{SstWriterImpl, SstWriterOptions};
+        use forst_rs_storage::sst::{BLOCK_HEADER_SIZE, FILE_HEADER_SIZE};
+
+        struct MemFile(Arc<Vec<u8>>);
+        impl RandomAccessFile for MemFile {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
+                let start = offset as usize;
+                if start >= self.0.len() {
+                    return Ok(0);
+                }
+                let end = std::cmp::min(start + buf.len(), self.0.len());
+                buf[..end - start].copy_from_slice(&self.0[start..end]);
+                Ok(end - start)
+            }
+            fn file_size(&self) -> ForstResult<u64> {
+                Ok(self.0.len() as u64)
+            }
+        }
+
+        let build_sst = |tag: &str, corrupt: bool| -> Arc<forst_rs_storage::sst::SstReaderImpl> {
+            let mut w = SstWriterImpl::with_options(SstWriterOptions {
+                block_size: 1024,
+                compression: forst_rs_common::CompressionType::None,
+                cf_id: forst_rs_common::DEFAULT_CF_ID,
+            });
+            for i in 0..200u32 {
+                w.add(
+                    format!("e:{tag}:{i:04}").as_bytes(),
+                    Some(format!("v{i}").as_bytes()),
+                    u64::from(i) + 1,
+                    1,
+                )
+                .unwrap();
+            }
+            let (mut data, _) = w.finish().unwrap();
+            if corrupt {
+                // Flip a byte INSIDE the first data block's payload — the
+                // checksum gate rejects it at first read (mid-stream error;
+                // open() only decodes footer/index/bloom, which stay intact).
+                data[FILE_HEADER_SIZE + BLOCK_HEADER_SIZE + 8] ^= 0xFF;
+            }
+            Arc::new(
+                forst_rs_storage::sst::SstReaderImpl::open(Box::new(MemFile(Arc::new(data))))
+                    .unwrap(),
+            )
+        };
+
+        // 6 sources (>= S2_TREE_MIN_SOURCES so the tree engages): source "bb"
+        // is corrupt; the others must survive. Distinct key namespaces per
+        // source make the expected row set exact.
+        let tags = ["aa", "bb", "cc", "dd", "ee", "ff"];
+        let make_sources = |pinned: bool| -> Vec<TierKeySource> {
+            tags.iter()
+                .map(|t| TierKeySource::Sst {
+                    fetcher: forst_rs_storage::sst::prefetch::BlockPrefetcher::new(
+                        build_sst(t, *t == "bb"),
+                        0,
+                        None,
+                    ),
+                    lower: Vec::new(),
+                    upper: None,
+                    buffered: Vec::new(),
+                    pos: 0,
+                    pinned,
+                    pbuf: Box::new(SstBlockBuf::default()),
+                    mat_allocs: std::cell::Cell::new(0),
+                })
+                .collect()
+        };
+
+        let expected_keys: Vec<Vec<u8>> = {
+            let mut v: Vec<Vec<u8>> = tags
+                .iter()
+                .filter(|t| **t != "bb")
+                .flat_map(|t| (0..200u32).map(move |i| format!("e:{t}:{i:04}").into_bytes()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        // Pinned (tree engaged at n=6) and pinned-linear-forced.
+        for force_linear in [false, true] {
+            let mut iter = LazyPrefixIter::new(make_sources(true), true).unwrap();
+            iter.tree_disabled = force_linear;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            while let Some(step) = iter.next_step_pinned() {
+                match step {
+                    PinnedStep::Put { .. } | PinnedStep::Fallback => {
+                        keys.push(iter.last_emitted_buf.clone());
+                    }
+                }
+            }
+            assert_eq!(
+                keys, expected_keys,
+                "force_linear={force_linear}: surviving rows wrong"
+            );
+            assert!(
+                iter.take_last_error().is_some(),
+                "force_linear={force_linear}: corrupt source must record an error"
+            );
+        }
+
+        // Legacy reference: identical surviving keys + recorded error.
+        let mut iter = LazyPrefixIter::new(make_sources(false), false).unwrap();
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        while let Some((k, _decision)) = iter.next_with_value() {
+            keys.push(k.as_ref().to_vec());
+        }
+        assert_eq!(keys, expected_keys, "legacy: surviving rows wrong");
+        assert!(iter.take_last_error().is_some());
     }
 }

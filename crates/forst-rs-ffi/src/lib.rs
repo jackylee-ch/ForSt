@@ -4963,8 +4963,9 @@ impl IterValue {
 enum IterBackend {
     /// Legacy boxed Arc-pair iterator.
     Boxed(Box<dyn Iterator<Item = (IterKey, IterValue)> + Send>),
-    /// S2 push-style stream + its chunk-overflow stash.
-    Pinned(PinnedIter),
+    /// S2 push-style stream + its chunk-overflow stash (boxed: the
+    /// stream embeds the k-way merge state and dwarfs the Boxed variant).
+    Pinned(Box<PinnedIter>),
 }
 
 /// S2: pinned-stream backend state. The pending buffers are the chunk-full
@@ -5051,13 +5052,13 @@ impl IterHandle {
         last_error: Arc<Mutex<Option<forst_rs_common::ForstError>>>,
     ) -> Self {
         Self {
-            inner: IterBackend::Pinned(PinnedIter {
+            inner: IterBackend::Pinned(Box::new(PinnedIter {
                 stream,
                 exhausted: false,
                 pending_key: Vec::new(),
                 pending_val: Vec::new(),
                 pending_set: false,
-            }),
+            })),
             pending: None,
             aborted: AtomicBool::new(false),
             last_error,

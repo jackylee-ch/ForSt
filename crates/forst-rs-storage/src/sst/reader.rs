@@ -90,6 +90,28 @@ impl DecodedBlock {
         }
     }
 
+    /// S2-3: seek-aware, early-stopping twin of [`Self::for_each_row_ranges`]
+    /// — yields only rows with key `>= lower`; the callback returns
+    /// `Ok(false)` to stop the walk (upper-bound early termination). See
+    /// `KvBlock::for_each_row_ranges_from` for the rationale (bounds the
+    /// per-block walk to the probed window instead of the whole block).
+    pub fn for_each_row_ranges_from<F>(
+        &self,
+        lower: &[u8],
+        arena: &mut Vec<u8>,
+        mut cb: F,
+    ) -> ForstResult<()>
+    where
+        F: FnMut(&[u8], RowRanges) -> ForstResult<bool>,
+    {
+        match self {
+            DecodedBlock::Arrow(batch) => {
+                for_each_row_ranges_in_batch_from(batch, lower, |row| cb(arena.as_slice(), row))
+            }
+            DecodedBlock::Kv(kv) => kv.for_each_row_ranges_from(lower, arena, cb),
+        }
+    }
+
     /// S2-1: the stable `(key_buffer, value_buffer)` pair that
     /// [`SliceRef::Block`] refs from [`Self::for_each_row_ranges`] resolve
     /// against — `key` field refs index the first slice, `value` field refs
@@ -1250,6 +1272,80 @@ where
     Ok(())
 }
 
+/// S2-3: seek-aware, early-stopping ranges twin for v1 Arrow blocks —
+/// binary-searches the first row with key `>= lower` (keys are sorted ASC),
+/// then yields rows until exhaustion or the callback returns `Ok(false)`.
+pub fn for_each_row_ranges_in_batch_from<F>(
+    batch: &RecordBatch,
+    lower: &[u8],
+    mut cb: F,
+) -> ForstResult<()>
+where
+    F: FnMut(RowRanges) -> ForstResult<bool>,
+{
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 0 not BinaryArray"))?;
+    let values = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 1 not BinaryArray"))?;
+    let sequences = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 2 not UInt64Array"))?;
+    let op_types = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<UInt8Array>()
+        .ok_or_else(|| ForstError::corruption("SST batch column 3 not UInt8Array"))?;
+
+    // Lower-bound binary search: first row with key >= lower.
+    let num_rows = batch.num_rows();
+    let mut lo = 0usize;
+    let mut hi = num_rows;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if keys.value(mid) < lower {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let key_offsets = keys.value_offsets();
+    let value_offsets = values.value_offsets();
+    for row in lo..num_rows {
+        let ks = key_offsets[row] as usize;
+        let ke = key_offsets[row + 1] as usize;
+        let value = if values.is_null(row) {
+            None
+        } else {
+            let vs = value_offsets[row] as usize;
+            let ve = value_offsets[row + 1] as usize;
+            Some(SliceRef::block(vs, ve - vs)?)
+        };
+        let op_byte = op_types.value(row);
+        let op_type = OpType::from_u8(op_byte).ok_or_else(|| {
+            ForstError::corruption(format!("invalid op_type in SST batch: {}", op_byte))
+        })?;
+        let keep_going = cb(RowRanges {
+            key: SliceRef::block(ks, ke - ks)?,
+            value,
+            sequence: sequences.value(row),
+            op_type,
+        })?;
+        if !keep_going {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
 /// FRS-ZERO-COPY-MERGE (2026-06-05): a pull cursor over an ENTIRE SST file,
 /// yielding every row (all versions) in on-disk `(key ASC, seq DESC)` order by
 /// reference. This is the per-input iterator for the streaming k-way compaction
@@ -2150,6 +2246,68 @@ mod tests {
             })
             .collect();
         assert_eq!(got, want);
+    }
+
+    /// S2-3 G1: the v1 seek-aware twin yields exactly the `key >= lower`
+    /// suffix of the full walk, and the stop-callback truncates it.
+    #[test]
+    fn s2_ranges_from_twin_matches_filtered_full_walk_v1() {
+        let batch = s2_v1_test_batch();
+        let (key_buf, val_buf) = batch_key_value_data(&batch).unwrap();
+        let mut all: Vec<SstScanRow> = Vec::new();
+        for_each_row_in_batch(&batch, |v| {
+            all.push((
+                v.key.to_vec(),
+                v.value.map(|b| b.to_vec()),
+                v.sequence,
+                v.op_type,
+            ));
+            Ok(())
+        })
+        .unwrap();
+
+        for lower in [
+            b"".as_ref(),
+            b"user:0005".as_ref(),
+            b"user:0005x".as_ref(),
+            b"zzzz".as_ref(),
+        ] {
+            let want: Vec<SstScanRow> = all
+                .iter()
+                .filter(|r| r.0.as_slice() >= lower)
+                .cloned()
+                .collect();
+            let mut metas: Vec<RowRanges> = Vec::new();
+            for_each_row_ranges_in_batch_from(&batch, lower, |row| {
+                metas.push(row);
+                Ok(true)
+            })
+            .unwrap();
+            let got: Vec<SstScanRow> = metas
+                .iter()
+                .map(|m| {
+                    (
+                        m.key.resolve(&[], key_buf).to_vec(),
+                        m.value.map(|v| v.resolve(&[], val_buf).to_vec()),
+                        m.sequence,
+                        m.op_type,
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "lower={lower:?}");
+
+            // Stop truncation.
+            if want.len() > 1 {
+                let stop_after = want.len() / 2;
+                let mut n = 0usize;
+                for_each_row_ranges_in_batch_from(&batch, lower, |_row| {
+                    n += 1;
+                    Ok(n < stop_after)
+                })
+                .unwrap();
+                assert_eq!(n, stop_after);
+            }
+        }
     }
 
     /// `DecodedBlock` dispatch: the Arrow arm must leave the caller's arena

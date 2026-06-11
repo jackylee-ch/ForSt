@@ -36,8 +36,9 @@ pub use footer::{ChecksumType, FooterV1, FOOTER_FIXED_FIELDS_SIZE, FOOTER_TAIL_S
 pub use kv_block::{encode_kv_data_block, KvBlock, RowRanges, SliceRef};
 pub use prefetch::{prefetch_buffered_bytes, BlockPrefetcher};
 pub use reader::{
-    batch_key_value_data, for_each_row_in_batch, for_each_row_ranges_in_batch, LookupResult,
-    RowView, SstBlockCursor, SstReaderImpl, SstScanRow,
+    batch_key_value_data, for_each_row_in_batch, for_each_row_ranges_in_batch,
+    for_each_row_ranges_in_batch_from, LookupResult, RowView, SstBlockCursor, SstReaderImpl,
+    SstScanRow,
 };
 pub use schema::{
     sst_schema, BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA, BLOCK_TYPE_DATA_KV, FILE_HEADER_SIZE,

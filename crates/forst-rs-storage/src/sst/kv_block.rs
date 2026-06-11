@@ -676,6 +676,107 @@ impl KvBlock {
         Ok(e.next)
     }
 
+    /// S2-3: seek-aware, early-stopping twin of [`Self::for_each_row_ranges`]
+    /// — the ranges counterpart of [`Self::for_each_row_from`]. Binary-seeks
+    /// the restart points, reconstructs the (skipped) prefix-chain keys
+    /// before `lower` into a LOCAL scratch (never the caller's arena — at
+    /// most one restart interval of throwaway work), then yields every row
+    /// whose key is `>= lower` with the key APPENDED into `arena` exactly as
+    /// the full visitor does. The callback returns `Ok(true)` to continue or
+    /// `Ok(false)` to stop the walk (the caller's upper-bound early
+    /// termination — the remaining rows are not decoded at all).
+    ///
+    /// This exists because the engine's pinned replenish probes are often
+    /// point-shaped: walking (and arena-copying) a whole ~64 KiB block to
+    /// accept a handful of rows measured +54 % on the deep-fan-out probe
+    /// cell; this visitor bounds the waste to `< KV_RESTART_INTERVAL` rows.
+    pub fn for_each_row_ranges_from<F>(
+        &self,
+        lower: &[u8],
+        arena: &mut Vec<u8>,
+        mut cb: F,
+    ) -> ForstResult<()>
+    where
+        F: FnMut(&[u8], RowRanges) -> ForstResult<bool>,
+    {
+        let mut pos = self.seek_restart(lower)?;
+        // Prefix-chain scratch for rows BEFORE `lower` (skipped, not yielded).
+        let mut scratch: Vec<u8> = Vec::new();
+        // (offset, len) of the previous YIELDED row's key inside `arena`.
+        let mut prev_arena: Option<(usize, usize)> = None;
+        let mut started = false;
+        while pos < self.restarts_start {
+            let e = self.parse_entry(pos)?;
+            if !started {
+                if e.shared > scratch.len() {
+                    return Err(ForstError::corruption(
+                        "KV entry shared-prefix len exceeds previous key",
+                    ));
+                }
+                scratch.truncate(e.shared);
+                scratch.extend_from_slice(&self.payload[e.key_range.0..e.key_range.1]);
+                if scratch.as_slice() < lower {
+                    // Reconstructed for prefix-chain continuity, but skipped.
+                    pos = e.next;
+                    continue;
+                }
+                started = true;
+                // First in-range key: copy the scratch into the arena so the
+                // yielded ref obeys the D2 contract (Arena, stable).
+                let key_off = arena.len();
+                arena.extend_from_slice(&scratch);
+                let key_len = scratch.len();
+                let row = RowRanges {
+                    key: SliceRef::arena(key_off, key_len)?,
+                    value: match e.value_range {
+                        None => None,
+                        Some((s, en)) => Some(SliceRef::block(s, en - s)?),
+                    },
+                    sequence: e.sequence,
+                    op_type: OpType::from_u8(e.op_byte).ok_or_else(|| {
+                        ForstError::corruption(format!(
+                            "invalid op_type in KV block: {}",
+                            e.op_byte
+                        ))
+                    })?,
+                };
+                prev_arena = Some((key_off, key_len));
+                if !cb(arena, row)? {
+                    return Ok(());
+                }
+                pos = e.next;
+                continue;
+            }
+            let (prev_off, prev_len) = prev_arena.expect("set when started");
+            if e.shared > prev_len {
+                return Err(ForstError::corruption(
+                    "KV entry shared-prefix len exceeds previous key",
+                ));
+            }
+            let key_off = arena.len();
+            arena.extend_from_within(prev_off..prev_off + e.shared);
+            arena.extend_from_slice(&self.payload[e.key_range.0..e.key_range.1]);
+            let key_len = arena.len() - key_off;
+            let row = RowRanges {
+                key: SliceRef::arena(key_off, key_len)?,
+                value: match e.value_range {
+                    None => None,
+                    Some((s, en)) => Some(SliceRef::block(s, en - s)?),
+                },
+                sequence: e.sequence,
+                op_type: OpType::from_u8(e.op_byte).ok_or_else(|| {
+                    ForstError::corruption(format!("invalid op_type in KV block: {}", e.op_byte))
+                })?,
+            };
+            prev_arena = Some((key_off, key_len));
+            if !cb(arena, row)? {
+                return Ok(());
+            }
+            pos = e.next;
+        }
+        Ok(())
+    }
+
     /// Parses the fixed-size header + spans of one entry starting at `pos`
     /// (offset into the entries region). All slicing is bounds-checked against
     /// `restarts_start`, so a corrupt block yields a corruption error, never a
@@ -1291,6 +1392,96 @@ mod tests {
                     got, want,
                     "seed={seed} compression={compression:?}: ranges walk != for_each_row"
                 );
+            }
+        }
+    }
+
+    /// S2-3 G1: the seek-aware `for_each_row_ranges_from` yields, for every
+    /// target, EXACTLY the rows `for_each_row_from` yields (byte-equality,
+    /// resolved post-walk per D2), and the stop-callback truncates the walk.
+    #[test]
+    fn s2_ranges_from_visitor_matches_for_each_row_from_property() {
+        for seed in 1..=25u64 {
+            let rows = random_rows(seed.wrapping_mul(0xA24B_AED4_963E_E407));
+            let refs: Vec<TestRow<'_>> = rows
+                .iter()
+                .map(|(k, v, s, o)| (k.as_slice(), v.as_deref(), *s, *o))
+                .collect();
+            let batch = make_batch(&refs);
+            for compression in [CompressionType::None, CompressionType::Lz4] {
+                let block = encode_kv_data_block(&batch, compression).unwrap();
+                let kv = KvBlock::decode(&block, true).unwrap();
+                // Targets: before-all, an existing key, a between-keys probe,
+                // after-all.
+                let mut targets: Vec<Vec<u8>> = vec![Vec::new(), b"zzzzzz".to_vec()];
+                if let Some((k, ..)) = rows.first() {
+                    targets.push(k.clone());
+                }
+                if let Some((k, ..)) = rows.get(rows.len() / 2) {
+                    targets.push(k.clone());
+                    let mut between = k.clone();
+                    between.push(0x00);
+                    targets.push(between);
+                }
+                for target in targets {
+                    let mut want: Vec<OwnedTestRow> = Vec::new();
+                    kv.for_each_row_from(&target, |v| {
+                        want.push((
+                            v.key.to_vec(),
+                            v.value.map(|b| b.to_vec()),
+                            v.sequence,
+                            v.op_type,
+                        ));
+                        Ok(())
+                    })
+                    .unwrap();
+
+                    let mut arena = b"PRESEED".to_vec();
+                    let mut metas: Vec<RowRanges> = Vec::new();
+                    kv.for_each_row_ranges_from(&target, &mut arena, |_, row| {
+                        assert!(matches!(row.key, SliceRef::Arena { .. }), "D2");
+                        metas.push(row);
+                        Ok(true)
+                    })
+                    .unwrap();
+                    let got: Vec<OwnedTestRow> = metas
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.key.resolve(&arena, kv.payload_bytes()).to_vec(),
+                                m.value
+                                    .map(|v| v.resolve(&arena, kv.payload_bytes()).to_vec()),
+                                m.sequence,
+                                m.op_type,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        got, want,
+                        "seed={seed} compression={compression:?} target={target:?}"
+                    );
+
+                    // Stop-callback: cb returning false after k rows yields a
+                    // strict prefix of `want`.
+                    if want.len() > 1 {
+                        let stop_after = want.len() / 2;
+                        let mut arena = Vec::new();
+                        let mut metas: Vec<RowRanges> = Vec::new();
+                        kv.for_each_row_ranges_from(&target, &mut arena, |_, row| {
+                            metas.push(row);
+                            Ok(metas.len() < stop_after)
+                        })
+                        .unwrap();
+                        assert_eq!(metas.len(), stop_after, "stop must truncate the walk");
+                        let got_keys: Vec<Vec<u8>> = metas
+                            .iter()
+                            .map(|m| m.key.resolve(&arena, kv.payload_bytes()).to_vec())
+                            .collect();
+                        let want_keys: Vec<Vec<u8>> =
+                            want[..stop_after].iter().map(|r| r.0.clone()).collect();
+                        assert_eq!(got_keys, want_keys);
+                    }
+                }
             }
         }
     }
