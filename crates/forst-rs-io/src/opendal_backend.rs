@@ -612,6 +612,12 @@ async fn read_range_async(
 }
 
 impl RandomAccessFile for OpendalRandomAccessFile {
+    /// §2.1: remote object-store reads — the prefetcher uses the deep
+    /// (4 MiB) readahead regime and ramps after the first block.
+    fn is_local(&self) -> bool {
+        false
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
         if offset >= self.size {
             return Ok(0);

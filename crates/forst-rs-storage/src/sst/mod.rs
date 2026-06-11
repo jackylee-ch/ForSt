@@ -21,6 +21,7 @@ pub mod data_block;
 pub mod file_header;
 pub mod footer;
 pub mod kv_block;
+pub mod prefetch;
 pub mod reader;
 pub mod schema;
 pub mod sparse_index;
@@ -33,6 +34,7 @@ pub use data_block::{decode_data_block, encode_data_block};
 pub use file_header::FileHeader;
 pub use footer::{ChecksumType, FooterV1, FOOTER_FIXED_FIELDS_SIZE, FOOTER_TAIL_SIZE};
 pub use kv_block::{encode_kv_data_block, KvBlock};
+pub use prefetch::BlockPrefetcher;
 pub use reader::{
     for_each_row_in_batch, LookupResult, RowView, SstBlockCursor, SstReaderImpl, SstScanRow,
 };
