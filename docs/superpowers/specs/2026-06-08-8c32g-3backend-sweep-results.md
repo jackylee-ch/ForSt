@@ -2064,3 +2064,16 @@ q7@100M forst-rs FRS_IO_URING=on: FINISHED 2376.4s, out_rows 92,000,002 (src
 ~48s class); cross-population q7-vs-ForSt-587s comparisons INVALID pending a
 remote ForSt pin. The uring-off arm (started 00:56) gives the io_uring delta;
 the rocksdb arm gives the remote ratio. Second q8 canary: 170.1s rows-in-band.
+
+### REMOTE round-1: q7 trio complete — io_uring = finish-vs-DNF; ratio 1.74×
+| arm | result |
+|---|---|
+| q7 frs FRS_IO_URING=on | FINISHED 2376.4s, out 92,000,002 |
+| q7 frs FRS_IO_URING=off | DNF (MAXSEC 2400) |
+| q7 rocksdb | FINISHED 1367.6s, out 92,000,002 (EXACT == frs ✓) |
+io_uring verdict: ON completes, OFF does not — keep default-ON on Linux.
+Remote ratio 1.74× (bar ≤1.25×… per-query bar is ≥0.8× RDB = ≤1.25× wall) ⇒ q7
+FAILS remotely; RocksDB FINISHES q7 here (Mac: DNF) — NVMe changes its profile.
+Streaming P0/prefetcher alone insufficient for q7 remote; S2 loser-tree +
+compaction-windowed (promoted in roadmap §5 recalibration) are the next levers.
+q9 pair started 02:01:54.
