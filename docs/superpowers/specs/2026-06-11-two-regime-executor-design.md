@@ -166,3 +166,10 @@ APPROVED for implementation with these binding conditions:
    write-batch FFI passes Arrow-layout columnar buffers, not per-op copies), and
    BATCH-ONLY execution (no per-key/per-record engine crossings in the heavy regime;
    drains and commits are one vectorized FFI call per worker per batch).
+
+## 9. Scope amendment (user, 2026-06-11): conditional flink-runtime access
+Flink engine code MAY be changed ONLY if the defect is a genuine CORRECTNESS bug affecting
+BOTH the ForSt and forst-rs backends (i.e., an upstream framework bug, not a backend-
+specific behavior). The Stage-0 ForSt-exactness fork test is precisely this gate:
+ForSt q8 corrupt ⇒ upstream bug ⇒ a minimal, well-documented flink-runtime fix is in scope
+(plus upstream report); ForSt exact ⇒ flink stays frozen and the fix lands backend-side.
