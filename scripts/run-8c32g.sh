@@ -54,7 +54,7 @@ case "$cmd" in
     # seccomp only when profiling is requested (benchmarks stay confined).
     PERF_OPTS=()
     [ -n "${FRS_PERF:-}" ] && PERF_OPTS=(--security-opt seccomp=unconfined --cap-add SYS_ADMIN)
-    docker run --rm --cpus=8 --memory=32g --memory-swap=32g ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" \
+    ENVS=(
       -e QUERY="$Q" -e CONFIG="$CFG" -e MAXSEC="$MS" -e EVENTS_NUM="${EVENTS_NUM:-}" -e TPS="${TPS:-}" \
       -e S3_ENDPOINT=x -e S3_ACCESS_KEY=x -e S3_SECRET_KEY=x -e S3_BUCKET=x -e S3_REGION=x -e S3_PREFIX=x \
       -e FRS_BLOCK_SIZE_KB=8 -e FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-none}" \
@@ -75,6 +75,42 @@ case "$cmd" in
       -e FRS_DISABLE_MAPSTATE_CACHE="${FRS_DISABLE_MAPSTATE_CACHE:-}" \
       -e FRS_WBM_TOTAL_MB="${FRS_WBM_TOTAL_MB:-}" -e FRS_WBM_STALL="${FRS_WBM_STALL:-}" \
       -e FRS_WBM_HARD_MB="${FRS_WBM_HARD_MB:-}" \
+    )
+    # TOPO=split (2026-06-11 user directive): the 8c/32g budget is TM-ONLY.
+    # 2 TM containers x 4c/16g (the measured resource) + 1 JM container 2c/4g
+    # (JM + sql-gateway + client — NOT part of the budget). Single-container
+    # legacy topology remains TOPO=single (all pre-2026-06-11 pins live there).
+    if [ "${TOPO:-single}" = "split" ]; then
+      [ -n "${FRS_PERF:-}${FRS_RSS_SAMPLE:-}${FRS_JFR:-}" ] && echo "WARN: FRS_PERF/FRS_RSS_SAMPLE/FRS_JFR not supported under TOPO=split yet — ignored"
+      NET=frs-net
+      docker network create "$NET" >/dev/null 2>&1 || true
+      docker rm -f frs-jm frs-tm1 frs-tm2 >/dev/null 2>&1 || true
+      for i in 1 2; do
+        docker run -d --name "frs-tm$i" --network "$NET" --cpus=4 --memory=16g --memory-swap=16g \
+          "${DKR_COMMON[@]}" "${ENVS[@]}" "$IMG" bash -lc "
+            mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
+            cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
+            for t in \$(seq 1 150); do curl -sf http://frs-jm:8081/overview >/dev/null 2>&1 && break; sleep 2; done
+            exec bash '$FLINK/bin/taskmanager.sh' start-foreground
+          " >/dev/null
+      done
+      docker run --rm --name frs-jm --network "$NET" --cpus=2 --memory=4g \
+        "${DKR_COMMON[@]}" "${ENVS[@]}" -e CLUSTER_MODE=external -e EXPECT_TMS=2 -e JM_HOST=frs-jm \
+        "$IMG" bash -lc "
+          mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
+          cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
+          nproc && free -g | head -2 &&
+          bash scripts/measure-sql.sh
+        " 2>&1 | tee "$OUT"
+      for i in 1 2; do
+        docker logs "frs-tm$i" 2>/dev/null | grep -h 'STREAM_STATS\|DIAG_COMPLETION' | tail -6
+      done
+      docker rm -f frs-tm1 frs-tm2 >/dev/null 2>&1 || true
+      echo "--- RESULT line ---"; grep -E 'RESULT:|MAXSEC' "$OUT" | tail -1
+      exit 0
+    fi
+    docker run --rm --cpus=8 --memory=32g --memory-swap=32g ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" \
+      "${ENVS[@]}" \
       "$IMG" bash -lc "
         cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
         mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&

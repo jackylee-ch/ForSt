@@ -44,16 +44,55 @@ sql-gateway:
       port: 8083
       bind-port: 8083
 EOF
+# CLUSTER_MODE=external (TOPO=split, 2026-06-11 user directive): the 8c/32g budget
+# is TM-ONLY. TMs run in their own containers (2 x 4c/16g); this container (2c/4g)
+# hosts ONLY JM + sql-gateway + client. Rewrite the conf for cross-container RPC:
+# bind 0.0.0.0, JM advertised as ${JM_HOST}, 2 slots/TM (parallelism 4 = 2+2 spread),
+# JM process shrunk to 1600m so JM+gateway+client fit the 4g envelope.
+if [ "${CLUSTER_MODE:-}" = "external" ]; then
+  JMH="${JM_HOST:-frs-jm}"
+  python3 - "$CONF" "$JMH" <<'PYEOF'
+import sys
+p, jmh = sys.argv[1], sys.argv[2]
+out, sect = [], None
+for ln in open(p):
+    s = ln.rstrip('\n')
+    if s and not s[0].isspace() and s.endswith(':'):
+        sect = s[:-1]
+    if s == '  bind-host: localhost':
+        s = '  bind-host: 0.0.0.0'
+    elif s == '    address: localhost' and sect == 'jobmanager':
+        s = '    address: ' + jmh
+    elif s == '  host: localhost' and sect == 'taskmanager':
+        continue  # each external TM must register its own hostname
+    elif s == '  numberOfTaskSlots: 4':
+        s = '  numberOfTaskSlots: 2'
+    elif s == '      size: 4096m' and sect == 'jobmanager':
+        s = '      size: 1600m'
+    elif s == '  address: localhost' and sect == 'rest':
+        s = '  address: ' + jmh
+    elif s == '  bind-address: localhost' and sect == 'rest':
+        s = '  bind-address: 0.0.0.0'
+    out.append(s + '\n')
+open(p, 'w').writelines(out)
+PYEOF
+fi
 # Fresh cluster + sql-gateway
 "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1
 "$FLINK_HOME"/bin/sql-gateway.sh stop >/dev/null 2>&1
 pkill -9 -f 'Benchmark|TaskManagerRunner|StandaloneSession|SqlGateway|SqlClient' 2>/dev/null || true
 sleep 4
-JAVA_HOME="$JDK" "$FLINK_HOME"/bin/start-cluster.sh >/dev/null 2>&1
+if [ "${CLUSTER_MODE:-}" = "external" ]; then
+  # JM only — external TM containers join once the REST endpoint is up.
+  JAVA_HOME="$JDK" "$FLINK_HOME"/bin/jobmanager.sh start >/dev/null 2>&1
+else
+  JAVA_HOME="$JDK" "$FLINK_HOME"/bin/start-cluster.sh >/dev/null 2>&1
+fi
 sleep 6
-for i in $(seq 1 20); do
+EXPECT_TMS="${EXPECT_TMS:-1}"
+for i in $(seq 1 40); do
   tms=$(curl -sf http://localhost:8081/overview 2>/dev/null | grep -oE '"taskmanagers":[0-9]+' | grep -oE '[0-9]+$')
-  [ -n "$tms" ] && [ "$tms" -ge 1 ] && break
+  [ -n "$tms" ] && [ "$tms" -ge "$EXPECT_TMS" ] && break
   sleep 3
 done
 JAVA_HOME="$JDK" "$FLINK_HOME"/bin/sql-gateway.sh start >/dev/null 2>&1
