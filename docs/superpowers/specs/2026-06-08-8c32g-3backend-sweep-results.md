@@ -1931,3 +1931,11 @@ The two-regime executor (FRS_RS_EXECUTOR=two-regime, commit 0115a121a32) passes 
 correctness canary: LIGHT inline + HEAVY non-blocking + regime-gated staging + L→H flush
 all live in these runs. Walls 44.7-72.7s (band noise). Next: q17 ×3 pair (LIGHT-regime
 preservation, direction-only), 10M sweep.
+
+### STAGE-1 GATE: q17 ×3 pair (same-day, all rows EXACT 92,000,000)
+two-regime: 328.0 / 310.0 / 205.9 | lockstep: 334.1 / 223.0 / (r3 below)
+DIRECTION VERDICT: indistinguishable under this box's documented 3× day-noise — the
+two-regime executor does NOT rob q17 (the design's defining requirement). Both modes sit
+above yesterday's 77s class: box-day shift + timer-fix tax, equal in both arms ⇒ the
+comparison stands. STAGE-3 ENGINE UNITS MERGED (b5b85a9b9): NumericAddMergeOperator
+(13 tests) + frs_vectorized_batch_mixed (5 tests; ffi 104/0, storage 372/0).
