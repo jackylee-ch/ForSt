@@ -25,6 +25,11 @@ repository.workspace = true
 [dependencies]
 forst-rs-common = { workspace = true }
 forst-rs-io = { workspace = true }
+# io_uring BlockIo backend for the §2.1 prefetcher's multi-block window reads.
+# Compiles to a stub off Linux (uring_available() == false), so no cfg is
+# needed here; the unsafe submission-queue code stays isolated in that crate
+# while this one keeps #![forbid(unsafe_code)].
+forst-rs-io-uring = { workspace = true }
 arrow = { workspace = true }
 bytes = { workspace = true }
 lz4_flex = { workspace = true }

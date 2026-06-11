@@ -79,7 +79,9 @@ impl SequentialFile for LocalSequentialFile {
 /// `File` is `Send + Sync` in Rust, and `pread` is thread-safe, so no
 /// `Mutex` is needed.
 pub struct LocalRandomAccessFile {
-    file: File,
+    /// `Arc` so [`RandomAccessFile::local_file_handle`] can hand the io_uring
+    /// backend a shared fd without `dup(2)`-ing per window read.
+    file: std::sync::Arc<File>,
     size: u64,
 }
 
@@ -89,7 +91,10 @@ impl LocalRandomAccessFile {
             .metadata()
             .map_err(|e| map_io_error(e, "random access file metadata"))?
             .len();
-        Ok(Self { file, size })
+        Ok(Self {
+            file: std::sync::Arc::new(file),
+            size,
+        })
     }
 }
 
@@ -121,6 +126,11 @@ impl RandomAccessFile for LocalRandomAccessFile {
 
     fn file_size(&self) -> ForstResult<u64> {
         Ok(self.size)
+    }
+
+    /// io_uring backend: this IS a local regular file — expose the shared fd.
+    fn local_file_handle(&self) -> Option<std::sync::Arc<File>> {
+        Some(std::sync::Arc::clone(&self.file))
     }
 }
 

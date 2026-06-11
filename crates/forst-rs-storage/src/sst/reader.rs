@@ -860,19 +860,40 @@ impl SstReaderImpl {
         }
     }
 
-    /// One positional multi-byte read for the prefetcher's window fetch.
-    /// Reads exactly `buf.len()` bytes at `offset` (short read ⇒ corruption).
-    pub(crate) fn read_window(&self, offset: u64, buf: &mut [u8]) -> ForstResult<()> {
-        let end = offset
-            .checked_add(buf.len() as u64)
-            .ok_or_else(|| ForstError::corruption("SST window offset+len overflow"))?;
-        if end > self.file_size {
-            return Err(ForstError::corruption(format!(
-                "SST window [{}, {}) exceeds file_size {}",
-                offset, end, self.file_size
-            )));
+    /// Vectored window read for the prefetcher: every `(offset, len)` region
+    /// is read FULLY into `buf`, packed back-to-back in order (short read ⇒
+    /// corruption — regions come from the sparse index). Backend selection
+    /// (io_uring stage): when the file currently serves from a LOCAL fd and
+    /// the io_uring backend is available (Linux + kernel probe +
+    /// `FRS_IO_URING` gate, see `forst-rs-io-uring`), all regions go down as
+    /// ONE ring submission; otherwise the portable serial-pread
+    /// [`forst_rs_io::PreadBlockIo`] fallback runs — bit-identical results.
+    pub(crate) fn read_block_regions(
+        &self,
+        regions: &[(u64, usize)],
+        buf: &mut [u8],
+    ) -> ForstResult<()> {
+        // SECURITY: bound every region against file_size (same rationale as
+        // read_decoded_block — the sparse index is untrusted input).
+        for &(off, len) in regions {
+            let end = off
+                .checked_add(len as u64)
+                .ok_or_else(|| ForstError::corruption("SST window offset+len overflow"))?;
+            if end > self.file_size {
+                return Err(ForstError::corruption(format!(
+                    "SST window [{}, {}) exceeds file_size {}",
+                    off, end, self.file_size
+                )));
+            }
         }
-        read_at_exact(self.file.as_ref(), offset, buf)
+        if let Some(handle) = self.file.local_file_handle() {
+            if let Some(uring) = forst_rs_io_uring::UringBlockIo::new(handle) {
+                use forst_rs_io::BlockIo as _;
+                return uring.read_at_vectored(regions, buf);
+            }
+        }
+        use forst_rs_io::BlockIo as _;
+        forst_rs_io::PreadBlockIo(self.file.as_ref()).read_at_vectored(regions, buf)
     }
 
     /// Bumps the `blocks_read` diagnostic counter — the prefetcher calls this

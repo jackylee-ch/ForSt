@@ -576,6 +576,25 @@ impl LocalCache {
         Ok(Some(filled))
     }
 
+    /// io_uring backend (streaming-read redesign): a shared open read handle
+    /// for `key`'s on-disk cache file (via the FRS-FDCACHE), or `None` on a
+    /// cache miss. Bumps the LRU like `get_range_into` so handle-based block
+    /// reads keep the entry warm. Sound for the write-once SST files this
+    /// cache stores: the fd stays valid (and its bytes immutable) even if the
+    /// entry is later evicted/unlinked — Unix keeps the inode alive while the
+    /// fd is open.
+    pub fn file_handle(&self, key: &str) -> Option<Arc<fs::File>> {
+        let on_disk = {
+            let mut inner = self.inner.lock().expect("local cache mutex poisoned");
+            if !inner.entries.contains_key(key) {
+                return None;
+            }
+            inner.touch_lru(key);
+            self.path_for(key)
+        };
+        self.get_or_open_fd(key, &on_disk).ok().flatten()
+    }
+
     /// Writes `data` into the cache under `key`. Evicts oldest entries
     /// as needed to keep `current_bytes <= capacity_bytes`. Returns
     /// `Ok(false)` and writes nothing when `data.len() > capacity_bytes`

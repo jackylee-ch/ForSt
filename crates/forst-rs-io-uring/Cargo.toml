@@ -1,0 +1,36 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "forst-rs-io-uring"
+version = "0.1.0"
+publish = false  # internal-only; never published to crates.io
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Linux io_uring BlockIo backend for ForSt-RS (isolated: the submission queue requires unsafe, while the storage/io crates forbid(unsafe_code))"
+
+[dependencies]
+forst-rs-common = { workspace = true }
+forst-rs-io = { workspace = true }
+
+# The io_uring submission/completion queue interface. Linux-only; the crate
+# compiles to a stub (uring_available() == false, UringBlockIo::new == None)
+# on every other platform so dependents need no cfg.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -133,6 +133,18 @@ pub trait RandomAccessFile: Send + Sync {
     fn is_local(&self) -> bool {
         true
     }
+
+    /// io_uring backend (streaming-read redesign): the underlying LOCAL
+    /// regular-file handle when this reader currently serves from one, used
+    /// by `UringBlockIo` to submit vectored block reads against the raw fd.
+    /// Default `None` (remote / in-memory / synthetic backends) — callers
+    /// fall back to [`crate::block_io::PreadBlockIo`] over `read_at`.
+    /// Like [`Self::is_local`], the answer may change per call (local-first
+    /// cache files); the returned handle stays valid regardless (write-once
+    /// files; an open fd outlives eviction/unlink on Unix).
+    fn local_file_handle(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        None
+    }
 }
 
 /// A file opened for sequential (append-only) writes.

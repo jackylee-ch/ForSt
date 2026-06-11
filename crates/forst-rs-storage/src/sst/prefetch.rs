@@ -386,10 +386,12 @@ impl BlockPrefetcher {
 }
 
 /// Pool-side window production: cache-first per block (window SPLIT around
-/// hits — cached blocks are excluded from I/O), one contiguous positional
-/// read per run of misses, decode (decompress + KvBlock pointer-walk) on this
-/// pool thread, cache insert at `priority`. Returns the window's blocks in
-/// index order.
+/// hits — cached blocks are excluded from I/O), then ALL contiguous runs of
+/// misses issued as ONE vectored read (`read_block_regions` — N read SQEs in
+/// one io_uring submission on Linux, serial preads on the portable fallback;
+/// bit-identical either way), decode (decompress + KvBlock pointer-walk) on
+/// this pool thread, cache insert at `priority`. Returns the window's blocks
+/// in index order.
 fn fetch_window(
     reader: &SstReaderImpl,
     start: usize,
@@ -409,16 +411,17 @@ fn fetch_window(
             out[idx - start] = Some(hit);
         }
     }
-    // Pass 2: contiguous runs of misses → ONE positional read each, then
-    // per-block decode from slices of the run buffer.
+    // Pass 2: group cache-missing blocks into runs of PHYSICALLY contiguous
+    // file ranges (the writer lays blocks back-to-back; verified
+    // defensively). Each run is one I/O region.
+    let mut io_regions: Vec<(u64, usize)> = Vec::new(); // (file_off, run_bytes)
+    let mut run_blocks: Vec<(usize, usize)> = Vec::new(); // [run_start, run_end) window-local
     let mut i = 0usize;
     while i < n {
         if out[i].is_some() {
             i += 1;
             continue;
         }
-        // Extend the run while blocks are missing AND physically contiguous
-        // (the writer lays blocks back-to-back; verified defensively).
         let run_start = i;
         let mut run_end = i + 1;
         while run_end < n
@@ -427,27 +430,36 @@ fn fetch_window(
         {
             run_end += 1;
         }
-        let run_off = regions[run_start].0;
         let run_bytes: usize = regions[run_start..run_end]
             .iter()
             .map(|&(_, s)| s as usize)
             .sum();
-        let mut buf = vec![0u8; run_bytes];
-        reader.read_window(run_off, &mut buf)?;
-        let mut cursor = 0usize;
-        for (j, &(off, size)) in regions
-            .iter()
-            .enumerate()
-            .take(run_end)
-            .skip(run_start)
-        {
-            let slice = &buf[cursor..cursor + size as usize];
-            cursor += size as usize;
-            let decoded = reader.decode_block_from_slice(slice)?;
-            reader.cache_insert_decoded(off, &decoded, priority);
-            out[j] = Some(decoded);
-        }
+        io_regions.push((regions[run_start].0, run_bytes));
+        run_blocks.push((run_start, run_end));
         i = run_end;
+    }
+    if !io_regions.is_empty() {
+        // Pass 3: ONE vectored read for every run, packed back-to-back.
+        let total: usize = io_regions.iter().map(|&(_, l)| l).sum();
+        let mut buf = vec![0u8; total];
+        reader.read_block_regions(&io_regions, &mut buf)?;
+        // Pass 4: per-block decode from slices of the packed buffer.
+        let mut cursor = 0usize;
+        for &(run_start, run_end) in &run_blocks {
+            for (j, &(off, size)) in regions
+                .iter()
+                .enumerate()
+                .take(run_end)
+                .skip(run_start)
+            {
+                let slice = &buf[cursor..cursor + size as usize];
+                cursor += size as usize;
+                let decoded = reader.decode_block_from_slice(slice)?;
+                reader.cache_insert_decoded(off, &decoded, priority);
+                out[j] = Some(decoded);
+            }
+        }
+        debug_assert_eq!(cursor, total);
     }
     Ok(out
         .into_iter()

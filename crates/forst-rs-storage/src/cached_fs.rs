@@ -770,6 +770,14 @@ impl RandomAccessFile for LocalFirstSstFile {
     fn is_local(&self) -> bool {
         self.cache.contains(&self.key)
     }
+
+    /// io_uring backend: the write-through copy's shared fd when locally
+    /// resident (FRS-FDCACHE handle — stays valid across later eviction;
+    /// write-once bytes). `None` once evicted → callers pread the remote
+    /// fallback path instead.
+    fn local_file_handle(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        self.cache.file_handle(&self.key)
+    }
 }
 
 impl LocalFirstSstFile {
