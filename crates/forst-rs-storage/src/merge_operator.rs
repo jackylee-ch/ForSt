@@ -357,6 +357,40 @@ impl MergeOperator for NumericAddBeMergeOperator {
     }
 }
 
+/// THE name registry for built-in merge operators (OPT-N04 E3).
+///
+/// Resolves a stable operator identity string (the value returned by
+/// [`MergeOperator::name`], persisted in checkpoint CF descriptors and
+/// passed by name across the FFI) to a fresh operator instance. This is
+/// the single source of truth shared by:
+/// - `frs_db_create_cf_with_merge` (FFI create path),
+/// - the checkpoint restore-by-name arms in `DbImpl::open_from_incremental`
+///   (default-CF and non-default-CF descriptors),
+/// - `DbImpl::create_cf_from_import_with_merge` (rescale/import path).
+///
+/// Accepted names:
+/// - `"ListAppendMergeOperator"` (legacy alias) and
+///   `"ListAppendMergeOperator(delim=44)"` (the R47-H3 identity of
+///   [`ListAppendMergeOperator::with_comma`]) — comma list-append.
+/// - `"RawConcatMergeOperator"` — byte-for-byte concatenation.
+/// - `"NumericAddMergeOperator"` — 8-byte LE i64 saturating sum.
+/// - `"NumericAddBeMergeOperator"` — 8-byte BE i64 wrapping sum
+///   (Java `long +` equivalent; OPT-N04 §4).
+///
+/// Returns `None` for any unknown name; callers decide whether that is
+/// `InvalidArgument` (create/import) or `Corruption`-adjacent (restore).
+pub fn merge_operator_by_name(name: &str) -> Option<std::sync::Arc<dyn MergeOperator>> {
+    match name {
+        "ListAppendMergeOperator" | "ListAppendMergeOperator(delim=44)" => {
+            Some(std::sync::Arc::new(ListAppendMergeOperator::with_comma()))
+        }
+        "RawConcatMergeOperator" => Some(std::sync::Arc::new(RawConcatMergeOperator::new())),
+        "NumericAddMergeOperator" => Some(std::sync::Arc::new(NumericAddMergeOperator::new())),
+        "NumericAddBeMergeOperator" => Some(std::sync::Arc::new(NumericAddBeMergeOperator::new())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

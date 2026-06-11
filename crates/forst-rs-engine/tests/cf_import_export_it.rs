@@ -179,6 +179,99 @@ fn create_cf_from_import_rejects_magic_mismatch() {
     );
 }
 
+/// OPT-N04 E3 — rescale/import round-trip with a LIVE merge chain.
+///
+/// Source engine: `agg-merge-i64` CF carries `NumericAddBeMergeOperator`;
+/// the accumulator has a Put base, an SST-resident Merge operand, and a
+/// Merge operand still PENDING in the active memtable at export time.
+/// The export blob materialises the resolved fold (export reads collapse
+/// merge chains), so the destination only needs the operator for FUTURE
+/// merges — which is exactly what `create_cf_from_import_with_merge`
+/// threads through by name. Without it (the legacy import), the first
+/// post-rescale merge is rejected and the state is read-only.
+#[test]
+fn create_cf_from_import_with_merge_rescale_round_trip_live_chain() {
+    let be = |v: i64| v.to_be_bytes().to_vec();
+    let src_dir = tempfile::tempdir().expect("src db tempdir");
+    let dst_dir = tempfile::tempdir().expect("dst db tempdir");
+    let export_dir = tempfile::tempdir().expect("export tempdir");
+    let exp_path = export_dir.path();
+
+    // ---- Source engine: build the live chain, then export ----
+    {
+        let src = open_local(&src_dir.path().to_string_lossy());
+        let agg = src
+            .create_column_family(
+                ColumnFamilyDescriptor::new("agg-merge-i64").with_merge_operator(Arc::new(
+                    forst_rs_storage::merge_operator::NumericAddBeMergeOperator::new(),
+                )),
+            )
+            .expect("create agg cf");
+
+        // Put(10) + Merge(+5) → flush (SST-resident part of the chain).
+        src.put(&agg, b"acc/k", &be(10)).expect("put base");
+        src.merge(&agg, b"acc/k", &be(5)).expect("merge sst part");
+        src.switch_and_flush(&agg).expect("flush").expect("sst");
+        // Merge(+2) left PENDING in the live memtable at export time.
+        src.merge(&agg, b"acc/k", &be(2)).expect("live merge");
+
+        src.cf_export(&agg, exp_path).expect("cf_export");
+    } // drop source engine
+
+    // ---- Destination engine (the rescaled job) ----
+    let dst = open_local(&dst_dir.path().to_string_lossy());
+
+    // (a) Unknown operator name fails BEFORE any side effect — the CF
+    //     name must remain free for the retry below.
+    let err = dst
+        .create_cf_from_import_with_merge("agg-merge-i64", exp_path, Some("NoSuchOperator"))
+        .expect_err("unknown operator name must be rejected");
+    assert!(
+        format!("{err}").contains("unknown merge operator"),
+        "error must name the problem; got: {err}"
+    );
+
+    // (b) Import WITH the operator threaded by name.
+    let agg2 = dst
+        .create_cf_from_import_with_merge(
+            "agg-merge-i64",
+            exp_path,
+            Some("NumericAddBeMergeOperator"),
+        )
+        .expect("import with merge operator");
+    assert!(
+        dst.cf_has_merge_operator(&agg2),
+        "imported CF must carry the operator for future merges"
+    );
+
+    // Imported data is the resolved fold: 10 + 5 + 2 (incl. the operand
+    // that was live in the source memtable at export time).
+    assert_eq!(dst.get(&agg2, b"acc/k").expect("get"), Some(be(17)));
+
+    // (c) FUTURE merges fold against the imported Put base — the whole
+    //     point of threading the operator through the rescale path.
+    dst.merge(&agg2, b"acc/k", &be(3)).expect("post-import merge");
+    dst.merge(&agg2, b"acc/k", &be(-1))
+        .expect("post-import retraction");
+    assert_eq!(dst.get(&agg2, b"acc/k").expect("get"), Some(be(19)));
+
+    // (d) The chain survives flush + compaction under the operator.
+    dst.switch_and_flush(&agg2).expect("flush").expect("sst");
+    dst.compact_range(&agg2).expect("compact");
+    assert_eq!(dst.get(&agg2, b"acc/k").expect("get"), Some(be(19)));
+
+    // (e) Contrast: the legacy no-operator import yields a CF whose
+    //     data reads fine but which cannot accept future merges.
+    let plain = dst
+        .create_cf_from_import("agg-merge-i64-plain", exp_path)
+        .expect("legacy import");
+    assert_eq!(dst.get(&plain, b"acc/k").expect("get"), Some(be(17)));
+    assert!(
+        !dst.cf_has_merge_operator(&plain),
+        "legacy import must not invent an operator"
+    );
+}
+
 #[test]
 fn create_cf_from_import_rejects_duplicate_cf_name() {
     let db_dir = tempfile::tempdir().expect("db tempdir");

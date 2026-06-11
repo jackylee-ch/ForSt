@@ -87,10 +87,7 @@ use forst_rs_engine::{
     ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, WriteBatch, DEFAULT_CF_NAME,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem};
-use forst_rs_storage::merge_operator::{
-    ListAppendMergeOperator, MergeOperator, NumericAddBeMergeOperator, NumericAddMergeOperator,
-    RawConcatMergeOperator,
-};
+use forst_rs_storage::merge_operator::{merge_operator_by_name, RawConcatMergeOperator};
 
 /// Defense-in-depth cap on `count` (or row count) passed to FFI batch
 /// operations. Untrusted C-side caller could otherwise drive
@@ -1226,8 +1223,11 @@ pub unsafe extern "C" fn frs_db_create_cf(
 /// Creates a new column family with the named merge operator attached.
 /// `merge_op_name = NULL` means no merge operator.
 ///
-/// Currently recognised merge operators:
-/// - `"ListAppendMergeOperator"` — comma-separated concatenation
+/// Recognised merge operators (resolved via the shared
+/// `merge_operator_by_name` registry — the same names accepted by the
+/// checkpoint restore arms and `frs_db_create_cf_from_import_with_merge`):
+/// - `"ListAppendMergeOperator"` (alias `"ListAppendMergeOperator(delim=44)"`)
+///   — comma-separated concatenation
 /// - `"RawConcatMergeOperator"` — byte-for-byte concatenation
 /// - `"NumericAddMergeOperator"` — 8-byte little-endian i64 saturating sum
 /// - `"NumericAddBeMergeOperator"` — 8-byte big-endian i64 WRAPPING sum
@@ -1255,12 +1255,10 @@ pub unsafe extern "C" fn frs_db_create_cf_with_merge(
             let Some(op_name) = cstr_to_str(&merge_op_name) else {
                 return FRS_STATUS_NULL_ARG;
             };
-            let op: Arc<dyn MergeOperator> = match op_name {
-                "ListAppendMergeOperator" => Arc::new(ListAppendMergeOperator::with_comma()),
-                "RawConcatMergeOperator" => Arc::new(RawConcatMergeOperator::new()),
-                "NumericAddMergeOperator" => Arc::new(NumericAddMergeOperator::new()),
-                "NumericAddBeMergeOperator" => Arc::new(NumericAddBeMergeOperator::new()),
-                _ => return FRS_STATUS_INVALID_ARGUMENT,
+            // OPT-N04 E3: resolve via THE shared name registry (same one
+            // used by the checkpoint restore arms and the import path).
+            let Some(op) = merge_operator_by_name(op_name) else {
+                return FRS_STATUS_INVALID_ARGUMENT;
             };
             desc = desc.with_merge_operator(op);
         }
@@ -4599,6 +4597,75 @@ pub unsafe extern "C" fn frs_db_create_cf_from_import(
         };
         let dir = std::path::Path::new(dir_str);
         match db.create_cf_from_import(name_str, dir) {
+            Ok(cf_handle) => {
+                let boxed = Box::new(cf_handle);
+                *out_cf = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// OPT-N04 E3: `frs_db_create_cf_from_import` with the destination CF's
+/// merge operator threaded through BY NAME. The export blob contains only
+/// resolved Puts (export reads collapse merge chains, including operands
+/// still pending in memtables at export time), so the operator is not
+/// needed for the imported *data* — but without it the recreated CF
+/// rejects all *future* Merge writes (D-R8-NEW-H2), making rescaled
+/// merge-routed state read-only. The Java rescale path MUST use this
+/// entry point for CFs created via `frs_db_create_cf_with_merge`.
+///
+/// `merge_op_name` accepts the same names as `frs_db_create_cf_with_merge`
+/// (shared `merge_operator_by_name` registry). `NULL` means no operator —
+/// byte-identical behaviour to `frs_db_create_cf_from_import`.
+///
+/// Returns:
+/// - `FRS_STATUS_OK` on success.
+/// - `FRS_STATUS_NULL_ARG` if `db`, `name`, `import_dir`, or `out_cf`
+///   is null.
+/// - `FRS_STATUS_INVALID_ARGUMENT` for an unknown `merge_op_name` (no CF
+///   is created), a missing blob, a magic mismatch, or a duplicate name.
+/// - `FRS_STATUS_CORRUPTION` if the blob is truncated mid-entry.
+/// - `FRS_STATUS_IO` if a backing put fails.
+///
+/// # SAFETY
+/// - `db` must be a handle returned by `frs_db_open*` and not yet closed.
+/// - `name` and `import_dir` must be NUL-terminated UTF-8 strings for the
+///   duration of the call; `merge_op_name` must be either NULL or a
+///   NUL-terminated UTF-8 string for the duration of the call.
+/// - `out_cf` must point to a writable `FrsCfHandle`.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_create_cf_from_import_with_merge(
+    db: FrsDb,
+    name: *const c_char,
+    merge_op_name: *const c_char,
+    import_dir: *const c_char,
+    out_cf: *mut FrsCfHandle,
+) -> i32 {
+    guarded(|| {
+        if out_cf.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(name_str) = cstr_to_str(&name) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let op_name: Option<&str> = if merge_op_name.is_null() {
+            None
+        } else {
+            let Some(s) = cstr_to_str(&merge_op_name) else {
+                return FRS_STATUS_NULL_ARG;
+            };
+            Some(s)
+        };
+        let Some(dir_str) = cstr_to_str(&import_dir) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let dir = std::path::Path::new(dir_str);
+        match db.create_cf_from_import_with_merge(name_str, dir, op_name) {
             Ok(cf_handle) => {
                 let boxed = Box::new(cf_handle);
                 *out_cf = Box::into_raw(boxed) as *mut c_void;
@@ -8526,6 +8593,153 @@ mod tests {
                 frs_bytes_free(&mut out);
             }
 
+            assert_eq!(frs_cf_close(imp_cf), FRS_STATUS_OK);
+            assert_eq!(frs_cf_close(src_cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// OPT-N04 E3: `frs_db_create_cf_from_import_with_merge` threads the
+    /// operator by name through the rescale/import path. The source CF's
+    /// chain has operands pending at export time; the import must (1)
+    /// read the resolved fold byte-exactly and (2) accept FUTURE merges —
+    /// which the legacy no-operator import rejects (D-R8-NEW-H2).
+    #[test]
+    fn test_frs_cf_import_with_merge_live_chain_roundtrip() {
+        let export_dir = tempfile::TempDir::new().expect("export tempdir");
+        let export_dir_c =
+            CString::new(export_dir.path().to_string_lossy().into_owned()).expect("cstring");
+
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            // Source CF with the BE numeric-add operator + a live chain.
+            let src_name = CString::new("agg-src").unwrap();
+            let op_name = CString::new("NumericAddBeMergeOperator").unwrap();
+            let mut src_cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(
+                frs_db_create_cf_with_merge(db, src_name.as_ptr(), op_name.as_ptr(), &mut src_cf),
+                FRS_STATUS_OK
+            );
+            let k = b"acc";
+            let base = 10i64.to_be_bytes();
+            let d1 = 5i64.to_be_bytes();
+            let d2 = 2i64.to_be_bytes();
+            assert_eq!(
+                frs_put(db, src_cf, k.as_ptr(), k.len(), base.as_ptr(), base.len()),
+                FRS_STATUS_OK
+            );
+            assert_eq!(
+                frs_merge(db, src_cf, k.as_ptr(), k.len(), d1.as_ptr(), d1.len()),
+                FRS_STATUS_OK
+            );
+            assert_eq!(
+                frs_merge(db, src_cf, k.as_ptr(), k.len(), d2.as_ptr(), d2.len()),
+                FRS_STATUS_OK
+            );
+
+            assert_eq!(frs_cf_export(db, src_cf, export_dir_c.as_ptr()), FRS_STATUS_OK);
+
+            // Unknown operator name → INVALID_ARGUMENT, no CF created.
+            let imp_name = CString::new("agg-imported").unwrap();
+            let bad_op = CString::new("NoSuchOperator").unwrap();
+            let mut imp_cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(
+                frs_db_create_cf_from_import_with_merge(
+                    db,
+                    imp_name.as_ptr(),
+                    bad_op.as_ptr(),
+                    export_dir_c.as_ptr(),
+                    &mut imp_cf,
+                ),
+                FRS_STATUS_INVALID_ARGUMENT
+            );
+            assert!(imp_cf.is_null());
+
+            // Import WITH the operator (name freed by the failed attempt).
+            assert_eq!(
+                frs_db_create_cf_from_import_with_merge(
+                    db,
+                    imp_name.as_ptr(),
+                    op_name.as_ptr(),
+                    export_dir_c.as_ptr(),
+                    &mut imp_cf,
+                ),
+                FRS_STATUS_OK
+            );
+            assert!(!imp_cf.is_null());
+
+            // Resolved fold imported byte-exactly: 10 + 5 + 2 = 17 (BE).
+            let mut out = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, imp_cf, k.as_ptr(), k.len(), &mut out),
+                FRS_STATUS_OK
+            );
+            assert_eq!(
+                slice::from_raw_parts(out.data, out.len),
+                &17i64.to_be_bytes()
+            );
+            frs_bytes_free(&mut out);
+
+            // FUTURE merge folds — the operator made it across the import.
+            let d3 = (-4i64).to_be_bytes();
+            assert_eq!(
+                frs_merge(db, imp_cf, k.as_ptr(), k.len(), d3.as_ptr(), d3.len()),
+                FRS_STATUS_OK
+            );
+            let mut out2 = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, imp_cf, k.as_ptr(), k.len(), &mut out2),
+                FRS_STATUS_OK
+            );
+            assert_eq!(
+                slice::from_raw_parts(out2.data, out2.len),
+                &13i64.to_be_bytes()
+            );
+            frs_bytes_free(&mut out2);
+
+            // NULL operator name == legacy import shape: data readable,
+            // future merges REJECTED (D-R8-NEW-H2).
+            let plain_name = CString::new("agg-imported-plain").unwrap();
+            let mut plain_cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(
+                frs_db_create_cf_from_import_with_merge(
+                    db,
+                    plain_name.as_ptr(),
+                    ptr::null(),
+                    export_dir_c.as_ptr(),
+                    &mut plain_cf,
+                ),
+                FRS_STATUS_OK
+            );
+            let mut out3 = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, plain_cf, k.as_ptr(), k.len(), &mut out3),
+                FRS_STATUS_OK
+            );
+            assert_eq!(
+                slice::from_raw_parts(out3.data, out3.len),
+                &17i64.to_be_bytes()
+            );
+            frs_bytes_free(&mut out3);
+            // The single-shot frs_merge path doesn't pre-validate the
+            // operator (only the vectorized batch path does, D-R8-NEW-H2),
+            // so the write lands — but the fold is impossible and the next
+            // read surfaces InvalidArgument: the op-less imported CF cannot
+            // serve merge-routed state.
+            assert_eq!(
+                frs_merge(db, plain_cf, k.as_ptr(), k.len(), d3.as_ptr(), d3.len()),
+                FRS_STATUS_OK
+            );
+            let mut out4 = FrsBytes::NULL;
+            assert_eq!(
+                frs_get(db, plain_cf, k.as_ptr(), k.len(), &mut out4),
+                FRS_STATUS_INVALID_ARGUMENT,
+                "reading a merge chain on an operator-less imported CF must error"
+            );
+
+            assert_eq!(frs_cf_close(plain_cf), FRS_STATUS_OK);
             assert_eq!(frs_cf_close(imp_cf), FRS_STATUS_OK);
             assert_eq!(frs_cf_close(src_cf), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);

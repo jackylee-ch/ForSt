@@ -35,10 +35,7 @@ use forst_rs_io::{FileSystem, LocalFileSystem, MemoryFileSystem, OpendalFileSyst
 use forst_rs_storage::cache::clock::ShardedClockCache;
 use forst_rs_storage::cached_fs::CachedFileSystem;
 use forst_rs_storage::local_cache::LocalCache;
-use forst_rs_storage::merge_operator::{
-    ListAppendMergeOperator, NumericAddBeMergeOperator, NumericAddMergeOperator,
-    RawConcatMergeOperator,
-};
+use forst_rs_storage::merge_operator::merge_operator_by_name;
 use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
 use forst_rs_storage::version::{
     SstFileMeta, Version, VersionEdit, VersionSetImpl, VersionSetSnapshot,
@@ -5169,28 +5166,24 @@ impl DbImpl {
                     DEFAULT_CF_NAME, cf.name
                 )));
             }
+            // OPT-N04 E2/E3: restore-by-name goes through THE shared
+            // registry (`merge_operator_by_name`) — the same one used by
+            // `frs_db_create_cf_with_merge` and the import path — so a
+            // checkpoint written with any built-in operator (incl. the
+            // numeric-add pair) is always restorable.
             match cf.merge_op_name.as_str() {
                 "" => default_desc,
-                "RawConcatMergeOperator" => ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
-                    .with_merge_operator(Arc::new(RawConcatMergeOperator::new())),
-                "ListAppendMergeOperator" | "ListAppendMergeOperator(delim=44)" => {
-                    ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
-                        .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma()))
-                }
-                // OPT-N04 E2: numeric-add operators restore by name —
-                // checkpoints holding CFs with these operators must be
-                // restorable (without this arm any checkpoint taken with
-                // merge-RMW routing ON would be permanently unreadable).
-                "NumericAddBeMergeOperator" => ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
-                    .with_merge_operator(Arc::new(NumericAddBeMergeOperator::new())),
-                "NumericAddMergeOperator" => ColumnFamilyDescriptor::new(DEFAULT_CF_NAME)
-                    .with_merge_operator(Arc::new(NumericAddMergeOperator::new())),
-                other => {
-                    return Err(ForstError::invalid_argument(format!(
-                        "checkpoint cf_descriptor for default CF references unknown merge operator '{}'",
-                        other
-                    )));
-                }
+                name => match merge_operator_by_name(name) {
+                    Some(op) => {
+                        ColumnFamilyDescriptor::new(DEFAULT_CF_NAME).with_merge_operator(op)
+                    }
+                    None => {
+                        return Err(ForstError::invalid_argument(format!(
+                            "checkpoint cf_descriptor for default CF references unknown merge operator '{}'",
+                            name
+                        )));
+                    }
+                },
             }
         } else {
             default_desc
@@ -5218,29 +5211,20 @@ impl DbImpl {
                 continue;
             }
             let mut desc = ColumnFamilyDescriptor::new(cf.name.clone());
+            // OPT-N04 E2/E3: restore-by-name via THE shared registry (e.g.
+            // the agg-merge-i64 CF's BE wrapping operator; the LE twin and
+            // the list/concat operators are recognised for completeness).
             desc = match cf.merge_op_name.as_str() {
                 "" => desc,
-                "RawConcatMergeOperator" => {
-                    desc.with_merge_operator(Arc::new(RawConcatMergeOperator::new()))
-                }
-                "ListAppendMergeOperator" | "ListAppendMergeOperator(delim=44)" => {
-                    desc.with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma()))
-                }
-                // OPT-N04 E2: the agg-merge-i64 CF (merge-routed Reducing
-                // states) carries the BE wrapping operator; restore it by
-                // name. The LE twin is recognised for completeness.
-                "NumericAddBeMergeOperator" => {
-                    desc.with_merge_operator(Arc::new(NumericAddBeMergeOperator::new()))
-                }
-                "NumericAddMergeOperator" => {
-                    desc.with_merge_operator(Arc::new(NumericAddMergeOperator::new()))
-                }
-                other => {
-                    return Err(ForstError::invalid_argument(format!(
-                        "checkpoint cf_descriptor for '{}' references unknown merge operator '{}'",
-                        cf.name, other
-                    )));
-                }
+                name => match merge_operator_by_name(name) {
+                    Some(op) => desc.with_merge_operator(op),
+                    None => {
+                        return Err(ForstError::invalid_argument(format!(
+                            "checkpoint cf_descriptor for '{}' references unknown merge operator '{}'",
+                            cf.name, name
+                        )));
+                    }
+                },
             };
             // Best-effort: bump next_cf_id past every restored id so future
             // `create_column_family` doesn't collide.
@@ -7359,27 +7343,17 @@ impl DbImpl {
     /// call returns [`ForstError::InvalidArgument`] and no state is
     /// imported.
     ///
-    /// # R46-M2: homogeneity check exemption
+    /// # OPT-N04 E3: merge operator
     ///
-    /// The export blob format does not currently carry the source CF's
-    /// merge_operator or compaction_filter name, so the imported CF is
-    /// always created with a default-shape descriptor (no merge, no
-    /// filter). If the destination engine has any existing non-default CF
-    /// with a non-default policy, the R45-H1 / R46-H1 homogeneity check
-    /// would reject the import. To keep §6g cross-job transfer functional
-    /// we deliberately bypass the check here.
-    ///
-    /// SILENT WRONG-RESULT RISK: imports are admitted unconditionally;
-    /// if the source CF in the producing engine used a merge operator
-    /// or compaction filter that the destination engine does NOT carry
-    /// on its other CFs, cross-CF compaction in the destination will
-    /// behave incorrectly for the imported data (the same hazard R45-H1
-    /// guards against on the `create_column_family` path). Callers
-    /// orchestrating cross-job transfer are responsible for ensuring
-    /// source and destination engines use the same per-CF policy. A
-    /// follow-up that propagates the source merge/filter name through
-    /// the export blob would let us tighten this back to a checked
-    /// import; that work is out of scope here.
+    /// This no-operator variant delegates to
+    /// [`Self::create_cf_from_import_with_merge`] with `merge_op_name =
+    /// None` — the imported CF carries NO merge operator and any future
+    /// `merge()` against it is rejected (D-R8-NEW-H2). The export blob
+    /// materialises resolved values (the export scan collapses merge
+    /// chains into Puts), so the missing operator is benign for the
+    /// *imported* rows — but a CF whose source carried an operator and
+    /// expects future Merge writes MUST be imported via the with-merge
+    /// variant.
     ///
     /// Errors: [`ForstError::InvalidArgument`] for a missing or
     /// magic-mismatched blob; [`ForstError::Corruption`] for a truncated
@@ -7390,6 +7364,53 @@ impl DbImpl {
         name: &str,
         import_dir: &Path,
     ) -> ForstResult<ColumnFamilyHandle> {
+        self.create_cf_from_import_with_merge(name, import_dir, None)
+    }
+
+    /// OPT-N04 E3: [`Self::create_cf_from_import`] with the destination
+    /// CF's merge operator threaded through BY NAME (resolved via the
+    /// shared [`merge_operator_by_name`] registry — the same identity
+    /// strings accepted by `frs_db_create_cf_with_merge` and the
+    /// checkpoint restore-by-name arms).
+    ///
+    /// Rescale/import rationale: the export blob contains only resolved
+    /// Puts (export reads collapse merge chains, including operands still
+    /// pending in memtables at export time), so imported *data* never
+    /// needs the operator — but the recreated CF must still carry it for
+    /// *future* merges, otherwise the first post-rescale `merge()` is
+    /// rejected (D-R8-NEW-H2) and the state is functionally read-only.
+    ///
+    /// `merge_op_name`:
+    /// - `None` — no operator (the legacy `create_cf_from_import` shape).
+    /// - `Some(name)` — resolved via the registry BEFORE any side effect;
+    ///   an unknown name returns [`ForstError::InvalidArgument`] and no
+    ///   CF is created.
+    ///
+    /// # R46-M2: homogeneity check exemption
+    ///
+    /// The CF is installed via the no-homogeneity-check path. Since
+    /// OPT-N04 E1 the homogeneity wall only covers compaction FILTERS
+    /// (merge operators are per-CF safe; cross-CF compaction inputs are
+    /// a hard error), and the export blob does not carry a filter name,
+    /// so the imported CF (always filter-less) is exactly the shape the
+    /// restore path already admits unconditionally.
+    pub fn create_cf_from_import_with_merge(
+        &self,
+        name: &str,
+        import_dir: &Path,
+        merge_op_name: Option<&str>,
+    ) -> ForstResult<ColumnFamilyHandle> {
+        // Resolve the operator FIRST — an unknown name must fail before
+        // the CF is registered or any blob byte is replayed.
+        let merge_op = match merge_op_name {
+            None => None,
+            Some(op_name) => Some(merge_operator_by_name(op_name).ok_or_else(|| {
+                ForstError::invalid_argument(format!(
+                    "create_cf_from_import: unknown merge operator '{op_name}' \
+                     for column family '{name}'"
+                ))
+            })?),
+        };
         let blob_path = import_dir.join(Self::EXPORT_BLOB_NAME);
         let blob = std::fs::read(&blob_path).map_err(|e| {
             ForstError::invalid_argument(format!(
@@ -7424,10 +7445,14 @@ impl DbImpl {
         // courtesy.
 
         // ---- Create the destination CF ----
-        // R46-M2: bypass the R45-H1/R46-H1 homogeneity check (default-shape
-        // descriptor — see fn doc for the silent-wrong-result caveat).
-        let cf =
-            self.create_column_family_no_homogeneity_check(ColumnFamilyDescriptor::new(name))?;
+        // R46-M2: bypass the (filter-only since E1) homogeneity check —
+        // see fn doc. OPT-N04 E3: attach the resolved merge operator so
+        // future Merge writes against the imported CF fold correctly.
+        let mut desc = ColumnFamilyDescriptor::new(name);
+        if let Some(op) = merge_op {
+            desc = desc.with_merge_operator(op);
+        }
+        let cf = self.create_column_family_no_homogeneity_check(desc)?;
 
         // ---- Replay entries ----
         // R42-H1: any failure in the replay loop (truncated blob, put error)
@@ -11291,7 +11316,9 @@ trait _Marker {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forst_rs_storage::merge_operator::{ListAppendMergeOperator, MergeOperator};
+    use forst_rs_storage::merge_operator::{
+        ListAppendMergeOperator, MergeOperator, NumericAddBeMergeOperator,
+    };
 
     fn open() -> Arc<DbImpl> {
         DbImpl::open_default().expect("open")
