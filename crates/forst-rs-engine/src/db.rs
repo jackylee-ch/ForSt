@@ -6504,7 +6504,18 @@ impl DbImpl {
                         working.display()
                     ))
                 })?;
-                mgr.register(&working, key, file.file_size)?;
+                // FRS-PHASE2-S3: register ONLY unmapped working paths.
+                // `register` REBINDS an existing logical to a new physical —
+                // on an instant-link-restored engine the working path of an
+                // ADOPTED SST maps to the SOURCE checkpoint's physical object
+                // (the working path itself has no bytes); rebinding it to the
+                // identity mapping would make this checkpoint's links point
+                // at a byte-less key. Keeping the existing mapping makes
+                // chained link-checkpoints after restore resolve transitively
+                // to the original physical.
+                if !mgr.is_registered(&working) {
+                    mgr.register(&working, key, file.file_size)?;
+                }
                 let basename = working.file_name().ok_or_else(|| {
                     ForstError::corruption(format!(
                         "link-mode checkpoint: SST path has no file name: {}",
@@ -7079,6 +7090,122 @@ impl DbImpl {
             ..EngineOptions::default()
         };
         Self::open_from_checkpoint(options, fs)
+    }
+
+    /// FRS-PHASE2-S3 (design §5 Stage-3): INSTANT-LINK restore — opens an
+    /// engine from a LINK-mode checkpoint directory downloading/copying
+    /// NOTHING. Per live SST: resolve the `<chk-k>/NNNNNN.sst` linked path to
+    /// its physical key via the blob-embedded mapping snapshot, then
+    /// `adopt()` it under the new working namespace
+    /// (`<target>/NNNNNN.sst` → physical, [`forst_rs_io::FileMappingManager`]
+    /// `NotOwned` — the restored engine NEVER physically deletes a
+    /// checkpoint-owned object). Reads route through a
+    /// [`forst_rs_io::MappedFileSystem`] (the UFS read-path indirection), so
+    /// the engine addresses canonical working paths while bytes stay at the
+    /// source physicals; the cache warms lazily
+    /// ([`forst_rs_io::FileSystem::pre_seed_admission`] is hinted per adopted
+    /// SST — ForSt §2.1.6 `registerInCache`). Restore wall-time is O(files)
+    /// metadata, flat in state bytes (paper Fig. 10 shape).
+    ///
+    /// Crash-retry: the target journal (`<target>/MAPPING.journal`) is
+    /// replayed by `FileMappingManager::new`, and `adopt` is idempotent, so a
+    /// re-run over a partially-restored target (journal synced, blob never
+    /// written) completes cleanly.
+    ///
+    /// OWNERSHIP BOUNDARY (claim semantics, recorded): the adopted physicals
+    /// belong to the SOURCE checkpoint's refcount domain. The caller must
+    /// keep that checkpoint retained until this engine no longer references
+    /// foreign physicals — compaction weans them out naturally;
+    /// [`Self::adopted_residual`] reports the count still referenced. This is
+    /// Flink CLAIM-mode discipline; the cross-job ownership-transfer protocol
+    /// is the Java-integration stage.
+    pub fn open_from_linked_checkpoint_instant(
+        fs: Arc<dyn FileSystem>,
+        ckpt_dir: &Path,
+        target_dir: &str,
+    ) -> ForstResult<Arc<Self>> {
+        use crate::checkpoint::{
+            deserialize_snapshot, read_blob, split_mapping_trailer, write_blob,
+        };
+        let blob = read_blob(fs.as_ref(), ckpt_dir)?;
+        let (base, mapping) = split_mapping_trailer(&blob)?;
+        let mapping = mapping.ok_or_else(|| {
+            ForstError::invalid_argument(format!(
+                "open_from_linked_checkpoint_instant: {} carries no mapping trailer — \
+                 not a link-mode checkpoint (use open_from_checkpoint/_incremental)",
+                ckpt_dir.display()
+            ))
+        })?;
+        let view = forst_rs_io::MappingSnapshotView::decode(mapping)?;
+        let snap = deserialize_snapshot(base)?;
+
+        let target = PathBuf::from(target_dir);
+        fs.create_dir_all(&target)?;
+        let mgr = Arc::new(forst_rs_io::FileMappingManager::new(
+            fs.clone(),
+            target.join("MAPPING.journal"),
+        )?);
+        for file in snap.version.live_sst_files() {
+            let canonical = sst_file_path(&target, file.file_number);
+            let basename = canonical.file_name().ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "open_from_linked_checkpoint_instant: SST path has no file name: {}",
+                    canonical.display()
+                ))
+            })?;
+            let linked = ckpt_dir.join(basename);
+            let physical = view.resolve(&linked).ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "open_from_linked_checkpoint_instant: manifest references {} but \
+                     the embedded mapping snapshot has no entry for it",
+                    linked.display()
+                ))
+            })?;
+            // `adopt` verifies the physical exists (loud NotFound on a
+            // missing object — no silent empty state) and enters NotOwned.
+            mgr.adopt(&canonical, physical)?;
+            // Lazy-warm hint: the first foreground touch admits the
+            // load-back when the FS stack has an admission-gated cache.
+            fs.pre_seed_admission(Path::new(physical));
+        }
+        mgr.sync_journal()?;
+        // Persist the STRIPPED base blob; the restored engine's mapping
+        // lives in its own journal (the adopted entries), not the source
+        // trailer.
+        write_blob(fs.as_ref(), &target, base)?;
+
+        let mapped: Arc<dyn FileSystem> =
+            Arc::new(forst_rs_io::MappedFileSystem::new(fs, mgr.clone()));
+        let options = EngineOptions {
+            db_path: target.to_string_lossy().into_owned(),
+            ..EngineOptions::default()
+        };
+        let db = Self::open_from_checkpoint(options, mapped)?;
+        db.attach_file_mapping(mgr)?;
+        Ok(db)
+    }
+
+    /// FRS-PHASE2-S3: number of LIVE SSTs whose bytes still resolve to a
+    /// physical object OUTSIDE this engine's working namespace (adopted from
+    /// a restored checkpoint and not yet compacted away). Zero means the
+    /// engine is fully weaned off the restore source — the caller's signal
+    /// that discarding the source checkpoint can no longer invalidate live
+    /// state (see [`Self::open_from_linked_checkpoint_instant`] ownership
+    /// boundary).
+    pub fn adopted_residual(&self) -> usize {
+        let Some(mgr) = self.file_mapping.get() else {
+            return 0;
+        };
+        let mut residual = 0usize;
+        for file in self.version_set.current().live_sst_files_iter() {
+            let working = sst_file_path(&self.db_path, file.file_number);
+            if let Some(physical) = mgr.resolve(&working) {
+                if Path::new(&physical) != working.as_path() {
+                    residual += 1;
+                }
+            }
+        }
+        residual
     }
 
     /// FRS-LEVELED-COMPACTION (2026-06-04): pre-allocate the ADDITIONAL output
@@ -19083,6 +19210,345 @@ mod tests {
         assert!(local.file_exists(&r.manifest_path).unwrap());
         for info in &r.new_ssts {
             assert!(local.file_exists(&info.path).unwrap());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-S3 gates (design §5 Stage-3): instant-link restore
+    // ------------------------------------------------------------------
+
+    /// Builds the Stage-3 fixture: a DB with overwrites + deletes at
+    /// snapshot time, a linked checkpoint, then post-checkpoint churn that
+    /// compacts the snapshot's working copies away (the checkpoint refs are
+    /// the only thing keeping the physicals alive). Returns (db, chk_dir).
+    fn s3_fixture(fs: &Arc<dyn FileSystem>) -> (Arc<DbImpl>, PathBuf) {
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        for i in 0..200u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        for i in (0..200u32).step_by(2) {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v2").unwrap();
+        }
+        for i in 0..50u32 {
+            db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
+        }
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 9, 0).unwrap();
+        assert!(r.link_mode);
+        // Post-checkpoint churn: overwrite everything, flush, compact —
+        // restore must see SNAPSHOT-time state regardless.
+        for i in 0..200u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap();
+        db.compact_l0(&cf).unwrap();
+        db.reap_pending_deletions();
+        (db, PathBuf::from("/db/checkpoints/00000000000000000009"))
+    }
+
+    fn s3_assert_snapshot_state(restored: &Arc<DbImpl>) {
+        let rcf = restored.default_cf();
+        for i in 0..200u32 {
+            let k = format!("k{:04}", i);
+            let got = restored.get(&rcf, k.as_bytes()).unwrap();
+            let want: Option<&[u8]> = if i < 50 {
+                None
+            } else if i % 2 == 0 {
+                Some(b"v2")
+            } else {
+                Some(b"v1")
+            };
+            assert_eq!(got.as_deref(), want, "snapshot-time mismatch at {}", k);
+        }
+    }
+
+    /// Stage-3 gate: instant-link restore downloads/copies NOTHING — the
+    /// target dir physically holds only CHECKPOINT.blob + MAPPING.journal,
+    /// reads are byte-exact through the MappedFileSystem indirection (cold,
+    /// straight off the source physicals), the restored engine is writable,
+    /// and `adopted_residual` reports the foreign live set.
+    #[test]
+    fn test_phase2_s3_instant_restore_zero_copy_byte_exact() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = s3_fixture(&fs);
+
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+
+        // ZERO data movement: no physical .sst object exists under the
+        // restore target — adopted bytes stay at the source physicals.
+        let names: Vec<String> = fs
+            .list_dir(Path::new("/restore"))
+            .unwrap()
+            .into_iter()
+            .filter(|m| !m.is_dir)
+            .map(|m| {
+                m.path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|n| n == "CHECKPOINT.blob" || n == "MAPPING.journal"),
+            "instant restore must materialize nothing, target holds {:?}",
+            names
+        );
+
+        s3_assert_snapshot_state(&restored);
+        assert!(restored.adopted_residual() > 0, "live set is all-adopted");
+
+        // Writable: new writes land in the restored namespace.
+        let rcf = restored.default_cf();
+        restored.put(&rcf, b"new-key", b"new-val").unwrap();
+        assert_eq!(
+            restored.get(&rcf, b"new-key").unwrap().as_deref(),
+            Some(&b"new-val"[..])
+        );
+    }
+
+    /// Stage-3 gate (crash-point): a restore that crashed AFTER adopting a
+    /// subset + syncing the target journal but BEFORE the blob landed is
+    /// retried over the same target dir and completes cleanly (journal
+    /// replay + idempotent adopt).
+    #[test]
+    fn test_phase2_s3_instant_restore_crash_retry_idempotent() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (db, chk_dir) = s3_fixture(&fs);
+
+        // Simulate the partial first attempt: adopt ONE live SST under the
+        // target namespace, sync the journal, crash (drop) before write_blob.
+        let mgr = db.file_mapping().unwrap();
+        let some_linked = {
+            let blob = crate::checkpoint::read_blob(fs.as_ref(), &chk_dir).unwrap();
+            let (base, _) = crate::checkpoint::split_mapping_trailer(&blob).unwrap();
+            let snap = crate::checkpoint::deserialize_snapshot(base).unwrap();
+            let file = snap.version.live_sst_files()[0].clone();
+            (
+                file.file_number,
+                chk_dir.join(
+                    sst_file_path(Path::new("/db"), file.file_number)
+                        .file_name()
+                        .unwrap(),
+                ),
+            )
+        };
+        let physical = mgr.resolve(&some_linked.1).expect("linked path resolves");
+        {
+            let partial = forst_rs_io::FileMappingManager::new(
+                fs.clone(),
+                Path::new("/restore").join("MAPPING.journal"),
+            )
+            .unwrap();
+            partial
+                .adopt(&sst_file_path(Path::new("/restore"), some_linked.0), &physical)
+                .unwrap();
+            partial.sync_journal().unwrap();
+            // No CHECKPOINT.blob written — the crash window (D5-class).
+        }
+        assert!(!fs
+            .file_exists(Path::new("/restore/CHECKPOINT.blob"))
+            .unwrap());
+
+        // Retry over the SAME target: must complete and be byte-exact.
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+        s3_assert_snapshot_state(&restored);
+    }
+
+    /// Stage-3 gate: a missing physical fails the instant restore LOUDLY
+    /// (no silent empty state) — same bar as the Stage-2 copy restore.
+    #[test]
+    fn test_phase2_s3_instant_restore_missing_physical_fails_loud() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (db, chk_dir) = s3_fixture(&fs);
+
+        // Delete one physical OUT-OF-BAND (bypassing the mapping).
+        let mgr = db.file_mapping().unwrap();
+        let blob = crate::checkpoint::read_blob(fs.as_ref(), &chk_dir).unwrap();
+        let (base, _) = crate::checkpoint::split_mapping_trailer(&blob).unwrap();
+        let snap = crate::checkpoint::deserialize_snapshot(base).unwrap();
+        let victim_linked = chk_dir.join(
+            sst_file_path(Path::new("/db"), snap.version.live_sst_files()[0].file_number)
+                .file_name()
+                .unwrap(),
+        );
+        let victim = mgr.resolve(&victim_linked).expect("resolves");
+        fs.delete_file(Path::new(&victim)).unwrap();
+
+        match DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore") {
+            Ok(_) => panic!("instant restore with a missing physical must fail loudly"),
+            Err(err) => assert!(
+                err.is_not_found(),
+                "missing physical must fail loudly, got {err}"
+            ),
+        }
+    }
+
+    /// Stage-3 gate (ownership boundary): churn on the restored engine weans
+    /// it off the adopted physicals (`adopted_residual` → 0) WITHOUT ever
+    /// deleting them (NotOwned — the source checkpoint's bytes survive), and
+    /// the source checkpoint discard afterwards still deletes each physical
+    /// exactly once.
+    #[test]
+    fn test_phase2_s3_restored_churn_weans_adopted_never_deletes_foreign() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (db, chk_dir) = s3_fixture(&fs);
+
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+        assert!(restored.adopted_residual() > 0);
+        let mgr = restored.file_mapping().unwrap().clone();
+        let adopted_physicals: Vec<String> = restored
+            .version_set
+            .current()
+            .live_sst_files_iter()
+            .filter_map(|f| mgr.resolve(&sst_file_path(Path::new("/restore"), f.file_number)))
+            .collect();
+        assert!(!adopted_physicals.is_empty());
+
+        // Wean: overwrite the full keyspace, flush, compact until no live
+        // SST resolves outside the restored namespace.
+        let rcf = restored.default_cf();
+        for i in 0..200u32 {
+            restored
+                .put(&rcf, format!("k{:04}", i).as_bytes(), b"mine")
+                .unwrap();
+        }
+        let mut weaned = false;
+        for i in 0..16 {
+            restored.put(&rcf, format!("churn{i}").as_bytes(), b"x").unwrap();
+            restored.switch_and_flush(&rcf).unwrap();
+            restored.compact_l0(&rcf).unwrap();
+            restored.reap_pending_deletions();
+            if restored.adopted_residual() == 0 {
+                weaned = true;
+                break;
+            }
+        }
+        assert!(weaned, "compaction must wean the engine off adopted SSTs");
+
+        // NotOwned discipline: every foreign physical SURVIVED the wean.
+        for p in &adopted_physicals {
+            assert!(
+                fs.file_exists(Path::new(p)).unwrap(),
+                "restored engine must never delete checkpoint-owned physical {p}"
+            );
+        }
+        // Restored data intact post-wean.
+        assert_eq!(
+            restored.get(&rcf, b"k0000").unwrap().as_deref(),
+            Some(&b"mine"[..])
+        );
+
+        // Drain the source's working-dir refs (compaction may not have
+        // released every snapshot-time copy in the fixture's single round)
+        // so chk-9 holds the LAST reference on every adopted physical.
+        let src_mgr = db.file_mapping().unwrap().clone();
+        let src_cf = db.default_cf();
+        for i in 0..16 {
+            if adopted_physicals
+                .iter()
+                .all(|p| !src_mgr.is_registered(Path::new(p)))
+            {
+                break;
+            }
+            db.put(&src_cf, format!("drain{i}").as_bytes(), b"x").unwrap();
+            db.switch_and_flush(&src_cf).unwrap();
+            db.compact_l0(&src_cf).unwrap();
+            db.reap_pending_deletions();
+        }
+        assert!(
+            adopted_physicals
+                .iter()
+                .all(|p| !src_mgr.is_registered(Path::new(p))),
+            "source working refs must drain"
+        );
+
+        // Source-side lifecycle unaffected: discard the source checkpoint —
+        // each physical deleted exactly once (chk-9 holds the last refs).
+        let d = db.discard_linked_checkpoint(9).unwrap();
+        assert!(d.physicals_deleted > 0);
+        for p in &adopted_physicals {
+            assert!(!fs.file_exists(Path::new(p)).unwrap(), "{p} must be gone");
+        }
+        // The weaned restored engine no longer needs them.
+        assert_eq!(
+            restored.get(&rcf, b"k0199").unwrap().as_deref(),
+            Some(&b"mine"[..])
+        );
+    }
+
+    /// Stage-3 gate (chained restore): a linked checkpoint taken ON an
+    /// instant-restored engine must keep the adopted mappings (the
+    /// register-rebind guard) so its links resolve TRANSITIVELY to the
+    /// original physicals — proven by a second instant restore from it.
+    #[test]
+    fn test_phase2_s3_chained_link_ckpt_after_instant_restore() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = s3_fixture(&fs);
+
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+        let rcf = restored.default_cf();
+        // New data on top of the adopted state, flushed to a NEW working SST.
+        for i in 0..50u32 {
+            restored
+                .put(&rcf, format!("extra{:04}", i).as_bytes(), b"e1")
+                .unwrap();
+        }
+        let snap = restored.snapshot();
+        let r2 = restored
+            .create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
+        assert!(r2.link_mode);
+        // The chk-1 links must resolve: adopted files transitively to the
+        // SOURCE physicals (no byte-less rebind), new files to the restored
+        // working dir.
+        let mgr = restored.file_mapping().unwrap();
+        let mut foreign = 0usize;
+        for info in r2.linked_new_ssts.iter().chain(r2.linked_shared_ssts.iter()) {
+            let physical = mgr.resolve(&info.path).expect("chk-1 link resolves");
+            assert!(
+                fs.file_exists(Path::new(&physical)).unwrap(),
+                "linked physical {physical} must exist (rebind guard)"
+            );
+            if !physical.starts_with("/restore/") {
+                foreign += 1;
+            }
+        }
+        assert!(foreign > 0, "adopted SSTs must still point at source physicals");
+
+        // Second-generation instant restore: byte-exact for old AND new data.
+        let chk2_dir = PathBuf::from("/restore/checkpoints/00000000000000000001");
+        let restored2 =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk2_dir, "/restore2")
+                .unwrap();
+        s3_assert_snapshot_state(&restored2);
+        let r2cf = restored2.default_cf();
+        for i in 0..50u32 {
+            assert_eq!(
+                restored2
+                    .get(&r2cf, format!("extra{:04}", i).as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"e1"[..]),
+                "second-generation restore missing extra{:04}",
+                i
+            );
         }
     }
 

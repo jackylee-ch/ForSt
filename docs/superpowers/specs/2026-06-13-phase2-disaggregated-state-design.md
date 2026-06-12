@@ -649,6 +649,85 @@ tail replay on restore; startup sweep reaping abandoned chk-k link leaks
 (D5 crash window a); FFI surface for linked handles + attach-at-open wiring
 so the env key becomes effective end-to-end.
 
+### Stage 3 — Instant-link restore (engine side, landed 2026-06-13)
+
+Built (engine `crates/forst-rs-engine/src/db.rs`, io
+`crates/forst-rs-io/src/file_mapping.rs` + `filesystem.rs`, storage
+`crates/forst-rs-storage/src/cached_fs.rs`):
+
+- **`MappedFileSystem`** (io) — the UFS read-path indirection (paper §5.1):
+  resolves logical paths through the `FileMappingManager` on READ-side ops
+  only (`open_*_file` reads, `file_exists`, metadata, `ensure_cached`,
+  `prefetch_concurrent`, `await_upload`, `pre_seed_admission`);
+  writes/deletes/renames pass through UNresolved — a passthrough delete of a
+  mapped-but-byteless logical path can never reach the shared physical.
+- **`open_from_linked_checkpoint_instant`** — restore downloads/copies
+  NOTHING: per live SST resolve `<chk-k>/NNNNNN.sst` → physical via the
+  blob-embedded snapshot, `adopt()` under `<target>/NNNNNN.sst`
+  (NotOwned — the restored engine never physically deletes a
+  checkpoint-owned object), sync the target journal, write the stripped
+  blob, open through `MappedFileSystem`, attach the mapping. The target dir
+  physically holds exactly CHECKPOINT.blob + MAPPING.journal.
+- **Lazy warm** — `FileSystem::pre_seed_admission` (default no-op trait
+  hook); `CachedFileSystem` forwards to `LocalCache::pre_seed_admission`
+  (ForSt §2.1.6 registerInCache); the instant restore hints every adopted
+  SST so its first foreground touch admits the load-back.
+- **Register-rebind guard** (link-mode checkpoint): `register()` only
+  unmapped working paths — on a restored engine an adopted working path
+  maps to the SOURCE physical (no bytes at the working key); rebinding
+  would emit byte-less links. Chained link-checkpoints after restore now
+  resolve TRANSITIVELY to the original physicals.
+- **`adopted_residual()`** — count of live SSTs still resolving to foreign
+  physicals; 0 = weaned, the caller's signal that the restore-source
+  checkpoint can be discarded safely (CLAIM-mode discipline; the cross-job
+  ownership-transfer protocol = Java-integration stage).
+
+Gates green (2026-06-13):
+
+- **Zero-copy byte-exact IT**: cold instant restore reads exactly the
+  snapshot-time state (overwrites + deletes; post-checkpoint source churn
+  invisible); target dir object-count assert (blob + journal only);
+  restored engine writable; `adopted_residual > 0`.
+- **Crash-point IT** (D5-class window): partial restore (subset adopted +
+  journal synced, blob never written) retried over the SAME target
+  completes via journal replay + idempotent adopt, byte-exact.
+- **Missing-physical IT**: loud NotFound (no silent empty state) — `adopt`
+  verifies the physical before any state lands.
+- **Ownership-boundary IT**: churn on the restored engine weans
+  `adopted_residual` → 0 WITHOUT deleting any foreign physical (NotOwned
+  discipline); discarding the source checkpoint afterwards still deletes
+  each physical exactly once.
+- **Chained-restore IT**: linked checkpoint ON an instant-restored engine →
+  second-generation instant restore byte-exact for adopted AND new data
+  (the register-rebind guard proven end-to-end).
+- io `MappedFileSystem` UTs (resolve-on-read / passthrough-on-write+delete /
+  unmapped transparency); storage trait-level pre-seed UT (seeded file
+  admits on FIRST touch). engine 343/0, io 231/0, storage 444/0; clippy 0.
+
+**Restore-duration-vs-state-size minibench** (the §5 Stage-3 "~flat" gate;
+fs-emulation on local FS, same fixture as the Stage-2 bench, median of 3,
+`crates/forst-rs-engine/examples/restore_link_flat_bench.rs`, dev Mac
+2026-06-13):
+
+```
+scale    ssts   state_mb   copy_median_ms   instant_median_ms     ratio
+1x          8       32.3             73.9                11.0        7x
+4x         32      129.2            312.9                12.3       26x
+16x        11      516.9            363.0                12.0       30x
+```
+
+INSTANT restore is **flat in state size** (11.0 / 12.3 / 12.0 ms across a
+16× sweep — paper Fig. 10 shape) while COPY restore grows with bytes
+(74 → 313 → 363 ms on local page-cache; bandwidth-bound on a real uplink).
+Each instant rep also proves a cold spot-read through the mapped
+indirection.
+
+**Stage-3 residue (recorded, next):** Java zero-upload + download-skip
+branches and FFI surface for `linked_*` handles (cross-repo); mapping-journal
+TAIL replay on restore (blob-embedded snapshot only today); startup sweep for
+abandoned chk-k link leaks (D5 crash window a); rescale-by-clip (key-group
+clipped adoption). Stage 4 (WAL-delta memtable durability) is next in-repo.
+
 ---
 
 ## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)

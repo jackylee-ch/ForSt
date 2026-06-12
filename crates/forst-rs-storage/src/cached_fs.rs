@@ -632,6 +632,18 @@ impl FileSystem for CachedFileSystem {
         self.remote.await_all_uploads()
     }
 
+    /// FRS-PHASE2-S3 (ForSt §2.1.6 `registerInCache`): forwards the
+    /// restored-working-set hint to the [`LocalCache`] admission tracker so
+    /// the file's first foreground touch admits its load-back. No bytes move;
+    /// pure no-op when admission is off. Non-UTF-8 paths (uncacheable by
+    /// definition — see [`Self::cache_key`]) are silently ignored: this is a
+    /// best-effort warm hint, not a correctness operation.
+    fn pre_seed_admission(&self, path: &Path) {
+        if let Ok(key) = self.cache_key(path) {
+            self.cache.pre_seed_admission(key);
+        }
+    }
+
     /// R50-H1: fsync both the remote-side directory entry AND the local
     /// cache directory. The remote leg is delegated to the backing FS
     /// (object stores no-op, a wrapped POSIX backend honours it). The
@@ -1714,6 +1726,36 @@ mod tests {
         assert!(
             cache.contains("/db/cold.sst"),
             "threshold touch admits the fill"
+        );
+    }
+
+    #[test]
+    fn pre_seed_admission_first_touch_admits_via_fs_trait() {
+        // FRS-PHASE2-S3: the instant-link restore hints the restored working
+        // set through the FileSystem trait; the pre-seeded file's FIRST
+        // demand read must admit its load-back (vs. the un-seeded
+        // count-to-promote behavior asserted above).
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(
+            LocalCache::open_with_policy(tmp.path(), 1 << 20, admission_policy()).unwrap(),
+        );
+        let fs = CachedFileSystem::new(remote.clone(), cache.clone());
+
+        let path = PathBuf::from("/db/restored.sst");
+        seed_remote(&remote, &path, b"restored-bytes");
+
+        let dynfs: &dyn FileSystem = &fs;
+        dynfs.pre_seed_admission(&path);
+
+        let mut r = fs.open_sequential_file(&path).unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = r.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"restored-bytes");
+        assert!(
+            cache.contains("/db/restored.sst"),
+            "pre-seeded restored file must admit on the FIRST foreground touch"
         );
     }
 
