@@ -2292,3 +2292,12 @@ needed); q20 2201.6 FINISHED; q19 FIRST REMOTE WALL 1190.9 rows exact. Concurren
 needed; 2 harness fixes to upstream (FRS_CTMP_BASE: frs-tmp is a separate mount
 dockerd won't traverse; explicit-subnet docker networks: IPv4 pools exhausted).
 NEXT DECIDER: tip vs bisect-decontention q9 A/B in a QUIET window.
+
+### ★ DISK-IO POLICY (user, 2026-06-12): /ssd2 I/O saturated by concurrent runs
+DISTRIBUTE state storage across /ssd2/jackylee, /ssd1/jackylee, /tmp/jackylee —
+one disk per CONCURRENT cluster (via FRS_CTMP_BASE per run). RULES: both arms of
+an A/B pair = SAME disk; reference/single runs = consistent disk (note which in
+results). MEASUREMENT CAVEAT (H1 de-confound): the 98-99% /ssd2 util + writes>
+reads observation was taken under multi-cluster shared-disk contention — part of
+the "write saturation" may be contention, not write-amp; the ForSt-vs-frs iostat
+comparison and the post-distribution re-measure settle it.
