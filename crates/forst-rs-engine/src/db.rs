@@ -769,6 +769,14 @@ pub struct DbImpl {
     /// pin. Reaped during subsequent flush/compact calls once the pins
     /// have been released.
     pending_deletions: Mutex<Vec<FileNumber>>,
+    /// FRS-WA-V1: file numbers of lifecycle-segment COHORT-MERGE outputs.
+    /// Cohort merging is MERGE-ONCE — a segment that is itself a merge
+    /// output is never re-selected as a merge input (bounds per-byte write
+    /// count at flush + ≤1 merge). In-memory only: after a restore the set
+    /// is empty, so a restored cohort output may be re-merged at most once
+    /// more (bounded, documented; correctness-neutral). Entries are pruned
+    /// when their file is dropped/retired.
+    lifecycle_merged: Mutex<std::collections::HashSet<FileNumber>>,
     /// FRS-PHASE2-S1 (2026-06-13 design §2): optional file-mapping /
     /// ownership layer (UFS-equivalent: logical→physical mapping +
     /// refcounts, hard-link semantics over object stores). `None` by
@@ -1055,6 +1063,7 @@ impl DbImpl {
             sst_readers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
+            lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
             file_mapping: std::sync::OnceLock::new(),
             sequence_number: AtomicU64::new(0),
             write_controller: Arc::new(WriteController::new(wc_config)),
@@ -1952,7 +1961,7 @@ impl DbImpl {
         self.write_controller
             .set_imm_count(cf_data.imm_count() as u32);
         self.write_controller
-            .set_l0_file_count(self.version_set.current().l0_files().len() as u32);
+            .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
 
         // R47-M1: standardize lock order to `cfs → name_map` everywhere.
         // The reverse order (name_map → cfs) inverted the convention used
@@ -2160,6 +2169,9 @@ impl DbImpl {
                 min_sequence: SequenceNumber(footer.min_sequence),
                 max_sequence: SequenceNumber(footer.max_sequence),
                 num_entries: footer.total_entries,
+                // FRS-WA-V1: ingested SSTs come from outside the lifecycle
+                // contract — never whole-file expirable (conservative).
+                max_death: 0,
             };
 
             // R51-H3: register `dest` in `new_files` BEFORE attempting the
@@ -2287,7 +2299,7 @@ impl DbImpl {
 
         // L0 file count for back-pressure.
         self.write_controller
-            .set_l0_file_count(self.version_set.current().l0_files().len() as u32);
+            .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
 
         Ok(new_ids)
     }
@@ -3429,7 +3441,9 @@ impl DbImpl {
     /// If the current L0 file count is at or above the slowdown trigger,
     /// run an L0→L1 compaction. Returns `Ok(())` either way.
     fn maybe_auto_compact(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
-        let l0_count = self.version_set.current().l0_files().len() as u32;
+        // FRS-WA-V1: stamped lifecycle segments are exempt from the rollup
+        // trigger (reclaimed by expiry, fan-out-bounded by cohort merge).
+        let l0_count = self.backpressure_l0_count(&self.version_set.current());
         // FRS-COMPACT-BG (2026-06-03): use the dedicated LOW
         // `l0_compaction_trigger` (default 4), NOT `l0_slowdown_trigger` (40).
         // Keeping L0 shallow cuts the per-point-read SST scan count
@@ -3508,6 +3522,13 @@ impl DbImpl {
             let guard = self.cfs.read().expect("lock poisoned");
             guard.values().cloned().collect()
         };
+        // FRS-WA-V1: with lifecycle segments ON, stamped files do not count
+        // toward the normal rollup trigger — they are reclaimed by
+        // whole-segment expiry (drop, not compaction) and fan-out-bounded by
+        // cohort merge-once. Compacting them would re-pay exactly the
+        // write-amp the design removes. (Flag OFF ⇒ no file carries a stamp
+        // ⇒ behavior identical.)
+        let lifecycle_on = lifecycle_segments_enabled();
         cfs.into_iter()
             .filter(|cf_data| {
                 if cf_data.is_dropped() {
@@ -3517,11 +3538,453 @@ impl DbImpl {
                 let l0_count = version
                     .l0_files()
                     .iter()
-                    .filter(|f| f.cf_id == cf_id)
+                    .filter(|f| f.cf_id == cf_id && !(lifecycle_on && f.max_death != 0))
                     .count() as u32;
                 l0_count >= trigger
             })
             .collect()
+    }
+
+    /// FRS-WA-V1: the L0 count fed to the [`WriteController`] backpressure
+    /// triggers. With lifecycle segments ON, death-stamped segments are
+    /// EXEMPT — their count is bounded by expiry + cohort merge-once, not by
+    /// rollup compaction, so counting them would throttle the writer for a
+    /// backlog compaction is never going to drain (the survey's cell-F
+    /// artifact: writer throttled to 111K rows/s at 41 segments). Flag OFF ⇒
+    /// no stamps exist ⇒ identical to `l0_files().len()`.
+    fn backpressure_l0_count(&self, version: &Version) -> u32 {
+        if lifecycle_segments_enabled() {
+            version
+                .l0_files()
+                .iter()
+                .filter(|f| f.max_death == 0)
+                .count() as u32
+        } else {
+            version.l0_files().len() as u32
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // FRS-WA-V1: lifecycle-segment maintenance (whole-segment expiry +
+    // merge-once cohort compaction). Survey §3.2: state with a death
+    // certificate is reclaimed by DROPPING files at the watermark — one
+    // metadata edit + unlink, zero rewrite (measured floor: write-amp
+    // 0.98) — instead of riding the compaction treadmill (~87 % of
+    // physical write bytes).
+    // -----------------------------------------------------------------
+
+    /// Files of `cf_data` (any level) whose death stamp the CF watermark has
+    /// passed: every entry in them is dead by the lifecycle contract.
+    fn lifecycle_expired_files(
+        &self,
+        version: &Version,
+        cf_data: &Arc<ColumnFamilyData>,
+    ) -> Vec<(u32, FileNumber)> {
+        let wm = cf_data.watermark();
+        if wm == 0 {
+            return Vec::new();
+        }
+        let cf_id = cf_data.handle().id();
+        let mut out = Vec::new();
+        for lvl in &version.levels {
+            for f in &lvl.files {
+                if f.cf_id == cf_id && f.max_death != 0 && wm > f.max_death {
+                    out.push((lvl.level, f.file_number));
+                }
+            }
+        }
+        out
+    }
+
+    /// Drops every expired lifecycle segment of `cf_data`: one VersionEdit
+    /// (logical removal) + guarded physical deletes (checkpoint pins and
+    /// in-flight-read version references defer the unlink exactly like
+    /// compaction-input retirement). Returns the number of segments dropped.
+    ///
+    /// Safety rules (survey §5 invariant i):
+    /// * watermark > max_death — checked per file;
+    /// * snapshot policy — by default drops are DEFERRED while any engine
+    ///   snapshot is active (MVCC-pure; see
+    ///   [`lifecycle_drop_ignore_snapshots`] for the RocksDB
+    ///   compaction-filter-precedent opt-out). NOTE a snapshot captured
+    ///   between this check and the apply can still observe the drop — the
+    ///   conservative check narrows, but does not close, that window; the
+    ///   opt-in semantics are the contract that makes either outcome sound
+    ///   (expired state is backend-sanctioned dead).
+    /// * checkpoint/read pins — `delete_file_guarded` defers the physical
+    ///   delete; the logical removal is what stops NEW reads from paying
+    ///   fan-out for dead segments.
+    fn lifecycle_drop_expired(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<usize> {
+        if !lifecycle_segments_enabled() || cf_data.is_dropped() {
+            return Ok(0);
+        }
+        if !lifecycle_drop_ignore_snapshots() && self.snapshot_registry.active_count() > 0 {
+            return Ok(0); // defer to a tick with no active snapshots
+        }
+        let version = self.version_set.current();
+        let expired = self.lifecycle_expired_files(&version, cf_data);
+        if expired.is_empty() {
+            return Ok(0);
+        }
+        let edit = VersionEdit {
+            deleted_files: expired.clone(),
+            ..Default::default()
+        };
+        match self.version_set.apply(&edit) {
+            Ok(_) => {}
+            // Busy = a racing flush/compaction edit invalidated ours (e.g. a
+            // cohort merge consumed one of the files). Benign: re-evaluated
+            // on the next maintenance tick against the fresh Version.
+            Err(e) if e.is_busy() => return Ok(0),
+            Err(e) => return Err(e),
+        }
+        // Retire cached readers + the merge-once markers for dropped files.
+        self.sst_readers.rcu(|cur| {
+            let mut next = (**cur).clone();
+            for (_, fnum) in &expired {
+                next.remove(fnum);
+            }
+            std::sync::Arc::new(next)
+        });
+        {
+            let mut merged = self.lifecycle_merged.lock().expect("lock poisoned");
+            for (_, fnum) in &expired {
+                merged.remove(fnum);
+            }
+        }
+        for (_, fnum) in &expired {
+            self.delete_file_guarded(*fnum);
+        }
+        self.reap_pending_deletions();
+        let live: std::collections::HashSet<FileNumber> = self
+            .version_set
+            .current()
+            .live_sst_files()
+            .iter()
+            .map(|m| m.file_number)
+            .collect();
+        let _ = cf_data.prune_resident_flushed(&live);
+        self.refresh_snapshot_view(cf_data);
+        self.write_controller
+            .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
+        tracing::info!(
+            cf_id = cf_data.handle().id().0,
+            cf_name = cf_data.handle().name(),
+            dropped = expired.len(),
+            watermark = cf_data.watermark(),
+            "FRS-WA-V1: dropped expired lifecycle segments (no rewrite)"
+        );
+        Ok(expired.len())
+    }
+
+    /// Picks the cohort-merge input set for `cf_data`, or `None` when no
+    /// merge is due. Candidates are the CF's LIVE (non-expired), UNMERGED,
+    /// death-stamped L0 segments; when they exceed
+    /// [`lifecycle_cohort_trigger`], the OLDEST (by `max_sequence`) are
+    /// selected so the unmerged count returns to ~trigger/2.
+    ///
+    /// Invariant guarded here: the engine's L0 read path reconstructs global
+    /// newest-first order by sorting L0 files on DISJOINT seq ranges — so a
+    /// merge output (whose seq range spans its inputs) is only sound if the
+    /// selected inputs are CONTIGUOUS in seq order among ALL of this CF's L0
+    /// files. Death stamps are monotone in seal order for Windowed CFs, so
+    /// the oldest-prefix selection is contiguous by construction; the check
+    /// is defense-in-depth (skip + warn instead of corrupt).
+    fn lifecycle_cohort_pick(
+        &self,
+        version: &Version,
+        cf_data: &Arc<ColumnFamilyData>,
+    ) -> Option<Vec<SstFileMeta>> {
+        let cf_id = cf_data.handle().id();
+        let wm = cf_data.watermark();
+        let mut stamped: Vec<&SstFileMeta> = version
+            .l0_files()
+            .iter()
+            .filter(|f| f.cf_id == cf_id && f.max_death != 0)
+            .collect();
+        stamped.sort_by_key(|f| f.max_sequence.value());
+        let merged = self.lifecycle_merged.lock().expect("lock poisoned");
+        let fresh: Vec<&SstFileMeta> = stamped
+            .iter()
+            .copied()
+            .filter(|f| !merged.contains(&f.file_number) && (wm == 0 || f.max_death >= wm))
+            .collect();
+        drop(merged);
+        let trigger = lifecycle_cohort_trigger();
+        if fresh.len() <= trigger {
+            return None;
+        }
+        let take = fresh.len() - trigger / 2;
+        if take < 2 {
+            return None;
+        }
+        let selection: Vec<SstFileMeta> = fresh[..take].iter().map(|f| (*f).clone()).collect();
+        // Contiguity check: no UNSELECTED L0 file of this CF may have a seq
+        // range inside the selection's span.
+        let span_min = selection
+            .iter()
+            .map(|f| f.min_sequence.value())
+            .min()
+            .unwrap_or(0);
+        let span_max = selection
+            .iter()
+            .map(|f| f.max_sequence.value())
+            .max()
+            .unwrap_or(0);
+        let selected: std::collections::HashSet<FileNumber> =
+            selection.iter().map(|f| f.file_number).collect();
+        for f in version.l0_files() {
+            if f.cf_id != cf_id || selected.contains(&f.file_number) {
+                continue;
+            }
+            let overlaps =
+                f.min_sequence.value() <= span_max && f.max_sequence.value() >= span_min;
+            if overlaps {
+                tracing::warn!(
+                    cf_id = cf_id.0,
+                    file = f.file_number.value(),
+                    "FRS-WA-V1: cohort selection not seq-contiguous; skipping merge this tick"
+                );
+                return None;
+            }
+        }
+        Some(selection)
+    }
+
+    /// MERGE-ONCE cohort compaction: folds the picked lifecycle segments
+    /// into one sorted cohort run that STAYS AT L0 (lifecycle segments never
+    /// enter the leveled cascade), inheriting `max(inputs.max_death)` so the
+    /// cohort still drops whole at the watermark. Bounds probe fan-out at
+    /// ~trigger/2 + cohorts while write-amp stays ≤ 2× by construction
+    /// (flush + at most one merge per byte). Returns true when a merge ran.
+    fn lifecycle_cohort_merge(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<bool> {
+        if !lifecycle_segments_enabled() || cf_data.is_dropped() {
+            return Ok(false);
+        }
+        let cf_id = cf_data.handle().id();
+        // Serialize against L0 rollups / drop_cf via the compaction gate's
+        // (cf, L0) slot. Re-read the Version under the gate so the pick
+        // can't race a rollup that consumed our candidates.
+        let _gate = self.compaction_gate.acquire(cf_id, &[0]);
+        if cf_data.is_dropped() {
+            return Ok(false);
+        }
+        let version = self.version_set.current();
+        let Some(selection) = self.lifecycle_cohort_pick(&version, cf_data) else {
+            return Ok(false);
+        };
+
+        let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> =
+            Vec::with_capacity(selection.len());
+        for meta in &selection {
+            inputs.push((0, meta.clone(), self.get_or_open_sst_reader(meta)?));
+        }
+        let output_file_number = self.version_set.allocate_file_number();
+        let output_path = compaction_output_path(&self.db_path, output_file_number);
+        let writer_options = SstWriterOptions {
+            block_size: self.options.block_size,
+            compression: self.options.compression,
+            cf_id,
+        };
+        // A cohort is ONE sorted run — `target_file_size = 0` (single-file
+        // legacy mode) so the output is NOT split back into ~input-count
+        // files. MEASURED (cohort8 cell, 2026-06-12): with the default 64 MB
+        // split, a 9-segment merge re-emitted ~9 key-disjoint files — full
+        // rewrite cost (write-amp 0.98→1.85) with ZERO fan-out reduction
+        // (p50 914→858 µs, last_l0 17→17). The whole point of merge-once is
+        // trading one rewrite for collapsed run count; splitting forfeits
+        // the gain. Lifecycle files never enter the leveled cascade, so the
+        // large-file concerns behind target_file_size don't apply.
+        let target_file_size = 0u64;
+        let job = CompactionJob {
+            cf_id,
+            inputs,
+            output_level: 0,
+            output_file_number,
+            output_path,
+            additional_outputs: Vec::new(),
+            target_file_size,
+            writer_options,
+            fs: self.fs.clone(),
+            merge_operator: cf_data.merge_operator().cloned(),
+            compaction_filter: cf_data.compaction_filter(),
+            // Conservative: never drop tombstones here (lifecycle CFs write
+            // ~none; per-CF bottommost analysis is not worth the risk).
+            is_bottommost: false,
+            min_active_snapshot: self.snapshot_registry.min_active(),
+        };
+        let Some(edit) = job.run()? else {
+            return Ok(false);
+        };
+        if let Err(e) = self.version_set.apply(&edit) {
+            // Orphan cleanup mirrors compact_l0_for_cf's stale-edit arm.
+            for (_, meta) in &edit.new_files {
+                let p = compaction_output_path(&self.db_path, meta.file_number);
+                let _ = self.fs.delete_file(&p);
+            }
+            if e.is_busy() {
+                return Ok(false); // racing pick; retry next tick
+            }
+            return Err(e);
+        }
+        // Install readers for the cohort outputs (block-cache wired, like
+        // every other compaction/flush output) and retire the inputs'.
+        for (_, meta) in &edit.new_files {
+            let p = compaction_output_path(&self.db_path, meta.file_number);
+            self.fs.await_upload(&p)?;
+            let rac = self.fs.open_random_access_file(&p)?;
+            let reader = Arc::new(SstReaderImpl::open(rac)?.with_block_cache(
+                Arc::clone(&self.block_cache)
+                    as std::sync::Arc<dyn forst_rs_storage::cache::BlockCache>,
+                self.db_id.0,
+                meta.file_number.value(),
+            ));
+            let fnum = meta.file_number;
+            self.sst_readers.rcu(|cur| {
+                let mut next = (**cur).clone();
+                next.insert(fnum, std::sync::Arc::clone(&reader));
+                std::sync::Arc::new(next)
+            });
+        }
+        self.sst_readers.rcu(|cur| {
+            let mut next = (**cur).clone();
+            for (_, file_number) in &edit.deleted_files {
+                next.remove(file_number);
+            }
+            std::sync::Arc::new(next)
+        });
+        {
+            // Merge-once bookkeeping: outputs are cohorts (never re-picked);
+            // consumed inputs leave the set.
+            let mut merged = self.lifecycle_merged.lock().expect("lock poisoned");
+            for (_, fnum) in &edit.deleted_files {
+                merged.remove(fnum);
+            }
+            for (_, meta) in &edit.new_files {
+                merged.insert(meta.file_number);
+            }
+        }
+        for (_, file_number) in &edit.deleted_files {
+            self.delete_file_guarded(*file_number);
+        }
+        self.reap_pending_deletions();
+        let live: std::collections::HashSet<FileNumber> = self
+            .version_set
+            .current()
+            .live_sst_files()
+            .iter()
+            .map(|m| m.file_number)
+            .collect();
+        let _ = cf_data.prune_resident_flushed(&live);
+        self.refresh_snapshot_view(cf_data);
+        self.write_controller
+            .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
+        tracing::info!(
+            cf_id = cf_id.0,
+            cf_name = cf_data.handle().name(),
+            inputs = edit.deleted_files.len(),
+            outputs = edit.new_files.len(),
+            "FRS-WA-V1: cohort merge-once folded lifecycle segments"
+        );
+        Ok(true)
+    }
+
+    /// One round of lifecycle maintenance for a CF: drop expired segments,
+    /// then merge-once a cohort if the unmerged-segment count is over
+    /// trigger. Runs on the background compaction pool (see
+    /// [`Self::enqueue_lifecycle_maintenance`]).
+    fn run_lifecycle_maintenance(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
+        self.compaction_queued
+            .lock()
+            .expect("lock poisoned")
+            .remove(&cf_data.handle().id());
+        let _ = self.lifecycle_drop_expired(cf_data)?;
+        let _ = self.lifecycle_cohort_merge(cf_data)?;
+        Ok(())
+    }
+
+    /// Non-blocking, per-CF-deduped enqueue of lifecycle maintenance onto
+    /// the shared background compaction pool. Shares `compaction_queued`
+    /// with [`Self::enqueue_compaction`] — sound because, with the flag ON,
+    /// lifecycle CFs are excluded from the normal rollup trigger, so the
+    /// two job kinds never contend for one CF's slot in steady state (and
+    /// if they ever did, dedup just defers one to the next tick).
+    fn enqueue_lifecycle_maintenance(&self, cf_data: Arc<ColumnFamilyData>) {
+        let cf_id = cf_data.handle().id();
+        {
+            let mut q = self.compaction_queued.lock().expect("lock poisoned");
+            if !q.insert(cf_id) {
+                return;
+            }
+        }
+        let Some(weak) = self.self_weak.get().cloned() else {
+            self.compaction_queued
+                .lock()
+                .expect("lock poisoned")
+                .remove(&cf_id);
+            return;
+        };
+        bg_compact_pool().submit(Box::new(move || {
+            if let Some(db) = weak.upgrade() {
+                if let Err(e) = db.run_lifecycle_maintenance(&cf_data) {
+                    if e.is_busy() {
+                        tracing::debug!(
+                            cf_id = cf_data.handle().id().0,
+                            error = %e,
+                            "lifecycle maintenance lost a racing edit; next tick retries"
+                        );
+                    } else {
+                        db.record_flush_error(e);
+                    }
+                }
+            }
+        }));
+    }
+
+    /// Ticker hook: enqueues lifecycle maintenance for every CF with
+    /// expired segments or an over-trigger unmerged-segment count. Cheap
+    /// (one Version walk) and a no-op while the flag is OFF or no file
+    /// carries a death stamp.
+    fn enqueue_due_lifecycle_maintenance(&self) {
+        if !lifecycle_segments_enabled() {
+            return;
+        }
+        let version = self.version_set.current();
+        // Fast path: no stamped files anywhere → nothing to do.
+        if !version
+            .levels
+            .iter()
+            .any(|lvl| lvl.files.iter().any(|f| f.max_death != 0))
+        {
+            return;
+        }
+        let cfs: Vec<Arc<ColumnFamilyData>> = {
+            let guard = self.cfs.read().expect("lock poisoned");
+            guard.values().cloned().collect()
+        };
+        let trigger = lifecycle_cohort_trigger();
+        for cf_data in cfs {
+            if cf_data.is_dropped() {
+                continue;
+            }
+            let cf_id = cf_data.handle().id();
+            let has_expired = !self.lifecycle_expired_files(&version, &cf_data).is_empty();
+            let unmerged = {
+                let merged = self.lifecycle_merged.lock().expect("lock poisoned");
+                version
+                    .l0_files()
+                    .iter()
+                    .filter(|f| {
+                        f.cf_id == cf_id
+                            && f.max_death != 0
+                            && !merged.contains(&f.file_number)
+                    })
+                    .count()
+            };
+            if has_expired || unmerged > trigger {
+                self.enqueue_lifecycle_maintenance(cf_data);
+            }
+        }
     }
 
     /// FRS-COMPACT-MAINTENANCE: enqueue a background L0→L1 compaction for every
@@ -5607,6 +6070,7 @@ impl DbImpl {
             sst_readers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
+            lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
             file_mapping: std::sync::OnceLock::new(),
             // D-R7-H1: A-R6-H3 patched the VersionSet seed but missed
             // this sibling — `DbImpl::sequence_number` is the source of
@@ -6694,7 +7158,7 @@ impl DbImpl {
 
         // Update back-pressure counts — L0 is now empty (for this rollup).
         self.write_controller
-            .set_l0_file_count(self.version_set.current().l0_files().len() as u32);
+            .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
 
         Ok(new_meta)
     }
@@ -8322,7 +8786,25 @@ impl DbImpl {
             writer_opts,
             self.fs.clone(),
         );
-        let meta = job.run()?;
+        let mut meta = job.run()?;
+
+        // FRS-WA-V1: death-stamp the fresh L0 segment for lifecycle CFs.
+        // Soundness: `max_event_time` is a monotonic bound the writer
+        // advances BEFORE/with each write, and every entry in this SST was
+        // written before the memtable was sealed (which happened before this
+        // read) — so the bound covers every entry, and
+        // `bound + ttl >= true max death` (never premature; at worst the
+        // segment lives a little longer). Stamp 0 stays "not expirable"
+        // (e.g. lifecycle declared but no event-time ever noted).
+        if lifecycle_segments_enabled() {
+            if let crate::column_family::CfLifecycle::Windowed { ttl } = cf_data.lifecycle() {
+                let bound = cf_data.max_event_time();
+                if bound > 0 {
+                    meta.max_death = bound.saturating_add(ttl);
+                }
+            }
+        }
+        let meta = meta;
 
         // R59-H1 (post-job-run check): drop_cf may have raced while
         // `job.run()` was streaming bytes to disk. If the CF is now
@@ -8495,7 +8977,7 @@ impl DbImpl {
         self.write_controller
             .set_imm_count(cf_data.imm_count() as u32);
         self.write_controller
-            .set_l0_file_count(self.version_set.current().l0_files().len() as u32);
+            .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
         self.write_controller.on_flush_complete();
 
         wamp_record_flush(meta.file_size); // FRS-WAMP: ingested bytes, all flush paths
@@ -8577,6 +9059,12 @@ impl DbImpl {
                     // Deduped + non-blocking (enqueue only); the actual rollup
                     // runs on the dedicated compaction worker.
                     db.enqueue_due_compactions();
+                    // FRS-WA-V1: lifecycle-segment maintenance — drop whole
+                    // expired segments at the watermark (zero rewrite) and
+                    // bound fan-out via merge-once cohorts. No-op while
+                    // FRS_LIFECYCLE_SEGMENTS is OFF (default) or no file
+                    // carries a death stamp.
+                    db.enqueue_due_lifecycle_maintenance();
                     if let Some(w) = db.snapshot_registry.check_long_lived() {
                         // Emit structured fields so a log aggregator can
                         // index by seq / db_id. The Display impl gives a
@@ -11520,6 +12008,119 @@ fn wbm_stall_enabled() -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// FRS-WA-V1 (2026-06-13 write-path redesign survey §3.2/§6 stage V1):
+// death-bucketed lifecycle segments — flag-gated, DEFAULT OFF.
+// ---------------------------------------------------------------------------
+
+/// Test override for [`lifecycle_segments_enabled`]: 0 = env, 1 = forced
+/// off, 2 = forced on. Same pattern as `S2_PINNED_OVERRIDE`.
+static LIFECYCLE_SEGMENTS_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Forces the FRS-WA-V1 lifecycle-segment machinery on/off for tests
+/// (`None` = defer to the `FRS_LIFECYCLE_SEGMENTS` env). Safe to flip in a
+/// shared test process: with the flag ON, behavior changes ONLY for CFs
+/// whose lifecycle is `Windowed` (stamping) or for files already carrying a
+/// death stamp (triggers/backpressure filters) — CFs that never declare a
+/// lifecycle are byte-identical either way.
+pub fn set_lifecycle_segments_override(v: Option<bool>) {
+    LIFECYCLE_SEGMENTS_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-WA-V1 master flag (`FRS_LIFECYCLE_SEGMENTS=1`, DEFAULT OFF). When ON,
+/// CFs declared `CfLifecycle::Windowed{ttl}` get the death-bucketed segment
+/// write path: flush stamps `max_death = max_event_time + ttl` onto the L0
+/// segment; the maintenance ticker DROPS whole segments once the CF
+/// watermark passes their stamp (unlink — zero rewrite, the survey's
+/// measured ~1× write floor); stamped segments are EXEMPT from L0
+/// backpressure accounting and from the normal L0→L1 rollup trigger; fan-out
+/// is bounded by MERGE-ONCE cohort compaction (see
+/// [`lifecycle_cohort_trigger`]). OFF (default): no stamping, no drops, no
+/// accounting change — byte-identical to pre-V1.
+pub fn lifecycle_segments_enabled() -> bool {
+    use std::sync::OnceLock;
+    match LIFECYCLE_SEGMENTS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_LIFECYCLE_SEGMENTS").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-WA-V1 cohort-merge trigger (`FRS_LIFECYCLE_COHORT_TRIGGER`, default
+/// 24, floor 4): when a CF's live UNMERGED lifecycle segments exceed this
+/// count, the oldest are merged ONCE into a single cohort run, bringing the
+/// unmerged count back to ~trigger/2. Sized so the q7-shaped churn steady
+/// state (~1 GiB live / 64 MB flushes ≈ 16-17 segments) NEVER merges —
+/// write-amp stays at the measured ~1× flush floor — while wider windows
+/// engage merge-once and bound probe fan-out at ~trigger/2 + cohorts
+/// (write-amp ≤ 2× by construction: each byte is written at flush + at most
+/// one merge).
+fn lifecycle_cohort_trigger() -> usize {
+    // Test override (0 = unset → env). Programmatic so in-process tests can
+    // exercise the cohort path without racing the OnceLock env cache.
+    let ov = LIFECYCLE_COHORT_TRIGGER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov > 0 {
+        return ov;
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FRS_LIFECYCLE_COHORT_TRIGGER")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&v| v >= 4)
+            .unwrap_or(24)
+    })
+}
+
+/// Test override for [`lifecycle_cohort_trigger`] (0 = env/default).
+static LIFECYCLE_COHORT_TRIGGER_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_lifecycle_cohort_trigger_override(v: usize) {
+    LIFECYCLE_COHORT_TRIGGER_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// FRS-WA-V1 snapshot policy for whole-segment expiry
+/// (`FRS_LIFECYCLE_DROP_IGNORE_SNAPSHOTS=1`, default OFF = conservative).
+///
+/// Default: a segment is dropped only while NO engine snapshot is active —
+/// MVCC-pure (a pinned `get_at` can never lose a row to expiry), at the cost
+/// of deferring drops while a snapshot (e.g. an in-flight incremental
+/// checkpoint) is held; drops resume on the next maintenance tick after
+/// release. Opt-in: expiry ignores engine snapshots — the precedent of
+/// RocksDB compaction filters (`ignore_snapshots=true` since 5.x) and
+/// ForSt's FlinkCompactionFilter: Flink-sanctioned dead state may disappear
+/// from under a snapshot read (the runtime never reads expired state).
+fn lifecycle_drop_ignore_snapshots() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_LIFECYCLE_DROP_IGNORE_SNAPSHOTS")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
 /// S2 (pinned-rows + loser-tree design, 2026-06-12): test/bench override for
 /// [`s2_pinned_enabled`]. 0 = unset (read the env), 1 = forced OFF,
 /// 2 = forced ON. Programmatic (not env) so in-process A/B fixtures and the
@@ -13446,6 +14047,199 @@ mod tests {
         db.drop_cf(&cf2).unwrap();
         assert!(db.set_cf_lifecycle(&cf2, CfLifecycle::Unbounded).is_err());
         assert!(db.advance_cf_watermark(&cf2, 1).is_err());
+    }
+
+    /// FRS-WA-V1 tests share the global `LIFECYCLE_SEGMENTS_OVERRIDE` /
+    /// `LIFECYCLE_COHORT_TRIGGER_OVERRIDE`; serialize them so parallel test
+    /// threads can't observe each other's override values.
+    static WA_V1_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// FRS-WA-V1 PREMATURE-DROP FALSIFIER (survey §3.2 correctness
+    /// falsifier): nothing may EVER drop at watermark ≤ max_death; at
+    /// watermark > max_death the whole segment drops with zero rewrite.
+    /// Also covers: death stamping (`max_event_time + ttl`), backpressure
+    /// exemption, and the conservative snapshot-defer rule.
+    #[test]
+    fn test_wa_v1_premature_drop_falsifier_and_expiry() {
+        use crate::column_family::CfLifecycle;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_lifecycle_segments_override(Some(true));
+        let db = open();
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("life")
+                    .with_lifecycle(CfLifecycle::Windowed { ttl: 100 }),
+            )
+            .unwrap();
+        let cf_data = db.lookup_cf_by_id(cf.id()).unwrap();
+
+        // Entries with event-times 1..=50; bound advanced BEFORE each write
+        // (the soundness contract).
+        for i in 1..=50u64 {
+            db.note_cf_max_event_time(&cf, i).unwrap();
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"v").unwrap();
+        }
+        let meta = db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert_eq!(meta.max_death, 150, "stamp = max_event_time(50) + ttl(100)");
+
+        // Backpressure exemption: the stamped segment is live in L0 but does
+        // NOT count toward the write controller's L0 triggers.
+        let v = db.version_set.current();
+        assert_eq!(
+            v.l0_files()
+                .iter()
+                .filter(|f| f.cf_id == cf.id() && f.max_death == 150)
+                .count(),
+            1,
+            "stamped segment must be live in L0"
+        );
+        assert_eq!(db.backpressure_l0_count(&v), 0, "stamped segments exempt");
+
+        // FALSIFIER: watermark at/below the stamp ⇒ NOTHING drops, every
+        // live key stays readable.
+        for wm in [100u64, 149, 150] {
+            db.advance_cf_watermark(&cf, wm).unwrap();
+            assert_eq!(
+                db.lifecycle_drop_expired(&cf_data).unwrap(),
+                0,
+                "premature drop at watermark {wm} (stamp 150)"
+            );
+            assert_eq!(
+                db.get(&cf, b"k0001").unwrap().as_deref(),
+                Some(&b"v"[..]),
+                "live state lost at watermark {wm}"
+            );
+        }
+
+        // Conservative snapshot rule: an active snapshot defers expiry.
+        db.advance_cf_watermark(&cf, 151).unwrap();
+        let snap = db.snapshot();
+        assert_eq!(
+            db.lifecycle_drop_expired(&cf_data).unwrap(),
+            0,
+            "active snapshot must defer segment expiry (default policy)"
+        );
+        drop(snap);
+
+        // watermark > max_death + no snapshots ⇒ the whole segment drops.
+        assert_eq!(db.lifecycle_drop_expired(&cf_data).unwrap(), 1);
+        assert_eq!(
+            db.get(&cf, b"k0001").unwrap(),
+            None,
+            "expired state must be reclaimed"
+        );
+        assert_eq!(
+            db.version_set
+                .current()
+                .l0_files()
+                .iter()
+                .filter(|f| f.cf_id == cf.id())
+                .count(),
+            0,
+            "segment removed from the version"
+        );
+        set_lifecycle_segments_override(None);
+    }
+
+    /// FRS-WA-V1 cohort MERGE-ONCE: over-trigger fresh segments fold into
+    /// one cohort run that (a) stays at L0, (b) inherits max(input stamps)
+    /// so it still whole-drops at the watermark, (c) is never re-picked as
+    /// a merge input, and (d) preserves every row.
+    #[test]
+    fn test_wa_v1_cohort_merge_once_and_cohort_expiry() {
+        use crate::column_family::CfLifecycle;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_lifecycle_segments_override(Some(true));
+        set_lifecycle_cohort_trigger_override(4);
+        let db = open();
+        const TTL: u64 = 1_000_000;
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("cohort")
+                    .with_lifecycle(CfLifecycle::Windowed { ttl: TTL }),
+            )
+            .unwrap();
+        let cf_data = db.lookup_cf_by_id(cf.id()).unwrap();
+
+        // Six stamped segments; segment s holds keys s*10..s*10+9 with
+        // event-time bound s*10+9.
+        for s in 1..=6u64 {
+            for i in 0..10u64 {
+                let t = s * 10 + i;
+                db.note_cf_max_event_time(&cf, t).unwrap();
+                db.put(&cf, format!("k{t:06}").as_bytes(), b"v").unwrap();
+            }
+            let m = db.switch_and_flush(&cf).unwrap().expect("flushed");
+            assert_eq!(m.max_death, s * 10 + 9 + TTL);
+        }
+
+        // 6 fresh > trigger 4 ⇒ merge the oldest 4 (6 - 4/2) into 1 cohort.
+        assert!(db.lifecycle_cohort_merge(&cf_data).unwrap());
+        let v = db.version_set.current();
+        let mut cf_l0: Vec<_> = v
+            .l0_files()
+            .iter()
+            .filter(|f| f.cf_id == cf.id())
+            .cloned()
+            .collect();
+        cf_l0.sort_by_key(|f| f.max_sequence.value());
+        assert_eq!(cf_l0.len(), 3, "4 inputs folded into 1 cohort + 2 fresh");
+        // Cohort = oldest by seq; inherits the NEWEST input stamp (segment 4).
+        assert_eq!(cf_l0[0].max_death, 49 + TTL, "cohort stamp = max(inputs)");
+        assert!(cf_l0.iter().all(|f| f.max_death != 0));
+
+        // Every row survives the merge.
+        for s in 1..=6u64 {
+            for i in 0..10u64 {
+                let t = s * 10 + i;
+                assert_eq!(
+                    db.get(&cf, format!("k{t:06}").as_bytes()).unwrap().as_deref(),
+                    Some(&b"v"[..]),
+                    "row k{t:06} lost by cohort merge"
+                );
+            }
+        }
+
+        // MERGE-ONCE: the cohort is never re-picked; 1 cohort + 2 fresh is
+        // under trigger, so no further merge fires.
+        assert!(!db.lifecycle_cohort_merge(&cf_data).unwrap());
+
+        // The cohort itself whole-drops at its stamp.
+        db.advance_cf_watermark(&cf, 49 + TTL + 1).unwrap();
+        assert_eq!(db.lifecycle_drop_expired(&cf_data).unwrap(), 1);
+        assert_eq!(db.get(&cf, b"k000010").unwrap(), None, "cohort reclaimed");
+        assert_eq!(
+            db.get(&cf, b"k000059").unwrap().as_deref(),
+            Some(&b"v"[..]),
+            "fresh segments unaffected by cohort expiry"
+        );
+        set_lifecycle_cohort_trigger_override(0);
+        set_lifecycle_segments_override(None);
+    }
+
+    /// FRS-WA-V1 default-OFF inertness: with the flag off, a Windowed CF
+    /// flushes UNSTAMPED segments (max_death = 0) and nothing ever expires.
+    #[test]
+    fn test_wa_v1_flag_off_is_inert() {
+        use crate::column_family::CfLifecycle;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_lifecycle_segments_override(Some(false));
+        let db = open();
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("off")
+                    .with_lifecycle(CfLifecycle::Windowed { ttl: 1 }),
+            )
+            .unwrap();
+        let cf_data = db.lookup_cf_by_id(cf.id()).unwrap();
+        db.note_cf_max_event_time(&cf, 10).unwrap();
+        db.put(&cf, b"k", b"v").unwrap();
+        let meta = db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert_eq!(meta.max_death, 0, "flag OFF must not stamp");
+        db.advance_cf_watermark(&cf, u64::MAX).unwrap();
+        assert_eq!(db.lifecycle_drop_expired(&cf_data).unwrap(), 0);
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        set_lifecycle_segments_override(None);
     }
 
     /// Step ② (roadmap L1): boundary coverage of the composite garbage-drain

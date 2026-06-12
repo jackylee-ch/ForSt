@@ -309,6 +309,10 @@ impl FlushJob {
             min_sequence: SequenceNumber(info.min_sequence),
             max_sequence: SequenceNumber(info.max_sequence),
             num_entries: info.entry_count,
+            // FRS-WA-V1: the death stamp is applied by `flush_cf_data` AFTER
+            // the job returns (it needs the CF's lifecycle + event-time clock,
+            // which the FlushJob deliberately doesn't know about).
+            max_death: 0,
         }
     }
 }
