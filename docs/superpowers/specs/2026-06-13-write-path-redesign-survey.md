@@ -693,6 +693,37 @@ the same trade that has RocksDB ship `enable_blob_garbage_collection =
 false`. Relocation stays env-gated for mixed-lifetime value workloads
 (its correctness is pinned by the UT's cutoff-100 drain).
 
+## 10.4 V3 delivery — link-compaction / trivial move (2026-06-13, standing write-amp agent, cycle 2)
+
+§10.1 item 4 IMPLEMENTED (flag `FRS_TRIVIAL_MOVE`, DEFAULT OFF):
+
+- A compaction whose inputs do not overlap the destination level (and
+  whose CF has no compaction filter) is satisfied by ONE VersionEdit
+  re-leveling the SAME files — zero bytes rewritten, zero new file
+  numbers, zero uploads on remote-primary. Two sites: the L0 rollup
+  (requires the L0 set mutually key-disjoint — the destination-invariant
+  guard; the whole-CF rollup means no remaining-L0 recency hazard) and
+  the Ln→Ln+1 demotion (Ln per-CF non-overlap gives the invariant free).
+- **No FileMappingManager edit is needed** — levels are manifest metadata
+  over a flat `<num>.sst` namespace, so the "re-link" of the survey's §5
+  degenerates to a pure VersionEdit (strictly cheaper than a mapping
+  re-link; the mapping layer stays untouched — additive-only discipline
+  holds). Cached readers stay valid (keyed by file number); death stamps
+  ride along (lifecycle expiry scans every level); sorted-run M2 is
+  SUBSUMED as designed.
+- Correctness IT (`test_wa_v3_trivial_move_metadata_only_and_overlap_guard`):
+  same-file-numbers re-level with `next_file_number` unchanged; byte-exact
+  point/scan reads; OVERLAP forces the rewrite path; flag OFF byte-identical.
+
+Gate — write-amp delta on the trivial-move-shaped cell (`--seq-keys
+--no-deletes`: globally monotone keys ⇒ key-disjoint flushes, the
+timer/seq-keyed-state shape; 3 × 90 s medians):
+
+| Cell | write-amp | p50 late (µs) | rows/s | verdict |
+|---|---|---|---|---|
+| seqkeys-rewrite (flag OFF) | **2.95** | 555 | 200 K | rewrite cascade |
+| seqkeys-tmove (flag ON) | **0.98** | 540 | 200 K | **metadata-only ⇒ flush floor; 3.0× write-volume cut, no probe regression** (n=3: 0.98/0.98/0.98) |
+
 ### 10.1 Remaining for "solved" (supersedes §9.3)
 
 1. V1 gate (c): remote q7 iostat A/B (≥3× write-volume cut) — needs the
@@ -704,9 +735,10 @@ false`. Relocation stays env-gated for mixed-lifetime value workloads
 3. ~~V2b: BlobDB-style age-cutoff GC~~ — **DONE 2026-06-13 cycle 2, §10.3**
    (space-amp bounded ≈1.04× live at the V2a-2 write floor; relocation
    env-gated OFF by measured decision).
-4. V3: link-compaction (disagg agent owns file_mapping.rs — public API
-   only; Stage-2/3 of its lane landed 2026-06-13, the link/adopt surface
-   V3 needs is now on forst-rs).
+4. ~~V3: link-compaction~~ — **DONE 2026-06-13 cycle 2, §10.4** (trivial
+   move 2.95→0.98 on the seq-keys cell; flag `FRS_TRIVIAL_MOVE` DEFAULT
+   OFF; zero FileMappingManager edits needed — levels are manifest
+   metadata over a flat namespace).
 
 External references: WiscKey — Lu, Pillai, Gunawi, Arpaci-Dusseau, Arpaci-Dusseau,
 "WiscKey: Separating Keys from Values in SSD-conscious Storage", FAST '16.

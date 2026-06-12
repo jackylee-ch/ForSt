@@ -112,9 +112,10 @@ pub use compaction_filter::{
 };
 pub use db::{
     kv_min_blob_size, kv_separation_enabled, lifecycle_segments_enabled, s2_pinned_enabled,
-    set_kv_separation_override, set_lifecycle_segments_override, set_s2_pinned_override, DbImpl,
-    FillOutcome, IncrementalCheckpointResult, LinkedCheckpointDiscard, LiveFileInfo,
-    PrefixScanStream, RowSink, DEFAULT_CF_NAME,
+    set_kv_separation_override, set_lifecycle_segments_override, set_s2_pinned_override,
+    set_trivial_move_override, set_vlog_gc_age_cutoff_override, trivial_move_enabled,
+    vlog_gc_age_cutoff_percent, DbImpl, FillOutcome, IncrementalCheckpointResult,
+    LinkedCheckpointDiscard, LiveFileInfo, PrefixScanStream, RowSink, DEFAULT_CF_NAME,
 };
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};

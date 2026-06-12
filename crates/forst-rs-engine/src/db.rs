@@ -5461,6 +5461,29 @@ impl DbImpl {
             overlapping_dst.push(f.clone());
         }
 
+        // FRS-WA-V3 (link-compaction): no destination overlap + no filter ⇒
+        // demote the picked file by metadata alone (Ln files are per-CF
+        // non-overlapping, so the destination invariant holds trivially).
+        if trivial_move_enabled()
+            && cf_data.compaction_filter().is_none()
+            && overlapping_dst.is_empty()
+        {
+            let src = src_files[0].clone();
+            let edit = VersionEdit {
+                deleted_files: vec![(level, src.file_number)],
+                new_files: vec![(next_level as u32, src.clone())],
+                ..Default::default()
+            };
+            self.version_set.apply(&edit)?;
+            tracing::debug!(
+                file = src.file_number.value(),
+                from = level,
+                to = next_level,
+                "FRS-WA-V3: level demotion satisfied by trivial move (no rewrite)"
+            );
+            return Ok(Some(src));
+        }
+
         // Build input list. Source files carry `level`; destination overlap
         // carries `next_level`.
         let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> = Vec::new();
@@ -7783,6 +7806,40 @@ impl DbImpl {
             .cloned()
             .collect();
         let out_overlap_files: Vec<SstFileMeta> = overlap_scoped_clean_cut(&l0_files, cf_out);
+
+        // FRS-WA-V3 (link-compaction): when the rollup's L0 set is mutually
+        // key-disjoint AND nothing at the output level overlaps it AND no
+        // compaction filter must inspect rows, the rollup is a METADATA-ONLY
+        // re-level of the same files — zero rewrite, zero upload. Death
+        // stamps/meta ride along verbatim (lifecycle expiry scans every
+        // level); cached readers stay valid (keyed by file number).
+        if trivial_move_enabled()
+            && cf_data.compaction_filter().is_none()
+            && out_overlap_files.is_empty()
+            && sst_metas_mutually_disjoint(&l0_files)
+        {
+            let edit = VersionEdit {
+                deleted_files: l0_files.iter().map(|f| (0u32, f.file_number)).collect(),
+                new_files: l0_files
+                    .iter()
+                    .map(|f| (output_level, f.clone()))
+                    .collect(),
+                ..Default::default()
+            };
+            // Busy ⇒ a racing writer changed the version; nothing was
+            // created, so propagating lets the caller retry cleanly.
+            self.version_set.apply(&edit)?;
+            tracing::debug!(
+                files = l0_files.len(),
+                bytes = l0_files.iter().map(|f| f.file_size).sum::<u64>(),
+                output_level,
+                "FRS-WA-V3: L0 rollup satisfied by trivial move (no rewrite)"
+            );
+            drop(flush_guard);
+            self.write_controller
+                .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
+            return Ok(l0_files.last().cloned());
+        }
 
         // Gather input readers.
         let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> = Vec::new();
@@ -13565,6 +13622,57 @@ pub fn vlog_gc_age_cutoff_percent() -> u32 {
     })
 }
 
+/// FRS-WA-V3 test override for [`trivial_move_enabled`]: 0 = env, 1 =
+/// forced off, 2 = forced on.
+static TRIVIAL_MOVE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-WA-V3: forces trivial-move compaction on/off for tests/benches
+/// (`None` = defer to the `FRS_TRIVIAL_MOVE` env).
+pub fn set_trivial_move_override(v: Option<bool>) {
+    TRIVIAL_MOVE_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-WA-V3 link-compaction flag (`FRS_TRIVIAL_MOVE=1`, DEFAULT OFF):
+/// when a compaction's inputs do not overlap the destination level (and no
+/// compaction filter must run), the "compaction" is ONE VersionEdit
+/// re-leveling the SAME files — zero bytes rewritten, zero new files, and
+/// on remote-primary zero uploads (levels are manifest metadata over a
+/// flat file namespace, so no FileMappingManager edit is needed either —
+/// strictly cheaper than a re-link). Subsumes sorted-run M2; the survey's
+/// "non-overlapping demotion → re-link" arm.
+pub fn trivial_move_enabled() -> bool {
+    use std::sync::OnceLock;
+    match TRIVIAL_MOVE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_TRIVIAL_MOVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-WA-V3: strict mutual key-disjointness over a set of SST metas (the
+/// destination-level invariant a multi-file move must preserve).
+fn sst_metas_mutually_disjoint(files: &[SstFileMeta]) -> bool {
+    let mut sorted: Vec<&SstFileMeta> = files.iter().collect();
+    sorted.sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
+    sorted
+        .windows(2)
+        .all(|w| w[0].largest_key < w[1].smallest_key)
+}
+
 /// FRS-WA-V2a-2 separation threshold (`FRS_KV_MIN_BLOB_SIZE`, bytes,
 /// default 128, floor 22): values STRICTLY SHORTER stay inline. The floor
 /// is `VALUE_POINTER_LEN + 1` — separating a value the size of its own
@@ -16197,6 +16305,106 @@ mod tests {
 
         set_vlog_gc_age_cutoff_override(None);
         set_kv_separation_override(None);
+    }
+
+    /// FRS-WA-V3 (survey §6 stage V3, link-compaction): a compaction whose
+    /// inputs do not overlap the destination level is a METADATA-ONLY move
+    /// — the same file numbers re-level in one VersionEdit, zero bytes
+    /// rewritten, zero new files (M2 subsumed; on remote-primary this is
+    /// the zero-upload compaction). Guards: overlap forces the rewrite
+    /// path; flag OFF is byte-identical to before.
+    #[test]
+    fn test_wa_v3_trivial_move_metadata_only_and_overlap_guard() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_trivial_move_override(Some(true));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("tm"))
+            .unwrap();
+        for i in 0..100u32 {
+            db.put(&cf, format!("a{i:04}").as_bytes(), b"v1").unwrap();
+        }
+        let m1 = db.switch_and_flush(&cf).unwrap().expect("flushed");
+        for i in 0..100u32 {
+            db.put(&cf, format!("b{i:04}").as_bytes(), b"v2").unwrap();
+        }
+        let m2 = db.switch_and_flush(&cf).unwrap().expect("flushed");
+        let moved: std::collections::HashSet<u64> =
+            [m1.file_number.value(), m2.file_number.value()].into();
+        let next_before = db.version_set.next_file_number();
+
+        // Key-disjoint L0 + empty destination ⇒ the whole rollup is a move.
+        db.compact_all().unwrap();
+        let v = db.version_set.current();
+        assert_eq!(
+            v.l0_files().iter().filter(|f| f.cf_id == cf.id()).count(),
+            0,
+            "L0 must drain"
+        );
+        let live: std::collections::HashSet<u64> = v
+            .live_sst_files_iter()
+            .filter(|f| f.cf_id == cf.id())
+            .map(|f| f.file_number.value())
+            .collect();
+        assert_eq!(
+            live, moved,
+            "trivial move must re-level the SAME files (no rewrite)"
+        );
+        assert_eq!(
+            db.version_set.next_file_number(),
+            next_before,
+            "metadata-only: no file number may be allocated"
+        );
+        assert_eq!(db.get(&cf, b"a0000").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(db.get(&cf, b"b0099").unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(db.prefix_scan(&cf, b"a").unwrap().len(), 100);
+
+        // Overlap guard: an L0 flush overlapping the moved range must take
+        // the REWRITE path (new file number) and reads stay exact.
+        for i in 50..150u32 {
+            db.put(&cf, format!("a{i:04}").as_bytes(), b"v3").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        db.compact_all().unwrap();
+        let v = db.version_set.current();
+        let live_after: std::collections::HashSet<u64> = v
+            .live_sst_files_iter()
+            .filter(|f| f.cf_id == cf.id())
+            .map(|f| f.file_number.value())
+            .collect();
+        assert!(
+            !live_after.contains(&m1.file_number.value()),
+            "overlapping compaction must rewrite, not move"
+        );
+        assert_eq!(db.get(&cf, b"a0049").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(db.get(&cf, b"a0050").unwrap().as_deref(), Some(&b"v3"[..]));
+        assert_eq!(db.get(&cf, b"a0149").unwrap().as_deref(), Some(&b"v3"[..]));
+        assert_eq!(db.get(&cf, b"b0000").unwrap().as_deref(), Some(&b"v2"[..]));
+
+        // Flag OFF: the same disjoint shape REWRITES (new file numbers).
+        set_trivial_move_override(Some(false));
+        let db2 = open();
+        let cf2 = db2
+            .create_column_family(ColumnFamilyDescriptor::new("tm-off"))
+            .unwrap();
+        for i in 0..50u32 {
+            db2.put(&cf2, format!("a{i:04}").as_bytes(), b"v").unwrap();
+        }
+        let m = db2.switch_and_flush(&cf2).unwrap().expect("flushed");
+        db2.compact_all().unwrap();
+        let live2: Vec<u64> = db2
+            .version_set
+            .current()
+            .live_sst_files_iter()
+            .filter(|f| f.cf_id == cf2.id())
+            .map(|f| f.file_number.value())
+            .collect();
+        assert!(
+            !live2.contains(&m.file_number.value()),
+            "flag OFF must keep the rewrite path"
+        );
+        assert_eq!(db2.get(&cf2, b"a0000").unwrap().as_deref(), Some(&b"v"[..]));
+        set_trivial_move_override(None);
     }
 
     /// FRS-WA-V2a-2 checkpoint/restore with a LIVE vlog: the full

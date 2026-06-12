@@ -191,6 +191,14 @@ struct Args {
     /// predicts (~1.36×) plus the probe-side deref cost (gate ≤1.3× warm
     /// baseline p50).
     kvsep: bool,
+    /// FRS-WA-V3 gate cell: TRIVIAL-MOVE-SHAPED workload — keys are
+    /// globally monotone (`s{seq:015}`), so every flush covers a fresh
+    /// disjoint range and every L0 rollup / level demotion is
+    /// non-overlapping. Combined with `--no-deletes` this isolates the V3
+    /// write-amp delta: rewrite-compactions vs metadata-only moves.
+    seq_keys: bool,
+    /// FRS-WA-V3: force `FRS_TRIVIAL_MOVE` ON for this process.
+    trivial_move: bool,
 }
 
 impl Args {
@@ -213,6 +221,8 @@ impl Args {
             cfs: 1,
             lifecycle: false,
             kvsep: false,
+            seq_keys: false,
+            trivial_move: false,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -241,6 +251,8 @@ impl Args {
                 "--cfs" => a.cfs = take(&mut i).parse().unwrap(),
                 "--lifecycle" => a.lifecycle = true,
                 "--kvsep" => a.kvsep = true,
+                "--seq-keys" => a.seq_keys = true,
+                "--trivial-move" => a.trivial_move = true,
                 other => panic!("unknown arg {other}"),
             }
             i += 1;
@@ -371,6 +383,12 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     if args.kvsep {
         forst_rs_engine::set_kv_separation_override(Some(true));
     }
+    // FRS-WA-V3: trivial-move cell.
+    forst_rs_engine::set_trivial_move_override(if args.trivial_move {
+        Some(true)
+    } else {
+        None
+    });
     let db = DbImpl::open_with_fs(opts, fs).expect("open");
     // FRS-M3 G3: cf[0] = default; cf[1..] = extra churn CFs. Bucket-affine
     // assignment keeps put/delete/probe for a key on ONE cf.
@@ -441,7 +459,13 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                 }
                 let stream = if seq.is_multiple_of(2) { b'a' } else { b'b' };
                 let bucket = bucket_of(seq, stream, a.buckets);
-                let key = make_key(stream, bucket, seq);
+                // FRS-WA-V3 seq-keys: globally monotone keys ⇒ key-disjoint
+                // flushes ⇒ the trivial-move-shaped compaction stream.
+                let key = if a.seq_keys {
+                    format!("s{seq:015}").into_bytes()
+                } else {
+                    make_key(stream, bucket, seq)
+                };
                 for chunk in value.chunks_mut(8) {
                     let w = rng.next().to_le_bytes();
                     chunk.copy_from_slice(&w[..chunk.len()]);
@@ -541,6 +565,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
             let cfs = cfs.clone();
             let stop = Arc::clone(&stop);
             let win = Arc::clone(&window);
+            let max_seq_p = Arc::clone(&max_seq);
             let a = args.clone();
             std::thread::spawn(move || {
                 let mut rng = XorShift(0xBADF00D ^ ((p as u64 + 1) << 32));
@@ -554,7 +579,15 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                     } else {
                         b'b'
                     };
-                    let prefix = make_prefix(stream, bucket);
+                    // FRS-WA-V3 seq-keys: probe a random recent 1000-key
+                    // block (the same ~1K-row probe shape as the q7 cell).
+                    let prefix = if a.seq_keys {
+                        let head = max_seq_p.load(Ordering::Relaxed).max(1);
+                        let t = rng.next() % head;
+                        format!("s{:012}", t / 1000).into_bytes()
+                    } else {
+                        make_prefix(stream, bucket)
+                    };
                     let cf = &cfs[(bucket % cfs.len() as u64) as usize];
                     let t = Instant::now();
                     let entries = db.prefix_scan(cf, &prefix).expect("probe");
