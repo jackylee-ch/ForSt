@@ -876,6 +876,68 @@ fallback when the journal is unreachable. FFI IT (sweep through the C
 ABI: reap count, idempotence, live-set protection, null-arg). Suites:
 engine 350/0, io 235/0, storage 442/0, ffi ITs 4/0; clippy 0.
 
+### Phase-5 WAL sealed-segment rotation + GC (landed 2026-06-13, cycle 2 unit 3)
+
+Built — closes the D11 residue (v1 whole-segment capture, NOT flat):
+
+- **`WalWriter::seal_and_rotate`** (+ `SealedSegment`, per-CF max-seq
+  tracking incl. reopen-seeding): syncs, renames the live segment to a
+  unique `.seal-NNNN` sibling, reopens fresh — barrier-exact under the
+  engine WAL lock.
+- **`wal_capture_to` v2**: seal → **re-home ONCE** (sealed bytes copied to
+  `<db_path>/wal/WAL-NNNNNN.seg` on the engine FS, `register()`ed) →
+  **GC** (segments whose per-CF max seq is covered by every CF's flushed
+  floor lose their working ref; bytes deleted exactly once when the last
+  checkpoint ref drains) → **LINK** every still-live segment into
+  `<chk-k>/` (metadata-only, resolved via the blob trailer). The D8
+  object-count invariant TIGHTENS: the chk dir is physically blob-only
+  even in WAL mode (no more `WAL.delta` for new checkpoints).
+- **Restore replay v2**: handles linked segments (trailer-enumerated via
+  new `MappingSnapshotView::paths_under`) AND legacy `WAL.delta` images;
+  torn tail anywhere = loud corruption. **Hazard found & closed
+  (chain-of-restores)**: the replayed tail lived only in the restored
+  memtable — a next WAL-DELTA checkpoint (no flush) would silently drop
+  it; replay now RE-LOGS the tail into the restoring engine's live WAL
+  when one is attached (env route), and `attach_wal_at`'s pre-WAL flush
+  barrier covers the explicit route.
+- **Discard is now NAMESPACE-driven** (`logical_paths_under(<chk-k>/)`,
+  not manifest-driven): covers WAL-segment links uniformly, and reaps
+  window-a leftovers (links journaled, blob lost) on a direct JM discard
+  instead of stranding them for the sweep. Retry contract unchanged
+  (no blob AND no links ⇒ NotFound).
+
+Gates green (2026-06-13): wal UT (rotation isolates tail / per-CF max /
+unique seal names / reopen-seeded tracker); engine ITs ×3 — chain IT
+(ckpt-2's re-homed copy contains ONLY the since-ckpt-1 records (flat
+capture proof at the byte level), refs walk working+chk1+chk2, restores
+of chk-1/2/3 byte-exact with memtable counts 20/40/0, GC at flush drops
+working refs only, discard chain deletes both segment physicals exactly
+once); restored-engine WAL chain via `attach_wal_at` (replayed tail
+survives the next WAL-DELTA checkpoint); re-log branch UT (tail durable
+in the target's live WAL, 30/30). Stage-4 tests updated to the tightened
+blob-only invariant. Suites: engine 354/0, io 235/0, ffi green; clippy 0.
+
+**Re-run Stage-4 bench** (`ckpt_wal_delta_bench` extended with the
+steady-state cell: ckpt-1 over scale×4 MiB unflushed, then a FIXED
+256 KiB tail → ckpt-2; median of 3, local FS, dev Mac 2026-06-13):
+
+```
+scale    state_mb  flush_ck1_ms  flush_ck2_ms  wal_ck1_ms  wal_ck2_ms
+1x            4.0          29.0          21.8        27.8        24.2
+4x           16.0          41.0          21.9        33.2        22.3
+16x          64.0          72.1          20.0        82.2        25.1
+```
+
+**The §3.3 "independent of memtable size" promise now holds**: steady-
+state WAL-DELTA capture (`wal_ck2`) is FLAT — 24.2 / 22.3 / 25.1 ms
+across the 16× sweep — vs v1 which re-copied the whole accumulated tail
+every checkpoint (the v1 shape is `wal_ck1`: 28 → 33 → 82 ms, growing
+with bytes). First-checkpoint cost stays O(cold tail) by nature (the
+one-time re-home). Residue: cross-CF coverage uses per-CF floors —
+records of a CF that never flushes pin their segment's working ref
+(bounded by WBM flush cadence); dropped-CF records pin forever
+(conservative leak, reaped when the linking checkpoints are discarded).
+
 ---
 
 ## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)

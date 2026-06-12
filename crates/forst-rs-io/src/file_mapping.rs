@@ -962,6 +962,22 @@ impl MappingSnapshotView {
         self.logical.get(logical).map(String::as_str)
     }
 
+    /// FRS-PHASE2-C2U3: every (logical, physical) entry strictly under
+    /// `prefix`, sorted by logical path. The restore side uses it to
+    /// enumerate a checkpoint namespace's linked artifacts (e.g. Phase-5
+    /// `WAL-NNNNNN.seg` sealed-segment links) without an FS listing — the
+    /// linked paths are metadata-only.
+    pub fn paths_under(&self, prefix: &Path) -> Vec<(PathBuf, &str)> {
+        let mut out: Vec<(PathBuf, &str)> = self
+            .logical
+            .iter()
+            .filter(|(p, _)| p.starts_with(prefix) && p.as_path() != prefix)
+            .map(|(p, k)| (p.clone(), k.as_str()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Number of logical mappings in the snapshot.
     pub fn len(&self) -> usize {
         self.logical.len()

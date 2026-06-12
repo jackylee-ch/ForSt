@@ -213,13 +213,18 @@ fn linked_checkpoint_wal_delta_mode_replays_unflushed_tail() {
 
         let (mut result, ckpt_dir) = linked_ckpt(db, 5, 0);
 
-        // WAL-DELTA object-count invariant: blob + WAL.delta, nothing else.
-        let mut names: Vec<String> = std::fs::read_dir(&ckpt_dir)
+        // WAL-DELTA object-count invariant (Phase-5 rotation): the chk dir is
+        // physically blob-ONLY; the sealed tail was re-homed to `<db>/wal/`
+        // and linked as metadata.
+        let names: Vec<String> = std::fs::read_dir(&ckpt_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        names.sort();
-        assert_eq!(names, vec!["CHECKPOINT.blob", "WAL.delta"]);
+        assert_eq!(names, vec!["CHECKPOINT.blob"]);
+        assert!(
+            dir.path().join("wal").join("WAL-000000.seg").exists(),
+            "sealed tail re-homed under <db>/wal/"
+        );
 
         // A write AFTER the barrier must not be part of the checkpoint.
         put_kv(db, cf, "after-barrier", "nope");

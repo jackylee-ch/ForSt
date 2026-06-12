@@ -727,6 +727,18 @@ pub struct IncrementalCheckpointResult {
     pub linked_shared_ssts: Vec<LiveFileInfo>,
 }
 
+/// FRS-WAL Phase 5: one sealed WAL segment re-homed to the engine FS,
+/// tracked by [`DbImpl::wal_sealed`] for checkpoint linking + GC.
+struct WalSealedMeta {
+    /// Engine-FS path (`<db_path>/wal/WAL-NNNNNN.seg`) — also the working
+    /// logical path registered in the file-mapping layer.
+    engine_path: PathBuf,
+    /// Per-CF max sequence over the segment's records; the segment is
+    /// GC-eligible (working ref dropped) once every CF's flushed floor
+    /// covers its max.
+    cf_max_seqs: HashMap<u32, u64>,
+}
+
 /// Report from [`DbImpl::discard_linked_checkpoint`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LinkedCheckpointDiscard {
@@ -977,6 +989,13 @@ pub struct DbImpl {
     /// foundation for the cheap-checkpoint path (sync WAL instead of forced
     /// flush) that closes the q4-vs-RocksDB gap. See `crate::wal`.
     wal: Mutex<Option<crate::wal::WalWriter>>,
+    /// FRS-WAL Phase 5 (2026-06-13): sealed WAL segments re-homed to the
+    /// engine FS (`<db_path>/wal/WAL-NNNNNN.seg`), tracked for link-mode
+    /// checkpoint linking + flushed-floor GC. Each segment's bytes were
+    /// copied off the local WAL exactly once (at the checkpoint that sealed
+    /// it); later checkpoints LINK it through the mapping layer — the flat
+    /// WAL-delta capture (design §3.3 "independent of memtable size").
+    wal_sealed: Mutex<Vec<WalSealedMeta>>,
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): diagnostic counter — number of L0 SST
     /// data-block reads performed during point `get`s inside `Self::sst_get`.
     /// The L0 walk now visits files newest-first and STOPS at the first
@@ -1125,6 +1144,7 @@ impl DbImpl {
             compaction_gate: CompactionGate::from_env(),
             dynamic_levels: std::sync::atomic::AtomicBool::new(dynamic_levels_from_env()),
             wal: Mutex::new(None),
+            wal_sealed: Mutex::new(Vec::new()),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
 
@@ -3348,48 +3368,115 @@ impl DbImpl {
         Ok(())
     }
 
-    /// FRS-WAL Phase 4 / FRS-PHASE2-S4 (design §3.3 WAL-DELTA): the link-mode
-    /// checkpoint's memtable-durability barrier when the WAL is enabled —
-    /// syncs the WAL and captures the segment image into
-    /// `<chk-dir>/WAL.delta` on the ENGINE filesystem.
+    /// FRS-WAL Phase 5 / FRS-PHASE2-C2U3 (design §3.3 WAL-DELTA, sealed-
+    /// segment rotation): the link-mode checkpoint's memtable-durability
+    /// barrier when the WAL is enabled. v1 copied the WHOLE live segment
+    /// into `<chk-dir>/WAL.delta` per checkpoint — O(unflushed bytes),
+    /// converging with FLUSH cost at 64 MB (recorded Stage-4 finding).
+    /// Phase 5 makes the capture FLAT in accumulated tail size:
     ///
-    /// Barrier exactness: the WAL lock is held across sync + read, so the
-    /// captured image contains EXACTLY the mutations whose append completed
-    /// before the barrier (write paths append under this lock). A mutation
-    /// mid-flight at capture time is NOT part of this checkpoint — Flink's
-    /// barrier alignment guarantees no mid-flight writes at a real barrier.
+    /// 1. **Seal** the live segment under the WAL lock
+    ///    ([`crate::wal::WalWriter::seal_and_rotate`]) — barrier-exact: a
+    ///    mutation is in checkpoint k iff its append completed before the
+    ///    barrier (write paths append under the same lock).
+    /// 2. **Re-home ONCE**: the just-sealed bytes are copied to the engine
+    ///    FS at `<db_path>/wal/WAL-NNNNNN.seg` and `register()`ed in the
+    ///    mapping layer (working ref). Cost = O(bytes since LAST
+    ///    checkpoint), never O(total unflushed).
+    /// 3. **GC** (Phase-5 WAL GC): tracked segments whose per-CF max seq is
+    ///    covered by every CF's flushed floor are working-unlinked — bytes
+    ///    survive while older checkpoints still link them; deleted exactly
+    ///    once when the last checkpoint ref drains.
+    /// 4. **Link** every still-live segment into `<chk-dir>/` — O(segments)
+    ///    metadata, zero data movement (same mechanism as SST links). The
+    ///    blob's mapping trailer (written after this, at the barrier)
+    ///    resolves them on restore.
     ///
-    /// v1 captures the WHOLE segment, not a delta: restore filters records
-    /// by the per-CF flushed floor, so a superset image is correct; capture
-    /// cost is O(unflushed-WAL bytes) until Phase-5 segment rotation lands
-    /// (recorded residue). Returns `true` iff a non-empty image was written
-    /// (an empty WAL writes nothing, preserving the chk-dir object-count
-    /// invariant for WAL-less checkpoints).
+    /// The chk dir therefore stays physically blob-only even in WAL mode
+    /// (the D8 object-count invariant tightens); legacy `WAL.delta`
+    /// checkpoints remain restorable (replay handles both shapes).
+    /// Returns `true` iff at least one segment was linked.
     fn wal_capture_to(&self, chk_dir: &Path) -> ForstResult<bool> {
-        let bytes = {
+        let sealed = {
             let mut guard = self.wal.lock().expect("wal lock poisoned");
             let Some(w) = guard.as_mut() else {
                 return Ok(false);
             };
-            w.sync()?;
-            std::fs::read(w.path()).map_err(|e| {
+            w.seal_and_rotate()?
+        };
+        let mgr = self.ensure_file_mapping()?;
+        // 2. Re-home the just-sealed tail (exactly once per segment).
+        if let Some(seg) = sealed {
+            let bytes = std::fs::read(&seg.path).map_err(|e| {
                 ForstError::Io(std::io::Error::other(format!(
                     "WAL capture read {}: {e}",
-                    w.path().display()
+                    seg.path.display()
                 )))
-            })?
-        };
-        if bytes.is_empty() {
-            return Ok(false);
+            })?;
+            let wal_dir = self.db_path.join("wal");
+            self.fs.create_dir_all(&wal_dir)?;
+            let engine_path = {
+                let mut n = 0u64;
+                loop {
+                    let cand = wal_dir.join(format!("WAL-{n:06}.seg"));
+                    if !self.fs.file_exists(&cand)? && !mgr.is_registered(&cand) {
+                        break cand;
+                    }
+                    n += 1;
+                }
+            };
+            let mut f = self
+                .fs
+                .open_writable_file(&engine_path, WriteMode::CreateOrTruncate)?;
+            f.append(&bytes)?;
+            f.sync()?;
+            let key = engine_path.to_str().ok_or_else(|| {
+                ForstError::invalid_argument(format!(
+                    "wal_capture_to: non-utf8 segment path {}",
+                    engine_path.display()
+                ))
+            })?;
+            mgr.register(&engine_path, key, bytes.len() as u64)?;
+            let _ = std::fs::remove_file(&seg.path);
+            self.wal_sealed
+                .lock()
+                .expect("wal_sealed lock poisoned")
+                .push(WalSealedMeta {
+                    engine_path,
+                    cf_max_seqs: seg.cf_max_seqs,
+                });
         }
-        self.fs.create_dir_all(chk_dir)?;
-        let delta = chk_dir.join(WAL_DELTA_NAME);
-        let mut f = self
-            .fs
-            .open_writable_file(&delta, WriteMode::CreateOrTruncate)?;
-        f.append(&bytes)?;
-        f.sync()?;
-        Ok(true)
+        // 3. GC: drop the working ref of fully-flushed segments.
+        let mut floors: HashMap<u32, u64> = HashMap::new();
+        for f in self.version_set.current().live_sst_files_iter() {
+            let e = floors.entry(f.cf_id.value()).or_insert(0);
+            *e = (*e).max(f.max_sequence.value());
+        }
+        let mut tracked = self.wal_sealed.lock().expect("wal_sealed lock poisoned");
+        tracked.retain(|seg| {
+            let covered = seg
+                .cf_max_seqs
+                .iter()
+                .all(|(cf, max)| floors.get(cf).copied().unwrap_or(0) >= *max);
+            if covered {
+                // Retained while checkpoints link it; deleted at last ref.
+                let _ = mgr.unlink(&seg.engine_path);
+            }
+            !covered
+        });
+        // 4. Link every still-live segment into the chk namespace.
+        let mut linked_any = false;
+        for seg in tracked.iter() {
+            let basename = seg.engine_path.file_name().ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "wal_capture_to: segment path has no file name: {}",
+                    seg.engine_path.display()
+                ))
+            })?;
+            mgr.link(&seg.engine_path, &chk_dir.join(basename))?;
+            linked_any = true;
+        }
+        Ok(linked_any)
     }
 
     fn write_single(
@@ -6297,6 +6384,7 @@ impl DbImpl {
             compaction_gate: CompactionGate::from_env(),
             dynamic_levels: std::sync::atomic::AtomicBool::new(dynamic_levels_from_env()),
             wal: Mutex::new(None),
+            wal_sealed: Mutex::new(Vec::new()),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
         db.maybe_init_wal();
@@ -7300,7 +7388,7 @@ impl DbImpl {
         let db = Self::open_from_checkpoint_with_default_cf(options, fs.clone(), default_desc)?;
         // FRS-WAL Phase 4: replay the captured unflushed tail (WAL-DELTA
         // checkpoints; no-op for FLUSH-mode checkpoints).
-        Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir)?;
+        Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir, &view)?;
         Ok(db)
     }
 
@@ -7458,7 +7546,7 @@ impl DbImpl {
         db.attach_file_mapping(mgr)?;
         // FRS-WAL Phase 4: replay the captured unflushed tail (WAL-DELTA
         // checkpoints; no-op for FLUSH-mode checkpoints).
-        Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir)?;
+        Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir, &view)?;
         Ok(db)
     }
 
@@ -7509,33 +7597,52 @@ impl DbImpl {
         db: &Arc<Self>,
         fs: &dyn FileSystem,
         ckpt_dir: &Path,
+        view: &forst_rs_io::MappingSnapshotView,
     ) -> ForstResult<usize> {
-        let delta = ckpt_dir.join(WAL_DELTA_NAME);
-        if !fs.file_exists(&delta)? {
-            return Ok(0);
-        }
-        let size = fs.get_file_metadata(&delta)?.size as usize;
-        let mut bytes = vec![0u8; size];
-        let mut off = 0usize;
-        let mut f = fs.open_sequential_file(&delta)?;
-        while off < size {
-            let n = f.read(&mut bytes[off..])?;
-            if n == 0 {
-                break;
+        let read_image = |path: &Path| -> ForstResult<Vec<u8>> {
+            let size = fs.get_file_metadata(path)?.size as usize;
+            let mut bytes = vec![0u8; size];
+            let mut off = 0usize;
+            let mut f = fs.open_sequential_file(path)?;
+            while off < size {
+                let n = f.read(&mut bytes[off..])?;
+                if n == 0 {
+                    break;
+                }
+                off += n;
             }
-            off += n;
+            bytes.truncate(off);
+            Ok(bytes)
+        };
+        let mut images: Vec<Vec<u8>> = Vec::new();
+        // Legacy Stage-4 single-image capture (pre-Phase-5 checkpoints).
+        let delta = ckpt_dir.join(WAL_DELTA_NAME);
+        if fs.file_exists(&delta)? {
+            images.push(read_image(&delta)?);
         }
-        bytes.truncate(off);
-        let scan = crate::wal::scan_records(&bytes);
-        // The image was captured sync-then-copy under the WAL lock — a torn
-        // tail here means the checkpoint artifact itself is damaged. Fail
-        // LOUDLY rather than restore a silently-shortened tail.
-        if !scan.clean_eof {
-            return Err(ForstError::corruption(format!(
-                "WAL.delta in {} has a torn/corrupt tail — refusing to restore \
-                 a truncated memtable tail",
-                ckpt_dir.display()
-            )));
+        // FRS-WAL Phase 5: linked sealed segments — chk-namespace
+        // metadata-only paths in the blob's mapping trailer, resolved to the
+        // re-homed `<src_db>/wal/WAL-NNNNNN.seg` physicals.
+        for (linked, physical) in view.paths_under(ckpt_dir) {
+            let Some(name) = linked.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("WAL-") && name.ends_with(".seg")) {
+                continue; // SST links — handled by the SST restore loop
+            }
+            let physical_path = Path::new(physical);
+            if !fs.file_exists(physical_path)? {
+                return Err(ForstError::not_found(format!(
+                    "linked WAL segment {} (physical {}) is missing — refusing \
+                     to restore a partial memtable tail",
+                    linked.display(),
+                    physical
+                )));
+            }
+            images.push(read_image(physical_path)?);
+        }
+        if images.is_empty() {
+            return Ok(0);
         }
         let mut floors: HashMap<u32, u64> = HashMap::new();
         for file in db.version_set.current().live_sst_files_iter() {
@@ -7544,20 +7651,55 @@ impl DbImpl {
         }
         let mut replayed = 0usize;
         let mut max_seq = 0u64;
-        for rec in &scan.records {
-            let floor = floors.get(&rec.cf_id).copied().unwrap_or(0);
-            if rec.sequence <= floor {
-                continue; // already durable in a flushed SST
+        let mut replayed_records: Vec<crate::wal::WalRecord> = Vec::new();
+        for (i, bytes) in images.iter().enumerate() {
+            let scan = crate::wal::scan_records(bytes);
+            // Every image was sealed/synced-then-copied under the WAL lock —
+            // a torn tail means the checkpoint artifact itself is damaged.
+            // Fail LOUDLY rather than restore a silently-shortened tail.
+            if !scan.clean_eof {
+                return Err(ForstError::corruption(format!(
+                    "WAL image {} of {} for {} has a torn/corrupt tail — \
+                     refusing to restore a truncated memtable tail",
+                    i + 1,
+                    images.len(),
+                    ckpt_dir.display()
+                )));
             }
-            let cf_data = db.lookup_cf_by_id(ColumnFamilyId(rec.cf_id))?;
-            cf_data.active_memtable().put_with_seq(
-                &rec.key,
-                rec.value.as_deref(),
-                rec.op_type,
-                rec.sequence,
-            )?;
-            max_seq = max_seq.max(rec.sequence);
-            replayed += 1;
+            for rec in scan.records {
+                let floor = floors.get(&rec.cf_id).copied().unwrap_or(0);
+                if rec.sequence <= floor {
+                    continue; // already durable in a flushed SST
+                }
+                let cf_data = db.lookup_cf_by_id(ColumnFamilyId(rec.cf_id))?;
+                cf_data.active_memtable().put_with_seq(
+                    &rec.key,
+                    rec.value.as_deref(),
+                    rec.op_type,
+                    rec.sequence,
+                )?;
+                max_seq = max_seq.max(rec.sequence);
+                replayed += 1;
+                replayed_records.push(rec);
+            }
+        }
+        // FRS-PHASE2-C2U3 (chain-of-restores closure): the replayed tail
+        // lives ONLY in the restored memtable — if this engine has a WAL
+        // attached (env `FRS_WAL_DIR` at open), its next WAL-DELTA linked
+        // checkpoint skips the flush, so the tail must be re-logged into THIS
+        // engine's WAL or it would be in neither the SSTs nor the segments
+        // of the next checkpoint (silent loss one restore later). The
+        // explicit `attach_wal_at` route is safe either way (its pre-WAL
+        // barrier flushes the replayed memtable), but the env route attaches
+        // before replay.
+        if !replayed_records.is_empty() {
+            let mut guard = db.wal.lock().expect("wal lock poisoned");
+            if let Some(w) = guard.as_mut() {
+                for rec in &replayed_records {
+                    w.append(rec)?;
+                }
+                w.sync()?;
+            }
         }
         // Belt-and-braces: blob.last_sequence already covers every captured
         // seq (allocation precedes the snapshot), but keep the counter
@@ -11919,33 +12061,40 @@ impl DbImpl {
         &self,
         checkpoint_id: u64,
     ) -> ForstResult<LinkedCheckpointDiscard> {
-        use crate::checkpoint::{deserialize_snapshot, read_blob, split_mapping_trailer};
+        use crate::checkpoint::read_blob;
         let mgr = self.file_mapping.get().ok_or_else(|| {
             ForstError::invalid_argument(
                 "discard_linked_checkpoint: no file mapping attached",
             )
         })?;
         let dir = self.incremental_checkpoint_dir(checkpoint_id);
-        let blob = read_blob(self.fs.as_ref(), &dir)?;
-        let (base, _mapping) = split_mapping_trailer(&blob)?;
-        let snap = deserialize_snapshot(base)?;
+        // FRS-PHASE2-C2U3: the unlink loop is NAMESPACE-driven (everything
+        // the mapping holds under `<chk-k>/`), not manifest-driven — it must
+        // cover Phase-5 linked WAL segments alongside the SST links, and it
+        // also reaps window-a leftovers (links journaled, blob lost) instead
+        // of stranding them for the startup sweep.
+        let links = mgr.logical_paths_under(&dir);
+        // Retry contract: a previously-discarded checkpoint has neither a
+        // blob nor links — NotFound, exactly like before.
+        let blob_present = read_blob(self.fs.as_ref(), &dir).is_ok();
+        if !blob_present && links.is_empty() {
+            return Err(ForstError::not_found(format!(
+                "discard_linked_checkpoint: checkpoint {} not found (already \
+                 discarded?)",
+                checkpoint_id
+            )));
+        }
         let mut report = LinkedCheckpointDiscard::default();
-        for file in snap.version.live_sst_files() {
-            let working = sst_file_path(&self.db_path, file.file_number);
-            let basename = match working.file_name() {
-                Some(b) => b.to_os_string(),
-                None => continue,
-            };
-            let linked = dir.join(basename);
-            if !mgr.is_registered(&linked) {
-                continue; // retried discard — reference already dropped
-            }
-            match mgr.unlink(&linked)? {
-                forst_rs_io::UnlinkOutcome::PhysicalDeleted => {
+        for linked in links {
+            match mgr.unlink(&linked) {
+                Ok(forst_rs_io::UnlinkOutcome::PhysicalDeleted) => {
                     report.unlinked += 1;
                     report.physicals_deleted += 1;
                 }
-                _ => report.unlinked += 1,
+                Ok(_) => report.unlinked += 1,
+                // A concurrent retry raced the reference away — idempotence.
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e),
             }
         }
         mgr.sync_journal()?;
@@ -20232,7 +20381,9 @@ mod tests {
         let snap = db.snapshot();
         let r = db.create_incremental_checkpoint_linked(&snap, 4, 0).unwrap();
         assert!(r.link_mode);
-        // WAL-DELTA mode: the chk dir holds exactly blob + WAL.delta.
+        // WAL-DELTA mode, Phase-5 rotation: the chk dir is physically
+        // blob-ONLY (the D8 invariant tightened) — the sealed tail was
+        // re-homed to `<db>/wal/` and LINKED (metadata-only).
         let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000004");
         let names: Vec<String> = fs
             .list_dir(&chk_dir)
@@ -20241,9 +20392,18 @@ mod tests {
             .filter(|m| !m.is_dir)
             .map(|m| m.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names.len(), 2, "blob + WAL.delta, got {names:?}");
-        assert!(names.iter().any(|n| n == "CHECKPOINT.blob"));
-        assert!(names.iter().any(|n| n == WAL_DELTA_NAME));
+        assert_eq!(names, vec!["CHECKPOINT.blob"], "chk dir = blob ONLY");
+        let seg_path = PathBuf::from("/db/wal/WAL-000000.seg");
+        assert!(
+            fs.file_exists(&seg_path).unwrap(),
+            "sealed tail re-homed to the engine FS"
+        );
+        let mgr = db.file_mapping().expect("attached").clone();
+        assert!(
+            mgr.is_registered(&chk_dir.join("WAL-000000.seg")),
+            "segment linked into the chk namespace"
+        );
+        assert_eq!(mgr.refs("/db/wal/WAL-000000.seg"), 2, "working + chk-4");
 
         let verify = |restored: &Arc<DbImpl>| {
             let rcf = restored.default_cf();
@@ -20413,6 +20573,226 @@ mod tests {
                 "WAL tail row {k} missing"
             );
         }
+    }
+
+    /// FRS-WAL Phase 5 / FRS-PHASE2-C2U3 chain IT: sealed-segment rotation
+    /// makes the WAL-DELTA capture FLAT — each checkpoint copies ONLY the
+    /// since-last-checkpoint tail; earlier tails are LINKED. GC drops the
+    /// working ref once flushed floors cover a segment; discard deletes the
+    /// physical exactly once when the last checkpoint ref drains.
+    #[test]
+    fn test_phase2_c2u3_wal_segment_rotation_chain_gc_discard() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        *db.wal.lock().unwrap() =
+            Some(crate::wal::WalWriter::open(&wal_dir.path().join("db.wal")).unwrap());
+
+        // Flushed floor.
+        for i in 0..100u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap();
+
+        // Tail A → checkpoint 1 seals + re-homes SEG-000000.
+        for i in 100..120u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tailA").unwrap();
+        }
+        let max_seq_a = db.sequence_number.load(Ordering::Acquire);
+        let snap1 = db.snapshot();
+        db.create_incremental_checkpoint_linked(&snap1, 1, 0).unwrap();
+        let seg0 = PathBuf::from("/db/wal/WAL-000000.seg");
+        let mgr = db.file_mapping().expect("attached").clone();
+        assert!(fs.file_exists(&seg0).unwrap());
+        assert_eq!(mgr.refs("/db/wal/WAL-000000.seg"), 2, "working + chk-1");
+
+        // Tail B → checkpoint 2: the JUST-SEALED copy contains ONLY tail B
+        // (flat capture — the Phase-5 point), while chk-2 LINKS both.
+        for i in 120..140u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tailB").unwrap();
+        }
+        let snap2 = db.snapshot();
+        db.create_incremental_checkpoint_linked(&snap2, 2, 1).unwrap();
+        let seg1 = PathBuf::from("/db/wal/WAL-000001.seg");
+        assert!(fs.file_exists(&seg1).unwrap());
+        {
+            let size = fs.get_file_metadata(&seg1).unwrap().size as usize;
+            let mut bytes = vec![0u8; size];
+            let mut f = fs.open_sequential_file(&seg1).unwrap();
+            let mut off = 0;
+            while off < size {
+                let n = f.read(&mut bytes[off..]).unwrap();
+                if n == 0 {
+                    break;
+                }
+                off += n;
+            }
+            let scan = crate::wal::scan_records(&bytes);
+            assert!(scan.clean_eof);
+            assert_eq!(scan.records.len(), 20, "ONLY the since-chk-1 tail");
+            assert!(
+                scan.records.iter().all(|r| r.sequence > max_seq_a),
+                "no tail-A record re-copied (flat capture)"
+            );
+        }
+        assert_eq!(mgr.refs("/db/wal/WAL-000000.seg"), 3, "working+chk1+chk2");
+        assert_eq!(mgr.refs("/db/wal/WAL-000001.seg"), 2, "working+chk2");
+
+        // Restores: chk-1 = floor + A; chk-2 = floor + A + B.
+        let chk1 = PathBuf::from("/db/checkpoints/00000000000000000001");
+        let chk2 = PathBuf::from("/db/checkpoints/00000000000000000002");
+        let r1 = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk1, "/r1").unwrap();
+        let r1cf = r1.default_cf();
+        assert_eq!(r1.get(&r1cf, b"k0119").unwrap().as_deref(), Some(&b"tailA"[..]));
+        assert_eq!(r1.get(&r1cf, b"k0125").unwrap(), None, "tail B not in chk-1");
+        let r2 = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk2, "/r2").unwrap();
+        let r2cf = r2.default_cf();
+        assert_eq!(r2.get(&r2cf, b"k0000").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(r2.get(&r2cf, b"k0119").unwrap().as_deref(), Some(&b"tailA"[..]));
+        assert_eq!(r2.get(&r2cf, b"k0139").unwrap().as_deref(), Some(&b"tailB"[..]));
+        assert_eq!(
+            r2.lookup_cf_by_id(DEFAULT_CF_ID)
+                .unwrap()
+                .active_memtable()
+                .num_entries(),
+            40,
+            "both segments replayed, floor filtered"
+        );
+
+        // Flush everything → checkpoint 3: GC drops the WORKING refs (bytes
+        // survive on chk links); chk-3 links no segments; restore-3 memtable
+        // empty.
+        db.switch_and_flush(&cf).unwrap();
+        let snap3 = db.snapshot();
+        db.create_incremental_checkpoint_linked(&snap3, 3, 2).unwrap();
+        assert_eq!(mgr.refs("/db/wal/WAL-000000.seg"), 2, "GC dropped working ref");
+        assert_eq!(mgr.refs("/db/wal/WAL-000001.seg"), 1, "GC dropped working ref");
+        let chk3 = PathBuf::from("/db/checkpoints/00000000000000000003");
+        assert!(!mgr.is_registered(&chk3.join("WAL-000000.seg")));
+        let r3 = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk3, "/r3").unwrap();
+        let r3cf = r3.default_cf();
+        assert_eq!(r3.get(&r3cf, b"k0139").unwrap().as_deref(), Some(&b"tailB"[..]));
+        assert_eq!(
+            r3.lookup_cf_by_id(DEFAULT_CF_ID)
+                .unwrap()
+                .active_memtable()
+                .num_entries(),
+            0,
+            "everything flushed — nothing replayed"
+        );
+
+        // Discard chain: chk-1 retains SEG-0 (chk-2 still links it); chk-2
+        // deletes BOTH segment physicals exactly once.
+        db.discard_linked_checkpoint(1).unwrap();
+        assert!(fs.file_exists(&seg0).unwrap(), "chk-2 still references SEG-0");
+        let d2 = db.discard_linked_checkpoint(2).unwrap();
+        assert!(d2.physicals_deleted >= 2, "both segments drained: {d2:?}");
+        assert!(!fs.file_exists(&seg0).unwrap(), "SEG-0 deleted at last ref");
+        assert!(!fs.file_exists(&seg1).unwrap(), "SEG-1 deleted at last ref");
+        // chk-3 (SST-only) still restores.
+        let r3b = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk3, "/r3b").unwrap();
+        let r3bcf = r3b.default_cf();
+        assert_eq!(r3b.get(&r3bcf, b"k0000").unwrap().as_deref(), Some(&b"v1"[..]));
+    }
+
+    /// FRS-PHASE2-C2U3 (chain-of-restores closure): a restored engine that
+    /// re-enters WAL-DELTA mode keeps its REPLAYED tail across the next
+    /// linked checkpoint — via the supported `attach_wal_at` route (pre-WAL
+    /// barrier flushes the replayed memtable).
+    #[test]
+    fn test_phase2_c2u3_restored_engine_wal_chain_keeps_replayed_tail() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        *db.wal.lock().unwrap() =
+            Some(crate::wal::WalWriter::open(&wal_dir.path().join("src.wal")).unwrap());
+        for i in 0..30u32 {
+            db.put(&cf, format!("t{:02}", i).as_bytes(), b"tail").unwrap();
+        }
+        let snap = db.snapshot();
+        db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let chk1 = PathBuf::from("/db/checkpoints/00000000000000000001");
+
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk1, "/restore").unwrap();
+        let rcf = restored.default_cf();
+        // Re-enter WAL-DELTA mode the supported way.
+        restored
+            .attach_wal_at(&wal_dir.path().join("restored.wal"))
+            .unwrap();
+        for i in 0..10u32 {
+            restored
+                .put(&rcf, format!("n{:02}", i).as_bytes(), b"new")
+                .unwrap();
+        }
+        let rsnap = restored.snapshot();
+        restored
+            .create_incremental_checkpoint_linked(&rsnap, 2, 0)
+            .unwrap();
+        let chk2 = PathBuf::from("/restore/checkpoints/00000000000000000002");
+        let second =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk2, "/restore2").unwrap();
+        let scf = second.default_cf();
+        for i in 0..30u32 {
+            let k = format!("t{:02}", i);
+            assert_eq!(
+                second.get(&scf, k.as_bytes()).unwrap().as_deref(),
+                Some(&b"tail"[..]),
+                "replayed tail row {k} lost across the restored engine's next \
+                 WAL-DELTA checkpoint"
+            );
+        }
+        for i in 0..10u32 {
+            let k = format!("n{:02}", i);
+            assert_eq!(
+                second.get(&scf, k.as_bytes()).unwrap().as_deref(),
+                Some(&b"new"[..])
+            );
+        }
+    }
+
+    /// FRS-PHASE2-C2U3 (re-log branch, env route): when the restoring engine
+    /// already has a WAL at replay time (`FRS_WAL_DIR` attaches during open,
+    /// BEFORE the tail replay), the replayed records are re-logged into THIS
+    /// engine's live WAL — otherwise its next WAL-DELTA checkpoint (no
+    /// flush) would carry the tail in neither SSTs nor segments.
+    #[test]
+    fn test_phase2_c2u3_replay_relogs_into_attached_wal() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let src = open_in_shared_fs("/src", fs.clone());
+        let cf = src.default_cf();
+        *src.wal.lock().unwrap() =
+            Some(crate::wal::WalWriter::open(&wal_dir.path().join("src.wal")).unwrap());
+        for i in 0..30u32 {
+            src.put(&cf, format!("t{:02}", i).as_bytes(), b"tail").unwrap();
+        }
+        let snap = src.snapshot();
+        src.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let chk1 = PathBuf::from("/src/checkpoints/00000000000000000001");
+
+        // Target engine with a WAL ALREADY attached (the env-route shape).
+        use crate::checkpoint::{read_blob, split_mapping_trailer};
+        let tgt = open_in_shared_fs("/tgt", fs.clone());
+        let tgt_wal = wal_dir.path().join("tgt.wal");
+        *tgt.wal.lock().unwrap() = Some(crate::wal::WalWriter::open(&tgt_wal).unwrap());
+        let blob = read_blob(fs.as_ref(), &chk1).unwrap();
+        let (_base, mapping) = split_mapping_trailer(&blob).unwrap();
+        let view = forst_rs_io::MappingSnapshotView::decode(mapping.unwrap()).unwrap();
+        let replayed =
+            DbImpl::replay_linked_wal_delta(&tgt, fs.as_ref(), &chk1, &view).unwrap();
+        assert_eq!(replayed, 30);
+
+        // The replayed tail is durable in the TARGET's live WAL.
+        let scan = crate::wal::read_segment(&tgt_wal).unwrap();
+        assert!(scan.clean_eof);
+        assert_eq!(scan.records.len(), 30, "tail re-logged into the live WAL");
+        assert!(scan.records.iter().all(|r| r.value.as_deref() == Some(b"tail")));
     }
 
     /// FRS-PHASE2-C2U2 crash-point IT (design §9 D5 crash window a): the
