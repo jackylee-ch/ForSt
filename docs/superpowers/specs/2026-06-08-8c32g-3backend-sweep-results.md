@@ -2249,3 +2249,10 @@ the hottest path; (2) E5 per-call OnceLock load on overlapping_ssts_in_range
 (millions of q9 scans × 8 threads); (3) H1 catch_unwind per pool job; (4) Java
 V1/V4 alloc fixes (timer path). Round-3 S2 program DEFERRED until rooted (a
 regressed tip pollutes all further A/B). Bisect: engine-swap vs jar-swap runs.
+
+### ★★ FIXED-CSV ACCURACY GATE (2026-06-12): q3/q5/q8/q11 HASH-EQUAL, q12 invariant-PASS
+1M fixed input, identical bytes both backends, current tips (jar 72607e11097 +
+engine c921e297b): all EQUAL incl. retraction streams; determinism control (q8
+re-run ×2 each backend) = 4/4 identical hashes. Harness now IN-REPO:
+scripts/accuracy-gate/ (spec 2026-06-12-fixed-csv-accuracy-gate.md). The
+timer-index + alloc-fix stack is byte-correct on deterministic ground.
