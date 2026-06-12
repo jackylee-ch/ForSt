@@ -2149,3 +2149,19 @@ Drain-ON: q9 +19%, q20 ±0 on this box — the Mac-recorded drain wins (q9 −37
 q20 −568s) do NOT transfer to NVMe (no tombstone read-amp to reclaim; only the
 drain's compaction cost remains, and q9's write pattern pays it). q20-rdb pair
 running; r2b nodrain q9 auto-fires after.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★ REMOTE ROUND-2 FINAL (drain-ON+E5+alloc tip) — DRAIN LEVER DEAD ON NVMe
+# ═══════════════════════════════════════════════════════════════════════════
+| gate/query | result | vs round-1 |
+|---|---|---|
+| q1/q8/q3 gates | 4.0s / 168.0s rows-in-band / 1.16× | all PASS |
+| q17 ×3 | 418.3/422.6/387.3 (±4.5%), rows exact | first remote baseline |
+| q9 | frs 2872.8 / rdb 2175.3 = 1.32× | REGRESSED from 1.14× |
+| q20 | frs 2011.1 / rdb 1557.6 = 1.29× | unchanged (1.31×) |
+VERDICT (gate-matrix D2-class): drain-ON = q9 +19% / q20 ±0 on NVMe — the Mac
+win FALSIFIED on the production-like population. Default REVERTED (57f0466bf,
+env opt-in kept). r2b nodrain q9 confirmation run in flight (07:45:37).
+ROUND-3 NEXT: S2 flag-ON gate program (PMC §9, review-rounds/2026-06-12-pmc-
+review-s2.md) on the reverted tip — the q7 1.74× campaign's first full-stack
+measurement (micro: 9.2× deep fan-out, −30% churn scan).
