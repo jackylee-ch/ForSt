@@ -154,6 +154,9 @@ impl WalRecord {
 /// uses so a checkpoint need not force a memtable flush.
 pub struct WalWriter {
     inner: BufWriter<File>,
+    /// Segment path (FRS-WAL Phase 4: the checkpoint capture re-reads the
+    /// synced segment bytes from here under the WAL lock).
+    path: std::path::PathBuf,
     /// Bytes appended since construction (the segment's logical size, used by
     /// Phase 5 rotation/GC to bound segment size).
     bytes_written: u64,
@@ -178,9 +181,15 @@ impl WalWriter {
             .map_err(|e| ForstError::Io(std::io::Error::other(format!("WAL stat: {e}"))))?;
         Ok(WalWriter {
             inner: BufWriter::new(file),
+            path: path.to_path_buf(),
             bytes_written,
             pending: 0,
         })
+    }
+
+    /// The segment's on-disk path.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Buffers one record for the current group-commit batch. NOT durable until
@@ -262,7 +271,13 @@ pub fn read_segment(path: &Path) -> ForstResult<WalScan> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|e| ForstError::Io(std::io::Error::other(format!("WAL read: {e}"))))?;
+    Ok(scan_records(&bytes))
+}
 
+/// FRS-WAL Phase 4: scans an in-memory WAL segment image (e.g. a
+/// checkpoint-captured `WAL.delta` read back through the engine FS) with the
+/// same torn-tail tolerance as [`read_segment`].
+pub fn scan_records(bytes: &[u8]) -> WalScan {
     let mut records = Vec::new();
     let mut pos = 0usize;
     let clean_eof = loop {
@@ -290,7 +305,7 @@ pub fn read_segment(path: &Path) -> ForstResult<WalScan> {
         pos = payload_start + payload_len;
     };
 
-    Ok(WalScan { records, clean_eof })
+    WalScan { records, clean_eof }
 }
 
 #[cfg(test)]
