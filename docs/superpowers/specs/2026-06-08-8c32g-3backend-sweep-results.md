@@ -1,5 +1,42 @@
 # 8c/32g 3-backend NexMark sweep — verified time + accuracy (2026-06-08)
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★★ CURRENT STATUS 2026-06-12 — REMOTE-x86 IS THE BINDING POPULATION
+# ═══════════════════════════════════════════════════════════════════════════
+NexMark runs on the remote Linux box ONLY (yq01, x86_64, NVMe /ssd2, docker
+split-topo 2×TM 4c/16g + JM 2c/4g, io_uring live via seccomp=unconfined; Mac
+numbers below this section are a SEPARATE legacy population — never compare).
+
+## Remote scoreboard @100M (bar: frs ≤1.25× rdb wall AND rows match)
+| query | frs | rocksdb | ratio | verdict |
+|---|---|---|---|---|
+| q3 (point-get) | 142.1 | 122.6 | 1.16× | PASS |
+| q7 | 2376.4 (io_uring ON; OFF=DNF) | 1367.6 | 1.74× | FAIL — S2 flag-ON round-3 next |
+| q8 canary | 153.2–170.1, rows in-band ×3 | — | — | PASS |
+| q9 (round-1 tip) | 2421.2 (rows canonical) | 2121.2 | **1.14×** | **PASS** |
+| q9 (round-2 tip) | 2872.8 / nodrain 2779.2 | 2175.3 | 1.32× | REGRESSED — bisect in flight |
+| q17 ×3 | 387.3–422.6 (±4.5%) | — | — | baseline (box is measurement-grade) |
+| q20 | 2011.1–2026.5 | 1545.3–1557.6 | 1.29–1.31× | near-miss |
+
+## Lever ledger (measured, remote)
+- Streaming-read P0/P1/prefetcher + io_uring: SHIPPED — q9 1.63×(Mac)→1.14×;
+  io_uring = q7 finish-vs-DNF. THE win so far.
+- Garbage-drain default: FALSIFIED on NVMe (q9 +19%, q20 ±0) → REVERTED
+  (57f0466bf, env opt-in kept). Mac-recorded wins were population-specific.
+- Round-2 residual regression: +358s on q9 NON-drain (r2b 2779.2 vs r1 2421.2,
+  rdb controls flat) — suspects M3 global-atomic contention / E5 per-call
+  OnceLock / H1 unwind / jar V1-V4; de-contention fixes + jar-swap bisect
+  RUNNING. Round-3 (S2 flag-ON) deferred until the tip is clean.
+- S2 pinned-rows+loser-tree: APPROVED, merged flag-OFF (FRS_RS_S2_PINNED);
+  micro: join_probe_open ssts_128 9.2×, churn scan −30%, iter_drain −10%,
+  0 allocs/row. q7's lever — first 100M test in round-3.
+- Correctness: q9 rows canonical-exact cross-arch (frs); out_rows jitter
+  (±~200) on BOTH backends = harness sink-sampling at FINISH, not output error
+  (src always exact). Timer index + E5 multi-CF scan fix + BE merge operator
+  shipped with full suites green (engine 907+/0, flink module 565/0).
+
+Detail sections below are chronological (oldest first after the legacy lock).
+
 All 100M events, 8c/32g Docker, each backend with its own timer. `out_rows` = sink vertex
 read-records (accuracy: forst-rs must match RocksDB). Bar: forst-rs ≥0.8× RocksDB OR ≤+50s,
 AND faster than ForSt, AND out_rows match.
