@@ -4608,6 +4608,346 @@ pub unsafe extern "C" fn frs_db_open_from_incremental(
 }
 
 // ---------------------------------------------------------------------------
+// 8c. LINK-mode (Phase-2 disaggregated state) checkpoint surface
+//
+// FRS-PHASE2-FFI (design §8 Stage-3 residue, 2026-06-13): the end-to-end
+// enabler that makes link-mode checkpoints reachable from Flink. Mirrors the
+// engine surface:
+//
+//   * `frs_create_incremental_checkpoint_linked` — ZERO-upload checkpoint:
+//     the live SST set is `link()`ed into `<db_path>/checkpoints/<chk-id>/`
+//     through the FileMappingManager (auto-attached, journal at
+//     `<db_path>/MAPPING.journal`); the chk dir physically contains exactly
+//     `CHECKPOINT.blob` (+ `WAL.delta` iff a WAL is attached and non-empty).
+//     Returned `linked_new_ssts`/`linked_shared_ssts` are chk-namespace
+//     LOGICAL paths — metadata-only, NEVER byte-readable; register them as
+//     Flink handles, do NOT upload them. Memtable durability is dual-mode
+//     (§9 D10): no WAL ⇒ FLUSH-on-barrier; WAL attached (see
+//     `frs_db_attach_wal`) ⇒ WAL-DELTA (flush skipped, the unflushed tail is
+//     captured into `WAL.delta` and replayed on restore).
+//   * `frs_db_open_from_linked_checkpoint_instant[_remote]` — restore that
+//     downloads/copies NOTHING: physicals are adopt()ed (NotOwned) and reads
+//     route through the mapped indirection; restore wall-time is O(files)
+//     metadata. CLAIM discipline: the source checkpoint must stay retained
+//     until `frs_db_adopted_residual` reports 0.
+//   * `frs_db_discard_linked_checkpoint` — the JM `discardState()`
+//     delegate: manifest-driven unlink loop; a physical is deleted exactly
+//     once when its last reference drains. Retried discard → NOT_FOUND.
+//
+// Memory ownership of [`FrsLinkedCheckpointResult`] mirrors
+// [`FrsIncrementalCheckpointResult`]; release via
+// [`frs_db_linked_checkpoint_result_free`].
+// ---------------------------------------------------------------------------
+
+/// Result of a LINK-mode incremental checkpoint. `manifest_path` is the
+/// engine-FS blob path; `linked_new_ssts` / `linked_shared_ssts` carry the
+/// chk-namespace logical paths (the new/shared split is the Flink
+/// SharedStateRegistry registration hint — neither list is uploaded; the
+/// paths are metadata-only and must never be opened byte-wise).
+#[repr(C)]
+pub struct FrsLinkedCheckpointResult {
+    /// Path to the persisted manifest blob (with embedded mapping trailer),
+    /// NUL-terminated UTF-8. Rust-owned; release via
+    /// [`frs_db_linked_checkpoint_result_free`].
+    pub manifest_path: *mut c_char,
+    /// Live SSTs NOT in the base checkpoint, at linked
+    /// `<db_path>/checkpoints/<chk-id>/NNNNNN.sst` logical paths.
+    pub linked_new_ssts: *mut FrsLiveFileList,
+    /// Live SSTs shared with the base checkpoint, at linked logical paths.
+    pub linked_shared_ssts: *mut FrsLiveFileList,
+}
+
+/// Captures a LINK-mode incremental checkpoint pinned at `snapshot` —
+/// zero data movement (O(files) metadata link ops). See section 8c module
+/// comment for the contract; `checkpoint_id` / `base_checkpoint_id`
+/// semantics match [`frs_create_incremental_checkpoint_at`].
+///
+/// # SAFETY
+/// - `db` must be a live handle from `frs_db_open*`; `snapshot` a live
+///   snapshot of the SAME db; `out` a valid caller-allocated slot.
+#[no_mangle]
+pub unsafe extern "C" fn frs_create_incremental_checkpoint_linked(
+    db: FrsDb,
+    snapshot: FrsSnapshot,
+    checkpoint_id: u64,
+    base_checkpoint_id: u64,
+    out: *mut FrsLinkedCheckpointResult,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if snapshot.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let snap_ref = &(*snapshot).inner;
+        if snap_ref.db_id() != db.db_id() {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        match db.create_incremental_checkpoint_linked(snap_ref, checkpoint_id, base_checkpoint_id)
+        {
+            Ok(result) => {
+                debug_assert!(
+                    result.link_mode && result.new_ssts.is_empty() && result.shared_ssts.is_empty(),
+                    "linked checkpoint must return empty upload lists (design §9 D3)"
+                );
+                let manifest_path_c =
+                    std::ffi::CString::new(result.manifest_path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|_| {
+                            std::ffi::CString::new("<invalid-path>").expect("static literal")
+                        });
+                let new_list_box = Box::new(into_ffi_list(result.linked_new_ssts, 0));
+                let shared_list_box = Box::new(into_ffi_list(result.linked_shared_ssts, 0));
+                std::ptr::write(
+                    out,
+                    FrsLinkedCheckpointResult {
+                        manifest_path: manifest_path_c.into_raw(),
+                        linked_new_ssts: Box::into_raw(new_list_box),
+                        linked_shared_ssts: Box::into_raw(shared_list_box),
+                    },
+                );
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Releases the inner allocations of an [`FrsLinkedCheckpointResult`].
+/// Idempotent; the outer struct is caller-allocated and not freed.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_linked_checkpoint_result_free(
+    out: *mut FrsLinkedCheckpointResult,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_OK;
+        }
+        let r = &mut *out;
+        if !r.linked_new_ssts.is_null() {
+            frs_db_live_file_list_free(r.linked_new_ssts);
+            drop(Box::from_raw(r.linked_new_ssts));
+            r.linked_new_ssts = std::ptr::null_mut();
+        }
+        if !r.linked_shared_ssts.is_null() {
+            frs_db_live_file_list_free(r.linked_shared_ssts);
+            drop(Box::from_raw(r.linked_shared_ssts));
+            r.linked_shared_ssts = std::ptr::null_mut();
+        }
+        if !r.manifest_path.is_null() {
+            drop(std::ffi::CString::from_raw(r.manifest_path));
+            r.manifest_path = std::ptr::null_mut();
+        }
+        FRS_STATUS_OK
+    })
+}
+
+/// TM-side discard of a LINK-mode checkpoint (the JM `discardState()`
+/// delegate, design §9 D4). On success `*out_unlinked` /
+/// `*out_physicals_deleted` report the dropped references and the physical
+/// objects whose LAST reference this discard drained (deleted exactly
+/// once). A retried discard (blob already gone) returns
+/// `FRS_STATUS_NOT_FOUND`.
+///
+/// # SAFETY
+/// - `db` must be a live handle; out pointers may be null (counts skipped).
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_discard_linked_checkpoint(
+    db: FrsDb,
+    checkpoint_id: u64,
+    out_unlinked: *mut u64,
+    out_physicals_deleted: *mut u64,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        match db.discard_linked_checkpoint(checkpoint_id) {
+            Ok(report) => {
+                if !out_unlinked.is_null() {
+                    *out_unlinked = report.unlinked as u64;
+                }
+                if !out_physicals_deleted.is_null() {
+                    *out_physicals_deleted = report.physicals_deleted as u64;
+                }
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// INSTANT-LINK restore from a LINK-mode checkpoint directory on the LOCAL
+/// filesystem — downloads/copies NOTHING (adopt + mapped reads; WAL.delta
+/// tail replayed when present). `target_dir` must be fresh/clean. The
+/// restored default CF carries the standard raw-concat merge operator
+/// (same as `frs_db_open`).
+///
+/// CLAIM discipline: keep the source checkpoint retained until
+/// [`frs_db_adopted_residual`] reports 0 for the restored handle.
+///
+/// # SAFETY
+/// - `ckpt_dir` / `target_dir` must be NUL-terminated UTF-8;
+///   `out_handle` a valid slot. Close the handle with `frs_db_close`.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant(
+    ckpt_dir: *const c_char,
+    target_dir: *const c_char,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if out_handle.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let ckpt = match cstr_to_str(&ckpt_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let target = match cstr_to_str(&target_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let fs: std::sync::Arc<dyn forst_rs_io::FileSystem> =
+            std::sync::Arc::new(forst_rs_io::LocalFileSystem::new());
+        match DbImpl::open_from_linked_checkpoint_instant_with_default_cf(
+            fs,
+            Path::new(&ckpt),
+            &target,
+            raw_concat_default_cf_descriptor(),
+        ) {
+            Ok(db) => {
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// INSTANT-LINK restore over a REMOTE (OpenDAL) engine filesystem — the
+/// remote-primary download-skip restore. Builds the same
+/// `CachedFileSystem(OpendalFileSystem, LocalCache)` stack as
+/// [`frs_db_open_remote`] (same `uri` / `opendal_config_json` / cache
+/// parameters), then performs the instant restore of `ckpt_dir` into
+/// `target_dir` (both REMOTE-namespace paths).
+///
+/// # SAFETY
+/// - String args NUL-terminated UTF-8 (`opendal_config_json` may be null);
+///   `out_handle` a valid slot.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant_remote(
+    uri: *const c_char,
+    opendal_config_json: *const c_char,
+    cache_dir: *const c_char,
+    cache_capacity_bytes: u64,
+    ckpt_dir: *const c_char,
+    target_dir: *const c_char,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if out_handle.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let uri_str = match cstr_to_str(&uri) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let cache_dir_str = match cstr_to_str(&cache_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let ckpt = match cstr_to_str(&ckpt_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let target = match cstr_to_str(&target_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let json_str = if opendal_config_json.is_null() {
+            String::new()
+        } else {
+            match cstr_to_str(&opendal_config_json) {
+                Some(s) => s.to_string(),
+                None => return FRS_STATUS_NULL_ARG,
+            }
+        };
+        let config = match parse_flat_json_object(&json_str) {
+            Ok(m) => m,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        match DbImpl::open_from_linked_checkpoint_instant_remote(
+            &uri_str,
+            config,
+            Path::new(&cache_dir_str),
+            cache_capacity_bytes,
+            Path::new(&ckpt),
+            &target,
+            raw_concat_default_cf_descriptor(),
+        ) {
+            Ok(db) => {
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Number of LIVE SSTs still resolving to physical objects OUTSIDE this
+/// engine's working namespace (adopted from a restore source, not yet
+/// compacted away). 0 ⇒ the engine is weaned; the restore-source
+/// checkpoint may be discarded safely.
+///
+/// # SAFETY
+/// - `db` must be a live handle; `out` a valid slot.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_adopted_residual(db: FrsDb, out: *mut u64) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        *out = db.adopted_residual() as u64;
+        FRS_STATUS_OK
+    })
+}
+
+/// Attaches a write-ahead log at `wal_path` to this engine — the per-DB,
+/// env-free WAL-DELTA opt-in (design §9 D10: with a WAL attached, a LINK
+/// checkpoint skips the memtable flush and captures the unflushed tail
+/// into `<chk-dir>/WAL.delta`; restore replays it through the per-CF
+/// flushed-floor filter). The WAL is a LOCAL file (place it on fast local
+/// disk). Errors with `FRS_STATUS_INVALID_ARGUMENT` if a WAL is already
+/// attached.
+///
+/// # SAFETY
+/// - `db` must be a live handle; `wal_path` NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_attach_wal(db: FrsDb, wal_path: *const c_char) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let path = match cstr_to_str(&wal_path) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        match db.attach_wal_at(Path::new(&path)) {
+            Ok(()) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 9. State import / export migration (B-Prod-P10, spec §6g)
 //
 // `frs_cf_export` writes every (key, value) row in `cf` to a single

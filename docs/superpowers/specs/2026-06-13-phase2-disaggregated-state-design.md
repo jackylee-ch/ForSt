@@ -798,6 +798,48 @@ residue); local-WAL-dir placement for remote-primary TMs (today the segment
 lives wherever `FRS_WAL_DIR` points; capture re-homes bytes to the engine
 FS at the barrier).
 
+### FFI `linked_*` surface + Java adoption package (landed 2026-06-13, cycle 2 unit 1)
+
+Built — the end-to-end enabler for the Stage-3 cross-repo residue:
+
+- **FFI** (`crates/forst-rs-ffi/src/lib.rs` section 8c):
+  `frs_create_incremental_checkpoint_linked` (+ 24-byte
+  `FrsLinkedCheckpointResult` {manifest, linked_new, linked_shared} +
+  idempotent free), `frs_db_discard_linked_checkpoint` (retried →
+  NOT_FOUND), `frs_db_open_from_linked_checkpoint_instant` (local FS) and
+  `_remote` (same OpenDAL+LocalCache stack as `frs_db_open_remote`),
+  `frs_db_adopted_residual`, `frs_db_attach_wal` (per-DB env-free
+  WAL-DELTA opt-in — the "wal_capture variant": with a WAL attached the
+  linked entry point runs WAL-DELTA automatically, §9 D10).
+- **Engine additive**: `open_from_linked_checkpoint[_instant]_with_default_cf`
+  (the restored default CF carries the raw-concat merge operator on the
+  FFI/Java route), `open_from_linked_checkpoint_instant_remote`,
+  `attach_wal_at`. **Footgun found & fixed:** `attach_wal_at` runs a
+  PRE-WAL durability barrier (seal + flush every CF) — without it, rows
+  living only in the active memtable at attach time are in NEITHER the
+  SSTs nor the WAL and the first WAL-DELTA linked checkpoint silently
+  loses them (caught by the FFI IT; regression UT
+  `test_phase2_ffi_attach_wal_at_flushes_pre_wal_state`).
+- **Java adoption package** (`disagg-java/`, COPIES — flink repo
+  read-only): `ForStRsLinker.linked-fragment.java` (FFM binds + wrappers,
+  ABI-exact), `LinkedSstStateHandle.java` (JM-side no-op discard —
+  delegation per §9 D4/paper §5.2), `ForStRsSnapshotStrategy.link-mode-`
+  and `ForStRsRestoreOperation.download-skip-` fragments, README with
+  binding decisions D-J1..D-J5 (discard delegation via
+  notifyCheckpointSubsumed; link mode gated to FORWARD sharing; manifest
+  keeps its small EXCLUSIVE upload; CLAIM discipline on
+  `adopted_residual`; config keys `forst.rs.checkpoint.link-mode` /
+  `forst.rs.wal.dir`) + the 5M correctness gate list.
+
+Gates green (2026-06-13): FFI IT `linked_checkpoint_ffi_it.rs` — FLUSH
+round-trip (zero-upload object-count assert through the C ABI, instant
+restore byte-exact, residual>0 restored / 0 source, restored writable,
+double-free idempotent); WAL-DELTA (attach → blob+WAL.delta exactly, tail
++ overwrite replayed, post-barrier write absent, double-attach rejected);
+discard (unlinked==linked count, physicals_deleted==0 under working refs,
+retry NOT_FOUND, null-arg paths). Suites: engine 349 (348+1 ignored)/0,
+io 231/0, storage 442/0, ffi green; clippy 0.
+
 ---
 
 ## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)

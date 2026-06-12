@@ -3264,6 +3264,63 @@ impl DbImpl {
         }
     }
 
+    /// FRS-PHASE2-FFI (WAL-DELTA enabler): attaches a write-ahead log at
+    /// `path` directly — the env-free, per-DB equivalent of
+    /// [`Self::maybe_init_wal`], for FFI/Java consumers that opt a single
+    /// engine into WAL-DELTA link-mode checkpoints (design §3.3, §9 D10:
+    /// the WAL's presence IS the mode switch) without process-global
+    /// `FRS_WAL_DIR`. Errors if a WAL is already attached. The WAL is a
+    /// LOCAL artifact (NVMe) by design; the link-mode barrier re-homes the
+    /// captured image to the engine filesystem (`wal_capture_to`).
+    pub fn attach_wal_at(&self, path: &Path) -> ForstResult<()> {
+        {
+            let guard = self.wal.lock().expect("wal lock poisoned");
+            if guard.is_some() {
+                return Err(ForstError::invalid_argument(
+                    "attach_wal_at: a WAL is already attached to this engine",
+                ));
+            }
+        }
+        // PRE-WAL durability barrier: the WAL only covers mutations appended
+        // AFTER attach. Seal + flush every CF's memtable first so no pre-WAL
+        // row exists solely in RAM — otherwise the first WAL-DELTA linked
+        // checkpoint (which skips the flush, §9 D10) would silently exclude
+        // it. Same seal-active pattern as the checkpoint flush barrier.
+        // Caller contract: attach before serving writes (a write racing this
+        // barrier may land in neither the flush nor the WAL).
+        self.flush_all()?;
+        let cfs: Vec<Arc<ColumnFamilyData>> = {
+            let guard = self.cfs.read().expect("lock poisoned");
+            guard.values().cloned().collect()
+        };
+        for cf_data in &cfs {
+            let has_data = cf_data.active_memtable().num_entries() > 0;
+            if has_data {
+                let _writer = self.write_mutex.lock().expect("lock poisoned");
+                cf_data.swap_active_memtable();
+                self.refresh_snapshot_view(cf_data);
+                drop(_writer);
+                self.flush_cf_data(cf_data)?;
+            }
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ForstError::Io(std::io::Error::other(format!(
+                    "attach_wal_at: create WAL dir {}: {e}",
+                    parent.display()
+                )))
+            })?;
+        }
+        let mut guard = self.wal.lock().expect("wal lock poisoned");
+        if guard.is_some() {
+            return Err(ForstError::invalid_argument(
+                "attach_wal_at: a WAL is already attached to this engine",
+            ));
+        }
+        *guard = Some(crate::wal::WalWriter::open(path)?);
+        Ok(())
+    }
+
     /// FRS-WAL Phase 2: append a group of records to the WAL buffer. No-op
     /// (returns `Ok`) when the WAL is disabled. Does NOT fsync — durability is
     /// established at checkpoint time via [`wal_sync`](Self::wal_sync), which is
@@ -7163,6 +7220,24 @@ impl DbImpl {
         ckpt_dir: &Path,
         target_dir: &str,
     ) -> ForstResult<Arc<Self>> {
+        Self::open_from_linked_checkpoint_with_default_cf(
+            fs,
+            ckpt_dir,
+            target_dir,
+            ColumnFamilyDescriptor::new(DEFAULT_CF_NAME),
+        )
+    }
+
+    /// FRS-PHASE2-FFI: [`Self::open_from_linked_checkpoint`] with a
+    /// caller-supplied default-CF descriptor — the FFI/Java route, where the
+    /// restored default CF must carry the same merge operator the writing
+    /// engine had (`frs_db_open` installs `RawConcatMergeOperator`).
+    pub fn open_from_linked_checkpoint_with_default_cf(
+        fs: Arc<dyn FileSystem>,
+        ckpt_dir: &Path,
+        target_dir: &str,
+        default_desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<Arc<Self>> {
         use crate::checkpoint::{copy_file, deserialize_snapshot, read_blob, split_mapping_trailer, write_blob};
         let blob = read_blob(fs.as_ref(), ckpt_dir)?;
         let (base, mapping) = split_mapping_trailer(&blob)?;
@@ -7222,7 +7297,7 @@ impl DbImpl {
             db_path: target.to_string_lossy().into_owned(),
             ..EngineOptions::default()
         };
-        let db = Self::open_from_checkpoint(options, fs.clone())?;
+        let db = Self::open_from_checkpoint_with_default_cf(options, fs.clone(), default_desc)?;
         // FRS-WAL Phase 4: replay the captured unflushed tail (WAL-DELTA
         // checkpoints; no-op for FLUSH-mode checkpoints).
         Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir)?;
@@ -7260,6 +7335,23 @@ impl DbImpl {
         fs: Arc<dyn FileSystem>,
         ckpt_dir: &Path,
         target_dir: &str,
+    ) -> ForstResult<Arc<Self>> {
+        Self::open_from_linked_checkpoint_instant_with_default_cf(
+            fs,
+            ckpt_dir,
+            target_dir,
+            ColumnFamilyDescriptor::new(DEFAULT_CF_NAME),
+        )
+    }
+
+    /// FRS-PHASE2-FFI: [`Self::open_from_linked_checkpoint_instant`] with a
+    /// caller-supplied default-CF descriptor (see
+    /// [`Self::open_from_linked_checkpoint_with_default_cf`]).
+    pub fn open_from_linked_checkpoint_instant_with_default_cf(
+        fs: Arc<dyn FileSystem>,
+        ckpt_dir: &Path,
+        target_dir: &str,
+        default_desc: ColumnFamilyDescriptor,
     ) -> ForstResult<Arc<Self>> {
         use crate::checkpoint::{
             deserialize_snapshot, read_blob, split_mapping_trailer, write_blob,
@@ -7317,12 +7409,46 @@ impl DbImpl {
             db_path: target.to_string_lossy().into_owned(),
             ..EngineOptions::default()
         };
-        let db = Self::open_from_checkpoint(options, mapped)?;
+        let db = Self::open_from_checkpoint_with_default_cf(options, mapped, default_desc)?;
         db.attach_file_mapping(mgr)?;
         // FRS-WAL Phase 4: replay the captured unflushed tail (WAL-DELTA
         // checkpoints; no-op for FLUSH-mode checkpoints).
         Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir)?;
         Ok(db)
+    }
+
+    /// FRS-PHASE2-FFI: INSTANT-LINK restore over a REMOTE (OpenDAL) engine
+    /// filesystem — builds the same `CachedFileSystem(OpendalFileSystem,
+    /// LocalCache)` stack as [`Self::open_remote_with_default_cf`] and runs
+    /// [`Self::open_from_linked_checkpoint_instant_with_default_cf`] over
+    /// it. This is the remote-primary restore entry the FFI/Java
+    /// download-skip branch calls: nothing is downloaded; the cache warms
+    /// lazily through the mapped indirection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_linked_checkpoint_instant_remote(
+        uri: &str,
+        opendal_config: HashMap<String, String>,
+        cache_dir: &std::path::Path,
+        cache_capacity_bytes: u64,
+        ckpt_dir: &Path,
+        target_dir: &str,
+        default_desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<Arc<Self>> {
+        let remote_fs = build_opendal_fs_from_uri(uri, &opendal_config)?;
+        let cache = LocalCache::open(cache_dir, cache_capacity_bytes).map_err(|e| {
+            ForstError::Io(std::io::Error::other(format!(
+                "open_from_linked_checkpoint_instant_remote: failed to open \
+                 local cache at {cache_dir:?}: {e}"
+            )))
+        })?;
+        let cached_fs: Arc<dyn FileSystem> =
+            Arc::new(CachedFileSystem::new(remote_fs, Arc::new(cache)));
+        Self::open_from_linked_checkpoint_instant_with_default_cf(
+            cached_fs,
+            ckpt_dir,
+            target_dir,
+            default_desc,
+        )
     }
 
     /// FRS-WAL Phase 4 / FRS-PHASE2-S4 (design §3.3, §9 D6): replays a
@@ -20116,6 +20242,64 @@ mod tests {
             0,
             "FLUSH-mode restore replays nothing"
         );
+    }
+
+    /// FRS-PHASE2-FFI gate: `attach_wal_at` (the per-DB, env-free WAL-DELTA
+    /// opt-in) must make every PRE-WAL mutation durable in SSTs before the
+    /// WAL takes over — otherwise rows living only in the active memtable at
+    /// attach time are in NEITHER the SSTs nor the WAL, and the first
+    /// WAL-DELTA linked checkpoint silently loses them.
+    #[test]
+    fn test_phase2_ffi_attach_wal_at_flushes_pre_wal_state() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+
+        // Pre-WAL state: active memtable only, never explicitly flushed.
+        for i in 0..30u32 {
+            db.put(&cf, format!("pre{:02}", i).as_bytes(), b"p").unwrap();
+        }
+        db.attach_wal_at(&wal_dir.path().join("db.wal")).unwrap();
+        // Double-attach is rejected.
+        assert!(db
+            .attach_wal_at(&wal_dir.path().join("other.wal"))
+            .is_err());
+        // Post-attach tail: covered by the WAL.
+        for i in 0..10u32 {
+            db.put(&cf, format!("tail{:02}", i).as_bytes(), b"t").unwrap();
+        }
+
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        assert!(r.link_mode);
+        assert!(
+            !r.linked_new_ssts.is_empty(),
+            "the attach barrier must have sealed the pre-WAL memtable to SSTs"
+        );
+
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+        let rcf = restored.default_cf();
+        for i in 0..30u32 {
+            let k = format!("pre{:02}", i);
+            assert_eq!(
+                restored.get(&rcf, k.as_bytes()).unwrap().as_deref(),
+                Some(&b"p"[..]),
+                "pre-WAL row {k} lost across attach + WAL-DELTA checkpoint"
+            );
+        }
+        for i in 0..10u32 {
+            let k = format!("tail{:02}", i);
+            assert_eq!(
+                restored.get(&rcf, k.as_bytes()).unwrap().as_deref(),
+                Some(&b"t"[..]),
+                "WAL tail row {k} missing"
+            );
+        }
     }
 
     #[test]
