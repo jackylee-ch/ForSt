@@ -451,16 +451,16 @@ impl CachedFileSystem {
             return Ok(BackgroundFillOutcome::SkippedBudget);
         }
         let bytes = self.read_remote_whole(path)?;
-        let headroom = self
+        // `put_cold` re-checks the budget ATOMICALLY under the cache lock
+        // (R1-H1: a cold insert never evicts; `Ok(false)` = not admitted) —
+        // this pre-read headroom check raced concurrent demand fills.
+        let admitted = self
             .cache
-            .capacity_bytes()
-            .saturating_sub(self.cache.current_bytes());
-        if bytes.len() as u64 > headroom {
-            return Ok(BackgroundFillOutcome::SkippedBudget);
-        }
-        self.cache
             .put_cold(&key, &bytes)
             .map_err(|e| ForstError::Io(std::io::Error::other(format!("cache put_cold: {e}"))))?;
+        if !admitted {
+            return Ok(BackgroundFillOutcome::SkippedBudget);
+        }
         Ok(BackgroundFillOutcome::Filled(bytes.len() as u64))
     }
 }

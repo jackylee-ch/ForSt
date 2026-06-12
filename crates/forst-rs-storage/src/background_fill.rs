@@ -379,6 +379,52 @@ mod tests {
         );
     }
 
+    /// R1-H1 regression: a cold put that does not fit the FREE headroom is
+    /// rejected ATOMICALLY (Ok(false), nothing evicted, no file admitted) —
+    /// the never-evicts guarantee can't be raced past the pre-check.
+    #[test]
+    fn test_c3u3_r1h1_cold_put_never_evicts_atomically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = vec![0u8; FILE_KB * 1024];
+        let cache = LocalCache::open_with_policy(
+            tmp.path(),
+            2 * (FILE_KB as u64) * 1024,
+            CachePolicy::default(),
+        )
+        .unwrap();
+        cache.put("/db/a.sst", &payload).unwrap();
+        cache.put("/db/b.sst", &payload).unwrap();
+        // Budget full: a cold insert must be REJECTED, not evict.
+        assert!(!cache.put_cold("/db/c.sst", &payload).unwrap());
+        assert!(cache.contains("/db/a.sst"));
+        assert!(cache.contains("/db/b.sst"));
+        assert!(!cache.contains("/db/c.sst"));
+        assert_eq!(cache.current_bytes(), 2 * (FILE_KB as u64) * 1024);
+    }
+
+    /// R1-M1 regression: a cold put racing an EXISTING (demand-filled)
+    /// entry must not demote it to the eviction front.
+    #[test]
+    fn test_c3u3_r1m1_cold_update_does_not_demote_hot_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload = vec![0u8; FILE_KB * 1024];
+        let cache = LocalCache::open_with_policy(
+            tmp.path(),
+            2 * (FILE_KB as u64) * 1024,
+            CachePolicy::default(),
+        )
+        .unwrap();
+        cache.put("/db/old.sst", &payload).unwrap();
+        cache.put("/db/hot.sst", &payload).unwrap();
+        // bg fill races: cold update of the already-cached hot entry.
+        assert!(cache.put_cold("/db/hot.sst", &payload).unwrap());
+        // A demand put needing room must evict the OLD entry, not the
+        // cold-updated hot one.
+        cache.put("/db/new.sst", &payload).unwrap();
+        assert!(cache.contains("/db/hot.sst"), "cold update must not demote");
+        assert!(!cache.contains("/db/old.sst"));
+    }
+
     /// Skip policy: a promote_limit-blocked key is never background-filled.
     #[test]
     fn test_c3u3_blocked_key_skipped() {

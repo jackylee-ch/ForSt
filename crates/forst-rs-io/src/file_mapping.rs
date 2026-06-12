@@ -658,6 +658,12 @@ impl FileMappingManager {
     /// the crashed-flush file-number-reuse window: the stale object is
     /// orphaned bytes nothing references. `src` unmapped ⇒ `NotFound`.
     pub fn rename_logical(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+        // R1-M2 (PMC cycle-3 review): POSIX `rename(a, a)` is a no-op.
+        // Without this guard the same-key branch below would UNLINK the
+        // sole logical reference — deleting the physical at refs==1.
+        if src == dst {
+            return Ok(());
+        }
         let mut inner = self.inner.lock().expect("lock poisoned");
         let key = inner.state.logical.get(src).cloned().ok_or_else(|| {
             ForstError::not_found(format!(
@@ -2352,6 +2358,28 @@ mod tests {
         assert_eq!(
             read_all(&mapped2, Path::new("/db/.000007.sst.tmp")).unwrap(),
             b"retry".to_vec()
+        );
+    }
+
+    /// R1-M2 regression: rename to SELF is a POSIX no-op — it must not
+    /// unlink the sole reference (which deleted the physical pre-fix).
+    #[test]
+    fn test_c3u1_r1m2_rename_logical_to_self_is_noop() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        fs.create_dir_all(Path::new("/db")).unwrap();
+        let m = Arc::new(mgr(&fs));
+        let mapped = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
+        write_through(&mapped, "/db/000009.sst", WriteMode::CreateNew, b"self");
+        let key = m.resolve(Path::new("/db/000009.sst")).unwrap();
+        assert_eq!(m.refs(&key), 1);
+        mapped
+            .rename(Path::new("/db/000009.sst"), Path::new("/db/000009.sst"))
+            .unwrap();
+        assert_eq!(m.refs(&key), 1, "self-rename keeps the reference");
+        assert!(fs.file_exists(Path::new(&key)).unwrap(), "bytes survive");
+        assert_eq!(
+            read_all(&mapped, Path::new("/db/000009.sst")).unwrap(),
+            b"self".to_vec()
         );
     }
 

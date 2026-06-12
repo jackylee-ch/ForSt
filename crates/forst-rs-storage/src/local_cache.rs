@@ -1016,9 +1016,27 @@ impl LocalCache {
             // If the key already exists, treat the put as an update: free
             // the old bytes from the accounting before deciding evictions.
             // Its stale lru ref is reclaimed lazily (no O(N) scan).
-            if let Some(prev) = inner.entries.remove(key) {
+            let existed = if let Some(prev) = inner.entries.remove(key) {
                 inner.current_bytes = inner.current_bytes.saturating_sub(prev.bytes);
                 inner.mark_stale();
+                true
+            } else {
+                false
+            };
+
+            // FRS-PHASE2-C3U3 R1-H1: a COLD insert must NEVER evict live
+            // entries — the budget-capped guarantee made ATOMIC here (the
+            // caller's headroom pre-check races concurrent demand puts).
+            // The file was already renamed into place above; undo it and
+            // report "not admitted". Only for genuinely NEW keys: an
+            // existing key's bytes were just atomically replaced (same
+            // content for write-once SSTs) and are handled below.
+            if cold
+                && !existed
+                && inner.current_bytes.saturating_add(new_bytes) > self.capacity_bytes
+            {
+                let _ = fs::remove_file(&path);
+                return Ok(false);
             }
 
             let mut evict = Vec::new();
@@ -1050,9 +1068,14 @@ impl LocalCache {
                     gen: g,
                 },
             );
-            if cold {
+            if cold && !existed {
                 // FRS-PHASE2-C3U3 "Bottom": background fills enter at the
                 // eviction end; only a real foreground touch promotes them.
+                //
+                // R1-M1: an EXISTING key keeps hot ordering instead — a
+                // background fill racing a just-completed demand fill must
+                // not DEMOTE the (foreground-touched) entry to the front of
+                // the eviction queue.
                 inner.lru.push_front((key.to_string(), g));
             } else {
                 inner.lru.push_back((key.to_string(), g));
