@@ -921,6 +921,39 @@ impl LocalCache {
     /// `Ok(false)` and writes nothing when `data.len() > capacity_bytes`
     /// (the entry would never fit and would force eviction of everything).
     pub fn put(&self, key: &str, data: &[u8]) -> io::Result<bool> {
+        self.put_inner(key, data, false)
+    }
+
+    /// FRS-PHASE2-C3U3 (design §4.1.1 background fill, ForSt "Bottom"
+    /// insert): like [`Self::put`] but the entry enters at the COLD end of
+    /// the LRU — a background prefill that is never actually touched by a
+    /// foreground read is the FIRST eviction victim, so speculative warming
+    /// can never displace the operator hot set's recency. A later foreground
+    /// `get` promotes it like any other entry.
+    pub fn put_cold(&self, key: &str, data: &[u8]) -> io::Result<bool> {
+        self.put_inner(key, data, true)
+    }
+
+    /// FRS-PHASE2-C3U3 ("Skip" policy probe): `true` when the admission
+    /// machinery has PERMANENTLY blocked `key` (evicted `promote_limit`+
+    /// times — the anti-thrash cap). Background fill must skip such keys:
+    /// they have already proven to thrash. Always `false` with admission
+    /// disabled (no eviction history is kept).
+    pub fn is_admission_blocked(&self, key: &str) -> bool {
+        let Some(params) = self.policy.admission else {
+            return false;
+        };
+        self.admission
+            .lock()
+            .expect("admission tracker mutex poisoned")
+            .evictions
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            >= params.promote_limit
+    }
+
+    fn put_inner(&self, key: &str, data: &[u8], cold: bool) -> io::Result<bool> {
         let new_bytes = data.len() as u64;
         if new_bytes > self.capacity_bytes {
             // Reject inserts that exceed the entire budget — they cannot
@@ -983,9 +1016,27 @@ impl LocalCache {
             // If the key already exists, treat the put as an update: free
             // the old bytes from the accounting before deciding evictions.
             // Its stale lru ref is reclaimed lazily (no O(N) scan).
-            if let Some(prev) = inner.entries.remove(key) {
+            let existed = if let Some(prev) = inner.entries.remove(key) {
                 inner.current_bytes = inner.current_bytes.saturating_sub(prev.bytes);
                 inner.mark_stale();
+                true
+            } else {
+                false
+            };
+
+            // FRS-PHASE2-C3U3 R1-H1: a COLD insert must NEVER evict live
+            // entries — the budget-capped guarantee made ATOMIC here (the
+            // caller's headroom pre-check races concurrent demand puts).
+            // The file was already renamed into place above; undo it and
+            // report "not admitted". Only for genuinely NEW keys: an
+            // existing key's bytes were just atomically replaced (same
+            // content for write-once SSTs) and are handled below.
+            if cold
+                && !existed
+                && inner.current_bytes.saturating_add(new_bytes) > self.capacity_bytes
+            {
+                let _ = fs::remove_file(&path);
+                return Ok(false);
             }
 
             let mut evict = Vec::new();
@@ -1017,7 +1068,18 @@ impl LocalCache {
                     gen: g,
                 },
             );
-            inner.lru.push_back((key.to_string(), g));
+            if cold && !existed {
+                // FRS-PHASE2-C3U3 "Bottom": background fills enter at the
+                // eviction end; only a real foreground touch promotes them.
+                //
+                // R1-M1: an EXISTING key keeps hot ordering instead — a
+                // background fill racing a just-completed demand fill must
+                // not DEMOTE the (foreground-touched) entry to the front of
+                // the eviction queue.
+                inner.lru.push_front((key.to_string(), g));
+            } else {
+                inner.lru.push_back((key.to_string(), g));
+            }
             inner.current_bytes = inner.current_bytes.saturating_add(new_bytes);
             evict
         };

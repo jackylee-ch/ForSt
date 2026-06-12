@@ -81,6 +81,11 @@ crc32c = "0.6"
 # Hashing — xxHash64 for Bloom Filter
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
+# FRS-PHASE2-C3U1: UUID v4 physical keys on the remote tier (ForSt
+# `toUUIDPath` mechanism — competitive analysis §2.2d). Already in the lock
+# transitively (opendal); promoted to a direct dep of forst-rs-io.
+uuid = { version = "1", features = ["v4"] }
+
 # Dev / testing dependencies
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"

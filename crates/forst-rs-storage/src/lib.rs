@@ -27,6 +27,7 @@
 // Workspace-wide ForstError is intentionally large; see forst-rs-common rationale.
 #![allow(clippy::result_large_err)]
 
+pub mod background_fill;
 pub mod cache;
 pub mod cached_fs;
 pub mod iter;

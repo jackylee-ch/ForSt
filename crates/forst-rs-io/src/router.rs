@@ -509,6 +509,91 @@ impl FileSystem for FileSystemRouter {
         self.route(path).ensure_cached(path)
     }
 
+    /// FRS-PHASE2-C3U2: route the upload barrier to the leg that owns the
+    /// file instead of falling to the trait's default no-op. Without this
+    /// override, the checkpoint's per-file `await_upload` (the durability
+    /// barrier that guarantees the manifest never references an SST whose
+    /// bytes are still in a write-back buffer) silently NO-OPs in tiered
+    /// mode — a restore could observe a manifest pointing at an
+    /// un-uploaded SST.
+    fn await_upload(&self, path: &Path) -> ForstResult<()> {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            return fs.await_upload(&stripped);
+        }
+        self.route(path).await_upload(path)
+    }
+
+    /// FRS-PHASE2-C3U2: fan the global upload barrier out to every distinct
+    /// backend (shutdown / legacy-checkpoint durability point).
+    fn await_all_uploads(&self) -> ForstResult<()> {
+        self.local_fs.await_all_uploads()?;
+        if let Some(remote) = self.remote_fs.as_ref() {
+            if !Arc::ptr_eq(&self.local_fs, remote) {
+                remote.await_all_uploads()?;
+            }
+        }
+        for fs in self.scheme_fs.values() {
+            if !Arc::ptr_eq(&self.local_fs, fs)
+                && !self
+                    .remote_fs
+                    .as_ref()
+                    .is_some_and(|r| Arc::ptr_eq(r, fs))
+            {
+                fs.await_all_uploads()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// FRS-PHASE2-C3U2: split the batch by owning leg so cache-warming
+    /// prefetches reach the remote (caching) backend instead of no-opping
+    /// through the trait default's serial `ensure_cached` on the router.
+    fn prefetch_concurrent(&self, paths: &[&Path]) {
+        let mut local: Vec<&Path> = Vec::new();
+        let mut remote: Vec<&Path> = Vec::new();
+        for p in paths {
+            if self.match_scheme(p).is_some() {
+                // Scheme-prefixed entries are rare on this path; serve them
+                // via ensure_cached (correct, just not batched).
+                let _ = self.ensure_cached(p);
+            } else if Self::is_remote_file(p) && self.remote_fs.is_some() {
+                remote.push(p);
+            } else {
+                local.push(p);
+            }
+        }
+        if !local.is_empty() {
+            self.local_fs.prefetch_concurrent(&local);
+        }
+        if let (Some(r), false) = (self.remote_fs.as_ref(), remote.is_empty()) {
+            r.prefetch_concurrent(&remote);
+        }
+    }
+
+    /// FRS-PHASE2-C3U2: admission pre-seed hints follow the read path.
+    fn pre_seed_admission(&self, path: &Path) {
+        if let Some((fs, stripped)) = self.match_scheme(path) {
+            fs.pre_seed_admission(&stripped);
+            return;
+        }
+        self.route(path).pre_seed_admission(path)
+    }
+
+    /// FRS-PHASE2-C3U2: a tiered router only supports the tmp+rename SST
+    /// publication convention when EVERY leg does — the SST write path
+    /// consults this once and stages/renames on whichever leg
+    /// `is_remote_file` routes to. With an object-store remote (no atomic
+    /// rename) this returns `false`, so SSTs stream straight to their final
+    /// remote key while local non-SST writers use the same rename-free
+    /// convention they already exercise on object-store-only stacks.
+    fn supports_atomic_rename(&self) -> bool {
+        let local = self.local_fs.supports_atomic_rename();
+        match self.remote_fs.as_ref() {
+            Some(r) => local && r.supports_atomic_rename(),
+            None => local,
+        }
+    }
+
     fn name(&self) -> &str {
         // We return a static string; for display purposes the user can
         // inspect local_fs().name() and remote_fs().map(|f| f.name()).
@@ -1219,6 +1304,213 @@ mod tests {
         router.register_scheme("s3://", Arc::clone(&remote) as Arc<dyn FileSystem>);
         assert!(router.scheme_fs("s3://").is_some());
         assert!(router.scheme_fs("gs://").is_none());
+    }
+
+    // -- FRS-PHASE2-C3U2: non-SST-always-local file classes -------------------
+
+    /// The ForSt FileOwnershipDecider rule (competitive analysis §2.2c):
+    /// only SST-class files are shareable/remote; the DB's chatty small-file
+    /// traffic — MANIFEST/CURRENT/OPTIONS/LOCK/IDENTITY, WAL `.log` and
+    /// Phase-5 `WAL-NNNNNN.seg` segments, `MAPPING.journal`,
+    /// `CHECKPOINT.blob` — is pinned LOCAL and never generates S3 metadata
+    /// ops. UUID-keyed physicals (C3U1) are SST-class and route remote.
+    #[test]
+    fn test_c3u2_file_class_locality_catalog() {
+        let local: [&str; 10] = [
+            "/db/MANIFEST-000007",
+            "/db/CURRENT",
+            "/db/OPTIONS-000003",
+            "/db/LOCK",
+            "/db/IDENTITY",
+            "/db/000004.log",
+            "/db/wal/WAL-000002.seg",
+            "/db/wal/WAL-000002.seg.seal-0001",
+            "/db/MAPPING.journal",
+            "/db/checkpoints/00000000000000000009/CHECKPOINT.blob",
+        ];
+        for p in local {
+            assert_eq!(
+                file_locality(Path::new(p)),
+                FileLocality::Local,
+                "{p} must be pinned local"
+            );
+        }
+        let remote: [&str; 3] = [
+            "/db/000042.sst",
+            "/db/uuid-0123456789abcdef0123456789abcdef.sst",
+            "/db/.000042.sst.tmp",
+        ];
+        for p in remote {
+            assert_eq!(
+                file_locality(Path::new(p)),
+                FileLocality::Remote,
+                "{p} is SST-class and routes remote"
+            );
+        }
+    }
+
+    /// Tiered writes land non-SST classes on the LOCAL leg only — the
+    /// remote backend never sees them.
+    #[test]
+    fn test_c3u2_tiered_nonsst_classes_never_touch_remote() {
+        let (local, remote, router) = create_tiered_router();
+        local.create_dir_all(Path::new("/db/wal")).unwrap();
+        local
+            .create_dir_all(Path::new("/db/checkpoints/00000000000000000001"))
+            .unwrap();
+        for p in [
+            "/db/wal/WAL-000001.seg",
+            "/db/MAPPING.journal",
+            "/db/checkpoints/00000000000000000001/CHECKPOINT.blob",
+        ] {
+            let mut w = router
+                .open_writable_file(Path::new(p), WriteMode::CreateNew)
+                .unwrap();
+            w.append(b"meta").unwrap();
+            drop(w);
+            assert!(local.file_exists(Path::new(p)).unwrap(), "{p} on local");
+            assert!(
+                !remote.file_exists(Path::new(p)).unwrap(),
+                "{p} must never reach the remote leg"
+            );
+        }
+    }
+
+    /// C3U2: `await_upload` routes to the owning leg (the checkpoint
+    /// durability barrier must reach the remote backend for SSTs instead of
+    /// no-opping through the trait default).
+    #[test]
+    fn test_c3u2_await_upload_routes_to_owning_leg() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct AwaitCountingFs {
+            inner: Arc<dyn FileSystem>,
+            awaits: AtomicUsize,
+        }
+        impl FileSystem for AwaitCountingFs {
+            fn open_sequential_file(&self, p: &Path) -> ForstResult<Box<dyn SequentialFile>> {
+                self.inner.open_sequential_file(p)
+            }
+            fn open_random_access_file(
+                &self,
+                p: &Path,
+            ) -> ForstResult<Box<dyn RandomAccessFile>> {
+                self.inner.open_random_access_file(p)
+            }
+            fn open_writable_file(
+                &self,
+                p: &Path,
+                m: WriteMode,
+            ) -> ForstResult<Box<dyn WritableFile>> {
+                self.inner.open_writable_file(p, m)
+            }
+            fn file_exists(&self, p: &Path) -> ForstResult<bool> {
+                self.inner.file_exists(p)
+            }
+            fn get_file_metadata(&self, p: &Path) -> ForstResult<FileMetadata> {
+                self.inner.get_file_metadata(p)
+            }
+            fn list_dir(&self, d: &Path) -> ForstResult<Vec<FileMetadata>> {
+                self.inner.list_dir(d)
+            }
+            fn create_dir_all(&self, d: &Path) -> ForstResult<()> {
+                self.inner.create_dir_all(d)
+            }
+            fn delete_file(&self, p: &Path) -> ForstResult<()> {
+                self.inner.delete_file(p)
+            }
+            fn delete_dir(&self, p: &Path, r: bool) -> ForstResult<()> {
+                self.inner.delete_dir(p, r)
+            }
+            fn rename(&self, s: &Path, d: &Path) -> ForstResult<()> {
+                self.inner.rename(s, d)
+            }
+            fn name(&self) -> &str {
+                "await-counting"
+            }
+            fn await_upload(&self, _p: &Path) -> ForstResult<()> {
+                self.awaits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn await_all_uploads(&self) -> ForstResult<()> {
+                self.awaits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+        let local = Arc::new(MemoryFileSystem::new());
+        let remote = Arc::new(AwaitCountingFs {
+            inner: Arc::new(MemoryFileSystem::new()),
+            awaits: AtomicUsize::new(0),
+        });
+        let router = FileSystemRouter::with_remote(
+            local as Arc<dyn FileSystem>,
+            Arc::clone(&remote) as Arc<dyn FileSystem>,
+        );
+        router.await_upload(Path::new("/db/000001.sst")).unwrap();
+        assert_eq!(remote.awaits.load(Ordering::SeqCst), 1, "SST barrier hits remote");
+        router.await_upload(Path::new("/db/MANIFEST-000001")).unwrap();
+        assert_eq!(remote.awaits.load(Ordering::SeqCst), 1, "non-SST barrier stays local");
+        router.await_all_uploads().unwrap();
+        assert_eq!(remote.awaits.load(Ordering::SeqCst), 2, "global barrier fans out");
+    }
+
+    /// C3U2: a tiered router's atomic-rename capability is the AND of its
+    /// legs (an object-store remote forces the rename-free SST convention).
+    #[test]
+    fn test_c3u2_supports_atomic_rename_is_leg_and() {
+        struct NoRenameFs(MemoryFileSystem);
+        impl FileSystem for NoRenameFs {
+            fn open_sequential_file(&self, p: &Path) -> ForstResult<Box<dyn SequentialFile>> {
+                self.0.open_sequential_file(p)
+            }
+            fn open_random_access_file(
+                &self,
+                p: &Path,
+            ) -> ForstResult<Box<dyn RandomAccessFile>> {
+                self.0.open_random_access_file(p)
+            }
+            fn open_writable_file(
+                &self,
+                p: &Path,
+                m: WriteMode,
+            ) -> ForstResult<Box<dyn WritableFile>> {
+                self.0.open_writable_file(p, m)
+            }
+            fn file_exists(&self, p: &Path) -> ForstResult<bool> {
+                self.0.file_exists(p)
+            }
+            fn get_file_metadata(&self, p: &Path) -> ForstResult<FileMetadata> {
+                self.0.get_file_metadata(p)
+            }
+            fn list_dir(&self, d: &Path) -> ForstResult<Vec<FileMetadata>> {
+                self.0.list_dir(d)
+            }
+            fn create_dir_all(&self, d: &Path) -> ForstResult<()> {
+                self.0.create_dir_all(d)
+            }
+            fn delete_file(&self, p: &Path) -> ForstResult<()> {
+                self.0.delete_file(p)
+            }
+            fn delete_dir(&self, p: &Path, r: bool) -> ForstResult<()> {
+                self.0.delete_dir(p, r)
+            }
+            fn rename(&self, s: &Path, d: &Path) -> ForstResult<()> {
+                self.0.rename(s, d)
+            }
+            fn name(&self) -> &str {
+                "no-rename"
+            }
+            fn supports_atomic_rename(&self) -> bool {
+                false
+            }
+        }
+        let local = Arc::new(MemoryFileSystem::new());
+        let router = FileSystemRouter::with_remote(
+            local as Arc<dyn FileSystem>,
+            Arc::new(NoRenameFs(MemoryFileSystem::new())) as Arc<dyn FileSystem>,
+        );
+        assert!(!router.supports_atomic_rename());
+        let local2 = Arc::new(MemoryFileSystem::new());
+        assert!(FileSystemRouter::new(local2 as Arc<dyn FileSystem>).supports_atomic_rename());
     }
 
     #[test]

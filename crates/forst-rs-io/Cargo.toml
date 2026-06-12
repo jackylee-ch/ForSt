@@ -28,6 +28,8 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 opendal = { workspace = true }
+# FRS-PHASE2-C3U1: UUID v4 minting for remote-tier physical SST keys.
+uuid = { workspace = true }
 
 # FRS-FADVISE (2026-06-08): posix_fadvise(DONTNEED) on written local SSTs to cap
 # the container page cache (the q9/q20/q4 8c/32g cgroup-OOM margin killer). Linux

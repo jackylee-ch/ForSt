@@ -594,6 +594,13 @@ impl FileMappingManager {
     /// bytes (design risk R1: leak over data-loss).
     pub fn unlink(&self, logical: &Path) -> ForstResult<UnlinkOutcome> {
         let mut inner = self.inner.lock().expect("lock poisoned");
+        self.unlink_locked(&mut inner, logical)
+    }
+
+    /// [`Self::unlink`] body with the lock already held — composite metadata
+    /// ops ([`Self::rename_logical`], [`Self::sweep_temp_logicals`]) call this
+    /// so their multi-record sequences are atomic under the single mutex.
+    fn unlink_locked(&self, inner: &mut Inner, logical: &Path) -> ForstResult<UnlinkOutcome> {
         let key = inner.state.logical.get(logical).cloned().ok_or_else(|| {
             ForstError::not_found(format!(
                 "unlink: {} is not a mapped logical path",
@@ -603,7 +610,7 @@ impl FileMappingManager {
         let rec = MappingRecord::Unlink {
             logical: logical.to_path_buf(),
         };
-        self.append_journal(&mut inner, &rec)?;
+        self.append_journal(inner, &rec)?;
         // Capture the entry BEFORE apply removes it at refs==0.
         let entry = inner
             .state
@@ -625,6 +632,98 @@ impl FileMappingManager {
         // so no other thread can reach this branch for the same key again.
         self.fs.delete_file(Path::new(&key))?;
         Ok(UnlinkOutcome::PhysicalDeleted)
+    }
+
+    /// FRS-PHASE2-C3U1 (competitive analysis §2.2d, ForSt `toUUIDPath`):
+    /// mints a fresh UUID-v4 physical key for `logical` — same parent
+    /// directory, `uuid-<32 hex>.sst` basename. The `.sst` suffix is kept
+    /// REGARDLESS of the logical's own suffix (a `.NNNNNN.sst.tmp` staging
+    /// file mints a `.sst`-suffixed physical) so [`Self::gc_sweep`]'s
+    /// `.sst` orphan filter covers every minted object, and the later
+    /// staging→final rename is a pure metadata re-point
+    /// ([`Self::rename_logical`]) — never a remote rename (S3 has none).
+    /// Pure: does not touch the mapping; pair with [`Self::register`].
+    pub fn mint_physical_key(logical: &Path) -> ForstResult<String> {
+        let parent = logical.parent().unwrap_or_else(|| Path::new(""));
+        let key = parent.join(format!("uuid-{}.sst", uuid::Uuid::new_v4().simple()));
+        Ok(path_to_str(&key, "mint_physical_key")?.to_string())
+    }
+
+    /// FRS-PHASE2-C3U1: POSIX-rename semantics as a pure metadata operation —
+    /// `dst` is re-pointed at `src`'s physical object and `src` is dropped,
+    /// with ZERO remote ops (the rename-free invariant for UUID-keyed
+    /// physicals). Atomic under the single mapping mutex. If `dst` was
+    /// already mapped to a DIFFERENT physical its old reference is dropped
+    /// first with full physical fate (refs drain ⇒ exactly-once delete) —
+    /// the crashed-flush file-number-reuse window: the stale object is
+    /// orphaned bytes nothing references. `src` unmapped ⇒ `NotFound`.
+    pub fn rename_logical(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+        // R1-M2 (PMC cycle-3 review): POSIX `rename(a, a)` is a no-op.
+        // Without this guard the same-key branch below would UNLINK the
+        // sole logical reference — deleting the physical at refs==1.
+        if src == dst {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().expect("lock poisoned");
+        let key = inner.state.logical.get(src).cloned().ok_or_else(|| {
+            ForstError::not_found(format!(
+                "rename_logical: source {} is not a mapped logical path",
+                src.display()
+            ))
+        })?;
+        if let Some(existing) = inner.state.logical.get(dst).cloned() {
+            if existing == key {
+                // dst already points at the same physical: dropping src
+                // cannot drain it (dst holds a reference).
+                self.unlink_locked(&mut inner, src)?;
+                return Ok(());
+            }
+            self.unlink_locked(&mut inner, dst)?;
+        }
+        // Link dst BEFORE unlinking src so the physical's refcount never
+        // dips to zero mid-rename (no delete window).
+        let link = MappingRecord::Link {
+            dst_logical: dst.to_path_buf(),
+            physical_key: key,
+        };
+        self.append_journal(&mut inner, &link)?;
+        inner.state.apply(&link);
+        let unlink = MappingRecord::Unlink {
+            logical: src.to_path_buf(),
+        };
+        self.append_journal(&mut inner, &unlink)?;
+        inner.state.apply(&unlink);
+        Ok(())
+    }
+
+    /// FRS-PHASE2-C3U1 startup sweep: unlinks every mapped logical path whose
+    /// basename ends in `.tmp` — flush/compaction staging names
+    /// (`.NNNNNN.sst.tmp`) that can only exist in the mapping if a writer
+    /// crashed between the UUID mint and the staging→final rename. A `.tmp`
+    /// logical is transient by construction, so at manager-(re)open time it is
+    /// dead: its working ref would otherwise pin the minted physical forever
+    /// (refs never drain — nothing renames or deletes a crashed staging path).
+    /// Physical fate follows [`Self::unlink`] (refs drain ⇒ exactly-once
+    /// delete). Returns the number of staging mappings swept.
+    pub fn sweep_temp_logicals(&self) -> ForstResult<usize> {
+        let mut inner = self.inner.lock().expect("lock poisoned");
+        let mut stale: Vec<PathBuf> = inner
+            .state
+            .logical
+            .keys()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".tmp"))
+            })
+            .cloned()
+            .collect();
+        stale.sort();
+        let swept = stale.len();
+        for path in stale {
+            self.unlink_locked(&mut inner, &path)?;
+        }
+        Ok(swept)
     }
 
     /// Restore link: adopts an existing external physical object under a new
@@ -716,6 +815,41 @@ impl FileMappingManager {
             .map(|e| e.ownership)
     }
 
+    /// FRS-PHASE2-C2U2: whether a physical key carries a JM-discard
+    /// tombstone (delete-on-drain). Restore-side guard: an instant restore
+    /// must refuse to adopt a tombstoned physical — its bytes are scheduled
+    /// for deletion the moment the surviving refs drain.
+    pub fn is_tombstoned(&self, physical_key: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("lock poisoned")
+            .state
+            .physical
+            .get(physical_key)
+            .map(|e| e.tombstoned)
+            .unwrap_or(false)
+    }
+
+    /// FRS-PHASE2-C2U2 (design §9 D5 crash-window a): every CURRENTLY-mapped
+    /// logical path strictly under `prefix`, sorted for determinism. The
+    /// startup sweep uses this to enumerate chk-namespace links
+    /// (`<db_path>/checkpoints/<id>/...`) straight from the journal-replayed
+    /// state — which is exactly what survives a crash BETWEEN
+    /// `sync_journal()` and the blob write (links exist, no blob, JM never
+    /// acked the id).
+    pub fn logical_paths_under(&self, prefix: &Path) -> Vec<PathBuf> {
+        let inner = self.inner.lock().expect("lock poisoned");
+        let mut out: Vec<PathBuf> = inner
+            .state
+            .logical
+            .keys()
+            .filter(|p| p.starts_with(prefix) && p.as_path() != prefix)
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Number of live logical mappings.
     pub fn len(&self) -> usize {
         self.inner.lock().expect("lock poisoned").state.logical.len()
@@ -782,18 +916,24 @@ impl FileMappingManager {
         writer.append(&header)?;
         let mut sorted: Vec<(&PathBuf, &String)> = state.logical.iter().collect();
         sorted.sort();
+        // FRS-PHASE2-C3U1: the FIRST logical of each DB-owned physical is
+        // rewritten as Register (it carries size + ShareableOwnedByDb on
+        // replay), subsequent logicals as Link. The old identity test
+        // (`path == key`) silently downgraded UUID-keyed working files to
+        // Link records, losing their size on the next journal replay.
+        let mut registered: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (path, key) in sorted {
             let entry = state.physical.get(key.as_str()).expect("snapshot invariant");
-            let rec = if path.as_os_str().to_str() == Some(key.as_str()) {
+            let rec = if entry.ownership == FileOwnership::NotOwned {
+                MappingRecord::Adopt {
+                    logical: path.clone(),
+                    physical_key: key.clone(),
+                }
+            } else if registered.insert(key.as_str()) {
                 MappingRecord::Register {
                     logical: path.clone(),
                     physical_key: key.clone(),
                     size: entry.size,
-                }
-            } else if entry.ownership == FileOwnership::NotOwned {
-                MappingRecord::Adopt {
-                    logical: path.clone(),
-                    physical_key: key.clone(),
                 }
             } else {
                 MappingRecord::Link {
@@ -814,7 +954,10 @@ impl FileMappingManager {
             }
         }
         writer.sync()?;
-        inner.journal = Some(writer);
+        // FRS-PHASE2-C3U1: same as `sync_journal` — a synced object-store
+        // writer is closed; drop it and let the next append reopen.
+        drop(writer);
+        inner.journal = None;
         inner.state = state;
         Ok(())
     }
@@ -859,10 +1002,19 @@ impl FileMappingManager {
     }
 
     /// Syncs the journal append handle (group-durability point).
+    ///
+    /// FRS-PHASE2-C3U1: the handle is DROPPED after the sync — object-store
+    /// `WritableFile::sync` CLOSES the writer (close is what publishes the
+    /// object), so keeping it would fail the next append with
+    /// "append after close". The next mutation lazily reopens in `Append`
+    /// mode (real append on local FS; read-existing+rewrite emulation on
+    /// object stores), which is exactly the recovery the journal format is
+    /// built for. One reopen per checkpoint cycle — metadata-cheap.
     pub fn sync_journal(&self) -> ForstResult<()> {
         let mut inner = self.inner.lock().expect("lock poisoned");
         if let Some(w) = inner.journal.as_mut() {
             w.sync()?;
+            inner.journal = None;
         }
         Ok(())
     }
@@ -927,6 +1079,22 @@ impl MappingSnapshotView {
         self.logical.get(logical).map(String::as_str)
     }
 
+    /// FRS-PHASE2-C2U3: every (logical, physical) entry strictly under
+    /// `prefix`, sorted by logical path. The restore side uses it to
+    /// enumerate a checkpoint namespace's linked artifacts (e.g. Phase-5
+    /// `WAL-NNNNNN.seg` sealed-segment links) without an FS listing — the
+    /// linked paths are metadata-only.
+    pub fn paths_under(&self, prefix: &Path) -> Vec<(PathBuf, &str)> {
+        let mut out: Vec<(PathBuf, &str)> = self
+            .logical
+            .iter()
+            .filter(|(p, _)| p.starts_with(prefix) && p.as_path() != prefix)
+            .map(|(p, k)| (p.clone(), k.as_str()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Number of logical mappings in the snapshot.
     pub fn len(&self) -> usize {
         self.logical.len()
@@ -935,6 +1103,78 @@ impl MappingSnapshotView {
     /// True when the snapshot carries no logical mappings.
     pub fn is_empty(&self) -> bool {
         self.logical.is_empty()
+    }
+}
+
+/// FRS-PHASE2-C2U2 (design §2.4 "journal tail replayed on restore"): a
+/// READ-ONLY view over a mapping journal's CURRENT state — full replay,
+/// including every record appended AFTER the snapshot that a checkpoint blob
+/// froze in its trailer. The restore side consults it (when the source
+/// journal is reachable on the engine FS) for the truths the blob cannot
+/// carry: post-checkpoint JM-discard **tombstones** (a tombstoned physical
+/// must never be adopted) and post-checkpoint link/unlink churn.
+///
+/// Never appends — loading this view cannot mutate the source journal (the
+/// restoring process does not own it).
+pub struct MappingJournalView {
+    state: MappingState,
+}
+
+impl MappingJournalView {
+    /// Replays the journal at `journal_path` into a read-only view. Returns
+    /// `Ok(None)` when no journal exists (legacy / relocated checkpoint —
+    /// callers fall back to the blob snapshot alone). A truncated tail
+    /// record (crash mid-append) is tolerated exactly like
+    /// [`FileMappingManager::new`]; mid-stream corruption is an error.
+    pub fn load(fs: &dyn FileSystem, journal_path: &Path) -> ForstResult<Option<Self>> {
+        if !fs.file_exists(journal_path)? {
+            return Ok(None);
+        }
+        let bytes = read_all(fs, journal_path)?;
+        let mut state = MappingState::default();
+        if bytes.len() >= 6 {
+            if &bytes[..4] != JOURNAL_MAGIC {
+                return Err(ForstError::corruption("mapping journal bad magic"));
+            }
+            let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+            if version != JOURNAL_VERSION {
+                return Err(ForstError::corruption(format!(
+                    "mapping journal unsupported version {version}"
+                )));
+            }
+            replay_records(&mut state, &bytes[6..])?;
+        }
+        Ok(Some(Self { state }))
+    }
+
+    /// Resolves a logical path to its physical key in the journal-current
+    /// state.
+    pub fn resolve(&self, logical: &Path) -> Option<&str> {
+        self.state.logical.get(logical).map(String::as_str)
+    }
+
+    /// Whether `logical` is mapped in the journal-current state.
+    pub fn is_registered(&self, logical: &Path) -> bool {
+        self.state.logical.contains_key(logical)
+    }
+
+    /// Whether `physical_key` carries a live JM-discard tombstone.
+    pub fn is_tombstoned(&self, physical_key: &str) -> bool {
+        self.state
+            .physical
+            .get(physical_key)
+            .map(|e| e.tombstoned)
+            .unwrap_or(false)
+    }
+
+    /// Number of live logical mappings in the view.
+    pub fn len(&self) -> usize {
+        self.state.logical.len()
+    }
+
+    /// True when the view carries no logical mappings.
+    pub fn is_empty(&self) -> bool {
+        self.state.logical.is_empty()
     }
 }
 
@@ -965,12 +1205,50 @@ impl MappingSnapshotView {
 pub struct MappedFileSystem {
     inner: Arc<dyn FileSystem>,
     mapping: Arc<FileMappingManager>,
+    /// FRS-PHASE2-C3U1 (default OFF — [`Self::new`] keeps the read-only
+    /// indirection byte-identical to pre-C3U1): UUID-keyed write-side
+    /// indirection. When set, SST-class creates mint a `uuid-<hex>.sst`
+    /// physical key ([`FileMappingManager::mint_physical_key`]) and the
+    /// bytes are written THERE; renames of mapped paths become metadata
+    /// re-points ([`FileMappingManager::rename_logical`]) and deletes of
+    /// mapped paths route through refcounted `unlink` — no remote rename
+    /// ever reaches the backend for the SST lifecycle (ForSt `toUUIDPath`,
+    /// competitive analysis §2.2d).
+    uuid_keys: bool,
 }
 
 impl MappedFileSystem {
     /// Wraps `inner`, resolving logical paths through `mapping`.
     pub fn new(inner: Arc<dyn FileSystem>, mapping: Arc<FileMappingManager>) -> Self {
-        Self { inner, mapping }
+        Self {
+            inner,
+            mapping,
+            uuid_keys: false,
+        }
+    }
+
+    /// FRS-PHASE2-C3U1: [`Self::new`] with UUID physical keys enabled for
+    /// SST-class writes (see the `uuid_keys` field doc). Sweeps crashed
+    /// staging mappings first ([`FileMappingManager::sweep_temp_logicals`]):
+    /// a `.tmp` logical surviving in the journal means a writer died between
+    /// mint and rename — its mapping would otherwise pin the minted physical
+    /// forever AND fail the engine's `CreateNew` re-stage after a
+    /// file-number-reusing restart.
+    pub fn with_uuid_physical_keys(
+        inner: Arc<dyn FileSystem>,
+        mapping: Arc<FileMappingManager>,
+    ) -> ForstResult<Self> {
+        mapping.sweep_temp_logicals()?;
+        Ok(Self {
+            inner,
+            mapping,
+            uuid_keys: true,
+        })
+    }
+
+    /// Whether UUID-keyed write indirection is active.
+    pub fn uuid_physical_keys(&self) -> bool {
+        self.uuid_keys
     }
 
     /// Resolves `path` to its physical location, or returns it unchanged
@@ -980,6 +1258,30 @@ impl MappedFileSystem {
             Some(physical) => PathBuf::from(physical),
             None => path.to_path_buf(),
         }
+    }
+
+    /// SST-class paths get UUID physical keys: the canonical `NNNNNN.sst`
+    /// working name AND its `.NNNNNN.sst.tmp` staging sibling (basename
+    /// containing `.sst`). Everything else (MANIFEST, CURRENT, blob, WAL
+    /// segments, journals) writes through at its literal path.
+    fn is_sst_class(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains(".sst"))
+    }
+
+    /// Mints + registers a fresh UUID physical for `logical`, then opens the
+    /// writer AT the physical key. Journal-before-bytes: a crash after the
+    /// mint leaves a mapping to a missing/partial object — the staging sweep
+    /// (`.tmp`) or rebind-on-number-reuse reaps it; never data loss (R1).
+    fn mint_and_open(
+        &self,
+        logical: &Path,
+        mode: WriteMode,
+    ) -> ForstResult<Box<dyn WritableFile>> {
+        let key = FileMappingManager::mint_physical_key(logical)?;
+        self.mapping.register(logical, &key, 0)?;
+        self.inner.open_writable_file(Path::new(&key), mode)
     }
 }
 
@@ -1011,7 +1313,45 @@ impl FileSystem for MappedFileSystem {
         path: &Path,
         mode: WriteMode,
     ) -> ForstResult<Box<dyn WritableFile>> {
-        self.inner.open_writable_file(path, mode)
+        if !self.uuid_keys || !Self::is_sst_class(path) {
+            return self.inner.open_writable_file(path, mode);
+        }
+        if let Some(existing) = self.mapping.resolve(path) {
+            return match mode {
+                // Appends continue at the mapped physical.
+                WriteMode::Append => self
+                    .inner
+                    .open_writable_file(Path::new(&existing), WriteMode::Append),
+                WriteMode::CreateNew => Err(ForstError::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "open_writable_file(CreateNew): {} is already mapped to {}",
+                        path.display(),
+                        existing
+                    ),
+                ))),
+                // NEVER truncate a (possibly checkpoint-shared) physical in
+                // place: drop this logical's reference (refcount decides the
+                // old bytes' fate) and mint a fresh object.
+                WriteMode::CreateOrTruncate => {
+                    self.mapping.unlink(path)?;
+                    self.mint_and_open(path, WriteMode::CreateOrTruncate)
+                }
+            };
+        }
+        // CreateNew semantics also cover a pre-UUID identity file sitting at
+        // the literal path (mixed-mode migration: old identity objects and
+        // new UUID objects coexist; mapping-layer only).
+        if mode == WriteMode::CreateNew && self.inner.file_exists(path)? {
+            return Err(ForstError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "open_writable_file(CreateNew): {} already exists",
+                    path.display()
+                ),
+            )));
+        }
+        self.mint_and_open(path, mode)
     }
 
     fn file_exists(&self, path: &Path) -> ForstResult<bool> {
@@ -1031,6 +1371,14 @@ impl FileSystem for MappedFileSystem {
     }
 
     fn delete_file(&self, path: &Path) -> ForstResult<()> {
+        // FRS-PHASE2-C3U1: under UUID keys a mapped logical has no bytes at
+        // its literal path — the delete IS the refcounted unlink (physical
+        // gone exactly once, at the last reference). Default mode keeps the
+        // historical passthrough (a mapped-but-byteless logical delete can
+        // never reach the shared physical object).
+        if self.uuid_keys && self.mapping.is_registered(path) {
+            return self.mapping.unlink(path).map(|_| ());
+        }
         self.inner.delete_file(path)
     }
 
@@ -1039,6 +1387,25 @@ impl FileSystem for MappedFileSystem {
     }
 
     fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+        if self.uuid_keys {
+            if self.mapping.is_registered(src) {
+                // Staging→final publication of a minted object: pure
+                // metadata re-point, ZERO backend ops (rename-free
+                // invariant — S3 has no rename).
+                return self.mapping.rename_logical(src, dst);
+            }
+            if self.mapping.is_registered(dst) {
+                // Bytes at an UNMAPPED literal src replace a mapped dst
+                // (ingest footer-rewrite shape): move the bytes to a fresh
+                // physical, then re-point dst. One backend rename of the
+                // staging object; the displaced physical's fate follows its
+                // refcount.
+                let key = FileMappingManager::mint_physical_key(dst)?;
+                self.inner.rename(src, Path::new(&key))?;
+                self.mapping.unlink(dst)?;
+                return self.mapping.register(dst, &key, 0);
+            }
+        }
         self.inner.rename(src, dst)
     }
 
@@ -1681,5 +2048,407 @@ mod tests {
         assert_eq!(report.reaped, vec!["/db/000040.sst".to_string()]);
         assert!(!fs.file_exists(Path::new("/db/000040.sst")).unwrap());
         assert!(fs.file_exists(Path::new("/db/000041.sst")).unwrap());
+    }
+
+    // --- FRS-PHASE2-C2U2: journal tail view + chk-namespace enumeration ----
+
+    #[test]
+    fn test_journal_view_absent_journal_is_none() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        assert!(MappingJournalView::load(fs.as_ref(), Path::new("/nope/MAPPING.journal"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// The view replays the journal's CURRENT state — including records
+    /// appended after any snapshot point: links, unlinks AND tombstones.
+    #[test]
+    fn test_journal_view_replays_current_state_with_tombstones() {
+        let fs = fs_with_file("/db/000001.sst", b"a");
+        write_file(fs.as_ref(), "/db/000002.sst", b"b");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000001.sst"), "/db/000001.sst", 1)
+            .unwrap();
+        m.register(Path::new("/db/000002.sst"), "/db/000002.sst", 1)
+            .unwrap();
+        m.link(Path::new("/db/000001.sst"), Path::new("/db/checkpoints/00000000000000000001/000001.sst"))
+            .unwrap();
+        // Post-"snapshot" tail: unlink one working ref + tombstone the other.
+        m.unlink(Path::new("/db/000002.sst")).unwrap();
+        assert!(!m.tombstone("/db/000001.sst").unwrap(), "refs held → deferred");
+        m.sync_journal().unwrap();
+
+        let v = MappingJournalView::load(fs.as_ref(), Path::new("/db/MAPPING.journal"))
+            .unwrap()
+            .expect("journal exists");
+        assert_eq!(v.resolve(Path::new("/db/000001.sst")), Some("/db/000001.sst"));
+        assert_eq!(
+            v.resolve(Path::new("/db/checkpoints/00000000000000000001/000001.sst")),
+            Some("/db/000001.sst")
+        );
+        assert!(!v.is_registered(Path::new("/db/000002.sst")), "unlink replayed");
+        assert!(v.is_tombstoned("/db/000001.sst"), "tombstone visible in tail");
+        assert!(!v.is_tombstoned("/db/000002.sst"));
+        assert_eq!(v.len(), 2);
+        // Read-only: loading the view never mutates the journal.
+        let before = read_all(fs.as_ref(), Path::new("/db/MAPPING.journal")).unwrap();
+        let _ = MappingJournalView::load(fs.as_ref(), Path::new("/db/MAPPING.journal")).unwrap();
+        let after = read_all(fs.as_ref(), Path::new("/db/MAPPING.journal")).unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// A torn tail record (crash mid-append) is tolerated exactly like
+    /// `FileMappingManager::new`: the clean prefix replays, the tail drops.
+    #[test]
+    fn test_journal_view_tolerates_torn_tail() {
+        let fs = fs_with_file("/db/000001.sst", b"a");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000001.sst"), "/db/000001.sst", 1)
+            .unwrap();
+        m.sync_journal().unwrap();
+        // Append a torn frame: a length prefix promising more than exists.
+        let mut bytes = read_all(fs.as_ref(), Path::new("/db/MAPPING.journal")).unwrap();
+        bytes.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0xAA]); // frame_len=255, 1 byte present
+        write_file(fs.as_ref(), "/db/MAPPING.journal", &bytes);
+
+        let v = MappingJournalView::load(fs.as_ref(), Path::new("/db/MAPPING.journal"))
+            .unwrap()
+            .expect("journal exists");
+        assert_eq!(v.len(), 1, "clean prefix replayed, torn tail dropped");
+        assert!(v.is_registered(Path::new("/db/000001.sst")));
+    }
+
+    #[test]
+    fn test_logical_paths_under_filters_and_sorts() {
+        let fs = fs_with_file("/db/000001.sst", b"a");
+        write_file(fs.as_ref(), "/db/000002.sst", b"b");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000002.sst"), "/db/000002.sst", 1)
+            .unwrap();
+        m.register(Path::new("/db/000001.sst"), "/db/000001.sst", 1)
+            .unwrap();
+        let chk = Path::new("/db/checkpoints/00000000000000000007");
+        m.link(Path::new("/db/000001.sst"), &chk.join("000001.sst"))
+            .unwrap();
+        m.link(Path::new("/db/000002.sst"), &chk.join("000002.sst"))
+            .unwrap();
+
+        let under_root = m.logical_paths_under(Path::new("/db/checkpoints"));
+        assert_eq!(
+            under_root,
+            vec![chk.join("000001.sst"), chk.join("000002.sst")],
+            "chk namespace only, sorted"
+        );
+        // The prefix itself is never returned; working paths are excluded.
+        assert!(m
+            .logical_paths_under(Path::new("/db"))
+            .contains(&PathBuf::from("/db/000001.sst")));
+        assert!(m
+            .logical_paths_under(Path::new("/elsewhere"))
+            .is_empty());
+    }
+
+    // --- FRS-PHASE2-C3U1: UUID physical keys (competitive analysis §2.2d) --
+
+    /// Counts every `rename` that reaches the wrapped backend — the
+    /// rename-free-invariant probe.
+    struct RenameCountingFs {
+        inner: Arc<dyn FileSystem>,
+        renames: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RenameCountingFs {
+        fn new(inner: Arc<dyn FileSystem>) -> Self {
+            Self {
+                inner,
+                renames: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn renames(&self) -> usize {
+            self.renames.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl FileSystem for RenameCountingFs {
+        fn open_sequential_file(
+            &self,
+            path: &Path,
+        ) -> ForstResult<Box<dyn crate::filesystem::SequentialFile>> {
+            self.inner.open_sequential_file(path)
+        }
+        fn open_random_access_file(
+            &self,
+            path: &Path,
+        ) -> ForstResult<Box<dyn crate::filesystem::RandomAccessFile>> {
+            self.inner.open_random_access_file(path)
+        }
+        fn open_writable_file(
+            &self,
+            path: &Path,
+            mode: WriteMode,
+        ) -> ForstResult<Box<dyn WritableFile>> {
+            self.inner.open_writable_file(path, mode)
+        }
+        fn file_exists(&self, path: &Path) -> ForstResult<bool> {
+            self.inner.file_exists(path)
+        }
+        fn get_file_metadata(
+            &self,
+            path: &Path,
+        ) -> ForstResult<crate::filesystem::FileMetadata> {
+            self.inner.get_file_metadata(path)
+        }
+        fn list_dir(&self, dir: &Path) -> ForstResult<Vec<crate::filesystem::FileMetadata>> {
+            self.inner.list_dir(dir)
+        }
+        fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+            self.inner.create_dir_all(dir)
+        }
+        fn delete_file(&self, path: &Path) -> ForstResult<()> {
+            self.inner.delete_file(path)
+        }
+        fn delete_dir(&self, path: &Path, recursive: bool) -> ForstResult<()> {
+            self.inner.delete_dir(path, recursive)
+        }
+        fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+            self.renames
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.rename(src, dst)
+        }
+        fn supports_atomic_rename(&self) -> bool {
+            self.inner.supports_atomic_rename()
+        }
+        fn name(&self) -> &str {
+            "rename-counting"
+        }
+    }
+
+    fn write_through(fs: &dyn FileSystem, path: &str, mode: WriteMode, content: &[u8]) {
+        let mut w = fs.open_writable_file(Path::new(path), mode).unwrap();
+        w.append(content).unwrap();
+        w.sync().unwrap();
+    }
+
+    fn is_uuid_key(key: &str) -> bool {
+        let base = Path::new(key).file_name().unwrap().to_str().unwrap();
+        base.strip_prefix("uuid-")
+            .and_then(|rest| rest.strip_suffix(".sst"))
+            .is_some_and(|hex| hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    }
+
+    /// UUID mode: an SST-class create mints a `uuid-<32hex>.sst` physical in
+    /// the same directory; reads/metadata resolve through the logical name;
+    /// the literal logical path holds no bytes.
+    #[test]
+    fn test_c3u1_uuid_mode_mints_uuid_physicals() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        fs.create_dir_all(Path::new("/db")).unwrap();
+        let m = Arc::new(mgr(&fs));
+        let mapped = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
+        assert!(mapped.uuid_physical_keys());
+
+        write_through(&mapped, "/db/000001.sst", WriteMode::CreateNew, b"sst-bytes");
+        let key = m.resolve(Path::new("/db/000001.sst")).expect("minted");
+        assert!(is_uuid_key(&key), "physical {key} must be uuid-shaped");
+        assert!(key.starts_with("/db/"), "same parent dir, got {key}");
+        assert!(!fs.file_exists(Path::new("/db/000001.sst")).unwrap());
+        assert_eq!(
+            read_all(&mapped, Path::new("/db/000001.sst")).unwrap(),
+            b"sst-bytes".to_vec()
+        );
+        // Non-SST files write through at their literal path (no mint).
+        write_through(&mapped, "/db/MANIFEST-000001", WriteMode::CreateNew, b"m");
+        assert!(fs.file_exists(Path::new("/db/MANIFEST-000001")).unwrap());
+        assert!(!m.is_registered(Path::new("/db/MANIFEST-000001")));
+        // CreateNew on an already-mapped logical refuses (AlreadyExists).
+        assert!(mapped
+            .open_writable_file(Path::new("/db/000001.sst"), WriteMode::CreateNew)
+            .is_err());
+        // Default-OFF gate: `new` keeps passthrough writes byte-identical.
+        let plain = MappedFileSystem::new(fs.clone(), m.clone());
+        assert!(!plain.uuid_physical_keys());
+        write_through(&plain, "/db/000002.sst", WriteMode::CreateNew, b"x");
+        assert!(fs.file_exists(Path::new("/db/000002.sst")).unwrap());
+        assert!(!m.is_registered(Path::new("/db/000002.sst")));
+    }
+
+    /// The rename-free invariant on the opendal-fs emulation (the unit
+    /// gate): the staging→final SST publication (`.NNNNNN.sst.tmp` →
+    /// `NNNNNN.sst`, the flush.rs convention) is a pure metadata re-point —
+    /// ZERO renames reach the backend, bytes never move, and a delete of the
+    /// final logical follows the refcount.
+    #[test]
+    fn test_c3u1_uuid_mode_rename_free_on_opendal_fs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend: Arc<dyn FileSystem> =
+            Arc::new(crate::opendal_backend::OpendalFileSystem::local(tmp.path()).unwrap());
+        let counting = Arc::new(RenameCountingFs::new(backend));
+        let fs: Arc<dyn FileSystem> = counting.clone();
+        fs.create_dir_all(Path::new("/db")).unwrap();
+        let m = Arc::new(mgr(&fs));
+        let mapped = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
+
+        // Stage exactly like flush.rs: write the staging name, rename into
+        // place (the local-FS convention — supports_atomic_rename is true on
+        // the opendal Fs scheme, so this IS the path the engine takes).
+        assert!(mapped.supports_atomic_rename());
+        write_through(&mapped, "/db/.000001.sst.tmp", WriteMode::CreateNew, b"sst-1");
+        let staged_key = m.resolve(Path::new("/db/.000001.sst.tmp")).unwrap();
+        assert!(is_uuid_key(&staged_key));
+        mapped
+            .rename(Path::new("/db/.000001.sst.tmp"), Path::new("/db/000001.sst"))
+            .unwrap();
+
+        assert_eq!(counting.renames(), 0, "rename-free invariant violated");
+        assert_eq!(
+            m.resolve(Path::new("/db/000001.sst")).unwrap(),
+            staged_key,
+            "publication is a re-point, not a data move"
+        );
+        assert!(!m.is_registered(Path::new("/db/.000001.sst.tmp")));
+        assert_eq!(
+            read_all(&mapped, Path::new("/db/000001.sst")).unwrap(),
+            b"sst-1".to_vec()
+        );
+
+        // Checkpoint-link + working delete: bytes survive via the chk ref,
+        // physical goes exactly once when the last ref drains.
+        m.link(
+            Path::new("/db/000001.sst"),
+            Path::new("/db/checkpoints/00000000000000000001/000001.sst"),
+        )
+        .unwrap();
+        mapped.delete_file(Path::new("/db/000001.sst")).unwrap();
+        assert!(fs.file_exists(Path::new(&staged_key)).unwrap());
+        assert_eq!(
+            m.unlink(Path::new("/db/checkpoints/00000000000000000001/000001.sst"))
+                .unwrap(),
+            UnlinkOutcome::PhysicalDeleted
+        );
+        assert!(!fs.file_exists(Path::new(&staged_key)).unwrap());
+        assert_eq!(counting.renames(), 0, "whole lifecycle stays rename-free");
+    }
+
+    /// Crashed staging writer (mint journaled, rename never happened): the
+    /// next UUID-mode mount sweeps the `.tmp` mapping AND reaps the minted
+    /// physical, so a file-number-reusing restart can `CreateNew` the same
+    /// staging name again.
+    #[test]
+    fn test_c3u1_uuid_mode_crashed_staging_swept_on_mount() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        fs.create_dir_all(Path::new("/db")).unwrap();
+        {
+            let m = Arc::new(mgr(&fs));
+            let mapped =
+                MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
+            write_through(&mapped, "/db/.000007.sst.tmp", WriteMode::CreateNew, b"torn");
+            // crash: no rename, manager dropped (journal survives on fs).
+        }
+        let m2 = Arc::new(mgr(&fs)); // journal replay resurrects the mapping
+        let stale_key = m2.resolve(Path::new("/db/.000007.sst.tmp")).unwrap();
+        assert!(fs.file_exists(Path::new(&stale_key)).unwrap());
+        let mapped2 = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m2.clone()).unwrap();
+        assert!(!m2.is_registered(Path::new("/db/.000007.sst.tmp")));
+        assert!(
+            !fs.file_exists(Path::new(&stale_key)).unwrap(),
+            "crashed staging physical must be reaped"
+        );
+        // Same staging name is creatable again (file-number reuse).
+        write_through(&mapped2, "/db/.000007.sst.tmp", WriteMode::CreateNew, b"retry");
+        assert_eq!(
+            read_all(&mapped2, Path::new("/db/.000007.sst.tmp")).unwrap(),
+            b"retry".to_vec()
+        );
+    }
+
+    /// R1-M2 regression: rename to SELF is a POSIX no-op — it must not
+    /// unlink the sole reference (which deleted the physical pre-fix).
+    #[test]
+    fn test_c3u1_r1m2_rename_logical_to_self_is_noop() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        fs.create_dir_all(Path::new("/db")).unwrap();
+        let m = Arc::new(mgr(&fs));
+        let mapped = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
+        write_through(&mapped, "/db/000009.sst", WriteMode::CreateNew, b"self");
+        let key = m.resolve(Path::new("/db/000009.sst")).unwrap();
+        assert_eq!(m.refs(&key), 1);
+        mapped
+            .rename(Path::new("/db/000009.sst"), Path::new("/db/000009.sst"))
+            .unwrap();
+        assert_eq!(m.refs(&key), 1, "self-rename keeps the reference");
+        assert!(fs.file_exists(Path::new(&key)).unwrap(), "bytes survive");
+        assert_eq!(
+            read_all(&mapped, Path::new("/db/000009.sst")).unwrap(),
+            b"self".to_vec()
+        );
+    }
+
+    /// UUID mappings round-trip through BOTH durability paths: the journal
+    /// (manager re-open) and the snapshot (restore_snapshot rewrites the
+    /// journal — the old identity-test downgraded UUID registers to Links,
+    /// losing sizes).
+    #[test]
+    fn test_c3u1_uuid_mappings_journal_and_snapshot_roundtrip() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        fs.create_dir_all(Path::new("/db")).unwrap();
+        let m = Arc::new(mgr(&fs));
+        let mapped = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
+        write_through(&mapped, "/db/000003.sst", WriteMode::CreateNew, b"bytes-3");
+        let key = m.resolve(Path::new("/db/000003.sst")).unwrap();
+        m.link(
+            Path::new("/db/000003.sst"),
+            Path::new("/db/checkpoints/00000000000000000002/000003.sst"),
+        )
+        .unwrap();
+
+        // Journal replay (re-open).
+        let m2 = mgr(&fs);
+        assert_eq!(m2.resolve(Path::new("/db/000003.sst")).unwrap(), key);
+        assert_eq!(m2.refs(&key), 2);
+        assert_eq!(m2.ownership_of(&key), Some(FileOwnership::ShareableOwnedByDb));
+
+        // Snapshot → restore_snapshot (journal REWRITE) → re-open again.
+        let snap = m2.snapshot_bytes().unwrap();
+        let m3 = mgr(&fs);
+        m3.restore_snapshot(&snap).unwrap();
+        assert_eq!(m3.resolve(Path::new("/db/000003.sst")).unwrap(), key);
+        assert_eq!(m3.refs(&key), 2);
+        let m4 = mgr(&fs); // replays the REWRITTEN journal
+        assert_eq!(m4.resolve(Path::new("/db/000003.sst")).unwrap(), key);
+        assert_eq!(m4.refs(&key), 2);
+        assert_eq!(m4.ownership_of(&key), Some(FileOwnership::ShareableOwnedByDb));
+        assert_eq!(
+            read_all(fs.as_ref(), Path::new(&key)).unwrap(),
+            b"bytes-3".to_vec()
+        );
+    }
+
+    /// CreateOrTruncate on a checkpoint-shared logical never truncates the
+    /// shared physical in place: the logical re-points to a FRESH mint and
+    /// the checkpoint's bytes survive untouched.
+    #[test]
+    fn test_c3u1_uuid_mode_truncate_never_clobbers_shared_physical() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        fs.create_dir_all(Path::new("/db")).unwrap();
+        let m = Arc::new(mgr(&fs));
+        let mapped = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
+        write_through(&mapped, "/db/000004.sst", WriteMode::CreateNew, b"original");
+        let old_key = m.resolve(Path::new("/db/000004.sst")).unwrap();
+        let chk = Path::new("/db/checkpoints/00000000000000000003/000004.sst");
+        m.link(Path::new("/db/000004.sst"), chk).unwrap();
+
+        write_through(&mapped, "/db/000004.sst", WriteMode::CreateOrTruncate, b"rewritten");
+        let new_key = m.resolve(Path::new("/db/000004.sst")).unwrap();
+        assert_ne!(new_key, old_key, "truncate must mint a fresh physical");
+        assert_eq!(
+            read_all(fs.as_ref(), Path::new(&old_key)).unwrap(),
+            b"original".to_vec(),
+            "checkpoint-shared bytes untouched"
+        );
+        assert_eq!(m.resolve(chk).unwrap(), old_key);
+        assert_eq!(
+            read_all(&mapped, Path::new("/db/000004.sst")).unwrap(),
+            b"rewritten".to_vec()
+        );
     }
 }

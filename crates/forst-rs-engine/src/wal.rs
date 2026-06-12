@@ -162,11 +162,27 @@ pub struct WalWriter {
     bytes_written: u64,
     /// Records appended since the last successful `sync` (group-commit batch).
     pending: u64,
+    /// FRS-WAL Phase 5: per-CF max sequence over every record in the CURRENT
+    /// segment (reset at rotation). Drives segment GC: a sealed segment is
+    /// obsolete once every CF's flushed floor covers its per-CF max.
+    cf_max_seqs: std::collections::HashMap<u32, u64>,
+}
+
+/// FRS-WAL Phase 5: a sealed (rotated-out) WAL segment — immutable bytes at
+/// `path` plus the per-CF max-sequence map the GC criterion needs.
+#[derive(Debug, Clone)]
+pub struct SealedSegment {
+    /// On-disk path of the sealed local segment file.
+    pub path: std::path::PathBuf,
+    /// Per-CF max sequence over the segment's records.
+    pub cf_max_seqs: std::collections::HashMap<u32, u64>,
 }
 
 impl WalWriter {
     /// Opens `path` for appending, creating it if absent. Existing content is
-    /// preserved (segments are append-only; recovery reads the whole file).
+    /// preserved (segments are append-only; recovery reads the whole file) —
+    /// and scanned once to seed the Phase-5 per-CF max-seq tracker, so a
+    /// reopened segment's GC criterion accounts for pre-restart records.
     pub fn open(path: &Path) -> ForstResult<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -179,11 +195,19 @@ impl WalWriter {
             .metadata()
             .map(|m| m.len())
             .map_err(|e| ForstError::Io(std::io::Error::other(format!("WAL stat: {e}"))))?;
+        let mut cf_max_seqs = std::collections::HashMap::new();
+        if bytes_written > 0 {
+            for rec in read_segment(path)?.records {
+                let e = cf_max_seqs.entry(rec.cf_id).or_insert(0u64);
+                *e = (*e).max(rec.sequence);
+            }
+        }
         Ok(WalWriter {
             inner: BufWriter::new(file),
             path: path.to_path_buf(),
             bytes_written,
             pending: 0,
+            cf_max_seqs,
         })
     }
 
@@ -208,7 +232,61 @@ impl WalWriter {
             .map_err(|e| ForstError::Io(std::io::Error::other(format!("WAL append: {e}"))))?;
         self.bytes_written += frame_len as u64;
         self.pending += 1;
+        let e = self.cf_max_seqs.entry(rec.cf_id).or_insert(0u64);
+        *e = (*e).max(rec.sequence);
         Ok(frame_len)
+    }
+
+    /// FRS-WAL Phase 5 (sealed-segment rotation): syncs the current segment,
+    /// seals it (rename to a unique `<path>.seal-NNNN` sibling) and reopens a
+    /// FRESH empty segment at the original path. Returns the sealed segment's
+    /// path + per-CF max-seq map, or `Ok(None)` when the current segment is
+    /// empty (nothing to seal — checkpoints with no unflushed tail).
+    ///
+    /// The caller (the link-mode checkpoint barrier) holds the engine WAL
+    /// lock across this call, so the seal point is EXACT: a record is in the
+    /// sealed segment iff its append completed before the barrier.
+    pub fn seal_and_rotate(&mut self) -> ForstResult<Option<SealedSegment>> {
+        self.sync()?;
+        if self.bytes_written == 0 {
+            return Ok(None);
+        }
+        // Unique sibling name: monotonic probe survives leftovers from
+        // crashed prior seals AND checkpoint-id retries.
+        let mut n = 0u64;
+        let sealed_path = loop {
+            let candidate = self
+                .path
+                .with_file_name(format!(
+                    "{}.seal-{:04}",
+                    self.path.file_name().and_then(|s| s.to_str()).unwrap_or("wal"),
+                    n
+                ));
+            if !candidate.exists() {
+                break candidate;
+            }
+            n += 1;
+            if n > 1_000_000 {
+                return Err(ForstError::Io(std::io::Error::other(
+                    "WAL seal: cannot find a free sealed-segment name",
+                )));
+            }
+        };
+        std::fs::rename(&self.path, &sealed_path).map_err(|e| {
+            ForstError::Io(std::io::Error::other(format!(
+                "WAL seal rename {:?} -> {:?}: {e}",
+                self.path, sealed_path
+            )))
+        })?;
+        let sealed = SealedSegment {
+            path: sealed_path,
+            cf_max_seqs: std::mem::take(&mut self.cf_max_seqs),
+        };
+        // Reopen fresh at the canonical path; swap the writer in place.
+        let fresh = WalWriter::open(&self.path)?;
+        let old = std::mem::replace(self, fresh);
+        drop(old); // sealed file handle closed via the rename; nothing pending
+        Ok(Some(sealed))
     }
 
     /// Flushes the buffered batch to the OS and fsyncs it to stable storage.
@@ -445,6 +523,51 @@ mod tests {
         assert_eq!(scan.records.len(), 2);
         assert_eq!(scan.records[0].key, b"first");
         assert_eq!(scan.records[1].key, b"second");
+    }
+
+    /// FRS-WAL Phase 5: seal_and_rotate moves the synced records into an
+    /// immutable sealed sibling, reopens a fresh segment at the canonical
+    /// path, returns the per-CF max-seq map, and is a no-op (None) on an
+    /// empty segment. A reopened segment's pre-existing records seed the
+    /// tracker (GC correctness across restarts).
+    #[test]
+    fn seal_and_rotate_isolates_tail_and_tracks_cf_max() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rot.wal");
+        let mut w = WalWriter::open(&path).unwrap();
+
+        // Empty segment: nothing to seal.
+        assert!(w.seal_and_rotate().unwrap().is_none());
+
+        w.append(&rec(0, 5, 0, b"a", Some(b"1"))).unwrap();
+        w.append(&rec(3, 9, 0, b"b", Some(b"2"))).unwrap();
+        let seg1 = w.seal_and_rotate().unwrap().expect("non-empty seals");
+        assert_ne!(seg1.path, path, "sealed sibling, not the live path");
+        assert_eq!(seg1.cf_max_seqs.get(&0), Some(&5));
+        assert_eq!(seg1.cf_max_seqs.get(&3), Some(&9));
+        let scan1 = read_segment(&seg1.path).unwrap();
+        assert!(scan1.clean_eof);
+        assert_eq!(scan1.records.len(), 2);
+
+        // The live segment is fresh: only post-rotation records.
+        w.append(&rec(0, 12, 0, b"c", Some(b"3"))).unwrap();
+        w.sync().unwrap();
+        let live = read_segment(&path).unwrap();
+        assert_eq!(live.records.len(), 1);
+        assert_eq!(live.records[0].key, b"c");
+
+        // Second rotation gets a distinct sealed name (no clobber).
+        let seg2 = w.seal_and_rotate().unwrap().expect("seals");
+        assert_ne!(seg2.path, seg1.path);
+        assert_eq!(seg2.cf_max_seqs.get(&0), Some(&12));
+        assert!(!seg2.cf_max_seqs.contains_key(&3), "tracker reset at seal");
+
+        // Reopen seeds the tracker from existing bytes.
+        drop(w);
+        let mut w2 = WalWriter::open(&seg1.path).unwrap();
+        let reseal = w2.seal_and_rotate().unwrap().expect("existing bytes seal");
+        assert_eq!(reseal.cf_max_seqs.get(&0), Some(&5));
+        assert_eq!(reseal.cf_max_seqs.get(&3), Some(&9));
     }
 
     #[test]

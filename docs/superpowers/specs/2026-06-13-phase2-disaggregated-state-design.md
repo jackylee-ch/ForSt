@@ -798,6 +798,260 @@ residue); local-WAL-dir placement for remote-primary TMs (today the segment
 lives wherever `FRS_WAL_DIR` points; capture re-homes bytes to the engine
 FS at the barrier).
 
+### FFI `linked_*` surface + Java adoption package (landed 2026-06-13, cycle 2 unit 1)
+
+Built — the end-to-end enabler for the Stage-3 cross-repo residue:
+
+- **FFI** (`crates/forst-rs-ffi/src/lib.rs` section 8c):
+  `frs_create_incremental_checkpoint_linked` (+ 24-byte
+  `FrsLinkedCheckpointResult` {manifest, linked_new, linked_shared} +
+  idempotent free), `frs_db_discard_linked_checkpoint` (retried →
+  NOT_FOUND), `frs_db_open_from_linked_checkpoint_instant` (local FS) and
+  `_remote` (same OpenDAL+LocalCache stack as `frs_db_open_remote`),
+  `frs_db_adopted_residual`, `frs_db_attach_wal` (per-DB env-free
+  WAL-DELTA opt-in — the "wal_capture variant": with a WAL attached the
+  linked entry point runs WAL-DELTA automatically, §9 D10).
+- **Engine additive**: `open_from_linked_checkpoint[_instant]_with_default_cf`
+  (the restored default CF carries the raw-concat merge operator on the
+  FFI/Java route), `open_from_linked_checkpoint_instant_remote`,
+  `attach_wal_at`. **Footgun found & fixed:** `attach_wal_at` runs a
+  PRE-WAL durability barrier (seal + flush every CF) — without it, rows
+  living only in the active memtable at attach time are in NEITHER the
+  SSTs nor the WAL and the first WAL-DELTA linked checkpoint silently
+  loses them (caught by the FFI IT; regression UT
+  `test_phase2_ffi_attach_wal_at_flushes_pre_wal_state`).
+- **Java adoption package** (`disagg-java/`, COPIES — flink repo
+  read-only): `ForStRsLinker.linked-fragment.java` (FFM binds + wrappers,
+  ABI-exact), `LinkedSstStateHandle.java` (JM-side no-op discard —
+  delegation per §9 D4/paper §5.2), `ForStRsSnapshotStrategy.link-mode-`
+  and `ForStRsRestoreOperation.download-skip-` fragments, README with
+  binding decisions D-J1..D-J5 (discard delegation via
+  notifyCheckpointSubsumed; link mode gated to FORWARD sharing; manifest
+  keeps its small EXCLUSIVE upload; CLAIM discipline on
+  `adopted_residual`; config keys `forst.rs.checkpoint.link-mode` /
+  `forst.rs.wal.dir`) + the 5M correctness gate list.
+
+Gates green (2026-06-13): FFI IT `linked_checkpoint_ffi_it.rs` — FLUSH
+round-trip (zero-upload object-count assert through the C ABI, instant
+restore byte-exact, residual>0 restored / 0 source, restored writable,
+double-free idempotent); WAL-DELTA (attach → blob+WAL.delta exactly, tail
++ overwrite replayed, post-barrier write absent, double-attach rejected);
+discard (unlinked==linked count, physicals_deleted==0 under working refs,
+retry NOT_FOUND, null-arg paths). Suites: engine 349 (348+1 ignored)/0,
+io 231/0, storage 442/0, ffi green; clippy 0.
+
+### Mapping-journal tail replay on restore + abandoned-chk startup sweep (landed 2026-06-13, cycle 2 unit 2)
+
+Built — closes the two recorded Stage-3 residue items (§2.4 tail replay;
+§9 D5 crash window a):
+
+- **`MappingJournalView`** (io) — READ-ONLY full replay of a mapping
+  journal (never appends; torn tail tolerated like `new`). Carries the
+  truths a blob-frozen trailer cannot: post-checkpoint **tombstones** and
+  link/unlink churn. + `FileMappingManager::logical_paths_under` /
+  `is_tombstoned` (additive only — write-amp agent coordination intact).
+- **Tail consult on instant restore**: `open_from_linked_checkpoint_instant`
+  loads the SOURCE journal (`<src_db>/MAPPING.journal`, derived from the
+  D1 layout) when reachable and (a) REFUSES to adopt a physical carrying a
+  JM-discard tombstone (it evaporates when surviving refs drain — silent
+  state loss otherwise), (b) corruption-gates a journal-vs-blob resolution
+  mismatch on the immutable chk namespace. Journal absent ⇒ blob-only
+  fallback, byte-identical to Stage-3 behavior.
+- **`DbImpl::sweep_abandoned_checkpoint_links(live_ids)`** — the startup
+  sweep: enumerates chk-namespace links straight from the journal-replayed
+  state (window a has NO blob), unlinks every id not in the JM-live set,
+  removes leftover chk dirs; physicals survive on working/live-checkpoint
+  refs; idempotent. FFI: `frs_db_sweep_abandoned_checkpoints` (+ linker
+  fragment binding + README D-J1 wiring already pointed at it).
+
+Gates green (2026-06-13): io UTs ×4 (view None/current-state-with-
+tombstones/torn-tail/paths-under sorted+filtered; read-only proof —
+journal bytes identical before/after load); engine crash-point ITs ×2 —
+sweep IT covers BOTH abandonment shapes (window a journal-only links via
+direct mapping ops + window b blob-written-never-acked), live-id
+protection, physicals_deleted==0 under working refs, idempotence,
+live-checkpoint restore byte-exact post-sweep, discard-after-sweep sane;
+tombstone IT proves refusal (loud, names the tombstone) + blob-only
+fallback when the journal is unreachable. FFI IT (sweep through the C
+ABI: reap count, idempotence, live-set protection, null-arg). Suites:
+engine 350/0, io 235/0, storage 442/0, ffi ITs 4/0; clippy 0.
+
+### Phase-5 WAL sealed-segment rotation + GC (landed 2026-06-13, cycle 2 unit 3)
+
+Built — closes the D11 residue (v1 whole-segment capture, NOT flat):
+
+- **`WalWriter::seal_and_rotate`** (+ `SealedSegment`, per-CF max-seq
+  tracking incl. reopen-seeding): syncs, renames the live segment to a
+  unique `.seal-NNNN` sibling, reopens fresh — barrier-exact under the
+  engine WAL lock.
+- **`wal_capture_to` v2**: seal → **re-home ONCE** (sealed bytes copied to
+  `<db_path>/wal/WAL-NNNNNN.seg` on the engine FS, `register()`ed) →
+  **GC** (segments whose per-CF max seq is covered by every CF's flushed
+  floor lose their working ref; bytes deleted exactly once when the last
+  checkpoint ref drains) → **LINK** every still-live segment into
+  `<chk-k>/` (metadata-only, resolved via the blob trailer). The D8
+  object-count invariant TIGHTENS: the chk dir is physically blob-only
+  even in WAL mode (no more `WAL.delta` for new checkpoints).
+- **Restore replay v2**: handles linked segments (trailer-enumerated via
+  new `MappingSnapshotView::paths_under`) AND legacy `WAL.delta` images;
+  torn tail anywhere = loud corruption. **Hazard found & closed
+  (chain-of-restores)**: the replayed tail lived only in the restored
+  memtable — a next WAL-DELTA checkpoint (no flush) would silently drop
+  it; replay now RE-LOGS the tail into the restoring engine's live WAL
+  when one is attached (env route), and `attach_wal_at`'s pre-WAL flush
+  barrier covers the explicit route.
+- **Discard is now NAMESPACE-driven** (`logical_paths_under(<chk-k>/)`,
+  not manifest-driven): covers WAL-segment links uniformly, and reaps
+  window-a leftovers (links journaled, blob lost) on a direct JM discard
+  instead of stranding them for the sweep. Retry contract unchanged
+  (no blob AND no links ⇒ NotFound).
+
+Gates green (2026-06-13): wal UT (rotation isolates tail / per-CF max /
+unique seal names / reopen-seeded tracker); engine ITs ×3 — chain IT
+(ckpt-2's re-homed copy contains ONLY the since-ckpt-1 records (flat
+capture proof at the byte level), refs walk working+chk1+chk2, restores
+of chk-1/2/3 byte-exact with memtable counts 20/40/0, GC at flush drops
+working refs only, discard chain deletes both segment physicals exactly
+once); restored-engine WAL chain via `attach_wal_at` (replayed tail
+survives the next WAL-DELTA checkpoint); re-log branch UT (tail durable
+in the target's live WAL, 30/30). Stage-4 tests updated to the tightened
+blob-only invariant. Suites: engine 354/0, io 235/0, ffi green; clippy 0.
+
+**Re-run Stage-4 bench** (`ckpt_wal_delta_bench` extended with the
+steady-state cell: ckpt-1 over scale×4 MiB unflushed, then a FIXED
+256 KiB tail → ckpt-2; median of 3, local FS, dev Mac 2026-06-13):
+
+```
+scale    state_mb  flush_ck1_ms  flush_ck2_ms  wal_ck1_ms  wal_ck2_ms
+1x            4.0          29.0          21.8        27.8        24.2
+4x           16.0          41.0          21.9        33.2        22.3
+16x          64.0          72.1          20.0        82.2        25.1
+```
+
+**The §3.3 "independent of memtable size" promise now holds**: steady-
+state WAL-DELTA capture (`wal_ck2`) is FLAT — 24.2 / 22.3 / 25.1 ms
+across the 16× sweep — vs v1 which re-copied the whole accumulated tail
+every checkpoint (the v1 shape is `wal_ck1`: 28 → 33 → 82 ms, growing
+with bytes). First-checkpoint cost stays O(cold tail) by nature (the
+one-time re-home). Residue: cross-CF coverage uses per-CF floors —
+records of a CF that never flushes pin their segment's working ref
+(bounded by WBM flush cadence); dropped-CF records pin forever
+(conservative leak, reaped when the linking checkpoints are discarded).
+**[CLOSED by cycle-3 unit 4 below: dropped-CF + floor-regression pins
+released precisely; the genuinely-unflushed-tail pin is retained as
+specified (it IS the tail's only durable copy).]**
+
+---
+
+### Cycle 3 unit 1 — UUID physical keys (landed 2026-06-13, C3U1)
+
+ForSt `toUUIDPath` mechanism (competitive analysis §2.2d), mapping-layer
+only, default OFF (`MappedFileSystem::with_uuid_physical_keys` is the only
+activation; `::new` and every engine default path byte-identical):
+
+- SST-class writes through a uuid-keyed `MappedFileSystem` mint
+  `uuid-<32hex>.sst` physicals (same dir; `.sst` kept for staging names so
+  `gc_sweep` covers every minted object); logical names unchanged.
+- Staging→final publication = `FileMappingManager::rename_logical` — an
+  atomic metadata re-point (link-before-unlink so refs never dip to 0);
+  deletes of mapped paths route through refcounted `unlink`;
+  `sweep_temp_logicals` reaps crashed staging mints at mount.
+- `restore_snapshot` rewrites the FIRST logical of each owned physical as
+  Register (the old `path==key` identity test downgraded uuid registers to
+  Link, losing sizes); journal handles drop after sync (object-store
+  writers CLOSE on sync — post-checkpoint appends reopen, fixing
+  "append after close" on any opendal-backed mapping).
+
+Gates green: rename-free invariant on opendal-fs emulation — engine
+put→flush→link-ckpt→compact→instant-restore with **0 SST-class renames**
+reaching the backend, uuid-shaped physicals, byte-exact restore; crashed-
+staging sweep IT; journal+snapshot round-trips; truncate-never-clobbers-
+shared-physical. io 240/0, engine 355/0 at land.
+
+### Cycle 3 unit 2 — non-SST-always-local routing (landed 2026-06-13, C3U2)
+
+ForSt `FileOwnershipDecider` rule (§2.2c), router-level, default OFF
+(`FRS_REMOTE_NONSST_LOCAL=1` wraps the remote-primary stacks in
+`FileSystemRouter::with_remote(LocalFileSystem, CachedFileSystem(OpenDAL))`):
+
+- MANIFEST/CURRENT/OPTIONS, WAL `.log` + `WAL-*.seg`, `MAPPING.journal`,
+  `CHECKPOINT.blob` pinned LOCAL — zero S3 metadata chatter; only
+  SST-class objects go remote through the cache stack.
+- Router correctness holes closed while wiring: `await_upload` now routes
+  to the owning leg (pre-fix the checkpoint per-file durability barrier
+  NO-OPed through the trait default in tiered mode — a restore could
+  observe a manifest referencing an un-uploaded SST); `await_all_uploads`
+  fans out across distinct legs; `prefetch_concurrent` splits by leg;
+  `supports_atomic_rename` = AND of legs.
+
+Gates green: file-class locality catalog UTs (10 local classes, uuid SSTs
+remote); **zero remote ops on non-SST paths across a full link-checkpoint
+cycle** (count assertion over a recording opendal-emulation remote leg);
+blob+journal on the local leg only; instant restore byte-exact with only
+the once-per-open R52-M2 orphan-scan dir listing remote.
+
+### Cycle 3 unit 3 — §4.1.1 background-fill scheduler (landed 2026-06-13, C3U3)
+
+Post-restore lazy warm → PACED background fill, default OFF
+(`FRS_RESTORE_BG_FILL=1` + `_WORKERS`/`_PACE_MB` on the remote instant-
+restore path; explicit `start/finish_restore_background_fill` engine API):
+
+- Read pool of background-class workers (FRS-CACHE-BG-EXEMPT: no LRU/stat
+  pollution) drains the adopted set through
+  `CachedFileSystem::fill_file_cold` — **Bottom** (`LocalCache::put_cold`
+  inserts at the eviction end; an untouched prefill is the first victim)
+  / **Skip** (`promote_limit`-blocked keys never re-loaded; fills never
+  evict live entries — the no-evict decision is atomic under the cache
+  mutex per review R1-H1) per the merged admission machinery.
+- Global bytes/sec pacing (token-bucket-by-schedule, prompt cancel);
+  engine drop cancels+joins the pool.
+
+Gates green: scheduler UTs (budget-cap exact, Bottom victim order, Skip
+on blocked, pacing lower-bound, prompt cancel) + engine IT (cold-cache
+instant restore: every adopted physical warmed, 0 errors, idempotent
+restart, byte-exact). **Warm-time vs foreground-impact bench pair**
+(`restore_bgfill_bench`, 64×256 KiB set, modeled 10 ms/GET ×4-slot remote,
+4 s fg window, n=3 dev Mac):
+
+```
+cell           warm_ms      fg_slow(>1ms)   fg_p999_us
+lazy           1429-2562    64 (every 1st touch stalls inline)   72-114
+bgfill-fast     477-528     17-18                                 37-38
+bgfill-paced    896-918     37-38                                 61-64
+```
+
+### Cycle 3 unit 4 — WAL GC precise pin release (landed 2026-06-13, C3U4)
+
+Closes the Phase-5 residue above:
+
+- **Dropped-CF forever-pin fixed**: coverage treats records of CFs absent
+  from the live registry as covered (their state is gone by definition;
+  CF ids are never reused). Checkpoints taken before the drop keep their
+  own links and restore the CF byte-exact.
+- **Floor-regression re-pin fixed**: a MONOTONIC per-CF flushed floor
+  (`wal_flushed_floors`, advanced at flush-install) merges with the
+  live-SST-derived floor, which regresses to 0 when a CF's SSTs are later
+  compacted away entirely.
+- **Mixed-segment restore fixed**: `replay_linked_wal_delta` SKIPS
+  records of CFs absent from the restored manifest instead of failing
+  the whole restore on `lookup_cf_by_id`; skipped records are not
+  re-logged into the chain-of-restores WAL.
+
+Gates green (pin-release ITs): dropped-CF working ref released at the
+next checkpoint GC (refs 2→1, not linked into new chks), tracked floor
+advances at flush, pre-drop checkpoint restores the CF byte-exact, its
+discard deletes the segment physical exactly once; mixed segment stays
+linked for the live tail and restores with dropped-CF records skipped
+(pre-fix: whole restore errored).
+
+### Cycle 3 PMC review (round 1, 2026-06-13)
+
+`docs/superpowers/specs/review-rounds/phase2-cycle3-pmc-review.md` —
+8 findings: R1-H1 (cold-fill eviction race), R1-M1 (cold-update demotion),
+R1-M2 (`rename_logical` self-rename data loss) ALL FIXED with regression
+UTs; 4 LOW accepted+documented; 2 notes. Post-fix suites: io 245/0,
+storage 450/0, engine 359/0; clippy 0.
+
 ---
 
 ## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)
