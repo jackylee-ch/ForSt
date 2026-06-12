@@ -165,6 +165,15 @@ impl AdmissionTracker {
                 None => break,
             }
         }
+        // PMC self-review (2026-06-12): an ADMITTED key is removed from `map`
+        // but its `order` ref survives — without this reclaim the deque grows
+        // by one String per admitted key forever (map stays under `cap`, so
+        // the loop above never runs). `trim` is called once per NEW tracked
+        // key (the only path that grows `order`), so checking here bounds the
+        // deque to ≤ 2×cap with amortized-O(1) cost.
+        if order.len() > cap.saturating_mul(2) {
+            order.retain(|k| map.contains_key(k));
+        }
     }
 
     /// Records one foreground read-miss touch of `key`; returns `true` when
@@ -1715,6 +1724,38 @@ mod tests {
         );
         // And the cache ends up holding a stable resident subset.
         assert!(!adm.is_empty(), "a resident subset survives");
+    }
+
+    #[test]
+    fn admission_tracker_order_deque_bounded_under_admit_traffic() {
+        // PMC self-review regression: every ADMITTED key removes its count
+        // but used to leave its order ref behind — under normal admit
+        // traffic (many distinct keys each admitted after K touches) the
+        // deque grew one String per admitted key forever. The reclaim must
+        // bound it to ~2x the tracker cap.
+        let cap = 64usize;
+        let policy = CachePolicy {
+            background_exempt: false,
+            admission: Some(AdmissionParams {
+                access_before_promote: 2,
+                promote_limit: 100, // never block: pure admit traffic
+                tracker_cap: cap,
+            }),
+        };
+        let (_tmp, cache) = policy_cache(1 << 20, policy);
+        for i in 0..5000 {
+            let key = format!("/db/admit-{i}");
+            assert!(!cache.admit_read_fill(&key));
+            assert!(cache.admit_read_fill(&key), "2nd touch admits");
+        }
+        let tracker = cache.admission.lock().unwrap();
+        assert!(
+            tracker.counts_order.len() <= cap * 2,
+            "counts_order leaked: {} refs for {} live counts (cap {})",
+            tracker.counts_order.len(),
+            tracker.counts.len(),
+            cap
+        );
     }
 
     #[test]
