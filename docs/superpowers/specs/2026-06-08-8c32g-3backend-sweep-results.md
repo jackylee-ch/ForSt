@@ -2312,3 +2312,23 @@ its own disk alone? writes still > reads?); (3) the local H1 microbench
 (write-amp + fan-out curves). If clean q7 is much faster / not disk-bound, H1
 demotes and the q7 lever hunt restarts from the clean profile. The in-flight
 sorted-run doc lands as HYPOTHESIS-PENDING-CLEAN-EVIDENCE, not approved.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★★ ForSt q7 REMOTE PIN: 1379.7s (rows EXACT) — ForSt ≈ RocksDB remotely!
+# ═══════════════════════════════════════════════════════════════════════════
+The Mac 2.46× ForSt advantage did NOT transfer: remote q7 bar = ~1370-1380s
+(ForSt 1379.7 ≈ rdb 1367.6). frs must claw 2376.4 → ~1380. ForSt crash-loop
+ROOT-CAUSED: image bakes stale libforstjni.so on LD_LIBRARY_PATH shadowing the
+jar's native — fix `-e LD_LIBRARY_PATH=` (unblocks all ForSt legs).
+H1 CONFIRMED clean: same-disk iostat ForSt 100-116MB/s writes/6% util vs frs
+435-682+190-292MB/s/98-99% (~10× physical bytes/event — frs's OWN write-amp,
+not contention); churn_probe bench (committed): frs write-amp 7.68× vs RDB
+3.91× INTRINSIC to picking (knobs change nothing); L0-depth dose-response
+linear. MECHANISM CORRECTED: L1+ already non-overlapping/bsearch — the read
+half is L0 depth; the BIGGER half is write volume (whole-L1 rewrite/rollup, no
+trivial move, global compaction mutex, fixed cascade). DESIGN (sorted-run doc
+6ee98844b): M1 clean-cut picking, M2 trivial move, M3 concurrent compactions,
+M4 score-based pick+dynamic targets (largest cell), M5 L0 20/36+LZ4-remote,
+M6 shadow budget; S1-S5 staged, G1-G3 micro falsifiers, G5 remote A/B.
+Expected q7 2376→1400-1700. ACCEPTANCE GATE: 2 of 3 conditions met (iostat ✓,
+microbench ✓); clean q7 pair (re-baseline, in flight) completes it.
