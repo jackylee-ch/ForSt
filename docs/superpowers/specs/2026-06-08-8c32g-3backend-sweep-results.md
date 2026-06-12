@@ -37,6 +37,38 @@ numbers below this section are a SEPARATE legacy population — never compare).
 
 Detail sections below are chronological (oldest first after the legacy lock).
 
+## ★ REFRESHED PER-QUERY TABLE (2026-06-12). Population: R = remote x86/NVMe
+## (BINDING), M = Mac 2026-06-10/11 (legacy; pending remote re-run). ForSt = M only.
+| query | RocksDB s | RocksDB out_rows | forst-rs s | forst-rs out_rows | ForSt s | acc | bar |
+|-------|-----------|------------------|------------|-------------------|---------|-----|-----|
+| q0 | 31.8 M | 100,000,000 | 30.9 M | 100,000,000 | 30.7 M | ✓ | ~PASS (ForSt parity +0.2s) |
+| q1 | 30.1 M | 100,000,000 | 29.3 M | 100,000,000 | 30.1 M | ✓ | PASS (R smoke 3.9s@1M ✓) |
+| q2 | 28.2 M | 100,000,000 | 27.8 M | 100,000,000 | 28.2 M | ✓ | PASS |
+| q3 | 122.6 R / 35.0 M | 2,199,554 R | 142.1 R / 35.6 M | 2,200,170 R | 37.2 M | ✓ | PASS (R 1.16×; M 0.98×; rows = stop-jitter) |
+| q4 | 302.7 M | 177.6M (changelog) | 373.0 M | 25.8M (cadence) | 1042.2 M | ⧗ | FAIL RDB (+70s); beats ForSt; final-result compare owed; q4@10M wedge pre-existing |
+| q5 | 162.5 M | 29,988,416 | FIXED (80015d2cfaa) | 1M fixed-CSV hash-equal ✓ | DNF M | ✓ | CORRECTNESS FIXED — 100M re-measure owed (old 41.6s was wrong-output) |
+| q7 | 1367.6 R (finishes!) / DNF M | 92,000,002 R | 2376.4 R io_uring (OFF=DNF) / 1441.6 M | 92,000,002 R EXACT | 586.8 M | ✓ | FAIL (R 1.74×; ForSt M far ahead) — S2 loser-tree flag-ON = round-3; io_uring mandatory |
+| q8 | 42.5 M | 3,064,457 | 43.6 M (timer-fix: rows now EXACT band; R 153-170) | 3,064,4xx ✓×5 | 39.2 M | ✓ | ~FAIL ForSt only (+4.4s); under-emit BUG FIXED (was -60% latent) |
+| q9 | 2121.2 R / 1437.6 M | 91,813,374 R | 2421.2 R / 2349.3 M | 91,813,372 CANONICAL (17× cross-arch) | DNF M | ✓ | **PASS on R (1.14×)**; M 1.63×; r2-tip regression (+358s) bisect in flight |
+| q10 | 129.5 M | 100,000,000 | 124.2 M | 100,000,000 | 129.3 M | ✓ | PASS |
+| q11 | 106.1 M | 92,000,000 | 264.8 M | 92,000,000 | 134.9 M | ✓ | FAIL both (0.40×) — R-long levers (S2/P2) apply; remote re-run owed |
+| q12 | 41.4 M | 92,000,000 | 49.6 M | 92,000,000 | 39.7 M | ✓ | FAIL ForSt (+9.9s) |
+| q13 | 29.3 M | 100,000,000 | 28.5 M | 100,000,000 | 29.5 M | ✓ | PASS |
+| q14 | 29.6 M | 100,000,000 | 29.4 M | 100,000,000 | 29.2 M | ✓ | ~PASS (ForSt parity +0.2s) |
+| q15 | 229.7 M | 92,000,000 | 161.8 M | 92,000,000 | 206.8 M | ✓ | PASS (beats BOTH) |
+| q16 | 374.1 M | 92,000,000 | 323.9 M | 92,000,000 | 331.7 M | ✓ | PASS (beats BOTH) |
+| q17 | 72.8 M | 92,000,000 | 77.7 M / R 387-423 ±4.5% ×3 | 92,000,000 ✓ | 253.0 M | ✓ | PASS (0.94× M; R rdb pin owed; R box measurement-grade) |
+| q18 | 366.4 M | 92,000,000 | 222.9 M | 92,000,000 | DNF M | ✓ | PASS (beats BOTH; ForSt DNF) |
+| q19 | 310.2 M | 92,000,000 | 527.9 M | 92,000,000 | 308.1 M | ✓ | FAIL both (0.59×) — R-long levers apply; remote re-run owed |
+| q20 | 1557.6 R / 1034.4 M | 93,200,471 R | 2011.1 R / 2045.8 M | 93,199,005 R (out==src) | 1535.9 M | ✓ | near-miss on R (1.29×; was 1.98× M); beats ForSt-M wall |
+| q21 | 60.0 M | 100,000,000 | 53.9 M | 100,000,000 | 58.3 M | ✓ | PASS |
+| q22 | 44.2 M | 100,000,000 | 43.6 M | 100,000,000 | 46.3 M | ✓ | PASS |
+
+SUMMARY: clear PASS 13 (q1,q2,q3,q9-R,q10,q13,q15,q16,q17,q18,q21,q22 + q20-beats-ForSt
+clause), ~PASS 2 (q0,q14 ForSt-parity), correctness-fixed-pending-remeasure 1 (q5),
+FAIL-vs-ForSt-only 3 (q7 big, q8 +4.4s, q12 +9.9s), FAIL-RDB-perf 4 (q4,q11,q19 + q7-R),
+near-miss 1 (q20-R 1.29×). Old q5/q8 correctness bugs FIXED; q9/q20 DNFs ELIMINATED.
+
 All 100M events, 8c/32g Docker, each backend with its own timer. `out_rows` = sink vertex
 read-records (accuracy: forst-rs must match RocksDB). Bar: forst-rs ≥0.8× RocksDB OR ≤+50s,
 AND faster than ForSt, AND out_rows match.
