@@ -2284,3 +2284,11 @@ and never-losing (default-ON gate unblocked, low priority). Strategy-doc q7 row
 Infra fixes for future agents (cost ~2h): FRS_RS_S2_PINNED not in ENVS;
 docker IPv4 pool exhaustion (need NET_SUBNET); dockerd stale overmount on
 ~/workenv/frs-tmp ⇒ use FRS_CTMP_BASE=/ssd2/jackylee/frs-bench/frs-tmp.
+
+### R3 CAMPAIGN (contended walls — 3 agents oversubscribed the box; ratios deferred)
+q9 r3a2 single: 2904.6 FINISHED (engine-culpable class ⇒ DE-CONTENTION branch
+needed); q20 2201.6 FINISHED; q19 FIRST REMOTE WALL 1190.9 rows exact. Concurrent
+2-cell q9 INVALID (58c demand/28c box). PROCESS: box lock-file coordination
+needed; 2 harness fixes to upstream (FRS_CTMP_BASE: frs-tmp is a separate mount
+dockerd won't traverse; explicit-subnet docker networks: IPv4 pools exhausted).
+NEXT DECIDER: tip vs bisect-decontention q9 A/B in a QUIET window.
