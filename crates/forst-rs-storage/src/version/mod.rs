@@ -22,7 +22,7 @@ pub mod checkpoint;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use forst_rs_common::{
@@ -100,32 +100,40 @@ impl LevelMeta {
 #[derive(Debug)]
 pub struct Version {
     pub levels: Vec<LevelMeta>,
-    /// E5 (PMC cycle-3 §E1-F2): lazily-computed, per-level soundness flags
-    /// for the L1+ lower-bound binary search in
-    /// [`Self::overlapping_ssts_in_range`]. `true` iff that level's
-    /// `largest_key` sequence is monotonic non-decreasing in stored
-    /// (smallest_key-sorted) order — the EXACT premise the
-    /// `partition_point` on `largest_key` needs. Single-CF levels always
-    /// satisfy it (L1+ non-overlap); multi-CF levels with nested/
-    /// interleaved cross-CF ranges may not, and then the locator must
-    /// fall back to the linear left-skip (see E5 in
+    /// E5 (PMC cycle-3 §E1-F2): per-level soundness flags for the L1+
+    /// lower-bound binary search in [`Self::overlapping_ssts_in_range`].
+    /// `true` iff that level's `largest_key` sequence is monotonic
+    /// non-decreasing in stored (smallest_key-sorted) order — the EXACT
+    /// premise the `partition_point` on `largest_key` needs. Single-CF
+    /// levels always satisfy it (L1+ non-overlap); multi-CF levels with
+    /// nested/interleaved cross-CF ranges may not, and then the locator
+    /// must fall back to the linear left-skip (see E5 in
     /// `overlapping_ssts_in_range`).
     ///
-    /// Lazy + cached per Version: a `Version` is immutable once published
-    /// (ArcSwap install / restore), so the flags are computed at most once
-    /// (O(total files)) on the first scan and amortized across every scan
-    /// of that version. Deliberately NOT an eager field so that every
-    /// construction path (apply_edit, checkpoint restore's struct literal,
-    /// tests that build levels by direct mutation before first use) stays
-    /// correct without having to remember to recompute it.
-    scan_lower_bsearch_sound: OnceLock<Vec<bool>>,
+    /// EAGER, computed once in [`Self::from_levels`] (2026-06-12 bisect
+    /// de-contention): a `Version` is immutable once published (ArcSwap
+    /// install / restore) and EVERY non-test construction path funnels
+    /// through `from_levels` (`new`, `Clone`, `apply_edit`, checkpoint
+    /// restore at version/checkpoint.rs `restore_from_blob`), so the flags
+    /// are always consistent with `levels` at zero per-scan cost. The
+    /// previous `OnceLock` version paid a `get_or_init` synchronized load
+    /// on EVERY `overlapping_ssts_in_range` call — on the prefix/range
+    /// scan hot path × 8 task threads.
+    ///
+    /// INVARIANT: code (tests included) that mutates `levels` in place
+    /// after construction and then calls `overlapping_ssts_in_range`
+    /// would observe stale flags — rebuild via `from_levels` instead.
+    /// (Audited 2026-06-12: the only direct post-construction mutations
+    /// are test helpers that either touch L0 only — whose flag is never
+    /// read — or never scan.)
+    scan_lower_bsearch_sound: Vec<bool>,
 }
 
-// E5: manual impls — the OnceLock cache must not participate in
-// equality, and a clone starts with a FRESH (empty) cache so a
-// clone-then-mutate caller (e.g. `restore_version_set`'s
-// `(*snapshot.version).clone()`, or tests) can never observe flags
-// computed from the source's pre-mutation file layout.
+// E5: manual impls — the soundness flags must not participate in
+// equality (they are derived from `levels`), and a clone recomputes
+// them from the cloned layout so a clone-then-mutate caller (e.g.
+// `restore_version_set`'s `(*snapshot.version).clone()`, or tests)
+// stays consistent with what `from_levels` would produce.
 impl Clone for Version {
     fn clone(&self) -> Self {
         Self::from_levels(self.levels.clone())
@@ -147,12 +155,21 @@ impl Version {
     }
 
     /// Creates a Version from an explicit level layout (restore path,
-    /// `apply_edit` output). The E5 scan-soundness cache starts empty and
-    /// is computed lazily from `levels` on first scan.
+    /// `apply_edit` output). The E5 scan-soundness flags are computed
+    /// EAGERLY here — O(total files) once per (immutable) Version — so
+    /// the scan hot path pays nothing (see `scan_lower_bsearch_sound`).
     pub fn from_levels(levels: Vec<LevelMeta>) -> Self {
+        let scan_lower_bsearch_sound = levels
+            .iter()
+            .map(|lvl| {
+                lvl.files
+                    .windows(2)
+                    .all(|w| w[0].largest_key <= w[1].largest_key)
+            })
+            .collect();
         Self {
             levels,
-            scan_lower_bsearch_sound: OnceLock::new(),
+            scan_lower_bsearch_sound,
         }
     }
 
@@ -444,16 +461,9 @@ impl Version {
         upper: Option<&[u8]>,
         out: &mut Vec<&'a SstFileMeta>,
     ) {
-        let lower_bsearch_sound = self.scan_lower_bsearch_sound.get_or_init(|| {
-            self.levels
-                .iter()
-                .map(|lvl| {
-                    lvl.files
-                        .windows(2)
-                        .all(|w| w[0].largest_key <= w[1].largest_key)
-                })
-                .collect()
-        });
+        // E5: eager per-Version flags (computed in `from_levels`) — plain
+        // slice indexing on the hot path, no synchronization.
+        let lower_bsearch_sound = &self.scan_lower_bsearch_sound;
         for (lvl_idx, level) in self.levels.iter().enumerate() {
             let files = &level.files;
             // Binary-search the upper cut: first file whose smallest_key is

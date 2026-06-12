@@ -118,13 +118,69 @@ fn prefetch_enabled() -> bool {
 /// Incremented at window submit; balance moves from inflight to ready at
 /// claim (no net change); decremented at block delivery, window failure,
 /// [`BlockPrefetcher::terminate`], and prefetcher drop.
-static PREFETCH_BUFFERED_BYTES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+///
+/// SHARDED (2026-06-12 bisect de-contention): the original single global
+/// `AtomicUsize` was RMW-ed once per DELIVERED BLOCK on the consumer
+/// (Flink task / FFI) threads — 8 task threads hammering one cache line
+/// is exactly the cross-core ping-pong shape suspected in the q9@100M
+/// r1→r2 regression. Each thread now picks a fixed cache-line-padded
+/// shard (round-robin at first touch); adds/subs are `Relaxed` RMWs on
+/// the thread's own line, and the telemetry read sums all shards. Shards
+/// are SIGNED: a prefetcher charged on thread A may be dropped on thread
+/// B (iterator close on another thread), driving B's shard negative —
+/// the SUM stays exact.
+const PREFETCH_CTR_SHARDS: usize = 16;
+
+/// One cache line per shard — no false sharing between adjacent shards.
+#[repr(align(64))]
+struct PaddedCounter(std::sync::atomic::AtomicIsize);
+
+static PREFETCH_BUFFERED_BYTES: [PaddedCounter; PREFETCH_CTR_SHARDS] =
+    [const { PaddedCounter(std::sync::atomic::AtomicIsize::new(0)) }; PREFETCH_CTR_SHARDS];
+
+/// The calling thread's fixed shard (assigned round-robin on first touch).
+fn prefetch_ctr_shard() -> &'static PaddedCounter {
+    use std::cell::Cell;
+    thread_local! {
+        static SHARD_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    let idx = SHARD_IDX.with(|c| {
+        let mut v = c.get();
+        if v == usize::MAX {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            v = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % PREFETCH_CTR_SHARDS;
+            c.set(v);
+        }
+        v
+    });
+    &PREFETCH_BUFFERED_BYTES[idx]
+}
+
+/// Charge `n` on-disk bytes to the aggregate (window submit).
+fn prefetch_charge_add(n: usize) {
+    prefetch_ctr_shard()
+        .0
+        .fetch_add(n as isize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Release `n` on-disk bytes from the aggregate (delivery / failure /
+/// terminate / drop).
+fn prefetch_charge_sub(n: usize) {
+    prefetch_ctr_shard()
+        .0
+        .fetch_sub(n as isize, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Current aggregate of prefetcher ready+inflight bytes (M3 telemetry).
 /// Sizes are on-disk (pre-decompression) block bytes — the I/O-side budget.
+/// Sum over the shards; individual shards may be transiently negative (see
+/// the sharding note above), the sum is clamped at 0.
 pub fn prefetch_buffered_bytes() -> usize {
-    PREFETCH_BUFFERED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+    PREFETCH_BUFFERED_BYTES
+        .iter()
+        .map(|s| s.0.load(std::sync::atomic::Ordering::Relaxed))
+        .sum::<isize>()
+        .max(0) as usize
 }
 
 /// Diag gate shared with the read-path instrumentation (`FRS_READ_AT_DIAG=1`,
@@ -301,7 +357,7 @@ impl BlockPrefetcher {
         let held: usize = self.ready.iter().map(|&(sz, _)| sz as usize).sum::<usize>()
             + self.inflight.as_ref().map_or(0, |h| h.bytes);
         if held > 0 {
-            PREFETCH_BUFFERED_BYTES.fetch_sub(held, std::sync::atomic::Ordering::Relaxed);
+            prefetch_charge_sub(held);
         }
         self.ready.clear();
         self.inflight = None;
@@ -315,7 +371,7 @@ impl BlockPrefetcher {
         //    and nothing is in flight, submit the next window BEFORE the
         //    consumer walks the delivered block's rows.
         if let Some((sz, block)) = self.ready.pop_front() {
-            PREFETCH_BUFFERED_BYTES.fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
+            prefetch_charge_sub(sz as usize);
             self.on_delivered();
             if self.ready.is_empty() && self.inflight.is_none() {
                 self.maybe_submit_window();
@@ -340,8 +396,7 @@ impl BlockPrefetcher {
                 Err(e) => {
                     // The handle was already taken — release its inflight M3
                     // charge here (`terminate` only releases what it sees).
-                    PREFETCH_BUFFERED_BYTES
-                        .fetch_sub(handle.bytes, std::sync::atomic::Ordering::Relaxed);
+                    prefetch_charge_sub(handle.bytes);
                     self.terminate();
                     return Err(match e {
                         std::sync::mpsc::RecvTimeoutError::Disconnected => ForstError::internal(
@@ -369,8 +424,7 @@ impl BlockPrefetcher {
                     // Recurse once into the ready-serve path (never deeper:
                     // `ready` is now non-empty or the window was empty ⇒ EOF).
                     if let Some((sz, block)) = self.ready.pop_front() {
-                        PREFETCH_BUFFERED_BYTES
-                            .fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
+                        prefetch_charge_sub(sz as usize);
                         self.on_delivered();
                         return Ok(Some(block));
                     }
@@ -382,8 +436,7 @@ impl BlockPrefetcher {
                     // don't re-issue I/O on a known-bad region. The handle
                     // was already taken, so release its inflight charge here
                     // (`terminate` only releases what it can still see).
-                    PREFETCH_BUFFERED_BYTES
-                        .fetch_sub(handle.bytes, std::sync::atomic::Ordering::Relaxed);
+                    prefetch_charge_sub(handle.bytes);
                     self.terminate();
                     return Err(e);
                 }
@@ -473,11 +526,12 @@ impl BlockPrefetcher {
             let _ = tx.send(result);
         }));
         // M3 telemetry: charge the window at submit (released at delivery /
-        // failure / terminate / drop).
-        let agg = PREFETCH_BUFFERED_BYTES
-            .fetch_add(window_bytes as usize, std::sync::atomic::Ordering::Relaxed)
-            + window_bytes as usize;
+        // failure / terminate / drop). The aggregate (shard sum) is only
+        // materialized when diag is on — the hot path does one Relaxed RMW
+        // on this thread's own shard line.
+        prefetch_charge_add(window_bytes as usize);
         if prefetch_diag() {
+            let agg = prefetch_buffered_bytes();
             eprintln!(
                 "[PREFETCH_DIAG] window submit blocks=[{start},{end}) bytes={window_bytes} aggregate_buffered={agg}"
             );
