@@ -158,6 +158,15 @@ struct Args {
     label: String,
     engine: String, // "frs" (default) | "rocksdb" (needs --features rocksdb-baseline)
     smoke: bool,
+    /// 2026-06-13 write-path survey cell (b): TTL-segment / FIFO-drop MODEL —
+    /// suppress tombstone deletes entirely (a time-segmented FIFO design never
+    /// writes per-key deletes; expiry = whole-segment drop). Combined with
+    /// FRS_L0_COMPACTION_TRIGGER=100000 (compaction off) this measures the
+    /// flush-only physical write floor of a drop-instead-of-compact engine.
+    no_deletes: bool,
+    /// 2026-06-13 write-path survey §5 cell: memtable-pressure dose —
+    /// override `EngineOptions::write_buffer_size` (MiB; 0 = engine default).
+    wbuf_mib: usize,
 }
 
 impl Args {
@@ -175,6 +184,8 @@ impl Args {
             label: String::from("default"),
             engine: String::from("frs"),
             smoke: false,
+            no_deletes: false,
+            wbuf_mib: 0,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -198,6 +209,8 @@ impl Args {
                 "--label" => a.label = take(&mut i),
                 "--engine" => a.engine = take(&mut i),
                 "--smoke" => a.smoke = true,
+                "--no-deletes" => a.no_deletes = true,
+                "--wbuf-mib" => a.wbuf_mib = take(&mut i).parse().unwrap(),
                 other => panic!("unknown arg {other}"),
             }
             i += 1;
@@ -304,10 +317,13 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
         inner: LocalFileSystem,
         written: Arc::clone(&written),
     });
-    let opts = EngineOptions {
+    let mut opts = EngineOptions {
         db_path: db_path.to_string_lossy().into_owned(),
         ..EngineOptions::default()
     };
+    if args.wbuf_mib > 0 {
+        opts.write_buffer_size = args.wbuf_mib * 1024 * 1024;
+    }
     let db = DbImpl::open_with_fs(opts, fs).expect("open");
     let cf = db.default_cf();
 
@@ -347,7 +363,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                 db.put(&cf, &key, &value).expect("put");
                 logical.fetch_add((key.len() + a.value_bytes) as u64, Ordering::Relaxed);
                 // TTL-ish delete: expire the row that fell out of the window
-                if seq >= a.window_rows {
+                if !a.no_deletes && seq >= a.window_rows {
                     let old = seq - a.window_rows;
                     let old_stream = if old.is_multiple_of(2) { b'a' } else { b'b' };
                     let old_key = make_key(old_stream, bucket_of(old, old_stream, a.buckets), old);
@@ -377,7 +393,11 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                     let bucket = rng.next() % a.buckets;
                     // probe the OPPOSITE stream of the bucket's parity — both
                     // get probed over time (interval join probes both sides)
-                    let stream = if rng.next().is_multiple_of(2) { b'a' } else { b'b' };
+                    let stream = if rng.next().is_multiple_of(2) {
+                        b'a'
+                    } else {
+                        b'b'
+                    };
                     let prefix = make_prefix(stream, bucket);
                     let t = Instant::now();
                     let entries = db.prefix_scan(&cf, &prefix).expect("probe");
@@ -554,7 +574,7 @@ fn one_run_rocksdb(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                 }
                 db.put_opt(&key, &value, &wo).expect("put");
                 logical.fetch_add((key.len() + a.value_bytes) as u64, Ordering::Relaxed);
-                if seq >= a.window_rows {
+                if !a.no_deletes && seq >= a.window_rows {
                     let old = seq - a.window_rows;
                     let old_stream = if old % 2 == 0 { b'a' } else { b'b' };
                     let old_key = make_key(old_stream, bucket_of(old, old_stream, a.buckets), old);
