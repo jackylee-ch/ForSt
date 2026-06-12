@@ -35,5 +35,6 @@ pub mod memtable;
 pub mod merge_operator;
 pub mod sst;
 pub mod version;
+pub mod vlog;
 
 pub use iter::{IterChunk, NativeIter};
