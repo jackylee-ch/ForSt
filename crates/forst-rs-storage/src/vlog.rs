@@ -110,6 +110,9 @@ pub struct VlogWriter {
     file: Box<dyn forst_rs_io::WritableFile>,
     segment_id: u64,
     offset: u64,
+    /// FRS-WA-V2b: payload bytes appended (excludes record headers) — the
+    /// initial `live_bytes` of the segment's manifest entry.
+    payload_bytes: u64,
 }
 
 impl VlogWriter {
@@ -122,6 +125,7 @@ impl VlogWriter {
             file,
             segment_id,
             offset: 0,
+            payload_bytes: 0,
         })
     }
 
@@ -139,7 +143,14 @@ impl VlogWriter {
         self.file.append(&crc32c(value).to_le_bytes())?;
         self.file.append(value)?;
         self.offset += (VLOG_RECORD_HEADER + value.len()) as u64;
+        self.payload_bytes += value.len() as u64;
         Ok(ptr)
+    }
+
+    /// FRS-WA-V2b: payload bytes appended so far (excludes headers) — the
+    /// segment's initial manifest `live_bytes`.
+    pub fn payload_bytes(&self) -> u64 {
+        self.payload_bytes
     }
 
     /// Bytes appended so far (the segment-roll threshold input).

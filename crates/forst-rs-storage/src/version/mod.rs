@@ -109,6 +109,18 @@ pub struct VlogSegmentMeta {
     pub cf_id: ColumnFamilyId,
     /// Size in bytes at seal time (segments are append-once / immutable).
     pub file_size: u64,
+    /// FRS-WA-V2b (vlog GC): bytes of PAYLOAD still referenced by a live
+    /// pointer row somewhere in the key-LSM. Set to the appended payload
+    /// total at flush; decremented by compaction `vlog_freed` deltas
+    /// whenever a pointer row is dropped (shadowed/tombstoned) or relocated.
+    /// `0` ⇒ no live pointer references the segment and it is reclaimable
+    /// whole (subject to the same pin/retiring-version guards as SSTs).
+    /// EXACTNESS: every flushed pointer row contributes its payload length
+    /// exactly once and is decremented exactly once (when THAT row leaves
+    /// the LSM), so 0 is reached only when truly dead — over-estimation
+    /// (e.g. the opt-in parallel compaction path skips accounting) delays
+    /// reclaim but never causes premature deletion.
+    pub live_bytes: u64,
 }
 
 /// Metadata for a single LSM-tree level.
@@ -549,6 +561,12 @@ impl Version {
         if !edit.new_vlog_segments.is_empty() {
             new_vlogs.sort_by_key(|s| s.segment_id);
         }
+        // FRS-WA-V2b: apply per-segment freed-byte deltas (saturating).
+        for &(seg_id, freed) in &edit.vlog_freed {
+            if let Some(s) = new_vlogs.iter_mut().find(|s| s.segment_id == seg_id) {
+                s.live_bytes = s.live_bytes.saturating_sub(freed);
+            }
+        }
 
         Ok(Version::from_levels_and_vlogs(new_levels, new_vlogs))
     }
@@ -971,6 +989,11 @@ pub struct VersionEdit {
     pub new_vlog_segments: Vec<VlogSegmentMeta>,
     /// FRS-WA-V2a-2: value-log segments to remove (V2b GC), by segment id.
     pub deleted_vlog_segments: Vec<u64>,
+    /// FRS-WA-V2b: per-segment `(segment_id, payload_bytes)` freed by this
+    /// edit's compaction (pointer rows dropped or relocated). Applied as a
+    /// SATURATING decrement of [`VlogSegmentMeta::live_bytes`]; unknown ids
+    /// are tolerated (the segment may already be gone).
+    pub vlog_freed: Vec<(u64, u64)>,
 }
 
 /// R49-H2: a single column family's identity, persisted in the checkpoint
@@ -1275,6 +1298,7 @@ mod tests {
             segment_id: id,
             cf_id: DEFAULT_CF_ID,
             file_size: size,
+            live_bytes: size,
         };
         let v = Version::new();
         assert!(v.vlog_segments.is_empty(), "fresh version has no vlogs");
@@ -1320,6 +1344,46 @@ mod tests {
             })
             .unwrap();
         assert_eq!(v4.vlog_segments, vec![seg(7, 100)]);
+    }
+
+    /// FRS-WA-V2b (vlog GC): `vlog_freed` deltas decrement per-segment
+    /// `live_bytes` (saturating — over-free is a bug elsewhere but must not
+    /// wrap), unknown segment ids are tolerated (the segment may already be
+    /// gone), and `file_size` is untouched (it is the on-disk size; only
+    /// liveness shrinks).
+    #[test]
+    fn test_wa_v2b_version_edit_vlog_freed_decrements_live_bytes() {
+        let seg = VlogSegmentMeta {
+            segment_id: 5,
+            cf_id: DEFAULT_CF_ID,
+            file_size: 1000,
+            live_bytes: 900,
+        };
+        let v = Version::new()
+            .apply_edit(&VersionEdit {
+                new_vlog_segments: vec![seg],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Partial free.
+        let v2 = v
+            .apply_edit(&VersionEdit {
+                vlog_freed: vec![(5, 300), (999, 50)], // 999 = unknown, tolerated
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(v2.vlog_segments[0].live_bytes, 600);
+        assert_eq!(v2.vlog_segments[0].file_size, 1000, "file_size untouched");
+
+        // Saturating free past zero.
+        let v3 = v2
+            .apply_edit(&VersionEdit {
+                vlog_freed: vec![(5, 10_000)],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(v3.vlog_segments[0].live_bytes, 0, "saturating, no wrap");
     }
 
     #[test]

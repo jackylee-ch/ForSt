@@ -824,6 +824,10 @@ pub struct DbImpl {
     /// alongside segment deletion). Default path (no KV separation) never
     /// touches it.
     vlog_readers: RwLock<HashMap<u64, Arc<forst_rs_storage::vlog::VlogReader>>>,
+    /// FRS-WA-V2b: vlog segments whose reclaim was deferred by a deletion-
+    /// guard pin or a retiring-version reference (sister of
+    /// `pending_deletions`); drained by `reap_pending_deletions`.
+    pending_vlog_deletions: Mutex<Vec<u64>>,
     /// FRS-PHASE2-S1 (2026-06-13 design §2): optional file-mapping /
     /// ownership layer (UFS-equivalent: logical→physical mapping +
     /// refcounts, hard-link semantics over object stores). `None` by
@@ -1112,6 +1116,7 @@ impl DbImpl {
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
             vlog_readers: RwLock::new(HashMap::new()),
+            pending_vlog_deletions: Mutex::new(Vec::new()),
             file_mapping: std::sync::OnceLock::new(),
             sequence_number: AtomicU64::new(0),
             write_controller: Arc::new(WriteController::new(wc_config)),
@@ -1938,11 +1943,21 @@ impl DbImpl {
                     }
                 }
             }
-            if deleted_files.is_empty() {
+            // FRS-WA-V2b: the dropped CF's vlog segments go with its SSTs
+            // (segments are per-CF; without this they would leak forever —
+            // no compaction ever runs for a dropped CF to zero them out).
+            let deleted_vlogs: Vec<u64> = current_version
+                .vlog_segments
+                .iter()
+                .filter(|s| s.cf_id == cf_id_to_drop)
+                .map(|s| s.segment_id)
+                .collect();
+            if deleted_files.is_empty() && deleted_vlogs.is_empty() {
                 break;
             }
             let edit = VersionEdit {
                 deleted_files: deleted_files.clone(),
+                deleted_vlog_segments: deleted_vlogs.clone(),
                 ..Default::default()
             };
             match self.version_set.apply(&edit) {
@@ -1958,6 +1973,13 @@ impl DbImpl {
                     }
                     for (_, file_number) in &deleted_files {
                         self.delete_file_guarded(*file_number);
+                    }
+                    for segment_id in &deleted_vlogs {
+                        self.vlog_readers
+                            .write()
+                            .expect("lock poisoned")
+                            .remove(segment_id);
+                        self.delete_vlog_guarded(*segment_id);
                     }
                     self.reap_pending_deletions();
                     // Re-walk once more to catch a concurrent flush
@@ -3957,6 +3979,8 @@ impl DbImpl {
             fs: self.fs.clone(),
             merge_operator: cf_data.merge_operator().cloned(),
             compaction_filter: cf_data.compaction_filter(),
+            // FRS-WA-V2b: lifecycle CFs never separate values — no GC.
+            kv_gc: None,
             // Conservative: never drop tombstones here (lifecycle CFs write
             // ~none; per-CF bottommost analysis is not worth the risk).
             is_bottommost: false,
@@ -5043,6 +5067,7 @@ impl DbImpl {
             compaction_filter: cf_data.compaction_filter(),
             is_bottommost: true,
             min_active_snapshot,
+            kv_gc: self.kv_gc_spec_for_compaction(cf_data),
         };
 
         let Some(edit) = job.run()? else {
@@ -5065,8 +5090,21 @@ impl DbImpl {
                     );
                 }
             }
+            // FRS-WA-V2b: the relocation segment (if any) was never
+            // installed — drop the orphan file.
+            for seg in &edit.new_vlog_segments {
+                let _ = self.fs.delete_file(
+                    &forst_rs_storage::vlog::vlog_segment_path(
+                        Path::new(&self.db_path),
+                        seg.segment_id,
+                    ),
+                );
+            }
             return Err(e);
         }
+        // FRS-WA-V2b: freed deltas just applied — reclaim any segment that
+        // hit zero live bytes (whole-file delete, no rewrite).
+        let _ = self.kv_gc_reap_dead_segments();
 
         let new_meta = edit.new_files.first().map(|(_, m)| m.clone());
         for (_, meta) in &edit.new_files {
@@ -5477,6 +5515,7 @@ impl DbImpl {
             compaction_filter: cf_data.compaction_filter(),
             is_bottommost,
             min_active_snapshot,
+            kv_gc: self.kv_gc_spec_for_compaction(cf_data),
         };
 
         let Some(edit) = job.run()? else {
@@ -5507,8 +5546,19 @@ impl DbImpl {
                     );
                 }
             }
+            // FRS-WA-V2b: drop the never-installed relocation segment.
+            for seg in &edit.new_vlog_segments {
+                let _ = self.fs.delete_file(
+                    &forst_rs_storage::vlog::vlog_segment_path(
+                        Path::new(&self.db_path),
+                        seg.segment_id,
+                    ),
+                );
+            }
             return Err(e);
         }
+        // FRS-WA-V2b: reclaim segments whose live bytes hit zero.
+        let _ = self.kv_gc_reap_dead_segments();
 
         let new_meta = edit.new_files.first().map(|(_, m)| m.clone());
         for (_, meta) in &edit.new_files {
@@ -6299,6 +6349,7 @@ impl DbImpl {
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
             vlog_readers: RwLock::new(HashMap::new()),
+            pending_vlog_deletions: Mutex::new(Vec::new()),
             file_mapping: std::sync::OnceLock::new(),
             // D-R7-H1: A-R6-H3 patched the VersionSet seed but missed
             // this sibling — `DbImpl::sequence_number` is the source of
@@ -7799,6 +7850,7 @@ impl DbImpl {
             compaction_filter: cf_data.compaction_filter(),
             is_bottommost,
             min_active_snapshot,
+            kv_gc: self.kv_gc_spec_for_compaction(cf_data),
         };
 
         // FRS-COMPACT-PHASE-DIAG (FRS_COMPACT_DIAG=1): time the merge+local-write
@@ -7858,8 +7910,19 @@ impl DbImpl {
                     );
                 }
             }
+            // FRS-WA-V2b: drop the never-installed relocation segment.
+            for seg in &edit.new_vlog_segments {
+                let _ = self.fs.delete_file(
+                    &forst_rs_storage::vlog::vlog_segment_path(
+                        Path::new(&self.db_path),
+                        seg.segment_id,
+                    ),
+                );
+            }
             return Err(e);
         }
+        // FRS-WA-V2b: reclaim segments whose live bytes hit zero.
+        let _ = self.kv_gc_reap_dead_segments();
 
         // Open a reader for EVERY new output file, prune deleted readers, and
         // delete stale files from disk.
@@ -11418,6 +11481,124 @@ impl DbImpl {
         })
     }
 
+    /// FRS-WA-V2b: per-compaction vlog-GC directive. Armed whenever the CF
+    /// has live vlog segments (accounting is always wanted — it is the
+    /// reclaim trigger); the relocation set is the OLDEST
+    /// [`vlog_gc_age_cutoff_percent`] fraction of those segments (BlobDB's
+    /// `blob_garbage_collection_age_cutoff` precedent; segment ids are
+    /// allocation-ordered, so id order = age order). Cutoff 0 ⇒ accounting
+    /// only.
+    fn kv_gc_spec_for_compaction(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+    ) -> Option<crate::compaction::KvGcSpec> {
+        let cf_id = cf_data.handle().id();
+        let version = self.version_set.current();
+        let mut segs: Vec<u64> = version
+            .vlog_segments
+            .iter()
+            .filter(|s| s.cf_id == cf_id)
+            .map(|s| s.segment_id)
+            .collect();
+        if segs.is_empty() {
+            return None;
+        }
+        let cutoff = vlog_gc_age_cutoff_percent();
+        let relocate: std::collections::HashSet<u64> = if cutoff == 0 {
+            std::collections::HashSet::new()
+        } else {
+            segs.sort_unstable();
+            let take = ((segs.len() as u64 * u64::from(cutoff)).div_ceil(100)) as usize;
+            segs.into_iter().take(take).collect()
+        };
+        Some(crate::compaction::KvGcSpec {
+            relocate,
+            output_segment_id: self.version_set.allocate_file_number(),
+            db_dir: PathBuf::from(&self.db_path),
+        })
+    }
+
+    /// FRS-WA-V2b: reclaims every vlog segment whose `live_bytes` reached 0
+    /// — one VersionEdit removing them, then guarded physical deletes
+    /// (deletion-guard pins + retiring-version references defer exactly as
+    /// for SSTs). Called after compaction edits apply. Returns the count.
+    pub(crate) fn kv_gc_reap_dead_segments(&self) -> ForstResult<usize> {
+        let version = self.version_set.current();
+        let dead: Vec<u64> = version
+            .vlog_segments
+            .iter()
+            .filter(|s| s.live_bytes == 0)
+            .map(|s| s.segment_id)
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let edit = VersionEdit {
+            deleted_vlog_segments: dead.clone(),
+            ..Default::default()
+        };
+        self.version_set.apply(&edit)?;
+        for seg in &dead {
+            // Drop the cached reader BEFORE unlinking so a later (buggy)
+            // re-open cannot resurrect a stale handle by id.
+            self.vlog_readers
+                .write()
+                .expect("lock poisoned")
+                .remove(seg);
+            self.delete_vlog_guarded(*seg);
+        }
+        tracing::info!(
+            segments = dead.len(),
+            "FRS-WA-V2b: reclaimed dead vlog segments (no rewrite)"
+        );
+        Ok(dead.len())
+    }
+
+    /// FRS-WA-V2b: guarded vlog-segment delete — same pin/reference rules
+    /// as [`Self::delete_file_guarded`] (segment ids share the file-number
+    /// space and `referenced_file_numbers` covers vlog segments of current
+    /// + retiring versions).
+    fn delete_vlog_guarded(&self, segment_id: u64) {
+        let referenced = self.version_set.referenced_file_numbers();
+        if self.can_reclaim_file(FileNumber(segment_id), &referenced) {
+            self.delete_vlog_physical(segment_id);
+        } else {
+            self.pending_vlog_deletions
+                .lock()
+                .expect("lock poisoned")
+                .push(segment_id);
+        }
+    }
+
+    /// FRS-WA-V2b: physical vlog delete choke point — mirrors
+    /// [`Self::delete_sst_physical`]'s mapping-aware unlink (a segment
+    /// linked into a checkpoint namespace survives until refs hit 0).
+    fn delete_vlog_physical(&self, segment_id: u64) {
+        let path = forst_rs_storage::vlog::vlog_segment_path(
+            Path::new(&self.db_path),
+            segment_id,
+        );
+        if let Some(mgr) = self.file_mapping.get() {
+            if mgr.is_registered(&path) {
+                if let Err(e) = mgr.unlink(&path) {
+                    tracing::warn!(
+                        "delete_vlog_physical: unlink({}) failed: {}",
+                        path.display(),
+                        e
+                    );
+                }
+                return;
+            }
+        }
+        if let Err(e) = self.fs.delete_file(&path) {
+            tracing::warn!(
+                "delete_vlog_physical: delete_file({}) failed: {}",
+                path.display(),
+                e
+            );
+        }
+    }
+
     /// FRS-WA-V2a-2: cached open of a value-log segment reader. Segments
     /// are immutable once any pointer to them is version-visible, so a
     /// cached reader never goes stale.
@@ -12064,6 +12245,21 @@ impl DbImpl {
                 self.delete_sst_physical(file_number);
             } else {
                 still_pending.push(file_number);
+            }
+        }
+        *pending = still_pending;
+        drop(pending);
+        // FRS-WA-V2b: same deferred-reclaim drain for vlog segments.
+        let mut pending = self
+            .pending_vlog_deletions
+            .lock()
+            .expect("lock poisoned");
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for segment_id in pending.drain(..) {
+            if self.can_reclaim_file(FileNumber(segment_id), &referenced) {
+                self.delete_vlog_physical(segment_id);
+            } else {
+                still_pending.push(segment_id);
             }
         }
         *pending = still_pending;
@@ -13321,6 +13517,51 @@ pub fn kv_separation_enabled() -> bool {
             std::env::var("FRS_KV_SEPARATION").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE")
         )
+    })
+}
+
+/// FRS-WA-V2b test override for [`vlog_gc_age_cutoff_percent`]:
+/// `u32::MAX` = unset (env/default).
+static VLOG_GC_AGE_CUTOFF_OVERRIDE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// FRS-WA-V2b: forces the vlog-GC age cutoff (percent, clamped to 100) for
+/// tests/benches; `None` restores the `FRS_VLOG_GC_AGE_CUTOFF` env/default.
+pub fn set_vlog_gc_age_cutoff_override(v: Option<u32>) {
+    VLOG_GC_AGE_CUTOFF_OVERRIDE.store(
+        v.map_or(u32::MAX, |p| p.min(100)),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-WA-V2b vlog-GC age cutoff (`FRS_VLOG_GC_AGE_CUTOFF`, percent,
+/// **default 0 = relocation disabled**): when non-zero, each compaction
+/// relocates the live values of the OLDEST cutoff-fraction of the CF's
+/// vlog segments into a fresh segment (RocksDB BlobDB
+/// `blob_garbage_collection_age_cutoff` precedent), so mostly-dead old
+/// segments drain and reclaim whole. Dead-segment accounting + zero-rewrite
+/// reclaim runs REGARDLESS of the cutoff.
+///
+/// MEASURED default decision (2026-06-13 GC churn cell): on the q7-shaped
+/// streaming churn, deaths follow arrival order, so segments die WHOLE
+/// naturally — relocation at cutoff 25 only re-wrote rows that were about
+/// to die anyway, inflating write-amp 1.55 → ~3.1 while the footprint was
+/// already bounded by free reclaim. Same conclusion as RocksDB shipping
+/// `enable_blob_garbage_collection=false`. Opt in for mixed-lifetime
+/// (non-FIFO-death) value workloads.
+pub fn vlog_gc_age_cutoff_percent() -> u32 {
+    use std::sync::OnceLock;
+    let ov = VLOG_GC_AGE_CUTOFF_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != u32::MAX {
+        return ov;
+    }
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FRS_VLOG_GC_AGE_CUTOFF")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|v| v.min(100))
+            .unwrap_or(0)
     })
 }
 
@@ -15810,6 +16051,151 @@ mod tests {
             db.get(&cf, b"k").unwrap().as_deref(),
             Some(&b"sub-threshold"[..])
         );
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-WA-V2b (vlog GC, survey §6 stage V2 / §10.1 item 3b): space-amp
+    /// is BOUNDED — (a) a fully-shadowed segment is reclaimed by compaction
+    /// accounting alone (live_bytes → 0 ⇒ whole-file delete, no rewrite);
+    /// (b) age-cutoff relocation rewrites the few LIVE values out of old
+    /// segments so they too reclaim; (c) PREMATURE-RECLAIM FALSIFIER: a
+    /// segment with any live pointer survives and every read stays
+    /// byte-exact throughout.
+    #[test]
+    fn test_wa_v2b_vlog_gc_reclaim_relocation_and_falsifier() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        // Relocation OFF first — isolate pure dead-segment reclaim.
+        set_vlog_gc_age_cutoff_override(Some(0));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("gc"))
+            .unwrap();
+        let key = |i: u64| format!("k{i:04}").into_bytes();
+        let val = |i: u64, tag: u8| -> Vec<u8> { vec![tag ^ (i as u8); 300] };
+
+        // Segment A: 64 separated values; segment B: overwrite ALL of them.
+        for i in 0..64 {
+            db.put(&cf, &key(i), &val(i, 1)).unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        for i in 0..64 {
+            db.put(&cf, &key(i), &val(i, 2)).unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        // NOTE: snapshot the segment table WITHOUT retaining the Version Arc
+        // — a held Version is a "retiring reader" that (correctly) defers
+        // physical segment deletion, which is exactly what (a) asserts.
+        let segs = |db: &Arc<DbImpl>| -> Vec<forst_rs_storage::version::VlogSegmentMeta> {
+            db.version_set.current().vlog_segments.clone()
+        };
+        let s0 = segs(&db);
+        assert_eq!(s0.len(), 2);
+        let seg_a = s0[0].segment_id;
+        let seg_b = s0[1].segment_id;
+        assert!(s0.iter().all(|s| s.live_bytes > 0));
+        drop(s0);
+
+        // (a) Full compaction: every A-pointer row is shadowed ⇒ A's
+        // live_bytes hits 0 ⇒ A reclaimed whole (no rewrite); B survives.
+        db.compact_all().unwrap();
+        assert_eq!(
+            segs(&db).iter().map(|s| s.segment_id).collect::<Vec<_>>(),
+            vec![seg_b],
+            "fully-shadowed segment must be reclaimed; live segment retained"
+        );
+        // (Physical deletion is asserted at the END: CF snapshot views pin
+        // pre-compaction Versions until the next refresh — the deferral via
+        // pending_vlog_deletions is the same discipline as SST reclaim.)
+        for i in 0..64 {
+            assert_eq!(
+                db.get(&cf, &key(i)).unwrap().as_deref(),
+                Some(&val(i, 2)[..]),
+                "byte-exact after reclaim (key {i})"
+            );
+        }
+
+        // (c) FALSIFIER: overwrite only HALF the keys ⇒ B keeps 32 live
+        // pointers ⇒ B must survive the next compaction; all reads exact.
+        for i in 0..32 {
+            db.put(&cf, &key(i), &val(i, 3)).unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        db.compact_all().unwrap();
+        assert!(
+            segs(&db).iter().any(|s| s.segment_id == seg_b),
+            "segment with live pointers must NOT be reclaimed"
+        );
+        for i in 0..32 {
+            assert_eq!(
+                db.get(&cf, &key(i)).unwrap().as_deref(),
+                Some(&val(i, 3)[..])
+            );
+        }
+        for i in 32..64 {
+            assert_eq!(
+                db.get(&cf, &key(i)).unwrap().as_deref(),
+                Some(&val(i, 2)[..])
+            );
+        }
+
+        // (b) Age-cutoff relocation: with every segment eligible, the next
+        // compaction REWRITES B's 32 surviving values into a fresh segment
+        // and B reclaims. Reads stay byte-exact through the relocation.
+        // (compact_range drives the full cascade INCLUDING the bottommost
+        // rewrite — relocation is compaction-coupled, never standalone, and
+        // seg_b's surviving rows live at the bottom level.)
+        set_vlog_gc_age_cutoff_override(Some(100));
+        db.put(&cf, b"k9999-fresh", &val(99, 4)).unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        db.compact_range(&cf).unwrap();
+        let s_after = segs(&db);
+        assert!(
+            s_after.iter().all(|s| s.segment_id != seg_b),
+            "relocation must drain + reclaim the old segment"
+        );
+        assert!(
+            !s_after.is_empty(),
+            "relocated values live in a fresh segment"
+        );
+        assert!(s_after.iter().all(|s| s.live_bytes > 0));
+        for i in 0..32 {
+            assert_eq!(
+                db.get(&cf, &key(i)).unwrap().as_deref(),
+                Some(&val(i, 3)[..])
+            );
+        }
+        for i in 32..64 {
+            assert_eq!(
+                db.get(&cf, &key(i)).unwrap().as_deref(),
+                Some(&val(i, 2)[..])
+            );
+        }
+        let rows = db.prefix_scan(&cf, b"k").unwrap();
+        assert_eq!(
+            rows.len(),
+            65, // 64 originals + the k9999-fresh delta key
+            "scan sees every key after relocation"
+        );
+
+        // Physical reclaim: refresh the CF's snapshot view (it pins the
+        // pre-compaction Version) via one more write+flush, then drain the
+        // deferred deletions — both reclaimed segment FILES must be gone.
+        db.put(&cf, b"zz-refresh", b"x").unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        db.reap_pending_deletions();
+        for seg in [seg_a, seg_b] {
+            let path = forst_rs_storage::vlog::vlog_segment_path(
+                std::path::Path::new(&db.options.db_path),
+                seg,
+            );
+            assert!(
+                !db.fs.file_exists(&path).unwrap(),
+                "reclaimed segment {seg} file must be deleted after view refresh + reap"
+            );
+        }
+
+        set_vlog_gc_age_cutoff_override(None);
         set_kv_separation_override(None);
     }
 
@@ -21468,6 +21854,7 @@ mod tests {
             compaction_filter: None,
             is_bottommost: true,
             min_active_snapshot: SequenceNumber(u64::MAX),
+            kv_gc: None,
         };
         let err = job
             .run()

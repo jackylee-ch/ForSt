@@ -357,6 +357,9 @@ impl FlushJob {
                 segment_id: spec.segment_id.value(),
                 cf_id: self.cf_id,
                 file_size: w.size(),
+                // FRS-WA-V2b: every appended payload byte starts live
+                // (exactly one pointer row per append in this SST).
+                live_bytes: w.payload_bytes(),
             }),
             _ => None,
         };

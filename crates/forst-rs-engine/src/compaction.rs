@@ -97,6 +97,131 @@ pub struct CompactionJob {
     /// spec §6a.5. Pass `SequenceNumber(u64::MAX)` when there are no
     /// snapshots, which lets the consolidation logic run unconstrained.
     pub min_active_snapshot: SequenceNumber,
+    /// FRS-WA-V2b (vlog GC): when armed, this compaction (a) accounts every
+    /// dropped/relocated BlobRef row's payload bytes into the returned
+    /// edit's `vlog_freed` deltas, and (b) RELOCATES surviving BlobRef rows
+    /// whose segment is in `relocate` into a fresh segment (BlobDB
+    /// age-cutoff GC). `None` = no accounting, no relocation — segments are
+    /// retained conservatively (the V2a-2 behaviour). Only the DEFAULT
+    /// streaming merge honors this; the opt-in parallel path skips it
+    /// (over-retention only, never premature reclaim).
+    pub kv_gc: Option<KvGcSpec>,
+}
+
+/// FRS-WA-V2b: vlog-GC directive for one compaction (built by
+/// `DbImpl::kv_gc_spec_for`).
+#[derive(Debug, Clone)]
+pub struct KvGcSpec {
+    /// Segment ids eligible for relocation (the oldest age-cutoff fraction
+    /// of the CF's live segments). Empty = accounting only, no rewrites.
+    pub relocate: std::collections::HashSet<u64>,
+    /// Pre-allocated id for the relocation output segment (created lazily;
+    /// unused when nothing relocates).
+    pub output_segment_id: FileNumber,
+    /// Engine db dir (vlog segments live at its root).
+    pub db_dir: PathBuf,
+}
+
+/// FRS-WA-V2b: per-job vlog-GC working state (freed-byte deltas + the lazy
+/// relocation writer/readers). Threaded `&mut` through the streaming merge.
+#[derive(Default)]
+struct KvGcState {
+    /// payload bytes freed per source segment id.
+    freed: std::collections::HashMap<u64, u64>,
+    /// Lazy relocation output writer.
+    out: Option<forst_rs_storage::vlog::VlogWriter>,
+    /// Lazily-opened readers for relocation sources.
+    readers: std::collections::HashMap<u64, forst_rs_storage::vlog::VlogReader>,
+}
+
+impl KvGcState {
+    /// Group pre-pass: every input BlobRef row's payload provisionally
+    /// counts as freed; rows the merge KEEPS verbatim subtract back via
+    /// [`Self::unfree`]. Relocated rows stay counted (their bytes left the
+    /// source segment).
+    fn note_input(&mut self, versions: &[CompactionEntry]) -> ForstResult<()> {
+        for v in versions {
+            if v.op_type == forst_rs_common::OpType::BlobRef {
+                let ptr = Self::decode_ptr(v.value.as_deref())?;
+                *self.freed.entry(ptr.segment_id).or_insert(0) += u64::from(ptr.len);
+            }
+        }
+        Ok(())
+    }
+
+    fn unfree(&mut self, segment_id: u64, len: u32) {
+        if let Some(b) = self.freed.get_mut(&segment_id) {
+            *b = b.saturating_sub(u64::from(len));
+            if *b == 0 {
+                self.freed.remove(&segment_id);
+            }
+        }
+    }
+
+    fn decode_ptr(
+        bytes: Option<&[u8]>,
+    ) -> ForstResult<forst_rs_storage::vlog::ValuePointer> {
+        let bytes = bytes.ok_or_else(|| {
+            ForstError::corruption("compaction: BlobRef row missing pointer payload")
+        })?;
+        forst_rs_storage::vlog::ValuePointer::decode(bytes).ok_or_else(|| {
+            ForstError::corruption("compaction: BlobRef row carries malformed pointer bytes")
+        })
+    }
+
+    /// Relocates one value: deref from the source segment, append to the
+    /// (lazily-created) output segment, return the new pointer bytes.
+    fn relocate(
+        &mut self,
+        spec: &KvGcSpec,
+        fs: &dyn forst_rs_io::FileSystem,
+        ptr: &forst_rs_storage::vlog::ValuePointer,
+    ) -> ForstResult<[u8; forst_rs_storage::vlog::VALUE_POINTER_LEN]> {
+        use std::collections::hash_map::Entry;
+        let reader = match self.readers.entry(ptr.segment_id) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(forst_rs_storage::vlog::VlogReader::open(
+                fs,
+                &spec.db_dir,
+                ptr.segment_id,
+            )?),
+        };
+        let value = reader.get(ptr)?;
+        if self.out.is_none() {
+            self.out = Some(forst_rs_storage::vlog::VlogWriter::create(
+                fs,
+                &spec.db_dir,
+                spec.output_segment_id.value(),
+            )?);
+        }
+        let w = self.out.as_mut().expect("relocation writer just ensured");
+        Ok(w.append(&value)?.encode())
+    }
+
+    /// Folds the GC results into `edit`: freed deltas + (if relocation ran)
+    /// the synced output segment. Returns the edit.
+    fn finish_into(
+        mut self,
+        mut edit: VersionEdit,
+        spec: Option<&KvGcSpec>,
+        cf_id: ColumnFamilyId,
+    ) -> ForstResult<VersionEdit> {
+        if let Some(mut w) = self.out.take() {
+            w.sync()?;
+            let spec = spec.expect("relocation ran ⇒ spec armed");
+            edit.new_vlog_segments
+                .push(forst_rs_storage::version::VlogSegmentMeta {
+                    segment_id: spec.output_segment_id.value(),
+                    cf_id,
+                    file_size: w.size(),
+                    live_bytes: w.payload_bytes(),
+                });
+        }
+        let mut freed: Vec<(u64, u64)> = self.freed.into_iter().collect();
+        freed.sort_unstable();
+        edit.vlog_freed = freed;
+        Ok(edit)
+    }
 }
 
 impl CompactionJob {
@@ -165,6 +290,16 @@ impl CompactionJob {
         // vector by index range and so cannot stream.
         if !compaction_parallel_env() {
             return self.run_streaming();
+        }
+        // FRS-WA-V2b: the opt-in parallel path performs NO vlog-GC
+        // accounting/relocation (sub-compactions would need per-partition
+        // state merging). Consequence is over-retention only — segments
+        // reclaim later, never prematurely. Make that visible.
+        if self.kv_gc.is_some() {
+            tracing::debug!(
+                "FRS-WA-V2b: FRS_COMPACT_PARALLEL skips vlog-GC accounting \
+                 for this job (conservative over-retention)"
+            );
         }
 
         // R49-H1 defense-in-depth, promoted to a HARD error (OPT-N04 E1):
@@ -236,6 +371,7 @@ impl CompactionJob {
                 last_sequence: last_seq,
                 new_vlog_segments: Vec::new(),
                 deleted_vlog_segments: Vec::new(),
+                vlog_freed: Vec::new(),
             }));
         }
 
@@ -450,7 +586,7 @@ impl CompactionJob {
                             // Versions for this key, newest first.
                             let versions = &all[i..key_end];
                             i = key_end;
-                            self.emit_key_versions(&mut writer, versions, &mut file_emitted)?;
+                            self.emit_key_versions(&mut writer, versions, &mut file_emitted, &mut None)?;
                             // Roll to the next slot at this user-key boundary when
                             // the file has content, splitting is enabled, we are NOT
                             // on the final slot, the file reached target, and keys
@@ -554,6 +690,7 @@ impl CompactionJob {
                 last_sequence: last_seq,
                 new_vlog_segments: Vec::new(),
                 deleted_vlog_segments: Vec::new(),
+                vlog_freed: Vec::new(),
             }));
         }
 
@@ -602,6 +739,7 @@ impl CompactionJob {
             last_sequence: last_seq,
             new_vlog_segments: Vec::new(),
             deleted_vlog_segments: Vec::new(),
+            vlog_freed: Vec::new(),
         }))
     }
 
@@ -692,6 +830,7 @@ impl CompactionJob {
                 last_sequence: last_seq,
                 new_vlog_segments: Vec::new(),
                 deleted_vlog_segments: Vec::new(),
+                vlog_freed: Vec::new(),
             }));
         }
 
@@ -726,7 +865,12 @@ impl CompactionJob {
         let fast_eligible =
             self.compaction_filter.is_none() && self.min_active_snapshot.0 == u64::MAX;
 
+        // FRS-WA-V2b: vlog-GC working state (None = unarmed; the legacy /
+        // parallel paths never arm it).
+        let mut gc_holder: Option<KvGcState> =
+            self.kv_gc.as_ref().map(|_| KvGcState::default());
         let write_outcome: ForstResult<()> = (|| {
+            let gc_state = &mut gc_holder;
             while !heap.is_empty() {
                 let last_slot = slot_idx + 1 >= slots.len();
                 let (cur_fnum, cur_path) = slots[slot_idx].clone();
@@ -774,8 +918,22 @@ impl CompactionJob {
                                 file_emitted += 1;
                                 // Drain (drop) every shadowed version of cur_key
                                 // across all members, then re-push their next key.
+                                // FRS-WA-V2b: a drained BlobRef row's payload
+                                // bytes are freed (the newest Put shadows it).
                                 for &i in &members {
                                     while cursors[i].valid() && cursors[i].key() == cur_key {
+                                        if let Some(gc) = gc_state.as_mut() {
+                                            if cursors[i].op_type()
+                                                == forst_rs_common::OpType::BlobRef
+                                            {
+                                                let ptr = KvGcState::decode_ptr(
+                                                    cursors[i].value(),
+                                                )?;
+                                                *gc.freed
+                                                    .entry(ptr.segment_id)
+                                                    .or_insert(0) += u64::from(ptr.len);
+                                            }
+                                        }
                                         cursors[i].advance()?;
                                     }
                                     if cursors[i].valid() {
@@ -813,7 +971,7 @@ impl CompactionJob {
                             }
                             // Newest-first within the key (index 0 = newest).
                             group.sort_by_key(|b| std::cmp::Reverse(b.effective_seq()));
-                            self.emit_key_versions(&mut writer, &group, &mut file_emitted)?;
+                            self.emit_key_versions(&mut writer, &group, &mut file_emitted, gc_state)?;
                         }
 
                         // Roll to the next slot at this user-key boundary once the
@@ -901,6 +1059,20 @@ impl CompactionJob {
                 agg.prefetched_bytes,
             );
         }
+        if write_outcome.is_err() {
+            // FRS-WA-V2b: the job died — no pointer into the (partial)
+            // relocation segment was ever published; drop the file.
+            if let (Some(spec), Some(gc)) = (self.kv_gc.as_ref(), gc_holder.as_ref()) {
+                if gc.out.is_some() {
+                    let _ = self.fs.delete_file(
+                        &forst_rs_storage::vlog::vlog_segment_path(
+                            &spec.db_dir,
+                            spec.output_segment_id.value(),
+                        ),
+                    );
+                }
+            }
+        }
         write_outcome?;
 
         // Zero-emit across all slots (e.g. all bottommost tombstones).
@@ -912,7 +1084,7 @@ impl CompactionJob {
                 .max()
                 .unwrap_or(0);
             let last_seq = (max_in_seq > 0).then_some(SequenceNumber(max_in_seq));
-            return Ok(Some(VersionEdit {
+            let edit = VersionEdit {
                 deleted_files: self
                     .inputs
                     .iter()
@@ -923,7 +1095,14 @@ impl CompactionJob {
                 last_sequence: last_seq,
                 new_vlog_segments: Vec::new(),
                 deleted_vlog_segments: Vec::new(),
-            }));
+                vlog_freed: Vec::new(),
+            };
+            // FRS-WA-V2b: every input row was dropped — fold the freed
+            // accounting (no relocation can have run: nothing emitted).
+            return match gc_holder {
+                Some(gc) => Ok(Some(gc.finish_into(edit, self.kv_gc.as_ref(), self.cf_id)?)),
+                None => Ok(Some(edit)),
+            };
         }
 
         // FRS-WA-V1: outputs inherit the inputs' death stamp.
@@ -954,14 +1133,20 @@ impl CompactionJob {
             .map(|(lvl, m, _)| (*lvl, m.file_number))
             .collect();
         let last_seq = (max_out_seq > 0).then_some(SequenceNumber(max_out_seq));
-        Ok(Some(VersionEdit {
+        let edit = VersionEdit {
             new_files,
             deleted_files: deleted,
             next_file_number: None,
             last_sequence: last_seq,
             new_vlog_segments: Vec::new(),
             deleted_vlog_segments: Vec::new(),
-        }))
+            vlog_freed: Vec::new(),
+        };
+        // FRS-WA-V2b: fold freed deltas + the relocation output segment.
+        match gc_holder {
+            Some(gc) => Ok(Some(gc.finish_into(edit, self.kv_gc.as_ref(), self.cf_id)?)),
+            None => Ok(Some(edit)),
+        }
     }
 
     /// FRS-COMPACT-PARALLEL (2026-06-05): emit ONE output SST covering the
@@ -1004,7 +1189,7 @@ impl CompactionJob {
                 };
                 let versions = &all[i..key_end];
                 i = key_end;
-                self.emit_key_versions(&mut writer, versions, &mut file_emitted)?;
+                self.emit_key_versions(&mut writer, versions, &mut file_emitted, &mut None)?;
             }
             if file_emitted == 0 {
                 drop(writer);
@@ -1047,16 +1232,63 @@ impl CompactionJob {
         }
     }
 
+    /// FRS-WA-V2b: emits one verbatim [`CompactionEntry`], intercepting
+    /// BlobRef rows for GC — a row whose segment is relocation-eligible has
+    /// its value rewritten into the job's output segment (new pointer
+    /// emitted at the SAME seq/op — MVCC-neutral, the bytes are identical
+    /// after deref); a kept row subtracts its provisional `note_input`
+    /// freed-count back. With `gc = None` (legacy/parallel paths, or no
+    /// armed spec) this is exactly the old `writer.add` + count.
+    fn emit_entry<W>(
+        &self,
+        writer: &mut StreamingSstWriter<'_, W>,
+        v: &CompactionEntry,
+        emitted: &mut u64,
+        gc: &mut Option<KvGcState>,
+    ) -> ForstResult<()>
+    where
+        W: WritableFile + ?Sized,
+    {
+        if v.op_type == forst_rs_common::OpType::BlobRef {
+            if let Some(gc) = gc.as_mut() {
+                let ptr = KvGcState::decode_ptr(v.value.as_deref())?;
+                if let Some(spec) = self.kv_gc.as_ref() {
+                    if spec.relocate.contains(&ptr.segment_id) {
+                        let new_ptr = gc.relocate(spec, self.fs.as_ref(), &ptr)?;
+                        writer.add(
+                            &v.key,
+                            Some(&new_ptr),
+                            v.sequence,
+                            forst_rs_common::OpType::BlobRef as u8,
+                        )?;
+                        *emitted += 1;
+                        return Ok(());
+                    }
+                }
+                gc.unfree(ptr.segment_id, ptr.len);
+            }
+        }
+        writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
+        *emitted += 1;
+        Ok(())
+    }
+
     fn emit_key_versions<W>(
         &self,
         writer: &mut StreamingSstWriter<'_, W>,
         versions: &[CompactionEntry],
         emitted: &mut u64,
+        gc: &mut Option<KvGcState>,
     ) -> ForstResult<()>
     where
         W: WritableFile + ?Sized,
     {
         debug_assert!(!versions.is_empty());
+        // FRS-WA-V2b: provisionally count every input BlobRef payload as
+        // freed; rows kept verbatim subtract back in `emit_entry`.
+        if let Some(gc) = gc.as_mut() {
+            gc.note_input(versions)?;
+        }
         // `versions` is sorted by sequence DESC — the newest version is at
         // index 0.
 
@@ -1113,8 +1345,7 @@ impl CompactionJob {
             ) {
                 continue;
             }
-            writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
-            *emitted += 1;
+            self.emit_entry(writer, v, emitted, gc)?;
             newer_emitted_for_key = true;
         }
 
@@ -1182,13 +1413,7 @@ impl CompactionJob {
                 || pinned.iter().any(|v| v.op_type == OpType::Merge);
             if need_floor {
                 for entry in tail.iter() {
-                    writer.add(
-                        &entry.key,
-                        entry.value.as_deref(),
-                        entry.sequence,
-                        entry.op_type as u8,
-                    )?;
-                    *emitted += 1;
+                    self.emit_entry(writer, entry, emitted, gc)?;
                     match entry.op_type {
                         // FRS-WA-V2a-1: BlobRef is Put-like — a terminal.
                         OpType::Put | OpType::Delete | OpType::SingleDelete | OpType::BlobRef => {
@@ -1337,14 +1562,9 @@ impl CompactionJob {
             // op_type as u8`), so the output entry still dereferences.
             OpType::Put | OpType::BlobRef => {
                 // Emit the Put (most recent value). Drop every older version
-                // for this key since they're shadowed.
-                writer.add(
-                    &newest.key,
-                    newest.value.as_deref(),
-                    newest.sequence,
-                    newest.op_type as u8,
-                )?;
-                *emitted += 1;
+                // for this key since they're shadowed. FRS-WA-V2b:
+                // `emit_entry` relocates/accounts a BlobRef newest.
+                self.emit_entry(writer, newest, emitted, gc)?;
             }
             OpType::Merge => {
                 // Walk backwards collecting merges until we hit a Put/Delete
@@ -1438,8 +1658,7 @@ impl CompactionJob {
                         // terminal Delete. The bottommost compaction
                         // will eventually do the collapse safely.
                         for v in versions {
-                            writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
-                            *emitted += 1;
+                            self.emit_entry(writer, v, emitted, gc)?;
                         }
                     } else {
                         // A-R12-H3: Merge-only chain at non-bottommost MUST
@@ -1455,8 +1674,7 @@ impl CompactionJob {
                         // no intermediate snapshot can land below it.
                         let _ = reversed;
                         for v in versions {
-                            writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
-                            *emitted += 1;
+                            self.emit_entry(writer, v, emitted, gc)?;
                         }
                     }
                 } else {
@@ -1487,8 +1705,7 @@ impl CompactionJob {
                     }
                     let _ = stop_on_delete;
                     for v in versions {
-                        writer.add(&v.key, v.value.as_deref(), v.sequence, v.op_type as u8)?;
-                        *emitted += 1;
+                        self.emit_entry(writer, v, emitted, gc)?;
                     }
                 }
             }
@@ -1719,6 +1936,7 @@ mod tests {
             compaction_filter: None,
             is_bottommost: bottommost,
             min_active_snapshot: SequenceNumber(u64::MAX),
+            kv_gc: None,
         };
         let edit = job.run_streaming_with(window_blocks).unwrap().unwrap();
         assert!(!edit.new_files.is_empty(), "fixture must emit output");

@@ -316,6 +316,9 @@ struct Sample {
     l0: usize,
     files_per_level: Vec<usize>,
     live_bytes: u64,
+    /// FRS-WA-V2b: total on-disk bytes of *.vlog segments (the GC
+    /// space-amp gate: bounded vs unbounded growth).
+    vlog_bytes: u64,
     phys_write_bytes: u64,
     logical_bytes: u64,
     rows_written: u64,
@@ -326,6 +329,8 @@ struct Sample {
 
 struct RunSummary {
     write_amp: f64,
+    /// FRS-WA-V2b: last-sample vlog footprint (MiB).
+    last_vlog_mib: f64,
     rows_written: u64,
     logical_mib: f64,
     phys_mib: f64,
@@ -587,6 +592,17 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     while t0.elapsed().as_secs() < args.duration_s {
         std::thread::sleep(std::time::Duration::from_secs(args.sample_s));
         let live = db.list_live_files(false).expect("live files");
+        // FRS-WA-V2b: on-disk vlog footprint (kvsep cells; 0 otherwise).
+        let vlog_bytes: u64 = std::fs::read_dir(&db_path)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.path().extension().and_then(|x| x.to_str()) == Some("vlog")
+                    })
+                    .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                    .sum()
+            })
+            .unwrap_or(0);
         let max_level = live.iter().map(|f| f.level).max().unwrap_or(0) as usize;
         let mut per_level = vec![0usize; max_level + 1];
         for f in &live {
@@ -598,6 +614,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
             l0: *per_level.first().unwrap_or(&0),
             files_per_level: per_level,
             live_bytes: live.iter().map(|f| f.size).sum(),
+            vlog_bytes,
             phys_write_bytes: written.load(Ordering::Relaxed),
             logical_bytes: logical.load(Ordering::Relaxed),
             rows_written: rows.load(Ordering::Relaxed),
@@ -607,13 +624,14 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
         };
         println!(
             "{{\"sample\":1,\"label\":\"{}\",\"run\":{},\"t_s\":{:.0},\"files_per_level\":{:?},\
-             \"live_mib\":{:.0},\"phys_mib\":{:.0},\"logical_mib\":{:.0},\"wamp\":{:.2},\
+             \"live_mib\":{:.0},\"vlog_mib\":{:.0},\"phys_mib\":{:.0},\"logical_mib\":{:.0},\"wamp\":{:.2},\
              \"rows\":{},\"probe_n\":{},\"probe_p50_us\":{:.0},\"probe_p99_us\":{:.0}}}",
             args.label,
             run_idx,
             s.t_s,
             s.files_per_level,
             s.live_bytes as f64 / 1048576.0,
+            s.vlog_bytes as f64 / 1048576.0,
             s.phys_write_bytes as f64 / 1048576.0,
             s.logical_bytes as f64 / 1048576.0,
             s.phys_write_bytes as f64 / s.logical_bytes.max(1) as f64,
@@ -650,6 +668,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     let last = samples.last().cloned().unwrap_or_default();
     let summary = RunSummary {
         write_amp: last.phys_write_bytes as f64 / last.logical_bytes.max(1) as f64,
+        last_vlog_mib: last.vlog_bytes as f64 / 1048576.0,
         rows_written: last.rows_written,
         logical_mib: last.logical_bytes as f64 / 1048576.0,
         phys_mib: last.phys_write_bytes as f64 / 1048576.0,
@@ -863,6 +882,7 @@ fn one_run_rocksdb(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     let last = samples.last().cloned().unwrap_or_default();
     let summary = RunSummary {
         write_amp: last.phys_write_bytes as f64 / last.logical_bytes.max(1) as f64,
+        last_vlog_mib: 0.0,
         rows_written: last.rows_written,
         logical_mib: last.logical_bytes as f64 / 1048576.0,
         phys_mib: last.phys_write_bytes as f64 / 1048576.0,
@@ -948,7 +968,7 @@ fn main() {
     }
     println!(
         "MEDIANS label={} write_amp={:.2} p50_late_us={:.0} p99_late_us={:.0} \
-         p50_degradation={:.2}x last_l0={} (n={})",
+         p50_degradation={:.2}x last_l0={} vlog_mib={:.0} (n={})",
         args.label,
         median(summaries.iter().map(|s| s.write_amp).collect()),
         median(summaries.iter().map(|s| s.probe_p50_late_us).collect()),
@@ -960,6 +980,7 @@ fn main() {
                 .collect()
         ),
         median(summaries.iter().map(|s| s.last_l0 as f64).collect()) as u64,
+        median(summaries.iter().map(|s| s.last_vlog_mib).collect()),
         summaries.len()
     );
     if args.lifecycle {

@@ -69,6 +69,7 @@
 //! |     segment_id: u64 (LE)                 |
 //! |     cf_id: u32 (LE)                      |
 //! |     file_size: u64 (LE)                  |
+//! |     live_bytes: u64 (LE)                 |
 //! +------------------------------------------+
 //! | Footer (12 bytes)                        |
 //! |   checksum: u32 (CRC32C of all above)    |
@@ -109,7 +110,9 @@ const CHECKPOINT_MAGIC: &[u8; 4] = b"FRCP";
 ///   byte-identical to before. v1-v3 blobs decode with all four fields 0.
 /// * `5` — FRS-WA-V2a-2: appends a value-log segment table after the CF
 ///   descriptors (`num_vlog_segments: u32`, then per segment `segment_id:
-///   u64`, `cf_id: u32`, `file_size: u64`) so KV-separated value bytes are
+///   u64`, `cf_id: u32`, `file_size: u64`, `live_bytes: u64` — the V2b GC
+///   liveness counter, added in-branch before any v5 blob shipped, so no
+///   live_bytes-less v5 blob exists) so KV-separated value bytes are
 ///   checkpoint-addressable and restore re-adopts them. **Emitted ONLY when
 ///   at least one vlog segment is live**; v5 always carries the v3 per-file
 ///   and v4 per-CF fields (v5 ⊇ v4 ⊇ v3). No-kvsep snapshots keep
@@ -250,6 +253,7 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
             put_fixed64(&mut buf, seg.segment_id);
             put_fixed32(&mut buf, seg.cf_id.value());
             put_fixed64(&mut buf, seg.file_size);
+            put_fixed64(&mut buf, seg.live_bytes);
         }
     }
 
@@ -495,10 +499,13 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
             pos += n;
             let (file_size, n) = get_fixed64(&data[pos..])?;
             pos += n;
+            let (live_bytes, n) = get_fixed64(&data[pos..])?;
+            pos += n;
             segs.push(crate::version::VlogSegmentMeta {
                 segment_id,
                 cf_id: ColumnFamilyId(cf_raw),
                 file_size,
+                live_bytes,
             });
         }
         segs
@@ -758,11 +765,14 @@ mod tests {
                 segment_id: 9,
                 cf_id: ColumnFamilyId(3),
                 file_size: 12_345,
+                // FRS-WA-V2b: liveness rides the v5 table too.
+                live_bytes: 11_000,
             },
             VlogSegmentMeta {
                 segment_id: 11,
                 cf_id: forst_rs_common::DEFAULT_CF_ID,
                 file_size: 7,
+                live_bytes: 0,
             },
         ];
         let mut snap = make_snapshot(vec![(0, make_file(1, b"a", b"m"))]);

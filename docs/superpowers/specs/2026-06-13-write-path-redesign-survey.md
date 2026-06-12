@@ -640,6 +640,59 @@ without value rewrite). The ~0.2 over the 1.36 model is the assembled
 workload's tombstone+key bytes still riding the key-LSM cascade — V2b GC
 (item 3b) and the sorted-run lane own that residue.
 
+## 10.3 V2b delivery — vlog GC (2026-06-13, standing write-amp agent, cycle 2)
+
+§10.1 item 3b IMPLEMENTED (BlobDB-style, compaction-coupled — no standalone
+GC writer):
+
+- **Liveness accounting (the reclaim trigger)**: `VlogSegmentMeta.live_bytes`
+  (manifest v5; set to the appended payload total at flush) is decremented
+  by compaction `VersionEdit::vlog_freed` deltas — `emit_key_versions`
+  provisionally counts every input BlobRef payload as freed and subtracts
+  back rows it KEEPS verbatim (the streaming fast path accounts its drains
+  directly). EXACT by construction: each pointer row contributes once and
+  is decremented once, when THAT row leaves the LSM; the opt-in parallel
+  path skips accounting (over-retention only, never premature reclaim).
+- **Dead-segment reclaim**: after each compaction edit applies,
+  `kv_gc_reap_dead_segments` removes `live_bytes == 0` segments from the
+  version and deletes the files through the SAME guard discipline as SSTs
+  (`referenced_file_numbers` now covers vlog ids of current + retiring
+  versions; checkpoint pins defer via `pending_vlog_deletions`) — whole-file
+  delete, zero rewrite.
+- **Age-cutoff relocation** (`FRS_VLOG_GC_AGE_CUTOFF`, percent, **default
+  0 = off — measured decision below**): when enabled, each compaction
+  relocates surviving BlobRef rows whose segment is in the OLDEST cutoff
+  fraction (id order = allocation order = age) into a fresh segment — same
+  seq/op, MVCC-neutral — so mostly-dead old segments drain and reclaim.
+  Stale-edit rejects delete the orphan relocation segment; job failure
+  deletes the partial file.
+- **drop_cf** reclaims the dropped CF's segments with its SSTs (no
+  compaction ever runs for a dropped CF to zero them).
+- **Lifecycle segments**: nothing to do — lifecycle CFs are exempt from
+  separation (V2a-2 policy); their value bytes already expire whole via the
+  V1 watermark drop (the survey's "free" arm).
+
+Gates: space-amp bound UT
+(`test_wa_v2b_vlog_gc_reclaim_relocation_and_falsifier`: fully-shadowed
+segment reclaims with zero rewrite; live-pointer segment SURVIVES — the
+premature-reclaim falsifier; cutoff-100 relocation drains + reclaims with
+byte-exact reads throughout; physical deletes honor view/pin guards) + GC
+churn cell (3 × 90 s medians, same methodology):
+
+| Cell | write-amp | p50 late (µs) | vlog footprint (MiB, last; live window ≈ 870) | verdict |
+|---|---|---|---|---|
+| kvsep-v2a2-chunk (V2a-2, NO GC) | 1.55 | 635 | ~3 700 (unbounded: 18 M rows × 208 B all retained) | space-amp unbounded |
+| kvsep + GC, cutoff 25 (run 0 only) | 3.28 | 617 | 1 104 | bounded BUT relocation re-wrote rows that die naturally — **REJECTED as default** |
+| **kvsep-gc-v2b (GC default: cutoff 0)** | **1.58** | **649** (= 1.19×) | **903** (≈ 1.04× live) | **bounded ✓ at the V2a-2 write floor** (n=3, 200 K unthrottled) |
+
+**Measured default decision (relocation OFF)**: streaming churn deaths
+follow arrival order, so segments die WHOLE and the zero-rewrite reclaim
+alone bounds space-amp at ~1.1×; cutoff-25 relocation re-wrote
+soon-to-die rows, doubling write-amp (1.55 → ~3.1) for ~0 extra space —
+the same trade that has RocksDB ship `enable_blob_garbage_collection =
+false`. Relocation stays env-gated for mixed-lifetime value workloads
+(its correctness is pinned by the UT's cutoff-100 drain).
+
 ### 10.1 Remaining for "solved" (supersedes §9.3)
 
 1. V1 gate (c): remote q7 iostat A/B (≥3× write-volume cut) — needs the
@@ -648,7 +701,9 @@ workload's tombstone+key bytes still riding the key-LSM cascade — V2b GC
 3. ~~V2a-2: flag-gated flush-time separation~~ — **DONE 2026-06-13 cycle 2,
    §10.2** (both gates pass; flag stays DEFAULT OFF pending Flink adoption
    + remote A/B).
-3. V2b: BlobDB-style age-cutoff GC coupled to key-LSM compaction.
+3. ~~V2b: BlobDB-style age-cutoff GC~~ — **DONE 2026-06-13 cycle 2, §10.3**
+   (space-amp bounded ≈1.04× live at the V2a-2 write floor; relocation
+   env-gated OFF by measured decision).
 4. V3: link-compaction (disagg agent owns file_mapping.rs — public API
    only; Stage-2/3 of its lane landed 2026-06-13, the link/adopt surface
    V3 needs is now on forst-rs).
