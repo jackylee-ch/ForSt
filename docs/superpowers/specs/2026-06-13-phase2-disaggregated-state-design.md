@@ -537,6 +537,34 @@ admission is the load-bearing half; (3) **admission WITHOUT bg-exempt is an
 anti-config** (−51 pp): unexempted scan touches earn admission credit, their
 fills evict the hot set, and the thrash cap then permanently blocks the
 re-faulted HOT keys. Ops rule: `FRS_CACHE_ADMISSION` must ship with
-`FRS_CACHE_BG_EXEMPT`. Remaining Stage-5 scope: pluggable-policy trait
-formalization, admission-gated *background whole-file fill* scheduling
-(§4.1.1), q9/q20-class 10M cache-pressure soak (§5 Stage-5 IT).
+`FRS_CACHE_BG_EXEMPT`.
+
+**Follow-up unit (same session): batch-prefetch gating + engine-level
+cache-pressure IT.**
+
+- `prefetch_files_concurrent` (the engine's PER-BATCH warm,
+  `prefetch_sst_files_for_batch → prefetch_concurrent`) is a demand read in
+  disguise — under budget ≪ state, force-filling whole SSTs per batch IS the
+  thrash driver. It now consults `admit_read_fill` per miss when admission
+  is enabled (rejected paths simply aren't fetched; reads serve pass-through
+  at chunk granularity). Serial explicit warms (`ensure_cached`,
+  `prefetch_files`) keep force-admit. UT: 1st wave no-fill / 2nd wave fills.
+- **Stage-5 partial IT** (`crates/forst-rs-engine/tests/`
+  `cache_admission_pressure_it.rs`, fs-emulation memory://, 32 incompressible
+  ~128 KiB SSTs vs a 256 KiB cache budget, resident shadow clamped to 1 MiB):
+  (1) legacy default cell byte-exact across 3 get passes + batch_get with the
+  admission machinery provably inert — the 2026-05-31 q9 "state ≫ cache"
+  collapse shape as a correctness regression test; (2) admission cell
+  byte-exact + budget bound + gate ENGAGED by a checkpoint-staging-class
+  whole-file sweep (first-touch rejections, admitted ≤ rejected); (3)
+  cold-cache eviction regime (all write-through entries invalidated)
+  byte-exact via the reader remote-fallback paths.
+- **Coverage finding (recorded):** the engine opens SST readers EAGERLY at
+  flush time against the write-through copy, and post-eviction reads go
+  through `LocalFirstSstFile`'s direct remote fallback — neither is a cache
+  demand-FILL, so steady-state point reads never consult admission in the
+  current composition. Admission governs: staging/sequential whole-file
+  reads, chunk-path readers opened post-eviction (restore-class), and the
+  per-batch concurrent warm. The q9-class 10M soak on a real box remains
+  open Stage-5 scope, as does the §4.1.1 background-fill scheduler and the
+  pluggable-policy trait formalization.

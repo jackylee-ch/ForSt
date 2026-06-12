@@ -212,13 +212,26 @@ impl CachedFileSystem {
     /// so this is idempotent and races harmlessly with the on-demand read path.
     /// Reuses `fetch_through_cache` UNCHANGED — the short-read/size-verify and
     /// `await_upload` correctness logic is preserved verbatim.
+    ///
+    /// FRS-CACHE-ADMISSION: this warm is driven by the engine's BATCH READ
+    /// path (`prefetch_sst_files_for_batch`) on EVERY batch — a demand read
+    /// in disguise, not an operator-intended fill. Under a cache budget ≪
+    /// state, force-filling whole SSTs per batch is itself the thrash driver
+    /// (the 2026-05-31 q9 collapse shape). So when the admission policy is
+    /// enabled, each miss must EARN its whole-file fill via
+    /// [`LocalCache::admit_read_fill`] (count-to-promote ≈ ForSt's background
+    /// load-back); rejected paths are simply not fetched — the subsequent
+    /// read serves pass-through at chunk granularity. With the policy off
+    /// (default) `admit_read_fill` is always `true`: behavior unchanged.
+    /// The SERIAL explicit warms (`ensure_cached`, `prefetch_files`) keep
+    /// force-admit semantics (true caller-intended fills).
     pub fn prefetch_files_concurrent(&self, paths: &[&Path]) {
         // Pre-filter to misses so the warm-cache common case spawns no threads.
         let misses: Vec<&Path> = paths
             .iter()
             .copied()
             .filter(|p| match self.cache_key(p) {
-                Ok(k) => !self.cache.contains(k),
+                Ok(k) => !self.cache.contains(k) && self.cache.admit_read_fill(k),
                 Err(_) => false,
             })
             .collect();
@@ -1722,6 +1735,38 @@ mod tests {
         assert!(
             cache.contains("/db/warm.sst"),
             "explicit prefetch must force-admit on first touch"
+        );
+    }
+
+    #[test]
+    fn concurrent_prefetch_is_gated_by_admission() {
+        // The CONCURRENT warm is the engine's per-batch prefetch — a demand
+        // read in disguise. Under admission it must EARN the fill: the 1st
+        // wave is rejected (count 1 of 2), the 2nd wave admits. The SERIAL
+        // explicit warm (ensure_cached) stays force-admit (separate test).
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(
+            LocalCache::open_with_policy(tmp.path(), 1 << 20, admission_policy()).unwrap(),
+        );
+        let fs = CachedFileSystem::new(remote.clone(), cache.clone());
+
+        let a = PathBuf::from("/db/batch-a.sst");
+        let b = PathBuf::from("/db/batch-b.sst");
+        seed_remote(&remote, &a, b"aaaa");
+        seed_remote(&remote, &b, b"bbbb");
+
+        fs.prefetch_files_concurrent(&[a.as_path(), b.as_path()]);
+        assert!(
+            !cache.contains("/db/batch-a.sst") && !cache.contains("/db/batch-b.sst"),
+            "1st prefetch wave below the admission threshold must not fill"
+        );
+
+        fs.prefetch_files_concurrent(&[a.as_path(), b.as_path()]);
+        assert!(
+            cache.contains("/db/batch-a.sst") && cache.contains("/db/batch-b.sst"),
+            "2nd wave reaches count-to-promote and fills"
         );
     }
 
