@@ -2165,3 +2165,13 @@ env opt-in kept). r2b nodrain q9 confirmation run in flight (07:45:37).
 ROUND-3 NEXT: S2 flag-ON gate program (PMC §9, review-rounds/2026-06-12-pmc-
 review-s2.md) on the reverted tip — the q7 1.74× campaign's first full-stack
 measurement (micro: 9.2× deep fan-out, −30% churn scan).
+
+### ★★ r2b VERDICT: drain-off q9 = 2779.2s — drain only ~94s of the +450s; ~360s
+REMAINS from other r2 changes. Rows 91,813,195 (vs 372/396) ⇒ frs sink-sampling
+jitters like rdb ⇒ +24-row alarm DOWNGRADED to perf-only (src always exactly 98M).
+REGRESSION SUSPECTS (r1→r2 engine deltas, ranked): (1) M3 PREFETCH_BUFFERED_BYTES
+global AtomicUsize — per-window submit/claim/drop cross-core cacheline traffic in
+the hottest path; (2) E5 per-call OnceLock load on overlapping_ssts_in_range
+(millions of q9 scans × 8 threads); (3) H1 catch_unwind per pool job; (4) Java
+V1/V4 alloc fixes (timer path). Round-3 S2 program DEFERRED until rooted (a
+regressed tip pollutes all further A/B). Bisect: engine-swap vs jar-swap runs.
