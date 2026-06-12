@@ -250,7 +250,8 @@ fn create_cf_from_import_with_merge_rescale_round_trip_live_chain() {
 
     // (c) FUTURE merges fold against the imported Put base — the whole
     //     point of threading the operator through the rescale path.
-    dst.merge(&agg2, b"acc/k", &be(3)).expect("post-import merge");
+    dst.merge(&agg2, b"acc/k", &be(3))
+        .expect("post-import merge");
     dst.merge(&agg2, b"acc/k", &be(-1))
         .expect("post-import retraction");
     assert_eq!(dst.get(&agg2, b"acc/k").expect("get"), Some(be(19)));

@@ -8929,7 +8929,10 @@ mod tests {
                 FRS_STATUS_OK
             );
 
-            assert_eq!(frs_cf_export(db, src_cf, export_dir_c.as_ptr()), FRS_STATUS_OK);
+            assert_eq!(
+                frs_cf_export(db, src_cf, export_dir_c.as_ptr()),
+                FRS_STATUS_OK
+            );
 
             // Unknown operator name → INVALID_ARGUMENT, no CF created.
             let imp_name = CString::new("agg-imported").unwrap();
@@ -11946,17 +11949,17 @@ mod tests {
         let mut buf = vec![0u8; 64];
         let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         loop {
-            let (bytes_used, row_count, exhausted) = unsafe {
-                fill_chunk_from_iter(&mut handle, buf.as_mut_ptr(), buf.len())
-            };
+            let (bytes_used, row_count, exhausted) =
+                unsafe { fill_chunk_from_iter(&mut handle, buf.as_mut_ptr(), buf.len()) };
             let mut off = 0usize;
             for _ in 0..row_count {
-                let klen =
-                    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-                let vlen =
-                    u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()) as usize;
+                let klen = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+                let vlen = u32::from_le_bytes(buf[off + 4..off + 8].try_into().unwrap()) as usize;
                 off += 8;
-                rows.push((buf[off..off + klen].to_vec(), buf[off + klen..off + klen + vlen].to_vec()));
+                rows.push((
+                    buf[off..off + klen].to_vec(),
+                    buf[off + klen..off + klen + vlen].to_vec(),
+                ));
                 off += klen + vlen;
             }
             assert_eq!(off, bytes_used as usize, "chunk wire format consistent");
@@ -11978,6 +11981,9 @@ mod tests {
             handle.take_last_error().is_some(),
             "fallback error must land in the shared slot"
         );
-        assert!(handle.take_last_error().is_none(), "sticky error drains once");
+        assert!(
+            handle.take_last_error().is_none(),
+            "sticky error drains once"
+        );
     }
 }

@@ -2178,10 +2178,10 @@ mod tests {
         for i in 0..60u64 {
             let key = format!("user:{:04}", i / 2).into_bytes(); // dup keys
             let (val, op): (Option<Vec<u8>>, u8) = match i % 5 {
-                0 => (None, 0),                                      // Delete
-                1 => (Some(Vec::new()), 1),                          // empty Put
-                2 => (Some(format!("merge-{i}").into_bytes()), 2),   // Merge
-                _ => (Some(format!("value-{i}-xx").into_bytes()), 1) // Put
+                0 => (None, 0),                                       // Delete
+                1 => (Some(Vec::new()), 1),                           // empty Put
+                2 => (Some(format!("merge-{i}").into_bytes()), 2),    // Merge
+                _ => (Some(format!("value-{i}-xx").into_bytes()), 1), // Put
             };
             keys.push(key);
             vals.push(val);
@@ -2192,9 +2192,7 @@ mod tests {
             Arc::new(sst_schema()),
             vec![
                 Arc::new(BinaryArray::from_iter_values(keys.iter())),
-                Arc::new(BinaryArray::from_iter(
-                    vals.iter().map(|v| v.as_deref()),
-                )),
+                Arc::new(BinaryArray::from_iter(vals.iter().map(|v| v.as_deref()))),
                 Arc::new(UInt64Array::from(seqs)),
                 Arc::new(UInt8Array::from(ops)),
             ],
@@ -2349,11 +2347,9 @@ mod tests {
 
         // v2 KV arm (via the kv encoder; keys land in the arena APPENDED
         // after the pre-seed).
-        let kv_bytes = crate::sst::kv_block::encode_kv_data_block(
-            &s2_v1_test_batch(),
-            CompressionType::Lz4,
-        )
-        .unwrap();
+        let kv_bytes =
+            crate::sst::kv_block::encode_kv_data_block(&s2_v1_test_batch(), CompressionType::Lz4)
+                .unwrap();
         let kv = crate::sst::kv_block::KvBlock::decode(&kv_bytes, true).unwrap();
         let block = DecodedBlock::Kv(Arc::new(kv));
         let mut arena = b"PRESEED".to_vec();

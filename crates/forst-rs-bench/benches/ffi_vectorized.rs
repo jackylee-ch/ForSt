@@ -288,7 +288,9 @@ fn bench_put(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new("engine", format!("r{rows}_v{vsize}")),
                 &rows,
-                |b, _| b.iter(|| engine_put_once(&e.db, &e.cf, &key_slices, &val_slices, &op_types)),
+                |b, _| {
+                    b.iter(|| engine_put_once(&e.db, &e.cf, &key_slices, &val_slices, &op_types))
+                },
             );
         }
     }

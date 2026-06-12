@@ -142,7 +142,12 @@ fn s2_diag_churn_shape() {
     }
     eprintln!("[churn] live files per level: {by_level:?}");
 
-    for (label, pinned) in [("legacy", false), ("pinned", true), ("legacy2", false), ("pinned2", true)] {
+    for (label, pinned) in [
+        ("legacy", false),
+        ("pinned", true),
+        ("legacy2", false),
+        ("pinned2", true),
+    ] {
         // warm + measure
         let mut last_counters = (0u64, 0u64, 0u64);
         let mut n_sources = 0usize;

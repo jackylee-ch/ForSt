@@ -840,7 +840,10 @@ mod tests {
             let t = sat.partial_merge(b"k", &sp1, &sm1).unwrap();
             sat.partial_merge(b"k", &smax, &t).unwrap()
         };
-        assert_ne!(s_left, s_right, "saturating add must be non-associative at the rail");
+        assert_ne!(
+            s_left, s_right,
+            "saturating add must be non-associative at the rail"
+        );
     }
 
     #[test]
@@ -862,16 +865,23 @@ mod tests {
 
             let base_bytes = be(base_v);
             let operand_bytes: Vec<Vec<u8>> = deltas.iter().map(|d| be(*d)).collect();
-            let operand_refs: Vec<&[u8]> =
-                operand_bytes.iter().map(|v| v.as_slice()).collect();
+            let operand_refs: Vec<&[u8]> = operand_bytes.iter().map(|v| v.as_slice()).collect();
             let result = op
                 .full_merge(
                     b"key",
-                    if has_base { Some(base_bytes.as_slice()) } else { None },
+                    if has_base {
+                        Some(base_bytes.as_slice())
+                    } else {
+                        None
+                    },
                     &operand_refs,
                 )
                 .unwrap();
-            assert_eq!(result, be(expected), "case {case} diverged from wrapping fold");
+            assert_eq!(
+                result,
+                be(expected),
+                "case {case} diverged from wrapping fold"
+            );
         }
     }
 
@@ -897,8 +907,7 @@ mod tests {
                 .collect();
 
             let operand_bytes: Vec<Vec<u8>> = deltas.iter().map(|d| be(*d)).collect();
-            let operand_refs: Vec<&[u8]> =
-                operand_bytes.iter().map(|v| v.as_slice()).collect();
+            let operand_refs: Vec<&[u8]> = operand_bytes.iter().map(|v| v.as_slice()).collect();
             let flat = op.full_merge(b"key", None, &operand_refs).unwrap();
 
             // 5 random collapse orders per operand set.
@@ -941,7 +950,11 @@ mod tests {
                     let j = rng.next_idx(i + 1);
                     deltas.swap(i, j);
                 }
-                assert_eq!(merge(&bytes(&deltas)), baseline, "case {case}: permutation diverged");
+                assert_eq!(
+                    merge(&bytes(&deltas)),
+                    baseline,
+                    "case {case}: permutation diverged"
+                );
             }
         }
     }

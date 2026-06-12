@@ -431,7 +431,7 @@ impl Version {
     /// per-CF (L1+ non-overlap) but NOT guaranteed across CFs sharing the
     /// level array (nested/interleaved cross-CF ranges). The per-level
     /// soundness flag (cached once per immutable Version, see
-    /// [`Self::scan_lower_bsearch_sound`]) gates the binary search; when a
+    /// `Self::scan_lower_bsearch_sound`) gates the binary search; when a
     /// level is non-monotonic the lower bound falls back to the L0-style
     /// linear left-skip, which applies the flat path's own
     /// `largest_key >= lower` predicate per file and therefore cannot miss

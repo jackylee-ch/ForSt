@@ -6507,8 +6507,11 @@ impl DbImpl {
         }
         // Single probe: run inline — fan-out + channel overhead would only cost.
         if k == 1 {
-            let r =
-                self.prefix_scan_stream_with_error_slot(cf, prefixes[0], Arc::new(Mutex::new(None)));
+            let r = self.prefix_scan_stream_with_error_slot(
+                cf,
+                prefixes[0],
+                Arc::new(Mutex::new(None)),
+            );
             return vec![Some(f(0, r))];
         }
         let pool = bg_read_pool();
@@ -6521,11 +6524,8 @@ impl DbImpl {
             let tx = tx.clone();
             let f = Arc::clone(&f);
             pool.submit(Box::new(move || {
-                let built = me.prefix_scan_stream_with_error_slot(
-                    &cf,
-                    &prefix,
-                    Arc::new(Mutex::new(None)),
-                );
+                let built =
+                    me.prefix_scan_stream_with_error_slot(&cf, &prefix, Arc::new(Mutex::new(None)));
                 let r = f(i, built);
                 let _ = tx.send((i, r));
             }));
@@ -11209,8 +11209,7 @@ impl TierKeySource {
                             // S2 W3 diag: the legacy path's per-row alloc
                             // pair (key Arc::from + value Arc::from) — the
                             // exact cost the pinned path eliminates.
-                            mat_allocs
-                                .set(mat_allocs.get() + 1 + u64::from(view.value.is_some()));
+                            mat_allocs.set(mat_allocs.get() + 1 + u64::from(view.value.is_some()));
                             buffered.push(SstHeadRow {
                                 key: Arc::<[u8]>::from(view.key),
                                 value: view.value.map(Arc::<[u8]>::from),
@@ -11820,9 +11819,7 @@ impl LazyPrefixIter {
     /// tree (`(1+dups)·log₂ n` comparisons per key); smaller fan-outs keep
     /// the linear scan (it wins there — the R-short guard).
     fn next_step_pinned(&mut self) -> Option<PinnedStep> {
-        if self.sources.len() >= S2_TREE_MIN_SOURCES
-            && !self.tree_disabled
-            && !self.tree_abandoned
+        if self.sources.len() >= S2_TREE_MIN_SOURCES && !self.tree_disabled && !self.tree_abandoned
         {
             return self.next_step_pinned_tree();
         }
@@ -11844,8 +11841,7 @@ impl LazyPrefixIter {
         // the deferred refight is safe: the linear Phase A ensures EVERY
         // source's head (incl. the dedup-past-last_emitted skip) each step.
         if self.rows_emitted >= 16
-            && self.tree_dup_drains
-                > self.rows_emitted * (self.sources.len() as u64 / 2)
+            && self.tree_dup_drains > self.rows_emitted * (self.sources.len() as u64 / 2)
         {
             self.tree = None;
             self.deferred_refight = None;
@@ -16471,8 +16467,14 @@ mod tests {
             "cf_b must see exactly its own nested rows"
         );
         // Point reads unaffected either way (CF-aware locator) — guard rail.
-        assert_eq!(db.get(&cf_a, b"z:1").unwrap().as_deref(), Some(b"vz".as_ref()));
-        assert_eq!(db.get(&cf_b, b"m:2").unwrap().as_deref(), Some(b"vm2".as_ref()));
+        assert_eq!(
+            db.get(&cf_a, b"z:1").unwrap().as_deref(),
+            Some(b"vz".as_ref())
+        );
+        assert_eq!(
+            db.get(&cf_b, b"m:2").unwrap().as_deref(),
+            Some(b"vm2".as_ref())
+        );
     }
 
     /// E5 fuzz-ish multi-CF scan exactness: three CFs share the level
@@ -16533,10 +16535,7 @@ mod tests {
                     let key = format!("{b:03}:{:06}:{wave}{i}", lcg() % 1_000_000).into_bytes();
                     let val = format!("v-{cf_idx}-{}", String::from_utf8_lossy(&key)).into_bytes();
                     db.put(cfs[cf_idx], &key, &val).unwrap();
-                    expected[cf_idx]
-                        .entry(b)
-                        .or_default()
-                        .insert(key, val);
+                    expected[cf_idx].entry(b).or_default().insert(key, val);
                 }
             }
             for cf in cfs {
@@ -16614,10 +16613,7 @@ mod tests {
         let err = job
             .run()
             .expect_err("cross-CF compaction input must hard-error");
-        assert!(
-            err.is_corruption(),
-            "expected Corruption, got: {err:?}"
-        );
+        assert!(err.is_corruption(), "expected Corruption, got: {err:?}");
         let msg = format!("{}", err);
         assert!(
             msg.contains("cross-CF"),
@@ -16905,8 +16901,14 @@ mod tests {
         db.merge(&cf_a, b"k", b"y").unwrap();
         db.merge(&cf_b, b"k", b"x").unwrap();
         db.merge(&cf_b, b"k", b"y").unwrap();
-        assert_eq!(db.get(&cf_a, b"k").unwrap().as_deref(), Some(b"x,y".as_ref()));
-        assert_eq!(db.get(&cf_b, b"k").unwrap().as_deref(), Some(b"x|y".as_ref()));
+        assert_eq!(
+            db.get(&cf_a, b"k").unwrap().as_deref(),
+            Some(b"x,y".as_ref())
+        );
+        assert_eq!(
+            db.get(&cf_b, b"k").unwrap().as_deref(),
+            Some(b"x|y".as_ref())
+        );
     }
 
     /// R47-H2: TOCTOU regression. Two concurrent `set_compaction_filter`
@@ -17540,7 +17542,8 @@ mod tests {
                     let k = key(b, i);
                     match (i + wave) % 5 {
                         0 => {
-                            db.merge(&cf, &k, format!("m{wave}-{i}").as_bytes()).unwrap();
+                            db.merge(&cf, &k, format!("m{wave}-{i}").as_bytes())
+                                .unwrap();
                         }
                         1 => {
                             db.delete(&cf, &k).unwrap();
@@ -18178,14 +18181,16 @@ mod tests {
             .unwrap();
         for wave in 0..2u32 {
             for i in 0..30u32 {
-                db.put(&cf, &key(i), format!("w{wave}-{i}").as_bytes()).unwrap();
+                db.put(&cf, &key(i), format!("w{wave}-{i}").as_bytes())
+                    .unwrap();
             }
             db.switch_and_flush(&cf).unwrap().unwrap();
         }
         db.compact_l0(&cf).unwrap().expect("L0→L1 rollup");
         for wave in 2..5u32 {
             for i in 0..30u32 {
-                db.put(&cf, &key(i), format!("w{wave}-{i}").as_bytes()).unwrap();
+                db.put(&cf, &key(i), format!("w{wave}-{i}").as_bytes())
+                    .unwrap();
             }
             db.switch_and_flush(&cf).unwrap().unwrap();
         }
@@ -18292,6 +18297,9 @@ mod tests {
         // position — after the 17 rows that precede it, before every row
         // that follows it.
         assert_eq!(err_at, Some(17), "error must surface in key order");
-        assert_eq!(rows, expected, "rows after the error must still be delivered");
+        assert_eq!(
+            rows, expected,
+            "rows after the error must still be delivered"
+        );
     }
 }
