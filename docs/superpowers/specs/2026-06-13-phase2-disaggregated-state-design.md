@@ -576,6 +576,79 @@ cache-pressure IT.**
   Ready for the Stage-3 restore path to call per linked SST. UT covers all
   four properties.
 
+### Stage 2 — Link-based checkpoint on remote-primary (landed, per §9 decisions)
+
+Built (engine `crates/forst-rs-engine/src/db.rs`, io
+`crates/forst-rs-io/src/file_mapping.rs`):
+
+- `create_incremental_checkpoint_linked` + double-keyed gate (D2:
+  `FRS_CKPT_LINK_MODE=1` AND owner-attached mapping; noflush variant never
+  routes; WAL+link rejected until WAL Phase 4). Default path byte-identical
+  when off (gate test).
+- Link-mode barrier sequence (D5): pinned-set `await_upload` → `register()`
+  live set → `link()` into `<db_path>/checkpoints/<chk-id>/` → `sync_journal()`
+  → manifest blob with embedded mapping trailer. ZERO data movement: the chk
+  dir physically contains exactly one file (CHECKPOINT.blob); handles are
+  `linked_new_ssts`/`linked_shared_ssts` at chk-namespace logical paths;
+  upload lists empty (D3).
+- Discard flow (D4): `discard_linked_checkpoint` = manifest-driven unlink
+  loop; physical delete exactly once at refs==0; JM-unreachable fallback =
+  journal tombstone (Stage-1 machinery).
+- Minimal restore (D7): `open_from_linked_checkpoint` — resolve linked paths
+  via the blob's embedded `MappingSnapshotView`, materialize-by-copy,
+  fail-loud on missing physicals. Adopt+lazy-read instant restore = Stage 3.
+
+Gates green (2026-06-12):
+
+- **no-`await_all_uploads` invariant extended to the link path** (the Stage-2
+  gate on the `UploadRecordingFs` mock): link-mode checkpoint makes ZERO
+  `await_all_uploads` calls AND still awaits every pinned live SST per-file;
+  zero-upload object-count assert: chk dir = exactly `CHECKPOINT.blob`,
+  linked paths are metadata-only (no bytes) and resolve through the mapping.
+- **Registry discard→refcount→delete IT**: chained chk-1/chk-2 share
+  PHYSICALS (handle count exceeds object count; shared SST refs ≥ 3); discard
+  chk-1 deletes nothing (chk-2 + working refs); working copies compacted away
+  → bytes survive on chk-2's ref alone; JM-style tombstone with refs held
+  defers; discard chk-2 → every physical deleted exactly once; retried
+  discard = NotFound.
+- **Checkpoint→restore round-trip byte-exact** on the linked layout
+  (overwrites + deletes at snapshot time; post-checkpoint churn/compaction
+  does not leak into the restore); restored engine writable;
+  restore-under-missing-object fails loudly (no silent empty state).
+- Engine-level correctness ITs stand in for the 5M NexMark sweep (needs the
+  Java zero-upload branch — Stage 3; no flink writes in Stage 2).
+
+**Checkpoint-duration-vs-state-size minibench** (the §5 Stage-2 "~flat" gate;
+fs-emulation on local FS, incompressible 4 KiB values, median of 3,
+`crates/forst-rs-engine/examples/ckpt_link_flat_bench.rs`, dev Mac
+2026-06-12):
+
+```
+scale    ssts   state_mb   copy_median_ms   link_median_ms     ratio
+1x          8       32.3             63.8             16.0        4x
+4x         32      129.2            205.1             16.1       13x
+16x        11      516.9            344.1             16.0       21x
+```
+
+Re-validated at adoption (2026-06-13, fresh build of the salvaged worktree):
+link stays flat (14.9 / 16.0 / 16.0 ms) while copy grows 58.8 → 180.0 →
+476.7 ms (ratio 4× / 11× / 30×; the 16× live set compacted to 9 files).
+
+LINK mode is **flat in state size** (16.0 / 16.1 / 16.0 ms across a 16×
+state-size sweep — the paper's Fig. 9 shape reproduced) while COPY mode grows
+with bytes (64 → 205 → 344 ms; sub-linear only because the 16× run's live set
+compacted to 11 larger files and local page-cache copies are cheap — on a
+real uplink copy cost is bandwidth-bound, recorded 2026-06-01 at 10 MB/s).
+Zero data re-upload for unchanged files is asserted structurally (object
+count), not inferred from timing.
+
+**Stage-3 needs (recorded):** Java `ForStRsSnapshotStrategy` zero-upload
+branch consuming `linked_*` handles + `ForStRsRestoreOperation` download-loop
+skip; adopt()+lazy-read instant restore (replace D7's copy); mapping-journal
+tail replay on restore; startup sweep reaping abandoned chk-k link leaks
+(D5 crash window a); FFI surface for linked handles + attach-at-open wiring
+so the env key becomes effective end-to-end.
+
 ---
 
 ## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)

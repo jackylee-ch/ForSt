@@ -904,6 +904,40 @@ impl std::fmt::Debug for FileMappingManager {
     }
 }
 
+/// FRS-PHASE2-S2 (design §9 D7): a read-only view over a mapping snapshot
+/// produced by [`FileMappingManager::snapshot_bytes`] (e.g. the trailer
+/// embedded in `CHECKPOINT.blob`). The Stage-2 minimal restore uses it to
+/// resolve `<chk-k>/NNNNNN.sst` logical paths to their physical keys WITHOUT
+/// instantiating a journal-backed manager on the restore target.
+pub struct MappingSnapshotView {
+    logical: HashMap<PathBuf, String>,
+}
+
+impl MappingSnapshotView {
+    /// Decodes a snapshot blob (CRC + magic validated; corruption rejected).
+    pub fn decode(bytes: &[u8]) -> ForstResult<Self> {
+        let state = decode_snapshot(bytes)?;
+        Ok(Self {
+            logical: state.logical,
+        })
+    }
+
+    /// Resolves a logical path to its physical key.
+    pub fn resolve(&self, logical: &Path) -> Option<&str> {
+        self.logical.get(logical).map(String::as_str)
+    }
+
+    /// Number of logical mappings in the snapshot.
+    pub fn len(&self) -> usize {
+        self.logical.len()
+    }
+
+    /// True when the snapshot carries no logical mappings.
+    pub fn is_empty(&self) -> bool {
+        self.logical.is_empty()
+    }
+}
+
 fn decode_snapshot(bytes: &[u8]) -> ForstResult<MappingState> {
     if bytes.len() < 10 {
         return Err(ForstError::corruption("mapping snapshot too small"));

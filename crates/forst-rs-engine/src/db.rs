@@ -704,6 +704,41 @@ pub struct IncrementalCheckpointResult {
     pub new_ssts: Vec<LiveFileInfo>,
     /// SSTs shared with `base_checkpoint_id` — caller can reuse handles.
     pub shared_ssts: Vec<LiveFileInfo>,
+    /// FRS-PHASE2-S2 (design §9 D3): `true` when this checkpoint was taken in
+    /// LINK mode — zero data upload; `new_ssts`/`shared_ssts` are EMPTY (so no
+    /// caller can byte-copy a metadata-only path) and the live set is reported
+    /// in `linked_new_ssts`/`linked_shared_ssts` at chk-namespace logical
+    /// paths instead.
+    pub link_mode: bool,
+    /// Link mode only: live SSTs NOT in the base checkpoint, at their LINKED
+    /// `<db_path>/checkpoints/<chk-id>/NNNNNN.sst` logical paths (metadata-only
+    /// — resolve through the mapping layer; never read these paths byte-wise).
+    /// The new/shared split survives purely as the registry-registration hint
+    /// (design §3.1.5).
+    pub linked_new_ssts: Vec<LiveFileInfo>,
+    /// Link mode only: live SSTs shared with the base checkpoint, at linked
+    /// chk-namespace logical paths.
+    pub linked_shared_ssts: Vec<LiveFileInfo>,
+}
+
+/// Report from [`DbImpl::discard_linked_checkpoint`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedCheckpointDiscard {
+    /// Linked logical paths whose reference was dropped.
+    pub unlinked: usize,
+    /// Physical objects whose LAST reference this discard dropped — deleted
+    /// exactly once by the mapping layer.
+    pub physicals_deleted: usize,
+}
+
+/// FRS-PHASE2-S2 (design §9 D2): env half of the double-keyed link-mode gate.
+/// `FRS_CKPT_LINK_MODE=1` (or `true`) routes `create_incremental_checkpoint`
+/// to link mode — but ONLY when the owner has also attached a
+/// `FileMappingManager`. Default OFF.
+fn ckpt_link_mode_env() -> bool {
+    std::env::var("FRS_CKPT_LINK_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// RAII guard that releases a previously-reserved chunk back to the cross-CF
@@ -5676,7 +5711,58 @@ impl DbImpl {
         checkpoint_id: u64,
         base_checkpoint_id: u64,
     ) -> ForstResult<IncrementalCheckpointResult> {
-        self.create_incremental_checkpoint_impl(snapshot, checkpoint_id, base_checkpoint_id, true)
+        // FRS-PHASE2-S2 (design §9 D2): double-keyed link-mode gate — env
+        // `FRS_CKPT_LINK_MODE=1` AND a mapping attached by the owner. The env
+        // key alone must never flip behavior under an unaware consumer (the
+        // Java uploader reads returned paths byte-wise; linked paths have no
+        // bytes). Default OFF: this path is byte-identical to pre-Stage-2.
+        let link_mode = ckpt_link_mode_env() && self.file_mapping.get().is_some();
+        self.create_incremental_checkpoint_impl(
+            snapshot,
+            checkpoint_id,
+            base_checkpoint_id,
+            true,
+            link_mode,
+        )
+    }
+
+    /// FRS-PHASE2-S2 (design §3.1, §9): LINK-mode incremental checkpoint on
+    /// the remote-primary model — registers the pinned live SST set in the
+    /// file-mapping layer, `link()`s it into
+    /// `<db_path>/checkpoints/<checkpoint_id>/` (O(files) metadata, ZERO data
+    /// upload for unchanged files), syncs the mapping journal at the barrier,
+    /// and returns handles on the LINKED chk-namespace paths
+    /// (`linked_new_ssts`/`linked_shared_ssts`; the upload lists are empty).
+    /// The checkpoint directory physically contains exactly one file —
+    /// `CHECKPOINT.blob` with the embedded mapping trailer.
+    ///
+    /// Auto-attaches a [`forst_rs_io::FileMappingManager`] (journal at
+    /// `<db_path>/MAPPING.journal`) when none is attached yet. Memtable
+    /// durability is FLUSH-on-barrier (design §9 D6); combining link mode
+    /// with the WAL skip-flush override is rejected until WAL Phase 4
+    /// (restore replay) lands — a link-mode checkpoint must never silently
+    /// drop the unflushed tail on restore.
+    pub fn create_incremental_checkpoint_linked(
+        &self,
+        snapshot: &Snapshot,
+        checkpoint_id: u64,
+        base_checkpoint_id: u64,
+    ) -> ForstResult<IncrementalCheckpointResult> {
+        if self.wal.lock().expect("wal lock poisoned").is_some() {
+            return Err(ForstError::invalid_argument(
+                "create_incremental_checkpoint_linked: WAL mode is not supported in \
+                 link mode until WAL Phase 4 restore-replay lands (design §9 D6) — \
+                 the unflushed tail would be silently dropped on restore",
+            ));
+        }
+        self.ensure_file_mapping()?;
+        self.create_incremental_checkpoint_impl(
+            snapshot,
+            checkpoint_id,
+            base_checkpoint_id,
+            true,
+            true,
+        )
     }
 
     /// FRS-CKPT-NOFLUSH (2026-06-01): incremental checkpoint that DOES NOT flush
@@ -5693,7 +5779,17 @@ impl DbImpl {
         checkpoint_id: u64,
         base_checkpoint_id: u64,
     ) -> ForstResult<IncrementalCheckpointResult> {
-        self.create_incremental_checkpoint_impl(snapshot, checkpoint_id, base_checkpoint_id, false)
+        // FRS-PHASE2-S2 (design §9 D2): the noflush variant NEVER routes to
+        // link mode — the Arrow-IPC memtable artifact is per-checkpoint
+        // EXCLUSIVE state (nothing to share/link) and is deprecated for
+        // remote-primary (§3.3).
+        self.create_incremental_checkpoint_impl(
+            snapshot,
+            checkpoint_id,
+            base_checkpoint_id,
+            false,
+            false,
+        )
     }
 
     fn create_incremental_checkpoint_impl(
@@ -5702,6 +5798,7 @@ impl DbImpl {
         checkpoint_id: u64,
         base_checkpoint_id: u64,
         flush_memtables: bool,
+        link_mode: bool,
     ) -> ForstResult<IncrementalCheckpointResult> {
         if snapshot.db_id() != self.db_id {
             return Err(ForstError::invalid_argument(
@@ -5824,6 +5921,47 @@ impl DbImpl {
             self.fs.await_upload(&sst_path)?;
         }
 
+        // The checkpoint's canonical directory (holds CHECKPOINT.blob; in
+        // link mode it is also the chk-namespace the live set is linked into).
+        let target_dir = self.incremental_checkpoint_dir(checkpoint_id);
+
+        // FRS-PHASE2-S2 (design §9 D5): link-mode barrier sequence, all under
+        // the checkpoint's pinned live set (`_pin`, R31-H1) and AFTER the
+        // per-file await_upload barrier above (the freeze-fix invariant —
+        // no `await_all_uploads` — is unchanged):
+        //   1. register() every pinned live SST (identity mapping; idempotent),
+        //   2. link() each into <chk-k>/ (idempotent re-link on retry),
+        //   3. sync_journal() — the mapping's group-durability point,
+        //   4. (below) serialize the manifest + embed the mapping trailer,
+        //      which now includes the chk-k links.
+        // Zero data movement: the linked paths are metadata-only; the chk dir
+        // physically contains exactly one file, CHECKPOINT.blob (D1).
+        if link_mode {
+            let mgr = self.file_mapping.get().ok_or_else(|| {
+                ForstError::invalid_argument(
+                    "link-mode checkpoint requires an attached FileMappingManager",
+                )
+            })?;
+            for file in version_snapshot.version.live_sst_files() {
+                let working = sst_file_path(&self.db_path, file.file_number);
+                let key = working.to_str().ok_or_else(|| {
+                    ForstError::invalid_argument(format!(
+                        "link-mode checkpoint: non-utf8 working path {}",
+                        working.display()
+                    ))
+                })?;
+                mgr.register(&working, key, file.file_size)?;
+                let basename = working.file_name().ok_or_else(|| {
+                    ForstError::corruption(format!(
+                        "link-mode checkpoint: SST path has no file name: {}",
+                        working.display()
+                    ))
+                })?;
+                mgr.link(&working, &target_dir.join(basename))?;
+            }
+            mgr.sync_journal()?;
+        }
+
         let mut blob = serialize_snapshot(&version_snapshot)?;
         // FRS-PHASE2-S1 (design §2.4): embed the file-mapping snapshot (see
         // the sibling site in `create_checkpoint`). Inert when no mapping is
@@ -5864,6 +6002,8 @@ impl DbImpl {
 
         let mut new_ssts: Vec<LiveFileInfo> = Vec::new();
         let mut shared_ssts: Vec<LiveFileInfo> = Vec::new();
+        let mut linked_new_ssts: Vec<LiveFileInfo> = Vec::new();
+        let mut linked_shared_ssts: Vec<LiveFileInfo> = Vec::new();
         for (level_idx, level_meta) in version_snapshot.version.levels.iter().enumerate() {
             for file in &level_meta.files {
                 // R79-H1: derive cf_name from the per-file `cf_id` stamped on
@@ -5876,24 +6016,41 @@ impl DbImpl {
                     .get(&file.cf_id)
                     .cloned()
                     .unwrap_or_else(|| DEFAULT_CF_NAME.to_string());
+                let working_path = sst_file_path(&self.db_path, file.file_number);
+                // FRS-PHASE2-S2 (design §9 D3): in link mode the handles
+                // reference the LINKED chk-namespace logical paths; the
+                // new/shared split survives purely as the registry-
+                // registration hint. The upload lists stay EMPTY so no
+                // caller can byte-copy a metadata-only path.
+                let path = if link_mode {
+                    let basename = working_path.file_name().ok_or_else(|| {
+                        ForstError::corruption(format!(
+                            "link-mode checkpoint: SST path has no file name: {}",
+                            working_path.display()
+                        ))
+                    })?;
+                    target_dir.join(basename)
+                } else {
+                    working_path
+                };
                 let info = LiveFileInfo {
-                    path: sst_file_path(&self.db_path, file.file_number),
+                    path,
                     size: file.file_size,
                     sequence: file.max_sequence.value(),
                     level: level_idx as u8,
                     cf_name,
                 };
-                if base_live.contains(&file.file_number) {
-                    shared_ssts.push(info);
-                } else {
-                    new_ssts.push(info);
+                match (link_mode, base_live.contains(&file.file_number)) {
+                    (false, true) => shared_ssts.push(info),
+                    (false, false) => new_ssts.push(info),
+                    (true, true) => linked_shared_ssts.push(info),
+                    (true, false) => linked_new_ssts.push(info),
                 }
             }
         }
 
         // Persist the manifest blob into the per-checkpoint subdir so
         // `open_from_incremental` can pick it up by checkpoint id.
-        let target_dir = self.incremental_checkpoint_dir(checkpoint_id);
         self.fs.create_dir_all(&target_dir)?;
         // R80-L1: `write_blob` syncs `target_dir` after rename, but the
         // PARENT (.../checkpoints/) is not — POSIX requires the parent
@@ -5928,6 +6085,22 @@ impl DbImpl {
         // but eagerly reclaiming disk matches the sister contract.
         self.reap_pending_deletions();
 
+        // FRS-PHASE2-S2: link mode is metadata-complete at this point — the
+        // blob (with embedded mapping trailer) is durable, the live set is
+        // linked, and NOTHING is staged or uploaded (zero data movement).
+        // `manifest_path` is the engine-FS blob path; the Stage-3 backend
+        // branch consumes the linked handles instead of the uploader.
+        if link_mode {
+            return Ok(IncrementalCheckpointResult {
+                manifest_path,
+                new_ssts: Vec::new(),
+                shared_ssts: Vec::new(),
+                link_mode: true,
+                linked_new_ssts,
+                linked_shared_ssts,
+            });
+        }
+
         // FRS-CKPT-STAGE-UNIFORM (2026-05-30): ALWAYS stage the manifest + new
         // SSTs to a local temp dir and return those absolute paths, regardless
         // of `supports_atomic_rename`. The Java `ForStRsSstUploader` reads each
@@ -5959,6 +6132,9 @@ impl DbImpl {
             manifest_path,
             new_ssts,
             shared_ssts,
+            link_mode: false,
+            linked_new_ssts: Vec::new(),
+            linked_shared_ssts: Vec::new(),
         })
     }
 
@@ -6265,6 +6441,90 @@ impl DbImpl {
             ..EngineOptions::default()
         };
         Self::open_from_checkpoint_with_default_cf(options, fs, default_desc)
+    }
+
+    /// FRS-PHASE2-S2 (design §9 D7): the MINIMUM restore proving the linked
+    /// round-trip — opens an engine from a LINK-mode checkpoint directory
+    /// (which physically contains only `CHECKPOINT.blob`).
+    ///
+    /// Flow: read the blob, REQUIRE the embedded mapping trailer, resolve each
+    /// `<chk-k>/NNNNNN.sst` linked logical path to its physical key via the
+    /// snapshot ([`forst_rs_io::MappingSnapshotView`]), materialize-BY-COPY
+    /// into the fresh `target_dir`, fail LOUDLY on a missing physical (no
+    /// silent empty state), then open via the existing blob-restore path.
+    ///
+    /// Stage-3 boundary (explicitly NOT here): replace the copy with
+    /// `adopt()` + lazy reads through `CachedFileSystem` (instant-link
+    /// restore), skip the Java download loop, and replay the mapping-journal
+    /// tail (Stage-2 consumes only the blob-embedded snapshot).
+    ///
+    /// Caller contract: `target_dir` is fresh/clean (same as
+    /// [`Self::open_from_incremental`]).
+    pub fn open_from_linked_checkpoint(
+        fs: Arc<dyn FileSystem>,
+        ckpt_dir: &Path,
+        target_dir: &str,
+    ) -> ForstResult<Arc<Self>> {
+        use crate::checkpoint::{copy_file, deserialize_snapshot, read_blob, split_mapping_trailer, write_blob};
+        let blob = read_blob(fs.as_ref(), ckpt_dir)?;
+        let (base, mapping) = split_mapping_trailer(&blob)?;
+        let mapping = mapping.ok_or_else(|| {
+            ForstError::invalid_argument(format!(
+                "open_from_linked_checkpoint: {} carries no mapping trailer — \
+                 not a link-mode checkpoint (use open_from_checkpoint/_incremental)",
+                ckpt_dir.display()
+            ))
+        })?;
+        let view = forst_rs_io::MappingSnapshotView::decode(mapping)?;
+        let snap = deserialize_snapshot(base)?;
+
+        let target = PathBuf::from(target_dir);
+        fs.create_dir_all(&target)?;
+        for file in snap.version.live_sst_files() {
+            // The manifest enumerates exactly the basenames linked beside it
+            // (design §9 D1) — derive the linked path and resolve it.
+            let canonical = sst_file_path(&target, file.file_number);
+            let basename = canonical.file_name().ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "open_from_linked_checkpoint: SST path has no file name: {}",
+                    canonical.display()
+                ))
+            })?;
+            let linked = ckpt_dir.join(basename);
+            let physical = view.resolve(&linked).ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "open_from_linked_checkpoint: manifest references {} but the \
+                     embedded mapping snapshot has no entry for it",
+                    linked.display()
+                ))
+            })?;
+            let physical_path = Path::new(physical);
+            if !fs.file_exists(physical_path)? {
+                return Err(ForstError::not_found(format!(
+                    "open_from_linked_checkpoint: physical object {} (for linked \
+                     path {}) is missing — refusing to restore partial state",
+                    physical, linked.display()
+                )));
+            }
+            // Stage-2 materialization (Stage 3: adopt + lazy read instead).
+            let copied = copy_file(fs.as_ref(), physical_path, &target.join(basename))?;
+            if copied != file.file_size {
+                return Err(ForstError::corruption(format!(
+                    "open_from_linked_checkpoint: short copy of {}: expected {} \
+                     bytes, got {}",
+                    physical, file.file_size, copied
+                )));
+            }
+        }
+        // Persist the STRIPPED base blob into the target (the restored engine
+        // does not adopt the source mapping in Stage-2).
+        write_blob(fs.as_ref(), &target, base)?;
+
+        let options = EngineOptions {
+            db_path: target.to_string_lossy().into_owned(),
+            ..EngineOptions::default()
+        };
+        Self::open_from_checkpoint(options, fs)
     }
 
     /// FRS-LEVELED-COMPACTION (2026-06-04): pre-allocate the ADDITIONAL output
@@ -10490,6 +10750,27 @@ impl DbImpl {
         self.file_mapping.get()
     }
 
+    /// FRS-PHASE2-S2: returns the attached file-mapping layer, attaching a
+    /// fresh [`forst_rs_io::FileMappingManager`] (journal at
+    /// `<db_path>/MAPPING.journal` on the engine filesystem, replaying any
+    /// existing journal) when none is attached yet. Race-safe: a lost
+    /// `OnceLock::set` race simply discards the redundant manager.
+    pub fn ensure_file_mapping(&self) -> ForstResult<Arc<forst_rs_io::FileMappingManager>> {
+        if let Some(m) = self.file_mapping.get() {
+            return Ok(m.clone());
+        }
+        let mgr = Arc::new(forst_rs_io::FileMappingManager::new(
+            self.fs.clone(),
+            self.db_path.join("MAPPING.journal"),
+        )?);
+        let _ = self.file_mapping.set(mgr);
+        Ok(self
+            .file_mapping
+            .get()
+            .expect("set or raced-set just above")
+            .clone())
+    }
+
     /// FRS-PHASE2-S1: registers every CURRENTLY-LIVE SST under an identity
     /// mapping (logical == physical == working path, refs = 1,
     /// `ShareableOwnedByDb`). Idempotent — re-registering an existing
@@ -10516,6 +10797,54 @@ impl DbImpl {
             registered += 1;
         }
         Ok(registered)
+    }
+
+    /// FRS-PHASE2-S2 (design §9 D4): TM-side discard of a LINK-mode
+    /// checkpoint — the manifest-driven `unlink(<chk-k>/NNNNNN.sst)` loop the
+    /// JM's `discardState()` delegates to. Each unlink drops one logical
+    /// reference; a physical object is deleted EXACTLY ONCE, when its last
+    /// reference (working-dir ref + other checkpoints' refs) drains — never a
+    /// direct delete. The checkpoint directory (which physically contains
+    /// only `CHECKPOINT.blob`) is then removed — the TM owns it; it is not
+    /// shared state. Idempotent for retried discards: already-unlinked paths
+    /// are skipped, and a missing blob (directory already discarded) returns
+    /// `NotFound`.
+    pub fn discard_linked_checkpoint(
+        &self,
+        checkpoint_id: u64,
+    ) -> ForstResult<LinkedCheckpointDiscard> {
+        use crate::checkpoint::{deserialize_snapshot, read_blob, split_mapping_trailer};
+        let mgr = self.file_mapping.get().ok_or_else(|| {
+            ForstError::invalid_argument(
+                "discard_linked_checkpoint: no file mapping attached",
+            )
+        })?;
+        let dir = self.incremental_checkpoint_dir(checkpoint_id);
+        let blob = read_blob(self.fs.as_ref(), &dir)?;
+        let (base, _mapping) = split_mapping_trailer(&blob)?;
+        let snap = deserialize_snapshot(base)?;
+        let mut report = LinkedCheckpointDiscard::default();
+        for file in snap.version.live_sst_files() {
+            let working = sst_file_path(&self.db_path, file.file_number);
+            let basename = match working.file_name() {
+                Some(b) => b.to_os_string(),
+                None => continue,
+            };
+            let linked = dir.join(basename);
+            if !mgr.is_registered(&linked) {
+                continue; // retried discard — reference already dropped
+            }
+            match mgr.unlink(&linked)? {
+                forst_rs_io::UnlinkOutcome::PhysicalDeleted => {
+                    report.unlinked += 1;
+                    report.physicals_deleted += 1;
+                }
+                _ => report.unlinked += 1,
+            }
+        }
+        mgr.sync_journal()?;
+        self.fs.delete_dir(&dir, true)?;
+        Ok(report)
     }
 }
 
@@ -16632,9 +16961,9 @@ mod tests {
         // The overlapped old file must be gone (consumed by the rollup).
         for f in &v.levels[1].files {
             assert!(
-                !old_files.contains(&f.file_number.value())
-                    || !(f.smallest_key.as_slice() <= b"k0029".as_slice()
-                        && f.largest_key.as_slice() >= b"k0020".as_slice()),
+                !(old_files.contains(&f.file_number.value())
+                    && f.smallest_key.as_slice() <= b"k0029".as_slice()
+                    && f.largest_key.as_slice() >= b"k0020".as_slice()),
                 "overlapped L1 file {} survived the rollup",
                 f.file_number
             );
@@ -17518,6 +17847,307 @@ mod tests {
             restored.get(&rcf, b"k").unwrap().as_deref(),
             Some(&b"v"[..])
         );
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-S2 gates (design §5 Stage-2, §9)
+    // ------------------------------------------------------------------
+
+    /// Stage-2 gate: the no-`await_all_uploads` invariant EXTENDED to the
+    /// link path (design §3.2), plus the zero-upload object-count assert —
+    /// a link-mode checkpoint directory physically contains exactly ONE file
+    /// (CHECKPOINT.blob); every SST handle is a metadata-only linked path.
+    #[test]
+    fn test_phase2_s2_link_checkpoint_no_await_all_uploads_zero_upload() {
+        use forst_rs_io::MemoryFileSystem;
+        let rec = Arc::new(UploadRecordingFs::new(Arc::new(MemoryFileSystem::new())));
+        let fs: Arc<dyn FileSystem> = rec.clone();
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        for i in 0..200u32 {
+            let k = format!("k{:05}", i);
+            db.put(&cf, k.as_bytes(), b"value-payload").unwrap();
+        }
+        db.flush_all().unwrap();
+        rec.reset();
+
+        let snap = db.snapshot();
+        let result = db
+            .create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
+
+        // INVARIANT: no checkpoint code path may call await_all_uploads.
+        assert_eq!(
+            rec.await_all_count(),
+            0,
+            "link-mode checkpoint must not call await_all_uploads() (couples \
+             checkpoint latency to unrelated background compaction uploads)"
+        );
+        // CORRECTNESS: the pinned-set per-file barrier is still enforced —
+        // the manifest never references an un-uploaded physical.
+        let awaited = rec.awaited_paths.lock().unwrap().clone();
+        let live = db.version_set.current();
+        for f in live.live_sst_files_iter() {
+            let p = crate::flush::sst_file_path(Path::new("/db"), f.file_number);
+            assert!(
+                awaited.contains(&p),
+                "referenced live SST {:?} was not awaited; awaited={:?}",
+                p,
+                awaited
+            );
+        }
+
+        // Result contract (design §9 D3): upload lists EMPTY, linked handles
+        // carry chk-namespace paths.
+        assert!(result.link_mode);
+        assert!(result.new_ssts.is_empty(), "link mode must upload nothing");
+        assert!(result.shared_ssts.is_empty());
+        assert!(!result.linked_new_ssts.is_empty());
+        assert!(result.linked_shared_ssts.is_empty(), "base 0: nothing shared");
+
+        // Zero-upload object-count assert (design §9 D1): the chk dir holds
+        // exactly one physical file — the manifest blob.
+        let chk_dir = Path::new("/db/checkpoints/00000000000000000001");
+        let entries: Vec<_> = fs
+            .list_dir(chk_dir)
+            .unwrap()
+            .into_iter()
+            .filter(|m| !m.is_dir)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "link-mode chk dir must contain exactly CHECKPOINT.blob, got {:?}",
+            entries.iter().map(|m| m.path.clone()).collect::<Vec<_>>()
+        );
+        assert!(entries[0].path.ends_with("CHECKPOINT.blob"));
+        let mgr = db.file_mapping().expect("linked ckpt auto-attaches").clone();
+        for info in &result.linked_new_ssts {
+            assert!(
+                info.path.starts_with(chk_dir),
+                "linked handle {} must live in the chk namespace",
+                info.path.display()
+            );
+            // Metadata-only: no bytes at the linked path; the mapping
+            // resolves it to the working-dir physical object.
+            assert!(!fs.file_exists(&info.path).unwrap());
+            let physical = mgr.resolve(&info.path).expect("linked path resolves");
+            assert!(fs.file_exists(Path::new(&physical)).unwrap());
+        }
+    }
+
+    /// Stage-2 gate: chained link-mode checkpoints share PHYSICALS (object
+    /// count, not just handle dedup), and the JM-discard flow —
+    /// discard → tombstone → refcount → physical delete — deletes each
+    /// physical exactly once, only when the last reference drains.
+    #[test]
+    fn test_phase2_s2_chained_link_ckpts_share_physicals_discard_refcount_delete() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+
+        for i in 0..50u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        let snap1 = db.snapshot();
+        let r1 = db
+            .create_incremental_checkpoint_linked(&snap1, 1, 0)
+            .unwrap();
+        assert!(!r1.linked_new_ssts.is_empty());
+
+        for i in 50..100u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        let snap2 = db.snapshot();
+        let r2 = db
+            .create_incremental_checkpoint_linked(&snap2, 2, 1)
+            .unwrap();
+        // Chk-2 SHARES chk-1's SSTs (classification hint) and adds new ones.
+        assert!(
+            !r2.linked_shared_ssts.is_empty(),
+            "chk-2 must share chk-1's SSTs"
+        );
+        assert!(!r2.linked_new_ssts.is_empty());
+
+        // Physical sharing: handles across checkpoints exceed the physical
+        // .sst object count (objects live ONLY in the working dir).
+        let mgr = db.file_mapping().unwrap().clone();
+        let physical_ssts = fs
+            .list_dir(Path::new("/db"))
+            .unwrap()
+            .into_iter()
+            .filter(|m| !m.is_dir && m.path.extension().map(|e| e == "sst").unwrap_or(false))
+            .count();
+        let handles =
+            r1.linked_new_ssts.len() + r2.linked_new_ssts.len() + r2.linked_shared_ssts.len();
+        assert!(
+            handles > physical_ssts,
+            "expected handle count {} > physical object count {}",
+            handles,
+            physical_ssts
+        );
+        // A shared SST is referenced by working dir + chk-1 + chk-2.
+        let shared = &r2.linked_shared_ssts[0];
+        let shared_physical = mgr.resolve(&shared.path).expect("shared resolves");
+        assert!(mgr.refs(&shared_physical) >= 3);
+
+        // Discard chk-1: refs drop but chk-2 + working dir keep every byte.
+        let d1 = db.discard_linked_checkpoint(1).unwrap();
+        assert_eq!(d1.unlinked, r1.linked_new_ssts.len());
+        assert_eq!(
+            d1.physicals_deleted, 0,
+            "chk-2/working refs must keep all bytes alive"
+        );
+        assert!(fs.file_exists(Path::new(&shared_physical)).unwrap());
+        // Retried discard: blob already gone → NotFound (idempotence gate).
+        assert!(db.discard_linked_checkpoint(1).unwrap_err().is_not_found());
+
+        // Compact the working copies away; chk-2's refs must keep the bytes.
+        let chk2_workings: Vec<PathBuf> = r2
+            .linked_new_ssts
+            .iter()
+            .chain(r2.linked_shared_ssts.iter())
+            .map(|info| Path::new("/db").join(info.path.file_name().unwrap()))
+            .collect();
+        let mut drained = false;
+        for i in 0..16 {
+            db.put(&cf, format!("drain{i}").as_bytes(), b"v").unwrap();
+            db.switch_and_flush(&cf).unwrap();
+            db.compact_l0(&cf).unwrap();
+            db.reap_pending_deletions();
+            if chk2_workings.iter().all(|w| !mgr.is_registered(w)) {
+                drained = true;
+                break;
+            }
+        }
+        assert!(drained, "working copies must be unlinked after compaction");
+        for w in &chk2_workings {
+            assert!(
+                fs.file_exists(w).unwrap(),
+                "{} must survive working-dir unlink (chk-2 ref held)",
+                w.display()
+            );
+            assert_eq!(mgr.refs(w.to_str().unwrap()), 1, "only chk-2 ref left");
+        }
+
+        // JM-style tombstone while a checkpoint ref is held: bytes survive.
+        assert!(!mgr.tombstone(&shared_physical).unwrap());
+        assert!(fs.file_exists(Path::new(&shared_physical)).unwrap());
+
+        // Discard chk-2: every last reference drains → physicals deleted
+        // exactly once (incl. the tombstoned one).
+        let d2 = db.discard_linked_checkpoint(2).unwrap();
+        assert_eq!(d2.unlinked, chk2_workings.len());
+        assert_eq!(d2.physicals_deleted, chk2_workings.len());
+        for w in &chk2_workings {
+            assert!(!fs.file_exists(w).unwrap(), "{} must be gone", w.display());
+        }
+
+        // The live DB is unaffected.
+        assert_eq!(db.get(&cf, b"k0000").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(db.get(&cf, b"k0099").unwrap().as_deref(), Some(&b"v1"[..]));
+    }
+
+    /// Stage-2 gate: checkpoint→restore round-trip byte-exact on the LINKED
+    /// layout (restore = minimal materialize-by-copy, design §9 D7), restore
+    /// is unaffected by post-checkpoint working-dir churn, and a missing
+    /// physical fails LOUDLY (no silent empty state).
+    #[test]
+    fn test_phase2_s2_linked_checkpoint_restore_roundtrip() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+
+        // Snapshot-time state: k0000..k0199 v1; even keys overwritten v2;
+        // k0000..k0049 deleted.
+        for i in 0..200u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        for i in (0..200u32).step_by(2) {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v2").unwrap();
+        }
+        for i in 0..50u32 {
+            db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
+        }
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 7, 0).unwrap();
+        assert!(r.link_mode);
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000007");
+
+        // Post-checkpoint churn: overwrite everything, flush, compact.
+        for i in 0..200u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap();
+        db.compact_l0(&cf).unwrap();
+        db.reap_pending_deletions();
+
+        // Restore from the linked checkpoint into a fresh target.
+        let restored =
+            DbImpl::open_from_linked_checkpoint(fs.clone(), &chk_dir, "/restore").unwrap();
+        let rcf = restored.default_cf();
+        for i in 0..200u32 {
+            let k = format!("k{:04}", i);
+            let got = restored.get(&rcf, k.as_bytes()).unwrap();
+            let want: Option<&[u8]> = if i < 50 {
+                None
+            } else if i % 2 == 0 {
+                Some(b"v2")
+            } else {
+                Some(b"v1")
+            };
+            assert_eq!(got.as_deref(), want, "snapshot-time mismatch at {}", k);
+        }
+        // The restored engine is writable.
+        restored.put(&rcf, b"new-key", b"new-val").unwrap();
+        assert_eq!(
+            restored.get(&rcf, b"new-key").unwrap().as_deref(),
+            Some(&b"new-val"[..])
+        );
+
+        // Missing physical → loud failure. Delete one physical object
+        // OUT-OF-BAND (bypassing the mapping) and restore again.
+        let mgr = db.file_mapping().unwrap();
+        let victim = mgr
+            .resolve(&r.linked_new_ssts[0].path)
+            .expect("linked path resolves");
+        fs.delete_file(Path::new(&victim)).unwrap();
+        match DbImpl::open_from_linked_checkpoint(fs.clone(), &chk_dir, "/restore2") {
+            Ok(_) => panic!("restore with a missing physical must fail loudly"),
+            Err(err) => assert!(
+                err.is_not_found(),
+                "missing physical must fail the restore loudly, got {err}"
+            ),
+        }
+    }
+
+    /// Stage-2 gate: with the flag OFF (no mapping attached — the default),
+    /// `create_incremental_checkpoint` is byte-identical to pre-Stage-2: copy
+    /// mode, staged upload lists populated, linked fields empty. Holds under
+    /// BOTH env states because the gate is double-keyed (design §9 D2).
+    #[test]
+    fn test_phase2_s2_default_checkpoint_path_untouched() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs);
+        let cf = db.default_cf();
+        for i in 0..50u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v").unwrap();
+        }
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint(&snap, 1, 0).unwrap();
+        assert!(!r.link_mode);
+        assert!(r.linked_new_ssts.is_empty());
+        assert!(r.linked_shared_ssts.is_empty());
+        assert!(!r.new_ssts.is_empty(), "copy mode stages the new SSTs");
+        // Staged artifacts are REAL local files (the uploader contract).
+        let local = LocalFileSystem::new();
+        assert!(local.file_exists(&r.manifest_path).unwrap());
+        for info in &r.new_ssts {
+            assert!(local.file_exists(&info.path).unwrap());
+        }
     }
 
     #[test]

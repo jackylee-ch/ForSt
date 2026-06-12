@@ -112,7 +112,7 @@ pub use compaction_filter::{
 };
 pub use db::{
     s2_pinned_enabled, set_s2_pinned_override, DbImpl, FillOutcome, IncrementalCheckpointResult,
-    LiveFileInfo, PrefixScanStream, RowSink, DEFAULT_CF_NAME,
+    LinkedCheckpointDiscard, LiveFileInfo, PrefixScanStream, RowSink, DEFAULT_CF_NAME,
 };
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};
