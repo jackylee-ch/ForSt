@@ -937,6 +937,120 @@ one-time re-home). Residue: cross-CF coverage uses per-CF floors —
 records of a CF that never flushes pin their segment's working ref
 (bounded by WBM flush cadence); dropped-CF records pin forever
 (conservative leak, reaped when the linking checkpoints are discarded).
+**[CLOSED by cycle-3 unit 4 below: dropped-CF + floor-regression pins
+released precisely; the genuinely-unflushed-tail pin is retained as
+specified (it IS the tail's only durable copy).]**
+
+---
+
+### Cycle 3 unit 1 — UUID physical keys (landed 2026-06-13, C3U1)
+
+ForSt `toUUIDPath` mechanism (competitive analysis §2.2d), mapping-layer
+only, default OFF (`MappedFileSystem::with_uuid_physical_keys` is the only
+activation; `::new` and every engine default path byte-identical):
+
+- SST-class writes through a uuid-keyed `MappedFileSystem` mint
+  `uuid-<32hex>.sst` physicals (same dir; `.sst` kept for staging names so
+  `gc_sweep` covers every minted object); logical names unchanged.
+- Staging→final publication = `FileMappingManager::rename_logical` — an
+  atomic metadata re-point (link-before-unlink so refs never dip to 0);
+  deletes of mapped paths route through refcounted `unlink`;
+  `sweep_temp_logicals` reaps crashed staging mints at mount.
+- `restore_snapshot` rewrites the FIRST logical of each owned physical as
+  Register (the old `path==key` identity test downgraded uuid registers to
+  Link, losing sizes); journal handles drop after sync (object-store
+  writers CLOSE on sync — post-checkpoint appends reopen, fixing
+  "append after close" on any opendal-backed mapping).
+
+Gates green: rename-free invariant on opendal-fs emulation — engine
+put→flush→link-ckpt→compact→instant-restore with **0 SST-class renames**
+reaching the backend, uuid-shaped physicals, byte-exact restore; crashed-
+staging sweep IT; journal+snapshot round-trips; truncate-never-clobbers-
+shared-physical. io 240/0, engine 355/0 at land.
+
+### Cycle 3 unit 2 — non-SST-always-local routing (landed 2026-06-13, C3U2)
+
+ForSt `FileOwnershipDecider` rule (§2.2c), router-level, default OFF
+(`FRS_REMOTE_NONSST_LOCAL=1` wraps the remote-primary stacks in
+`FileSystemRouter::with_remote(LocalFileSystem, CachedFileSystem(OpenDAL))`):
+
+- MANIFEST/CURRENT/OPTIONS, WAL `.log` + `WAL-*.seg`, `MAPPING.journal`,
+  `CHECKPOINT.blob` pinned LOCAL — zero S3 metadata chatter; only
+  SST-class objects go remote through the cache stack.
+- Router correctness holes closed while wiring: `await_upload` now routes
+  to the owning leg (pre-fix the checkpoint per-file durability barrier
+  NO-OPed through the trait default in tiered mode — a restore could
+  observe a manifest referencing an un-uploaded SST); `await_all_uploads`
+  fans out across distinct legs; `prefetch_concurrent` splits by leg;
+  `supports_atomic_rename` = AND of legs.
+
+Gates green: file-class locality catalog UTs (10 local classes, uuid SSTs
+remote); **zero remote ops on non-SST paths across a full link-checkpoint
+cycle** (count assertion over a recording opendal-emulation remote leg);
+blob+journal on the local leg only; instant restore byte-exact with only
+the once-per-open R52-M2 orphan-scan dir listing remote.
+
+### Cycle 3 unit 3 — §4.1.1 background-fill scheduler (landed 2026-06-13, C3U3)
+
+Post-restore lazy warm → PACED background fill, default OFF
+(`FRS_RESTORE_BG_FILL=1` + `_WORKERS`/`_PACE_MB` on the remote instant-
+restore path; explicit `start/finish_restore_background_fill` engine API):
+
+- Read pool of background-class workers (FRS-CACHE-BG-EXEMPT: no LRU/stat
+  pollution) drains the adopted set through
+  `CachedFileSystem::fill_file_cold` — **Bottom** (`LocalCache::put_cold`
+  inserts at the eviction end; an untouched prefill is the first victim)
+  / **Skip** (`promote_limit`-blocked keys never re-loaded; fills never
+  evict live entries — the no-evict decision is atomic under the cache
+  mutex per review R1-H1) per the merged admission machinery.
+- Global bytes/sec pacing (token-bucket-by-schedule, prompt cancel);
+  engine drop cancels+joins the pool.
+
+Gates green: scheduler UTs (budget-cap exact, Bottom victim order, Skip
+on blocked, pacing lower-bound, prompt cancel) + engine IT (cold-cache
+instant restore: every adopted physical warmed, 0 errors, idempotent
+restart, byte-exact). **Warm-time vs foreground-impact bench pair**
+(`restore_bgfill_bench`, 64×256 KiB set, modeled 10 ms/GET ×4-slot remote,
+4 s fg window, n=3 dev Mac):
+
+```
+cell           warm_ms      fg_slow(>1ms)   fg_p999_us
+lazy           1429-2562    64 (every 1st touch stalls inline)   72-114
+bgfill-fast     477-528     17-18                                 37-38
+bgfill-paced    896-918     37-38                                 61-64
+```
+
+### Cycle 3 unit 4 — WAL GC precise pin release (landed 2026-06-13, C3U4)
+
+Closes the Phase-5 residue above:
+
+- **Dropped-CF forever-pin fixed**: coverage treats records of CFs absent
+  from the live registry as covered (their state is gone by definition;
+  CF ids are never reused). Checkpoints taken before the drop keep their
+  own links and restore the CF byte-exact.
+- **Floor-regression re-pin fixed**: a MONOTONIC per-CF flushed floor
+  (`wal_flushed_floors`, advanced at flush-install) merges with the
+  live-SST-derived floor, which regresses to 0 when a CF's SSTs are later
+  compacted away entirely.
+- **Mixed-segment restore fixed**: `replay_linked_wal_delta` SKIPS
+  records of CFs absent from the restored manifest instead of failing
+  the whole restore on `lookup_cf_by_id`; skipped records are not
+  re-logged into the chain-of-restores WAL.
+
+Gates green (pin-release ITs): dropped-CF working ref released at the
+next checkpoint GC (refs 2→1, not linked into new chks), tracked floor
+advances at flush, pre-drop checkpoint restores the CF byte-exact, its
+discard deletes the segment physical exactly once; mixed segment stays
+linked for the live tail and restores with dropped-CF records skipped
+(pre-fix: whole restore errored).
+
+### Cycle 3 PMC review (round 1, 2026-06-13)
+
+`docs/superpowers/specs/review-rounds/phase2-cycle3-pmc-review.md` —
+8 findings: R1-H1 (cold-fill eviction race), R1-M1 (cold-update demotion),
+R1-M2 (`rename_logical` self-rename data loss) ALL FIXED with regression
+UTs; 4 LOW accepted+documented; 2 notes. Post-fix suites: io 245/0,
+storage 450/0, engine 359/0; clippy 0.
 
 ---
 
