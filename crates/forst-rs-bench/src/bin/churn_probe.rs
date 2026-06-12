@@ -173,6 +173,15 @@ struct Args {
     /// assigned cf = bucket % cfs so the TTL deleter lands on the same CF.
     /// 1 (default) = the original single-CF cell.
     cfs: usize,
+    /// FRS-WA-V1 gate cell (2026-06-13 survey §6 stage V1): lifecycle-
+    /// segment mode. Declares every CF `Windowed{ttl = window_rows}` (clock
+    /// = row seq), suppresses per-key deletes (expiry replaces them),
+    /// advances the engine watermark to the write head, notes event-time
+    /// bounds ahead of writes, and runs a PREMATURE-DROP VERIFIER thread
+    /// that point-gets safely-live keys continuously — any miss is the
+    /// correctness falsifier firing (process exits non-zero). Forces the
+    /// engine flag ON via `set_lifecycle_segments_override` (no env needed).
+    lifecycle: bool,
 }
 
 impl Args {
@@ -193,6 +202,7 @@ impl Args {
             no_deletes: false,
             wbuf_mib: 0,
             cfs: 1,
+            lifecycle: false,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -219,6 +229,7 @@ impl Args {
                 "--no-deletes" => a.no_deletes = true,
                 "--wbuf-mib" => a.wbuf_mib = take(&mut i).parse().unwrap(),
                 "--cfs" => a.cfs = take(&mut i).parse().unwrap(),
+                "--lifecycle" => a.lifecycle = true,
                 other => panic!("unknown arg {other}"),
             }
             i += 1;
@@ -315,6 +326,9 @@ struct RunSummary {
     last_l0: usize,
     max_total_files: usize,
     achieved_write_rate: f64,
+    /// FRS-WA-V1 (--lifecycle only): premature-drop verifier results.
+    verify_checks: u64,
+    premature_miss: u64,
 }
 
 fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
@@ -332,6 +346,11 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     if args.wbuf_mib > 0 {
         opts.write_buffer_size = args.wbuf_mib * 1024 * 1024;
     }
+    // FRS-WA-V1: lifecycle cell — force the engine flag ON for this process
+    // (default OFF everywhere else; the override is the test-safe hook).
+    if args.lifecycle {
+        forst_rs_engine::set_lifecycle_segments_override(Some(true));
+    }
     let db = DbImpl::open_with_fs(opts, fs).expect("open");
     // FRS-M3 G3: cf[0] = default; cf[1..] = extra churn CFs. Bucket-affine
     // assignment keeps put/delete/probe for a key on ONE cf.
@@ -347,11 +366,27 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
             }
         })
         .collect();
+    // FRS-WA-V1: declare every churn CF Windowed{ttl = window_rows} (the
+    // lifecycle clock is the row SEQ — caller-defined units by contract).
+    if args.lifecycle {
+        for cf in &cfs {
+            db.set_cf_lifecycle(
+                cf,
+                forst_rs_engine::CfLifecycle::Windowed {
+                    ttl: args.window_rows,
+                },
+            )
+            .expect("set lifecycle");
+        }
+    }
 
     let stop = Arc::new(AtomicBool::new(false));
     let logical = Arc::new(AtomicU64::new(0));
     let rows = Arc::new(AtomicU64::new(0));
     let max_seq = Arc::new(AtomicU64::new(0)); // probe upper bound
+    // FRS-WA-V1: the watermark value last SENT to the engine (verifier reads
+    // it to pick provably-live keys).
+    let wm_sent = Arc::new(AtomicU64::new(0));
 
     // ---- writer thread (both streams interleaved + TTL deletes) ----
     let writer = {
@@ -361,6 +396,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
         let logical = Arc::clone(&logical);
         let rows = Arc::clone(&rows);
         let max_seq = Arc::clone(&max_seq);
+        let wm_sent = Arc::clone(&wm_sent);
         let a = args.clone();
         std::thread::spawn(move || {
             let mut rng = XorShift(0xC0FFEE ^ (run_idx as u64 + 1));
@@ -374,6 +410,15 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                     std::thread::sleep(std::time::Duration::from_micros(200));
                     continue;
                 }
+                // FRS-WA-V1: advance the event-time bound BEFORE the rows it
+                // covers (the stamping soundness contract): every 256 rows,
+                // bound = seq + 255 covers the upcoming block on every CF.
+                if a.lifecycle && seq.is_multiple_of(256) {
+                    for cf in &cfs {
+                        db.note_cf_max_event_time(cf, seq + 255)
+                            .expect("note event time");
+                    }
+                }
                 let stream = if seq.is_multiple_of(2) { b'a' } else { b'b' };
                 let bucket = bucket_of(seq, stream, a.buckets);
                 let key = make_key(stream, bucket, seq);
@@ -384,8 +429,17 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                 let cf = &cfs[(bucket % cfs.len() as u64) as usize];
                 db.put(cf, &key, &value).expect("put");
                 logical.fetch_add((key.len() + a.value_bytes) as u64, Ordering::Relaxed);
-                // TTL-ish delete: expire the row that fell out of the window
-                if !a.no_deletes && seq >= a.window_rows {
+                // TTL-ish delete: expire the row that fell out of the window.
+                // FRS-WA-V1 lifecycle mode: NO per-key deletes — expiry is
+                // whole-segment drop at the watermark (= the write head seq).
+                if a.lifecycle {
+                    if seq.is_multiple_of(1024) {
+                        for cf in &cfs {
+                            db.advance_cf_watermark(cf, seq).expect("advance wm");
+                        }
+                        wm_sent.store(seq, Ordering::Relaxed);
+                    }
+                } else if !a.no_deletes && seq >= a.window_rows {
                     let old = seq - a.window_rows;
                     let old_stream = if old.is_multiple_of(2) { b'a' } else { b'b' };
                     let old_bucket = bucket_of(old, old_stream, a.buckets);
@@ -400,6 +454,64 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
             }
         })
     };
+
+    // ---- FRS-WA-V1 premature-drop verifier (--lifecycle only) ----
+    // Continuously point-gets keys that are PROVABLY live under the
+    // watermark contract: key seq t is dead only once wm > t + window, so
+    // any t ≥ wm_sent - window + margin must be present. A miss = the
+    // correctness falsifier firing (premature whole-segment drop).
+    let verify_checks = Arc::new(AtomicU64::new(0));
+    let premature_miss = Arc::new(AtomicU64::new(0));
+    let verifier = args.lifecycle.then(|| {
+        let db = Arc::clone(&db);
+        let cfs = cfs.clone();
+        let stop = Arc::clone(&stop);
+        let max_seq = Arc::clone(&max_seq);
+        let wm_sent = Arc::clone(&wm_sent);
+        let checks = Arc::clone(&verify_checks);
+        let misses = Arc::clone(&premature_miss);
+        let a = args.clone();
+        std::thread::spawn(move || {
+            let mut rng = XorShift(0x5EED ^ (run_idx as u64 + 1));
+            // Safety margin over the wm-advance cadence (1024 rows) so a
+            // concurrent advance can never race a just-checked key over the
+            // boundary: ~0.5 s of rows at the target rate.
+            let margin = (a.write_rate / 2).max(8 * 1024);
+            while !stop.load(Ordering::Relaxed) {
+                let head = max_seq.load(Ordering::Relaxed);
+                let wm = wm_sent.load(Ordering::Relaxed);
+                let lo = (wm.saturating_sub(a.window_rows)).saturating_add(margin);
+                let hi = head.saturating_sub(1);
+                if hi <= lo {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                let t = lo + rng.next() % (hi - lo);
+                let stream = if t.is_multiple_of(2) { b'a' } else { b'b' };
+                let bucket = bucket_of(t, stream, a.buckets);
+                let key = make_key(stream, bucket, t);
+                let cf = &cfs[(bucket % cfs.len() as u64) as usize];
+                match db.get(cf, &key) {
+                    Ok(Some(_)) => {
+                        checks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => {
+                        checks.fetch_add(1, Ordering::Relaxed);
+                        misses.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "[FALSIFIER] premature drop: live key seq={t} missing \
+                             (wm_sent={wm}, head={head}, window={})",
+                            a.window_rows
+                        );
+                    }
+                    Err(e) => panic!("verifier get failed: {e}"),
+                }
+                // ~2 K checks/s — enough coverage without skewing the probe
+                // latency measurement.
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+        })
+    });
 
     // ---- probe threads (q7 probe shape: prefix_scan over a join bucket) ----
     let window = Arc::new(ProbeWindow::default());
@@ -506,6 +618,9 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     if let Some(h) = sweeper {
         h.join().expect("sweeper join");
     }
+    if let Some(h) = verifier {
+        h.join().expect("verifier join");
+    }
 
     // early = samples [1..=2] (skip warmup sample 0), late = last 2
     let pick = |sl: &[Sample], f: fn(&Sample) -> f64| -> f64 {
@@ -535,6 +650,8 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
             .max()
             .unwrap_or(0),
         achieved_write_rate: last.rows_written as f64 / last.t_s.max(0.001),
+        verify_checks: verify_checks.load(Ordering::Relaxed),
+        premature_miss: premature_miss.load(Ordering::Relaxed),
     };
     drop(db);
     let _ = std::fs::remove_dir_all(&db_path);
@@ -746,6 +863,8 @@ fn one_run_rocksdb(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
             .max()
             .unwrap_or(0),
         achieved_write_rate: last.rows_written as f64 / last.t_s.max(0.001),
+        verify_checks: 0,
+        premature_miss: 0,
     };
     drop(db);
     let _ = std::fs::remove_dir_all(&db_path);
@@ -792,7 +911,8 @@ fn main() {
              \"logical_mib\":{:.0},\"phys_mib\":{:.0},\"achieved_rows_per_s\":{:.0},\
              \"probe_p50_early_us\":{:.0},\"probe_p50_late_us\":{:.0},\
              \"probe_p99_early_us\":{:.0},\"probe_p99_late_us\":{:.0},\
-             \"max_l0\":{},\"last_l0\":{},\"max_total_files\":{}}}",
+             \"max_l0\":{},\"last_l0\":{},\"max_total_files\":{},\
+             \"verify_checks\":{},\"premature_miss\":{}}}",
             args.label,
             i,
             s.write_amp,
@@ -807,6 +927,8 @@ fn main() {
             s.max_l0,
             s.last_l0,
             s.max_total_files,
+            s.verify_checks,
+            s.premature_miss,
         );
     }
     println!(
@@ -825,6 +947,16 @@ fn main() {
         median(summaries.iter().map(|s| s.last_l0 as f64).collect()) as u64,
         summaries.len()
     );
+    if args.lifecycle {
+        let checks: u64 = summaries.iter().map(|s| s.verify_checks).sum();
+        let misses: u64 = summaries.iter().map(|s| s.premature_miss).sum();
+        println!("LIFECYCLE-VERIFY checks={checks} premature_miss={misses}");
+        assert!(checks > 0, "lifecycle verifier must have run");
+        assert_eq!(
+            misses, 0,
+            "PREMATURE-DROP FALSIFIER FIRED: {misses} live keys missing"
+        );
+    }
     if args.smoke {
         assert!(summaries[0].rows_written > 0, "smoke: must write rows");
         println!("SMOKE OK");

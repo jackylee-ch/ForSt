@@ -124,6 +124,24 @@ impl CompactionJob {
         Ok(())
     }
 
+    /// FRS-WA-V1: death stamp inherited by every output of this job.
+    ///
+    /// `max(inputs.max_death)` iff EVERY input carries a stamp (merging
+    /// lifecycle segments preserves whole-file dropability — every entry in
+    /// the output dies by the latest input bound); `0` as soon as ANY input
+    /// is unstamped (a normal SST may hold immortal entries, so the output
+    /// must never be whole-file expired). Empty inputs → 0.
+    fn output_max_death(&self) -> u64 {
+        let mut max_d = 0u64;
+        for (_, meta, _) in &self.inputs {
+            if meta.max_death == 0 {
+                return 0;
+            }
+            max_d = max_d.max(meta.max_death);
+        }
+        max_d
+    }
+
     /// Runs the compaction synchronously and returns a [`VersionEdit`] that
     /// the caller should apply atomically to the [`forst_rs_storage::version::VersionSetImpl`].
     ///
@@ -537,6 +555,9 @@ impl CompactionJob {
 
         // 6. Build the VersionEdit: add EVERY produced file at output_level,
         // remove all inputs. R49-H1: stamp the job's cf_id onto each meta.
+        // FRS-WA-V1: outputs inherit the inputs' death stamp (see
+        // `output_max_death`).
+        let output_max_death = self.output_max_death();
         let mut new_files: Vec<(u32, SstFileMeta)> = Vec::with_capacity(produced.len());
         let mut max_out_seq = 0u64;
         for (fnum, info) in produced {
@@ -553,6 +574,7 @@ impl CompactionJob {
                     min_sequence: forst_rs_common::SequenceNumber(info.min_sequence),
                     max_sequence: forst_rs_common::SequenceNumber(info.max_sequence),
                     num_entries: info.entry_count,
+                    max_death: output_max_death,
                 },
             ));
         }
@@ -894,6 +916,8 @@ impl CompactionJob {
             }));
         }
 
+        // FRS-WA-V1: outputs inherit the inputs' death stamp.
+        let output_max_death = self.output_max_death();
         let mut new_files: Vec<(u32, SstFileMeta)> = Vec::with_capacity(produced.len());
         let mut max_out_seq = 0u64;
         for (fnum, info) in produced {
@@ -910,6 +934,7 @@ impl CompactionJob {
                     min_sequence: forst_rs_common::SequenceNumber(info.min_sequence),
                     max_sequence: forst_rs_common::SequenceNumber(info.max_sequence),
                     num_entries: info.entry_count,
+                    max_death: output_max_death,
                 },
             ));
         }
@@ -1623,6 +1648,7 @@ mod tests {
             min_sequence: SequenceNumber(info.min_sequence),
             max_sequence: SequenceNumber(info.max_sequence),
             num_entries: info.entry_count,
+            max_death: 0,
         };
         (meta, reader)
     }

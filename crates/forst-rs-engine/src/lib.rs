@@ -103,7 +103,7 @@ pub mod write_batch;
 pub mod write_controller;
 
 pub use checkpoint::{CheckpointManifest, CHECKPOINT_BLOB_NAME};
-pub use column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
+pub use column_family::{CfLifecycle, ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
 pub use compaction::{compaction_output_path, CompactionJob};
 pub use compaction_filter::{
     decode_ttl_payload, encode_ttl_value, CompactionDecision, CompactionFilter,
@@ -111,8 +111,9 @@ pub use compaction_filter::{
     TtlStateType,
 };
 pub use db::{
-    s2_pinned_enabled, set_s2_pinned_override, DbImpl, FillOutcome, IncrementalCheckpointResult,
-    LiveFileInfo, PrefixScanStream, RowSink, DEFAULT_CF_NAME,
+    lifecycle_segments_enabled, s2_pinned_enabled, set_lifecycle_segments_override,
+    set_s2_pinned_override, DbImpl, FillOutcome, IncrementalCheckpointResult, LiveFileInfo,
+    PrefixScanStream, RowSink, DEFAULT_CF_NAME,
 };
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};

@@ -1377,6 +1377,112 @@ pub unsafe extern "C" fn frs_cf_set_compaction_filter_ttl(
 }
 
 // ---------------------------------------------------------------------------
+// 2b. FRS-WA-V0: per-CF state-lifecycle descriptor + watermark clocks
+// (2026-06-13 write-path redesign survey §3.2/§6 stage V0 — INERT plumbing).
+//
+// The Flink backend KNOWS when its state dies (window end, interval-join
+// TTL, timer fire); these entry points export that knowledge so the engine
+// can later (V1, flag-gated default-OFF) drop whole death-bucketed segments
+// at the watermark instead of compacting soon-dead bytes. Precedent: ForSt
+// C++ `FlinkCompactionFilter` already exports the TTL contract across the
+// boundary — but only as a filter INSIDE compaction, still paying the
+// rewrite. In V0 the engine stores + logs these values; no behavior changes.
+// ---------------------------------------------------------------------------
+
+/// FRS-WA-V0: declares the CF's state lifecycle.
+///
+/// `kind` ordinal (see `CfLifecycle::from_ordinal`):
+/// - `0` — Unbounded (default; classic leveled compaction)
+/// - `1` — Windowed: entries written at event-time `t` are dead once the CF
+///   watermark passes `t + ttl` (`ttl` in the CF's clock units; Flink: ms)
+/// - `2` — Timer (reserved hint; no engine behavior yet)
+///
+/// Unknown ordinals return `FRS_STATUS_INVALID_ARGUMENT`. `ttl` is ignored
+/// for kinds other than `1`.
+///
+/// # SAFETY
+///
+/// - `db` must be a handle returned by `frs_db_open*` and not yet closed.
+/// - `cf` must be a handle returned by `frs_db_create_cf*` /
+///   `frs_db_open_cf` for the same database, not yet closed.
+#[no_mangle]
+pub unsafe extern "C" fn frs_cf_set_lifecycle(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    kind: i32,
+    ttl: u64,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(lifecycle) = forst_rs_engine::CfLifecycle::from_ordinal(kind, ttl) else {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        };
+        match db.set_cf_lifecycle(cf, lifecycle) {
+            Ok(()) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// FRS-WA-V0: advances the CF's watermark clock (monotonic — stale or
+/// duplicate watermarks are harmless no-ops). The backend calls this from
+/// the operator's watermark path, AFTER subtracting any allowed-lateness
+/// slack it owes its own late-data handling.
+///
+/// # SAFETY — same handle contract as [`frs_cf_set_lifecycle`].
+#[no_mangle]
+pub unsafe extern "C" fn frs_cf_advance_watermark(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    watermark: u64,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        match db.advance_cf_watermark(cf, watermark) {
+            Ok(()) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// FRS-WA-V0: raises the CF's written-event-time upper bound (monotonic).
+/// The caller MUST keep this ≥ the event-time of every entry it has written
+/// to the CF — advance it before (or atomically with) the write. The V1
+/// flush path samples it after sealing a memtable to derive a sound (never
+/// premature) segment death stamp `max_event_time + ttl`.
+///
+/// # SAFETY — same handle contract as [`frs_cf_set_lifecycle`].
+#[no_mangle]
+pub unsafe extern "C" fn frs_cf_note_max_event_time(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    event_time: u64,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        match db.note_cf_max_event_time(cf, event_time) {
+            Ok(()) => FRS_STATUS_OK,
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // 3. Point operations
 // ---------------------------------------------------------------------------
 
@@ -7070,6 +7176,75 @@ mod tests {
             let mut out = FrsBytes::NULL;
             frs_get(db, cf, k.as_ptr(), k.len(), &mut out);
             assert!(out.data.is_null());
+
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    /// FRS-WA-V0: lifecycle + watermark FFI plumbing — ordinal mapping,
+    /// monotonic clock semantics, null-arg and bad-ordinal rejection, and
+    /// V0 inertness (a lifecycle CF still round-trips a put/get).
+    #[test]
+    fn test_wa_v0_cf_lifecycle_and_watermark_ffi() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            frs_db_open_memory(&mut db);
+            let name = CString::new("win").unwrap();
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_create_cf(db, name.as_ptr(), &mut cf), FRS_STATUS_OK);
+
+            // kind=1 (Windowed) with a ttl installs.
+            assert_eq!(frs_cf_set_lifecycle(db, cf, 1, 4_000_000), FRS_STATUS_OK);
+            // Engine-side observation (white-box through the handle).
+            {
+                let db_ref = db_from_handle(db).unwrap();
+                let cf_ref_h = cf_ref(&cf).unwrap();
+                assert_eq!(
+                    db_ref.cf_lifecycle(cf_ref_h).unwrap(),
+                    forst_rs_engine::CfLifecycle::Windowed { ttl: 4_000_000 }
+                );
+            }
+            // Unknown ordinal: rejected, descriptor unchanged.
+            assert_eq!(
+                frs_cf_set_lifecycle(db, cf, 7, 0),
+                FRS_STATUS_INVALID_ARGUMENT
+            );
+
+            // Watermark + event-time: monotonic via the FFI.
+            assert_eq!(frs_cf_advance_watermark(db, cf, 1_000), FRS_STATUS_OK);
+            assert_eq!(frs_cf_advance_watermark(db, cf, 500), FRS_STATUS_OK); // stale no-op
+            assert_eq!(frs_cf_note_max_event_time(db, cf, 9_000), FRS_STATUS_OK);
+            {
+                let db_ref = db_from_handle(db).unwrap();
+                let cf_ref_h = cf_ref(&cf).unwrap();
+                assert_eq!(db_ref.cf_watermark(cf_ref_h).unwrap(), 1_000);
+                assert_eq!(db_ref.cf_max_event_time(cf_ref_h).unwrap(), 9_000);
+            }
+
+            // NULL args rejected.
+            assert_eq!(
+                frs_cf_set_lifecycle(ptr::null_mut(), cf, 1, 1),
+                FRS_STATUS_NULL_ARG
+            );
+            assert_eq!(
+                frs_cf_advance_watermark(db, ptr::null_mut(), 1),
+                FRS_STATUS_NULL_ARG
+            );
+            assert_eq!(
+                frs_cf_note_max_event_time(ptr::null_mut(), cf, 1),
+                FRS_STATUS_NULL_ARG
+            );
+
+            // V0 inertness: lifecycle CF reads/writes like any other.
+            let k = b"k";
+            let v = b"v";
+            frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len());
+            let mut out = FrsBytes::NULL;
+            assert_eq!(frs_get(db, cf, k.as_ptr(), k.len(), &mut out), FRS_STATUS_OK);
+            let slice = slice::from_raw_parts(out.data, out.len);
+            assert_eq!(slice, b"v");
+            frs_bytes_free(&mut out);
 
             frs_cf_close(cf);
             frs_db_close(db);

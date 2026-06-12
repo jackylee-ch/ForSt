@@ -51,6 +51,17 @@ pub struct SstFileMeta {
     pub min_sequence: SequenceNumber,
     pub max_sequence: SequenceNumber,
     pub num_entries: u64,
+    /// FRS-WA-V1 (write-path redesign survey §3.2): death stamp for
+    /// lifecycle-segmented files. `0` = no stamp (the file is a normal SST;
+    /// it can never be whole-file expired). Non-zero = an UPPER BOUND, in
+    /// the owning CF's lifecycle clock units, on the death time of every
+    /// entry in the file (`max_event_time_at_seal + ttl`); once the CF
+    /// watermark exceeds this value the whole file is logically dead and
+    /// may be dropped by `unlink` without compaction. Stamped by the flush
+    /// path for lifecycle CFs when `FRS_LIFECYCLE_SEGMENTS=1`; compaction
+    /// outputs inherit `max(inputs)` iff every input is stamped, else `0`.
+    /// Persisted in checkpoint-blob format v3 (older blobs decode as `0`).
+    pub max_death: u64,
 }
 
 impl SstFileMeta {
@@ -75,6 +86,7 @@ impl SstFileMeta {
             min_sequence,
             max_sequence,
             num_entries,
+            max_death: 0,
         }
     }
 }
@@ -1159,6 +1171,7 @@ mod tests {
             min_sequence: SequenceNumber(1),
             max_sequence: SequenceNumber(100),
             num_entries: 50,
+            max_death: 0,
         }
     }
 
@@ -1265,6 +1278,7 @@ mod tests {
             min_sequence: SequenceNumber(1),
             max_sequence: SequenceNumber(100),
             num_entries: 50,
+            max_death: 0,
         };
         let edit = VersionEdit {
             new_files: vec![
@@ -1353,6 +1367,7 @@ mod tests {
             min_sequence: SequenceNumber(1),
             max_sequence: SequenceNumber(100),
             num_entries: 50,
+            max_death: 0,
         };
         let edit = VersionEdit {
             new_files: vec![
@@ -1587,6 +1602,7 @@ mod tests {
                             min_sequence: SequenceNumber(1),
                             max_sequence: SequenceNumber(100),
                             num_entries: 10,
+            max_death: 0,
                         },
                     ));
                     file_num += 1;
@@ -1612,6 +1628,7 @@ mod tests {
                                 min_sequence: SequenceNumber(1),
                                 max_sequence: SequenceNumber(100),
                                 num_entries: 10,
+            max_death: 0,
                             },
                         ));
                         file_num += 1;
@@ -1718,6 +1735,7 @@ mod tests {
                     min_sequence: SequenceNumber(1),
                     max_sequence: SequenceNumber(100),
                     num_entries: 50,
+            max_death: 0,
                 },
             ));
         }
