@@ -2270,3 +2270,17 @@ de-noising cells queued (resident agent). NOTE: the box hosts a USER campaign
 (run-matrix forst-local vs forst-rs-lib, 8c/40g, since 00:18 — ALL today's
 remote numbers share that neighbor load; population consistent). Box jar
 currently = r1 (725824ae9e9) — setup must redeploy 72607e110 before new cells.
+
+### ★★ q7 S2 VERDICT @100M: +3.1% only — MICRO WIN DID NOT TRANSFER (falsifier hit)
+5M screen PASS (rows identical ON/OFF). 100M concurrent ratio-fair pair: both
+arms DNF@2400 (pair regime slower — shared disk + neighbor load; RATIO is the
+measurement): S2-ON 75.63M vs OFF 73.33M events = +3.1% (consistent through the
+run). The 6-9× probe micro-win does NOT dominate q7@100M ⇒ q7's wall is NOT
+probe-merge-CPU-bound at scale (suspect: I/O regime or framework floor). PER THE
+ANTI-WANDERING RULE: q7 enters its RE-PROFILE stage (remote perf capture of the
+real 100M hot path) before any further q7 lever work. S2 stays correctness-clean
+and never-losing (default-ON gate unblocked, low priority). Strategy-doc q7 row
+(beat-ForSt-total decider) now needs the re-profile to re-rank.
+Infra fixes for future agents (cost ~2h): FRS_RS_S2_PINNED not in ENVS;
+docker IPv4 pool exhaustion (need NET_SUBNET); dockerd stale overmount on
+~/workenv/frs-tmp ⇒ use FRS_CTMP_BASE=/ssd2/jackylee/frs-bench/frs-tmp.
