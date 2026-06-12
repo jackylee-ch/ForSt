@@ -2301,3 +2301,14 @@ results). MEASUREMENT CAVEAT (H1 de-confound): the 98-99% /ssd2 util + writes>
 reads observation was taken under multi-cluster shared-disk contention — part of
 the "write saturation" may be contention, not write-amp; the ForSt-vs-frs iostat
 comparison and the post-distribution re-measure settle it.
+
+### ★ q7 DESIGN ACCEPTANCE GATE (user, 2026-06-12): H1 evidence was disk-confounded
+The sorted-run-discipline design (in progress) may rest on contaminated evidence
+(the 98-99% /ssd2 util + writes>reads iostat was captured under multi-cluster
+shared-disk contention). BEFORE the design is approved or built, ALL THREE must
+align on CLEAN conditions: (1) the re-baseline q7 pair (quiet dedicated disk);
+(2) a RE-CAPTURED q7 iostat/profile on a quiet disk (does frs q7 still saturate
+its own disk alone? writes still > reads?); (3) the local H1 microbench
+(write-amp + fan-out curves). If clean q7 is much faster / not disk-bound, H1
+demotes and the q7 lever hunt restarts from the clean profile. The in-flight
+sorted-run doc lands as HYPOTHESIS-PENDING-CLEAN-EVIDENCE, not approved.
