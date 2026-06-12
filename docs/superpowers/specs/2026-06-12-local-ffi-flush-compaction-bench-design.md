@@ -154,7 +154,9 @@ flush_stress -- --secs 60 --wbuf-mib 128 --value-bytes 256 [--delete-pct 30]
 ## 5. Evidence — B1 first baseline (Mac-population; one run, n=1)
 
 **Status: B1 `ffi_vectorized` IMPLEMENTED** (`crates/forst-rs-bench/benches/ffi_vectorized.rs`,
-`cargo bench -p forst-rs-bench --bench ffi_vectorized`). B2/B3/B4-bins still open.
+`cargo bench -p forst-rs-bench --bench ffi_vectorized`). **B3 `compaction_throughput`
+IMPLEMENTED** (`crates/forst-rs-bench/src/bin/compaction_throughput.rs` — see §5c;
+`--merge-chain` cells not built in v1). B2/B4-shared-module still open.
 
 Run: 2026-06-12, engine SHA `81903a5ed` (post E1/E3), Apple M5 Pro / 64 GiB,
 macOS, system allocator (jemalloc compile-gated off on Mac), LocalFileSystem
@@ -257,3 +259,55 @@ cell does not support a ns-precise claim; everything else is tight.
    OnceLock soundness-flag load + one cached-bool branch per level is
    invisible, as the by-inspection argument predicts (single-CF levels
    always take the unchanged binary-search arm).
+
+## 5c. Evidence — B3 first baseline pair: L4 windowed compaction reads OFF vs ON (Mac-population, median-of-3)
+
+**Status: B3 `compaction_throughput` IMPLEMENTED**
+(`crates/forst-rs-bench/src/bin/compaction_throughput.rs`;
+`cargo run -p forst-rs-bench --release --bin compaction_throughput -- [--smoke]
+[--runs N] [--with-read-load] [--l0-files N] [--sst-mib M] [--overlap-pct P]
+[--tombstone-pct T]`). Deviations from §B3 v1: `--merge-chain` operand cells
+NOT built; the L0-fan-in sweep is a CLI knob rather than a fixed {4,8,16}
+matrix; the bin pins `FRS_L0_COMPACTION_TRIGGER=100000` (unless preset) so the
+timed `compact_l0` is the only compaction. Workdir is `target/…` (auto-removed),
+not /tmp. B4 Mac fallback included (phase-boundary `ps` RSS lines).
+
+Run: 2026-06-12, tree = L4 windowed-readpath commits (storage 94936ea81 +
+engine e09175d00 on top of 8bc2a31df), Apple M5 Pro / 64 GiB, macOS 26.5.1,
+system allocator, LocalFileSystem under `target/`, release build. Cell:
+8 L0 files × 64 MiB (incompressible xorshift values, LZ4 SST compression,
+input ≈ 432.5 MB on disk), 50 % key overlap, 20 % tombstones, value 256 B;
+inputs page-cache-warm (written immediately before the timed compaction).
+Median-of-3 per cell, same session, same box. **Mac-population caveat
+(binding):** same-box A/B regressions only; absolute numbers do NOT transfer
+to the Linux deployment.
+
+| cell | flag | ns/byte-input (med-of-3) | per-run spread | MB/s | sidecar gets/s (med) |
+|---|---|---|---|---|---|
+| isolated | OFF | **0.906** | 0.897 / 0.906 / 0.953 | 1053 | — |
+| isolated | ON (`FRS_COMPACT_WINDOWED=1`) | **0.768** | 0.761 / 0.768 / 0.785 | 1242 | — |
+| with-read-load | OFF | **0.854** | 0.853 / 0.854 / 0.858 | 1118 | 599,026 |
+| with-read-load | ON | **0.793** | 0.786 / 0.793 / 0.814 | 1203 | 624,744 |
+
+**Verdicts (this box, n=3, tight spreads):**
+
+1. **Isolated: windowed reads −15.2 %** compaction wall (0.906 → 0.768
+   ns/byte) — pure I/O+decompress+decode↔merge overlap (no cache to pollute,
+   sidecar absent), consistent with the L4 design model §4(b).
+2. **Live: −7.1 %** compaction wall (0.854 → 0.793) AND the foreground
+   point-get sidecar gains **+4.3 %** (599 k → 625 k gets/s) DURING the
+   compaction — the Skip-policy direction (compaction no longer churns the
+   decoded-block cache) shows up on the foreground side exactly as design
+   §4 second-order predicts. Both directions agree across all 3 runs/cell.
+3. **Output byte-equality held in the wild:** per-run `output_bytes` are
+   IDENTICAL between OFF and ON for every run pair (240,583,154 /
+   240,792,873 / 240,525,082) — G1 corroborated outside the UT harness.
+4. W5 telemetry (`FRS_COMPACT_DIAG=1`, smoke cell): `blocks_window=104
+   blocks_demand=0` — 100 % windowed delivery, design falsifier 1 satisfied.
+5. This cell is page-cache-warm and ~0.9 ns/byte-class — far below the
+   recorded 21 ns/byte *live 100M q4* number; it measures the overlap +
+   cache-policy lever, NOT the cold-pread regime. The q9/q20 @100M A/B
+   (gates G4-G6 of the L4 design) remains the macro referee.
+
+B4 capture (Mac fallback): RSS ~540 MiB build-phase peak per run (1 Hz not
+needed; phase-boundary samples), released between runs.
