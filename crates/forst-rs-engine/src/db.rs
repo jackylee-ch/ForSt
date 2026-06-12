@@ -6247,6 +6247,42 @@ impl DbImpl {
             db.create_cf_with_id(cf.cf_id, desc)?;
         }
 
+        // FRS-WA-V1 R10: re-apply persisted lifecycle state (descriptor +
+        // watermark/event-time clocks, blob v4) to every restored CF —
+        // including the default CF, which the loop above `continue`s past.
+        // Pre-v4 blobs decode all-zero ⇒ this is a no-op for them. With the
+        // state restored, segment expiry resumes on the next maintenance
+        // tick instead of waiting for the backend to re-declare the
+        // lifecycle and re-advance the watermark, and the first
+        // post-restore flush stamps from a sound event-time bound.
+        for cf in &snapshot.cf_descriptors {
+            if cf.lifecycle_ordinal == 0
+                && cf.watermark == 0
+                && cf.max_event_time == 0
+            {
+                continue;
+            }
+            let cf_data = db.lookup_cf_by_id(cf.cf_id)?;
+            match crate::column_family::CfLifecycle::from_ordinal(
+                cf.lifecycle_ordinal as i32,
+                cf.lifecycle_ttl,
+            ) {
+                Some(crate::column_family::CfLifecycle::Unbounded) => {}
+                Some(lifecycle) => cf_data.set_lifecycle(lifecycle),
+                None => {
+                    // The blob decoder already rejects unknown ordinals;
+                    // defense-in-depth for any future decoder relaxation.
+                    return Err(ForstError::corruption(format!(
+                        "checkpoint cf_descriptor for '{}' carries unknown \
+                         lifecycle ordinal {}",
+                        cf.name, cf.lifecycle_ordinal
+                    )));
+                }
+            }
+            cf_data.advance_watermark(cf.watermark);
+            cf_data.note_max_event_time(cf.max_event_time);
+        }
+
         Self::init_self_weak(&db);
         Self::spawn_snapshot_age_worker(&db);
         Ok(db)
@@ -10951,11 +10987,29 @@ impl DbImpl {
                 .map(|f| f.name())
                 .unwrap_or_default();
             check("compaction_filter name", cf_id, &filter_name)?;
+            // FRS-WA-V1 R10: persist the lifecycle descriptor + clocks so
+            // whole-segment expiry resumes after restore without waiting
+            // for the backend to re-declare/re-advance. Both clocks are
+            // monotone bounds sampled under the snapshot's apply-locked
+            // view: the watermark restores ≤ its true crash-time value
+            // (drops only deferred, never premature) and the event-time
+            // bound covers every entry the snapshot contains (so the first
+            // post-restore flush stamps soundly instead of emitting an
+            // immortal stamp-0 segment — review R10 consequence (b)).
+            let lifecycle = cf.lifecycle();
+            let lifecycle_ttl = match lifecycle {
+                crate::column_family::CfLifecycle::Windowed { ttl } => ttl,
+                _ => 0,
+            };
             out.push(CfDescriptor {
                 cf_id,
                 name,
                 merge_op_name,
                 filter_name,
+                lifecycle_ordinal: lifecycle.ordinal() as u8,
+                lifecycle_ttl,
+                watermark: cf.watermark(),
+                max_event_time: cf.max_event_time(),
             });
         }
         Ok(out)
@@ -14382,6 +14436,77 @@ mod tests {
         assert_eq!(db.backpressure_l0_count(&db.version_set.current()), 0);
 
         set_lifecycle_stamped_ceiling_override(0);
+        set_lifecycle_segments_override(None);
+    }
+
+    /// FRS-WA-V1 R10 (PMC review 2026-06-12, blob v4): lifecycle
+    /// descriptor + watermark/event-time clocks PERSIST through a
+    /// checkpoint-restore cycle, so (a) expiry resumes without the backend
+    /// re-declaring/re-advancing anything, and (b) the first post-restore
+    /// flush stamps from the restored event-time bound instead of emitting
+    /// an immortal stamp-0 segment.
+    #[test]
+    fn test_wa_v1_r10_lifecycle_state_persists_across_restore() {
+        use crate::column_family::CfLifecycle;
+        use forst_rs_io::MemoryFileSystem;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_lifecycle_segments_override(Some(true));
+        const TTL: u64 = 100;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("life-restore")
+                    .with_lifecycle(CfLifecycle::Windowed { ttl: TTL }),
+            )
+            .unwrap();
+        // One stamped segment (events ≤ 50 ⇒ stamp 150) + clocks advanced.
+        for i in 1..=50u64 {
+            db.note_cf_max_event_time(&cf, i).unwrap();
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"v").unwrap();
+        }
+        let meta = db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert_eq!(meta.max_death, 150);
+        db.advance_cf_watermark(&cf, 120).unwrap();
+
+        db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
+
+        let opts = EngineOptions {
+            db_path: "/ckpt".to_string(),
+            ..EngineOptions::default()
+        };
+        let restored = DbImpl::open_from_checkpoint(opts, fs).unwrap();
+        let rcf = restored
+            .column_family("life-restore")
+            .expect("CF restored by name");
+
+        // (a) Descriptor + clocks restored — NO re-declaration happened.
+        assert_eq!(
+            restored.cf_lifecycle(&rcf).unwrap(),
+            CfLifecycle::Windowed { ttl: TTL }
+        );
+        assert_eq!(restored.cf_watermark(&rcf).unwrap(), 120);
+        assert_eq!(restored.cf_max_event_time(&rcf).unwrap(), 50);
+
+        // (b) A post-restore flush stamps from the RESTORED bound (50+TTL),
+        // not stamp-0 (the pre-R10 immortal-segment consequence).
+        restored.put(&rcf, b"post-restore", b"v").unwrap();
+        let meta = restored.switch_and_flush(&rcf).unwrap().expect("flushed");
+        assert_eq!(meta.max_death, 150, "stamp must use the restored bound");
+
+        // (c) Expiry resumes purely from restored state: advance past the
+        // stamp (the backend re-emits watermarks on restore — but the
+        // DESCRIPTOR needed no re-declaration) and the segments drop whole.
+        let rcf_data = restored.lookup_cf_by_id(rcf.id()).unwrap();
+        restored.advance_cf_watermark(&rcf, 151).unwrap();
+        assert_eq!(restored.lifecycle_drop_expired(&rcf_data).unwrap(), 2);
+        assert_eq!(restored.get(&rcf, b"k0001").unwrap(), None);
+
+        // (d) Round-trip of a restored-then-checkpointed engine keeps the
+        // monotone clocks (restore→checkpoint→restore is stable).
+        restored
+            .create_checkpoint(std::path::Path::new("/ckpt2"))
+            .unwrap();
         set_lifecycle_segments_override(None);
     }
 
