@@ -170,6 +170,11 @@ write_buffer_size 128mb (compaction-overload → restart). Merge-collapse REFUTE
 > under locked cfg): q16/q19 (`noflush=TRUE` — removed); q7/q11/q15 (OLD fast cfg). Light queries
 > (q0-q3,q10,q12-14,q21,q22) are source-bound and pre-lock — low-risk, re-confirm.
 
+> ⛔ **TABLE BELOW SUPERSEDED (2026-06-12).** It is the original 2026-06-08 snapshot, kept for
+> history. The CURRENT per-query table lives at the TOP of this doc under
+> "★ REFRESHED PER-QUERY TABLE (2026-06-12)" — q5/q8 correctness bugs since FIXED, q9/q20
+> DNFs ELIMINATED, q9 PASSES on the remote population, q7 finishes with io_uring.
+
 | query | RocksDB s | RocksDB out_rows | forst-rs s | forst-rs out_rows | ForSt s | acc | bar |
 |-------|-----------|------------------|------------|-------------------|---------|-----|-----|
 | q0    | 32.7      | 100,000,000      | 31.0       | 100,000,000       | -          | ✓ | **PASS (correct + faster)** |
