@@ -3900,6 +3900,23 @@ impl DbImpl {
             .remove(&cf_data.handle().id());
         let _ = self.lifecycle_drop_expired(cf_data)?;
         let _ = self.lifecycle_cohort_merge(cf_data)?;
+        // PMC review R11: merge-once markers for files retired by OTHER
+        // paths (a mixed L0 rollup consuming stamped files, drop_cf) were
+        // never cleaned here — a slow unbounded HashSet leak. Retain only
+        // live file numbers (cheap: both sets are small).
+        {
+            let live: std::collections::HashSet<FileNumber> = self
+                .version_set
+                .current()
+                .live_sst_files()
+                .iter()
+                .map(|m| m.file_number)
+                .collect();
+            self.lifecycle_merged
+                .lock()
+                .expect("lock poisoned")
+                .retain(|fnum| live.contains(fnum));
+        }
         Ok(())
     }
 
