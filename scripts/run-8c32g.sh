@@ -27,7 +27,6 @@ DKR_COMMON=(--platform "$PLAT"
   # ~36-45 GB of SST data + cache + checkpoint-noflush memtable artifacts to /tmp and
   # fill that 59 GB → "No space left on device" → job crash (mis-read earlier as OOM).
   # Bind-mount /tmp to a host dir on the big volume so all engine scratch uses it.
-  -v "$WORKENV/frs-tmp:/tmp"
   -v forst-cargo:/cargo-cache
   -e CARGO_HOME=/cargo-cache
   -e JDK17="${JDK17_IN_IMG:-/usr/lib/jvm/java-17-openjdk-arm64}"
@@ -37,12 +36,16 @@ DKR_COMMON=(--platform "$PLAT"
   -e NEXMARK_HOME="$REPO/nexmark/nexmark-flink/target/nexmark-flink-bin/nexmark-flink"
   -w "$REPO")
 
+# /tmp mount is per-invocation: single/build use the shared frs-tmp; TOPO=split
+# namespaces it per-cluster (CONCURRENT NexMark clusters, 2026-06-12 directive).
+TMP_MOUNT=(-v "$WORKENV/frs-tmp:/tmp")
+
 cmd="${1:?build|run|jar}"; shift || true
 
 case "$cmd" in
   build)
     echo "== building forst-rs Linux .so (arm64) into target-linux/release =="
-    docker run --rm "${DKR_COMMON[@]}" -e CARGO_TARGET_DIR="$REPO/target-linux" "$IMG" \
+    docker run --rm "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" -e CARGO_TARGET_DIR="$REPO/target-linux" "$IMG" \
       bash -lc 'cargo build --release -p forst-rs-ffi && ls -la target-linux/release/libforst_rs_ffi.so'
     ;;
   run)
@@ -84,26 +87,36 @@ case "$cmd" in
     # legacy topology remains TOPO=single (all pre-2026-06-11 pins live there).
     if [ "${TOPO:-single}" = "split" ]; then
       [ -n "${FRS_PERF:-}${FRS_RSS_SAMPLE:-}${FRS_JFR:-}" ] && echo "WARN: FRS_PERF/FRS_RSS_SAMPLE/FRS_JFR not supported under TOPO=split yet — ignored"
-      NET=frs-net
+      # CONCURRENCY (2026-06-12): every run gets its own cluster namespace —
+      # containers, network, /tmp scratch, and Flink conf dir — so multiple
+      # NexMark clusters run on one box concurrently (same .so/jar version only:
+      # $FLINK/lib is shared). CLUSTER defaults to the run tag.
+      CLUSTER="${CLUSTER:-frs-$TAG}"
+      NET="$CLUSTER-net"
+      CTMP="$WORKENV/frs-tmp/$CLUSTER"
+      CCONF="$CTMP/flink-conf"
+      mkdir -p "$CTMP"
+      rm -rf "$CCONF" && cp -r "$FLINK/conf" "$CCONF"
+      SPLIT_TMP=(-v "$CTMP:/tmp")
       docker network create "$NET" >/dev/null 2>&1 || true
-      docker rm -f frs-jm frs-tm1 frs-tm2 >/dev/null 2>&1 || true
+      docker rm -f "$CLUSTER-jm" "$CLUSTER-tm1" "$CLUSTER-tm2" >/dev/null 2>&1 || true
       # TM JVM allocator: jemalloc via LD_PRELOAD (uniform across ALL backends —
       # an environment property of the box, like the kernel). The engine's own
       # jemalloc is statically bundled in the .so and unaffected (prefixed symbols).
       TM_PRELOAD=()
       [ "${FRS_TM_JEMALLOC:-1}" = "1" ] && TM_PRELOAD=(-e LD_PRELOAD=/usr/local/lib/libjemalloc-preload.so)
       for i in 1 2; do
-        docker run -d --name "frs-tm$i" --network "$NET" --cpus=4 --memory=16g --memory-swap=16g \
+        docker run -d --name "$CLUSTER-tm$i" --network "$NET" --cpus=4 --memory=16g --memory-swap=16g \
           ${TM_PRELOAD[@]+"${TM_PRELOAD[@]}"} \
-          "${DKR_COMMON[@]}" "${ENVS[@]}" "$IMG" bash -lc "
+          "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e FLINK_CONF_DIR="$CCONF" "$IMG" bash -lc "
             mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
             cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
-            for t in \$(seq 1 150); do curl -sf http://frs-jm:8081/overview >/dev/null 2>&1 && break; sleep 2; done
+            for t in \$(seq 1 150); do curl -sf http://$CLUSTER-jm:8081/overview >/dev/null 2>&1 && break; sleep 2; done
             exec bash '$FLINK/bin/taskmanager.sh' start-foreground
           " >/dev/null
       done
-      docker run --rm --name frs-jm --network "$NET" --cpus=2 --memory=4g \
-        "${DKR_COMMON[@]}" "${ENVS[@]}" -e CLUSTER_MODE=external -e EXPECT_TMS=2 -e JM_HOST=frs-jm \
+      docker run --rm --name "$CLUSTER-jm" --network "$NET" --cpus=2 --memory=4g \
+        "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e CLUSTER_MODE=external -e EXPECT_TMS=2 -e JM_HOST="$CLUSTER-jm" -e FLINK_CONF_DIR="$CCONF" \
         "$IMG" bash -lc "
           mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
           cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
@@ -111,13 +124,14 @@ case "$cmd" in
           bash scripts/measure-sql.sh
         " 2>&1 | tee "$OUT"
       for i in 1 2; do
-        docker logs "frs-tm$i" 2>/dev/null | grep -h 'STREAM_STATS\|DIAG_COMPLETION' | tail -6
+        docker logs "$CLUSTER-tm$i" 2>/dev/null | grep -h 'STREAM_STATS\|DIAG_COMPLETION' | tail -6
       done
-      docker rm -f frs-tm1 frs-tm2 >/dev/null 2>&1 || true
+      docker rm -f "$CLUSTER-tm1" "$CLUSTER-tm2" >/dev/null 2>&1 || true
+      docker network rm "$NET" >/dev/null 2>&1 || true
       echo "--- RESULT line ---"; grep -E 'RESULT:|MAXSEC' "$OUT" | tail -1
       exit 0
     fi
-    docker run --rm --cpus=8 --memory=32g --memory-swap=32g ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" \
+    docker run --rm --cpus=8 --memory=32g --memory-swap=32g ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" \
       "${ENVS[@]}" \
       "$IMG" bash -lc "
         cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&

@@ -23,7 +23,8 @@ MAXSEC="${MAXSEC:-3000}"
 TPS="${TPS:-10000000}"; EVENTS_NUM="${EVENTS_NUM:-100000000}"
 PERSON_PROPORTION=1; AUCTION_PROPORTION=3; BID_PROPORTION=46
 S3VARS='${S3_ENDPOINT} ${S3_ACCESS_KEY} ${S3_SECRET_KEY} ${S3_BUCKET} ${S3_REGION} ${S3_PREFIX} ${RUN_ID}'
-CONF="$FLINK_HOME/conf/config.yaml"
+# Per-cluster conf dir (concurrent clusters): honor FLINK_CONF_DIR when set.
+CONF="${FLINK_CONF_DIR:-$FLINK_HOME/conf}/config.yaml"
 TEMPLATES="${TEMPLATES:-$FLINK_HOME/conf/templates}"
 case "$CONFIG" in
   rocksdb) cp "$TEMPLATES/config-rocksdb.yaml" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-rocksdb-io /tmp/nexmark-checkpoints-rocksdb ;;
