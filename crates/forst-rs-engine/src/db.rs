@@ -10476,6 +10476,13 @@ impl DbImpl {
                     match entry.op_type {
                         OpType::Put => resolved[i] = Some(entry.value),
                         OpType::Delete | OpType::SingleDelete => resolved[i] = Some(None),
+                        // FRS-WA-V2a-1: memtables never hold pointer entries;
+                        // fail loud rather than hand pointer bytes to a user.
+                        OpType::BlobRef => {
+                            return Err(ForstError::corruption(
+                                "batch imm get: BlobRef dereference not wired (FRS-WA-V2a-1)",
+                            ));
+                        }
                         OpType::Merge => {
                             // Merge chain — delegate to get_internal for full
                             // peel + snapshot semantics. `get_internal`
@@ -10518,6 +10525,12 @@ impl DbImpl {
                     match entry.op_type {
                         OpType::Put => resolved[i] = Some(entry.value),
                         OpType::Delete | OpType::SingleDelete => resolved[i] = Some(None),
+                        // FRS-WA-V2a-1: fail loud (see imm-stage sister arm).
+                        OpType::BlobRef => {
+                            return Err(ForstError::corruption(
+                                "batch resident get: BlobRef dereference not wired (FRS-WA-V2a-1)",
+                            ));
+                        }
                         OpType::Merge => {
                             // Merge chain — delegate to get_internal.
                             resolved[i] = Some(self.get_internal(&cf_data, k, read_seq)?);
@@ -10628,6 +10641,12 @@ impl DbImpl {
                                 }
                                 break 'l0_files;
                             }
+                            // FRS-WA-V2a-1: fail loud (no deref path yet).
+                            OpType::BlobRef => {
+                                return Err(ForstError::corruption(
+                                    "batch_get_vectorized: BlobRef dereference not wired (FRS-WA-V2a-1)",
+                                ));
+                            }
                             OpType::Merge => {
                                 had_merge_operand = true;
                             }
@@ -10710,6 +10729,12 @@ impl DbImpl {
                             }
                             break;
                         }
+                        // FRS-WA-V2a-1: fail loud (no deref path yet).
+                        OpType::BlobRef => {
+                            return Err(ForstError::corruption(
+                                "batch_get_vectorized: BlobRef dereference not wired (FRS-WA-V2a-1)",
+                            ));
+                        }
                         OpType::Merge => {
                             // Defer the chain to per-key get_internal — the
                             // batched path does not reproduce the
@@ -10791,6 +10816,12 @@ impl DbImpl {
                                 }
                                 decided = true;
                                 break;
+                            }
+                            // FRS-WA-V2a-1: fail loud (no deref path yet).
+                            OpType::BlobRef => {
+                                return Err(ForstError::corruption(
+                                    "batch_get_vectorized: BlobRef dereference not wired (FRS-WA-V2a-1)",
+                                ));
                             }
                             OpType::Merge => {
                                 had_merge_operand = true;
@@ -11039,6 +11070,13 @@ impl DbImpl {
             match entry.op_type {
                 OpType::Put => return Ok(entry.value),
                 OpType::Delete | OpType::SingleDelete => return Ok(None),
+                // FRS-WA-V2a-1: memtables never hold pointer entries; fail
+                // loud rather than hand pointer bytes to a caller.
+                OpType::BlobRef => {
+                    return Err(ForstError::corruption(
+                        "get_internal(imm): BlobRef dereference not wired (FRS-WA-V2a-1)",
+                    ));
+                }
                 OpType::Merge => {
                     let first_operand = entry.value.ok_or_else(|| {
                         ForstError::corruption("Merge entry missing operand payload")
@@ -11103,6 +11141,14 @@ impl DbImpl {
             match entry.op_type {
                 OpType::Put => return Ok(entry.value),
                 OpType::Delete | OpType::SingleDelete => return Ok(None),
+                // FRS-WA-V2a-1: resident-flushed memtables mirror L0 SST
+                // bytes — once flush-time separation lands they CAN hold
+                // pointer entries; until the deref path exists, fail loud.
+                OpType::BlobRef => {
+                    return Err(ForstError::corruption(
+                        "get_internal(resident): BlobRef dereference not wired (FRS-WA-V2a-1)",
+                    ));
+                }
                 OpType::Merge => {
                     let first_operand = entry.value.ok_or_else(|| {
                         ForstError::corruption("Merge entry missing operand payload")
@@ -11166,6 +11212,10 @@ impl DbImpl {
                 self.apply_merge_operator(cf_data, key, None, std::mem::take(merge_operands))
                     .map(|v| ControlFlow::Break(Some(v)))
             }
+            // FRS-WA-V2a-1: fail loud (no deref path yet).
+            OpType::BlobRef => Err(ForstError::corruption(
+                "sst_get: BlobRef dereference not wired (FRS-WA-V2a-1)",
+            )),
             OpType::Merge => match res.value {
                 // A-R6-H2: surface corruption on a missing operand payload.
                 Some(v) => {
@@ -11295,6 +11345,12 @@ impl DbImpl {
             versions.sort_by_key(|x| std::cmp::Reverse(x.sequence));
             for res in versions {
                 match res.op_type {
+                    // FRS-WA-V2a-1: fail loud (no deref path yet).
+                    OpType::BlobRef => {
+                        return Err(ForstError::corruption(
+                            "sst_get: L1+ BlobRef dereference not wired (FRS-WA-V2a-1)",
+                        ));
+                    }
                     OpType::Put => {
                         // B-R27-NEW-H1 (L1+ sibling): Put-with-None is
                         // corrupt — sister iter_versions_of raises
@@ -11655,6 +11711,13 @@ impl DbImpl {
         l0_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
         for (_, _, res) in l0_hits {
             match res.op_type {
+                // FRS-WA-V2a-1: a BlobRef base under a merge peel violates
+                // P12 (merge CFs are exempt from KV separation).
+                OpType::BlobRef => {
+                    return Err(ForstError::corruption(
+                        "peel_merges_from_sst: BlobRef base under a merge chain (P12)",
+                    ));
+                }
                 OpType::Put => {
                     // B-C4R14-NEW-H2: surface corruption on Put with no
                     // payload (matches sister sites sst_get/B-R27-NEW-H1,
@@ -11715,6 +11778,13 @@ impl DbImpl {
                     continue;
                 }
                 match res.op_type {
+                    // FRS-WA-V2a-1: BlobRef base under a merge peel = P12
+                    // violation (L1+ sister of the L0 arm above).
+                    OpType::BlobRef => {
+                        return Err(ForstError::corruption(
+                            "peel_merges_from_sst: L1+ BlobRef base under a merge chain (P12)",
+                        ));
+                    }
                     OpType::Put => {
                         // B-C4R14-NEW-H2 (L1+ sister): same as L0 check above.
                         if res.value.is_none() {
@@ -14573,6 +14643,9 @@ impl LazyPrefixIter {
                     continue;
                 }
                 Some((_, _, _, OpType::Merge, _)) => Some(PinnedStep::Fallback),
+                // FRS-WA-V2a-1: deref not wired — defer to get_internal,
+                // which surfaces the not-wired corruption error.
+                Some((_, _, _, OpType::BlobRef, _)) => Some(PinnedStep::Fallback),
                 // No head info though min came from a source — conservative.
                 None => Some(PinnedStep::Fallback),
             };
@@ -14724,6 +14797,8 @@ impl LazyPrefixIter {
                 Some((_, OpType::Put, None)) => return Some((min, ValueDecision::Fallback)),
                 Some((_, OpType::Delete, _)) | Some((_, OpType::SingleDelete, _)) => continue,
                 Some((_, OpType::Merge, _)) => return Some((min, ValueDecision::Fallback)),
+                // FRS-WA-V2a-1: deref not wired — defer to get_internal.
+                Some((_, OpType::BlobRef, _)) => return Some((min, ValueDecision::Fallback)),
                 // No source produced head info though `min` came from one —
                 // be conservative and let get_internal resolve it.
                 None => return Some((min, ValueDecision::Fallback)),

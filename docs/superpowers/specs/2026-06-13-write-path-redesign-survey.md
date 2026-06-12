@@ -549,6 +549,66 @@ raw: `target/churn_results_wa/*.jsonl`):
   default-ON discussion.
 - V2 (KV separation for unbounded CFs) and V3 (link-compaction) per §6.
 
+## 10. R2/R10 close-out + V2a-1 groundwork (2026-06-13, standing write-amp agent)
+
+Landed on `forst-rs` (V0-V2 delivery merged at 4ac16acc5; subsequent units
+commit-per-gate):
+
+- **R2 (review M → CLOSED)** — stamped-segment backpressure ceiling, option
+  (a): stamped runs above `FRS_LIFECYCLE_STAMPED_CEILING` (default 4× cohort
+  trigger = 96, floor 8) count back into the WriteController slowdown/stop
+  triggers; the NORMAL rollup trigger keeps the uncapped exemption (split
+  `rollup_l0_count` from `backpressure_l0_count`) because a forced rollup
+  over a stamped+unstamped mix emits an UNSTAMPED (immortal) output — the
+  valve is backpressure, never compaction. UT: 6 stamped @ ceiling 4 ⇒
+  backpressure 2, rollup exempt, drops clear it to 0.
+- **R10 (review M → CLOSED)** — lifecycle state persists (checkpoint blob
+  **v4**): CfDescriptor gains `lifecycle_ordinal/ttl/watermark/
+  max_event_time`, emitted ONLY when lifecycle state exists (default
+  snapshots stay byte-identical v2/v3); restore re-applies to every CF.
+  Kills consequence (b) — post-restore flush stamps from the restored
+  bound, not stamp-0/immortal. UTs: storage v4 roundtrip + v2-when-default
+  + ordinal-corruption; engine restore-resumes-expiry roundtrip.
+- **V2a-1 (KV-separation groundwork, inert)** — `OpType::BlobRef = 17`
+  (kTypeBlobIndex) engine-wide with every match arm chosen deliberately:
+  storage = passthrough (op + pointer bytes verbatim), compaction =
+  Put-like shadowing w/ op preserved, BlobRef-under-merge = corruption
+  (P12), TTL filters = Keep (uninspectable bytes), engine read paths =
+  fail-loud until deref lands, scan tables = Fallback. No writer emits it.
+- **Flink adoption package** — `wa-java/ADOPTION-GATES.md`: destinations,
+  wiring points, the C1-C6 byte-exact 5M cell matrix (q5/q8/q11 + lateness
+  + flag-OFF inertness + mid-run restore), P1-P3 perf gates, default-ON
+  disposition (R2 ✓, R10 ✓; C-cells + remote P1 still owed).
+
+Same-session churn_probe gate cells (3 × 90 s medians, methodology §2;
+raw: `target/churn_results_wa/*-r2r10post.log`):
+
+| Cell | write-amp | p50 late (µs) | rows/s | last L0 | falsifier |
+|---|---|---|---|---|---|
+| default-r2r10post (flag OFF) | **7.32** | 535 | 200 K | 3 | — (vs 7.35/7.42 recorded ⇒ no-regression ✓) |
+| ttlseg-r2r10post (flag ON, R2 ceiling default) | **0.98** | 911 | **200 K unthrottled** | 17 | **0 miss / 409 856 checks** |
+
+Reading: the R2 ceiling (96) sits far above the healthy steady state (17
+runs) — the lifecycle cell is bit-for-bit the §9 ttlseg-v1 regime (0.98 /
+914 / 17 / 0-miss) with the stall-protection now in place.
+
+### 10.1 Remaining for "solved" (supersedes §9.3)
+
+1. V1 gate (c): remote q7 iostat A/B (≥3× write-volume cut) — needs the
+   remote box; blocks default-ON and validates P3 before more V2 spend.
+2. Flink adoption: splice `wa-java/` + run ADOPTION-GATES C1-C6.
+3. V2a-2: flag-gated flush-time separation (`FRS_KV_SEPARATION`, per-CF
+   policy: Unbounded + no merge operator + no value-inspecting filter +
+   value ≥ threshold) + vlog deref on the read paths (the fail-loud arms
+   become dereferences) + vlog segments in checkpoint manifests (the v4
+   pattern extends; segments are SST-class immutable files under
+   FileMappingManager). Gate: kvsep churn cell toward the 1.36× model,
+   probe ≤ 1.3× warm baseline.
+3. V2b: BlobDB-style age-cutoff GC coupled to key-LSM compaction.
+4. V3: link-compaction (disagg agent owns file_mapping.rs — public API
+   only; Stage-2/3 of its lane landed 2026-06-13, the link/adopt surface
+   V3 needs is now on forst-rs).
+
 External references: WiscKey — Lu, Pillai, Gunawi, Arpaci-Dusseau, Arpaci-Dusseau,
 "WiscKey: Separating Keys from Values in SSD-conscious Storage", FAST '16.
 Dostoevsky — Dayan, Idreos, "Dostoevsky: Better Space-Time Trade-Offs for LSM-Tree

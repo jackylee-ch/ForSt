@@ -645,7 +645,11 @@ impl SstReaderImpl {
 
                 let value = match op {
                     OpType::Delete | OpType::SingleDelete => None,
-                    OpType::Put | OpType::Merge => {
+                    // FRS-WA-V2a-1: BlobRef passes through like Put — the
+                    // raw bytes ARE the encoded ValuePointer; dereference
+                    // happens above this layer, after MVCC visibility
+                    // (`op_type` is preserved on the LookupResult).
+                    OpType::Put | OpType::Merge | OpType::BlobRef => {
                         if values.is_null(best_row) {
                             None
                         } else {
@@ -664,9 +668,10 @@ impl SstReaderImpl {
                 None => Ok(None),
                 Some((raw_value, sequence, op_type)) => {
                     // Mirror the v1 op-type semantics exactly.
+                    // FRS-WA-V2a-1: BlobRef = pointer-bytes passthrough.
                     let value = match op_type {
                         OpType::Delete | OpType::SingleDelete => None,
-                        OpType::Put | OpType::Merge => raw_value,
+                        OpType::Put | OpType::Merge | OpType::BlobRef => raw_value,
                     };
                     Ok(Some(LookupResult {
                         value,
@@ -750,7 +755,8 @@ impl SstReaderImpl {
                         })?;
                         let value = match op {
                             OpType::Delete | OpType::SingleDelete => None,
-                            OpType::Put | OpType::Merge => {
+                            // FRS-WA-V2a-1: pointer-bytes passthrough.
+                            OpType::Put | OpType::Merge | OpType::BlobRef => {
                                 if values.is_null(row) {
                                     None
                                 } else {
@@ -770,9 +776,10 @@ impl SstReaderImpl {
                     let mut raw = Vec::new();
                     kv.collect_versions(key, &mut raw)?;
                     for (raw_value, sequence, op) in raw {
+                        // FRS-WA-V2a-1: pointer-bytes passthrough.
                         let value = match op {
                             OpType::Delete | OpType::SingleDelete => None,
-                            OpType::Put | OpType::Merge => raw_value,
+                            OpType::Put | OpType::Merge | OpType::BlobRef => raw_value,
                         };
                         out.push(LookupResult {
                             value,
@@ -1638,6 +1645,43 @@ mod tests {
         }
         let (data, _info) = writer.finish().unwrap();
         Arc::new(data)
+    }
+
+    /// FRS-WA-V2a-1 (KV separation groundwork): a `BlobRef` entry (op 17 =
+    /// RocksDB kTypeBlobIndex) round-trips through both SST formats with
+    /// the op preserved and the raw pointer bytes passed through verbatim —
+    /// the storage layer treats it as a Put whose payload is the encoded
+    /// ValuePointer; dereference is a higher (engine) layer's job.
+    #[test]
+    fn sst_blobref_roundtrip_preserves_op_and_pointer_bytes() {
+        let pointer_bytes: &[u8] = &[0xF7, 7, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9];
+        for &kv in &[false, true] {
+            let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+                block_size: 4096,
+                compression: CompressionType::None,
+                cf_id: forst_rs_common::DEFAULT_CF_ID,
+            });
+            writer.force_kv_block_format(kv);
+            writer.add(b"blob_key", Some(pointer_bytes), 5, 17).unwrap();
+            writer.add(b"plain_key", Some(b"v"), 6, 1).unwrap();
+            let (data, _info) = writer.finish().unwrap();
+            let reader = SstReaderImpl::open(Box::new(MemRandomAccessFile {
+                data: Arc::new(data),
+            }))
+            .unwrap();
+
+            // Point lookup: op preserved, pointer bytes verbatim.
+            let res = reader.get(b"blob_key").unwrap().expect("hit");
+            assert_eq!(res.op_type, forst_rs_common::OpType::BlobRef, "kv={kv}");
+            assert_eq!(res.value.as_deref(), Some(pointer_bytes), "kv={kv}");
+            assert_eq!(res.sequence, 5);
+
+            // Version walk: same passthrough contract.
+            let versions = reader.get_versions(b"blob_key").unwrap();
+            assert_eq!(versions.len(), 1, "kv={kv}");
+            assert_eq!(versions[0].op_type, forst_rs_common::OpType::BlobRef);
+            assert_eq!(versions[0].value.as_deref(), Some(pointer_bytes));
+        }
     }
 
     #[test]

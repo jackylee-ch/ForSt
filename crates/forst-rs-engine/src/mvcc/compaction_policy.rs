@@ -67,7 +67,8 @@ pub fn should_drop(
     // "deleted" rather than "missing".
     match entry_op {
         OpType::Delete | OpType::SingleDelete => newer_version_exists,
-        OpType::Put | OpType::Merge => newer_version_exists,
+        // FRS-WA-V2a-1: BlobRef shares Put's shadowing rule.
+        OpType::Put | OpType::Merge | OpType::BlobRef => newer_version_exists,
     }
 }
 

@@ -55,7 +55,10 @@ pub fn get_at<'a, I: Iterator<Item = VersionedEntry<'a>>>(
         // First entry with seq <= snapshot.seq for this user_key wins.
         return match entry.key.op_type() {
             OpType::Delete | OpType::SingleDelete => None,
-            OpType::Put => Some(entry.value),
+            // FRS-WA-V2a-1: Put-like passthrough (raw pointer bytes);
+            // unreachable today — separation happens at flush, and this
+            // walk serves memtable entries.
+            OpType::Put | OpType::BlobRef => Some(entry.value),
             OpType::Merge => None, // see contract above
         };
     }
@@ -109,6 +112,15 @@ pub fn get_at_with_merge<'a, I: Iterator<Item = VersionedEntry<'a>>>(
                 hit_terminal = true;
                 base = Some(entry.value.to_vec());
                 break;
+            }
+            // FRS-WA-V2a-1: a BlobRef under a merge walk violates P12
+            // (merge CFs are exempt from KV separation) — folding pointer
+            // bytes into full_merge would corrupt. Surface loudly.
+            OpType::BlobRef => {
+                return Err(forst_rs_common::ForstError::corruption(
+                    "get_at_with_merge: BlobRef in a merge-CF version chain \
+                     (merge CFs are exempt from KV separation)",
+                ));
             }
             OpType::Merge => {
                 operands_newest_first.push(entry.value.to_vec());
