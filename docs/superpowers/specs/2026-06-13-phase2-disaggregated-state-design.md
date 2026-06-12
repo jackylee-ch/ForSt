@@ -575,3 +575,273 @@ cache-pressure IT.**
   background touches still never admit; pure no-op when admission is off).
   Ready for the Stage-3 restore path to call per linked SST. UT covers all
   four properties.
+
+### Stage 2 — Link-based checkpoint on remote-primary (landed, per §9 decisions)
+
+Built (engine `crates/forst-rs-engine/src/db.rs`, io
+`crates/forst-rs-io/src/file_mapping.rs`):
+
+- `create_incremental_checkpoint_linked` + double-keyed gate (D2:
+  `FRS_CKPT_LINK_MODE=1` AND owner-attached mapping; noflush variant never
+  routes; WAL+link rejected until WAL Phase 4). Default path byte-identical
+  when off (gate test).
+- Link-mode barrier sequence (D5): pinned-set `await_upload` → `register()`
+  live set → `link()` into `<db_path>/checkpoints/<chk-id>/` → `sync_journal()`
+  → manifest blob with embedded mapping trailer. ZERO data movement: the chk
+  dir physically contains exactly one file (CHECKPOINT.blob); handles are
+  `linked_new_ssts`/`linked_shared_ssts` at chk-namespace logical paths;
+  upload lists empty (D3).
+- Discard flow (D4): `discard_linked_checkpoint` = manifest-driven unlink
+  loop; physical delete exactly once at refs==0; JM-unreachable fallback =
+  journal tombstone (Stage-1 machinery).
+- Minimal restore (D7): `open_from_linked_checkpoint` — resolve linked paths
+  via the blob's embedded `MappingSnapshotView`, materialize-by-copy,
+  fail-loud on missing physicals. Adopt+lazy-read instant restore = Stage 3.
+
+Gates green (2026-06-12):
+
+- **no-`await_all_uploads` invariant extended to the link path** (the Stage-2
+  gate on the `UploadRecordingFs` mock): link-mode checkpoint makes ZERO
+  `await_all_uploads` calls AND still awaits every pinned live SST per-file;
+  zero-upload object-count assert: chk dir = exactly `CHECKPOINT.blob`,
+  linked paths are metadata-only (no bytes) and resolve through the mapping.
+- **Registry discard→refcount→delete IT**: chained chk-1/chk-2 share
+  PHYSICALS (handle count exceeds object count; shared SST refs ≥ 3); discard
+  chk-1 deletes nothing (chk-2 + working refs); working copies compacted away
+  → bytes survive on chk-2's ref alone; JM-style tombstone with refs held
+  defers; discard chk-2 → every physical deleted exactly once; retried
+  discard = NotFound.
+- **Checkpoint→restore round-trip byte-exact** on the linked layout
+  (overwrites + deletes at snapshot time; post-checkpoint churn/compaction
+  does not leak into the restore); restored engine writable;
+  restore-under-missing-object fails loudly (no silent empty state).
+- Engine-level correctness ITs stand in for the 5M NexMark sweep (needs the
+  Java zero-upload branch — Stage 3; no flink writes in Stage 2).
+
+**Checkpoint-duration-vs-state-size minibench** (the §5 Stage-2 "~flat" gate;
+fs-emulation on local FS, incompressible 4 KiB values, median of 3,
+`crates/forst-rs-engine/examples/ckpt_link_flat_bench.rs`, dev Mac
+2026-06-12):
+
+```
+scale    ssts   state_mb   copy_median_ms   link_median_ms     ratio
+1x          8       32.3             63.8             16.0        4x
+4x         32      129.2            205.1             16.1       13x
+16x        11      516.9            344.1             16.0       21x
+```
+
+Re-validated at adoption (2026-06-13, fresh build of the salvaged worktree):
+link stays flat (14.9 / 16.0 / 16.0 ms) while copy grows 58.8 → 180.0 →
+476.7 ms (ratio 4× / 11× / 30×; the 16× live set compacted to 9 files).
+
+LINK mode is **flat in state size** (16.0 / 16.1 / 16.0 ms across a 16×
+state-size sweep — the paper's Fig. 9 shape reproduced) while COPY mode grows
+with bytes (64 → 205 → 344 ms; sub-linear only because the 16× run's live set
+compacted to 11 larger files and local page-cache copies are cheap — on a
+real uplink copy cost is bandwidth-bound, recorded 2026-06-01 at 10 MB/s).
+Zero data re-upload for unchanged files is asserted structurally (object
+count), not inferred from timing.
+
+**Stage-3 needs (recorded):** Java `ForStRsSnapshotStrategy` zero-upload
+branch consuming `linked_*` handles + `ForStRsRestoreOperation` download-loop
+skip; adopt()+lazy-read instant restore (replace D7's copy); mapping-journal
+tail replay on restore; startup sweep reaping abandoned chk-k link leaks
+(D5 crash window a); FFI surface for linked handles + attach-at-open wiring
+so the env key becomes effective end-to-end.
+
+### Stage 3 — Instant-link restore (engine side, landed 2026-06-13)
+
+Built (engine `crates/forst-rs-engine/src/db.rs`, io
+`crates/forst-rs-io/src/file_mapping.rs` + `filesystem.rs`, storage
+`crates/forst-rs-storage/src/cached_fs.rs`):
+
+- **`MappedFileSystem`** (io) — the UFS read-path indirection (paper §5.1):
+  resolves logical paths through the `FileMappingManager` on READ-side ops
+  only (`open_*_file` reads, `file_exists`, metadata, `ensure_cached`,
+  `prefetch_concurrent`, `await_upload`, `pre_seed_admission`);
+  writes/deletes/renames pass through UNresolved — a passthrough delete of a
+  mapped-but-byteless logical path can never reach the shared physical.
+- **`open_from_linked_checkpoint_instant`** — restore downloads/copies
+  NOTHING: per live SST resolve `<chk-k>/NNNNNN.sst` → physical via the
+  blob-embedded snapshot, `adopt()` under `<target>/NNNNNN.sst`
+  (NotOwned — the restored engine never physically deletes a
+  checkpoint-owned object), sync the target journal, write the stripped
+  blob, open through `MappedFileSystem`, attach the mapping. The target dir
+  physically holds exactly CHECKPOINT.blob + MAPPING.journal.
+- **Lazy warm** — `FileSystem::pre_seed_admission` (default no-op trait
+  hook); `CachedFileSystem` forwards to `LocalCache::pre_seed_admission`
+  (ForSt §2.1.6 registerInCache); the instant restore hints every adopted
+  SST so its first foreground touch admits the load-back.
+- **Register-rebind guard** (link-mode checkpoint): `register()` only
+  unmapped working paths — on a restored engine an adopted working path
+  maps to the SOURCE physical (no bytes at the working key); rebinding
+  would emit byte-less links. Chained link-checkpoints after restore now
+  resolve TRANSITIVELY to the original physicals.
+- **`adopted_residual()`** — count of live SSTs still resolving to foreign
+  physicals; 0 = weaned, the caller's signal that the restore-source
+  checkpoint can be discarded safely (CLAIM-mode discipline; the cross-job
+  ownership-transfer protocol = Java-integration stage).
+
+Gates green (2026-06-13):
+
+- **Zero-copy byte-exact IT**: cold instant restore reads exactly the
+  snapshot-time state (overwrites + deletes; post-checkpoint source churn
+  invisible); target dir object-count assert (blob + journal only);
+  restored engine writable; `adopted_residual > 0`.
+- **Crash-point IT** (D5-class window): partial restore (subset adopted +
+  journal synced, blob never written) retried over the SAME target
+  completes via journal replay + idempotent adopt, byte-exact.
+- **Missing-physical IT**: loud NotFound (no silent empty state) — `adopt`
+  verifies the physical before any state lands.
+- **Ownership-boundary IT**: churn on the restored engine weans
+  `adopted_residual` → 0 WITHOUT deleting any foreign physical (NotOwned
+  discipline); discarding the source checkpoint afterwards still deletes
+  each physical exactly once.
+- **Chained-restore IT**: linked checkpoint ON an instant-restored engine →
+  second-generation instant restore byte-exact for adopted AND new data
+  (the register-rebind guard proven end-to-end).
+- io `MappedFileSystem` UTs (resolve-on-read / passthrough-on-write+delete /
+  unmapped transparency); storage trait-level pre-seed UT (seeded file
+  admits on FIRST touch). engine 343/0, io 231/0, storage 444/0; clippy 0.
+
+**Restore-duration-vs-state-size minibench** (the §5 Stage-3 "~flat" gate;
+fs-emulation on local FS, same fixture as the Stage-2 bench, median of 3,
+`crates/forst-rs-engine/examples/restore_link_flat_bench.rs`, dev Mac
+2026-06-13):
+
+```
+scale    ssts   state_mb   copy_median_ms   instant_median_ms     ratio
+1x          8       32.3             73.9                11.0        7x
+4x         32      129.2            312.9                12.3       26x
+16x        11      516.9            363.0                12.0       30x
+```
+
+INSTANT restore is **flat in state size** (11.0 / 12.3 / 12.0 ms across a
+16× sweep — paper Fig. 10 shape) while COPY restore grows with bytes
+(74 → 313 → 363 ms on local page-cache; bandwidth-bound on a real uplink).
+Each instant rep also proves a cold spot-read through the mapped
+indirection.
+
+**Stage-3 residue (recorded, next):** Java zero-upload + download-skip
+branches and FFI surface for `linked_*` handles (cross-repo); mapping-journal
+TAIL replay on restore (blob-embedded snapshot only today); startup sweep for
+abandoned chk-k link leaks (D5 crash window a); rescale-by-clip (key-group
+clipped adoption). Stage 4 (WAL-delta memtable durability) is next in-repo.
+
+---
+
+## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)
+
+Decisions for the points §3/§5-Stage-2 left open, with rationale. These bind the
+Stage-2 implementation.
+
+### D1 — Linked checkpoint-handle path format
+
+A linked SST's logical path is
+`<db_path>/checkpoints/<%020d checkpoint_id>/<NNNNNN.sst>` — the SAME directory
+that already holds `CHECKPOINT.blob` (`incremental_checkpoint_dir`, db.rs), with
+the SST's canonical working-dir basename preserved. Rationale: (a) one
+self-describing namespace per checkpoint — the manifest enumerates exactly the
+basenames that are linked beside it, so discard needs no extra index; (b) the
+20-digit zero-padded id sorts lexicographically == numerically (reuses the
+staging-GC property); (c) `parse_file_number` keeps working on linked keys.
+The linked path is **metadata-only**: no physical object exists at that key.
+Invariant (the zero-upload object-count assert): a link-mode checkpoint
+directory physically contains exactly ONE file — `CHECKPOINT.blob` (with the
+embedded mapping trailer). All SST bytes stay at their working-dir physical
+keys, owned by the mapping refcounts.
+
+### D2 — Flag gate: double-keyed, default OFF
+
+Link mode activates only via:
+1. the explicit engine API `create_incremental_checkpoint_linked(...)`
+   (auto-attaches a `FileMappingManager` with journal at
+   `<db_path>/MAPPING.journal` if none is attached), or
+2. env `FRS_CKPT_LINK_MODE=1` **AND** a mapping already attached by the owner.
+
+Rationale: the env key alone must never flip behavior under an unaware
+consumer — today's Java `ForStRsSstUploader` reads returned paths byte-wise
+(`Files.newInputStream`), and linked paths have no bytes; flipping it without
+the Java zero-upload branch (Stage 3, no flink writes in Stage 2) would crash
+every checkpoint. The double key means env activation becomes effective exactly
+when the Stage-3 backend wires `attach_file_mapping` at open.
+`create_incremental_checkpoint_noflush` NEVER routes to link mode: the
+Arrow-IPC memtable artifact is per-checkpoint EXCLUSIVE state (nothing to
+share/link) and is already deprecated for remote-primary (§3.3).
+
+### D3 — Result contract (zero-upload made misuse-proof)
+
+In link mode `IncrementalCheckpointResult` returns `new_ssts == []` and
+`shared_ssts == []` (the upload lists — empty so no caller can byte-copy a
+metadata-only path), plus two new fields `linked_new_ssts` /
+`linked_shared_ssts` carrying the chk-namespace logical paths. The new/shared
+split survives purely as the §3.1(5) registry-registration hint (classified
+against the base checkpoint's manifest exactly as today). `manifest_path` is
+the engine-FS blob path (no local temp staging in link mode —
+`stage_checkpoint_artifacts_local` is skipped entirely). FFI keeps its ABI;
+mapping `linked_*` through FFI/Java is Stage-3 work.
+
+### D4 — JM-discard flow vs Flink SharedStateRegistry semantics
+
+Under link mode the registry STOPS being the dedup point: every checkpoint
+registers handles under its OWN `chk-k` logical paths (unique keys per
+checkpoint), so registry-level identity dedup is structurally a no-op and
+cross-checkpoint sharing lives ONLY in the mapping refcount layer (paper
+Fig. 8 delegation — "the JM delegates the deletion to the UFS"). Consequences:
+- JM discards checkpoint k → every chk-k handle's `discardState()` fires
+  (registry sees no other referent) → routed to the TM-side
+  `discard_linked_checkpoint(k)`: manifest-driven `unlink(<chk-k>/NNNNNN.sst)`
+  loop; the physical object is deleted exactly once when refs drain to 0
+  (working-dir ref + other checkpoints' refs keep it alive). The chk dir
+  (blob) is then deleted directly — the TM owns it, it is not shared state.
+- When the TM-side mapping is unreachable (job gone), discard degrades to the
+  journal-tombstone protocol (`FileMappingManager::tombstone(physical_key)`)
+  — never a direct S3 delete; drained refs or the startup `gc_sweep` consume
+  the tombstone.
+- Registry double-registration of the same chk-k path across job restarts is
+  impossible (checkpoint ids are monotonic per job); R3's residual risk is
+  covered by the Stage-1 exactly-once-delete gate + tombstone idempotence.
+
+### D5 — Barrier ordering + crash windows
+
+Link-mode checkpoint sequence (all under the checkpoint's pinned live set,
+R31-H1, and AFTER the per-file `await_upload` barrier — the freeze-fix
+no-`await_all_uploads` invariant is unchanged and gated by test):
+1. `register()` every pinned live SST (identity mapping; idempotent),
+2. `link()` each into `<chk-k>/` (idempotent re-link for checkpoint retry),
+3. `sync_journal()` — the mapping's group-durability point at the barrier,
+4. serialize manifest + embed mapping-snapshot trailer (now includes the
+   chk-k links) → `write_blob`.
+Crash windows: (a) between 3 and 4 → chk-k links exist in the journal but the
+checkpoint was never reported: JM never acks id k, nobody discards → leaked
+refs. Bounded: a RETRY of checkpoint id k re-links idempotently; an abandoned
+id leaks until the Stage-3 startup sweep (journal chk-namespaces vs JM-live
+checkpoint set) reaps it — recorded as Stage-3 work, leak-over-data-loss per
+R1. (b) after 4 before JM ack → standard Flink unacked-checkpoint discard →
+D4 flow. (c) before 3 → journal tail may lose the last records; replay
+truncated-tail tolerance (Stage-1) + the blob embed of the PREVIOUS checkpoint
+keep the mapping consistent.
+
+### D6 — Dual-mode memtable durability boundary (link mode)
+
+Stage-2 ships FLUSH-on-barrier only: barrier forces memtable→L0 (write-through
+makes it durable), the L0 SST registers+links like any other (q4 evidence:
+flush-is-load-bearing on 8c/32g). WAL-DELTA composes structurally (the
+`wal_sync()` barrier + skip-flush override already sit in
+`create_incremental_checkpoint_impl`) but remains FORBIDDEN with link mode
+until WAL Phase 4 restore-replay lands (Stage 4) — a link-mode checkpoint
+taken with WAL enabled would silently drop the unflushed tail on restore.
+The noflush Arrow artifact path is excluded by D2.
+
+### D7 — Restore boundary (Stage-2/3 split)
+
+Stage-2 implements the MINIMUM restore proving the linked round-trip:
+`open_from_linked_checkpoint(fs, ckpt_dir, target_dir)` — read blob, require
+the mapping trailer, resolve each `<chk-k>/NNNNNN.sst` to its physical key via
+the embedded snapshot (`MappingSnapshotView`), MATERIALIZE-BY-COPY into a
+fresh target dir, fail LOUDLY on a missing physical (no silent empty state),
+then open via the existing blob-restore path. Stage 3 replaces the copy with
+`adopt()` + lazy reads through `CachedFileSystem` (instant-link restore) and
+the Java `ForStRsRestoreOperation` download-loop skip. Restore does NOT
+consume the journal tail in Stage-2 (blob-embedded snapshot only) — journal
+tail replay is the Stage-3 restore-side trailer-consumption work.

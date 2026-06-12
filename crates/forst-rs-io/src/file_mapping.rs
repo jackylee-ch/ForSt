@@ -904,6 +904,179 @@ impl std::fmt::Debug for FileMappingManager {
     }
 }
 
+/// FRS-PHASE2-S2 (design §9 D7): a read-only view over a mapping snapshot
+/// produced by [`FileMappingManager::snapshot_bytes`] (e.g. the trailer
+/// embedded in `CHECKPOINT.blob`). The Stage-2 minimal restore uses it to
+/// resolve `<chk-k>/NNNNNN.sst` logical paths to their physical keys WITHOUT
+/// instantiating a journal-backed manager on the restore target.
+pub struct MappingSnapshotView {
+    logical: HashMap<PathBuf, String>,
+}
+
+impl MappingSnapshotView {
+    /// Decodes a snapshot blob (CRC + magic validated; corruption rejected).
+    pub fn decode(bytes: &[u8]) -> ForstResult<Self> {
+        let state = decode_snapshot(bytes)?;
+        Ok(Self {
+            logical: state.logical,
+        })
+    }
+
+    /// Resolves a logical path to its physical key.
+    pub fn resolve(&self, logical: &Path) -> Option<&str> {
+        self.logical.get(logical).map(String::as_str)
+    }
+
+    /// Number of logical mappings in the snapshot.
+    pub fn len(&self) -> usize {
+        self.logical.len()
+    }
+
+    /// True when the snapshot carries no logical mappings.
+    pub fn is_empty(&self) -> bool {
+        self.logical.is_empty()
+    }
+}
+
+/// FRS-PHASE2-S3 (design §5 Stage-3): the UFS read-path indirection — a thin
+/// [`FileSystem`] layer that resolves *logical* paths through a
+/// [`FileMappingManager`] before delegating to the backing filesystem
+/// (paper §5.1: "efficient move or link operations without necessitating
+/// physical file relocation").
+///
+/// Used by the instant-link restore: adopted SSTs live at the SOURCE
+/// checkpoint's physical keys; the restored engine keeps addressing its
+/// canonical working-dir paths (`<target>/NNNNNN.sst`) and this layer routes
+/// the reads to the physical objects — zero downloads, zero copies.
+///
+/// Resolution applies to READ-side operations only (`open_sequential_file`,
+/// `open_random_access_file`, `file_exists`, `get_file_metadata`,
+/// `ensure_cached`, `prefetch_concurrent`, `await_upload`,
+/// `pre_seed_admission`). Write/namespace operations (`open_writable_file`,
+/// `delete_file`, `rename`, `list_dir`, dirs) pass through UNresolved: new
+/// files are identity-mapped working files, and physical deletion is governed
+/// exclusively by the mapping layer's `unlink` refcounts — a passthrough
+/// `delete_file` on a mapped-but-byteless logical path can never reach the
+/// shared physical object.
+///
+/// Unmapped paths pass through untouched, so the layer is transparent for
+/// everything except adopted/linked files (identity mappings resolve to
+/// themselves).
+pub struct MappedFileSystem {
+    inner: Arc<dyn FileSystem>,
+    mapping: Arc<FileMappingManager>,
+}
+
+impl MappedFileSystem {
+    /// Wraps `inner`, resolving logical paths through `mapping`.
+    pub fn new(inner: Arc<dyn FileSystem>, mapping: Arc<FileMappingManager>) -> Self {
+        Self { inner, mapping }
+    }
+
+    /// Resolves `path` to its physical location, or returns it unchanged
+    /// when unmapped (or identity-mapped).
+    fn resolve(&self, path: &Path) -> PathBuf {
+        match self.mapping.resolve(path) {
+            Some(physical) => PathBuf::from(physical),
+            None => path.to_path_buf(),
+        }
+    }
+}
+
+impl std::fmt::Debug for MappedFileSystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedFileSystem")
+            .field("inner", &self.inner.name())
+            .finish()
+    }
+}
+
+impl FileSystem for MappedFileSystem {
+    fn open_sequential_file(
+        &self,
+        path: &Path,
+    ) -> ForstResult<Box<dyn crate::filesystem::SequentialFile>> {
+        self.inner.open_sequential_file(&self.resolve(path))
+    }
+
+    fn open_random_access_file(
+        &self,
+        path: &Path,
+    ) -> ForstResult<Box<dyn crate::filesystem::RandomAccessFile>> {
+        self.inner.open_random_access_file(&self.resolve(path))
+    }
+
+    fn open_writable_file(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> ForstResult<Box<dyn WritableFile>> {
+        self.inner.open_writable_file(path, mode)
+    }
+
+    fn file_exists(&self, path: &Path) -> ForstResult<bool> {
+        self.inner.file_exists(&self.resolve(path))
+    }
+
+    fn get_file_metadata(&self, path: &Path) -> ForstResult<crate::filesystem::FileMetadata> {
+        self.inner.get_file_metadata(&self.resolve(path))
+    }
+
+    fn list_dir(&self, dir: &Path) -> ForstResult<Vec<crate::filesystem::FileMetadata>> {
+        self.inner.list_dir(dir)
+    }
+
+    fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+        self.inner.create_dir_all(dir)
+    }
+
+    fn delete_file(&self, path: &Path) -> ForstResult<()> {
+        self.inner.delete_file(path)
+    }
+
+    fn delete_dir(&self, path: &Path, recursive: bool) -> ForstResult<()> {
+        self.inner.delete_dir(path, recursive)
+    }
+
+    fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+        self.inner.rename(src, dst)
+    }
+
+    fn supports_atomic_rename(&self) -> bool {
+        self.inner.supports_atomic_rename()
+    }
+
+    fn sync_dir(&self, dir: &Path) -> ForstResult<()> {
+        self.inner.sync_dir(dir)
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn ensure_cached(&self, path: &Path) -> ForstResult<()> {
+        self.inner.ensure_cached(&self.resolve(path))
+    }
+
+    fn prefetch_concurrent(&self, paths: &[&Path]) {
+        let resolved: Vec<PathBuf> = paths.iter().map(|p| self.resolve(p)).collect();
+        let refs: Vec<&Path> = resolved.iter().map(PathBuf::as_path).collect();
+        self.inner.prefetch_concurrent(&refs);
+    }
+
+    fn await_upload(&self, path: &Path) -> ForstResult<()> {
+        self.inner.await_upload(&self.resolve(path))
+    }
+
+    fn await_all_uploads(&self) -> ForstResult<()> {
+        self.inner.await_all_uploads()
+    }
+
+    fn pre_seed_admission(&self, path: &Path) {
+        self.inner.pre_seed_admission(&self.resolve(path));
+    }
+}
+
 fn decode_snapshot(bytes: &[u8]) -> ForstResult<MappingState> {
     if bytes.len() < 10 {
         return Err(ForstError::corruption("mapping snapshot too small"));
@@ -1026,6 +1199,83 @@ mod tests {
 
     fn mgr(fs: &Arc<dyn FileSystem>) -> FileMappingManager {
         FileMappingManager::new(fs.clone(), PathBuf::from("/db/MAPPING.journal")).unwrap()
+    }
+
+    // --- FRS-PHASE2-S3: MappedFileSystem (UFS read-path indirection) -------
+
+    #[test]
+    fn test_mapped_fs_resolves_reads_unmapped_passthrough() {
+        let fs = fs_with_file("/src/000001.sst", b"physical-bytes");
+        write_file(fs.as_ref(), "/plain/p.dat", b"plain");
+        let m = Arc::new(mgr(&fs));
+        m.adopt(Path::new("/restore/000001.sst"), "/src/000001.sst")
+            .unwrap();
+        let mapped = MappedFileSystem::new(fs.clone(), m);
+
+        // Mapped logical path: every read-side op resolves to the physical.
+        assert!(mapped
+            .file_exists(Path::new("/restore/000001.sst"))
+            .unwrap());
+        let raf = mapped
+            .open_random_access_file(Path::new("/restore/000001.sst"))
+            .unwrap();
+        let mut buf = vec![0u8; b"physical-bytes".len()];
+        raf.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"physical-bytes");
+        assert_eq!(
+            mapped
+                .get_file_metadata(Path::new("/restore/000001.sst"))
+                .unwrap()
+                .size,
+            b"physical-bytes".len() as u64
+        );
+        let mut seq = mapped
+            .open_sequential_file(Path::new("/restore/000001.sst"))
+            .unwrap();
+        let mut sbuf = vec![0u8; 64];
+        let n = seq.read(&mut sbuf).unwrap();
+        assert_eq!(&sbuf[..n], b"physical-bytes");
+
+        // Unmapped paths pass through untouched.
+        assert!(mapped.file_exists(Path::new("/plain/p.dat")).unwrap());
+        assert!(!mapped.file_exists(Path::new("/restore/other.sst")).unwrap());
+    }
+
+    #[test]
+    fn test_mapped_fs_writes_and_deletes_never_touch_physical() {
+        let fs = fs_with_file("/src/000001.sst", b"physical-bytes");
+        let m = Arc::new(mgr(&fs));
+        m.adopt(Path::new("/restore/000001.sst"), "/src/000001.sst")
+            .unwrap();
+        let mapped = MappedFileSystem::new(fs.clone(), m);
+
+        // A passthrough delete on the mapped-but-byteless logical path can
+        // never reach the shared physical object (lifecycle belongs to the
+        // mapping layer's unlink refcounts).
+        let _ = mapped.delete_file(Path::new("/restore/000001.sst"));
+        assert!(
+            fs.file_exists(Path::new("/src/000001.sst")).unwrap(),
+            "physical must survive a passthrough delete of the logical path"
+        );
+
+        // Writable opens are passthrough: new files land at their literal
+        // working path (identity, unmapped).
+        fs.create_dir_all(Path::new("/restore")).unwrap();
+        let mut w = mapped
+            .open_writable_file(
+                Path::new("/restore/000099.sst"),
+                WriteMode::CreateOrTruncate,
+            )
+            .unwrap();
+        w.append(b"new-working-bytes").unwrap();
+        w.sync().unwrap();
+        drop(w);
+        assert!(fs.file_exists(Path::new("/restore/000099.sst")).unwrap());
+        assert_eq!(
+            read_all(fs.as_ref(), Path::new("/src/000001.sst")).unwrap(),
+            b"physical-bytes".to_vec(),
+            "physical bytes untouched by writes in the mapped namespace"
+        );
     }
 
     // --- link / unlink / refcount ------------------------------------------

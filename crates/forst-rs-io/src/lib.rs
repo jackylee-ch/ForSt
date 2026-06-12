@@ -38,7 +38,9 @@ pub mod router;
 
 pub use async_io::{AsyncRandomReader, AsyncSequentialReader, AsyncWriter, BoxFuture};
 pub use block_io::{check_vectored_args, BlockIo, PreadBlockIo};
-pub use file_mapping::{FileMappingManager, GcReport, UnlinkOutcome};
+pub use file_mapping::{
+    FileMappingManager, GcReport, MappedFileSystem, MappingSnapshotView, UnlinkOutcome,
+};
 pub use filesystem::{
     map_io_error, FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile,
     WriteMode,

@@ -306,6 +306,14 @@ pub trait FileSystem: Send + Sync {
     fn await_all_uploads(&self) -> ForstResult<()> {
         Ok(())
     }
+
+    /// FRS-PHASE2-S3 (ForSt §2.1.6 `registerInCache`): hint that `path`
+    /// belongs to a restored working set — admission-gated caches prime the
+    /// file's admission tracker so its FIRST foreground touch loads it back
+    /// into the cache (instant-link restore: link first, cache warms lazily
+    /// but eagerly). No bytes are fetched here. Default no-op: filesystems
+    /// without an admission-gated cache ignore the hint.
+    fn pre_seed_admission(&self, _path: &Path) {}
 }
 
 // ---------------------------------------------------------------------------
