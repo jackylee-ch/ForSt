@@ -728,6 +728,76 @@ TAIL replay on restore (blob-embedded snapshot only today); startup sweep for
 abandoned chk-k link leaks (D5 crash window a); rescale-by-clip (key-group
 clipped adoption). Stage 4 (WAL-delta memtable durability) is next in-repo.
 
+### Stage 4 — WAL-delta memtable durability on link mode (WAL Phase 4, landed 2026-06-13)
+
+Decisions recorded at implementation (binding, D8–D12):
+
+- **D8 capture barrier.** Link-mode checkpoint with WAL enabled holds the
+  WAL lock across `sync` + whole-segment read, writing the image to
+  `<chk-k>/WAL.delta` on the ENGINE filesystem (`wal_capture_to`). The lock
+  makes the barrier EXACT: a mutation is in checkpoint k iff its append
+  completed before the capture (write paths append under the same lock);
+  mid-flight writes are excluded — Flink barrier alignment means none exist
+  at a real barrier. v1 captures the WHOLE segment (not a delta): correct
+  because restore floor-filters; cost recorded below. The D1 object-count
+  invariant becomes: chk dir = `CHECKPOINT.blob` + (WAL mode, non-empty WAL
+  only) `WAL.delta`.
+- **D9 replay.** Restore replays records with
+  `seq > per-CF flushed floor` (max `max_sequence` over the restored
+  manifest's live SSTs of that CF) via `put_with_seq`, preserving original
+  seq + op_type (the `replay_memtable_artifact_bytes` mechanism); the floor
+  filter also dedups whole-segment supersets and WBM flushes racing the
+  capture. A torn `WAL.delta` tail fails the restore LOUDLY (the image was
+  synced-then-copied; torn = damaged artifact). Wired into BOTH linked
+  restore paths (instant + copy).
+- **D10 gate.** The Stage-2 WAL+link rejection is LIFTED: WAL attached ⇒
+  the linked checkpoint runs WAL-DELTA (flush skipped); no WAL ⇒
+  FLUSH-on-barrier. The mode boundary is the WAL's presence, nothing else.
+- **D11 GC.** Deferred to Phase-5 segment rotation: the live WAL grows for
+  the DB lifetime and every capture copies it whole (recorded residue).
+- **D12** noflush Arrow-artifact path unchanged (still never link-routed).
+
+Gates green (2026-06-13):
+
+- **Tail-replay IT** (kill-after-ckpt shape): flushed floor (100 rows in
+  SSTs) + 70-record unflushed tail (inserts + tombstones + overwrites) →
+  WAL-DELTA linked checkpoint (chk dir = blob + WAL.delta exactly; no
+  forced flush) → BOTH restores byte-exact; restored memtable holds
+  EXACTLY the 70 tail records (floor filter, no double-apply).
+- **Barrier-exactness IT**: a write after the capture is absent from the
+  restore; the restored engine writes above every replayed seq.
+- **Mode-boundary IT**: FLUSH-mode (no WAL) linked checkpoint emits no
+  WAL.delta and restores with an empty memtable.
+- engine 346/0, io 231/0, storage 444/0 cumulative 1105/0; clippy 0.
+
+**Checkpoint-cost-vs-memtable-size minibench**
+(`crates/forst-rs-engine/examples/ckpt_wal_delta_bench.rs`, fs-emulation,
+fresh DB per rep, median of 3, ALL state unflushed, dev Mac 2026-06-13):
+
+```
+scale   memtable_mb    flush_median_ms    wal_delta_median_ms   ratio
+1x              4.0               31.1                   17.5    1.8x
+4x             16.0               33.6                   26.2    1.3x
+16x            64.0               72.8                   70.4    1.0x
+```
+
+HONEST finding: WAL-DELTA **v1 is NOT flat** in memtable size — whole-
+segment capture copies O(unflushed bytes), converging with FLUSH cost at
+64 MB. The §3.3 "independent of memtable size" promise requires the
+Phase-5 delta capture (sealed-segment rotation: checkpoint copies only the
+since-last-ckpt segment and LINKS prior sealed segments through the
+mapping layer). v1's win is real but modest (1.8× at small tails) and it
+keeps memtables unflushed (the q4 noflush memory trade-off applies: 8c/32g
+boxes should stay FLUSH). Recorded as the Stage-4→5 residue alongside WAL
+GC.
+
+**Stage-4 residue (recorded):** Phase-5 sealed-segment rotation (flat
+capture + WAL GC at covering checkpoint + linking shared sealed segments);
+q4-class 5M mode A/B (needs the Java branch — cross-repo with the Stage-3
+residue); local-WAL-dir placement for remote-primary TMs (today the segment
+lives wherever `FRS_WAL_DIR` points; capture re-homes bytes to the engine
+FS at the barrier).
+
 ---
 
 ## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)

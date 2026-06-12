@@ -632,6 +632,12 @@ static SEQ_HIGH_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// Name of the default column family (always id 0).
 pub const DEFAULT_CF_NAME: &str = "default";
 
+/// FRS-WAL Phase 4 / FRS-PHASE2-S4: file name of the WAL segment image a
+/// link-mode checkpoint captures beside `CHECKPOINT.blob` when the WAL is
+/// enabled (WAL-DELTA mode, design §3.3). Restore replays it through the
+/// per-CF flushed-floor filter.
+pub const WAL_DELTA_NAME: &str = "WAL.delta";
+
 // PR-C6-H2: re-export `ValueSink` from the storage layer so callers
 // who already depend on `forst-rs-engine` do not need to take a direct
 // dep on `forst-rs-storage` just to name the trait.
@@ -3283,6 +3289,50 @@ impl DbImpl {
             w.sync()?;
         }
         Ok(())
+    }
+
+    /// FRS-WAL Phase 4 / FRS-PHASE2-S4 (design §3.3 WAL-DELTA): the link-mode
+    /// checkpoint's memtable-durability barrier when the WAL is enabled —
+    /// syncs the WAL and captures the segment image into
+    /// `<chk-dir>/WAL.delta` on the ENGINE filesystem.
+    ///
+    /// Barrier exactness: the WAL lock is held across sync + read, so the
+    /// captured image contains EXACTLY the mutations whose append completed
+    /// before the barrier (write paths append under this lock). A mutation
+    /// mid-flight at capture time is NOT part of this checkpoint — Flink's
+    /// barrier alignment guarantees no mid-flight writes at a real barrier.
+    ///
+    /// v1 captures the WHOLE segment, not a delta: restore filters records
+    /// by the per-CF flushed floor, so a superset image is correct; capture
+    /// cost is O(unflushed-WAL bytes) until Phase-5 segment rotation lands
+    /// (recorded residue). Returns `true` iff a non-empty image was written
+    /// (an empty WAL writes nothing, preserving the chk-dir object-count
+    /// invariant for WAL-less checkpoints).
+    fn wal_capture_to(&self, chk_dir: &Path) -> ForstResult<bool> {
+        let bytes = {
+            let mut guard = self.wal.lock().expect("wal lock poisoned");
+            let Some(w) = guard.as_mut() else {
+                return Ok(false);
+            };
+            w.sync()?;
+            std::fs::read(w.path()).map_err(|e| {
+                ForstError::Io(std::io::Error::other(format!(
+                    "WAL capture read {}: {e}",
+                    w.path().display()
+                )))
+            })?
+        };
+        if bytes.is_empty() {
+            return Ok(false);
+        }
+        self.fs.create_dir_all(chk_dir)?;
+        let delta = chk_dir.join(WAL_DELTA_NAME);
+        let mut f = self
+            .fs
+            .open_writable_file(&delta, WriteMode::CreateOrTruncate)?;
+        f.append(&bytes)?;
+        f.sync()?;
+        Ok(true)
     }
 
     fn write_single(
@@ -6292,23 +6342,17 @@ impl DbImpl {
     ///
     /// Auto-attaches a [`forst_rs_io::FileMappingManager`] (journal at
     /// `<db_path>/MAPPING.journal`) when none is attached yet. Memtable
-    /// durability is FLUSH-on-barrier (design §9 D6); combining link mode
-    /// with the WAL skip-flush override is rejected until WAL Phase 4
-    /// (restore replay) lands — a link-mode checkpoint must never silently
-    /// drop the unflushed tail on restore.
+    /// durability is dual-mode (design §9 D6, Stage 4): FLUSH-on-barrier by
+    /// default; with the WAL enabled the flush is skipped and the barrier
+    /// captures `<chk-k>/WAL.delta` instead (WAL-DELTA mode) — restore
+    /// replays the tail through the per-CF flushed-floor filter (WAL
+    /// Phase 4, landed 2026-06-13).
     pub fn create_incremental_checkpoint_linked(
         &self,
         snapshot: &Snapshot,
         checkpoint_id: u64,
         base_checkpoint_id: u64,
     ) -> ForstResult<IncrementalCheckpointResult> {
-        if self.wal.lock().expect("wal lock poisoned").is_some() {
-            return Err(ForstError::invalid_argument(
-                "create_incremental_checkpoint_linked: WAL mode is not supported in \
-                 link mode until WAL Phase 4 restore-replay lands (design §9 D6) — \
-                 the unflushed tail would be silently dropped on restore",
-            ));
-        }
         self.ensure_file_mapping()?;
         self.create_incremental_checkpoint_impl(
             snapshot,
@@ -6410,7 +6454,19 @@ impl DbImpl {
         // skipped (see the `flush_memtables &&` override), so here we fsync the
         // WAL instead — cheap sequential append-sync vs an expensive
         // flush+compaction. No-op when the WAL is disabled.
-        self.wal_sync()?;
+        //
+        // FRS-WAL Phase 4 / FRS-PHASE2-S4: in LINK mode the barrier also
+        // CAPTURES the synced segment image into `<chk-k>/WAL.delta` so the
+        // restore side can replay the unflushed tail (WAL-DELTA mode,
+        // design §3.3 + §9 D6). The capture happens BEFORE the version
+        // snapshot below: a WBM flush racing in between adds an SST whose
+        // records are ALSO in the captured image — the restore's per-CF
+        // flushed-floor filter dedups them.
+        if link_mode {
+            self.wal_capture_to(&self.incremental_checkpoint_dir(checkpoint_id))?;
+        } else {
+            self.wal_sync()?;
+        }
 
         // 2026-06-02 q7 ckpt-ON FREEZE FIX: the durability barrier is deferred
         // until AFTER the VersionSet snapshot below, where it awaits the upload
@@ -7089,7 +7145,11 @@ impl DbImpl {
             db_path: target.to_string_lossy().into_owned(),
             ..EngineOptions::default()
         };
-        Self::open_from_checkpoint(options, fs)
+        let db = Self::open_from_checkpoint(options, fs.clone())?;
+        // FRS-WAL Phase 4: replay the captured unflushed tail (WAL-DELTA
+        // checkpoints; no-op for FLUSH-mode checkpoints).
+        Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir)?;
+        Ok(db)
     }
 
     /// FRS-PHASE2-S3 (design §5 Stage-3): INSTANT-LINK restore — opens an
@@ -7175,14 +7235,89 @@ impl DbImpl {
         write_blob(fs.as_ref(), &target, base)?;
 
         let mapped: Arc<dyn FileSystem> =
-            Arc::new(forst_rs_io::MappedFileSystem::new(fs, mgr.clone()));
+            Arc::new(forst_rs_io::MappedFileSystem::new(fs.clone(), mgr.clone()));
         let options = EngineOptions {
             db_path: target.to_string_lossy().into_owned(),
             ..EngineOptions::default()
         };
         let db = Self::open_from_checkpoint(options, mapped)?;
         db.attach_file_mapping(mgr)?;
+        // FRS-WAL Phase 4: replay the captured unflushed tail (WAL-DELTA
+        // checkpoints; no-op for FLUSH-mode checkpoints).
+        Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir)?;
         Ok(db)
+    }
+
+    /// FRS-WAL Phase 4 / FRS-PHASE2-S4 (design §3.3, §9 D6): replays a
+    /// link-mode checkpoint's captured WAL image (`WAL.delta`, if present)
+    /// into the freshly-restored engine. Records at or below their CF's
+    /// flushed floor (max `max_sequence` over the restored manifest's live
+    /// SSTs of that CF) are already durable in SSTs and are skipped; the
+    /// rest re-enter the active memtable PRESERVING their original
+    /// sequence + op_type (mirrors `replay_memtable_artifact_bytes`).
+    /// Returns the number of records replayed (0 when no image exists —
+    /// FLUSH-mode checkpoints).
+    fn replay_linked_wal_delta(
+        db: &Arc<Self>,
+        fs: &dyn FileSystem,
+        ckpt_dir: &Path,
+    ) -> ForstResult<usize> {
+        let delta = ckpt_dir.join(WAL_DELTA_NAME);
+        if !fs.file_exists(&delta)? {
+            return Ok(0);
+        }
+        let size = fs.get_file_metadata(&delta)?.size as usize;
+        let mut bytes = vec![0u8; size];
+        let mut off = 0usize;
+        let mut f = fs.open_sequential_file(&delta)?;
+        while off < size {
+            let n = f.read(&mut bytes[off..])?;
+            if n == 0 {
+                break;
+            }
+            off += n;
+        }
+        bytes.truncate(off);
+        let scan = crate::wal::scan_records(&bytes);
+        // The image was captured sync-then-copy under the WAL lock — a torn
+        // tail here means the checkpoint artifact itself is damaged. Fail
+        // LOUDLY rather than restore a silently-shortened tail.
+        if !scan.clean_eof {
+            return Err(ForstError::corruption(format!(
+                "WAL.delta in {} has a torn/corrupt tail — refusing to restore \
+                 a truncated memtable tail",
+                ckpt_dir.display()
+            )));
+        }
+        let mut floors: HashMap<u32, u64> = HashMap::new();
+        for file in db.version_set.current().live_sst_files_iter() {
+            let e = floors.entry(file.cf_id.value()).or_insert(0);
+            *e = (*e).max(file.max_sequence.value());
+        }
+        let mut replayed = 0usize;
+        let mut max_seq = 0u64;
+        for rec in &scan.records {
+            let floor = floors.get(&rec.cf_id).copied().unwrap_or(0);
+            if rec.sequence <= floor {
+                continue; // already durable in a flushed SST
+            }
+            let cf_data = db.lookup_cf_by_id(ColumnFamilyId(rec.cf_id))?;
+            cf_data.active_memtable().put_with_seq(
+                &rec.key,
+                rec.value.as_deref(),
+                rec.op_type,
+                rec.sequence,
+            )?;
+            max_seq = max_seq.max(rec.sequence);
+            replayed += 1;
+        }
+        // Belt-and-braces: blob.last_sequence already covers every captured
+        // seq (allocation precedes the snapshot), but keep the counter
+        // monotonic regardless of producer history.
+        if max_seq > 0 {
+            db.sequence_number.fetch_max(max_seq, Ordering::AcqRel);
+        }
+        Ok(replayed)
     }
 
     /// FRS-PHASE2-S3: number of LIVE SSTs whose bytes still resolve to a
@@ -19550,6 +19685,169 @@ mod tests {
                 i
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-S4 gates (design §3.3, §9 D6): WAL-delta memtable
+    // durability on link-mode checkpoints (WAL Phase 4 restore replay)
+    // ------------------------------------------------------------------
+
+    /// Stage-4 gate: a link-mode checkpoint with the WAL enabled skips the
+    /// forced flush, captures `WAL.delta` beside the blob, and BOTH restore
+    /// paths replay the unflushed tail byte-exactly — flushed-floor records
+    /// are NOT double-applied (memtable holds exactly the tail).
+    #[test]
+    fn test_phase2_s4_wal_delta_link_ckpt_replays_tail_on_restore() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        *db.wal.lock().unwrap() =
+            Some(crate::wal::WalWriter::open(&wal_dir.path().join("db.wal")).unwrap());
+
+        // Flushed floor: 100 puts sealed into SSTs.
+        for i in 0..100u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap();
+        // Unflushed tail: 50 new keys + 10 tombstones + 10 overwrites = 70.
+        for i in 100..150u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tail").unwrap();
+        }
+        for i in 0..10u32 {
+            db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
+        }
+        for i in 10..20u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v2").unwrap();
+        }
+
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 4, 0).unwrap();
+        assert!(r.link_mode);
+        // WAL-DELTA mode: the chk dir holds exactly blob + WAL.delta.
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000004");
+        let names: Vec<String> = fs
+            .list_dir(&chk_dir)
+            .unwrap()
+            .into_iter()
+            .filter(|m| !m.is_dir)
+            .map(|m| m.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "blob + WAL.delta, got {names:?}");
+        assert!(names.iter().any(|n| n == "CHECKPOINT.blob"));
+        assert!(names.iter().any(|n| n == WAL_DELTA_NAME));
+
+        let verify = |restored: &Arc<DbImpl>| {
+            let rcf = restored.default_cf();
+            for i in 0..150u32 {
+                let k = format!("k{:04}", i);
+                let got = restored.get(&rcf, k.as_bytes()).unwrap();
+                let want: Option<&[u8]> = if i < 10 {
+                    None // tail tombstone
+                } else if i < 20 {
+                    Some(b"v2") // tail overwrite
+                } else if i < 100 {
+                    Some(b"v1") // flushed floor
+                } else {
+                    Some(b"tail") // tail insert
+                };
+                assert_eq!(got.as_deref(), want, "mismatch at {k}");
+            }
+        };
+
+        // Instant restore.
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+        verify(&restored);
+        // No double-apply: the restored memtable holds EXACTLY the 70 tail
+        // records (floor-filtered), none of the 100 flushed ones.
+        let mem_entries = restored
+            .lookup_cf_by_id(DEFAULT_CF_ID)
+            .unwrap()
+            .active_memtable()
+            .num_entries();
+        assert_eq!(mem_entries, 70, "replay must skip flushed-floor records");
+
+        // Copy restore replays identically.
+        let restored2 =
+            DbImpl::open_from_linked_checkpoint(fs.clone(), &chk_dir, "/restore-copy").unwrap();
+        verify(&restored2);
+    }
+
+    /// Stage-4 gate (barrier exactness): writes appended AFTER the
+    /// checkpoint's WAL capture are NOT part of the restored state.
+    #[test]
+    fn test_phase2_s4_post_barrier_writes_excluded_from_restore() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        *db.wal.lock().unwrap() =
+            Some(crate::wal::WalWriter::open(&wal_dir.path().join("db.wal")).unwrap());
+
+        db.put(&cf, b"pre-barrier", b"in").unwrap();
+        let snap = db.snapshot();
+        db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        // Post-barrier: lands in the live WAL but NOT in chk-1's capture.
+        db.put(&cf, b"post-barrier", b"out").unwrap();
+
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+        let rcf = restored.default_cf();
+        assert_eq!(
+            restored.get(&rcf, b"pre-barrier").unwrap().as_deref(),
+            Some(&b"in"[..])
+        );
+        assert_eq!(
+            restored.get(&rcf, b"post-barrier").unwrap(),
+            None,
+            "post-barrier write must not leak into the checkpoint"
+        );
+        // The restored engine allocates writes ABOVE every replayed seq.
+        restored.put(&rcf, b"fresh", b"f").unwrap();
+        assert_eq!(restored.get(&rcf, b"fresh").unwrap().as_deref(), Some(&b"f"[..]));
+    }
+
+    /// Stage-4 gate: a FLUSH-mode (no WAL) link checkpoint writes NO
+    /// WAL.delta and restores with an EMPTY memtable — the dual-mode
+    /// boundary is the WAL's presence, nothing else.
+    #[test]
+    fn test_phase2_s4_flush_mode_checkpoint_has_no_wal_delta() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        for i in 0..50u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v").unwrap();
+        }
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        assert!(r.link_mode);
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
+        assert!(!fs.file_exists(&chk_dir.join(WAL_DELTA_NAME)).unwrap());
+
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+        let rcf = restored.default_cf();
+        assert_eq!(
+            restored.get(&rcf, b"k0000").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
+        assert_eq!(
+            restored
+                .lookup_cf_by_id(DEFAULT_CF_ID)
+                .unwrap()
+                .active_memtable()
+                .num_entries(),
+            0,
+            "FLUSH-mode restore replays nothing"
+        );
     }
 
     #[test]
