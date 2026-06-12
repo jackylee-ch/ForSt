@@ -32,7 +32,7 @@
 
 use std::path::{Path, PathBuf};
 
-use forst_rs_common::{ForstError, ForstResult};
+use forst_rs_common::{crc32c, ForstError, ForstResult};
 use forst_rs_io::{FileSystem, WriteMode};
 use forst_rs_storage::version::{checkpoint, SstFileMeta};
 
@@ -372,6 +372,64 @@ pub fn copy_live_ssts(
     Ok((total, files))
 }
 
+// ---------------------------------------------------------------------------
+// FRS-PHASE2-S1: mapping-snapshot trailer (design §2.4)
+// ---------------------------------------------------------------------------
+
+/// Magic terminating a mapping-snapshot trailer appended to `CHECKPOINT.blob`.
+///
+/// The Phase-2 file-mapping layer's consistent snapshot
+/// (`FileMappingManager::snapshot_bytes`) is embedded INTO the checkpoint
+/// blob so every checkpoint carries the logical→physical mapping it was
+/// taken under, atomically with the manifest (design risk R1). The base
+/// VersionSet blob format is strict (`blob_size == data.len()`), so the
+/// embed is an *envelope*: `[base blob][payload][crc32c(payload) u32]
+/// [payload_len u32][magic 4B]`. A legacy blob ends with its u64
+/// `blob_length` footer whose high bytes are zero, which can never equal the
+/// magic — detection from the tail is unambiguous. Default (no mapping
+/// attached) writes NO trailer: bytes byte-identical to pre-Phase-2.
+pub const MAPPING_TRAILER_MAGIC: &[u8; 4] = b"FRMT";
+
+/// Appends a mapping-snapshot trailer to `blob` (see
+/// [`MAPPING_TRAILER_MAGIC`] for the envelope layout).
+pub fn append_mapping_trailer(blob: &mut Vec<u8>, mapping: &[u8]) {
+    blob.extend_from_slice(mapping);
+    blob.extend_from_slice(&crc32c(mapping).to_le_bytes());
+    blob.extend_from_slice(&(mapping.len() as u32).to_le_bytes());
+    blob.extend_from_slice(MAPPING_TRAILER_MAGIC);
+}
+
+/// Splits checkpoint-blob bytes into `(base_blob, mapping_snapshot)`.
+/// Returns `(data, None)` for legacy blobs without a trailer; validates
+/// length + CRC when the trailer magic is present (corruption otherwise).
+pub fn split_mapping_trailer(data: &[u8]) -> ForstResult<(&[u8], Option<&[u8]>)> {
+    const TRAILER_FIXED: usize = 4 + 4 + 4; // crc + len + magic
+    if data.len() < TRAILER_FIXED || &data[data.len() - 4..] != MAPPING_TRAILER_MAGIC {
+        return Ok((data, None));
+    }
+    let len_off = data.len() - 8;
+    let payload_len =
+        u32::from_le_bytes(data[len_off..len_off + 4].try_into().expect("4 bytes")) as usize;
+    let total = payload_len + TRAILER_FIXED;
+    if data.len() < total {
+        return Err(ForstError::corruption(format!(
+            "mapping trailer payload_len {} exceeds blob size {}",
+            payload_len,
+            data.len()
+        )));
+    }
+    let payload_start = data.len() - total;
+    let payload = &data[payload_start..payload_start + payload_len];
+    let crc_off = data.len() - 12;
+    let stored_crc = u32::from_le_bytes(data[crc_off..crc_off + 4].try_into().expect("4 bytes"));
+    if stored_crc != crc32c(payload) {
+        return Err(ForstError::corruption(
+            "mapping trailer checksum mismatch",
+        ));
+    }
+    Ok((&data[..payload_start], Some(payload)))
+}
+
 /// Serialises a VersionSet snapshot to the checkpoint blob format.
 pub fn serialize_snapshot(
     snapshot: &forst_rs_storage::version::VersionSetSnapshot,
@@ -437,6 +495,39 @@ mod tests {
             "expected cap-exceeded error; got: {}",
             msg
         );
+    }
+
+    /// FRS-PHASE2-S1: mapping-trailer envelope round-trip + legacy-blob
+    /// pass-through + corruption detection.
+    #[test]
+    fn test_mapping_trailer_roundtrip_and_legacy_passthrough() {
+        let base = b"FRCP-fake-base-blob-bytes".to_vec();
+        // Legacy blob (no trailer): split is identity.
+        let (b, m) = split_mapping_trailer(&base).unwrap();
+        assert_eq!(b, &base[..]);
+        assert!(m.is_none());
+
+        // Round-trip.
+        let mapping = b"FRMS-fake-mapping-snapshot".to_vec();
+        let mut blob = base.clone();
+        append_mapping_trailer(&mut blob, &mapping);
+        let (b, m) = split_mapping_trailer(&blob).unwrap();
+        assert_eq!(b, &base[..]);
+        assert_eq!(m.unwrap(), &mapping[..]);
+
+        // Empty mapping payload round-trips too.
+        let mut blob2 = base.clone();
+        append_mapping_trailer(&mut blob2, &[]);
+        let (b2, m2) = split_mapping_trailer(&blob2).unwrap();
+        assert_eq!(b2, &base[..]);
+        assert_eq!(m2.unwrap(), &[] as &[u8]);
+
+        // Corrupt the payload: CRC must fire.
+        let mut corrupted = base.clone();
+        append_mapping_trailer(&mut corrupted, &mapping);
+        let idx = base.len() + 2;
+        corrupted[idx] ^= 0xFF;
+        assert!(split_mapping_trailer(&corrupted).is_err());
     }
 
     #[test]

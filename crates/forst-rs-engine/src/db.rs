@@ -610,6 +610,17 @@ pub struct DbImpl {
     /// pin. Reaped during subsequent flush/compact calls once the pins
     /// have been released.
     pending_deletions: Mutex<Vec<FileNumber>>,
+    /// FRS-PHASE2-S1 (2026-06-13 design §2): optional file-mapping /
+    /// ownership layer (UFS-equivalent: logical→physical mapping +
+    /// refcounts, hard-link semantics over object stores). `None` by
+    /// default — Stage-1 is INERT until Stage-2 wires checkpoints to
+    /// `link()`; when attached via [`Self::attach_file_mapping`], physical
+    /// SST deletes route through `unlink()` so bytes linked into a
+    /// checkpoint namespace survive working-dir compaction (refs > 0) and
+    /// are deleted exactly once at refs == 0. The [`FileDeletionGuard`]
+    /// stays in front of it: the guard protects process-local
+    /// readers/snapshots; the mapping governs durable lifetime (§2.2).
+    file_mapping: std::sync::OnceLock<Arc<forst_rs_io::FileMappingManager>>,
     /// Monotonic sequence number shared across all CFs. Incremented on every
     /// successful mutation.
     sequence_number: AtomicU64,
@@ -847,6 +858,7 @@ impl DbImpl {
             sst_readers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
+            file_mapping: std::sync::OnceLock::new(),
             sequence_number: AtomicU64::new(0),
             write_controller: Arc::new(WriteController::new(wc_config)),
             write_mutex: Mutex::new(()),
@@ -4578,7 +4590,14 @@ impl DbImpl {
         if engine_seq > snapshot.last_sequence {
             snapshot.last_sequence = engine_seq;
         }
-        let blob = serialize_snapshot(&snapshot)?;
+        let mut blob = serialize_snapshot(&snapshot)?;
+        // FRS-PHASE2-S1 (design §2.4): embed the file-mapping snapshot into
+        // the checkpoint blob so the mapping is durable atomically with the
+        // manifest. No mapping attached (the default) → no trailer, bytes
+        // byte-identical to pre-Phase-2.
+        if let Some(mgr) = self.file_mapping.get() {
+            crate::checkpoint::append_mapping_trailer(&mut blob, &mgr.snapshot_bytes()?);
+        }
 
         // R49-M1: copy live SSTs FIRST, write the blob LAST. The blob is the
         // crash-recovery anchor — a valid blob that references SSTs not yet
@@ -4851,11 +4870,15 @@ impl DbImpl {
         fs: Arc<dyn FileSystem>,
         default_desc: ColumnFamilyDescriptor,
     ) -> ForstResult<Arc<Self>> {
-        use crate::checkpoint::{deserialize_snapshot, read_blob};
+        use crate::checkpoint::{deserialize_snapshot, read_blob, split_mapping_trailer};
 
         let db_path = PathBuf::from(&options.db_path);
         let blob = read_blob(fs.as_ref(), &db_path)?;
-        let snapshot = deserialize_snapshot(&blob)?;
+        // FRS-PHASE2-S1: strip the optional mapping-snapshot trailer (no-op
+        // for legacy blobs). Mapping-state consumption on restore is Stage-2/3
+        // wiring; here the base VersionSet blob is what restores the engine.
+        let (base_blob, _mapping_snapshot) = split_mapping_trailer(&blob)?;
+        let snapshot = deserialize_snapshot(base_blob)?;
 
         // Verify every referenced SST file exists.
         for file in snapshot.version.live_sst_files() {
@@ -5148,6 +5171,7 @@ impl DbImpl {
             sst_readers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
+            file_mapping: std::sync::OnceLock::new(),
             // D-R7-H1: A-R6-H3 patched the VersionSet seed but missed
             // this sibling — `DbImpl::sequence_number` is the source of
             // every write's allocated seq via `fetch_add`. A stale
@@ -5438,7 +5462,14 @@ impl DbImpl {
             self.fs.await_upload(&sst_path)?;
         }
 
-        let blob = serialize_snapshot(&version_snapshot)?;
+        let mut blob = serialize_snapshot(&version_snapshot)?;
+        // FRS-PHASE2-S1 (design §2.4): embed the file-mapping snapshot (see
+        // the sibling site in `create_checkpoint`). Inert when no mapping is
+        // attached.
+        if let Some(mgr) = self.file_mapping.get() {
+            crate::checkpoint::append_mapping_trailer(&mut blob, &mgr.snapshot_bytes()?);
+        }
+        let blob = blob;
 
         // R79-H1: build a cf_id → name lookup so per-file `cf_name` reflects
         // the actual owner CF, not the hardcoded DEFAULT_CF_NAME. Required by
@@ -5454,9 +5485,11 @@ impl DbImpl {
         let base_live: std::collections::HashSet<FileNumber> = if base_checkpoint_id != 0
             && self.fs.file_exists(&base_dir.join(CHECKPOINT_BLOB_NAME))?
         {
-            use crate::checkpoint::{deserialize_snapshot, read_blob};
+            use crate::checkpoint::{deserialize_snapshot, read_blob, split_mapping_trailer};
             let base_blob = read_blob(self.fs.as_ref(), &base_dir)?;
-            let base_snap = deserialize_snapshot(&base_blob)?;
+            // FRS-PHASE2-S1: the base checkpoint may carry a mapping trailer.
+            let (base_bytes, _mapping) = split_mapping_trailer(&base_blob)?;
+            let base_snap = deserialize_snapshot(base_bytes)?;
             base_snap
                 .version
                 .live_sst_files()
@@ -9959,14 +9992,40 @@ impl DbImpl {
     fn delete_file_guarded(&self, file_number: FileNumber) {
         let referenced = self.version_set.referenced_file_numbers();
         if self.can_reclaim_file(file_number, &referenced) {
-            let path = sst_file_path(&self.db_path, file_number);
-            let _ = self.fs.delete_file(&path);
+            self.delete_sst_physical(file_number);
         } else {
             self.pending_deletions
                 .lock()
                 .expect("lock poisoned")
                 .push(file_number);
         }
+    }
+
+    /// FRS-PHASE2-S1: the single physical-delete choke point for SSTs whose
+    /// process-local lifetime has ended (guard pins + live-version refs both
+    /// released). With a [`forst_rs_io::FileMappingManager`] attached AND the
+    /// working path registered in it, the delete becomes `unlink(working)`:
+    /// the mapping drops one logical reference and deletes the physical
+    /// object only at refs == 0 — so SSTs linked into a checkpoint namespace
+    /// survive working-dir compaction (design §2.2 deletion order). Files
+    /// never registered (or no mapping attached — the default) take the
+    /// direct-delete path, byte-identical to the pre-Phase-2 engine.
+    fn delete_sst_physical(&self, file_number: FileNumber) {
+        let path = sst_file_path(&self.db_path, file_number);
+        if let Some(mgr) = self.file_mapping.get() {
+            if mgr.is_registered(&path) {
+                if let Err(e) = mgr.unlink(&path) {
+                    tracing::warn!(
+                        "delete_sst_physical: mapping unlink({}) failed: {} \
+                         (object retained; gc_sweep reaps if truly dead)",
+                        path.display(),
+                        e
+                    );
+                }
+                return;
+            }
+        }
+        let _ = self.fs.delete_file(&path);
     }
 
     /// Reaps previously-deferred deletions whose pins / live-version references
@@ -9980,13 +10039,63 @@ impl DbImpl {
         let mut still_pending = Vec::with_capacity(pending.len());
         for file_number in pending.drain(..) {
             if self.can_reclaim_file(file_number, &referenced) {
-                let path = sst_file_path(&self.db_path, file_number);
-                let _ = self.fs.delete_file(&path);
+                self.delete_sst_physical(file_number);
             } else {
                 still_pending.push(file_number);
             }
         }
         *pending = still_pending;
+    }
+
+    // ---------------------------------------------------------------
+    // FRS-PHASE2-S1: file-mapping layer attachment (inert by default)
+    // ---------------------------------------------------------------
+
+    /// Attaches the Phase-2 file-mapping / ownership layer. May be called at
+    /// most once; the manager MUST be backed by this engine's filesystem so
+    /// `unlink`'s physical deletes hit the same namespace. Nothing in the
+    /// default open paths calls this — Stage-1 stays inert until Stage-2
+    /// wires `create_incremental_checkpoint` to `link()`.
+    pub fn attach_file_mapping(
+        &self,
+        mgr: Arc<forst_rs_io::FileMappingManager>,
+    ) -> ForstResult<()> {
+        self.file_mapping
+            .set(mgr)
+            .map_err(|_| ForstError::invalid_argument("file mapping already attached"))
+    }
+
+    /// Returns the attached file-mapping layer, if any.
+    pub fn file_mapping(&self) -> Option<&Arc<forst_rs_io::FileMappingManager>> {
+        self.file_mapping.get()
+    }
+
+    /// FRS-PHASE2-S1: registers every CURRENTLY-LIVE SST under an identity
+    /// mapping (logical == physical == working path, refs = 1,
+    /// `ShareableOwnedByDb`). Idempotent — re-registering an existing
+    /// identity mapping is a no-op. This is the "working-dir create" hook the
+    /// Stage-2 link-mode checkpoint runs before `link()`ing the live set into
+    /// `<ckpt-root>/chk-k/`; exposed now so the Stage-1 engine IT exercises
+    /// the real checkpoint→link→compact lifecycle. Returns the number of
+    /// SSTs registered.
+    pub fn mapping_register_live_ssts(&self) -> ForstResult<usize> {
+        let mgr = self.file_mapping.get().ok_or_else(|| {
+            ForstError::invalid_argument("mapping_register_live_ssts: no file mapping attached")
+        })?;
+        let live = self.version_set.current().live_sst_files();
+        let mut registered = 0usize;
+        for file in &live {
+            let path = sst_file_path(&self.db_path, file.file_number);
+            let key = path.to_str().ok_or_else(|| {
+                ForstError::invalid_argument(format!(
+                    "mapping_register_live_ssts: non-utf8 path {}",
+                    path.display()
+                ))
+            })?;
+            mgr.register(&path, key, file.file_size)?;
+            registered += 1;
+        }
+        Ok(registered)
     }
 }
 
@@ -16087,6 +16196,162 @@ mod tests {
             "input SSTs {:?} must be DELETED after the read version is released",
             input_fnums.iter().map(|f| f.value()).collect::<Vec<_>>()
         );
+    }
+
+    /// FRS-PHASE2-S1 IT (design §5 Stage-1 gates): the full link lifecycle —
+    /// checkpoint→link→compact-away-working-copy→read-via-checkpoint-link
+    /// stays byte-exact; discarding the last ref deletes the physical object
+    /// exactly once. Includes the FileDeletionGuard pin interplay: a pinned
+    /// compaction input's unlink is deferred until the pin releases.
+    #[test]
+    fn test_phase2_s1_mapping_checkpoint_link_lifecycle() {
+        use forst_rs_io::{FileMappingManager, MemoryFileSystem, UnlinkOutcome};
+
+        fn read_all(fs: &dyn FileSystem, path: &Path) -> Vec<u8> {
+            let mut r = fs.open_sequential_file(path).unwrap();
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = r.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        }
+
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+
+        // Two L0 SSTs so compaction has inputs to obsolete.
+        db.put(&cf, b"k1", b"v1").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.put(&cf, b"k2", b"v2").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        let mgr = Arc::new(
+            FileMappingManager::new(fs.clone(), PathBuf::from("/db/MAPPING.journal")).unwrap(),
+        );
+        db.attach_file_mapping(mgr.clone()).unwrap();
+        // Double-attach is rejected.
+        assert!(db.attach_file_mapping(mgr.clone()).is_err());
+        assert!(db.mapping_register_live_ssts().unwrap() >= 2);
+
+        // "Checkpoint": link every live L0 SST into the checkpoint namespace
+        // (exactly what the Stage-2 link-mode checkpoint will do).
+        let inputs: Vec<FileNumber> = db
+            .version_set
+            .current()
+            .l0_files()
+            .iter()
+            .map(|f| f.file_number)
+            .collect();
+        assert!(inputs.len() >= 2);
+        let mut links: Vec<(PathBuf, PathBuf, Vec<u8>)> = Vec::new();
+        for f in &inputs {
+            let working = sst_file_path(&db.db_path, *f);
+            let ckpt = PathBuf::from(format!("/ckpt/chk-1/{:06}.sst", f.value()));
+            let bytes = read_all(fs.as_ref(), &working);
+            assert!(!bytes.is_empty());
+            mgr.link(&working, &ckpt).unwrap();
+            links.push((working, ckpt, bytes));
+        }
+
+        // Pin interplay: while pinned, even the mapping unlink is deferred.
+        let pinned = inputs[0];
+        let pin = db.deletion_guard().pin_batch(&[pinned]);
+        db.compact_l0(&cf).unwrap().expect("compaction output");
+        let pinned_working = sst_file_path(&db.db_path, pinned);
+        assert!(
+            mgr.is_registered(&pinned_working),
+            "pinned input's working mapping must survive (delete deferred)"
+        );
+        drop(pin);
+
+        // Drain version references (same pattern as
+        // test_compaction_defers_delete_while_read_version_held) until the
+        // engine has routed every input's delete through the mapping.
+        let mut drained = false;
+        for i in 0..16 {
+            db.put(&cf, format!("drain{i}").as_bytes(), b"v").unwrap();
+            db.switch_and_flush(&cf).unwrap();
+            db.compact_l0(&cf).unwrap();
+            db.reap_pending_deletions();
+            if links.iter().all(|(w, _, _)| !mgr.is_registered(w)) {
+                drained = true;
+                break;
+            }
+        }
+        assert!(drained, "working copies must be unlinked after compaction");
+
+        for (working, ckpt, original) in &links {
+            // Bytes survive: the checkpoint link still holds a reference.
+            assert!(
+                fs.file_exists(working).unwrap(),
+                "physical {} must survive working-dir unlink (ckpt ref held)",
+                working.display()
+            );
+            assert_eq!(mgr.refs(working.to_str().unwrap()), 1);
+            // Read VIA the checkpoint link: resolve → physical → byte-exact.
+            let physical = mgr.resolve(ckpt).expect("ckpt link resolves");
+            assert_eq!(physical, working.to_str().unwrap());
+            assert_eq!(&read_all(fs.as_ref(), Path::new(&physical)), original);
+        }
+
+        // Discard the checkpoint: last ref → physical gone, EXACTLY once.
+        for (working, ckpt, _) in &links {
+            assert_eq!(
+                mgr.unlink(ckpt).unwrap(),
+                UnlinkOutcome::PhysicalDeleted,
+                "last unlink must delete {}",
+                working.display()
+            );
+            assert!(!fs.file_exists(working).unwrap());
+            // Second discard of the same logical path fails NotFound —
+            // the exactly-once physical-delete gate.
+            assert!(mgr.unlink(ckpt).unwrap_err().is_not_found());
+        }
+
+        // The DB keeps working on the compacted state.
+        assert_eq!(db.get(&cf, b"k1").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(db.get(&cf, b"k2").unwrap().as_deref(), Some(&b"v2"[..]));
+    }
+
+    /// FRS-PHASE2-S1: with a mapping attached, `create_checkpoint` embeds the
+    /// mapping-snapshot trailer in CHECKPOINT.blob and restore strips it
+    /// transparently (legacy paths untouched when no mapping is attached).
+    #[test]
+    fn test_phase2_s1_checkpoint_blob_mapping_trailer_roundtrip() {
+        use crate::checkpoint::{read_blob, split_mapping_trailer};
+        use forst_rs_io::{FileMappingManager, MemoryFileSystem};
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        db.put(&cf, b"k", b"v").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        let mgr = Arc::new(
+            FileMappingManager::new(fs.clone(), PathBuf::from("/db/MAPPING.journal")).unwrap(),
+        );
+        db.attach_file_mapping(mgr).unwrap();
+        db.mapping_register_live_ssts().unwrap();
+        db.create_checkpoint(Path::new("/ckpt")).unwrap();
+
+        // The written blob carries a valid mapping trailer with content.
+        let blob = read_blob(fs.as_ref(), Path::new("/ckpt")).unwrap();
+        let (_base, mapping) = split_mapping_trailer(&blob).unwrap();
+        assert!(mapping.expect("trailer present").len() > 10);
+
+        // Restore strips the trailer transparently and state is intact.
+        let opts = EngineOptions {
+            db_path: "/ckpt".to_string(),
+            ..EngineOptions::default()
+        };
+        let restored = DbImpl::open_from_checkpoint(opts, fs.clone()).unwrap();
+        let rcf = restored.default_cf();
+        assert_eq!(restored.get(&rcf, b"k").unwrap().as_deref(), Some(&b"v"[..]));
     }
 
     #[test]

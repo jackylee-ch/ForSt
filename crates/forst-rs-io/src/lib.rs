@@ -27,6 +27,7 @@
 
 pub mod async_io;
 pub mod block_io;
+pub mod file_mapping;
 pub mod filesystem;
 pub mod local_fs;
 pub mod memory_fs;
@@ -37,6 +38,7 @@ pub mod router;
 
 pub use async_io::{AsyncRandomReader, AsyncSequentialReader, AsyncWriter, BoxFuture};
 pub use block_io::{check_vectored_args, BlockIo, PreadBlockIo};
+pub use file_mapping::{FileMappingManager, GcReport, UnlinkOutcome};
 pub use filesystem::{
     map_io_error, FileMetadata, FileSystem, RandomAccessFile, SequentialFile, WritableFile,
     WriteMode,

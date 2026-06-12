@@ -435,6 +435,50 @@ Standing baseline for the dev box stays as recorded 2026-06-01: dev-Mac→BOS =
 would emit `fs-emulation-only`); all Stage-1+ partial benches below are
 emulation-based per §5.
 
-### Stage 1 — FileMappingManager (filled by the Stage-1 commit)
+### Stage 1 — FileMappingManager (landed)
 
-- 10k-file link-vs-copy bench pair: *pending*
+Built (`crates/forst-rs-io/src/file_mapping.rs` + engine wiring in
+`crates/forst-rs-engine/src/db.rs` / `checkpoint.rs`):
+
+- `FileMappingManager` — durable logical→physical mapping, derived refcounts
+  (refs == |logical links|, which makes journal replay idempotent),
+  `register`/`link`/`unlink`/`adopt`, JM-discard `tombstone` protocol (§2.3 —
+  never a direct S3 delete), `gc_sweep` (refs>0 hard-stop), CRC-framed
+  append-only journal (truncated-tail tolerant) + `snapshot_bytes`/
+  `restore_snapshot`.
+- `FileOwnershipTracker` (previously dormant, `ownership.rs:141`) is now the
+  layer's ownership authority: register → `ShareableOwnedByDb`, adopt →
+  `NotOwned` (drain keeps bytes unless tombstoned).
+- Engine: `DbImpl::attach_file_mapping` (OnceLock, **None by default — Stage-1
+  inert**); `delete_file_guarded`/`reap_pending_deletions` route through the
+  single `delete_sst_physical` choke point → `unlink()` when the working path
+  is registered; `mapping_register_live_ssts()` = the Stage-2 working-dir
+  registration hook. Mapping snapshot embedded in `CHECKPOINT.blob` via a
+  tail envelope (`append_mapping_trailer`/`split_mapping_trailer`; legacy
+  blobs pass through unchanged; no-mapping blobs byte-identical).
+
+Gates green (2026-06-12):
+
+- UT (forst-rs-io): link/unlink/refcount, unlink-at-refs>0 keeps bytes,
+  adopt/NotOwned, tombstone defer/immediate/overrides-NotOwned, journal replay
+  + double-apply idempotence + torn-tail tolerance, snapshot round-trip +
+  corruption reject, **concurrent link-vs-unlink race** (8 rounds × 4 linker
+  threads: bytes exist iff refs>0; delete only when no link landed), GC sweep
+  reaps orphans/never refs>0.
+- IT (forst-rs-engine, `db.rs`):
+  `test_phase2_s1_mapping_checkpoint_link_lifecycle` — checkpoint→link→
+  compact-away-working-copy→read-via-checkpoint-link byte-exact; pinned input
+  defers unlink (FileDeletionGuard interplay); **last-ref discard deletes the
+  physical exactly once** (second unlink = NotFound).
+  `test_phase2_s1_checkpoint_blob_mapping_trailer_roundtrip` — trailer embeds
+  + restore strips transparently.
+- **10k-file link-vs-copy bench pair** (fs-emulation, dev Mac,
+  `examples/link_vs_copy.rs`, 64 KiB files):
+
+  ```
+  LINKBENCH n=10000 size_kb=64 copy_total_ms=45203.0 link_total_ms=14.3
+            copy_per_file_us=4520.3 link_per_file_us=1.4 speedup=3172x
+  ```
+
+  ≥100× expectation exceeded (3172×) — the headline link-mechanism cost
+  constant for R5's per-file extrapolation is ~1.4 µs/link (+ journal append).
