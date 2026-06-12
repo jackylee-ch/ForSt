@@ -482,3 +482,61 @@ Gates green (2026-06-12):
 
   ≥100× expectation exceeded (3172×) — the headline link-mechanism cost
   constant for R5's per-file extrapolation is ~1.4 µs/link (+ journal append).
+
+### ForSt-mechanism adoption #1 (competitive analysis §2.1 items a+b) —
+### requester-class exemption + write-only admission (landed, default-OFF)
+
+Built (`crates/forst-rs-storage/src/requester.rs`, `local_cache.rs`,
+`cached_fs.rs`; engine wiring `bg_pool.rs` + the two pool constructors in
+`db.rs`):
+
+- **Requester class** (`requester.rs`): thread-local background mark
+  (`mark_thread_background` sticky / `BackgroundScope` RAII). Engine flush +
+  compaction pool workers are marked (`WorkerPool::new_background`); the
+  read pool (foreground parallel operator reads) is NOT. Advisory — inert
+  unless a cache policy opts in.
+- **`CachePolicy`** on `LocalCache` (env: `FRS_CACHE_BG_EXEMPT=1`,
+  `FRS_CACHE_ADMISSION=1` + `_PROMOTE`/`_EVICT_LIMIT`/`_TRACKER_CAP`; both
+  default OFF ⇒ byte-identical legacy behavior; explicit
+  `open_with_policy` for tests):
+  - *bg-exempt* (ForSt §2.1.4): background accesses don't promote LRU order,
+    don't accumulate admission credit, and are excluded from the headline
+    hit-rate stats (separate `bg_hits/bg_misses`).
+  - *read-fill admission* (ForSt §2.1.1-2.1.3 write-only admission +
+    count-to-promote + promoteLimit): demand-read miss fills (whole-file
+    `fetch_through_cache_gated` + per-chunk fills) are admitted only after
+    `access_before_promote` (default 2) foreground touches; a key evicted
+    ≥ `promote_limit` (default 3) times is blocked (anti-thrash cap; FIFO
+    tracker aging = the cheap stand-in for ForSt's epoch decay).
+    Write-through (`CachePopulatingWritableFile`) and explicit prefetch
+    (`ensure_cached`/`prefetch_files*`) always admit.
+
+Gates green (2026-06-12): 14 new UTs (bg-no-promote on get/get_range/
+file_handle paths, count-to-promote, promote-limit permanent block,
+bg-no-credit, write-path-never-gated, paper-§5.4 thrash scenario LRU-vs-
+admission, tracker bound, demand-vs-prefetch-vs-write-through FS
+integration, chunk-path pass-through-while-rejected, bg-pool marking);
+full forst-rs-storage suite 432/0; engine suite green; clippy clean.
+
+**Hit-rate minibench** (`examples/cache_admission_bench.rs`, dev Mac,
+release; hot=32 files ≤ budget=64×64 KiB, bg compaction-scan 128 files=2×
+budget per round, fg cold scan 2× budget every 3rd round, 12 rounds):
+
+```
+ADMBENCH cell=legacy-lru          fg_hot_hit_rate=88.5% fills=2400 fill_mb=150.0 elapsed_ms=19413
+ADMBENCH cell=bg-exempt           fg_hot_hit_rate=88.5% fills=2400 fill_mb=150.0 elapsed_ms=19559
+ADMBENCH cell=admission           fg_hot_hit_rate=37.5% fills=704  fill_mb=44.0  elapsed_ms=5782
+ADMBENCH cell=bg-exempt+admission fg_hot_hit_rate=97.9% fills=256  fill_mb=16.0  elapsed_ms=2170
+```
+
+Findings (recorded): (1) the PAIR is the mechanism — +9.4 pp fg hot-set hit
+rate and **9.4× less cache-fill churn** (150→16 MB; wall 19.4→2.2 s, churn
+fsyncs dominate) vs legacy; (2) bg-exempt ALONE is a no-op here because
+miss-FILLS (not hit-touches) do the evicting — confirms ForSt's write-only
+admission is the load-bearing half; (3) **admission WITHOUT bg-exempt is an
+anti-config** (−51 pp): unexempted scan touches earn admission credit, their
+fills evict the hot set, and the thrash cap then permanently blocks the
+re-faulted HOT keys. Ops rule: `FRS_CACHE_ADMISSION` must ship with
+`FRS_CACHE_BG_EXEMPT`. Remaining Stage-5 scope: pluggable-policy trait
+formalization, admission-gated *background whole-file fill* scheduling
+(§4.1.1), q9/q20-class 10M cache-pressure soak (§5 Stage-5 IT).

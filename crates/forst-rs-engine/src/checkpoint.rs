@@ -423,9 +423,7 @@ pub fn split_mapping_trailer(data: &[u8]) -> ForstResult<(&[u8], Option<&[u8]>)>
     let crc_off = data.len() - 12;
     let stored_crc = u32::from_le_bytes(data[crc_off..crc_off + 4].try_into().expect("4 bytes"));
     if stored_crc != crc32c(payload) {
-        return Err(ForstError::corruption(
-            "mapping trailer checksum mismatch",
-        ));
+        return Err(ForstError::corruption("mapping trailer checksum mismatch"));
     }
     Ok((&data[..payload_start], Some(payload)))
 }

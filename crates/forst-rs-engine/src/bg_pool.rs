@@ -43,6 +43,23 @@ impl WorkerPool {
     /// Spawn a pool with `n_workers` threads (clamped to ≥1), each named with
     /// `name` for visibility in `sample`/profilers.
     pub(crate) fn new(n_workers: usize, name: &str) -> Self {
+        Self::with_class(n_workers, name, false)
+    }
+
+    /// [`new`](Self::new), but every worker thread is marked as a BACKGROUND
+    /// cache requester (`forst_rs_storage::requester`). Used by the flush and
+    /// compaction pools so their SST reads cannot evict/promote the operator
+    /// hot set in requester-aware caches (FRS-CACHE-BG-EXEMPT, ForSt §2.1.4 —
+    /// only state-executor threads affect LRU order). The mark is advisory
+    /// and inert unless a cache policy flag opts in (default OFF).
+    ///
+    /// NOT used for `bg_read_pool`: its workers execute FOREGROUND operator
+    /// reads (parallel batch iterator opens) that must keep promoting.
+    pub(crate) fn new_background(n_workers: usize, name: &str) -> Self {
+        Self::with_class(n_workers, name, true)
+    }
+
+    fn with_class(n_workers: usize, name: &str, background: bool) -> Self {
         let n = n_workers.max(1);
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::new()),
@@ -53,7 +70,12 @@ impl WorkerPool {
             let sh = Arc::clone(&shared);
             let handle = std::thread::Builder::new()
                 .name(name.to_string())
-                .spawn(move || worker_loop(sh))
+                .spawn(move || {
+                    if background {
+                        forst_rs_storage::requester::mark_thread_background();
+                    }
+                    worker_loop(sh)
+                })
                 .expect("failed to spawn bg worker");
             workers.push(handle);
         }
@@ -177,6 +199,33 @@ mod tests {
         }
         assert_eq!(ran.load(Ordering::SeqCst), JOBS);
         assert_eq!(max_seen.load(Ordering::SeqCst), CAP);
+    }
+
+    /// FRS-CACHE-BG-EXEMPT: `new_background` workers carry the background
+    /// requester mark; plain `new` workers stay foreground. The mark is what
+    /// lets requester-aware caches exempt flush/compaction reads from LRU
+    /// promotion without affecting the read pool.
+    #[test]
+    fn background_pool_marks_workers_plain_pool_does_not() {
+        use forst_rs_storage::requester::is_background_thread;
+        let check = |pool: &WorkerPool, expect_bg: bool, what: &'static str| {
+            let (tx, rx) = std::sync::mpsc::channel::<bool>();
+            pool.submit(Box::new(move || {
+                let _ = tx.send(is_background_thread());
+            }));
+            let got = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("job did not run");
+            assert_eq!(got, expect_bg, "{what}");
+        };
+        let bg = WorkerPool::new_background(1, "test-bg-marked");
+        check(
+            &bg,
+            true,
+            "new_background workers must be marked background",
+        );
+        let fg = WorkerPool::new(1, "test-fg-unmarked");
+        check(&fg, false, "plain new workers must stay foreground");
     }
 
     /// H1: a panicking job (i) does not kill its worker — subsequent jobs on

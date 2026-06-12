@@ -4674,9 +4674,7 @@ impl DbImpl {
             let overlap_bytes = |m: &SstFileMeta| -> u64 {
                 dst_candidates
                     .iter()
-                    .filter(|d| {
-                        d.largest_key >= m.smallest_key && d.smallest_key <= m.largest_key
-                    })
+                    .filter(|d| d.largest_key >= m.smallest_key && d.smallest_key <= m.largest_key)
                     .map(|d| d.file_size)
                     .sum()
             };
@@ -6401,7 +6399,11 @@ impl DbImpl {
             inputs.push((0, meta.clone(), self.get_or_open_sst_reader(meta)?));
         }
         for meta in &out_overlap_files {
-            inputs.push((output_level, meta.clone(), self.get_or_open_sst_reader(meta)?));
+            inputs.push((
+                output_level,
+                meta.clone(),
+                self.get_or_open_sst_reader(meta)?,
+            ));
         }
 
         // Allocate the output file number and build the job. We mark the
@@ -11225,7 +11227,9 @@ fn bg_flush_pool() -> &'static crate::bg_pool::WorkerPool {
         // Data-driven (2026-06-05 q4 sweep, 18-core): flush≈cores/3 — the low
         // cores/8 default caused write-stalls (L0 couldn't drain).
         let n = bg_pool_threads("FRS_BG_FLUSH_THREADS", |c| (c / 3).max(1));
-        crate::bg_pool::WorkerPool::new(n, "forst-rs-flush")
+        // FRS-CACHE-BG-EXEMPT: flush workers are background cache requesters
+        // (advisory mark; inert unless the cache policy opts in).
+        crate::bg_pool::WorkerPool::new_background(n, "forst-rs-flush")
     })
 }
 
@@ -11271,7 +11275,11 @@ fn bg_compact_pool() -> &'static crate::bg_pool::WorkerPool {
         // unbounded baseline (545s, 1451%) and lower bounds f3c5/f4c6 (~565s,
         // write-stalled). Too few starves L0 drain; too many starves the join.
         let n = bg_pool_threads("FRS_BG_COMPACT_THREADS", |c| (c / 2).max(2));
-        crate::bg_pool::WorkerPool::new(n, "forst-rs-compact")
+        // FRS-CACHE-BG-EXEMPT: compaction workers are background cache
+        // requesters — their input-SST scans must not be able to evict the
+        // operator hot set from requester-aware caches (ForSt §2.1.4).
+        // Advisory mark; inert unless the cache policy opts in (default OFF).
+        crate::bg_pool::WorkerPool::new_background(n, "forst-rs-compact")
     })
 }
 
@@ -16112,10 +16120,7 @@ mod tests {
     #[test]
     fn overlap_scoped_clean_cut_disjoint_selects_none() {
         let l0 = vec![meta_for_range(10, b"x", b"z")];
-        let l1 = vec![
-            meta_for_range(1, b"a", b"c"),
-            meta_for_range(2, b"d", b"f"),
-        ];
+        let l1 = vec![meta_for_range(1, b"a", b"c"), meta_for_range(2, b"d", b"f")];
         assert!(overlap_scoped_clean_cut(&l0, l1).is_empty());
     }
 
@@ -16191,11 +16196,15 @@ mod tests {
         // Every key readable.
         for i in 0..50u32 {
             assert_eq!(
-                db.get(&cf, format!("a{i:04}").as_bytes()).unwrap().as_deref(),
+                db.get(&cf, format!("a{i:04}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
                 Some(b"v1" as &[u8])
             );
             assert_eq!(
-                db.get(&cf, format!("z{i:04}").as_bytes()).unwrap().as_deref(),
+                db.get(&cf, format!("z{i:04}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
                 Some(b"v2" as &[u8])
             );
         }
@@ -16261,7 +16270,10 @@ mod tests {
             })
         };
         std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(!entered.load(AOrd::SeqCst), "exclusive admitted past a live permit");
+        assert!(
+            !entered.load(AOrd::SeqCst),
+            "exclusive admitted past a live permit"
+        );
         drop(p);
         handle.join().expect("exclusive join");
         assert!(entered.load(AOrd::SeqCst));
@@ -16505,7 +16517,9 @@ mod tests {
         assert!(!v.levels[bottom].files.is_empty());
         for i in 0..50u32 {
             assert_eq!(
-                db.get(&cf, format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                db.get(&cf, format!("k{i:04}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
                 Some(b"v" as &[u8])
             );
         }
@@ -16532,16 +16546,16 @@ mod tests {
         db.compact_l0(&cf).unwrap();
 
         let v = db.version_set.current();
-        let total_entries: u64 = v
-            .live_sst_files_iter()
-            .map(|f| f.num_entries)
-            .sum();
+        let total_entries: u64 = v.live_sst_files_iter().map(|f| f.num_entries).sum();
         assert_eq!(
             total_entries, 0,
             "tombstones/values survived a bottommost rollup: {total_entries} entries live"
         );
         for i in 0..100u32 {
-            assert!(db.get(&cf, format!("k{i:04}").as_bytes()).unwrap().is_none());
+            assert!(db
+                .get(&cf, format!("k{i:04}").as_bytes())
+                .unwrap()
+                .is_none());
         }
     }
 
@@ -16578,7 +16592,9 @@ mod tests {
         assert!(!v.levels[bottom].files.is_empty());
         for i in 0..50u32 {
             assert_eq!(
-                db.get(&cf, format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                db.get(&cf, format!("k{i:04}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
                 Some(b"v" as &[u8])
             );
         }
@@ -16624,9 +16640,15 @@ mod tests {
             );
         }
         for i in 0..50u32 {
-            let want: &[u8] = if (20..30).contains(&i) { b"new" } else { b"old" };
+            let want: &[u8] = if (20..30).contains(&i) {
+                b"new"
+            } else {
+                b"old"
+            };
             assert_eq!(
-                db.get(&cf, format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                db.get(&cf, format!("k{i:04}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
                 Some(want),
                 "key k{i:04}"
             );
@@ -17492,7 +17514,10 @@ mod tests {
         };
         let restored = DbImpl::open_from_checkpoint(opts, fs.clone()).unwrap();
         let rcf = restored.default_cf();
-        assert_eq!(restored.get(&rcf, b"k").unwrap().as_deref(), Some(&b"v"[..]));
+        assert_eq!(
+            restored.get(&rcf, b"k").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
     }
 
     #[test]

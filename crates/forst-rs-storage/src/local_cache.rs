@@ -54,6 +54,165 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::requester;
+
+/// FRS-CACHE-ADMISSION (Phase-2 disagg, ForSt mechanism §2.1.1-2.1.3):
+/// parameters of the *read-fill* admission policy. Mirrors ForSt's
+/// `FileBasedCache` cold-list machinery: reads of uncached files accumulate
+/// access counts and are only admitted (cached) after `access_before_promote`
+/// touches; a key evicted `promote_limit`+ times is permanently blocked from
+/// re-admission (the anti-thrash cap). Write-through puts (newly generated
+/// SSTs) are NEVER gated — that is ForSt's "write-only admission" split.
+#[derive(Clone, Copy, Debug)]
+pub struct AdmissionParams {
+    /// Number of read-miss touches before a key's fill is admitted.
+    /// ForSt: `accessBeforePromote` (`FileBasedCache.java:75-77,378-387`).
+    pub access_before_promote: u32,
+    /// A key evicted at least this many times is blocked from read-fill
+    /// re-admission. ForSt: `promoteLimit` (`FileBasedCache.java:79-82`).
+    pub promote_limit: u32,
+    /// Bound on tracked cold/evicted keys (FIFO aging — the cheap stand-in
+    /// for ForSt's epoch-decayed cold-list counts; old keys fall out of the
+    /// tracker, which both bounds memory and decays stale counts).
+    pub tracker_cap: usize,
+}
+
+impl Default for AdmissionParams {
+    fn default() -> Self {
+        Self {
+            access_before_promote: 2,
+            promote_limit: 3,
+            tracker_cap: 65_536,
+        }
+    }
+}
+
+/// Cache behavior policy, flag-gated and default-OFF (legacy behavior is
+/// byte-identical when both fields are off — the standing Phase-2 rule).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CachePolicy {
+    /// FRS-CACHE-BG-EXEMPT (ForSt §2.1.4): when `true`, accesses from threads
+    /// marked background ([`crate::requester`]) do NOT promote LRU order, do
+    /// NOT count toward admission, and are excluded from the foreground
+    /// hit-rate stats — so compaction scans cannot evict the operator hot set.
+    pub background_exempt: bool,
+    /// `Some(_)` enables read-fill admission gating (see [`AdmissionParams`]).
+    /// `None` = legacy: every read miss may populate the cache.
+    pub admission: Option<AdmissionParams>,
+}
+
+impl CachePolicy {
+    /// Builds the policy from environment flags (both default OFF):
+    /// - `FRS_CACHE_BG_EXEMPT=1` → background-thread exemption,
+    /// - `FRS_CACHE_ADMISSION=1` → read-fill admission gating, tuned by
+    ///   `FRS_CACHE_ADMISSION_PROMOTE` (touches before admit, default 2),
+    ///   `FRS_CACHE_ADMISSION_EVICT_LIMIT` (evictions before permanent
+    ///   block, default 3), `FRS_CACHE_ADMISSION_TRACKER_CAP` (default 65536).
+    pub fn from_env() -> Self {
+        fn flag(name: &str) -> bool {
+            matches!(
+                std::env::var(name).ok().as_deref(),
+                Some("1") | Some("true") | Some("TRUE")
+            )
+        }
+        fn num<T: std::str::FromStr>(name: &str, default: T) -> T {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        }
+        let admission = if flag("FRS_CACHE_ADMISSION") {
+            let d = AdmissionParams::default();
+            Some(AdmissionParams {
+                access_before_promote: num("FRS_CACHE_ADMISSION_PROMOTE", d.access_before_promote)
+                    .max(1),
+                promote_limit: num("FRS_CACHE_ADMISSION_EVICT_LIMIT", d.promote_limit).max(1),
+                tracker_cap: num("FRS_CACHE_ADMISSION_TRACKER_CAP", d.tracker_cap).max(16),
+            })
+        } else {
+            None
+        };
+        Self {
+            background_exempt: flag("FRS_CACHE_BG_EXEMPT"),
+            admission,
+        }
+    }
+}
+
+/// Bounded tracker behind the admission policy: per-key read-miss access
+/// counts (the "cold list") and per-key eviction counts (the thrash signal).
+/// Both maps age FIFO at `cap` entries — a dropped key simply restarts its
+/// count on the next touch (decay), and a dropped eviction record unblocks
+/// the key (acceptable: permanent blocking only needs to hold while the key
+/// is actively thrashing, which keeps its record fresh).
+#[derive(Default)]
+struct AdmissionTracker {
+    counts: HashMap<String, u32>,
+    counts_order: VecDeque<String>,
+    evictions: HashMap<String, u32>,
+    evictions_order: VecDeque<String>,
+}
+
+impl AdmissionTracker {
+    /// Drops oldest entries until `map` is under `cap`. Order refs whose key
+    /// is no longer present (already removed on admit) are skipped.
+    fn trim(map: &mut HashMap<String, u32>, order: &mut VecDeque<String>, cap: usize) {
+        while map.len() > cap {
+            match order.pop_front() {
+                Some(old) => {
+                    map.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+
+    /// Records one foreground read-miss touch of `key`; returns `true` when
+    /// the touch reaches `access_before_promote` (the fill is admitted and the
+    /// key's count is cleared).
+    fn touch_and_should_admit(&mut self, key: &str, p: &AdmissionParams) -> bool {
+        if self.evictions.get(key).copied().unwrap_or(0) >= p.promote_limit {
+            return false; // blocked: thrashing key (ForSt promoteLimit)
+        }
+        match self.counts.get_mut(key) {
+            Some(c) => {
+                *c += 1;
+                if *c >= p.access_before_promote {
+                    self.counts.remove(key);
+                    // Stale counts_order ref is skipped by trim later.
+                    return true;
+                }
+                false
+            }
+            None => {
+                if p.access_before_promote <= 1 {
+                    return true;
+                }
+                self.counts.insert(key.to_string(), 1);
+                self.counts_order.push_back(key.to_string());
+                Self::trim(&mut self.counts, &mut self.counts_order, p.tracker_cap);
+                false
+            }
+        }
+    }
+
+    /// Records that `key` was evicted from the cache.
+    fn record_eviction(&mut self, key: &str, p: &AdmissionParams) {
+        match self.evictions.get_mut(key) {
+            Some(c) => *c = c.saturating_add(1),
+            None => {
+                self.evictions.insert(key.to_string(), 1);
+                self.evictions_order.push_back(key.to_string());
+                Self::trim(
+                    &mut self.evictions,
+                    &mut self.evictions_order,
+                    p.tracker_cap,
+                );
+            }
+        }
+    }
+}
+
 /// Per-entry bookkeeping. `bytes` is the on-disk size; the LRU position
 /// is implied by membership in the `lru` deque.
 #[derive(Clone, Debug)]
@@ -95,6 +254,21 @@ pub struct LocalCache {
     /// Count of ACTUAL `open()` calls made by `get_range` (a cache miss). A
     /// low value relative to block reads validates the fd-cache hit rate.
     fd_opens: AtomicU64,
+    /// FRS-CACHE-BG-EXEMPT / FRS-CACHE-ADMISSION policy (default OFF ⇒
+    /// byte-identical legacy behavior).
+    policy: CachePolicy,
+    /// Cold/eviction tracker behind the admission policy. Only locked when
+    /// `policy.admission` is `Some(_)`.
+    admission: Mutex<AdmissionTracker>,
+    /// Background-thread hits/misses (recorded separately so the headline
+    /// hit rate reflects the FOREGROUND working set only — ForSt §2.1.4).
+    /// Always 0 unless `policy.background_exempt`.
+    bg_hits: AtomicU64,
+    bg_misses: AtomicU64,
+    /// Read-fill admission outcomes (admitted / rejected). Always 0 unless
+    /// `policy.admission` is `Some(_)`.
+    admitted: AtomicU64,
+    rejected: AtomicU64,
 }
 
 /// Bounded FIFO cache of open read file handles. `order` records insertion
@@ -249,6 +423,16 @@ impl LocalCache {
     ///
     /// Returns I/O errors from creating or reading the directory.
     pub fn open(cache_dir: impl Into<PathBuf>, capacity_bytes: u64) -> io::Result<Self> {
+        Self::open_with_policy(cache_dir, capacity_bytes, CachePolicy::from_env())
+    }
+
+    /// [`open`](Self::open) with an explicit [`CachePolicy`] (tests and
+    /// callers that configure programmatically instead of via env flags).
+    pub fn open_with_policy(
+        cache_dir: impl Into<PathBuf>,
+        capacity_bytes: u64,
+        policy: CachePolicy,
+    ) -> io::Result<Self> {
         let cache_dir = cache_dir.into();
         fs::create_dir_all(&cache_dir)?;
 
@@ -288,7 +472,78 @@ impl LocalCache {
             // limit. Evicted FIFO; stale entries purged on removal.
             fd_cache: Mutex::new(FdCache::new(512)),
             fd_opens: AtomicU64::new(0),
+            policy,
+            admission: Mutex::new(AdmissionTracker::default()),
+            bg_hits: AtomicU64::new(0),
+            bg_misses: AtomicU64::new(0),
+            admitted: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
         })
+    }
+
+    /// Returns the active [`CachePolicy`].
+    pub fn policy(&self) -> CachePolicy {
+        self.policy
+    }
+
+    /// FRS-CACHE-BG-EXEMPT: `true` when the CURRENT access should be treated
+    /// as foreground for LRU/stats/admission purposes. Always `true` unless
+    /// the policy opts in AND the calling thread is marked background.
+    #[inline]
+    fn foreground(&self) -> bool {
+        !(self.policy.background_exempt && requester::is_background_thread())
+    }
+
+    /// FRS-CACHE-ADMISSION: decides whether a READ-MISS fill of `key` may be
+    /// admitted into the cache (callers skip their `put` on `false`).
+    ///
+    /// - Admission disabled (`policy.admission == None`): always `true`
+    ///   (legacy behavior).
+    /// - Background-exempt thread: `false` without counting — compaction
+    ///   reads neither admit nor accumulate promotion credit (ForSt §2.1.4).
+    /// - Otherwise ForSt's count-to-promote: the key's foreground miss count
+    ///   must reach `access_before_promote`, and a key evicted
+    ///   `promote_limit`+ times is blocked (anti-thrash cap, §2.1.1-2.1.2).
+    ///
+    /// Write-through puts (newly generated SSTs) must NOT consult this —
+    /// they call [`put`](Self::put) directly (write-only admission split).
+    pub fn admit_read_fill(&self, key: &str) -> bool {
+        let Some(params) = self.policy.admission else {
+            return true;
+        };
+        if !self.foreground() {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let admit = self
+            .admission
+            .lock()
+            .expect("admission tracker mutex poisoned")
+            .touch_and_should_admit(key, &params);
+        if admit {
+            self.admitted.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+        }
+        admit
+    }
+
+    /// Returns `(admitted, rejected)` read-fill admission decisions so far
+    /// (both 0 when admission is disabled).
+    pub fn admission_stats(&self) -> (u64, u64) {
+        (
+            self.admitted.load(Ordering::Relaxed),
+            self.rejected.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Returns `(hits, misses)` observed from BACKGROUND-class threads (both
+    /// 0 unless `background_exempt` is on).
+    pub fn bg_stats(&self) -> (u64, u64) {
+        (
+            self.bg_hits.load(Ordering::Relaxed),
+            self.bg_misses.load(Ordering::Relaxed),
+        )
     }
 
     /// FRS-FDCACHE: returns a shared open read handle for `key`, opening (and
@@ -336,13 +591,16 @@ impl LocalCache {
     }
 
     /// Records a hit/miss and emits a periodic `FRS-CACHE-STATS` line every
-    /// 100k gets. Lock-free; called on every `get`.
-    fn record_get(&self, hit: bool) {
-        if hit {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-        }
+    /// 100k gets. Lock-free; called on every `get`. `fg=false` accesses
+    /// (background threads under FRS-CACHE-BG-EXEMPT) are counted separately
+    /// so the headline hit rate reflects the foreground working set only.
+    fn record_get(&self, hit: bool, fg: bool) {
+        match (fg, hit) {
+            (true, true) => self.hits.fetch_add(1, Ordering::Relaxed),
+            (true, false) => self.misses.fetch_add(1, Ordering::Relaxed),
+            (false, true) => self.bg_hits.fetch_add(1, Ordering::Relaxed),
+            (false, false) => self.bg_misses.fetch_add(1, Ordering::Relaxed),
+        };
         let n = self.gets.fetch_add(1, Ordering::Relaxed) + 1;
         if n.is_multiple_of(100_000) {
             let hits = self.hits.load(Ordering::Relaxed);
@@ -353,7 +611,13 @@ impl LocalCache {
             } else {
                 (hits as f64 / total as f64) * 100.0
             };
-            eprintln!("FRS-CACHE-STATS: hits={hits} misses={misses} hit_rate={rate:.1}%");
+            let bg_hits = self.bg_hits.load(Ordering::Relaxed);
+            let bg_misses = self.bg_misses.load(Ordering::Relaxed);
+            let (admitted, rejected) = self.admission_stats();
+            eprintln!(
+                "FRS-CACHE-STATS: hits={hits} misses={misses} hit_rate={rate:.1}% \
+                 bg_hits={bg_hits} bg_misses={bg_misses} admit={admitted} reject={rejected}"
+            );
         }
     }
 
@@ -439,27 +703,31 @@ impl LocalCache {
     }
 
     /// Reads the cached bytes for `key`. Returns `Ok(None)` on miss.
-    /// On hit, marks `key` as most-recently-used.
+    /// On hit, marks `key` as most-recently-used (foreground accesses only
+    /// under FRS-CACHE-BG-EXEMPT — background reads must not reorder the LRU).
     pub fn get(&self, key: &str) -> io::Result<Option<Vec<u8>>> {
+        let fg = self.foreground();
         // Critical section: check membership + bump LRU. Read the file
         // outside the lock so concurrent gets don't serialize on disk I/O.
         let on_disk = {
             let mut inner = self.inner.lock().expect("local cache mutex poisoned");
             if !inner.entries.contains_key(key) {
-                self.record_get(false);
+                self.record_get(false, fg);
                 return Ok(None);
             }
-            inner.touch_lru(key);
+            if fg {
+                inner.touch_lru(key);
+            }
             self.path_for(key)
         };
 
         match fs::read(&on_disk) {
             Ok(bytes) => {
-                self.record_get(true);
+                self.record_get(true, fg);
                 Ok(Some(bytes))
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                self.record_get(false);
+                self.record_get(false, fg);
                 // The metadata says we have it but the file is gone — surface
                 // as a miss rather than an error so callers can re-fetch.
                 self.drop_entry(key);
@@ -537,16 +805,19 @@ impl LocalCache {
         if dst.is_empty() {
             return Ok(Some(0));
         }
+        let fg = self.foreground();
         // Critical section: membership check + LRU bump. The pread happens
         // AFTER the guard is released (mirrors `get`) so disk I/O never
         // serializes concurrent readers on the single cache mutex.
         let on_disk = {
             let mut inner = self.inner.lock().expect("local cache mutex poisoned");
             if !inner.entries.contains_key(key) {
-                self.record_get(false);
+                self.record_get(false, fg);
                 return Ok(None);
             }
-            inner.touch_lru(key);
+            if fg {
+                inner.touch_lru(key);
+            }
             self.path_for(key)
         };
 
@@ -557,7 +828,7 @@ impl LocalCache {
                 // Metadata says present but the file is gone — treat as a miss
                 // and drop the stale entry so the caller re-fetches (mirrors
                 // `get`'s NotFound handling).
-                self.record_get(false);
+                self.record_get(false, fg);
                 self.drop_entry(key);
                 return Ok(None);
             }
@@ -572,7 +843,7 @@ impl LocalCache {
             }
             filled += n;
         }
-        self.record_get(true);
+        self.record_get(true, fg);
         Ok(Some(filled))
     }
 
@@ -584,12 +855,15 @@ impl LocalCache {
     /// entry is later evicted/unlinked — Unix keeps the inode alive while the
     /// fd is open.
     pub fn file_handle(&self, key: &str) -> Option<Arc<fs::File>> {
+        let fg = self.foreground();
         let on_disk = {
             let mut inner = self.inner.lock().expect("local cache mutex poisoned");
             if !inner.entries.contains_key(key) {
                 return None;
             }
-            inner.touch_lru(key);
+            if fg {
+                inner.touch_lru(key);
+            }
             self.path_for(key)
         };
         self.get_or_open_fd(key, &on_disk).ok().flatten()
@@ -705,6 +979,21 @@ impl LocalCache {
         // any cached fd points at the old inode and must be dropped so the next
         // read opens the fresh file (correctness, not just fd hygiene).
         self.purge_fd(key);
+
+        // FRS-CACHE-ADMISSION: count evictions per key — a key evicted
+        // `promote_limit`+ times is blocked from read-fill re-admission
+        // (ForSt's promoteLimit anti-thrash cap).
+        if let Some(params) = self.policy.admission {
+            if !to_evict.is_empty() {
+                let mut tracker = self
+                    .admission
+                    .lock()
+                    .expect("admission tracker mutex poisoned");
+                for victim in &to_evict {
+                    tracker.record_eviction(victim, &params);
+                }
+            }
+        }
 
         // Best-effort unlink of evicted files. Errors are logged but not
         // propagated: a stale file on disk just wastes a few bytes until
@@ -1216,6 +1505,240 @@ mod tests {
         }
         // Bound preserved.
         assert!(cache.current_bytes() <= cache.capacity_bytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // FRS-CACHE-BG-EXEMPT / FRS-CACHE-ADMISSION (Phase-2 disagg, ForSt §2.1)
+    // -----------------------------------------------------------------------
+
+    fn policy_cache(capacity: u64, policy: CachePolicy) -> (TempDir, LocalCache) {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache = LocalCache::open_with_policy(tmp.path(), capacity, policy).expect("open");
+        (tmp, cache)
+    }
+
+    fn admission_on() -> CachePolicy {
+        CachePolicy {
+            background_exempt: true,
+            admission: Some(AdmissionParams {
+                access_before_promote: 2,
+                promote_limit: 3,
+                tracker_cap: 1024,
+            }),
+        }
+    }
+
+    #[test]
+    fn default_policy_is_off_and_legacy_passthrough() {
+        // The Phase-2 rule: flags default OFF ⇒ byte-identical legacy behavior.
+        let (_tmp, cache) = fresh_cache(1024);
+        assert!(!cache.policy().background_exempt);
+        assert!(cache.policy().admission.is_none());
+        // admit_read_fill is unconditionally true with admission disabled —
+        // even from a background-marked thread.
+        let _bg = crate::requester::BackgroundScope::enter();
+        assert!(cache.admit_read_fill("/db/x.sst"));
+        assert_eq!(cache.admission_stats(), (0, 0));
+    }
+
+    #[test]
+    fn background_reads_do_not_promote_lru() {
+        // ForSt §2.1.4: only foreground threads affect LRU order. A background
+        // touch of /a must NOT save it from eviction; a foreground touch must.
+        let policy = CachePolicy {
+            background_exempt: true,
+            admission: None,
+        };
+        let (_tmp, cache) = policy_cache(220, policy);
+        let block = vec![0xEEu8; 100];
+
+        // Background touch: /a stays the LRU victim.
+        assert!(cache.put("/a", &block).unwrap());
+        assert!(cache.put("/b", &block).unwrap());
+        {
+            let _bg = crate::requester::BackgroundScope::enter();
+            assert!(cache.get("/a").unwrap().is_some(), "bg read still SERVES");
+        }
+        assert!(cache.put("/c", &block).unwrap());
+        assert!(
+            !cache.contains("/a"),
+            "background get must NOT promote /a — it stays the eviction victim"
+        );
+        assert!(cache.contains("/b") && cache.contains("/c"));
+
+        // Control: the same sequence with a FOREGROUND touch promotes /a.
+        let (_tmp2, cache2) = policy_cache(220, policy);
+        assert!(cache2.put("/a", &block).unwrap());
+        assert!(cache2.put("/b", &block).unwrap());
+        assert!(cache2.get("/a").unwrap().is_some());
+        assert!(cache2.put("/c", &block).unwrap());
+        assert!(cache2.contains("/a"), "foreground get promotes /a");
+        assert!(!cache2.contains("/b"));
+
+        // Stats split: bg accesses land in bg counters, not the headline rate.
+        let (fg_hits, _) = cache.stats();
+        let (bg_hits, _) = cache.bg_stats();
+        assert_eq!(bg_hits, 1, "the bg get is counted separately");
+        assert_eq!(fg_hits, 0);
+    }
+
+    #[test]
+    fn background_get_range_does_not_promote_lru() {
+        // Same exemption through the hot positional-read path.
+        let policy = CachePolicy {
+            background_exempt: true,
+            admission: None,
+        };
+        let (_tmp, cache) = policy_cache(220, policy);
+        let block = vec![0x5Au8; 100];
+        assert!(cache.put("/a", &block).unwrap());
+        assert!(cache.put("/b", &block).unwrap());
+        let mut buf = [0u8; 16];
+        {
+            let _bg = crate::requester::BackgroundScope::enter();
+            let n = cache.get_range_into("/a", 0, &mut buf).unwrap().unwrap();
+            assert_eq!(n, 16);
+        }
+        assert!(cache.put("/c", &block).unwrap());
+        assert!(!cache.contains("/a"), "bg get_range_into must not promote");
+    }
+
+    #[test]
+    fn admission_gates_read_fills_count_to_promote() {
+        // ForSt count-to-promote: the K-th foreground miss admits the fill.
+        let (_tmp, cache) = policy_cache(4096, admission_on());
+        assert!(
+            !cache.admit_read_fill("/db/cold.sst"),
+            "1st touch below access_before_promote=2 → rejected"
+        );
+        assert!(
+            cache.admit_read_fill("/db/cold.sst"),
+            "2nd touch reaches the threshold → admitted"
+        );
+        // Counts reset on admit: the next round starts over.
+        assert!(!cache.admit_read_fill("/db/cold.sst"));
+        assert!(cache.admit_read_fill("/db/cold.sst"));
+        assert_eq!(cache.admission_stats(), (2, 2));
+    }
+
+    #[test]
+    fn admission_promote_limit_blocks_thrashing_key() {
+        // ForSt promoteLimit: a key evicted >= limit times is permanently
+        // blocked from read-fill re-admission (anti-thrash cap). Capacity for
+        // exactly TWO 100-byte entries; /hot1 + /hot2 churn /victim out.
+        let (_tmp, cache) = policy_cache(220, admission_on());
+        let block = vec![0xAB; 100];
+        for round in 0..3 {
+            // /victim is admitted (2 touches) and put, then evicted by churn.
+            assert!(!cache.admit_read_fill("/victim"));
+            assert!(cache.admit_read_fill("/victim"), "round {round} admit");
+            assert!(cache.put("/victim", &block).unwrap());
+            assert!(cache.put(&format!("/hot1-{round}"), &block).unwrap());
+            assert!(cache.put(&format!("/hot2-{round}"), &block).unwrap());
+            assert!(!cache.contains("/victim"), "round {round}: churned out");
+        }
+        // 3 evictions reached promote_limit=3 → blocked forever after.
+        for _ in 0..8 {
+            assert!(
+                !cache.admit_read_fill("/victim"),
+                "evicted >= promote_limit times → permanently blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn background_reads_do_not_accumulate_admission_credit() {
+        // ForSt §2.1.4: only foreground threads update access counts. A burst
+        // of background touches must neither admit nor advance the count.
+        let (_tmp, cache) = policy_cache(4096, admission_on());
+        {
+            let _bg = crate::requester::BackgroundScope::enter();
+            for _ in 0..10 {
+                assert!(
+                    !cache.admit_read_fill("/db/scan.sst"),
+                    "background read-fill is always rejected"
+                );
+            }
+        }
+        // Foreground still needs its OWN 2 touches (bg touches counted 0).
+        assert!(!cache.admit_read_fill("/db/scan.sst"));
+        assert!(cache.admit_read_fill("/db/scan.sst"));
+    }
+
+    #[test]
+    fn write_path_put_is_never_gated_by_admission() {
+        // Write-only admission split: newly generated SSTs (write-through)
+        // call `put` directly and are always cached, admission policy or not.
+        let (_tmp, cache) = policy_cache(4096, admission_on());
+        assert!(cache.put("/db/fresh-flush.sst", &[1, 2, 3]).unwrap());
+        assert!(cache.contains("/db/fresh-flush.sst"));
+    }
+
+    #[test]
+    fn admission_thrash_scenario_stabilizes_cache() {
+        // The paper's thrash scenario (§5.4): cyclically scan a working set
+        // 2× the cache budget. Legacy LRU admits every miss → every entry is
+        // evicted before its next touch → the cache churns at full write
+        // volume and hits stay ~0. With count-to-promote + promote_limit the
+        // cache stops churning: after each key's eviction count reaches the
+        // cap, fills cease (rejected) and the resident set stabilizes.
+        let block = vec![0u8; 100];
+        let keys: Vec<String> = (0..20).map(|i| format!("/db/{i:03}.sst")).collect();
+
+        // Cell A — legacy (admission off): every round refills every key.
+        let (_t1, lru) = policy_cache(1000, CachePolicy::default()); // fits 10 of 20
+        let mut lru_fills = 0u64;
+        for _round in 0..10 {
+            for k in &keys {
+                if lru.get(k).unwrap().is_none() && lru.admit_read_fill(k) {
+                    lru.put(k, &block).unwrap();
+                    lru_fills += 1;
+                }
+            }
+        }
+        assert_eq!(lru_fills, 200, "legacy LRU thrashes: 20 fills × 10 rounds");
+
+        // Cell B — admission on: fills must stop once the thrash cap engages.
+        let (_t2, adm) = policy_cache(1000, admission_on());
+        let mut adm_fills = 0u64;
+        for _round in 0..10 {
+            for k in &keys {
+                if adm.get(k).unwrap().is_none() && adm.admit_read_fill(k) {
+                    adm.put(k, &block).unwrap();
+                    adm_fills += 1;
+                }
+            }
+        }
+        assert!(
+            adm_fills < lru_fills / 2,
+            "admission policy must kill the thrash churn (fills {adm_fills} vs LRU {lru_fills})"
+        );
+        // And the cache ends up holding a stable resident subset.
+        assert!(!adm.is_empty(), "a resident subset survives");
+    }
+
+    #[test]
+    fn admission_tracker_stays_bounded() {
+        // FIFO aging: the tracker must never exceed its cap no matter how
+        // many distinct keys touch it.
+        let policy = CachePolicy {
+            background_exempt: false,
+            admission: Some(AdmissionParams {
+                access_before_promote: 3, // touches stay below promote → counts retained
+                promote_limit: 2,
+                tracker_cap: 64,
+            }),
+        };
+        let (_tmp, cache) = policy_cache(1 << 20, policy);
+        for i in 0..1000 {
+            let _ = cache.admit_read_fill(&format!("/db/k{i}"));
+        }
+        let tracker = cache.admission.lock().unwrap();
+        assert!(
+            tracker.counts.len() <= 64,
+            "cold-count tracker exceeded cap: {}",
+            tracker.counts.len()
+        );
     }
 
     #[test]

@@ -261,7 +261,25 @@ impl CachedFileSystem {
     /// The returned [`Bytes`] is ref-counted and slice-able — callers can
     /// hand it to multiple readers without recopying. The conversion from
     /// `Vec<u8>` (returned by [`LocalCache::get`]) to `Bytes` is zero-copy.
+    ///
+    /// FRS-CACHE-ADMISSION: this entry point FORCE-ADMITS the fill — it is
+    /// used by the explicit prefetch/warm paths (`ensure_cached`,
+    /// `prefetch_files*`), where the caller *intends* a cache fill. Demand
+    /// reads go through [`Self::fetch_through_cache_gated`], whose miss fill
+    /// is subject to the cache's read-fill admission policy (a no-op unless
+    /// `FRS_CACHE_ADMISSION` opts in — default-OFF, legacy behavior).
     fn fetch_through_cache(&self, path: &Path) -> ForstResult<Bytes> {
+        self.fetch_through_cache_inner(path, true)
+    }
+
+    /// [`Self::fetch_through_cache`] for DEMAND reads: on a miss the remote
+    /// bytes are served pass-through and the cache is only populated when
+    /// [`LocalCache::admit_read_fill`] admits the key.
+    fn fetch_through_cache_gated(&self, path: &Path) -> ForstResult<Bytes> {
+        self.fetch_through_cache_inner(path, false)
+    }
+
+    fn fetch_through_cache_inner(&self, path: &Path, force_admit: bool) -> ForstResult<Bytes> {
         let key = self.cache_key(path)?.to_string();
         if let Some(bytes) = self
             .cache
@@ -347,13 +365,20 @@ impl CachedFileSystem {
         // cache_dir) into a hard read failure. `forst-rs-storage` does
         // not pull in `tracing` so the diagnostic is via `eprintln!`
         // to stderr — the engine layer above relays anything important.
-        if let Err(e) = self.cache.put(&key, &bytes) {
-            eprintln!(
-                "CachedFileSystem cache put for {} failed: {} \
-                 (continuing with the streamed bytes; next read will retry)",
-                path.display(),
-                e
-            );
+        //
+        // FRS-CACHE-ADMISSION: demand-read fills consult the admission policy
+        // first (`force_admit=false`); a rejected fill serves the streamed
+        // bytes pass-through, exactly the paper's split between *serving*
+        // reads and *loading* files into cache.
+        if force_admit || self.cache.admit_read_fill(&key) {
+            if let Err(e) = self.cache.put(&key, &bytes) {
+                eprintln!(
+                    "CachedFileSystem cache put for {} failed: {} \
+                     (continuing with the streamed bytes; next read will retry)",
+                    path.display(),
+                    e
+                );
+            }
         }
         // Zero-copy hand-off into the refcounted Bytes container. Callers
         // can slice / share without recopying the full payload.
@@ -363,7 +388,7 @@ impl CachedFileSystem {
 
 impl FileSystem for CachedFileSystem {
     fn open_sequential_file(&self, path: &Path) -> ForstResult<Box<dyn SequentialFile>> {
-        let bytes = self.fetch_through_cache(path)?;
+        let bytes = self.fetch_through_cache_gated(path)?;
         Ok(Box::new(InMemorySequential::new(bytes)))
     }
 
@@ -418,7 +443,7 @@ impl FileSystem for CachedFileSystem {
             None
         };
         let Some(file_size) = size else {
-            let bytes = self.fetch_through_cache(path)?;
+            let bytes = self.fetch_through_cache_gated(path)?;
             return Ok(Box::new(InMemoryRandom::new(bytes)));
         };
         let key = self.cache_key(path)?.to_string();
@@ -1009,13 +1034,17 @@ impl RangeCachedRandomAccessFile {
                 chunk_len, chunk_idx, self.path_key, self.file_size, off
             )));
         }
-        // Best-effort cache populate; a failure just means the next read re-fetches.
-        if let Err(e) = self.cache.put(&key, &buf) {
-            eprintln!(
-                "RangeCachedRandomAccessFile chunk cache put for {} failed: {} \
-                 (continuing with the fetched bytes; next read will retry)",
-                key, e
-            );
+        // Best-effort cache populate; a failure just means the next read
+        // re-fetches. FRS-CACHE-ADMISSION: chunk fills are demand reads —
+        // subject to the admission policy (per-chunk key; no-op when off).
+        if self.cache.admit_read_fill(&key) {
+            if let Err(e) = self.cache.put(&key, &buf) {
+                eprintln!(
+                    "RangeCachedRandomAccessFile chunk cache put for {} failed: {} \
+                     (continuing with the fetched bytes; next read will retry)",
+                    key, e
+                );
+            }
         }
         Ok(buf)
     }
@@ -1076,12 +1105,15 @@ impl RangeCachedRandomAccessFile {
                 )));
             }
             let key = format!("{}#c{}", self.path_key, chunk_idx);
-            if let Err(e) = self.cache.put(&key, bytes) {
-                eprintln!(
-                    "RangeCachedRandomAccessFile chunk cache put for {} failed: {} \
-                     (continuing with the fetched bytes; next read will retry)",
-                    key, e
-                );
+            // FRS-CACHE-ADMISSION: same demand-read gate as `chunk_bytes`.
+            if self.cache.admit_read_fill(&key) {
+                if let Err(e) = self.cache.put(&key, bytes) {
+                    eprintln!(
+                        "RangeCachedRandomAccessFile chunk cache put for {} failed: {} \
+                         (continuing with the fetched bytes; next read will retry)",
+                        key, e
+                    );
+                }
             }
         }
         Ok(fetched)
@@ -1609,6 +1641,165 @@ mod tests {
 
         fs.delete_file(&path).unwrap();
         assert!(!cache.contains("/db/ephemeral.sst"));
+    }
+
+    // -----------------------------------------------------------------------
+    // FRS-CACHE-ADMISSION integration (Phase-2 disagg, ForSt §2.1.1-2.1.3)
+    // -----------------------------------------------------------------------
+
+    use crate::local_cache::{AdmissionParams, CachePolicy};
+
+    fn admission_policy() -> CachePolicy {
+        CachePolicy {
+            background_exempt: true,
+            admission: Some(AdmissionParams {
+                access_before_promote: 2,
+                promote_limit: 3,
+                tracker_cap: 1024,
+            }),
+        }
+    }
+
+    fn seed_remote(remote: &Arc<dyn FileSystem>, path: &Path, data: &[u8]) {
+        let mut w = remote
+            .open_writable_file(path, WriteMode::CreateOrTruncate)
+            .unwrap();
+        w.append(data).unwrap();
+        w.sync().unwrap();
+    }
+
+    #[test]
+    fn demand_read_fill_respects_admission_count_to_promote() {
+        // A demand read (open_sequential_file) of an uncached file must serve
+        // the bytes pass-through WITHOUT caching until the key accumulates
+        // access_before_promote touches; the threshold touch populates.
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(
+            LocalCache::open_with_policy(tmp.path(), 1 << 20, admission_policy()).unwrap(),
+        );
+        let fs = CachedFileSystem::new(remote.clone(), cache.clone());
+
+        let path = PathBuf::from("/db/cold.sst");
+        seed_remote(&remote, &path, b"cold-bytes");
+
+        // 1st demand read: served correctly, NOT admitted.
+        let mut r = fs.open_sequential_file(&path).unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = r.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"cold-bytes", "rejected fill still SERVES");
+        assert!(
+            !cache.contains("/db/cold.sst"),
+            "1st touch below the threshold must not populate the cache"
+        );
+
+        // 2nd demand read: threshold reached → populated.
+        let mut r2 = fs.open_sequential_file(&path).unwrap();
+        let n2 = r2.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n2], b"cold-bytes");
+        assert!(
+            cache.contains("/db/cold.sst"),
+            "threshold touch admits the fill"
+        );
+    }
+
+    #[test]
+    fn explicit_prefetch_force_admits_under_admission() {
+        // ensure_cached / prefetch_files are intentional warms — they must
+        // populate on the FIRST call even with admission gating on.
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(
+            LocalCache::open_with_policy(tmp.path(), 1 << 20, admission_policy()).unwrap(),
+        );
+        let fs = CachedFileSystem::new(remote.clone(), cache.clone());
+
+        let path = PathBuf::from("/db/warm.sst");
+        seed_remote(&remote, &path, b"warm-bytes");
+        fs.ensure_cached(&path).unwrap();
+        assert!(
+            cache.contains("/db/warm.sst"),
+            "explicit prefetch must force-admit on first touch"
+        );
+    }
+
+    #[test]
+    fn write_through_always_admits_under_admission() {
+        // ForSt write-only admission: newly generated SSTs are cached at
+        // flush sync() unconditionally — never subject to the read gate.
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(
+            LocalCache::open_with_policy(tmp.path(), 1 << 20, admission_policy()).unwrap(),
+        );
+        let fs = CachedFileSystem::new(remote.clone(), cache.clone());
+
+        let path = PathBuf::from("/db/00000099.sst");
+        let mut w = fs
+            .open_writable_file(&path, WriteMode::CreateOrTruncate)
+            .unwrap();
+        w.append(b"flushed-sst").unwrap();
+        w.sync().unwrap();
+        drop(w);
+        assert!(
+            cache.contains("/db/00000099.sst"),
+            "write-through populates on first sync regardless of admission"
+        );
+    }
+
+    #[test]
+    fn chunk_path_fills_respect_admission_and_serve_passthrough() {
+        // The ranged chunk reader must serve byte-exact reads while admission
+        // rejects the chunk fills, then populate once the threshold is hit.
+        let tmp = TempDir::new().unwrap();
+        let remote: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        remote.create_dir_all(Path::new("/db")).unwrap();
+        let cache = Arc::new(
+            LocalCache::open_with_policy(tmp.path(), 64 << 20, admission_policy()).unwrap(),
+        );
+
+        let size = (BLOCK_CACHE_CHUNK_SIZE + 4096) as usize; // 2 chunks
+        let mut data = vec![0u8; size];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let path = PathBuf::from("/db/00000123.sst");
+        seed_remote(&remote, &path, &data);
+
+        let raf = RangeCachedRandomAccessFile {
+            remote: remote.open_random_access_file(&path).unwrap(),
+            cache: Arc::clone(&cache),
+            path_key: "/db/00000123.sst".to_string(),
+            file_size: size as u64,
+        };
+
+        // 1st read of chunk 0: byte-exact, chunk NOT cached (touch 1 of 2).
+        let mut buf = vec![0u8; 512];
+        let n = raf.read_at(100, &mut buf).unwrap();
+        assert_eq!(n, 512);
+        assert_eq!(&buf[..], &data[100..612]);
+        assert!(
+            !cache.contains("/db/00000123.sst#c0"),
+            "chunk fill rejected below the admission threshold"
+        );
+
+        // 2nd read of the same chunk: admitted → cached.
+        let n2 = raf.read_at(200, &mut buf).unwrap();
+        assert_eq!(n2, 512);
+        assert_eq!(&buf[..], &data[200..712]);
+        assert!(
+            cache.contains("/db/00000123.sst#c0"),
+            "threshold touch admits the chunk"
+        );
+
+        // Cached chunk now serves without the remote.
+        remote.delete_file(&path).unwrap();
+        let n3 = raf.read_at(300, &mut buf).unwrap();
+        assert_eq!(n3, 512);
+        assert_eq!(&buf[..], &data[300..812]);
     }
 
     /// FRS-CONCURRENT-READ: a multi-chunk read that misses on >1 chunk takes
