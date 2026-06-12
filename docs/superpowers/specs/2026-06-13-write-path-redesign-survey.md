@@ -458,6 +458,97 @@ accounting has no tombstone bytes and SST framing is sub-1 % at 200 B values.
 Cell-I detail: all 3 runs at full 200 000 rows/s, write_amp {4.58, 4.38, 4.45},
 max_total_files 27-30 (vs A′-class ~18-20), max_l0 4.
 
+---
+
+## 9. V0/V1 delivery evidence (2026-06-12, standing write-amp agent)
+
+Stages V0 + V1 of §6 are IMPLEMENTED in this worktree (commits: V0 lifecycle
+FFI plumbing; V1 death-bucketed segments + watermark FIFO-drop + cohort
+merge-once, flag `FRS_LIFECYCLE_SEGMENTS` DEFAULT OFF). Same-session
+churn_probe cells (Mac, medians of 3 × 90 s, methodology identical to §2;
+raw: `target/churn_results_wa/*.jsonl`):
+
+| Cell | Config | write-amp | p50 late (µs) | rows/s | last L0 | falsifier |
+|---|---|---|---|---|---|---|
+| rebaseline-v0pre | HEAD 771419c2c defaults | 7.35 | 552 | 200 K | 2 | — |
+| default-v1post | V1 code, flag OFF | **7.42** | 542 | 200 K | 1 | — (no-regression gate ✓) |
+| ttlseg-v1 | `--lifecycle` (trigger 24 ⇒ drop-only) | **0.98** | 914 | **200 K (unthrottled)** | 17 | **0 miss / 366 270 checks** |
+| ttlseg-v1-cohort8 (pre-fix) | `--lifecycle`, trigger 8, 64 MB output split | 1.85 | 858 | 200 K | 17 | 0 miss / 419 803 |
+| ttlseg-v1-cohort8-fix | ditto, single-run cohort outputs | 1.85 | 739 | 200 K | **11** | 0 miss / 389 323 |
+| **ttlseg-v1-bigbuf** | `--lifecycle --wbuf-mib 256` (trigger 24) | **0.96** | **476** (p99 657) | 200 K | **4** | **0 miss / 354 055** |
+
+### 9.1 Gate verdicts (V1 gates from §6 stage 2)
+
+- **(a) write-amp ≤ 1.3 with probe p50 ≤ 700 µs**: **PASS — 0.96 / 476 µs**
+  (lifecycle × 256 MB memtable, the composed cell). Decomposition: the
+  segment machinery alone (64 MB flushes) hits the write floor at FULL rate
+  (0.98, unthrottled — the cell-F backpressure artifact is fixed via
+  `backpressure_l0_count` exemption) but sits at 17 live runs = 914 µs (the
+  P9 dose curve); fewer-bigger segments via the memtable knob remove the
+  fan-out for FREE in lifecycle mode (no compaction ⇒ no cell-I 4.45×
+  write-amp coupling; RAM cost = 256 MB × lifecycle-CFs, the cell-I caveat).
+  The cohort merge-once valve covers regimes where RAM can't (window ≫
+  memtable): trigger-8 cell bounds fan-out 17→11 runs (739 µs) at write-amp
+  1.85 ≤ the by-construction 2.0 bound. Probe p50 ~ 75 µs/run across all
+  cells — fan-out, not machinery, prices reads.
+- **(b) premature-drop falsifier**: **PASS — zero misses** across 1.5 M+
+  continuous live-key point-gets (verifier thread in `churn_probe
+  --lifecycle`) + the engine UT falsifier
+  (`test_wa_v1_premature_drop_falsifier_and_expiry`: no drop at watermark ≤
+  stamp, snapshot-defer honored, whole-segment drop after). The q5/q8-shaped
+  byte-exact NexMark cells remain OWED before any default-ON flip (flag is
+  default-OFF; Java wiring is V0-inert copies in `wa-java/`).
+- **(c) remote q7 iostat A/B**: NOT RUN (remote box session required) — owed
+  before V2.
+
+### 9.2 Measured design corrections (decisions appended per discipline)
+
+1. **Cohort outputs must be ONE run** (single-file `target_file_size = 0`).
+   Measured falsification of the naive reuse of the compaction writer's 64 MB
+   split: trigger-8 cell paid the full merge rewrite (write-amp 0.98 → 1.85)
+   while last_l0 stayed 17 and p50 858 µs — a 9-segment merge re-emitted ~9
+   key-disjoint files, i.e. all cost, zero consolidation. Fixed in
+   `lifecycle_cohort_merge`; re-measured: last_l0 17 → 11, p50 → 739 µs at
+   the same 1.85 (the rewrite is the price of the valve; consolidation now
+   actually delivered).
+1b. **Fewer-bigger segments beat merging at memtable-coverable shapes**: in
+   lifecycle mode the memtable knob has NO write-amp coupling (cell I's
+   7.83→4.45 was a compaction-amortization effect; with drop-instead-of-
+   compact there is nothing to amortize) — `--wbuf-mib 256` measured 0.96 /
+   476 µs / 4 runs. Default guidance: size lifecycle-CF memtables ≈
+   live-window/4-8 where RAM allows; cohort merge is the fallback valve.
+2. **Death stamping uses a writer-advanced event-time BOUND, not the
+   watermark**: `max_death = max_event_time_at_flush + ttl` where the bound
+   is advanced BEFORE the writes it covers (`frs_cf_note_max_event_time`).
+   Stamping from the watermark would under-stamp (events run ahead of the
+   watermark) = premature drops. The bound is monotone ⇒ over-stamping only
+   (segments may live slightly longer — sound).
+3. **Snapshot policy**: default = drops deferred while ANY engine snapshot is
+   active (MVCC-pure); `FRS_LIFECYCLE_DROP_IGNORE_SNAPSHOTS=1` opts into the
+   RocksDB compaction-filter precedent (`ignore_snapshots`) for deployments
+   where checkpoint-held snapshots would defer reclamation too long.
+4. **Merge-once bookkeeping is in-memory** (`lifecycle_merged` set): after a
+   restore, a cohort may be re-merged at most once more — bounded and
+   correctness-neutral; persisting a "merged" bit in blob v4 is not worth the
+   format churn at V1.
+5. **Manifest format v3 is conditional**: emitted only when a death stamp
+   exists; flag-OFF (and any no-lifecycle) snapshots stay byte-identical v2 —
+   the default-path-unchanged discipline, verified by the no-regression cell
+   and `test_wa_v1_blob_v3_max_death_roundtrip_and_v2_when_unstamped`.
+6. **L0 seq-disjointness invariant**: cohort merges select the oldest
+   seq-CONTIGUOUS prefix of the CF's fresh segments (death order = seal order
+   = seq order for Windowed CFs) and defense-in-depth verify contiguity
+   before merging — a cohort output's spanned seq range can never interleave
+   another L0 file's range, preserving the newest-first L0 read order.
+
+### 9.3 What remains for "solved"
+
+- V1 gate (c): remote q7 write-volume A/B (≥ 3× iostat write cut falsifier).
+- Java side: adopt `wa-java/` copies in the Flink backend + q5/q8/q11
+  byte-exact 5M cells (premature-drop falsifier at the SQL level) before any
+  default-ON discussion.
+- V2 (KV separation for unbounded CFs) and V3 (link-compaction) per §6.
+
 External references: WiscKey — Lu, Pillai, Gunawi, Arpaci-Dusseau, Arpaci-Dusseau,
 "WiscKey: Separating Keys from Values in SSD-conscious Storage", FAST '16.
 Dostoevsky — Dayan, Idreos, "Dostoevsky: Better Space-Time Trade-Offs for LSM-Tree

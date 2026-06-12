@@ -81,7 +81,14 @@ const CHECKPOINT_MAGIC: &[u8; 4] = b"FRCP";
 /// * `2` — adds per-file `cf_id` (R49-H1) and a trailing CF descriptors
 ///   table (R49-H2). v1 blobs decode with `cf_id = DEFAULT_CF_ID` and an
 ///   empty CF descriptor list ("assume DEFAULT_CF only").
+/// * `3` — FRS-WA-V1: adds per-file `max_death` (lifecycle-segment death
+///   stamp, u64 after `num_entries`). **Emitted ONLY when at least one file
+///   carries a non-zero stamp** — a snapshot with no lifecycle segments
+///   serializes as v2, byte-identical to pre-V1 (downgrade-safe while the
+///   default-OFF `FRS_LIFECYCLE_SEGMENTS` flag is unused). v1/v2 blobs
+///   decode with `max_death = 0` ("never expires whole-file").
 const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION_V3: u16 = 3;
 
 /// R49-H2: defense-in-depth cap on the number of CF descriptors in a blob.
 /// Way above any sane user limit; protects against OOM-DoS from a crafted blob.
@@ -118,9 +125,22 @@ const FOOTER_SIZE: usize = 12;
 pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> {
     let mut buf = Vec::with_capacity(4096);
 
+    // FRS-WA-V1: emit v3 only when a death stamp actually exists, so the
+    // no-lifecycle path stays byte-identical to v2 (see FORMAT_VERSION doc).
+    let needs_v3 = snapshot
+        .version
+        .levels
+        .iter()
+        .any(|lvl| lvl.files.iter().any(|f| f.max_death != 0));
+    let emit_version = if needs_v3 {
+        FORMAT_VERSION_V3
+    } else {
+        FORMAT_VERSION
+    };
+
     // --- Header (placeholder for blob_size, filled later) ---
     buf.extend_from_slice(CHECKPOINT_MAGIC);
-    buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&emit_version.to_le_bytes());
     buf.extend_from_slice(&0u16.to_le_bytes()); // flags (reserved)
     buf.extend_from_slice(&0u64.to_le_bytes()); // blob_size placeholder
 
@@ -152,6 +172,10 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
             put_fixed64(&mut buf, file.min_sequence.value());
             put_fixed64(&mut buf, file.max_sequence.value());
             put_fixed64(&mut buf, file.num_entries);
+            // FRS-WA-V1: per-file death stamp (v3+ only).
+            if needs_v3 {
+                put_fixed64(&mut buf, file.max_death);
+            }
         }
     }
 
@@ -200,13 +224,14 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         return Err(ForstError::corruption("invalid checkpoint magic"));
     }
     let version = u16::from_le_bytes([data[4], data[5]]);
-    if version != 1 && version != FORMAT_VERSION {
+    if version != 1 && version != FORMAT_VERSION && version != FORMAT_VERSION_V3 {
         return Err(ForstError::corruption(format!(
             "unsupported checkpoint format version: {}",
             version
         )));
     }
     let is_v2 = version >= 2;
+    let is_v3 = version >= 3;
     // flags at [6..8] -- reserved, ignore
     let blob_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
     if blob_size != data.len() as u64 {
@@ -299,6 +324,16 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
             pos += n;
             let (num_entries, n) = get_fixed64(&data[pos..])?;
             pos += n;
+            // FRS-WA-V1: v3+ carries the death stamp; older blobs decode 0
+            // ("never expires whole-file" — restored legacy segments simply
+            // stay on the classic compaction path).
+            let max_death = if is_v3 {
+                let (d, n) = get_fixed64(&data[pos..])?;
+                pos += n;
+                d
+            } else {
+                0
+            };
 
             files.push(SstFileMeta {
                 file_number: FileNumber(file_number),
@@ -309,6 +344,7 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
                 min_sequence: SequenceNumber(min_sequence),
                 max_sequence: SequenceNumber(max_sequence),
                 num_entries,
+                max_death,
             });
         }
 
@@ -432,6 +468,7 @@ mod tests {
             min_sequence: SequenceNumber(1),
             max_sequence: SequenceNumber(100),
             num_entries: 50,
+            max_death: 0,
         }
     }
 
@@ -446,6 +483,53 @@ mod tests {
             last_sequence: 1000,
             cf_descriptors: Vec::new(),
         }
+    }
+
+    /// FRS-WA-V1: blob format v3 — death stamps round-trip; the v3 header
+    /// is emitted ONLY when a stamp exists (no-lifecycle blobs stay
+    /// byte-identical v2, the default-OFF discipline).
+    #[test]
+    fn test_wa_v1_blob_v3_max_death_roundtrip_and_v2_when_unstamped() {
+        // (a) Unstamped snapshot ⇒ v2 header, stamps restore as 0.
+        let snap_plain = make_snapshot(vec![(0, make_file(1, b"a", b"m"))]);
+        let blob_plain = serialize_to_blob(&snap_plain).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([blob_plain[4], blob_plain[5]]),
+            FORMAT_VERSION,
+            "no stamps ⇒ emit v2 (byte-identical to pre-V1)"
+        );
+        let restored = restore_from_blob(&blob_plain).unwrap();
+        assert_eq!(restored.version.levels[0].files[0].max_death, 0);
+
+        // (b) Stamped snapshot ⇒ v3 header, stamp round-trips exactly;
+        // unstamped sibling stays 0.
+        let mut stamped = make_file(2, b"a", b"m");
+        stamped.max_death = 123_456_789;
+        let snap_v3 = make_snapshot(vec![
+            (0, stamped),
+            (0, make_file(3, b"n", b"z")),
+        ]);
+        let blob_v3 = serialize_to_blob(&snap_v3).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([blob_v3[4], blob_v3[5]]),
+            FORMAT_VERSION_V3
+        );
+        let restored = restore_from_blob(&blob_v3).unwrap();
+        let files = &restored.version.levels[0].files;
+        let by_num = |n: u64| {
+            files
+                .iter()
+                .find(|f| f.file_number == FileNumber(n))
+                .unwrap()
+        };
+        assert_eq!(by_num(2).max_death, 123_456_789);
+        assert_eq!(by_num(3).max_death, 0);
+
+        // (c) CRC still guards the v3 payload.
+        let mut corrupted = blob_v3.clone();
+        let idx = HEADER_SIZE + 8; // inside the snapshot data
+        corrupted[idx] ^= 0xFF;
+        assert!(restore_from_blob(&corrupted).is_err());
     }
 
     #[test]
