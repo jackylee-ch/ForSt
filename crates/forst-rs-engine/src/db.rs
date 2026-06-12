@@ -898,6 +898,28 @@ pub struct DbImpl {
     /// `run_compaction` treats `Busy` as a benign re-pick, not an engine
     /// error.
     compaction_gate: CompactionGate,
+    /// FRS-M4-DYNAMIC-LEVELS (2026-06-12 sorted-run-discipline §4 M4):
+    /// when `true` (default; kill-switch `FRS_DYNAMIC_LEVELS=0` for
+    /// same-session A/B), the compaction shape is RocksDB
+    /// `level_compaction_dynamic_level_bytes` parity:
+    ///
+    /// - L0 rollups output to the CF's BASE level — anchored at the
+    ///   bottom level's actual CF size and derived upward
+    ///   (`target(Ln-1) = size(Ln) / mult`), so small/medium state takes
+    ///   ONE hop to its resting level instead of cascading
+    ///   L1→L2→…→Ln through fixed 256 MB-base targets (the E-cell gap's
+    ///   largest measured contributor, design §2.2.4);
+    /// - level picking is SCORE-based (highest `bytes/target` first, not
+    ///   shallowest-over-budget) over TOMBSTONE-COMPENSATED file sizes
+    ///   (footer-v4 `tombstone_count`), so delete-laden levels compact
+    ///   first and TTL garbage stops riding the cascade;
+    /// - legacy data parked ABOVE the base level (pre-M4 layouts) gets
+    ///   drain-priority scores and migrates down organically.
+    ///
+    /// An `AtomicBool` resolved from env at open (not a process-global
+    /// OnceLock) so unit tests building legacy fixed-target layouts can
+    /// opt out per-DbImpl without env races.
+    dynamic_levels: std::sync::atomic::AtomicBool,
     /// FRS-WAL Phase 2 (2026-06-06): optional local write-ahead log. `None`
     /// unless `FRS_WAL_DIR` is set, so the default build is byte-identical to
     /// the pre-WAL engine (the append sites are `if let Some(..)` no-ops when
@@ -1051,6 +1073,7 @@ impl DbImpl {
             snapshot_age_worker: Mutex::new(None),
             snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_gate: CompactionGate::from_env(),
+            dynamic_levels: std::sync::atomic::AtomicBool::new(dynamic_levels_from_env()),
             wal: Mutex::new(None),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
@@ -4422,33 +4445,144 @@ impl DbImpl {
         Ok(true)
     }
 
-    /// Returns the shallowest level (>= 1) whose CF-scoped total file size
-    /// exceeds its target, or `None` if every level is within budget for
-    /// the given CF.
+    /// FRS-M4-DYNAMIC-LEVELS: per-DbImpl mode read (see field docs).
+    fn dynamic_levels_on(&self) -> bool {
+        self.dynamic_levels
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test hook: restore the legacy fixed-target layout (rollup→L1,
+    /// shallowest-over-budget pick) for tests that construct multi-level
+    /// layouts by hand.
+    #[cfg(test)]
+    pub(crate) fn force_fixed_levels(&self) {
+        self.dynamic_levels
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Test hook: force the FRS-M4 dynamic layout regardless of env.
+    #[cfg(test)]
+    pub(crate) fn force_dynamic_levels(&self) {
+        self.dynamic_levels
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CF-scoped raw byte total at `level`.
+    fn cf_level_bytes(version: &Version, cf_id: ColumnFamilyId, level: usize) -> u64 {
+        version
+            .levels
+            .get(level)
+            .map(|l| {
+                l.files
+                    .iter()
+                    .filter(|f| f.cf_id == cf_id)
+                    .map(|f| f.file_size)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// CF-scoped TOMBSTONE-COMPENSATED byte total at `level` (FRS-M4).
+    /// Tombstone counts come from the footer of CACHED readers only (the
+    /// `sst_readers` map — pre-populated at flush/compaction/restore), so
+    /// this never performs I/O on the pick path; an uncached file falls
+    /// back to its raw size (conservative: no compensation).
+    fn compensated_cf_level_bytes(
+        &self,
+        version: &Version,
+        cf_id: ColumnFamilyId,
+        level: usize,
+    ) -> u64 {
+        let Some(l) = version.levels.get(level) else {
+            return 0;
+        };
+        let readers = self.sst_readers.load();
+        l.files
+            .iter()
+            .filter(|f| f.cf_id == cf_id)
+            .map(|f| {
+                let tombstones = readers
+                    .get(&f.file_number)
+                    .map(|r| r.footer().tombstone_count)
+                    .unwrap_or(0);
+                compensated_file_size(f.file_size, f.num_entries, tombstones)
+            })
+            .sum()
+    }
+
+    /// FRS-M4-DYNAMIC-LEVELS: the level an L0 rollup outputs to. Legacy
+    /// mode: always 1. Dynamic mode: the CF's base level (see
+    /// [`compute_base_level`]).
+    fn rollup_output_level(&self, cf_id: ColumnFamilyId, version: &Version) -> u32 {
+        if !self.dynamic_levels_on() {
+            return 1;
+        }
+        let bottom = (self.options.num_levels as u32).saturating_sub(1).max(1);
+        let s_bottom = Self::cf_level_bytes(version, cf_id, bottom as usize);
+        compute_base_level(
+            s_bottom,
+            bottom,
+            self.options.max_bytes_for_level_base as u64,
+            self.options.max_bytes_for_level_multiplier,
+        )
+    }
+
+    /// Returns the level (>= 1) to compact next for this CF, or `None` if
+    /// every level is within budget.
     ///
     /// R50-M1: only files matching `cf_id` are summed. Pre-fix this method
     /// summed all CFs' bytes per level which made `compact_once` waste
     /// scheduling cycles on levels where the over-budget came from a
     /// different CF.
     ///
-    /// Target is `max_bytes_for_level_base * multiplier^(level-1)`.
+    /// Legacy mode (`FRS_DYNAMIC_LEVELS=0`): the SHALLOWEST level whose raw
+    /// CF byte total exceeds the fixed `base × mult^(L-1)` target.
+    ///
+    /// Dynamic mode (FRS-M4, default): SCORE-based — the level with the
+    /// HIGHEST `compensated_bytes / dynamic_target` ratio > 1, where
+    /// targets are anchored at the bottom level's actual CF size
+    /// ([`dynamic_level_target`]) and file sizes are tombstone-compensated.
+    /// Legacy residue parked ABOVE the base level (pre-M4 layouts) gets
+    /// drain-priority scores (deepest first) so old DBs migrate down
+    /// organically. The bottom level is never a source (it is the resting
+    /// level; bottommost garbage is reclaimed by rollups/descents merging
+    /// INTO it with `is_bottommost`).
     fn pick_compaction_level_for_cf(&self, cf_id: ColumnFamilyId) -> Option<u32> {
         let version = self.version_set.current();
         let base = self.options.max_bytes_for_level_base as f64;
         let mult = self.options.max_bytes_for_level_multiplier;
-        for level in 1..(self.options.num_levels - 1) {
-            let total_size: u64 = version.levels[level]
-                .files
-                .iter()
-                .filter(|f| f.cf_id == cf_id)
-                .map(|f| f.file_size)
-                .sum();
-            let target = (base * mult.powi(level as i32 - 1)) as u64;
-            if total_size > target {
-                return Some(level as u32);
+        if !self.dynamic_levels_on() {
+            for level in 1..(self.options.num_levels - 1) {
+                let total_size = Self::cf_level_bytes(&version, cf_id, level);
+                let target = (base * mult.powi(level as i32 - 1)) as u64;
+                if total_size > target {
+                    return Some(level as u32);
+                }
+            }
+            return None;
+        }
+        let bottom = (self.options.num_levels as u32).saturating_sub(1).max(1);
+        let s_bottom = Self::cf_level_bytes(&version, cf_id, bottom as usize);
+        let base_level = compute_base_level(s_bottom, bottom, base as u64, mult);
+        /// Score offset that outranks ANY size ratio: legacy-residue levels
+        /// above the base level drain first, deepest first.
+        const LEGACY_DRAIN_SCORE: f64 = 1.0e18;
+        let mut best: Option<(u32, f64)> = None;
+        for level in 1..bottom {
+            let comp = self.compensated_cf_level_bytes(&version, cf_id, level as usize);
+            if comp == 0 {
+                continue;
+            }
+            let score = if level < base_level {
+                LEGACY_DRAIN_SCORE + level as f64
+            } else {
+                comp as f64 / dynamic_level_target(s_bottom, bottom, level, mult) as f64
+            };
+            if score > 1.0 && best.map(|(_, s)| score > s).unwrap_or(true) {
+                best = Some((level, score));
             }
         }
-        None
+        best.map(|(l, _)| l)
     }
 
     fn compact_level_for_cf(
@@ -4499,9 +4633,6 @@ impl DbImpl {
         if all_src.is_empty() {
             return Ok(None);
         }
-        // `apply_edit` keeps each level sorted by smallest_key, so `all_src[0]`
-        // is the lowest-key file for this CF — a deterministic, rotating pick.
-        let src_files: Vec<SstFileMeta> = vec![all_src[0].clone()];
         let next_level = level_idx + 1;
         if next_level >= version.num_levels() {
             // Can't go deeper — the engine is at max depth. Treat as no-op.
@@ -4513,6 +4644,59 @@ impl DbImpl {
             .filter(|f| f.cf_id == cf_id)
             .cloned()
             .collect();
+        // Legacy mode: `apply_edit` keeps each level sorted by smallest_key,
+        // so `all_src[0]` is the lowest-key file for this CF — a
+        // deterministic, rotating pick (the picked file is consumed, so
+        // successive picks rotate through the key space).
+        //
+        // FRS-M4 (dynamic mode): RocksDB `kMinOverlappingRatio` parity (the
+        // default `compaction_pri` since 6.x) — pick the file with the
+        // SMALLEST next-level-overlap ÷ tombstone-COMPENSATED-size ratio.
+        // This is the descent write-amp lever: moving a byte down costs
+        // (src + overlap) rewritten bytes, so the cheapest-ratio file moves
+        // the most data per byte rewritten; the compensated denominator
+        // simultaneously prioritizes delete-laden files so TTL garbage
+        // descends toward annihilation instead of riding along. Measured
+        // need: with max-compensated-size picking alone, the q7-shape cell
+        // ended at write-amp ~8.2 — each descent of a wide file rewrote
+        // ~10× its size of bottom-level overlap. Progress is guaranteed —
+        // the picked file is consumed by the edit — and ties fall back to
+        // the lowest-key file (iteration order), preserving rotation.
+        let src_pick: SstFileMeta = if self.dynamic_levels_on() {
+            let readers = self.sst_readers.load();
+            let comp = |m: &SstFileMeta| -> u64 {
+                let t = readers
+                    .get(&m.file_number)
+                    .map(|r| r.footer().tombstone_count)
+                    .unwrap_or(0);
+                compensated_file_size(m.file_size, m.num_entries, t)
+            };
+            let overlap_bytes = |m: &SstFileMeta| -> u64 {
+                dst_candidates
+                    .iter()
+                    .filter(|d| {
+                        d.largest_key >= m.smallest_key && d.smallest_key <= m.largest_key
+                    })
+                    .map(|d| d.file_size)
+                    .sum()
+            };
+            // min_by on the ratio overlap/comp, compared exactly via
+            // cross-multiplication in u128 (no float drift, no div-by-0).
+            all_src
+                .iter()
+                .min_by(|a, b| {
+                    let (oa, ca) = (overlap_bytes(a) as u128, comp(a).max(1) as u128);
+                    let (ob, cb) = (overlap_bytes(b) as u128, comp(b).max(1) as u128);
+                    // `min_by` keeps the FIRST minimal element on Equal, so
+                    // ties go to the lowest-key file automatically.
+                    (oa * cb).cmp(&(ob * ca))
+                })
+                .cloned()
+                .unwrap_or_else(|| all_src[0].clone())
+        } else {
+            all_src[0].clone()
+        };
+        let src_files: Vec<SstFileMeta> = vec![src_pick];
 
         // Compute the key range spanned by src_files; pull any dst file
         // whose range overlaps.
@@ -5376,6 +5560,7 @@ impl DbImpl {
             snapshot_age_worker: Mutex::new(None),
             snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             compaction_gate: CompactionGate::from_env(),
+            dynamic_levels: std::sync::atomic::AtomicBool::new(dynamic_levels_from_env()),
             wal: Mutex::new(None),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
@@ -6118,16 +6303,33 @@ impl DbImpl {
     ) -> ForstResult<Option<SstFileMeta>> {
         // R44-H1 → FRS-M3: admit this rollup through the compaction gate.
         // Serial mode = the old engine-global serialization; concurrent
-        // mode (`FRS_COMPACT_CONCURRENT=1`) locks this CF's L0+L1 slots so
-        // disjoint (cf, level) compactions proceed in parallel. The rollup
-        // reads from L0 and installs into L1, so those are the two slots.
+        // mode (`FRS_COMPACT_CONCURRENT=1`) locks this CF's L0 + output
+        // slots so disjoint (cf, level) compactions proceed in parallel.
+        //
+        // FRS-M4: the output level is DYNAMIC (the CF's base level), and it
+        // depends on the Version, so the slot pair is acquired with a
+        // guess-and-revalidate loop: compute the output level, lock
+        // [0, out], re-read the Version, and retry if a racing compaction
+        // moved the base level in between. Once the slots are held, the
+        // output level is stable: every compaction that could change the
+        // out-level file set must hold the `out` slot itself, and same-CF
+        // rollups serialize on slot 0.
         //
         // Lock ordering (see `compaction_gate` field docs): the gate is
         // acquired BEFORE the per-CF `flush_mutex`. No other path takes
         // them in the reverse order.
-        let _compaction_guard = self
-            .compaction_gate
-            .acquire(cf_data.handle().id(), &[0, 1]);
+        let cf_id = cf_data.handle().id();
+        let mut out_guess = self.rollup_output_level(cf_id, &self.version_set.current());
+        let _compaction_guard = loop {
+            let g = self.compaction_gate.acquire(cf_id, &[0, out_guess]);
+            let now = self.rollup_output_level(cf_id, &self.version_set.current());
+            if now == out_guess {
+                break g;
+            }
+            drop(g);
+            out_guess = now;
+        };
+        let output_level = out_guess;
         // Serialize compaction per CF so two callers cannot both pick the
         // same L0 files. We piggyback on the flush_mutex since flush and
         // compaction both rewrite the on-disk layer.
@@ -6159,9 +6361,8 @@ impl DbImpl {
         }
 
         // R49-H1: only roll up this CF's L0 files (and overlap into this CF's
-        // L1 files). Without the filter, an L0→L1 rollup could fold another
-        // CF's data into this CF's stream.
-        let cf_id = cf_data.handle().id();
+        // output-level files). Without the filter, an L0 rollup could fold
+        // another CF's data into this CF's stream.
         let version = self.version_set.current();
         let l0_files: Vec<SstFileMeta> = version
             .l0_files()
@@ -6173,42 +6374,49 @@ impl DbImpl {
             return Ok(None);
         }
         // FRS-M1-OVERLAP-SCOPED (2026-06-12 sorted-run-discipline §4 M1):
-        // pick only the L1 files whose key range overlaps the L0 union
-        // range, expanded to a clean cut — NOT the CF's entire L1. Pre-M1
-        // every rollup rewrote the whole L1 (the measured 7.68× write-amp
-        // driver, design §2.3/W1). The level invariant is preserved: the
-        // output range equals the input union range, which is disjoint
-        // from the untouched L1 remainder (any L1 file overlapping the L0
-        // union — or, transitively, the growing selected union — is pulled
-        // in by the clean-cut expansion below, so no key in the inputs can
-        // also live in an unselected file). That same disjointness keeps
-        // the `is_bottommost` tombstone-drop rule sound: a tombstone's key
-        // lies inside the input union range, so it cannot shadow (and
-        // dropping it cannot resurrect) anything in the unselected
-        // remainder.
-        let cf_l1: Vec<SstFileMeta> = version.levels[1]
+        // pick only the output-level files whose key range overlaps the L0
+        // union range, expanded to a clean cut — NOT the CF's entire level.
+        // Pre-M1 every rollup rewrote the whole L1 (the measured 7.68×
+        // write-amp driver, design §2.3/W1). The level invariant is
+        // preserved: the output range equals the input union range, which
+        // is disjoint from the untouched remainder (any file overlapping
+        // the L0 union — or, transitively, the growing selected union — is
+        // pulled in by the clean-cut expansion below, so no key in the
+        // inputs can also live in an unselected file). That same
+        // disjointness keeps the `is_bottommost` tombstone-drop rule
+        // sound: a tombstone's key lies inside the input union range, so
+        // it cannot shadow (and dropping it cannot resurrect) anything in
+        // the unselected remainder.
+        let cf_out: Vec<SstFileMeta> = version.levels[output_level as usize]
             .files
             .iter()
             .filter(|f| f.cf_id == cf_id)
             .cloned()
             .collect();
-        let l1_files: Vec<SstFileMeta> = overlap_scoped_clean_cut(&l0_files, cf_l1);
+        let out_overlap_files: Vec<SstFileMeta> = overlap_scoped_clean_cut(&l0_files, cf_out);
 
         // Gather input readers.
         let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> = Vec::new();
         for meta in &l0_files {
             inputs.push((0, meta.clone(), self.get_or_open_sst_reader(meta)?));
         }
-        for meta in &l1_files {
-            inputs.push((1, meta.clone(), self.get_or_open_sst_reader(meta)?));
+        for meta in &out_overlap_files {
+            inputs.push((output_level, meta.clone(), self.get_or_open_sst_reader(meta)?));
         }
 
-        // Allocate the output file number and build the job. This rollup
-        // produces a single bottommost-style file at L1. We mark it as
-        // bottommost iff there are no files below L1 (all higher levels
-        // empty) so delete tombstones can be eliminated.
-        let is_bottommost =
-            (2..version.num_levels()).all(|lvl| version.levels[lvl].files.is_empty());
+        // Allocate the output file number and build the job. We mark the
+        // rollup as bottommost iff every level OTHER than the output level
+        // is empty, so delete tombstones can be eliminated:
+        // - levels DEEPER than the output must be empty (an older version
+        //   under a dropped tombstone would resurrect);
+        // - levels BETWEEN L0 and the output (FRS-M4: the output can be
+        //   deep) must be empty too — they hold data OLDER than L0 that a
+        //   dropped L0 tombstone may shadow;
+        // - the output level's own non-input remainder is range-disjoint
+        //   from the inputs (M1 clean cut), so it can never hold a key the
+        //   inputs cover.
+        let is_bottommost = (1..version.num_levels())
+            .all(|lvl| lvl == output_level as usize || version.levels[lvl].files.is_empty());
 
         let output_file_number = self.version_set.allocate_file_number();
         let output_path = compaction_output_path(&self.db_path, output_file_number);
@@ -6238,7 +6446,7 @@ impl DbImpl {
         let job = CompactionJob {
             cf_id: cf_data.handle().id(),
             inputs,
-            output_level: 1,
+            output_level,
             output_file_number,
             output_path: output_path.clone(),
             additional_outputs,
@@ -10573,7 +10781,23 @@ impl CompactionExecutor for DbImpl {
         // drain spreads across maintenance ticks. Strictly level-1 → L2 grows
         // but stays non-overlapping (read-fine), touched only by bounded picking.
         let mut drained_l1 = false;
-        if r.is_ok() && drain_l1_on() && !cf_data.is_dropped() {
+        // FRS-M4 (dynamic mode): score-based drain — ONE bounded descent of
+        // the highest-score over-budget level (tombstone-compensated sizes,
+        // dynamic targets), then re-enqueue while any level stays over
+        // budget so draining spreads across maintenance ticks (the same
+        // bounded-step pattern as the legacy FRS-COMPACT-DRAIN-L1 below;
+        // never an unbounded cascade per run). The FRS-GARBAGE-DRAIN
+        // tombstone gate stays legacy-mode-only: under M4 the compensated
+        // scores ARE the tombstone signal the gate approximated.
+        if r.is_ok() && self.dynamic_levels_on() && drain_l1_on() && !cf_data.is_dropped() {
+            if let Some(lvl) = self.pick_compaction_level_for_cf(cf_id) {
+                let _ = self.compact_level_for_cf(cf_data, lvl);
+                drained_l1 = true;
+                if self.pick_compaction_level_for_cf(cf_id).is_some() {
+                    self.enqueue_compaction(cf_data.clone());
+                }
+            }
+        } else if r.is_ok() && drain_l1_on() && !cf_data.is_dropped() {
             let over = self
                 .pick_compaction_level_for_cf(cf_id)
                 .map(|lvl| lvl == 1)
@@ -10835,6 +11059,63 @@ fn overlap_scoped_clean_cut(
         .filter(|(_, &s)| s)
         .map(|(f, _)| f.clone())
         .collect()
+}
+
+/// FRS-M4-DYNAMIC-LEVELS: env resolution for the per-DbImpl flag. Default ON;
+/// `FRS_DYNAMIC_LEVELS=0|false` restores the legacy fixed
+/// `base × mult^(L-1)` targets + shallowest-over-budget picking + rollup→L1
+/// (the same-session A/B lever for the design's G3 gate).
+fn dynamic_levels_from_env() -> bool {
+    !matches!(
+        std::env::var("FRS_DYNAMIC_LEVELS").ok().as_deref(),
+        Some("0") | Some("false") | Some("FALSE")
+    )
+}
+
+/// FRS-M4-DYNAMIC-LEVELS: the CF's BASE level — where L0 rollups output —
+/// derived RocksDB-style (`VersionStorageInfo::CalculateBaseBytes` parity,
+/// `advanced_options.h:691` default-true since 8.x): anchor at the BOTTOM
+/// level's actual CF size and walk upward dividing by `mult` until the
+/// derived target fits under `max_bytes_for_level_base`. An empty bottom
+/// anchors the whole CF at the bottom (first rollup takes ONE hop to its
+/// resting level). Pure function — unit-tested directly.
+fn compute_base_level(s_bottom: u64, bottom: u32, base_bytes: u64, mult: f64) -> u32 {
+    if bottom <= 1 || s_bottom == 0 {
+        return bottom.max(1);
+    }
+    let mult = mult.max(1.0 + f64::EPSILON);
+    let mut cur = s_bottom as f64;
+    let mut bl = bottom;
+    while bl > 1 && cur > base_bytes as f64 {
+        cur /= mult;
+        bl -= 1;
+    }
+    bl
+}
+
+/// FRS-M4-DYNAMIC-LEVELS: dynamic size target for `level` ∈
+/// [base_level, bottom): `target(Ln) = size(bottom) / mult^(bottom - Ln)` —
+/// the design's "anchor at the last level's actual size and derive upward".
+/// Floored at 1 so the score division is well-defined.
+fn dynamic_level_target(s_bottom: u64, bottom: u32, level: u32, mult: f64) -> u64 {
+    let mult = mult.max(1.0 + f64::EPSILON);
+    let t = s_bottom as f64 / mult.powi((bottom.saturating_sub(level)) as i32);
+    (t as u64).max(1)
+}
+
+/// FRS-M4 tombstone compensation (RocksDB compensated_file_size parity,
+/// `compaction_picker_level.cc:130-185`): weight delete tombstones by twice
+/// the file's average entry size, so tombstone-laden files/levels sort first
+/// in the score pick and TTL garbage is compacted toward annihilation
+/// instead of riding to the bottom repeatedly. `tombstone_count` comes from
+/// the footer-v4 field (pre-v4 SSTs decode 0 → no compensation —
+/// conservative). Pure function — unit-tested directly.
+fn compensated_file_size(file_size: u64, num_entries: u64, tombstone_count: u64) -> u64 {
+    if num_entries == 0 || tombstone_count == 0 {
+        return file_size;
+    }
+    let avg = file_size / num_entries.max(1);
+    file_size.saturating_add(tombstone_count.saturating_mul(avg.saturating_mul(2)))
 }
 
 // ---------------------------------------------------------------------
@@ -13286,6 +13567,9 @@ mod tests {
         };
         let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
         let db = DbImpl::open_with_fs(opts, fs).expect("open");
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
 
         const N: usize = 2000;
@@ -15503,6 +15787,9 @@ mod tests {
     #[test]
     fn test_compact_l0_single_file_rolls_up_to_l1() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         db.put(&cf, b"k", b"v").unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
@@ -15520,6 +15807,9 @@ mod tests {
     #[test]
     fn test_compact_l0_multiple_files_merged() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         db.put(&cf, b"k1", b"v1").unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
@@ -15543,6 +15833,9 @@ mod tests {
     #[test]
     fn test_compact_l0_consolidates_versions() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         // Same key written three times; each flush produces a new L0.
         db.put(&cf, b"k", b"v1").unwrap();
@@ -15561,6 +15854,9 @@ mod tests {
     #[test]
     fn test_compact_l0_drops_bottommost_tombstones() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         db.put(&cf, b"k", b"v").unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
@@ -15577,6 +15873,8 @@ mod tests {
     #[test]
     fn test_compact_l0_with_merge_operator_resolves_chain() {
         let (db, cf) = open_with_merge_cf();
+        // FRS-M4: legacy fixed-target layout test — pin the kill-switch path.
+        db.force_fixed_levels();
         db.put(&cf, b"k", b"a").unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
         db.merge(&cf, b"k", b"b").unwrap();
@@ -15596,6 +15894,8 @@ mod tests {
     #[test]
     fn test_non_bottommost_merge_only_compaction_preserves_lower_level_base() {
         let (db, cf) = open_with_merge_cf();
+        // FRS-M4: legacy fixed-target layout test — pin the kill-switch path.
+        db.force_fixed_levels();
         db.put(&cf, b"k", b"base").unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
         db.compact_l0(&cf).unwrap().unwrap();
@@ -15678,6 +15978,9 @@ mod tests {
     #[test]
     fn test_compact_level_from_l1_to_l2() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         db.put(&cf, b"k1", b"v1").unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
@@ -15697,6 +16000,9 @@ mod tests {
     #[test]
     fn test_compact_level_zero_delegates_to_l0() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         db.put(&cf, b"k", b"v").unwrap();
         db.switch_and_flush(&cf).unwrap().unwrap();
@@ -15709,6 +16015,9 @@ mod tests {
     #[test]
     fn test_compact_level_returns_none_on_empty_level() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         let out = db.compact_level(&cf, 2).unwrap();
         assert!(out.is_none());
@@ -15717,6 +16026,9 @@ mod tests {
     #[test]
     fn test_compact_level_overlapping_files_are_merged_into_destination() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         // Seed L1 with "a..d".
         db.put(&cf, b"a", b"1").unwrap();
@@ -15832,6 +16144,9 @@ mod tests {
     #[test]
     fn m1_rollup_preserves_untouched_l1_remainder() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         // Seed L1 with an "a"-range file.
         for i in 0..50u32 {
@@ -16123,11 +16438,160 @@ mod tests {
         }
     }
 
+    // --- FRS-M4-DYNAMIC-LEVELS (sorted-run-discipline §4 M4 / §6 S3) ---
+
+    /// Pure base-level derivation (RocksDB CalculateBaseBytes parity cells).
+    #[test]
+    fn m4_compute_base_level_cells() {
+        const MB: u64 = 1024 * 1024;
+        const BASE: u64 = 256 * MB;
+        // Empty bottom anchors at the bottom (one-hop resting level).
+        assert_eq!(compute_base_level(0, 6, BASE, 10.0), 6);
+        // Small state fits under base at the bottom itself.
+        assert_eq!(compute_base_level(100 * MB, 6, BASE, 10.0), 6);
+        // ~1 GiB: one derived level above the bottom (the E-cell layout).
+        assert_eq!(compute_base_level(1024 * MB, 6, BASE, 10.0), 5);
+        // ~30 GiB: 30G→3G@5→300M@4→30M@3.
+        assert_eq!(compute_base_level(30 * 1024 * MB, 6, BASE, 10.0), 3);
+        // Degenerate geometries clamp to level 1.
+        assert_eq!(compute_base_level(u64::MAX, 6, BASE, 10.0), 1);
+        assert_eq!(compute_base_level(1024 * MB, 1, BASE, 10.0), 1);
+    }
+
+    /// Targets derive upward from the bottom level's actual size.
+    #[test]
+    fn m4_dynamic_level_target_derives_upward() {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let t5 = dynamic_level_target(GB, 6, 5, 10.0);
+        let t4 = dynamic_level_target(GB, 6, 4, 10.0);
+        assert_eq!(dynamic_level_target(GB, 6, 6, 10.0), GB);
+        assert!((t5 as i64 - (GB / 10) as i64).abs() < (GB / 100) as i64);
+        assert!((t4 as i64 - (GB / 100) as i64).abs() < (GB / 1000) as i64);
+    }
+
+    /// Tombstone compensation weights deletes at 2× the file's average
+    /// entry size; zero tombstones / zero entries are identity.
+    #[test]
+    fn m4_compensated_file_size_weights_tombstones() {
+        assert_eq!(compensated_file_size(1000, 100, 0), 1000);
+        assert_eq!(compensated_file_size(1000, 0, 50), 1000);
+        // avg=10, 50 tombstones × 2×10 = +1000.
+        assert_eq!(compensated_file_size(1000, 100, 50), 2000);
+        // Saturates instead of overflowing.
+        let _ = compensated_file_size(u64::MAX, 1, u64::MAX);
+    }
+
+    /// M4 falsifier: a fresh CF's first rollup takes ONE hop to the
+    /// resting (bottom) level — no L1→…→Ln cascade — and stays readable.
+    #[test]
+    fn m4_rollup_lands_at_bottom_one_hop() {
+        let db = open();
+        db.force_dynamic_levels();
+        let cf = db.default_cf();
+        for i in 0..50u32 {
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"v").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+        let v = db.version_set.current();
+        let bottom = v.num_levels() - 1;
+        assert!(v.l0_files().is_empty());
+        for lvl in 1..bottom {
+            assert!(
+                v.levels[lvl].files.is_empty(),
+                "level {lvl} unexpectedly populated — rollup cascaded instead of one hop"
+            );
+        }
+        assert!(!v.levels[bottom].files.is_empty());
+        for i in 0..50u32 {
+            assert_eq!(
+                db.get(&cf, format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                Some(b"v" as &[u8])
+            );
+        }
+    }
+
+    /// M4 falsifier: with the rollup output AT the resting level,
+    /// `is_bottommost` holds and TTL-style delete tombstones annihilate at
+    /// every rollup instead of riding the cascade (the churn-bench garbage
+    /// mechanism).
+    #[test]
+    fn m4_tombstones_annihilate_at_resting_level() {
+        let db = open();
+        db.force_dynamic_levels();
+        let cf = db.default_cf();
+        for i in 0..100u32 {
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"v").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+        for i in 0..100u32 {
+            db.delete(&cf, format!("k{i:04}").as_bytes()).unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap();
+
+        let v = db.version_set.current();
+        let total_entries: u64 = v
+            .live_sst_files_iter()
+            .map(|f| f.num_entries)
+            .sum();
+        assert_eq!(
+            total_entries, 0,
+            "tombstones/values survived a bottommost rollup: {total_entries} entries live"
+        );
+        for i in 0..100u32 {
+            assert!(db.get(&cf, format!("k{i:04}").as_bytes()).unwrap().is_none());
+        }
+    }
+
+    /// M4 migration: data parked at L1 by the LEGACY layout drains to the
+    /// dynamic resting level organically through the score picker
+    /// (legacy-residue drain-priority), with no data loss.
+    #[test]
+    fn m4_legacy_residue_drains_down() {
+        let db = open();
+        db.force_fixed_levels();
+        let cf = db.default_cf();
+        for i in 0..50u32 {
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"v").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+        let v = db.version_set.current();
+        assert!(!v.levels[1].files.is_empty(), "legacy layout seed failed");
+
+        // Flip to dynamic: the L1 residue sits ABOVE the base level
+        // (empty bottom ⇒ base = bottom) and must be drain-prioritized.
+        db.force_dynamic_levels();
+        assert_eq!(db.pick_compaction_level_for_cf(cf.id()), Some(1));
+        let mut steps = 0;
+        while db.compact_once_for(&cf).unwrap() {
+            steps += 1;
+            assert!(steps < 32, "migration did not converge");
+        }
+        let v = db.version_set.current();
+        let bottom = v.num_levels() - 1;
+        for lvl in 1..bottom {
+            assert!(v.levels[lvl].files.is_empty(), "level {lvl} not drained");
+        }
+        assert!(!v.levels[bottom].files.is_empty());
+        for i in 0..50u32 {
+            assert_eq!(
+                db.get(&cf, format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                Some(b"v" as &[u8])
+            );
+        }
+    }
+
     /// S1: an OVERLAPPING rollup must still consume the overlapped L1 file
     /// (subset picking must not under-select) and produce the merged value.
     #[test]
     fn m1_rollup_consumes_overlapping_l1() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf = db.default_cf();
         for i in 0..50u32 {
             db.put(&cf, format!("k{i:04}").as_bytes(), b"old").unwrap();
@@ -17159,6 +17623,9 @@ mod tests {
     #[test]
     fn test_r44_h1_concurrent_multi_cf_compaction_no_overlap() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf_a = db.default_cf();
         let cf_b = db
             .create_column_family(ColumnFamilyDescriptor::new("cf_b"))
@@ -17302,6 +17769,9 @@ mod tests {
         use forst_rs_storage::merge_operator::NumericAddBeMergeOperator;
         let be = |v: i64| v.to_be_bytes().to_vec();
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf_list = db
             .create_column_family(
                 ColumnFamilyDescriptor::new("cf_list")
@@ -17370,6 +17840,9 @@ mod tests {
     #[test]
     fn test_e5_multi_cf_nested_l1_ranges_scan_locator() {
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf_a = db.default_cf();
         let cf_b = db
             .create_column_family(ColumnFamilyDescriptor::new("agg-shape"))
@@ -17467,6 +17940,9 @@ mod tests {
     fn test_e5_multi_cf_interleaved_buckets_scan_exact_rows() {
         use std::collections::BTreeMap;
         let db = open();
+        // FRS-M4: this test builds/asserts the LEGACY fixed-target
+        // layout (rollup→L1) — pin the kill-switch path.
+        db.force_fixed_levels();
         let cf_wide_a = db.default_cf();
         let cf_mid = db
             .create_column_family(ColumnFamilyDescriptor::new("cf-mid-nested"))
