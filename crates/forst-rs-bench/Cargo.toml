@@ -107,3 +107,10 @@ harness = false
 [[bench]]
 name = "ffi_vectorized"
 harness = false
+
+# B3 (same design, §B3): compaction-throughput stress bin — the 21 ns/byte
+# reproduction target and the L4 windowed-compaction-read before/after
+# harness. NOT criterion (wall-clock phase loop); takes --smoke for CI.
+[[bin]]
+name = "compaction_throughput"
+path = "src/bin/compaction_throughput.rs"

@@ -52,8 +52,22 @@
 //! I/O window around hits. Demand blocks insert at `Low` (today's behaviour);
 //! ramped prefetch inserts at `Bottom` once `ra_blocks >= 4` so deep
 //! streaming scans are evicted first and never displace hot point-get blocks.
-//! Insertion is never skipped — interval-join re-probes of recently scanned
-//! windows are common and the decoded cache hit is the cheapest read.
+//! Insertion is never skipped on the SCAN path — interval-join re-probes of
+//! recently scanned windows are common and the decoded cache hit is the
+//! cheapest read.
+//!
+//! **Compaction-input mode (L4, 2026-06-12 windowed-readpath design):**
+//! [`BlockPrefetcher::for_compaction`] reuses the same state machine / pool /
+//! cancellation with three policy differences:
+//! 1. full-file scan `[0, n_blocks)` with a FIXED window from the start (no
+//!    cold state, no ramp — sequentiality is known a priori; the engine
+//!    clamps the window size against the fan-in budget);
+//! 2. [`CacheFillPolicy::Skip`]: cache-first READ stays (recently-flushed
+//!    blocks are served for free — the 27ae792c3 lesson), but compaction
+//!    input blocks are NEVER inserted — each input block is read exactly
+//!    once and future reads hit the compaction *output*, so inserting (even
+//!    at `Bottom`) only evicts the foreground's hot set;
+//! 3. the demand fallback inside `next_decoded` also runs with Skip.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::Receiver;
@@ -217,8 +231,43 @@ fn read_io_pool() -> &'static ReadIoPool {
     })
 }
 
-/// Result type a window-production job sends back through its oneshot.
-type WindowResult = ForstResult<Vec<DecodedBlock>>;
+/// L4 (2026-06-12 compaction windowed-readpath design §2.1): what
+/// [`fetch_window`] does with blocks it had to READ (cache misses).
+/// The cache-first check (window splitting around hits) is unconditional —
+/// only the INSERT side is a policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheFillPolicy {
+    /// Scan path (existing behavior): insert every fetched block at the
+    /// given priority (`Low` shallow / `Bottom` deep-ramp).
+    Insert(CachePriority),
+    /// Compaction inputs: read-only cache use (`fill_cache=false`
+    /// equivalent). Blocks are decoded and returned but never inserted —
+    /// a streaming compaction pass must not evict the foreground hot set
+    /// (nor pay per-block insert cost for entries that are dead on arrival).
+    Skip,
+}
+
+/// L4 W5 telemetry: per-prefetcher counters for compaction-input reads.
+/// Summed across a job's cursors by the engine ⇒ per-compaction telemetry
+/// (design falsifier 1: ≥90 % of input blocks must arrive via windows).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CompactionReadStats {
+    /// Blocks delivered to the consumer from prefetched windows.
+    pub window_blocks: u64,
+    /// Blocks delivered via the (Skip-policy) demand fallback.
+    pub demand_blocks: u64,
+    /// Windows submitted to the read-I/O pool.
+    pub window_submits: u64,
+    /// On-disk bytes covered by submitted windows.
+    pub prefetched_bytes: u64,
+    /// Blocks served from the decoded-block cache (window splitting) instead
+    /// of I/O.
+    pub cache_hits: u64,
+}
+
+/// Result type a window-production job sends back through its oneshot:
+/// the window's decoded blocks plus how many were decoded-cache hits.
+type WindowResult = ForstResult<(Vec<DecodedBlock>, u32)>;
 
 /// §2.1.4: oneshot slot for an in-flight window production. Dropping the
 /// receiver (iterator closed/aborted) makes the producer's `send` fail and
@@ -252,6 +301,12 @@ pub struct BlockPrefetcher {
     local: bool,
     /// Speculation enabled (env gate; forced in tests via `with_regime`).
     enabled: bool,
+    /// L4 compaction-input mode: fixed window (no ramp/doubling), regime
+    /// byte-caps bypassed (the engine's fan-in budget clamp sizes the
+    /// window), `CacheFillPolicy::Skip` everywhere (windows AND demand).
+    compaction: bool,
+    /// L4 W5: compaction-read telemetry (only updated in compaction mode).
+    stats: CompactionReadStats,
 }
 
 impl BlockPrefetcher {
@@ -270,7 +325,47 @@ impl BlockPrefetcher {
             inflight: None,
             local,
             enabled: prefetch_enabled(),
+            compaction: false,
+            stats: CompactionReadStats::default(),
         }
+    }
+
+    /// L4 (2026-06-12 windowed-readpath design §2.2) compaction-input mode:
+    /// full-file scan `[0, n_blocks)`, FIXED `window_blocks` window from the
+    /// start (no cold state, no ramp — sequentiality is known a priori; the
+    /// regime byte-caps are bypassed because the engine already clamped the
+    /// window against the fan-in prefetch budget), cache fill policy `Skip`
+    /// for window production AND the demand fallback. Gated by
+    /// `FRS_COMPACT_WINDOWED` at the ENGINE construction site (compaction.rs)
+    /// — NOT by the scan gate `FRS_RS_BLOCK_PREFETCH`.
+    ///
+    /// The first window is submitted here, so it is in flight before the
+    /// merge consumes the first block (I/O + decompress + decode overlap the
+    /// merge from block 0).
+    pub fn for_compaction(reader: Arc<SstReaderImpl>, window_blocks: u32) -> Self {
+        let end_block = reader.index_entry_count();
+        let local = reader.is_local_file();
+        let mut pf = Self {
+            reader,
+            next_block: 0,
+            end_block,
+            blocks_consumed: 0,
+            ra_blocks: window_blocks.max(1),
+            ready: VecDeque::new(),
+            inflight: None,
+            local,
+            enabled: true,
+            compaction: true,
+            stats: CompactionReadStats::default(),
+        };
+        pf.maybe_submit_window();
+        pf
+    }
+
+    /// L4 W5: this prefetcher's compaction-read telemetry snapshot (all-zero
+    /// for scan-mode prefetchers).
+    pub fn compaction_stats(&self) -> CompactionReadStats {
+        self.stats
     }
 
     /// Test hook: force the local/remote regime and the enabled flag,
@@ -317,6 +412,9 @@ impl BlockPrefetcher {
         if let Some((sz, block)) = self.ready.pop_front() {
             PREFETCH_BUFFERED_BYTES.fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
             self.on_delivered();
+            if self.compaction {
+                self.stats.window_blocks += 1;
+            }
             if self.ready.is_empty() && self.inflight.is_none() {
                 self.maybe_submit_window();
             }
@@ -354,8 +452,11 @@ impl BlockPrefetcher {
                 }
             };
             match produced {
-                Ok(blocks) => {
+                Ok((blocks, cache_hits)) => {
                     debug_assert_eq!(blocks.len(), handle.range.1 - handle.range.0);
+                    if self.compaction {
+                        self.stats.cache_hits += cache_hits as u64;
+                    }
                     // M3: the inflight charge transfers to `ready` (each
                     // block keeps its on-disk size) — no net counter change.
                     for (j, block) in blocks.into_iter().enumerate() {
@@ -372,6 +473,9 @@ impl BlockPrefetcher {
                         PREFETCH_BUFFERED_BYTES
                             .fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
                         self.on_delivered();
+                        if self.compaction {
+                            self.stats.window_blocks += 1;
+                        }
                         return Ok(Some(block));
                     }
                     return Ok(None);
@@ -390,8 +494,11 @@ impl BlockPrefetcher {
             }
         }
 
-        // 3. Cold / demand path — identical to the legacy per-block read
-        //    (cache-first + Low insert inside `read_decoded_block`).
+        // 3. Cold / demand path. Scan mode: identical to the legacy per-block
+        //    read (cache-first + Low insert inside `read_decoded_block`).
+        //    Compaction mode (L4): the demand fallback must ALSO honor
+        //    `CacheFillPolicy::Skip` — reuse the 1-block `fetch_window` run
+        //    synchronously (cache-first check, no insert).
         if self.next_block >= self.end_block {
             return Ok(None);
         }
@@ -400,18 +507,32 @@ impl BlockPrefetcher {
             .reader
             .block_region(idx)
             .ok_or_else(|| ForstError::internal("BlockPrefetcher: block index out of range"))?;
-        let block = self.reader.read_decoded_block(off, size)?;
+        let block = if self.compaction {
+            let (mut blocks, cache_hits) =
+                fetch_window(&self.reader, idx, idx + 1, CacheFillPolicy::Skip)?;
+            self.stats.demand_blocks += 1;
+            self.stats.cache_hits += cache_hits as u64;
+            blocks.pop().expect("1-block window produces 1 block")
+        } else {
+            self.reader.read_decoded_block(off, size)?
+        };
         self.next_block = idx + 1;
         self.on_delivered();
-        // Enter the ramp once sequentiality is established for the regime.
-        let ramp_after = if self.local {
-            LOCAL_RAMP_AFTER
-        } else {
-            REMOTE_RAMP_AFTER
-        };
-        if self.enabled && self.ra_blocks == 0 && self.blocks_consumed >= ramp_after {
-            self.ra_blocks = 2;
+        if self.compaction {
+            // Restore windowed flow for the remaining blocks (the demand
+            // fallback only fires when no window was submittable).
             self.maybe_submit_window();
+        } else {
+            // Enter the ramp once sequentiality is established for the regime.
+            let ramp_after = if self.local {
+                LOCAL_RAMP_AFTER
+            } else {
+                REMOTE_RAMP_AFTER
+            };
+            if self.enabled && self.ra_blocks == 0 && self.blocks_consumed >= ramp_after {
+                self.ra_blocks = 2;
+                self.maybe_submit_window();
+            }
         }
         Ok(Some(block))
     }
@@ -434,7 +555,12 @@ impl BlockPrefetcher {
         {
             return;
         }
-        let cap_bytes = if self.local {
+        // L4 compaction mode: the window is already sized IN BLOCKS by the
+        // engine's fan-in budget clamp — the scan regime byte-caps (256 KiB
+        // local) must not shrink the 2 MiB-class compaction window.
+        let cap_bytes = if self.compaction {
+            u64::MAX
+        } else if self.local {
             LOCAL_CAP_BYTES
         } else {
             REMOTE_CAP_BYTES
@@ -458,17 +584,21 @@ impl BlockPrefetcher {
             return;
         }
         // §2.1: ramped prefetch inserts at Bottom once the window is deep;
-        // shallow (just-ramped) windows keep today's Low.
-        let priority = if self.ra_blocks >= BOTTOM_PRIORITY_RA {
-            CachePriority::Bottom
+        // shallow (just-ramped) windows keep today's Low. L4: compaction
+        // inputs SKIP insertion entirely (read each block exactly once;
+        // future reads hit the compaction output).
+        let policy = if self.compaction {
+            CacheFillPolicy::Skip
+        } else if self.ra_blocks >= BOTTOM_PRIORITY_RA {
+            CacheFillPolicy::Insert(CachePriority::Bottom)
         } else {
-            CachePriority::Low
+            CacheFillPolicy::Insert(CachePriority::Low)
         };
         let reader = Arc::clone(&self.reader);
         // Rendezvous-free oneshot: capacity 1 so the producer never blocks.
         let (tx, rx) = std::sync::mpsc::sync_channel::<WindowResult>(1);
         read_io_pool().submit(Box::new(move || {
-            let result = fetch_window(&reader, start, end, priority);
+            let result = fetch_window(&reader, start, end, policy);
             // Receiver dropped (iterator closed/aborted) ⇒ result discarded.
             let _ = tx.send(result);
         }));
@@ -488,13 +618,19 @@ impl BlockPrefetcher {
             bytes: window_bytes as usize,
         });
         self.next_block = end;
-        // Double toward the regime cap for the NEXT window.
-        let cap_blocks = if self.local {
-            LOCAL_CAP_BLOCKS
+        if self.compaction {
+            // L4: FIXED window — no ramp doubling; record W5 telemetry.
+            self.stats.window_submits += 1;
+            self.stats.prefetched_bytes += window_bytes;
         } else {
-            REMOTE_CAP_BLOCKS
-        };
-        self.ra_blocks = (self.ra_blocks * 2).min(cap_blocks);
+            // Double toward the regime cap for the NEXT window.
+            let cap_blocks = if self.local {
+                LOCAL_CAP_BLOCKS
+            } else {
+                REMOTE_CAP_BLOCKS
+            };
+            self.ra_blocks = (self.ra_blocks * 2).min(cap_blocks);
+        }
     }
 }
 
@@ -513,16 +649,18 @@ impl Drop for BlockPrefetcher {
 /// misses issued as ONE vectored read (`read_block_regions` — N read SQEs in
 /// one io_uring submission on Linux, serial preads on the portable fallback;
 /// bit-identical either way), decode (decompress + KvBlock pointer-walk) on
-/// this pool thread, cache insert at `priority`. Returns the window's blocks
-/// in index order.
+/// this pool thread, then apply the cache fill `policy` (L4: scan path
+/// inserts at its priority; compaction inputs Skip). Returns the window's
+/// blocks in index order plus the number of decoded-cache hits (W5).
 fn fetch_window(
     reader: &SstReaderImpl,
     start: usize,
     end: usize,
-    priority: CachePriority,
-) -> ForstResult<Vec<DecodedBlock>> {
+    policy: CacheFillPolicy,
+) -> ForstResult<(Vec<DecodedBlock>, u32)> {
     let n = end - start;
     let mut out: Vec<Option<DecodedBlock>> = (0..n).map(|_| None).collect();
+    let mut cache_hits = 0u32;
     // Pass 1: cache hits (window splitting).
     let mut regions: Vec<(u64, u32)> = Vec::with_capacity(n);
     for idx in start..end {
@@ -532,6 +670,7 @@ fn fetch_window(
         regions.push((off, size));
         if let Some(hit) = reader.cache_get_decoded(off) {
             out[idx - start] = Some(hit);
+            cache_hits += 1;
         }
     }
     // Pass 2: group cache-missing blocks into runs of PHYSICALLY contiguous
@@ -573,16 +712,25 @@ fn fetch_window(
                 let slice = &buf[cursor..cursor + size as usize];
                 cursor += size as usize;
                 let decoded = reader.decode_block_from_slice(slice)?;
-                reader.cache_insert_decoded(off, &decoded, priority);
+                match policy {
+                    CacheFillPolicy::Insert(priority) => {
+                        reader.cache_insert_decoded(off, &decoded, priority)
+                    }
+                    // L4 compaction inputs: read-only cache use — never
+                    // insert (each input block is read exactly once).
+                    CacheFillPolicy::Skip => {}
+                }
                 out[j] = Some(decoded);
             }
         }
         debug_assert_eq!(cursor, total);
     }
-    Ok(out
-        .into_iter()
-        .map(|o| o.expect("every window slot filled above"))
-        .collect())
+    Ok((
+        out.into_iter()
+            .map(|o| o.expect("every window slot filled above"))
+            .collect(),
+        cache_hits,
+    ))
 }
 
 #[cfg(test)]
@@ -680,14 +828,23 @@ mod tests {
         }
     }
 
-    /// Builds a multi-block SST (small block_size forces many blocks).
-    /// Returns the raw bytes.
-    fn build_sst(n_rows: usize) -> Arc<Vec<u8>> {
+    /// Builds a multi-block SST (small block_size forces many blocks) with
+    /// explicit compression and (optionally forced) block format.
+    /// `kv_format`: `None` = env default, `Some(true)` = v2 KV,
+    /// `Some(false)` = v1 Arrow. Returns the raw bytes.
+    fn build_sst_with(
+        n_rows: usize,
+        compression: CompressionType,
+        kv_format: Option<bool>,
+    ) -> Arc<Vec<u8>> {
         let mut writer = SstWriterImpl::with_options(SstWriterOptions {
             block_size: 1024,
-            compression: CompressionType::None,
+            compression,
             cf_id: forst_rs_common::DEFAULT_CF_ID,
         });
+        if let Some(kv) = kv_format {
+            writer.force_kv_block_format(kv);
+        }
         for i in 0..n_rows {
             let key = format!("key_{:05}", i);
             let val = format!("val_{:05}_{}", i, "x".repeat(48));
@@ -697,6 +854,10 @@ mod tests {
         }
         let (data, _info) = writer.finish().unwrap();
         Arc::new(data)
+    }
+
+    fn build_sst(n_rows: usize) -> Arc<Vec<u8>> {
+        build_sst_with(n_rows, CompressionType::None, None)
     }
 
     fn open_reader(
@@ -888,8 +1049,15 @@ mod tests {
         let reads_before = file.reads.load(Ordering::SeqCst);
         // Window [2, 6) contains the cached block 4 → I/O runs are [2,4) and
         // [5,6): exactly 2 positional reads for 3 missing blocks.
-        let out = fetch_window(&reader, 2, 6, CachePriority::Low).unwrap();
+        let (out, hits) = fetch_window(
+            &reader,
+            2,
+            6,
+            CacheFillPolicy::Insert(CachePriority::Low),
+        )
+        .unwrap();
         assert_eq!(out.len(), 4);
+        assert_eq!(hits, 1, "the pre-warmed block 4 is a decoded-cache hit");
         let reads_after = file.reads.load(Ordering::SeqCst);
         assert_eq!(
             reads_after - reads_before,
@@ -899,8 +1067,15 @@ mod tests {
 
         // And a fully-missing window of 4 blocks = exactly 1 pread.
         let reads_before = file.reads.load(Ordering::SeqCst);
-        let out = fetch_window(&reader, 8, 12, CachePriority::Low).unwrap();
+        let (out, hits) = fetch_window(
+            &reader,
+            8,
+            12,
+            CacheFillPolicy::Insert(CachePriority::Low),
+        )
+        .unwrap();
         assert_eq!(out.len(), 4);
+        assert_eq!(hits, 0);
         assert_eq!(
             file.reads.load(Ordering::SeqCst) - reads_before,
             1,
@@ -1077,4 +1252,161 @@ mod tests {
         let got = drain_rows(&mut pf);
         assert_eq!(got, expected);
     }
+
+    // -----------------------------------------------------------------------
+    // L4 compaction-input mode (2026-06-12 windowed-readpath design)
+    // -----------------------------------------------------------------------
+
+    /// (key, value, sequence, op_byte) — the full-row drain element.
+    type FullRow = (Vec<u8>, Option<Vec<u8>>, u64, u8);
+
+    /// Full-row demand-paged reference drain (key, value, seq, op).
+    fn drain_full_demand(reader: &SstReaderImpl) -> Vec<FullRow> {
+        let mut rows = Vec::new();
+        for idx in 0..reader.index_entry_count() {
+            reader
+                .for_each_row_in_block(idx, |v| {
+                    rows.push((
+                        v.key.to_vec(),
+                        v.value.map(|x| x.to_vec()),
+                        v.sequence,
+                        v.op_type as u8,
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        rows
+    }
+
+    /// Full-row drain through a prefetcher.
+    fn drain_full(pf: &mut BlockPrefetcher) -> Vec<FullRow> {
+        let mut rows = Vec::new();
+        while let Some(block) = pf.next_decoded().unwrap() {
+            block
+                .for_each_row(|v| {
+                    rows.push((
+                        v.key.to_vec(),
+                        v.value.map(|x| x.to_vec()),
+                        v.sequence,
+                        v.op_type as u8,
+                    ));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        rows
+    }
+
+    /// G0 byte-equality: the compaction-mode windowed drain yields exactly
+    /// the demand-paged rows for BOTH block formats (v1 Arrow / v2 KV) ×
+    /// compression (None / LZ4), across window sizes that do and don't
+    /// divide the block count.
+    #[test]
+    fn compaction_windowed_drain_equals_demand_all_formats() {
+        for kv in [false, true] {
+            for compression in [CompressionType::None, CompressionType::Lz4] {
+                let data = build_sst_with(400, compression, Some(kv));
+                let (reader, _file) = open_reader(&data, None, &data);
+                assert!(
+                    reader.index_entry_count() >= 8,
+                    "need a multi-block SST (kv={kv}, {compression:?})"
+                );
+                let expected = drain_full_demand(&reader);
+                for window_blocks in [3u32, 32] {
+                    let mut pf =
+                        BlockPrefetcher::for_compaction(Arc::clone(&reader), window_blocks);
+                    let got = drain_full(&mut pf);
+                    assert_eq!(
+                        got, expected,
+                        "kv={kv} compression={compression:?} window={window_blocks}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// G0 Skip-policy cache assertion: a compaction-mode drain performs ZERO
+    /// cache inserts (read-only cache use), while serving pre-warmed blocks
+    /// from the cache (cache-first check preserved — the 27ae792c3 lesson)
+    /// with correspondingly less I/O.
+    #[test]
+    fn compaction_mode_never_inserts_but_serves_cache_hits() {
+        let data = build_sst_with(400, CompressionType::Lz4, Some(true));
+        let cache = Arc::new(RecordingCache::new());
+        let (reader, file) = open_reader(&data, Some(cache.clone()), &data);
+        let blocks = reader.index_entry_count();
+        assert!(blocks >= 8);
+
+        // Pre-warm two blocks (as a foreground probe / flush-read would).
+        for idx in [1usize, 5] {
+            let (off, size) = reader.block_region(idx).unwrap();
+            let d = reader.read_decoded_block(off, size).unwrap();
+            reader.cache_insert_decoded(off, &d, CachePriority::Low);
+        }
+        let inserts_before = cache.inserts.lock().unwrap().len();
+        let reads_before = file.reads.load(Ordering::SeqCst);
+
+        let mut pf = BlockPrefetcher::for_compaction(Arc::clone(&reader), 4);
+        let got = drain_full(&mut pf);
+
+        // Compaction reads must NOT insert (Skip policy): insert count is
+        // exactly the pre-warm count, nothing more.
+        assert_eq!(
+            cache.inserts.lock().unwrap().len(),
+            inserts_before,
+            "compaction-mode drain must perform ZERO cache inserts"
+        );
+        // The pre-warmed blocks were served from cache (W5 telemetry) ...
+        assert_eq!(pf.compaction_stats().cache_hits, 2);
+        // ... and rows are still exactly the demand-paged reference.
+        let (reader_ref, _f) = open_reader(&data, None, &data);
+        assert_eq!(got, drain_full_demand(&reader_ref));
+        // I/O happened (the misses) but is bounded by the non-cached blocks.
+        let preads = file.reads.load(Ordering::SeqCst) - reads_before;
+        assert!(preads > 0 && (preads as usize) < blocks, "preads={preads}");
+    }
+
+    /// L4 §2.2: compaction mode uses a FIXED window from block 0 — no cold
+    /// phase, no ramp doubling — and (falsifier 1) 100 % of blocks arrive
+    /// via windows, zero via the demand fallback.
+    #[test]
+    fn compaction_mode_fixed_window_no_ramp_all_blocks_windowed() {
+        let data = build_sst(400);
+        let (reader, _file) = open_reader(&data, None, &data);
+        let blocks = reader.index_entry_count();
+        let window: u32 = 4;
+        let mut pf = BlockPrefetcher::for_compaction(Arc::clone(&reader), window);
+        // First window already in flight at construction (overlaps block 0).
+        assert_eq!(pf.ra_blocks(), window, "fixed window from the start");
+        let mut n = 0usize;
+        while pf.next_decoded().unwrap().is_some() {
+            n += 1;
+            assert_eq!(pf.ra_blocks(), window, "window never ramps/doubles");
+        }
+        assert_eq!(n, blocks);
+        let stats = pf.compaction_stats();
+        assert_eq!(stats.window_blocks, blocks as u64, "all blocks windowed");
+        assert_eq!(stats.demand_blocks, 0, "demand fallback never used");
+        assert_eq!(
+            stats.window_submits,
+            (blocks as u64).div_ceil(window as u64),
+            "ceil(blocks/window) submissions"
+        );
+        assert!(stats.prefetched_bytes > 0);
+        assert_eq!(stats.cache_hits, 0, "no cache attached");
+    }
+
+    /// Compaction-mode termination parity with scan mode: dropping/terminating
+    /// mid-stream releases the M3 charge and parks at EOF.
+    #[test]
+    fn compaction_mode_terminate_parks_at_eof() {
+        let data = build_sst(400);
+        let (reader, _file) = open_reader(&data, None, &data);
+        let mut pf = BlockPrefetcher::for_compaction(Arc::clone(&reader), 8);
+        assert!(pf.next_decoded().unwrap().is_some());
+        pf.terminate();
+        assert!(pf.next_decoded().unwrap().is_none());
+    }
+
 }

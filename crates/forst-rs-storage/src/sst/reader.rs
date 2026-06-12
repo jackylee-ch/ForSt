@@ -1355,9 +1355,24 @@ where
 /// v1 Arrow and v2 KV blocks; reads one block at a time (peak memory = one block).
 pub struct SstBlockCursor {
     reader: Arc<SstReaderImpl>,
-    /// Index of the NEXT block to load.
+    /// Index of the NEXT block to load (Demand mode only; the Windowed
+    /// source keeps its own cursor inside the prefetcher).
     next_block: usize,
+    /// L4 (2026-06-12 windowed-readpath design §2.2): where blocks come from.
+    source: BlockSource,
     inner: CursorInner,
+}
+
+/// L4: block delivery source for [`SstBlockCursor`].
+enum BlockSource {
+    /// Today's path: strictly serial, demand-paged `read_decoded_block`
+    /// (cache-first check + `Low` insert).
+    Demand,
+    /// Compaction-input mode: fixed-window, double-buffered
+    /// [`BlockPrefetcher`] in `for_compaction` mode — input I/O + decompress
+    /// + decode overlap the merge on the read-I/O pool, with
+    /// `CacheFillPolicy::Skip` (cache-first read, NO insert).
+    Windowed(crate::sst::prefetch::BlockPrefetcher),
 }
 
 enum CursorInner {
@@ -1373,25 +1388,67 @@ impl SstBlockCursor {
         let mut c = Self {
             reader,
             next_block: 0,
+            source: BlockSource::Demand,
             inner: CursorInner::Done,
         };
         c.load_next_nonempty()?;
         Ok(c)
     }
 
+    /// L4: creates a compaction-input cursor whose blocks arrive via a
+    /// fixed-`window_blocks`, double-buffered [`BlockPrefetcher`] in
+    /// compaction mode (full-file scan, cache-first read, Skip insert).
+    /// The row stream is byte-identical to [`Self::new`]; only the block
+    /// production (overlap + cache policy) differs. The caller (the engine's
+    /// `CompactionJob::run_streaming`) gates this behind `FRS_COMPACT_WINDOWED`
+    /// and clamps `window_blocks` against the fan-in prefetch budget.
+    pub fn new_windowed(reader: Arc<SstReaderImpl>, window_blocks: u32) -> ForstResult<Self> {
+        let prefetcher =
+            crate::sst::prefetch::BlockPrefetcher::for_compaction(Arc::clone(&reader), window_blocks);
+        let mut c = Self {
+            reader,
+            next_block: 0,
+            source: BlockSource::Windowed(prefetcher),
+            inner: CursorInner::Done,
+        };
+        c.load_next_nonempty()?;
+        Ok(c)
+    }
+
+    /// L4 W5: compaction-read telemetry of the windowed source (`None` for a
+    /// demand cursor). The engine sums these across a job's inputs.
+    pub fn windowed_read_stats(&self) -> Option<crate::sst::prefetch::CompactionReadStats> {
+        match &self.source {
+            BlockSource::Windowed(pf) => Some(pf.compaction_stats()),
+            BlockSource::Demand => None,
+        }
+    }
+
     /// Loads successive blocks until a non-empty one is positioned, or marks the
     /// cursor Done at end-of-file.
     fn load_next_nonempty(&mut self) -> ForstResult<()> {
         loop {
-            if self.next_block >= self.reader.index_entries.len() {
-                self.inner = CursorInner::Done;
-                return Ok(());
-            }
-            let entry = &self.reader.index_entries[self.next_block];
-            let block = self
-                .reader
-                .read_decoded_block(entry.block_offset, entry.block_size)?;
-            self.next_block += 1;
+            let block = match &mut self.source {
+                BlockSource::Demand => {
+                    if self.next_block >= self.reader.index_entries.len() {
+                        self.inner = CursorInner::Done;
+                        return Ok(());
+                    }
+                    let entry = &self.reader.index_entries[self.next_block];
+                    let block = self
+                        .reader
+                        .read_decoded_block(entry.block_offset, entry.block_size)?;
+                    self.next_block += 1;
+                    block
+                }
+                BlockSource::Windowed(pf) => match pf.next_decoded()? {
+                    Some(block) => block,
+                    None => {
+                        self.inner = CursorInner::Done;
+                        return Ok(());
+                    }
+                },
+            };
             match block {
                 DecodedBlock::Arrow(batch) => {
                     if batch.num_rows() > 0 {
@@ -1617,6 +1674,41 @@ mod tests {
                     cur.advance().unwrap();
                 }
                 assert_eq!(got, oracle, "cursor vs scan_borrowed kv={kv} n={n}");
+            }
+        }
+    }
+
+    /// L4 G0 (2026-06-12 windowed-readpath design): the WINDOWED compaction
+    /// cursor yields exactly the demand cursor's row stream — v1 Arrow + v2
+    /// KV, tombstones + empty values, multi-block, for window sizes that do
+    /// and don't divide the block count (incl. window=1).
+    #[test]
+    fn sst_block_cursor_windowed_matches_demand() {
+        for &kv in &[false, true] {
+            for &n in &[1usize, 7, 100, 5000] {
+                let sst = write_test_sst_fmt(n, kv);
+                let reader = Arc::new(
+                    SstReaderImpl::open(Box::new(MemRandomAccessFile { data: sst.clone() }))
+                        .unwrap(),
+                );
+                let drain = |mut cur: SstBlockCursor| {
+                    let mut rows = Vec::new();
+                    while cur.valid() {
+                        rows.push((
+                            cur.key().to_vec(),
+                            cur.value().map(|x| x.to_vec()),
+                            cur.sequence(),
+                            cur.op_type(),
+                        ));
+                        cur.advance().unwrap();
+                    }
+                    rows
+                };
+                let expected = drain(SstBlockCursor::new(reader.clone()).unwrap());
+                for &w in &[1u32, 3, 64] {
+                    let got = drain(SstBlockCursor::new_windowed(reader.clone(), w).unwrap());
+                    assert_eq!(got, expected, "windowed vs demand kv={kv} n={n} w={w}");
+                }
             }
         }
     }

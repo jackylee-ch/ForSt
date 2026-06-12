@@ -593,6 +593,31 @@ impl CompactionJob {
     /// Multi-file output (`target_file_size` / `additional_outputs`) rolls to the
     /// next slot at a user-key boundary, identical to the serial path in `run`.
     fn run_streaming(self) -> ForstResult<Option<VersionEdit>> {
+        // L4 (2026-06-12 windowed-readpath design): flag-gated windowed
+        // compaction-input reads (default OFF). The per-input window is
+        // clamped against the aggregate prefetch budget by fan-in; below the
+        // 4-block floor the job falls back to Demand cursors entirely.
+        // `writer_options.block_size` (the engine-wide SST block size, which
+        // also produced the inputs) is the clamp's block-size estimate.
+        let window_blocks = if crate::runtime_tuning::compaction_windowed_enabled() {
+            crate::runtime_tuning::compaction_window_blocks(
+                self.inputs.len(),
+                self.writer_options.block_size,
+                crate::runtime_tuning::compaction_window_bytes(),
+                crate::runtime_tuning::compaction_prefetch_budget_bytes(),
+            )
+        } else {
+            None
+        };
+        self.run_streaming_with(window_blocks)
+    }
+
+    /// Body of [`Self::run_streaming`] with the windowed-read decision made
+    /// explicit: `Some(w)` ⇒ every input cursor reads through a fixed
+    /// `w`-block, double-buffered, cache-Skip [`BlockPrefetcher`] window;
+    /// `None` ⇒ today's demand-paged cursors. Split out so tests can A/B
+    /// both modes in one process (the env gates are `OnceLock`-cached).
+    fn run_streaming_with(self, window_blocks: Option<u32>) -> ForstResult<Option<VersionEdit>> {
         // OPT-N04 E1: hard cross-CF input check (see `check_inputs_single_cf`).
         self.check_inputs_single_cf()?;
 
@@ -601,7 +626,10 @@ impl CompactionJob {
         let mut cursors: Vec<SstBlockCursor> = Vec::with_capacity(self.inputs.len());
         let mut file_nums: Vec<u64> = Vec::with_capacity(self.inputs.len());
         for (_lvl, meta, reader) in &self.inputs {
-            cursors.push(SstBlockCursor::new(Arc::clone(reader))?);
+            cursors.push(match window_blocks {
+                Some(w) => SstBlockCursor::new_windowed(Arc::clone(reader), w)?,
+                None => SstBlockCursor::new(Arc::clone(reader))?,
+            });
             file_nums.push(meta.file_number.value());
         }
 
@@ -814,6 +842,35 @@ impl CompactionJob {
             }
             Ok(())
         })();
+
+        // L4 W5 telemetry: per-compaction windowed-read counters, summed
+        // across input cursors. Gate: `FRS_COMPACT_DIAG=1` (env name chosen
+        // here — the design's W5 row names the counters but not the gate).
+        // Falsifier 1 of the design: window_blocks / (window_blocks +
+        // demand_blocks) must be ≥ 0.9 before wall-times are read.
+        if window_blocks.is_some() && compaction_diag_env() {
+            let mut agg = forst_rs_storage::sst::CompactionReadStats::default();
+            for c in &cursors {
+                if let Some(s) = c.windowed_read_stats() {
+                    agg.window_blocks += s.window_blocks;
+                    agg.demand_blocks += s.demand_blocks;
+                    agg.window_submits += s.window_submits;
+                    agg.prefetched_bytes += s.prefetched_bytes;
+                    agg.cache_hits += s.cache_hits;
+                }
+            }
+            eprintln!(
+                "[COMPACT_WINDOWED] inputs={} window={} blocks_window={} blocks_demand={} \
+                 cache_hits={} window_submits={} prefetched_bytes={}",
+                self.inputs.len(),
+                window_blocks.unwrap_or(0),
+                agg.window_blocks,
+                agg.demand_blocks,
+                agg.cache_hits,
+                agg.window_submits,
+                agg.prefetched_bytes,
+            );
+        }
         write_outcome?;
 
         // Zero-emit across all slots (e.g. all bottommost tombstones).
@@ -1397,6 +1454,19 @@ fn compaction_parallel_env() -> bool {
     )
 }
 
+/// L4 W5: `FRS_COMPACT_DIAG=1` logs per-compaction windowed-read telemetry
+/// to stderr (window/demand block split, cache hits, submits, bytes).
+fn compaction_diag_env() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_COMPACT_DIAG").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
 /// Heap element for the streaming k-way merge: orders inputs by current key
 /// ASCENDING (so `BinaryHeap`, a max-heap, yields the smallest key first via the
 /// reversed `Ord`). Ties on key are broken by `idx` for a total order; the
@@ -1488,5 +1558,196 @@ mod tests {
         let base = std::path::PathBuf::from("/db");
         let p = compaction_output_path(&base, FileNumber(7));
         assert_eq!(p, std::path::PathBuf::from("/db/000007.sst"));
+    }
+
+    // -----------------------------------------------------------------------
+    // L4 G1 (2026-06-12 windowed-readpath design): full compaction
+    // byte-equivalence, windowed vs demand cursors, on multi-block multi-SST
+    // fixtures across formats (v1 Arrow / v2 KV) × compression (None / LZ4)
+    // × bottommost, including multi-output target-size rolling.
+    // -----------------------------------------------------------------------
+
+    use forst_rs_common::CompressionType;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Writes one multi-block input SST (block_size 1024 ⇒ tens of blocks)
+    /// and returns `(meta, reader)`. Key range `[lo, hi)`; every 6th key a
+    /// tombstone; every 10th key gets a second (older) version — exercises
+    /// version groups, the file_number tie-break, and the fast Put path.
+    fn build_input(
+        dir: &Path,
+        fs: &Arc<dyn FileSystem>,
+        file_number: u64,
+        lo: usize,
+        hi: usize,
+        compression: CompressionType,
+        kv: bool,
+    ) -> (SstFileMeta, Arc<SstReaderImpl>) {
+        let mut writer = SstWriterImpl::with_options(SstWriterOptions {
+            block_size: 1024,
+            compression,
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
+        });
+        writer.force_kv_block_format(kv);
+        for i in lo..hi {
+            let key = format!("key_{:06}", i);
+            let seq = (i - lo) as u64 + 1;
+            if i % 6 == 0 {
+                writer.add(key.as_bytes(), None, seq, 0).unwrap(); // Delete
+            } else {
+                let val = format!("val_{:06}_f{}_{}", i, file_number, "y".repeat(40));
+                writer
+                    .add(key.as_bytes(), Some(val.as_bytes()), seq, 1)
+                    .unwrap();
+                if i % 10 == 0 && seq > 1 {
+                    // Older version of the same key (seq DESC within key).
+                    let old = format!("old_{:06}", i);
+                    writer
+                        .add(key.as_bytes(), Some(old.as_bytes()), seq - 1, 1)
+                        .unwrap();
+                }
+            }
+        }
+        let (bytes, info) = writer.finish().unwrap();
+        let path = dir.join(format!("{:06}.sst", file_number));
+        std::fs::write(&path, &bytes).unwrap();
+        let rac = fs.open_random_access_file(&path).unwrap();
+        let reader = Arc::new(SstReaderImpl::open(rac).unwrap());
+        let meta = SstFileMeta {
+            file_number: FileNumber(file_number),
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
+            file_size: info.file_size,
+            smallest_key: info.min_key.clone(),
+            largest_key: info.max_key.clone(),
+            min_sequence: SequenceNumber(info.min_sequence),
+            max_sequence: SequenceNumber(info.max_sequence),
+            num_entries: info.entry_count,
+        };
+        (meta, reader)
+    }
+
+    /// Builds the 3-input overlapping job and runs `run_streaming_with` in
+    /// the given mode; returns the bytes of every produced output file in
+    /// `new_files` order.
+    #[allow(clippy::too_many_arguments)]
+    fn run_compaction_mode(
+        out_dir: &Path,
+        fs: &Arc<dyn FileSystem>,
+        inputs: &[(SstFileMeta, Arc<SstReaderImpl>)],
+        compression: CompressionType,
+        bottommost: bool,
+        window_blocks: Option<u32>,
+    ) -> Vec<Vec<u8>> {
+        std::fs::create_dir_all(out_dir).unwrap();
+        let slots: Vec<(FileNumber, PathBuf)> = (100u64..106)
+            .map(|n| (FileNumber(n), out_dir.join(format!("{:06}.sst", n))))
+            .collect();
+        let job = CompactionJob {
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
+            inputs: inputs
+                .iter()
+                .map(|(m, r)| (0u32, m.clone(), Arc::clone(r)))
+                .collect(),
+            output_level: 1,
+            output_file_number: slots[0].0,
+            output_path: slots[0].1.clone(),
+            additional_outputs: slots[1..].to_vec(),
+            // Small target forces multi-output rolling at key boundaries.
+            target_file_size: 24 * 1024,
+            writer_options: SstWriterOptions {
+                block_size: 1024,
+                compression,
+                cf_id: forst_rs_common::DEFAULT_CF_ID,
+            },
+            fs: Arc::clone(fs),
+            merge_operator: None,
+            compaction_filter: None,
+            is_bottommost: bottommost,
+            min_active_snapshot: SequenceNumber(u64::MAX),
+        };
+        let edit = job.run_streaming_with(window_blocks).unwrap().unwrap();
+        assert!(!edit.new_files.is_empty(), "fixture must emit output");
+        edit.new_files
+            .iter()
+            .map(|(_, meta)| {
+                std::fs::read(out_dir.join(format!("{:06}.sst", meta.file_number.value())))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// The SST writer stamps a MILLISECOND-resolution `creation_time` into
+    /// the footer (writer.rs `SystemTime::now()`, footer offset 66) and the
+    /// footer tail checksum covers it — two runs can never be raw-byte
+    /// identical. Zero exactly those two fields (creation_time + footer
+    /// checksum); every other byte (all data blocks, bloom, index, the rest
+    /// of the footer) stays strictly compared.
+    fn normalize_creation_time(bytes: &mut [u8]) {
+        let n = bytes.len();
+        assert!(n > forst_rs_storage::sst::FOOTER_TAIL_SIZE);
+        let flen = u32::from_le_bytes(bytes[n - 8..n - 4].try_into().unwrap()) as usize;
+        let fstart = n.checked_sub(flen).expect("footer length sane");
+        bytes[fstart + 66..fstart + 74].fill(0); // creation_time u64 LE
+        bytes[n - 12..n - 8].fill(0); // footer_checksum (covers creation_time)
+    }
+
+    /// G1: identical output SST bytes (modulo the writer's wall-clock
+    /// `creation_time` stamp — see `normalize_creation_time`), windowed vs
+    /// demand, across the format × compression × bottommost matrix
+    /// (multi-block, multi-SST, overlapping keys, tombstones, multi-version,
+    /// multi-output rolling).
+    #[test]
+    fn streaming_compaction_windowed_output_byte_identical() {
+        let fs: Arc<dyn FileSystem> = Arc::new(forst_rs_io::LocalFileSystem);
+        for kv in [false, true] {
+            for compression in [CompressionType::None, CompressionType::Lz4] {
+                let dir = tempfile::tempdir().unwrap();
+                let in_dir = dir.path().join("in");
+                std::fs::create_dir_all(&in_dir).unwrap();
+                // Overlapping fan-in: [0,600) ∪ [300,900) ∪ [600,1200).
+                let inputs = vec![
+                    build_input(&in_dir, &fs, 1, 0, 600, compression, kv),
+                    build_input(&in_dir, &fs, 2, 300, 900, compression, kv),
+                    build_input(&in_dir, &fs, 3, 600, 1200, compression, kv),
+                ];
+                for bottommost in [false, true] {
+                    let mut demand = run_compaction_mode(
+                        &dir.path().join(format!("out_demand_{bottommost}")),
+                        &fs,
+                        &inputs,
+                        compression,
+                        bottommost,
+                        None,
+                    );
+                    demand.iter_mut().for_each(|b| normalize_creation_time(b));
+                    for w in [3u32, 32] {
+                        let mut windowed = run_compaction_mode(
+                            &dir.path().join(format!("out_windowed_{bottommost}_{w}")),
+                            &fs,
+                            &inputs,
+                            compression,
+                            bottommost,
+                            Some(w),
+                        );
+                        windowed
+                            .iter_mut()
+                            .for_each(|b| normalize_creation_time(b));
+                        assert_eq!(
+                            windowed.len(),
+                            demand.len(),
+                            "output file count kv={kv} {compression:?} bottommost={bottommost} w={w}"
+                        );
+                        for (i, (a, b)) in windowed.iter().zip(demand.iter()).enumerate() {
+                            assert_eq!(
+                                a, b,
+                                "output #{i} bytes differ kv={kv} {compression:?} \
+                                 bottommost={bottommost} w={w}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

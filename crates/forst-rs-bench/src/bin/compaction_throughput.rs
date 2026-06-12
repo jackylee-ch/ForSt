@@ -12,29 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! B3 — `compaction_throughput` (2026-06-12 local FFI/flush/compaction bench
-//! design §2-B3): the repeatable reproduction target for the recorded
-//! "3 ns/byte isolated vs 21 ns/byte under live load" compaction number
-//! (memory: resume 2026-06-05, q4 binder = bandwidth-bound compaction merge).
+//! B3 `compaction_throughput` (2026-06-12 local FFI/flush/compaction bench
+//! design §B3): repeatable reproduction target for the recorded
+//! 3 ns/byte-isolated vs 21 ns/byte-live compaction merge numbers, and the
+//! before/after harness for the L4 windowed compaction read path
+//! (`FRS_COMPACT_WINDOWED=1` — set it in the LAUNCHING environment; the
+//! engine reads it once per process).
 //!
-//! Build phase: write + `switch_and_flush` until L0 holds `--ssts` files of
-//! `--sst-mib` each, with controllable cross-file key overlap and tombstone
-//! fraction. Measure phase: time `compact_l0`; report ns/byte-live, MB/s,
-//! and reclaimed-bytes %. `--with-read-load` runs a sidecar point-get thread
-//! at max rate against the same CF during the compaction — the isolated/live
-//! pair quantifies compaction↔foreground interference (the L4
-//! compaction-windowed + cache-policy lever's before/after harness).
+//! Build phase: writes + `switch_and_flush` until L0 holds `--l0-files` SSTs
+//! of ~`--sst-mib` MiB each, with `--overlap-pct` key overlap between
+//! adjacent files and `--tombstone-pct` deletes. Measure phase: times
+//! `compact_l0` (the streaming k-way merge over every L0 + L1 input) and
+//! reports ns/byte-input, MB/s, reclaimed %. `--with-read-load` runs a
+//! sidecar point-get thread against the same CF during the compaction (the
+//! "live" cell of the 3-vs-21 pair).
 //!
-//! Methodology (design §3): real LocalFileSystem I/O on a scratch dir under
-//! `target/` (NOT /tmp), deterministic xorshift keys, machine-readable JSON
-//! line per cell, ≥1 compaction asserted per measured phase. Mac numbers are
-//! system-allocator numbers — same-box A/B only.
+//! Methodology rules (binding, design §3): same-session A/B only, n≥3 per
+//! cell, never compare across machines. Mac numbers are system-allocator
+//! numbers (jemalloc is compile-gated off on macOS) — same-box A/B only.
 //!
-//! Run:
+//! NOT built in v1 (design allows): `--merge-chain` operand cells.
+//!
 //! ```bash
-//! cargo run -p forst-rs-bench --release --bin compaction_throughput -- \
-//!     [--ssts 8] [--sst-mib 64] [--value-bytes 256] [--overlap-pct 50] \
-//!     [--tombstone-pct 0] [--with-read-load] [--smoke]
+//! cargo run -p forst-rs-bench --release --bin compaction_throughput -- --smoke
+//! FRS_COMPACT_WINDOWED=1 cargo run -p forst-rs-bench --release \
+//!     --bin compaction_throughput -- --runs 3
 //! ```
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,8 +45,65 @@ use std::time::Instant;
 
 use forst_rs_common::EngineOptions;
 use forst_rs_engine::DbImpl;
+use forst_rs_io::FileSystem;
 
-/// Deterministic xorshift64* generator (same pattern as merge_operator UTs).
+#[derive(Clone, Debug)]
+struct Args {
+    l0_files: usize,
+    sst_mib: usize,
+    value_bytes: usize,
+    overlap_pct: usize,
+    tombstone_pct: usize,
+    with_read_load: bool,
+    runs: usize,
+    smoke: bool,
+}
+
+impl Args {
+    fn parse() -> Self {
+        let mut a = Args {
+            l0_files: 8,
+            sst_mib: 64,
+            value_bytes: 256,
+            overlap_pct: 50,
+            tombstone_pct: 20,
+            with_read_load: false,
+            runs: 1,
+            smoke: false,
+        };
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let mut i = 0;
+        while i < argv.len() {
+            let take = |i: &mut usize| -> usize {
+                *i += 1;
+                argv.get(*i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| panic!("missing/invalid value for {}", argv[*i - 1]))
+            };
+            match argv[i].as_str() {
+                "--l0-files" => a.l0_files = take(&mut i),
+                "--sst-mib" => a.sst_mib = take(&mut i),
+                "--value-bytes" => a.value_bytes = take(&mut i),
+                "--overlap-pct" => a.overlap_pct = take(&mut i),
+                "--tombstone-pct" => a.tombstone_pct = take(&mut i),
+                "--runs" => a.runs = take(&mut i),
+                "--with-read-load" => a.with_read_load = true,
+                "--isolated" => a.with_read_load = false,
+                "--smoke" => a.smoke = true,
+                other => panic!("unknown arg {other}"),
+            }
+            i += 1;
+        }
+        if a.smoke {
+            a.l0_files = 4;
+            a.sst_mib = 2;
+            a.runs = 1;
+        }
+        a
+    }
+}
+
+/// Deterministic xorshift64* (same pattern as the merge-operator UTs).
 struct XorShift(u64);
 impl XorShift {
     fn next(&mut self) -> u64 {
@@ -53,259 +112,214 @@ impl XorShift {
         x ^= x >> 7;
         x ^= x << 17;
         self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        x.wrapping_mul(0x2545F4914F6CDD1D)
     }
 }
 
-struct Args {
-    ssts: u32,
-    sst_mib: u64,
-    value_bytes: usize,
-    overlap_pct: u32,
-    tombstone_pct: u32,
-    with_read_load: bool,
-    smoke: bool,
-}
-
-fn parse_args() -> Args {
-    let mut a = Args {
-        ssts: 8,
-        sst_mib: 64,
-        value_bytes: 256,
-        overlap_pct: 50,
-        tombstone_pct: 0,
-        with_read_load: false,
-        smoke: false,
-    };
-    let mut it = std::env::args().skip(1);
-    while let Some(flag) = it.next() {
-        let mut take = |a: &mut u64| {
-            *a = it
-                .next()
-                .expect("missing value")
-                .parse()
-                .expect("numeric arg");
-        };
-        let mut tmp = 0u64;
-        match flag.as_str() {
-            "--ssts" => {
-                take(&mut tmp);
-                a.ssts = tmp as u32;
-            }
-            "--sst-mib" => take(&mut a.sst_mib),
-            "--value-bytes" => {
-                take(&mut tmp);
-                a.value_bytes = tmp as usize;
-            }
-            "--overlap-pct" => {
-                take(&mut tmp);
-                a.overlap_pct = tmp as u32;
-            }
-            "--tombstone-pct" => {
-                take(&mut tmp);
-                a.tombstone_pct = tmp as u32;
-            }
-            "--with-read-load" => a.with_read_load = true,
-            "--smoke" => a.smoke = true,
-            other => panic!("unknown flag: {other}"),
-        }
-    }
-    if a.smoke {
-        a.ssts = 4.min(a.ssts);
-        a.sst_mib = 4.min(a.sst_mib);
-    }
-    assert!(a.overlap_pct <= 100 && a.tombstone_pct <= 100);
-    a
-}
-
+/// macOS/Linux RSS sample in MiB (B4 fallback sampler: `ps`, phase
+/// boundaries only — no jemalloc stats on the Mac, compile-gated off).
 fn rss_mib() -> u64 {
-    let pid = std::process::id();
     let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .ok();
-    out.and_then(|o| String::from_utf8(o.stdout).ok())
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output();
+    out.ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
         .and_then(|s| s.trim().parse::<u64>().ok())
         .map(|kib| kib / 1024)
         .unwrap_or(0)
 }
 
-/// Key layout: `[16-byte zero-padded decimal id]`. Overlap control: with
-/// `overlap_pct = p`, a fraction p of each file's keys are drawn from a
-/// SHARED key range (rewritten by every file → garbage versions) and the
-/// rest from a per-file DISJOINT range (live forever).
-fn make_key(buf: &mut [u8; 16], id: u64) {
-    // Hand-rolled zero-padded decimal, no per-key format! alloc.
-    let mut x = id;
-    for i in (0..16).rev() {
-        buf[i] = b'0' + (x % 10) as u8;
-        x /= 10;
-    }
+struct RunResult {
+    input_bytes: u64,
+    output_bytes: u64,
+    wall_ms: f64,
+    ns_per_byte: f64,
+    sidecar_gets_per_s: f64,
 }
 
-fn main() {
-    // Determinism: background L0→L1 auto-compaction (FRS_L0_COMPACTION_TRIGGER,
-    // default 4 — write_controller.rs:93) would drain L0 DURING the build phase,
-    // leaving `compact_l0` a nondeterministic (possibly empty) input set. Raise
-    // the trigger so the measured job is exactly the `--ssts` files we built.
-    // Must happen before `DbImpl::open` reads the controller config.
-    if std::env::var("FRS_L0_COMPACTION_TRIGGER").is_err() {
-        std::env::set_var("FRS_L0_COMPACTION_TRIGGER", "100000");
-    }
-    let args = parse_args();
-    let scratch = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target")
-        .join(format!("b3-compaction-scratch-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).expect("create scratch dir");
-    let db_path = scratch.join("db").to_string_lossy().into_owned();
-
-    println!(
-        "# B3 compaction_throughput | ssts={} sst_mib={} value_bytes={} overlap_pct={} \
-         tombstone_pct={} read_load={} smoke={}",
-        args.ssts,
-        args.sst_mib,
-        args.value_bytes,
-        args.overlap_pct,
-        args.tombstone_pct,
-        args.with_read_load,
-        args.smoke
-    );
-    println!(
-        "# RULE: Mac numbers are system-allocator numbers; same-box A/B regressions only. \
-         Linux runs for absolute footprints."
-    );
-
-    // Write buffer larger than one SST so only explicit switch_and_flush cuts files.
+fn one_run(args: &Args, run_idx: usize, workroot: &std::path::Path) -> RunResult {
+    let db_path = workroot.join(format!("run{run_idx}"));
+    std::fs::create_dir_all(&db_path).expect("create run dir");
+    let fs: Arc<dyn FileSystem> = Arc::new(forst_rs_io::LocalFileSystem);
     let opts = EngineOptions {
-        db_path,
-        write_buffer_size: (args.sst_mib as usize + 64) * 1024 * 1024,
+        db_path: db_path.to_string_lossy().into_owned(),
+        // Headroom over the per-file logical bytes so the active memtable
+        // never auto-switches before our explicit switch_and_flush.
+        write_buffer_size: args.sst_mib * 2 * 1024 * 1024,
         ..EngineOptions::default()
     };
-    let db = DbImpl::open(opts).expect("open local db");
+    let db = DbImpl::open_with_fs(opts, fs).expect("open");
     let cf = db.default_cf();
 
-    // ---- Build phase -------------------------------------------------
-    let row_bytes = 16 + args.value_bytes;
-    let rows_per_sst = (args.sst_mib * 1024 * 1024) as usize / row_bytes;
-    let shared_rows = rows_per_sst * args.overlap_pct as usize / 100;
-    // Incompressible value pool: random bytes, per-row random slice — so lz4
-    // cannot collapse the SSTs and byte-rate metrics stay honest.
-    let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
-    let mut pool = vec![0u8; args.value_bytes + 65536];
-    for chunk in pool.chunks_mut(8) {
-        let bytes = rng.next().to_le_bytes();
-        let n = chunk.len();
-        chunk.copy_from_slice(&bytes[..n]);
-    }
-    let mut key = [0u8; 16];
-    let build_t0 = Instant::now();
-    let mut logical_bytes = 0u64;
-    let mut tombstones = 0u64;
-    for file in 0..args.ssts {
-        for r in 0..rows_per_sst {
-            let id = if r < shared_rows {
-                // Shared range [0, shared_rows) — rewritten by every file.
-                (rng.next() as usize % shared_rows.max(1)) as u64
-            } else {
-                // Disjoint per-file range.
-                10_000_000_000 + (file as u64) * rows_per_sst as u64 + r as u64
-            };
-            make_key(&mut key, id);
+    // ---- build phase: l0_files SSTs of ~sst_mib MiB, overlapping keys ----
+    let key_len = 14usize; // "key_" + 10 digits
+    let row_logical = key_len + args.value_bytes;
+    let rows_per_file = (args.sst_mib * 1024 * 1024) / row_logical;
+    let stride = (rows_per_file * (100 - args.overlap_pct.min(100))) / 100;
+    let mut rng = XorShift(0x9E3779B97F4A7C15 ^ (run_idx as u64 + 1));
+    let mut value = vec![0u8; args.value_bytes];
+    let mut max_key = 0usize;
+    let t_build = Instant::now();
+    for f in 0..args.l0_files {
+        let lo = f * stride.max(1);
+        for r in 0..rows_per_file {
+            let k = lo + r;
+            max_key = max_key.max(k);
+            let key = format!("key_{:010}", k);
             if args.tombstone_pct > 0 && (rng.next() % 100) < args.tombstone_pct as u64 {
-                db.delete(&cf, &key).expect("delete");
-                tombstones += 1;
-                logical_bytes += 16;
+                db.delete(&cf, key.as_bytes()).expect("delete");
             } else {
-                let off = (rng.next() % 65536) as usize;
-                db.put(&cf, &key, &pool[off..off + args.value_bytes])
-                    .expect("put");
-                logical_bytes += row_bytes as u64;
+                // Pseudorandom filler (xorshift per 8-byte word) so LZ4
+                // cannot collapse the values — keeps `--sst-mib` ≈ the real
+                // on-disk input bytes the compaction read path must move.
+                for chunk in value.chunks_mut(8) {
+                    let w = rng.next().to_le_bytes();
+                    chunk.copy_from_slice(&w[..chunk.len()]);
+                }
+                db.put(&cf, key.as_bytes(), &value).expect("put");
             }
         }
-        db.switch_and_flush(&cf).expect("flush");
+        db.switch_and_flush(&cf).expect("flush").expect("nonempty");
     }
-    let build_secs = build_t0.elapsed().as_secs_f64();
-    let input_bytes_est = args.ssts as u64 * args.sst_mib * 1024 * 1024;
-    println!(
-        "# build: {} files x {} rows (tombstones {}) in {:.1}s, RSS {} MiB",
-        args.ssts,
-        rows_per_sst,
-        tombstones,
-        build_secs,
+    let build_s = t_build.elapsed().as_secs_f64();
+
+    // Design §3 rule 3: the measured phase must actually cycle — assert the
+    // build produced the requested L0 fan-in before timing anything.
+    let live = db.list_live_files(false).expect("live files");
+    let l0: Vec<_> = live.iter().filter(|f| f.level == 0).collect();
+    assert_eq!(
+        l0.len(),
+        args.l0_files,
+        "build phase must leave exactly the requested L0 fan-in \
+         (auto-compaction interfered? raise FRS_L0_COMPACTION_TRIGGER)"
+    );
+    let input_bytes: u64 = live.iter().map(|f| f.size).sum();
+    eprintln!(
+        "[build] run={run_idx} files={} input_mib={:.1} build_s={:.1} rss_mib={}",
+        l0.len(),
+        input_bytes as f64 / (1024.0 * 1024.0),
+        build_s,
         rss_mib()
     );
 
-    // ---- Optional sidecar read load ----------------------------------
+    // ---- measure phase: time compact_l0 (streaming k-way merge) ----
     let stop = Arc::new(AtomicBool::new(false));
-    let gets_done = Arc::new(AtomicU64::new(0));
-    let sidecar = if args.with_read_load {
+    let gets = Arc::new(AtomicU64::new(0));
+    let sidecar = args.with_read_load.then(|| {
         let db2 = Arc::clone(&db);
         let cf2 = cf.clone();
         let stop2 = Arc::clone(&stop);
-        let gets2 = Arc::clone(&gets_done);
-        let shared = shared_rows.max(1) as u64;
-        Some(std::thread::spawn(move || {
-            let mut rng = XorShift(0xDEAD_BEEF_CAFE_F00D);
-            let mut key = [0u8; 16];
+        let gets2 = Arc::clone(&gets);
+        let universe = max_key as u64 + 1;
+        std::thread::spawn(move || {
+            let mut rng = XorShift(0xDEADBEEFCAFEF00D);
             while !stop2.load(Ordering::Relaxed) {
-                make_key(&mut key, rng.next() % shared);
-                let _ = db2.get(&cf2, &key);
+                let key = format!("key_{:010}", rng.next() % universe);
+                let _ = db2.get(&cf2, key.as_bytes());
                 gets2.fetch_add(1, Ordering::Relaxed);
             }
-        }))
-    } else {
-        None
-    };
+        })
+    });
 
-    // ---- Measure phase ------------------------------------------------
     let t0 = Instant::now();
-    let out_meta = db.compact_l0(&cf).expect("compact_l0");
-    let secs = t0.elapsed().as_secs_f64();
-    assert!(out_meta.is_some(), "compaction must run (design rule 3)");
+    let out_meta = db.compact_l0(&cf).expect("compact_l0").expect("had L0 input");
+    let wall = t0.elapsed();
+
     stop.store(true, Ordering::Relaxed);
     if let Some(h) = sidecar {
         h.join().expect("sidecar join");
     }
-
-    let out_bytes = out_meta.map(|m| m.file_size).unwrap_or(0);
-    let live_bytes = out_bytes.max(1);
-    let ns_per_byte_live = secs * 1e9 / live_bytes as f64;
-    let mb_per_s_in = input_bytes_est as f64 / 1024.0 / 1024.0 / secs;
-    let reclaimed_pct = 100.0 * (1.0 - out_bytes as f64 / input_bytes_est as f64);
-    let gets = gets_done.load(Ordering::Relaxed);
-
-    println!(
-        "# compact_l0: {:.3}s | out {} MiB | {:.2} ns/byte-live | input {:.0} MB/s | \
-         reclaimed {:.1}% | sidecar gets {} ({:.0}/s) | RSS {} MiB",
-        secs,
-        out_bytes / 1024 / 1024,
-        ns_per_byte_live,
-        mb_per_s_in,
-        reclaimed_pct,
-        gets,
-        gets as f64 / secs,
-        rss_mib()
-    );
-    println!(
-        "{{\"bench\":\"compaction_throughput\",\"ssts\":{},\"sst_mib\":{},\"value_bytes\":{},\
-         \"overlap_pct\":{},\"tombstone_pct\":{},\"read_load\":{},\"secs\":{:.3},\
-         \"out_bytes\":{},\"ns_per_byte_live\":{:.2},\"input_mb_per_s\":{:.1},\
-         \"reclaimed_pct\":{:.1},\"sidecar_gets_per_s\":{:.0},\"logical_bytes\":{}}}",
-        args.ssts,
-        args.sst_mib,
-        args.value_bytes,
-        args.overlap_pct,
-        args.tombstone_pct,
-        args.with_read_load,
-        secs,
-        out_bytes,
-        ns_per_byte_live,
-        mb_per_s_in,
-        reclaimed_pct,
-        gets as f64 / secs,
-        logical_bytes
-    );
-
+    // `compact_l0` returns only the FIRST output file's meta; a rolled
+    // multi-file output is the norm at this input size — sum the surviving
+    // live files instead (L0 was fully drained into them).
+    let _ = out_meta;
+    let output_bytes: u64 = db
+        .list_live_files(false)
+        .expect("live files post-compaction")
+        .iter()
+        .map(|f| f.size)
+        .sum();
+    let wall_s = wall.as_secs_f64();
+    let result = RunResult {
+        input_bytes,
+        output_bytes,
+        wall_ms: wall_s * 1e3,
+        ns_per_byte: wall.as_nanos() as f64 / input_bytes as f64,
+        sidecar_gets_per_s: if args.with_read_load {
+            gets.load(Ordering::Relaxed) as f64 / wall_s
+        } else {
+            0.0
+        },
+    };
+    eprintln!("[measure] run={run_idx} rss_mib={}", rss_mib());
     drop(db);
-    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = std::fs::remove_dir_all(&db_path);
+    result
+}
+
+fn main() {
+    let args = Args::parse();
+    // Keep the background L0 trigger far above the build fan-in so the
+    // measured compact_l0 is the ONLY compaction (read before DB open).
+    if std::env::var("FRS_L0_COMPACTION_TRIGGER").is_err() {
+        // SAFETY-free std API on this single-threaded startup path.
+        std::env::set_var("FRS_L0_COMPACTION_TRIGGER", "100000");
+    }
+    let windowed = matches!(
+        std::env::var("FRS_COMPACT_WINDOWED").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    );
+    eprintln!(
+        "compaction_throughput: {:?} FRS_COMPACT_WINDOWED={} \
+         (Mac numbers are system-allocator numbers; same-box A/B only)",
+        args, windowed
+    );
+
+    let workroot = std::path::PathBuf::from("target").join(format!(
+        "compaction_throughput_bench_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workroot).expect("create workroot");
+
+    let mut results = Vec::with_capacity(args.runs);
+    for run_idx in 0..args.runs {
+        results.push(one_run(&args, run_idx, &workroot));
+    }
+    let _ = std::fs::remove_dir_all(&workroot);
+
+    let mut ns: Vec<f64> = results.iter().map(|r| r.ns_per_byte).collect();
+    ns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median_ns = ns[ns.len() / 2];
+
+    for (i, r) in results.iter().enumerate() {
+        println!(
+            "{{\"bench\":\"compaction_throughput\",\"run\":{},\"windowed\":{},\
+             \"l0_files\":{},\"sst_mib\":{},\"overlap_pct\":{},\"tombstone_pct\":{},\
+             \"with_read_load\":{},\"input_bytes\":{},\"output_bytes\":{},\
+             \"wall_ms\":{:.1},\"ns_per_byte\":{:.3},\"mb_per_s\":{:.1},\
+             \"reclaimed_pct\":{:.1},\"sidecar_gets_per_s\":{:.0}}}",
+            i,
+            windowed,
+            args.l0_files,
+            args.sst_mib,
+            args.overlap_pct,
+            args.tombstone_pct,
+            args.with_read_load,
+            r.input_bytes,
+            r.output_bytes,
+            r.wall_ms,
+            r.ns_per_byte,
+            (r.input_bytes as f64 / (1024.0 * 1024.0)) / (r.wall_ms / 1e3),
+            100.0 * (1.0 - r.output_bytes as f64 / r.input_bytes as f64),
+            r.sidecar_gets_per_s,
+        );
+    }
+    println!(
+        "MEDIAN ns/byte-input = {median_ns:.3} (windowed={windowed}, n={})",
+        results.len()
+    );
+    if args.smoke {
+        assert!(results[0].output_bytes > 0, "smoke: output must be non-empty");
+        println!("SMOKE OK");
+    }
 }
