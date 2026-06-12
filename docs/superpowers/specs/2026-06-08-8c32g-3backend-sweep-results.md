@@ -2256,3 +2256,17 @@ engine c921e297b): all EQUAL incl. retraction streams; determinism control (q8
 re-run ×2 each backend) = 4/4 identical hashes. Harness now IN-REPO:
 scripts/accuracy-gate/ (spec 2026-06-12-fixed-csv-accuracy-gate.md). The
 timer-index + alloc-fix stack is byte-correct on deterministic ground.
+
+### ★★ q5@100M REMOTE (fix verified): frs 604.5s vs rdb 595.4s = 1.015× PARITY
+Both finish, no collapse; q5 fix (80015d2cfaa) holds at 100M. out_rows Δ725
+(0.0024%, src_out also differs — sink/datagen jitter; exactness gate agent E
+queued). ForSt leg SKIPPED: no ForSt-C++ jar in remote flink/lib — USER must
+provide flink-statebackend-forst jar for the 3rd leg. q5 row: FAIL→**PASS-RDB**.
+
+### BISECT VERDICT: SPLIT — r1jar+r2engine = 2606.4 (refs 2421 jar / 2779 engine)
+~173s of the +358s q9 regression is the JAR delta (V1-V4 alloc fixes commit),
+~half engine-side (de-contention branch 87cbcec8e ready). Single runs each —
+de-noising cells queued (resident agent). NOTE: the box hosts a USER campaign
+(run-matrix forst-local vs forst-rs-lib, 8c/40g, since 00:18 — ALL today's
+remote numbers share that neighbor load; population consistent). Box jar
+currently = r1 (725824ae9e9) — setup must redeploy 72607e110 before new cells.
