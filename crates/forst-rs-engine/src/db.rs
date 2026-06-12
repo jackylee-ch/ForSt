@@ -12111,7 +12111,14 @@ impl DbImpl {
                     path.display()
                 ))
             })?;
-            mgr.register(&path, key, file.file_size)?;
+            // FRS-PHASE2-C3U1: same guard as the link-mode checkpoint —
+            // `register` REBINDS, and on a UUID-keyed (or instant-restored)
+            // engine the working path already maps to a non-identity
+            // physical; re-registering identity would point the mapping at a
+            // byte-less key.
+            if !mgr.is_registered(&path) {
+                mgr.register(&path, key, file.file_size)?;
+            }
             registered += 1;
         }
         Ok(registered)
@@ -20416,6 +20423,187 @@ mod tests {
                 i
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-C3U1 gate (competitive analysis §2.2d): UUID physical
+    // keys on the remote tier — rename-free invariant + restore round-trip
+    // ------------------------------------------------------------------
+
+    /// C3U1 gate, on the opendal-fs emulation (the full remote code path
+    /// minus network): an engine running over a UUID-keyed
+    /// `MappedFileSystem` (flag-ON construction; default `new` stays
+    /// identity/passthrough) puts→flushes→link-checkpoints→compacts with
+    /// ZERO SST-class renames reaching the backend — every SST physical is
+    /// a `uuid-<hex>.sst` object, logical working names unchanged — and an
+    /// instant-link restore from the checkpoint is byte-exact.
+    #[test]
+    fn test_phase2_c3u1_uuid_keys_rename_free_link_ckpt_restore() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct SstRenameCountingFs {
+            inner: Arc<dyn FileSystem>,
+            sst_renames: AtomicUsize,
+        }
+        impl SstRenameCountingFs {
+            fn is_sst(p: &Path) -> bool {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".sst"))
+            }
+        }
+        impl FileSystem for SstRenameCountingFs {
+            fn open_sequential_file(
+                &self,
+                path: &Path,
+            ) -> ForstResult<Box<dyn forst_rs_io::SequentialFile>> {
+                self.inner.open_sequential_file(path)
+            }
+            fn open_random_access_file(
+                &self,
+                path: &Path,
+            ) -> ForstResult<Box<dyn forst_rs_io::RandomAccessFile>> {
+                self.inner.open_random_access_file(path)
+            }
+            fn open_writable_file(
+                &self,
+                path: &Path,
+                mode: WriteMode,
+            ) -> ForstResult<Box<dyn forst_rs_io::WritableFile>> {
+                self.inner.open_writable_file(path, mode)
+            }
+            fn file_exists(&self, path: &Path) -> ForstResult<bool> {
+                self.inner.file_exists(path)
+            }
+            fn get_file_metadata(&self, path: &Path) -> ForstResult<forst_rs_io::FileMetadata> {
+                self.inner.get_file_metadata(path)
+            }
+            fn list_dir(&self, dir: &Path) -> ForstResult<Vec<forst_rs_io::FileMetadata>> {
+                self.inner.list_dir(dir)
+            }
+            fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+                self.inner.create_dir_all(dir)
+            }
+            fn delete_file(&self, path: &Path) -> ForstResult<()> {
+                self.inner.delete_file(path)
+            }
+            fn delete_dir(&self, path: &Path, recursive: bool) -> ForstResult<()> {
+                self.inner.delete_dir(path, recursive)
+            }
+            fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+                if Self::is_sst(src) || Self::is_sst(dst) {
+                    self.sst_renames.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.rename(src, dst)
+            }
+            fn supports_atomic_rename(&self) -> bool {
+                self.inner.supports_atomic_rename()
+            }
+            fn name(&self) -> &str {
+                "sst-rename-counting"
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let backend: Arc<dyn FileSystem> =
+            Arc::new(OpendalFileSystem::local(tmp.path()).unwrap());
+        let counting = Arc::new(SstRenameCountingFs {
+            inner: backend,
+            sst_renames: AtomicUsize::new(0),
+        });
+        let fs: Arc<dyn FileSystem> = counting.clone();
+        // The opendal Fs scheme keeps atomic renames, so the engine takes
+        // the tmp+rename staging path — exactly the renames UUID keying
+        // must convert into metadata re-points.
+        assert!(fs.supports_atomic_rename());
+
+        let mgr = Arc::new(
+            forst_rs_io::FileMappingManager::new(
+                fs.clone(),
+                PathBuf::from("/db/MAPPING.journal"),
+            )
+            .unwrap(),
+        );
+        let mapped: Arc<dyn FileSystem> = Arc::new(
+            forst_rs_io::MappedFileSystem::with_uuid_physical_keys(fs.clone(), mgr.clone())
+                .unwrap(),
+        );
+        let db = open_in_shared_fs("/db", mapped.clone());
+        db.attach_file_mapping(mgr.clone()).unwrap();
+        let cf = db.default_cf();
+
+        for i in 0..200u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        for i in (0..200u32).step_by(2) {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v2").unwrap();
+        }
+        for i in 0..50u32 {
+            db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
+        }
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        assert!(r.link_mode);
+
+        // Every live SST physical is a UUID object in the working dir; the
+        // canonical logical name holds NO bytes.
+        let live = db.version_set.current().live_sst_files();
+        assert!(!live.is_empty());
+        for f in &live {
+            let working = sst_file_path(Path::new("/db"), f.file_number);
+            let key = mgr.resolve(&working).expect("live SST must be mapped");
+            let base = Path::new(&key).file_name().unwrap().to_str().unwrap();
+            let hex = base
+                .strip_prefix("uuid-")
+                .and_then(|s| s.strip_suffix(".sst"))
+                .unwrap_or_else(|| panic!("physical {key} is not uuid-keyed"));
+            assert!(hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(
+                !fs.file_exists(&working).unwrap(),
+                "no bytes may exist at the logical name {}",
+                working.display()
+            );
+        }
+
+        // Post-checkpoint churn so working copies get unlinked through the
+        // refcount path too.
+        for i in 0..200u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap();
+        db.compact_l0(&cf).unwrap();
+        db.reap_pending_deletions();
+
+        // THE rename-free invariant: zero SST-class renames reached the
+        // backend across create→flush→checkpoint→compact.
+        assert_eq!(counting.sst_renames.load(Ordering::SeqCst), 0);
+
+        // Restore round-trip (instant-link) off the UUID physicals.
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
+                .unwrap();
+        let rcf = restored.default_cf();
+        for i in 0..200u32 {
+            let k = format!("k{:04}", i);
+            let want: Option<&[u8]> = if i < 50 {
+                None
+            } else if i % 2 == 0 {
+                Some(b"v2")
+            } else {
+                Some(b"v1")
+            };
+            assert_eq!(
+                restored.get(&rcf, k.as_bytes()).unwrap().as_deref(),
+                want,
+                "restore mismatch at {k}"
+            );
+        }
+        assert_eq!(
+            counting.sst_renames.load(Ordering::SeqCst),
+            0,
+            "restore must stay rename-free"
+        );
     }
 
     // ------------------------------------------------------------------
