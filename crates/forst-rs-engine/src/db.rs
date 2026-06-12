@@ -1064,6 +1064,14 @@ pub struct DbImpl {
     /// it); later checkpoints LINK it through the mapping layer — the flat
     /// WAL-delta capture (design §3.3 "independent of memtable size").
     wal_sealed: Mutex<Vec<WalSealedMeta>>,
+    /// FRS-PHASE2-C3U4 (WAL GC precise release): MONOTONIC per-CF flushed
+    /// floor, advanced at flush-install time to the flushed SST's max
+    /// sequence. The WAL GC's coverage check takes the max of this and the
+    /// live-SST-derived floor: the live-SST floor REGRESSES when a CF's
+    /// SSTs are later compacted away entirely (empty CF), which would
+    /// re-pin (forever) any sealed segment still carrying that CF's old
+    /// records. This map never regresses, so "flushed once" stays covered.
+    wal_flushed_floors: Mutex<HashMap<u32, u64>>,
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): diagnostic counter — number of L0 SST
     /// data-block reads performed during point `get`s inside `Self::sst_get`.
     /// The L0 walk now visits files newest-first and STOPS at the first
@@ -1214,6 +1222,7 @@ impl DbImpl {
             dynamic_levels: std::sync::atomic::AtomicBool::new(dynamic_levels_from_env()),
             wal: Mutex::new(None),
             wal_sealed: Mutex::new(Vec::new()),
+            wal_flushed_floors: Mutex::new(HashMap::new()),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
 
@@ -3517,18 +3526,49 @@ impl DbImpl {
                     cf_max_seqs: seg.cf_max_seqs,
                 });
         }
-        // 3. GC: drop the working ref of fully-flushed segments.
+        // 3. GC: drop the working ref of fully-covered segments.
+        //
+        // FRS-PHASE2-C3U4 (precise release — closes the Phase-5 residue):
+        // a CF's records in a sealed segment are covered when EITHER
+        //   (a) the CF's flushed floor reaches their max seq — the floor is
+        //       the MAX of the live-SST-derived value and the monotonic
+        //       `wal_flushed_floors` tracker (live-SST floors REGRESS when
+        //       a CF is compacted to empty, which re-pinned segments
+        //       forever), OR
+        //   (b) the CF was DROPPED: its records can never be replayed
+        //       (restore skips unknown CFs — the state is gone by
+        //       definition), so they must not pin the segment. Pre-fix,
+        //       dropped-CF records pinned their segment's working ref
+        //       FOREVER (floors.get(cf) == None ⇒ never covered).
+        // Checkpoints taken BEFORE a drop keep their own links — restore
+        // from them resurrects the CF from the barrier-time manifest +
+        // tail, unaffected by the working-ref release here.
         let mut floors: HashMap<u32, u64> = HashMap::new();
         for f in self.version_set.current().live_sst_files_iter() {
             let e = floors.entry(f.cf_id.value()).or_insert(0);
             *e = (*e).max(f.max_sequence.value());
         }
+        for (cf, floor) in self
+            .wal_flushed_floors
+            .lock()
+            .expect("wal_flushed_floors lock poisoned")
+            .iter()
+        {
+            let e = floors.entry(*cf).or_insert(0);
+            *e = (*e).max(*floor);
+        }
+        let live_cfs: std::collections::HashSet<u32> = self
+            .cfs
+            .read()
+            .expect("lock poisoned")
+            .keys()
+            .map(|id| id.value())
+            .collect();
         let mut tracked = self.wal_sealed.lock().expect("wal_sealed lock poisoned");
         tracked.retain(|seg| {
-            let covered = seg
-                .cf_max_seqs
-                .iter()
-                .all(|(cf, max)| floors.get(cf).copied().unwrap_or(0) >= *max);
+            let covered = seg.cf_max_seqs.iter().all(|(cf, max)| {
+                !live_cfs.contains(cf) || floors.get(cf).copied().unwrap_or(0) >= *max
+            });
             if covered {
                 // Retained while checkpoints link it; deleted at last ref.
                 let _ = mgr.unlink(&seg.engine_path);
@@ -6457,6 +6497,7 @@ impl DbImpl {
             dynamic_levels: std::sync::atomic::AtomicBool::new(dynamic_levels_from_env()),
             wal: Mutex::new(None),
             wal_sealed: Mutex::new(Vec::new()),
+            wal_flushed_floors: Mutex::new(HashMap::new()),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
         db.maybe_init_wal();
@@ -7804,7 +7845,21 @@ impl DbImpl {
                 if rec.sequence <= floor {
                     continue; // already durable in a flushed SST
                 }
-                let cf_data = db.lookup_cf_by_id(ColumnFamilyId(rec.cf_id))?;
+                // FRS-PHASE2-C3U4: a record whose CF is absent from the
+                // restored manifest belongs to a CF DROPPED before the
+                // barrier — its state is gone by definition; SKIP it. A
+                // mixed segment (live-CF tail + dropped-CF residue) stays
+                // linked for its live records; pre-fix this lookup ERRORED
+                // the whole restore on the first dropped-CF record.
+                let Ok(cf_data) = db.lookup_cf_by_id(ColumnFamilyId(rec.cf_id)) else {
+                    tracing::debug!(
+                        cf_id = rec.cf_id,
+                        seq = rec.sequence,
+                        "WAL replay: skipping record of CF absent from the \
+                         restored manifest (dropped before the barrier)"
+                    );
+                    continue;
+                };
                 cf_data.active_memtable().put_with_seq(
                     &rec.key,
                     rec.value.as_deref(),
@@ -9945,6 +10000,20 @@ impl DbImpl {
         }
 
         self.version_set.apply(&edit)?;
+
+        // FRS-PHASE2-C3U4: advance the CF's MONOTONIC flushed floor — every
+        // WAL record of this CF at or below `meta.max_sequence` is now
+        // durable in an installed SST. Unlike the live-SST-derived floor,
+        // this survives the SST being compacted away later (empty-CF
+        // regression would otherwise re-pin sealed WAL segments forever).
+        if meta.max_sequence.value() > 0 {
+            let mut floors = self
+                .wal_flushed_floors
+                .lock()
+                .expect("wal_flushed_floors lock poisoned");
+            let e = floors.entry(cf_data.handle().id().value()).or_insert(0);
+            *e = (*e).max(meta.max_sequence.value());
+        }
 
         // Pre-populate the SST reader cache so the first read doesn't pay
         // the open-file cost.
@@ -21005,6 +21074,175 @@ mod tests {
         assert!(report2.already_cached > 0, "{report2:?}");
 
         s3_assert_snapshot_state(&restored);
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-C3U4 gates: WAL GC precise pin release (Phase-5 residue)
+    // ------------------------------------------------------------------
+
+    /// C3U4 pin-release IT (dropped-CF): records of a CF dropped after a
+    /// checkpoint linked their segment must STOP pinning the segment's
+    /// working ref — pre-fix `floors.get(cf) == None` meant never-covered,
+    /// a forever pin. After the drop + a default-CF flush, the next
+    /// checkpoint's GC releases the working ref; the OLD checkpoint's link
+    /// keeps the bytes alive (restore resurrects the dropped CF from the
+    /// barrier-time manifest + tail) and its discard deletes the physical
+    /// exactly once. Also pins the C3U4 monotonic flushed-floor tracker.
+    #[test]
+    fn test_phase2_c3u4_dropped_cf_wal_pin_released() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        let other = db
+            .create_column_family(ColumnFamilyDescriptor::new("other"))
+            .unwrap();
+        *db.wal.lock().unwrap() =
+            Some(crate::wal::WalWriter::open(&wal_dir.path().join("db.wal")).unwrap());
+
+        // Segment 0 content: unflushed records of BOTH CFs.
+        for i in 0..10u32 {
+            db.put(&cf, format!("k{i:02}").as_bytes(), b"v1").unwrap();
+            db.put(&other, format!("o{i:02}").as_bytes(), b"w1").unwrap();
+        }
+        let snap = db.snapshot();
+        db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let seg0 = PathBuf::from("/db/wal/WAL-000000.seg");
+        let mgr = db.file_mapping().expect("attached").clone();
+        assert_eq!(
+            mgr.refs(seg0.to_str().unwrap()),
+            2,
+            "working + chk-1 hold segment 0"
+        );
+
+        // Drop `other`; flush the default CF so its records are covered.
+        db.drop_cf(&other).unwrap();
+        db.put(&cf, b"k-post", b"v2").unwrap();
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        // C3U4 monotonic floor advanced at flush-install.
+        assert!(
+            db.wal_flushed_floors
+                .lock()
+                .unwrap()
+                .get(&DEFAULT_CF_ID.value())
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "flush must advance the tracked per-CF floor"
+        );
+
+        // Next checkpoint's GC: segment 0 is now fully covered (default
+        // flushed, other DROPPED) — the working ref is released.
+        let snap2 = db.snapshot();
+        db.create_incremental_checkpoint_linked(&snap2, 2, 1).unwrap();
+        assert!(
+            !mgr.is_registered(&seg0),
+            "dropped-CF + flushed-default segment must lose its working ref"
+        );
+        assert_eq!(
+            mgr.refs(seg0.to_str().unwrap()),
+            1,
+            "only the chk-1 link remains"
+        );
+        let chk2 = PathBuf::from("/db/checkpoints/00000000000000000002");
+        assert!(
+            !mgr.is_registered(&chk2.join("WAL-000000.seg")),
+            "a released segment is not linked into new checkpoints"
+        );
+
+        // Restore from chk-1 (taken BEFORE the drop): both CFs byte-exact —
+        // the working-ref release must not affect older checkpoints.
+        let chk1 = PathBuf::from("/db/checkpoints/00000000000000000001");
+        let restored =
+            DbImpl::open_from_linked_checkpoint(fs.clone(), &chk1, "/restore-c3u4").unwrap();
+        let rcf = restored.default_cf();
+        let rother = restored
+            .column_family("other")
+            .expect("chk-1 manifest still carries the CF");
+        for i in 0..10u32 {
+            assert_eq!(
+                restored
+                    .get(&rcf, format!("k{i:02}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"v1"[..])
+            );
+            assert_eq!(
+                restored
+                    .get(&rother, format!("o{i:02}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"w1"[..])
+            );
+        }
+
+        // Discard chk-1: the last ref drains — physical gone exactly once.
+        db.discard_linked_checkpoint(1).unwrap();
+        assert!(
+            !fs.file_exists(&seg0).unwrap(),
+            "segment physical deleted when the last checkpoint ref drains"
+        );
+    }
+
+    /// C3U4 pin-release IT (mixed segment): a segment holding BOTH a live
+    /// CF's unflushed tail AND a dropped CF's residue stays linked (the
+    /// tail needs it) — and restore from that checkpoint SKIPS the
+    /// dropped-CF records instead of failing the whole restore on
+    /// `lookup_cf_by_id` (the pre-fix behavior).
+    #[test]
+    fn test_phase2_c3u4_mixed_segment_restore_skips_dropped_cf_records() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        let other = db
+            .create_column_family(ColumnFamilyDescriptor::new("other"))
+            .unwrap();
+        *db.wal.lock().unwrap() =
+            Some(crate::wal::WalWriter::open(&wal_dir.path().join("db.wal")).unwrap());
+
+        for i in 0..10u32 {
+            db.put(&cf, format!("k{i:02}").as_bytes(), b"v1").unwrap();
+            db.put(&other, format!("o{i:02}").as_bytes(), b"w1").unwrap();
+        }
+        // Drop `other` BEFORE the barrier; the default tail stays unflushed
+        // so the mixed segment MUST stay linked for the live records.
+        db.drop_cf(&other).unwrap();
+        db.put(&cf, b"k-tail", b"tail").unwrap();
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 3, 0).unwrap();
+        assert!(r.link_mode);
+        let chk3 = PathBuf::from("/db/checkpoints/00000000000000000003");
+        let mgr = db.file_mapping().expect("attached").clone();
+        assert!(
+            mgr.is_registered(&chk3.join("WAL-000000.seg")),
+            "mixed segment stays linked (live tail uncovered)"
+        );
+
+        // Restore: succeeds, live tail replayed, dropped-CF records skipped.
+        let restored =
+            DbImpl::open_from_linked_checkpoint(fs.clone(), &chk3, "/restore-c3u4b").unwrap();
+        assert!(
+            restored.column_family("other").is_none(),
+            "dropped CF must not resurrect from skipped records"
+        );
+        let rcf = restored.default_cf();
+        for i in 0..10u32 {
+            assert_eq!(
+                restored
+                    .get(&rcf, format!("k{i:02}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"v1"[..])
+            );
+        }
+        assert_eq!(
+            restored.get(&rcf, b"k-tail").unwrap().as_deref(),
+            Some(&b"tail"[..]),
+            "live tail replayed from the mixed segment"
+        );
     }
 
     // ------------------------------------------------------------------
