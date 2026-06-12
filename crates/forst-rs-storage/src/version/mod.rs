@@ -701,7 +701,22 @@ impl Version {
         upper: Option<&[u8]>,
         out: &mut Vec<&'a SstFileMeta>,
     ) {
-        let lower_bsearch_sound = &self.scan_index().lower_bsearch_sound;
+        self.overlap_walk_full(self.scan_index(), lower, upper, out)
+    }
+
+    /// Shared full-array walk for the cf-agnostic locator and the A2
+    /// single-CF-layout arm of [`Self::overlapping_ssts_in_range_for_cf`]
+    /// (which already holds the `ScanIndex` — passing it avoids a second
+    /// `OnceLock` load on the per-probe hot path).
+    #[inline]
+    fn overlap_walk_full<'a>(
+        &'a self,
+        idx: &ScanIndex,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        out: &mut Vec<&'a SstFileMeta>,
+    ) {
+        let lower_bsearch_sound = &idx.lower_bsearch_sound;
         for (lvl_idx, level) in self.levels.iter().enumerate() {
             let files = &level.files;
             // Binary-search the upper cut: first file whose smallest_key is
@@ -810,8 +825,9 @@ impl Version {
                 if *cf == cf_id {
                     // Every file is this CF's: the cf-agnostic walk IS the
                     // cf-filtered walk. Zero overhead vs pre-A2 (one enum
-                    // discriminant load + cf compare per scan).
-                    self.overlapping_ssts_in_range(lower, upper, out);
+                    // discriminant load + cf compare per scan; the already-
+                    // loaded ScanIndex is passed through).
+                    self.overlap_walk_full(idx, lower, upper, out);
                 }
             }
             CfLayout::Multi(level_views) => {
