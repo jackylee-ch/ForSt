@@ -5993,12 +5993,27 @@ impl DbImpl {
         if l0_files.is_empty() {
             return Ok(None);
         }
-        let l1_files: Vec<SstFileMeta> = version.levels[1]
+        // FRS-M1-OVERLAP-SCOPED (2026-06-12 sorted-run-discipline §4 M1):
+        // pick only the L1 files whose key range overlaps the L0 union
+        // range, expanded to a clean cut — NOT the CF's entire L1. Pre-M1
+        // every rollup rewrote the whole L1 (the measured 7.68× write-amp
+        // driver, design §2.3/W1). The level invariant is preserved: the
+        // output range equals the input union range, which is disjoint
+        // from the untouched L1 remainder (any L1 file overlapping the L0
+        // union — or, transitively, the growing selected union — is pulled
+        // in by the clean-cut expansion below, so no key in the inputs can
+        // also live in an unselected file). That same disjointness keeps
+        // the `is_bottommost` tombstone-drop rule sound: a tombstone's key
+        // lies inside the input union range, so it cannot shadow (and
+        // dropping it cannot resurrect) anything in the unselected
+        // remainder.
+        let cf_l1: Vec<SstFileMeta> = version.levels[1]
             .files
             .iter()
             .filter(|f| f.cf_id == cf_id)
             .cloned()
             .collect();
+        let l1_files: Vec<SstFileMeta> = overlap_scoped_clean_cut(&l0_files, cf_l1);
 
         // Gather input readers.
         let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> = Vec::new();
@@ -10559,6 +10574,72 @@ fn drain_l1_on() -> bool {
             Some("0") | Some("false") | Some("FALSE")
         )
     })
+}
+
+/// FRS-M1-OVERLAP-SCOPED (2026-06-12 sorted-run-discipline §4 M1): from the
+/// next-level files of ONE column family (`level_files`, mutually
+/// non-overlapping by the level invariant), select the subset whose key range
+/// overlaps the union key range of `upper_files` (the compaction's
+/// upper-level inputs), expanded to a CLEAN CUT.
+///
+/// "Clean cut" (RocksDB `ExpandInputsToCleanCut` parity): the selection is
+/// grown to a fixpoint — any file overlapping the union range of the
+/// selection so far is pulled in, so no key in the selected union range can
+/// also live in an unselected file. forst-rs SSTs are key-boundary split
+/// (FRS-LEVELED-COMPACTION), so for a healthy level the overlap subset is
+/// already boundary-aligned and the expansion loop is a safety net, not a
+/// rewrite source.
+///
+/// Returns the selected files in their original (smallest_key) order.
+/// `upper_files` must be non-empty.
+fn overlap_scoped_clean_cut(
+    upper_files: &[SstFileMeta],
+    level_files: Vec<SstFileMeta>,
+) -> Vec<SstFileMeta> {
+    debug_assert!(!upper_files.is_empty());
+    let mut lo: &[u8] = &upper_files[0].smallest_key;
+    let mut hi: &[u8] = &upper_files[0].largest_key;
+    for f in upper_files {
+        if f.smallest_key.as_slice() < lo {
+            lo = &f.smallest_key;
+        }
+        if f.largest_key.as_slice() > hi {
+            hi = &f.largest_key;
+        }
+    }
+    let mut selected = vec![false; level_files.len()];
+    // Fixpoint expansion: ranges only ever GROW, so each pass either selects
+    // at least one new file or terminates — O(n²) worst case over a level's
+    // file count (dozens), trivially cheap on the compaction worker.
+    loop {
+        let mut grew = false;
+        for (i, f) in level_files.iter().enumerate() {
+            if selected[i] {
+                continue;
+            }
+            // Inclusive-range overlap test (same predicate as the Ln→Ln+1
+            // picker in `compact_level_for_cf`).
+            if f.largest_key.as_slice() >= lo && f.smallest_key.as_slice() <= hi {
+                selected[i] = true;
+                if f.smallest_key.as_slice() < lo {
+                    lo = &f.smallest_key;
+                }
+                if f.largest_key.as_slice() > hi {
+                    hi = &f.largest_key;
+                }
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    level_files
+        .iter()
+        .zip(&selected)
+        .filter(|(_, &s)| s)
+        .map(|(f, _)| f.clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -15490,6 +15571,170 @@ mod tests {
         let cf = db.default_cf();
         let did = db.compact_once_for(&cf).unwrap();
         assert!(!did);
+    }
+
+    // --- FRS-M1-OVERLAP-SCOPED (sorted-run-discipline §4 M1 / §6 S1) ---
+
+    /// Test-only SstFileMeta with just the fields the picker reads.
+    fn meta_for_range(n: u64, smallest: &[u8], largest: &[u8]) -> SstFileMeta {
+        SstFileMeta::new_default_cf(
+            FileNumber(n),
+            1024,
+            smallest.to_vec(),
+            largest.to_vec(),
+            forst_rs_common::SequenceNumber(1),
+            forst_rs_common::SequenceNumber(2),
+            10,
+        )
+    }
+
+    #[test]
+    fn overlap_scoped_clean_cut_selects_only_overlap() {
+        let l0 = vec![meta_for_range(10, b"m", b"p")];
+        let l1 = vec![
+            meta_for_range(1, b"a", b"c"),
+            meta_for_range(2, b"d", b"n"), // overlaps [m,p]
+            meta_for_range(3, b"o", b"q"), // overlaps [m,p]
+            meta_for_range(4, b"r", b"z"),
+        ];
+        let picked = overlap_scoped_clean_cut(&l0, l1);
+        let nums: Vec<u64> = picked.iter().map(|f| f.file_number.value()).collect();
+        assert_eq!(nums, vec![2, 3]);
+    }
+
+    #[test]
+    fn overlap_scoped_clean_cut_disjoint_selects_none() {
+        let l0 = vec![meta_for_range(10, b"x", b"z")];
+        let l1 = vec![
+            meta_for_range(1, b"a", b"c"),
+            meta_for_range(2, b"d", b"f"),
+        ];
+        assert!(overlap_scoped_clean_cut(&l0, l1).is_empty());
+    }
+
+    #[test]
+    fn overlap_scoped_clean_cut_expands_to_fixpoint() {
+        // Pathological (invariant-violating) level: file 2 overlaps file 1
+        // but not the L0 range. The clean-cut expansion must pull it in
+        // transitively so no selected-union key can live in an unselected
+        // file.
+        let l0 = vec![meta_for_range(10, b"c", b"c")];
+        let l1 = vec![
+            meta_for_range(1, b"a", b"d"), // overlaps L0 [c,c] directly
+            meta_for_range(2, b"b", b"f"), // overlaps file 1's range
+            meta_for_range(3, b"e", b"g"), // overlaps file 2 only — transitive
+            meta_for_range(4, b"h", b"i"), // disjoint from the selected union
+        ];
+        let picked = overlap_scoped_clean_cut(&l0, l1);
+        let nums: Vec<u64> = picked.iter().map(|f| f.file_number.value()).collect();
+        assert_eq!(nums, vec![1, 2, 3]);
+    }
+
+    /// S1 falsifier (design §6.1 invariant property): an L0 rollup whose
+    /// range is disjoint from part of L1 must leave that L1 remainder
+    /// UNTOUCHED (same file numbers — no rewrite), keep the level
+    /// non-overlapping, and keep every key readable.
+    #[test]
+    fn m1_rollup_preserves_untouched_l1_remainder() {
+        let db = open();
+        let cf = db.default_cf();
+        // Seed L1 with an "a"-range file.
+        for i in 0..50u32 {
+            db.put(&cf, format!("a{i:04}").as_bytes(), b"v1").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+        let v = db.version_set.current();
+        let a_files: Vec<u64> = v.levels[1]
+            .files
+            .iter()
+            .map(|f| f.file_number.value())
+            .collect();
+        assert!(!a_files.is_empty());
+
+        // Rollup a DISJOINT "z"-range L0: must not rewrite the a-file(s).
+        for i in 0..50u32 {
+            db.put(&cf, format!("z{i:04}").as_bytes(), b"v2").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+
+        let v = db.version_set.current();
+        let l1_now: Vec<&SstFileMeta> = v.levels[1].files.iter().collect();
+        for n in &a_files {
+            assert!(
+                l1_now.iter().any(|f| f.file_number.value() == *n),
+                "untouched a-range L1 file {n} was rewritten by a disjoint rollup"
+            );
+        }
+        // Level invariant: pairwise non-overlapping (per CF).
+        for (i, f1) in l1_now.iter().enumerate() {
+            for f2 in l1_now.iter().skip(i + 1) {
+                assert!(
+                    f1.largest_key < f2.smallest_key || f2.largest_key < f1.smallest_key,
+                    "L1 overlap between {} and {}",
+                    f1.file_number,
+                    f2.file_number
+                );
+            }
+        }
+        // Every key readable.
+        for i in 0..50u32 {
+            assert_eq!(
+                db.get(&cf, format!("a{i:04}").as_bytes()).unwrap().as_deref(),
+                Some(b"v1" as &[u8])
+            );
+            assert_eq!(
+                db.get(&cf, format!("z{i:04}").as_bytes()).unwrap().as_deref(),
+                Some(b"v2" as &[u8])
+            );
+        }
+    }
+
+    /// S1: an OVERLAPPING rollup must still consume the overlapped L1 file
+    /// (subset picking must not under-select) and produce the merged value.
+    #[test]
+    fn m1_rollup_consumes_overlapping_l1() {
+        let db = open();
+        let cf = db.default_cf();
+        for i in 0..50u32 {
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"old").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+        let v = db.version_set.current();
+        let old_files: Vec<u64> = v.levels[1]
+            .files
+            .iter()
+            .map(|f| f.file_number.value())
+            .collect();
+
+        // Overwrite a subset — overlapping range.
+        for i in 20..30u32 {
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"new").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        db.compact_l0(&cf).unwrap().unwrap();
+
+        let v = db.version_set.current();
+        // The overlapped old file must be gone (consumed by the rollup).
+        for f in &v.levels[1].files {
+            assert!(
+                !old_files.contains(&f.file_number.value())
+                    || !(f.smallest_key.as_slice() <= b"k0029".as_slice()
+                        && f.largest_key.as_slice() >= b"k0020".as_slice()),
+                "overlapped L1 file {} survived the rollup",
+                f.file_number
+            );
+        }
+        for i in 0..50u32 {
+            let want: &[u8] = if (20..30).contains(&i) { b"new" } else { b"old" };
+            assert_eq!(
+                db.get(&cf, format!("k{i:04}").as_bytes()).unwrap().as_deref(),
+                Some(want),
+                "key k{i:04}"
+            );
+        }
     }
 
     // --- W15 CompactionFilter integration ---
