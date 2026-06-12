@@ -151,6 +151,10 @@ impl CompactionFilter for TtlCompactionFilter {
         match op_type {
             // Never drop tombstones — their presence shadows older versions.
             OpType::Delete | OpType::SingleDelete => CompactionDecision::Keep,
+            // FRS-WA-V2a-1: pointer bytes carry no inspectable timestamp —
+            // value-inspecting filters and KV separation are mutually
+            // exclusive per CF (V2 policy); Keep is the never-wrong arm.
+            OpType::BlobRef => CompactionDecision::Keep,
             OpType::Put | OpType::Merge => match value {
                 Some(v) if self.is_expired(v) => CompactionDecision::Discard,
                 _ => CompactionDecision::Keep,
@@ -432,6 +436,9 @@ impl CompactionFilter for FlinkTtlCompactionFilter {
             // Tombstones are ALWAYS kept — dropping them would resurrect
             // older Puts shadowed at lower levels.
             OpType::Delete | OpType::SingleDelete => CompactionDecision::Keep,
+            // FRS-WA-V2a-1: see TtlCompactionFilter — uninspectable pointer
+            // bytes are always kept (separation disabled for filtered CFs).
+            OpType::BlobRef => CompactionDecision::Keep,
             OpType::Put | OpType::Merge => match (self.state_type, value) {
                 (TtlStateType::List, Some(v)) => self.filter_list_value(v, value_out),
                 (_, Some(v)) if self.is_expired(v) => CompactionDecision::Discard,

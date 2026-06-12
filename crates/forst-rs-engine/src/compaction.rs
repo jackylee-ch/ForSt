@@ -1178,7 +1178,10 @@ impl CompactionJob {
                     )?;
                     *emitted += 1;
                     match entry.op_type {
-                        OpType::Put | OpType::Delete | OpType::SingleDelete => break,
+                        // FRS-WA-V2a-1: BlobRef is Put-like — a terminal.
+                        OpType::Put | OpType::Delete | OpType::SingleDelete | OpType::BlobRef => {
+                            break
+                        }
                         OpType::Merge => continue,
                     }
                 }
@@ -1317,7 +1320,10 @@ impl CompactionJob {
                 )?;
                 *emitted += 1;
             }
-            OpType::Put => {
+            // FRS-WA-V2a-1: BlobRef shares Put's newest-wins semantics; the
+            // op byte and pointer bytes pass through verbatim (`newest.
+            // op_type as u8`), so the output entry still dereferences.
+            OpType::Put | OpType::BlobRef => {
                 // Emit the Put (most recent value). Drop every older version
                 // for this key since they're shadowed.
                 writer.add(
@@ -1366,6 +1372,16 @@ impl CompactionJob {
                         OpType::Delete | OpType::SingleDelete => {
                             stop_on_delete = true;
                             break;
+                        }
+                        // FRS-WA-V2a-1: a BlobRef base under a Merge chain
+                        // violates P12 (merge CFs are exempt from KV
+                        // separation) — full_merge over pointer bytes would
+                        // corrupt. Surface loudly, mirroring the
+                        // missing-operand check above.
+                        OpType::BlobRef => {
+                            return Err(ForstError::corruption(
+                                "compaction: BlobRef base under a merge chain                                  (merge CFs are exempt from KV separation)",
+                            ));
                         }
                     }
                 }

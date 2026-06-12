@@ -46,6 +46,7 @@ use crate::error::{ForstError, ForstResult};
 /// - Put = 1 (kTypeValue)
 /// - Merge = 2 (kTypeMerge)
 /// - SingleDelete = 7 (kTypeSingleDeletion)
+/// - BlobRef = 17 (kTypeBlobIndex)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OpType {
@@ -58,6 +59,18 @@ pub enum OpType {
     Merge = 2,
     /// Optimised delete that assumes at most one prior `Put` exists.
     SingleDelete = 7,
+    /// FRS-WA-V2 (KV separation, write-path redesign survey §3.1): the
+    /// entry's value bytes are an encoded `ValuePointer` into an
+    /// append-only value-log segment, NOT the user value. Visibility,
+    /// shadowing and compaction semantics are IDENTICAL to [`OpType::Put`]
+    /// (it *is* a put whose payload lives elsewhere); the read path
+    /// dereferences the pointer only AFTER the MVCC visibility decision.
+    /// Merge chains never contain `BlobRef` operands or bases (P12:
+    /// merge-operand CFs are exempt from separation) — readers treat one
+    /// under a merge chain as corruption. Discriminant matches RocksDB
+    /// `kTypeBlobIndex` (0x11). V2a-1: no writer emits this yet
+    /// (groundwork; flag-gated write path lands with the vlog wiring).
+    BlobRef = 17,
 }
 
 impl fmt::Display for OpType {
@@ -67,6 +80,7 @@ impl fmt::Display for OpType {
             OpType::Delete => write!(f, "Delete"),
             OpType::SingleDelete => write!(f, "SingleDelete"),
             OpType::Merge => write!(f, "Merge"),
+            OpType::BlobRef => write!(f, "BlobRef"),
         }
     }
 }
@@ -85,6 +99,7 @@ impl OpType {
             1 => Some(OpType::Put),
             2 => Some(OpType::Merge),
             7 => Some(OpType::SingleDelete),
+            17 => Some(OpType::BlobRef),
             _ => None,
         }
     }

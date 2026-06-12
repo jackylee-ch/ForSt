@@ -895,6 +895,16 @@ impl VectorizedMemTable {
                         ));
                     }
                 },
+                // FRS-WA-V2a-1: KV separation never applies to merge CFs
+                // (P12 — operands must be bytes) and never writes pointer
+                // entries into a MEMTABLE (separation happens at flush).
+                // Either way a BlobRef here is a contract violation.
+                OpType::BlobRef => {
+                    return Err(forst_rs_common::ForstError::corruption(
+                        "collect_merge_operands: BlobRef under a merge chain \
+                         (merge CFs are exempt from KV separation)",
+                    ));
+                }
             }
         }
         // Exhausted every visible version without a terminal — continue older tiers.
@@ -1004,6 +1014,10 @@ impl VectorizedMemTable {
                 SinkGetOutcome::HitTombstone
             }
             OpType::Merge => SinkGetOutcome::NeedsFullPath,
+            // FRS-WA-V2a-1: memtables never hold pointer entries (separation
+            // happens at flush). Defer to the full path, whose Result
+            // channel surfaces the contract violation as corruption.
+            OpType::BlobRef => SinkGetOutcome::NeedsFullPath,
             OpType::Put => {
                 // Zero-extra-alloc fast path: borrow the value straight from
                 // the columnar `value_arena` (any size — no INLINE_THRESHOLD cliff).
