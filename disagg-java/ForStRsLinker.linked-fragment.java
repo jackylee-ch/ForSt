@@ -18,6 +18,7 @@ private final MethodHandle frsDbOpenFromLinkedCheckpointInstant;
 private final MethodHandle frsDbOpenFromLinkedCheckpointInstantRemote;
 private final MethodHandle frsDbAdoptedResidual;
 private final MethodHandle frsDbAttachWal;
+private final MethodHandle frsDbSweepAbandonedCheckpoints;
 
 // ---------------------------------------------------------------------------
 // B. Constructor binds
@@ -99,6 +100,19 @@ this.frsDbAttachWal =
                         ValueLayout.JAVA_INT,
                         ValueLayout.ADDRESS, // db
                         ValueLayout.ADDRESS)); // wal_path (c_char*)
+
+// Startup sweep (design §9 D5 crash window a): reaps chk-namespace links
+// for checkpoint ids not in the JM-live set. Call at restore/open time.
+this.frsDbSweepAbandonedCheckpoints =
+        bind(
+                "frs_db_sweep_abandoned_checkpoints",
+                FunctionDescriptor.of(
+                        ValueLayout.JAVA_INT,
+                        ValueLayout.ADDRESS, // db
+                        ValueLayout.ADDRESS, // live_ids (u64*, nullable when count==0)
+                        ValueLayout.JAVA_LONG, // live_count (size_t)
+                        ValueLayout.ADDRESS, // out_unlinked (u64*, nullable)
+                        ValueLayout.ADDRESS)); // out_physicals_deleted (u64*, nullable)
 
 // ---------------------------------------------------------------------------
 // C. Wrapper methods
@@ -272,6 +286,38 @@ public long dbAdoptedResidual(Arena arena, FrsDb db) {
     }
     check(rc, "frs_db_adopted_residual");
     return out.get(ValueLayout.JAVA_LONG, 0);
+}
+
+/**
+ * Startup sweep reaping ABANDONED link-mode checkpoint namespaces (crash window a: links
+ * durable in the mapping journal for an id the JM never acked). {@code liveIds} is the
+ * JM-live checkpoint id set; everything else under the chk namespace is unlinked and its
+ * leftover dir removed (physicals survive on working/live refs). Idempotent. Call during
+ * restore/open, BEFORE the first linked checkpoint. Returns the number of links reaped.
+ */
+public long dbSweepAbandonedCheckpoints(Arena arena, FrsDb db, long[] liveIds) {
+    MemorySegment ids =
+            liveIds.length == 0
+                    ? MemorySegment.NULL
+                    : arena.allocateFrom(ValueLayout.JAVA_LONG, liveIds);
+    MemorySegment unlinked = arena.allocate(ValueLayout.JAVA_LONG);
+    int rc;
+    try {
+        rc =
+                (int)
+                        frsDbSweepAbandonedCheckpoints.invokeExact(
+                                db.handle(),
+                                ids,
+                                (long) liveIds.length,
+                                unlinked,
+                                MemorySegment.NULL);
+    } catch (Throwable t) {
+        throw new FrsBackendException(
+                FrsStatus.PANIC,
+                "frs_db_sweep_abandoned_checkpoints threw: " + t.getMessage());
+    }
+    check(rc, "frs_db_sweep_abandoned_checkpoints");
+    return unlinked.get(ValueLayout.JAVA_LONG, 0);
 }
 
 /**

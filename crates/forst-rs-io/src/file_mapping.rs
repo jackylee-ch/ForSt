@@ -716,6 +716,41 @@ impl FileMappingManager {
             .map(|e| e.ownership)
     }
 
+    /// FRS-PHASE2-C2U2: whether a physical key carries a JM-discard
+    /// tombstone (delete-on-drain). Restore-side guard: an instant restore
+    /// must refuse to adopt a tombstoned physical — its bytes are scheduled
+    /// for deletion the moment the surviving refs drain.
+    pub fn is_tombstoned(&self, physical_key: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("lock poisoned")
+            .state
+            .physical
+            .get(physical_key)
+            .map(|e| e.tombstoned)
+            .unwrap_or(false)
+    }
+
+    /// FRS-PHASE2-C2U2 (design §9 D5 crash-window a): every CURRENTLY-mapped
+    /// logical path strictly under `prefix`, sorted for determinism. The
+    /// startup sweep uses this to enumerate chk-namespace links
+    /// (`<db_path>/checkpoints/<id>/...`) straight from the journal-replayed
+    /// state — which is exactly what survives a crash BETWEEN
+    /// `sync_journal()` and the blob write (links exist, no blob, JM never
+    /// acked the id).
+    pub fn logical_paths_under(&self, prefix: &Path) -> Vec<PathBuf> {
+        let inner = self.inner.lock().expect("lock poisoned");
+        let mut out: Vec<PathBuf> = inner
+            .state
+            .logical
+            .keys()
+            .filter(|p| p.starts_with(prefix) && p.as_path() != prefix)
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
     /// Number of live logical mappings.
     pub fn len(&self) -> usize {
         self.inner.lock().expect("lock poisoned").state.logical.len()
@@ -935,6 +970,78 @@ impl MappingSnapshotView {
     /// True when the snapshot carries no logical mappings.
     pub fn is_empty(&self) -> bool {
         self.logical.is_empty()
+    }
+}
+
+/// FRS-PHASE2-C2U2 (design §2.4 "journal tail replayed on restore"): a
+/// READ-ONLY view over a mapping journal's CURRENT state — full replay,
+/// including every record appended AFTER the snapshot that a checkpoint blob
+/// froze in its trailer. The restore side consults it (when the source
+/// journal is reachable on the engine FS) for the truths the blob cannot
+/// carry: post-checkpoint JM-discard **tombstones** (a tombstoned physical
+/// must never be adopted) and post-checkpoint link/unlink churn.
+///
+/// Never appends — loading this view cannot mutate the source journal (the
+/// restoring process does not own it).
+pub struct MappingJournalView {
+    state: MappingState,
+}
+
+impl MappingJournalView {
+    /// Replays the journal at `journal_path` into a read-only view. Returns
+    /// `Ok(None)` when no journal exists (legacy / relocated checkpoint —
+    /// callers fall back to the blob snapshot alone). A truncated tail
+    /// record (crash mid-append) is tolerated exactly like
+    /// [`FileMappingManager::new`]; mid-stream corruption is an error.
+    pub fn load(fs: &dyn FileSystem, journal_path: &Path) -> ForstResult<Option<Self>> {
+        if !fs.file_exists(journal_path)? {
+            return Ok(None);
+        }
+        let bytes = read_all(fs, journal_path)?;
+        let mut state = MappingState::default();
+        if bytes.len() >= 6 {
+            if &bytes[..4] != JOURNAL_MAGIC {
+                return Err(ForstError::corruption("mapping journal bad magic"));
+            }
+            let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+            if version != JOURNAL_VERSION {
+                return Err(ForstError::corruption(format!(
+                    "mapping journal unsupported version {version}"
+                )));
+            }
+            replay_records(&mut state, &bytes[6..])?;
+        }
+        Ok(Some(Self { state }))
+    }
+
+    /// Resolves a logical path to its physical key in the journal-current
+    /// state.
+    pub fn resolve(&self, logical: &Path) -> Option<&str> {
+        self.state.logical.get(logical).map(String::as_str)
+    }
+
+    /// Whether `logical` is mapped in the journal-current state.
+    pub fn is_registered(&self, logical: &Path) -> bool {
+        self.state.logical.contains_key(logical)
+    }
+
+    /// Whether `physical_key` carries a live JM-discard tombstone.
+    pub fn is_tombstoned(&self, physical_key: &str) -> bool {
+        self.state
+            .physical
+            .get(physical_key)
+            .map(|e| e.tombstoned)
+            .unwrap_or(false)
+    }
+
+    /// Number of live logical mappings in the view.
+    pub fn len(&self) -> usize {
+        self.state.logical.len()
+    }
+
+    /// True when the view carries no logical mappings.
+    pub fn is_empty(&self) -> bool {
+        self.state.logical.is_empty()
     }
 }
 
@@ -1681,5 +1788,103 @@ mod tests {
         assert_eq!(report.reaped, vec!["/db/000040.sst".to_string()]);
         assert!(!fs.file_exists(Path::new("/db/000040.sst")).unwrap());
         assert!(fs.file_exists(Path::new("/db/000041.sst")).unwrap());
+    }
+
+    // --- FRS-PHASE2-C2U2: journal tail view + chk-namespace enumeration ----
+
+    #[test]
+    fn test_journal_view_absent_journal_is_none() {
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        assert!(MappingJournalView::load(fs.as_ref(), Path::new("/nope/MAPPING.journal"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// The view replays the journal's CURRENT state — including records
+    /// appended after any snapshot point: links, unlinks AND tombstones.
+    #[test]
+    fn test_journal_view_replays_current_state_with_tombstones() {
+        let fs = fs_with_file("/db/000001.sst", b"a");
+        write_file(fs.as_ref(), "/db/000002.sst", b"b");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000001.sst"), "/db/000001.sst", 1)
+            .unwrap();
+        m.register(Path::new("/db/000002.sst"), "/db/000002.sst", 1)
+            .unwrap();
+        m.link(Path::new("/db/000001.sst"), Path::new("/db/checkpoints/00000000000000000001/000001.sst"))
+            .unwrap();
+        // Post-"snapshot" tail: unlink one working ref + tombstone the other.
+        m.unlink(Path::new("/db/000002.sst")).unwrap();
+        assert!(!m.tombstone("/db/000001.sst").unwrap(), "refs held → deferred");
+        m.sync_journal().unwrap();
+
+        let v = MappingJournalView::load(fs.as_ref(), Path::new("/db/MAPPING.journal"))
+            .unwrap()
+            .expect("journal exists");
+        assert_eq!(v.resolve(Path::new("/db/000001.sst")), Some("/db/000001.sst"));
+        assert_eq!(
+            v.resolve(Path::new("/db/checkpoints/00000000000000000001/000001.sst")),
+            Some("/db/000001.sst")
+        );
+        assert!(!v.is_registered(Path::new("/db/000002.sst")), "unlink replayed");
+        assert!(v.is_tombstoned("/db/000001.sst"), "tombstone visible in tail");
+        assert!(!v.is_tombstoned("/db/000002.sst"));
+        assert_eq!(v.len(), 2);
+        // Read-only: loading the view never mutates the journal.
+        let before = read_all(fs.as_ref(), Path::new("/db/MAPPING.journal")).unwrap();
+        let _ = MappingJournalView::load(fs.as_ref(), Path::new("/db/MAPPING.journal")).unwrap();
+        let after = read_all(fs.as_ref(), Path::new("/db/MAPPING.journal")).unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// A torn tail record (crash mid-append) is tolerated exactly like
+    /// `FileMappingManager::new`: the clean prefix replays, the tail drops.
+    #[test]
+    fn test_journal_view_tolerates_torn_tail() {
+        let fs = fs_with_file("/db/000001.sst", b"a");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000001.sst"), "/db/000001.sst", 1)
+            .unwrap();
+        m.sync_journal().unwrap();
+        // Append a torn frame: a length prefix promising more than exists.
+        let mut bytes = read_all(fs.as_ref(), Path::new("/db/MAPPING.journal")).unwrap();
+        bytes.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0xAA]); // frame_len=255, 1 byte present
+        write_file(fs.as_ref(), "/db/MAPPING.journal", &bytes);
+
+        let v = MappingJournalView::load(fs.as_ref(), Path::new("/db/MAPPING.journal"))
+            .unwrap()
+            .expect("journal exists");
+        assert_eq!(v.len(), 1, "clean prefix replayed, torn tail dropped");
+        assert!(v.is_registered(Path::new("/db/000001.sst")));
+    }
+
+    #[test]
+    fn test_logical_paths_under_filters_and_sorts() {
+        let fs = fs_with_file("/db/000001.sst", b"a");
+        write_file(fs.as_ref(), "/db/000002.sst", b"b");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000002.sst"), "/db/000002.sst", 1)
+            .unwrap();
+        m.register(Path::new("/db/000001.sst"), "/db/000001.sst", 1)
+            .unwrap();
+        let chk = Path::new("/db/checkpoints/00000000000000000007");
+        m.link(Path::new("/db/000001.sst"), &chk.join("000001.sst"))
+            .unwrap();
+        m.link(Path::new("/db/000002.sst"), &chk.join("000002.sst"))
+            .unwrap();
+
+        let under_root = m.logical_paths_under(Path::new("/db/checkpoints"));
+        assert_eq!(
+            under_root,
+            vec![chk.join("000001.sst"), chk.join("000002.sst")],
+            "chk namespace only, sorted"
+        );
+        // The prefix itself is never returned; working paths are excluded.
+        assert!(m
+            .logical_paths_under(Path::new("/db"))
+            .contains(&PathBuf::from("/db/000001.sst")));
+        assert!(m
+            .logical_paths_under(Path::new("/elsewhere"))
+            .is_empty());
     }
 }

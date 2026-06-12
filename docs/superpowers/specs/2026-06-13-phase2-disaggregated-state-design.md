@@ -840,6 +840,42 @@ discard (unlinked==linked count, physicals_deleted==0 under working refs,
 retry NOT_FOUND, null-arg paths). Suites: engine 349 (348+1 ignored)/0,
 io 231/0, storage 442/0, ffi green; clippy 0.
 
+### Mapping-journal tail replay on restore + abandoned-chk startup sweep (landed 2026-06-13, cycle 2 unit 2)
+
+Built — closes the two recorded Stage-3 residue items (§2.4 tail replay;
+§9 D5 crash window a):
+
+- **`MappingJournalView`** (io) — READ-ONLY full replay of a mapping
+  journal (never appends; torn tail tolerated like `new`). Carries the
+  truths a blob-frozen trailer cannot: post-checkpoint **tombstones** and
+  link/unlink churn. + `FileMappingManager::logical_paths_under` /
+  `is_tombstoned` (additive only — write-amp agent coordination intact).
+- **Tail consult on instant restore**: `open_from_linked_checkpoint_instant`
+  loads the SOURCE journal (`<src_db>/MAPPING.journal`, derived from the
+  D1 layout) when reachable and (a) REFUSES to adopt a physical carrying a
+  JM-discard tombstone (it evaporates when surviving refs drain — silent
+  state loss otherwise), (b) corruption-gates a journal-vs-blob resolution
+  mismatch on the immutable chk namespace. Journal absent ⇒ blob-only
+  fallback, byte-identical to Stage-3 behavior.
+- **`DbImpl::sweep_abandoned_checkpoint_links(live_ids)`** — the startup
+  sweep: enumerates chk-namespace links straight from the journal-replayed
+  state (window a has NO blob), unlinks every id not in the JM-live set,
+  removes leftover chk dirs; physicals survive on working/live-checkpoint
+  refs; idempotent. FFI: `frs_db_sweep_abandoned_checkpoints` (+ linker
+  fragment binding + README D-J1 wiring already pointed at it).
+
+Gates green (2026-06-13): io UTs ×4 (view None/current-state-with-
+tombstones/torn-tail/paths-under sorted+filtered; read-only proof —
+journal bytes identical before/after load); engine crash-point ITs ×2 —
+sweep IT covers BOTH abandonment shapes (window a journal-only links via
+direct mapping ops + window b blob-written-never-acked), live-id
+protection, physicals_deleted==0 under working refs, idempotence,
+live-checkpoint restore byte-exact post-sweep, discard-after-sweep sane;
+tombstone IT proves refusal (loud, names the tombstone) + blob-only
+fallback when the journal is unreachable. FFI IT (sweep through the C
+ABI: reap count, idempotence, live-set protection, null-arg). Suites:
+engine 350/0, io 235/0, storage 442/0, ffi ITs 4/0; clippy 0.
+
 ---
 
 ## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)

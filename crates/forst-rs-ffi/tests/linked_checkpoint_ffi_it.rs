@@ -319,3 +319,67 @@ fn discard_linked_checkpoint_reports_and_is_not_retriable() {
         assert_eq!(frs_db_close(db), FRS_STATUS_OK);
     }
 }
+
+/// Startup sweep (D5 crash window a) through the C ABI: an abandoned
+/// link-mode checkpoint (blob lost; links durable in the journal) is reaped
+/// when its id is not in the JM-live set; working refs keep every physical.
+#[test]
+fn sweep_abandoned_checkpoints_reaps_journal_only_links() {
+    unsafe {
+        let dir = TempDir::new().unwrap();
+        let (db, cf) = open_local(&dir);
+        for i in 0..10u32 {
+            put_kv(db, cf, &format!("k{i}"), &format!("v{i}"));
+        }
+        let (mut result, ckpt_dir) = linked_ckpt(db, 3, 0);
+        let linked_count = (*result.linked_new_ssts).count as u64;
+
+        // Simulate the crash window: the blob never made it / the id was
+        // never acked — the links live only in the mapping journal.
+        std::fs::remove_file(ckpt_dir.join("CHECKPOINT.blob")).unwrap();
+
+        let mut unlinked: u64 = 0;
+        let mut deleted: u64 = 99;
+        assert_eq!(
+            frs_db_sweep_abandoned_checkpoints(
+                db,
+                ptr::null(),
+                0,
+                &mut unlinked,
+                &mut deleted
+            ),
+            FRS_STATUS_OK
+        );
+        assert_eq!(unlinked, linked_count, "abandoned chk-3 links reaped");
+        assert_eq!(deleted, 0, "working refs hold every physical");
+        // The working DB still reads its state.
+        assert_get(db, cf, "k0", "v0");
+
+        // Idempotent.
+        assert_eq!(
+            frs_db_sweep_abandoned_checkpoints(db, ptr::null(), 0, &mut unlinked, &mut deleted),
+            FRS_STATUS_OK
+        );
+        assert_eq!(unlinked, 0);
+
+        // Live-set protection: a fresh checkpoint id=4 survives a sweep that
+        // lists it live.
+        let (mut r4, _d4) = linked_ckpt(db, 4, 0);
+        let live = [4u64];
+        assert_eq!(
+            frs_db_sweep_abandoned_checkpoints(
+                db,
+                live.as_ptr(),
+                1,
+                &mut unlinked,
+                &mut deleted
+            ),
+            FRS_STATUS_OK
+        );
+        assert_eq!(unlinked, 0, "live id untouched");
+
+        assert_eq!(frs_db_linked_checkpoint_result_free(&mut result), FRS_STATUS_OK);
+        assert_eq!(frs_db_linked_checkpoint_result_free(&mut r4), FRS_STATUS_OK);
+        assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+    }
+}

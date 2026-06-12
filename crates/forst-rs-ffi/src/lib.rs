@@ -4947,6 +4947,57 @@ pub unsafe extern "C" fn frs_db_attach_wal(db: FrsDb, wal_path: *const c_char) -
     })
 }
 
+/// Startup sweep reaping ABANDONED link-mode checkpoint namespaces (design
+/// §9 D5 crash window a): chk-k links durable in the mapping journal for a
+/// checkpoint id NOT in `live_ids` (the JM-live set; may be null when
+/// `live_count` is 0) are unlinked and their leftover chk dirs removed.
+/// Physicals survive while the working dir or live checkpoints reference
+/// them. Idempotent. Call at restore/open, BEFORE new linked checkpoints.
+///
+/// Requires a file mapping (a prior linked checkpoint / instant restore
+/// attached one) — INVALID_ARGUMENT otherwise.
+///
+/// # SAFETY
+/// - `db` must be a live handle; `live_ids` must point to `live_count` u64s
+///   (or be null when `live_count` is 0); out pointers may be null.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_sweep_abandoned_checkpoints(
+    db: FrsDb,
+    live_ids: *const u64,
+    live_count: usize,
+    out_unlinked: *mut u64,
+    out_physicals_deleted: *mut u64,
+) -> i32 {
+    guarded(|| {
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if live_count > 0 && live_ids.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        if live_count > MAX_BATCH_COUNT {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        let live: &[u64] = if live_count == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(live_ids, live_count)
+        };
+        match db.sweep_abandoned_checkpoint_links(live) {
+            Ok(report) => {
+                if !out_unlinked.is_null() {
+                    *out_unlinked = report.unlinked as u64;
+                }
+                if !out_physicals_deleted.is_null() {
+                    *out_physicals_deleted = report.physicals_deleted as u64;
+                }
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 9. State import / export migration (B-Prod-P10, spec §6g)
 //

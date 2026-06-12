@@ -7368,6 +7368,24 @@ impl DbImpl {
         let view = forst_rs_io::MappingSnapshotView::decode(mapping)?;
         let snap = deserialize_snapshot(base)?;
 
+        // FRS-PHASE2-C2U2 (design §2.4 journal-tail replay on restore): the
+        // blob trailer froze the mapping AT the barrier; the SOURCE journal
+        // (next to the source working dir, `<src_db>/MAPPING.journal`) holds
+        // every record appended SINCE — most critically JM-discard
+        // tombstones. When reachable on the engine FS, consult its CURRENT
+        // state: a tombstoned physical is scheduled for deletion the moment
+        // its surviving refs drain, so adopting it would hand the restored
+        // engine state that evaporates underneath it. Absent journal (legacy
+        // layout / relocated checkpoint) ⇒ blob-snapshot-only, as before.
+        let source_journal = ckpt_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|src_db| src_db.join("MAPPING.journal"));
+        let tail = match &source_journal {
+            Some(j) => forst_rs_io::MappingJournalView::load(fs.as_ref(), j)?,
+            None => None,
+        };
+
         let target = PathBuf::from(target_dir);
         fs.create_dir_all(&target)?;
         let mgr = Arc::new(forst_rs_io::FileMappingManager::new(
@@ -7390,6 +7408,33 @@ impl DbImpl {
                     linked.display()
                 ))
             })?;
+            if let Some(tail) = &tail {
+                // Journal-current truths the frozen blob cannot carry:
+                if tail.is_tombstoned(physical) {
+                    return Err(ForstError::invalid_argument(format!(
+                        "open_from_linked_checkpoint_instant: physical object {} \
+                         (for linked path {}) carries a JM-discard tombstone — \
+                         refusing to adopt state scheduled for deletion",
+                        physical,
+                        linked.display()
+                    )));
+                }
+                // Paranoia gate: a linked chk path is immutable after the
+                // barrier; the live journal disagreeing on its physical
+                // means the namespace was reused/corrupted.
+                if let Some(current) = tail.resolve(&linked) {
+                    if current != physical {
+                        return Err(ForstError::corruption(format!(
+                            "open_from_linked_checkpoint_instant: linked path {} \
+                             resolves to {} in the source journal but {} in the \
+                             blob snapshot — checkpoint namespace corrupted",
+                            linked.display(),
+                            current,
+                            physical
+                        )));
+                    }
+                }
+            }
             // `adopt` verifies the physical exists (loud NotFound on a
             // missing object — no silent empty state) and enters NotOwned.
             mgr.adopt(&canonical, physical)?;
@@ -11905,6 +11950,74 @@ impl DbImpl {
         }
         mgr.sync_journal()?;
         self.fs.delete_dir(&dir, true)?;
+        Ok(report)
+    }
+
+    /// FRS-PHASE2-C2U2 (design §9 D5 crash window a): startup sweep reaping
+    /// ABANDONED link-mode checkpoint namespaces. A crash between the
+    /// link-mode barrier's `sync_journal()` and the blob write (or between
+    /// the blob write and the JM ack) leaves `<db_path>/checkpoints/<k>/`
+    /// links durable in the mapping journal for a checkpoint id the JM never
+    /// acked — nobody will ever call [`Self::discard_linked_checkpoint`] for
+    /// it, so its refs leak (bounded, leak-over-data-loss per design R1).
+    ///
+    /// The sweep enumerates chk-namespace links straight from the
+    /// journal-replayed mapping state (NOT from blobs — crash window a has
+    /// no blob), and for every checkpoint id NOT in `live_checkpoint_ids`
+    /// (the JM-live set supplied by the caller) drops the links and removes
+    /// the leftover chk dir. Physical objects survive while the working dir
+    /// or any live checkpoint still references them — a physical is deleted
+    /// exactly once, when its last reference drains, same as a discard.
+    ///
+    /// Idempotent: a second sweep finds nothing. Call at restore/open time,
+    /// BEFORE new link-mode checkpoints are taken.
+    pub fn sweep_abandoned_checkpoint_links(
+        &self,
+        live_checkpoint_ids: &[u64],
+    ) -> ForstResult<LinkedCheckpointDiscard> {
+        let mgr = self.file_mapping.get().ok_or_else(|| {
+            ForstError::invalid_argument(
+                "sweep_abandoned_checkpoint_links: no file mapping attached",
+            )
+        })?;
+        let root = self.db_path.join("checkpoints");
+        let mut report = LinkedCheckpointDiscard::default();
+        let mut reaped_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for linked in mgr.logical_paths_under(&root) {
+            // Layout (design §9 D1): <root>/<%020d checkpoint_id>/<basename>.
+            let Ok(rel) = linked.strip_prefix(&root) else {
+                continue;
+            };
+            let mut comps = rel.components();
+            let Some(std::path::Component::Normal(id_os)) = comps.next() else {
+                continue;
+            };
+            let Some(id) = id_os.to_str().and_then(|s| s.parse::<u64>().ok()) else {
+                continue; // foreign namespace — never touch what we can't attribute
+            };
+            if live_checkpoint_ids.contains(&id) {
+                continue;
+            }
+            match mgr.unlink(&linked) {
+                Ok(forst_rs_io::UnlinkOutcome::PhysicalDeleted) => {
+                    report.unlinked += 1;
+                    report.physicals_deleted += 1;
+                }
+                Ok(_) => report.unlinked += 1,
+                // Raced/already-dropped reference — idempotence over failure.
+                Err(e) if e.is_not_found() => {}
+                Err(e) => return Err(e),
+            }
+            reaped_dirs.insert(root.join(id_os));
+        }
+        if report.unlinked > 0 {
+            mgr.sync_journal()?;
+        }
+        for dir in reaped_dirs {
+            // Best-effort: window-a namespaces have no dir at all; window-b
+            // namespaces still hold their blob (and WAL.delta) — remove it.
+            let _ = self.fs.delete_dir(&dir, true);
+        }
         Ok(report)
     }
 }
@@ -20300,6 +20413,159 @@ mod tests {
                 "WAL tail row {k} missing"
             );
         }
+    }
+
+    /// FRS-PHASE2-C2U2 crash-point IT (design §9 D5 crash window a): the
+    /// startup sweep reaps chk-namespace links for checkpoint ids the JM
+    /// never acked — BOTH abandonment shapes:
+    ///   (a) journal-only links, blob NEVER written (crash between
+    ///       `sync_journal()` and the blob write), and
+    ///   (b) blob written but id never acked/discarded.
+    /// Live checkpoint ids are untouched; physicals survive on working +
+    /// live-checkpoint refs; the sweep is idempotent.
+    #[test]
+    fn test_phase2_c2u2_sweep_reaps_abandoned_chk_links_spares_live() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+
+        for i in 0..50u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v").unwrap();
+        }
+        // LIVE checkpoint id=1 (JM acked).
+        let snap1 = db.snapshot();
+        let r1 = db.create_incremental_checkpoint_linked(&snap1, 1, 0).unwrap();
+        let live_links = r1.linked_new_ssts.len();
+        assert!(live_links >= 1);
+
+        // Window (b): checkpoint id=2 completed but the JM never acked it —
+        // same durable state as a written-then-abandoned id.
+        for i in 50..80u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v").unwrap();
+        }
+        let snap2 = db.snapshot();
+        let r2 = db.create_incremental_checkpoint_linked(&snap2, 2, 1).unwrap();
+        let chk2_links = r2.linked_new_ssts.len() + r2.linked_shared_ssts.len();
+        let chk2_dir = PathBuf::from("/db/checkpoints/00000000000000000002");
+
+        // Window (a): checkpoint id=9 crashed BETWEEN sync_journal and the
+        // blob write — links durable in the journal, NO blob, NO chk dir.
+        let mgr = db.file_mapping().expect("attached").clone();
+        let chk9_dir = PathBuf::from("/db/checkpoints/00000000000000000009");
+        let mut chk9_links = 0usize;
+        for f in db.version_set.current().live_sst_files_iter() {
+            let working = crate::flush::sst_file_path(Path::new("/db"), f.file_number);
+            let basename = working.file_name().unwrap().to_os_string();
+            mgr.link(&working, &chk9_dir.join(basename)).unwrap();
+            chk9_links += 1;
+        }
+        mgr.sync_journal().unwrap();
+        assert!(chk9_links >= 1);
+
+        // SWEEP with JM-live set {1, 2}: nothing to reap... then {1}: chk-2
+        // and chk-9 go, chk-1 stays.
+        let none = db.sweep_abandoned_checkpoint_links(&[1, 2]).unwrap();
+        // chk-9 is not JM-live — it IS reaped here. Re-establish it to test
+        // the all-live case cleanly first.
+        assert_eq!(none.unlinked, chk9_links, "only the window-a id reaped");
+        for f in db.version_set.current().live_sst_files_iter() {
+            let working = crate::flush::sst_file_path(Path::new("/db"), f.file_number);
+            let basename = working.file_name().unwrap().to_os_string();
+            mgr.link(&working, &chk9_dir.join(basename)).unwrap();
+        }
+
+        let report = db.sweep_abandoned_checkpoint_links(&[1]).unwrap();
+        assert_eq!(
+            report.unlinked,
+            chk2_links + chk9_links,
+            "both abandoned namespaces reaped"
+        );
+        assert_eq!(
+            report.physicals_deleted, 0,
+            "working-dir + chk-1 refs hold every physical"
+        );
+        // chk-2's leftover dir (blob) is gone; chk-1's blob intact.
+        assert!(fs.list_dir(&chk2_dir).map(|v| v.is_empty()).unwrap_or(true));
+        assert!(fs
+            .file_exists(Path::new("/db/checkpoints/00000000000000000001/CHECKPOINT.blob"))
+            .unwrap());
+
+        // Idempotent: second sweep reaps nothing.
+        let again = db.sweep_abandoned_checkpoint_links(&[1]).unwrap();
+        assert_eq!(again, LinkedCheckpointDiscard::default());
+
+        // The LIVE checkpoint still restores byte-exact after the sweep.
+        let chk1_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk1_dir, "/restore")
+                .unwrap();
+        let rcf = restored.default_cf();
+        for i in 0..50u32 {
+            let k = format!("k{:04}", i);
+            assert_eq!(
+                restored.get(&rcf, k.as_bytes()).unwrap().as_deref(),
+                Some(&b"v"[..]),
+                "live checkpoint state lost at {k}"
+            );
+        }
+        // And its discard still deletes each physical at most once (working
+        // refs remain here, so nothing is deleted — exactly like before the
+        // sweep).
+        let d1 = db.discard_linked_checkpoint(1).unwrap();
+        assert_eq!(d1.unlinked, live_links);
+        assert_eq!(d1.physicals_deleted, 0);
+    }
+
+    /// FRS-PHASE2-C2U2 (design §2.4 journal-tail replay on restore): the
+    /// instant restore consults the SOURCE journal's CURRENT state — a
+    /// physical tombstoned AFTER the checkpoint blob froze its trailer is
+    /// REFUSED (adopting it would hand the restored engine state scheduled
+    /// for deletion). Blob-only fallback (journal unreachable) preserved.
+    #[test]
+    fn test_phase2_c2u2_instant_restore_refuses_tombstoned_physical() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        for i in 0..30u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v").unwrap();
+        }
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
+
+        // Post-checkpoint tail: the JM-discard protocol tombstones one of
+        // the checkpoint's physicals (refs held → deferred delete).
+        let mgr = db.file_mapping().expect("attached").clone();
+        let victim = mgr
+            .resolve(&r.linked_new_ssts[0].path)
+            .expect("linked path resolves");
+        assert!(!mgr.tombstone(&victim).unwrap(), "refs held → deferred");
+        mgr.sync_journal().unwrap();
+
+        // Instant restore must refuse loudly — the blob snapshot alone would
+        // have adopted the doomed physical.
+        match DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore") {
+            Ok(_) => panic!("instant restore must refuse a tombstoned physical"),
+            Err(err) => assert!(
+                err.to_string().contains("tombstone"),
+                "want tombstone refusal, got: {err}"
+            ),
+        }
+
+        // Blob-only fallback: with the source journal unreachable the
+        // restore proceeds exactly as before this unit (and the bytes ARE
+        // still present — the tombstone is deferred).
+        fs.delete_file(Path::new("/db/MAPPING.journal")).unwrap();
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore2")
+                .unwrap();
+        let rcf = restored.default_cf();
+        assert_eq!(
+            restored.get(&rcf, b"k0000").unwrap().as_deref(),
+            Some(&b"v"[..])
+        );
     }
 
     #[test]
