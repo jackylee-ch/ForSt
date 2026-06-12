@@ -759,6 +759,36 @@ fn ckpt_link_mode_env() -> bool {
         .unwrap_or(false)
 }
 
+/// FRS-PHASE2-C3U2 (competitive analysis §2.2c, ForSt `FileOwnershipDecider`):
+/// `FRS_REMOTE_NONSST_LOCAL=1` pins all non-SST files (MANIFEST/CURRENT/
+/// OPTIONS, WAL `.log`/`.seg`, `MAPPING.journal`, `CHECKPOINT.blob`) to the
+/// LOCAL filesystem on the remote-primary open paths — the DB's chatty
+/// small-file traffic never generates S3 metadata ops; only SST-class
+/// objects go remote (through the cache stack). Default OFF: the remote
+/// stack stays byte-identical without the env.
+fn remote_nonsst_local_env() -> bool {
+    std::env::var("FRS_REMOTE_NONSST_LOCAL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// FRS-PHASE2-C3U2: wraps a remote-primary FS stack in the non-SST-local
+/// router when [`remote_nonsst_local_env`] is set (no-op passthrough
+/// otherwise). The local leg is the plain POSIX filesystem — `db_path` and
+/// `cache_dir` are real local paths on the FFI remote-open routes, so
+/// MANIFEST-class files land beside the working dir on local disk while
+/// SST-class reads/writes keep flowing through `remote_primary`
+/// (CachedFileSystem → OpenDAL).
+fn wrap_nonsst_local(remote_primary: Arc<dyn FileSystem>) -> Arc<dyn FileSystem> {
+    if !remote_nonsst_local_env() {
+        return remote_primary;
+    }
+    Arc::new(forst_rs_io::FileSystemRouter::with_remote(
+        Arc::new(LocalFileSystem::new()),
+        remote_primary,
+    ))
+}
+
 /// RAII guard that releases a previously-reserved chunk back to the cross-CF
 /// [`WriteBufferManager`] when dropped, unless [`Self::commit`] is called.
 ///
@@ -1299,6 +1329,8 @@ impl DbImpl {
         })?;
         let cached_fs: Arc<dyn FileSystem> =
             Arc::new(CachedFileSystem::new(remote_fs, Arc::new(cache)));
+        // FRS-PHASE2-C3U2 (default OFF): pin non-SST chatter local.
+        let cached_fs = wrap_nonsst_local(cached_fs);
         Self::open_with_fs_and_default_cf(options, cached_fs, default_desc)
     }
 
@@ -7576,6 +7608,10 @@ impl DbImpl {
         })?;
         let cached_fs: Arc<dyn FileSystem> =
             Arc::new(CachedFileSystem::new(remote_fs, Arc::new(cache)));
+        // FRS-PHASE2-C3U2 (default OFF): pin non-SST chatter local. The
+        // restore target's journal/blob then live beside the working dir on
+        // local disk; SST physicals keep resolving through the cache stack.
+        let cached_fs = wrap_nonsst_local(cached_fs);
         Self::open_from_linked_checkpoint_instant_with_default_cf(
             cached_fs,
             ckpt_dir,
@@ -20604,6 +20640,203 @@ mod tests {
             0,
             "restore must stay rename-free"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-C3U2 gate (competitive analysis §2.2c): non-SST-always-
+    // local routing — zero remote metadata ops in a checkpoint cycle
+    // ------------------------------------------------------------------
+
+    /// C3U2 gate: an engine over the tiered router (local POSIX leg +
+    /// recording opendal-fs-emulation remote leg) runs a full link-mode
+    /// checkpoint cycle with ZERO remote ops on non-SST paths — MANIFEST/
+    /// CURRENT, MAPPING.journal and CHECKPOINT.blob land on the local leg
+    /// only; every op the remote backend sees is SST-class. Instant restore
+    /// over the same router stays byte-exact.
+    #[test]
+    fn test_phase2_c3u2_nonsst_local_zero_remote_metadata_ops_in_ckpt_cycle() {
+        use std::sync::Mutex;
+        struct RecordingFs {
+            inner: Arc<dyn FileSystem>,
+            ops: Mutex<Vec<(&'static str, PathBuf)>>,
+        }
+        impl RecordingFs {
+            fn rec(&self, op: &'static str, p: &Path) {
+                self.ops.lock().unwrap().push((op, p.to_path_buf()));
+            }
+            fn ops_len(&self) -> usize {
+                self.ops.lock().unwrap().len()
+            }
+            fn non_sst_ops_since(&self, mark: usize) -> Vec<(&'static str, PathBuf)> {
+                self.ops.lock().unwrap()[mark..]
+                    .iter()
+                    .filter(|(_, p)| {
+                        !p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.contains(".sst"))
+                    })
+                    .cloned()
+                    .collect()
+            }
+        }
+        impl FileSystem for RecordingFs {
+            fn open_sequential_file(
+                &self,
+                p: &Path,
+            ) -> ForstResult<Box<dyn forst_rs_io::SequentialFile>> {
+                self.rec("open_seq", p);
+                self.inner.open_sequential_file(p)
+            }
+            fn open_random_access_file(
+                &self,
+                p: &Path,
+            ) -> ForstResult<Box<dyn forst_rs_io::RandomAccessFile>> {
+                self.rec("open_rand", p);
+                self.inner.open_random_access_file(p)
+            }
+            fn open_writable_file(
+                &self,
+                p: &Path,
+                m: WriteMode,
+            ) -> ForstResult<Box<dyn forst_rs_io::WritableFile>> {
+                self.rec("open_write", p);
+                self.inner.open_writable_file(p, m)
+            }
+            fn file_exists(&self, p: &Path) -> ForstResult<bool> {
+                self.rec("exists", p);
+                self.inner.file_exists(p)
+            }
+            fn get_file_metadata(&self, p: &Path) -> ForstResult<forst_rs_io::FileMetadata> {
+                self.rec("stat", p);
+                self.inner.get_file_metadata(p)
+            }
+            fn list_dir(&self, d: &Path) -> ForstResult<Vec<forst_rs_io::FileMetadata>> {
+                self.rec("list", d);
+                self.inner.list_dir(d)
+            }
+            fn create_dir_all(&self, d: &Path) -> ForstResult<()> {
+                self.rec("mkdir", d);
+                self.inner.create_dir_all(d)
+            }
+            fn delete_file(&self, p: &Path) -> ForstResult<()> {
+                self.rec("delete", p);
+                self.inner.delete_file(p)
+            }
+            fn delete_dir(&self, p: &Path, r: bool) -> ForstResult<()> {
+                self.rec("rmdir", p);
+                self.inner.delete_dir(p, r)
+            }
+            fn rename(&self, s: &Path, d: &Path) -> ForstResult<()> {
+                self.rec("rename", s);
+                self.rec("rename", d);
+                self.inner.rename(s, d)
+            }
+            fn supports_atomic_rename(&self) -> bool {
+                self.inner.supports_atomic_rename()
+            }
+            fn await_upload(&self, p: &Path) -> ForstResult<()> {
+                self.rec("await_upload", p);
+                self.inner.await_upload(p)
+            }
+            fn name(&self) -> &str {
+                "recording"
+            }
+        }
+
+        let local_root = tempfile::TempDir::new().expect("tempdir");
+        let remote_root = tempfile::TempDir::new().expect("tempdir");
+        let remote_backend: Arc<dyn FileSystem> =
+            Arc::new(OpendalFileSystem::local(remote_root.path()).unwrap());
+        let recording = Arc::new(RecordingFs {
+            inner: remote_backend,
+            ops: Mutex::new(Vec::new()),
+        });
+        let router: Arc<dyn FileSystem> = Arc::new(forst_rs_io::FileSystemRouter::with_remote(
+            Arc::new(forst_rs_io::LocalFileSystem::new()),
+            recording.clone() as Arc<dyn FileSystem>,
+        ));
+        let db_path = local_root
+            .path()
+            .join("db")
+            .to_string_lossy()
+            .into_owned();
+        let db = open_in_shared_fs(&db_path, router.clone());
+        let cf = db.default_cf();
+        for i in 0..200u32 {
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"v1").unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+        for i in 0..50u32 {
+            db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
+        }
+
+        // ---- THE checkpoint cycle: every remote op must be SST-class ----
+        let mark = recording.ops_len();
+        let snap = db.snapshot();
+        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        assert!(r.link_mode);
+        let non_sst = recording.non_sst_ops_since(mark);
+        assert!(
+            non_sst.is_empty(),
+            "remote backend saw non-SST metadata ops during the checkpoint \
+             cycle: {non_sst:?}"
+        );
+
+        // The metadata artifacts live on the LOCAL leg only.
+        let chk_dir = Path::new(&db_path).join("checkpoints/00000000000000000001");
+        let local_leg = forst_rs_io::LocalFileSystem::new();
+        assert!(local_leg
+            .file_exists(&chk_dir.join("CHECKPOINT.blob"))
+            .unwrap());
+        assert!(local_leg
+            .file_exists(&Path::new(&db_path).join("MAPPING.journal"))
+            .unwrap());
+        assert!(!recording
+            .inner
+            .file_exists(&chk_dir.join("CHECKPOINT.blob"))
+            .unwrap());
+        assert!(!recording
+            .inner
+            .file_exists(&Path::new(&db_path).join("MAPPING.journal"))
+            .unwrap());
+
+        // SSTs DID go remote (the tiered split actually engaged).
+        let live = db.version_set.current().live_sst_files();
+        assert!(!live.is_empty());
+        for f in &live {
+            let p = sst_file_path(Path::new(&db_path), f.file_number);
+            assert!(
+                recording.inner.file_exists(&p).unwrap(),
+                "live SST {} must be on the remote leg",
+                p.display()
+            );
+        }
+
+        // Instant restore over the same router: byte-exact, and the cycle
+        // stays free of non-SST remote ops (blob + journals read locally).
+        let mark2 = recording.ops_len();
+        let target = local_root.path().join("restore").to_string_lossy().into_owned();
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(router.clone(), &chk_dir, &target)
+                .unwrap();
+        // The only allowed non-SST remote op at open is the R52-M2
+        // orphan-scan dir-listing union (once per open, finds remote-
+        // resident SST orphans); FILE-level chatter must stay local.
+        let non_sst2 = recording.non_sst_ops_since(mark2);
+        assert!(
+            non_sst2.iter().all(|(op, _)| *op == "list"),
+            "restore issued non-SST remote FILE ops: {non_sst2:?}"
+        );
+        let rcf = restored.default_cf();
+        for i in 0..200u32 {
+            let k = format!("k{:04}", i);
+            let want: Option<&[u8]> = if i < 50 { None } else { Some(b"v1") };
+            assert_eq!(
+                restored.get(&rcf, k.as_bytes()).unwrap().as_deref(),
+                want,
+                "restore mismatch at {k}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
