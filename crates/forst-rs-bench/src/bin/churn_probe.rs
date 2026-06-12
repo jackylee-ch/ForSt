@@ -167,6 +167,12 @@ struct Args {
     /// 2026-06-13 write-path survey §5 cell: memtable-pressure dose —
     /// override `EngineOptions::write_buffer_size` (MiB; 0 = engine default).
     wbuf_mib: usize,
+    /// FRS-M3 G3 cell (2026-06-12 sorted-run §4 M3): number of column
+    /// families to spread the churn over (q7 churns join sides + timers =
+    /// multiple CFs; cross-CF concurrency is M3's primary claim). Rows are
+    /// assigned cf = bucket % cfs so the TTL deleter lands on the same CF.
+    /// 1 (default) = the original single-CF cell.
+    cfs: usize,
 }
 
 impl Args {
@@ -186,6 +192,7 @@ impl Args {
             smoke: false,
             no_deletes: false,
             wbuf_mib: 0,
+            cfs: 1,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -211,6 +218,7 @@ impl Args {
                 "--smoke" => a.smoke = true,
                 "--no-deletes" => a.no_deletes = true,
                 "--wbuf-mib" => a.wbuf_mib = take(&mut i).parse().unwrap(),
+                "--cfs" => a.cfs = take(&mut i).parse().unwrap(),
                 other => panic!("unknown arg {other}"),
             }
             i += 1;
@@ -325,7 +333,20 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
         opts.write_buffer_size = args.wbuf_mib * 1024 * 1024;
     }
     let db = DbImpl::open_with_fs(opts, fs).expect("open");
-    let cf = db.default_cf();
+    // FRS-M3 G3: cf[0] = default; cf[1..] = extra churn CFs. Bucket-affine
+    // assignment keeps put/delete/probe for a key on ONE cf.
+    let cfs: Vec<_> = (0..args.cfs.max(1))
+        .map(|i| {
+            if i == 0 {
+                db.default_cf()
+            } else {
+                db.create_column_family(forst_rs_engine::ColumnFamilyDescriptor::new(format!(
+                    "churn{i}"
+                )))
+                .expect("create cf")
+            }
+        })
+        .collect();
 
     let stop = Arc::new(AtomicBool::new(false));
     let logical = Arc::new(AtomicU64::new(0));
@@ -335,7 +356,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     // ---- writer thread (both streams interleaved + TTL deletes) ----
     let writer = {
         let db = Arc::clone(&db);
-        let cf = cf.clone();
+        let cfs = cfs.clone();
         let stop = Arc::clone(&stop);
         let logical = Arc::clone(&logical);
         let rows = Arc::clone(&rows);
@@ -360,14 +381,17 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                     let w = rng.next().to_le_bytes();
                     chunk.copy_from_slice(&w[..chunk.len()]);
                 }
-                db.put(&cf, &key, &value).expect("put");
+                let cf = &cfs[(bucket % cfs.len() as u64) as usize];
+                db.put(cf, &key, &value).expect("put");
                 logical.fetch_add((key.len() + a.value_bytes) as u64, Ordering::Relaxed);
                 // TTL-ish delete: expire the row that fell out of the window
                 if !a.no_deletes && seq >= a.window_rows {
                     let old = seq - a.window_rows;
                     let old_stream = if old.is_multiple_of(2) { b'a' } else { b'b' };
-                    let old_key = make_key(old_stream, bucket_of(old, old_stream, a.buckets), old);
-                    db.delete(&cf, &old_key).expect("delete");
+                    let old_bucket = bucket_of(old, old_stream, a.buckets);
+                    let old_key = make_key(old_stream, old_bucket, old);
+                    let old_cf = &cfs[(old_bucket % cfs.len() as u64) as usize];
+                    db.delete(old_cf, &old_key).expect("delete");
                     logical.fetch_add(old_key.len() as u64, Ordering::Relaxed);
                 }
                 seq += 1;
@@ -382,7 +406,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     let probers: Vec<_> = (0..args.probe_threads)
         .map(|p| {
             let db = Arc::clone(&db);
-            let cf = cf.clone();
+            let cfs = cfs.clone();
             let stop = Arc::clone(&stop);
             let win = Arc::clone(&window);
             let a = args.clone();
@@ -399,8 +423,9 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                         b'b'
                     };
                     let prefix = make_prefix(stream, bucket);
+                    let cf = &cfs[(bucket % cfs.len() as u64) as usize];
                     let t = Instant::now();
-                    let entries = db.prefix_scan(&cf, &prefix).expect("probe");
+                    let entries = db.prefix_scan(cf, &prefix).expect("probe");
                     win.record(t.elapsed().as_nanos() as u64);
                     drained += entries.len() as u64;
                 }

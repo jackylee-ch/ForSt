@@ -440,6 +440,165 @@ fn bulk_record(
     }
 }
 
+/// FRS-M3-CONCURRENT-COMPACTION (2026-06-12 sorted-run-discipline §4 M3 /
+/// §6 S4): compaction admission gate — see the `DbImpl::compaction_gate`
+/// field docs for the full model.
+///
+/// - **Serial mode** (default, `FRS_COMPACT_CONCURRENT` unset/0): every
+///   compaction acquires the WRITE side of `rw` — byte-identical to the
+///   old engine-global `compaction_mutex`.
+/// - **Concurrent mode** (`FRS_COMPACT_CONCURRENT=1`): compactions
+///   acquire the READ side plus per-(cf, level) slots in `inflight`; two
+///   compactions are admitted concurrently iff their (cf, level) slot
+///   sets are disjoint (per-level-pair exclusivity, RocksDB
+///   `files_being_compacted` parity at level granularity). Slot
+///   acquisition is all-or-wait (both slots taken atomically under ONE
+///   mutex; otherwise the caller blocks on `cv`), so there is no
+///   hold-and-wait and therefore no deadlock. Exclusive ops (`drop_cf`)
+///   take the WRITE side in both modes, which drains ALL in-flight
+///   compactions first.
+struct CompactionGate {
+    /// Compactions: write (serial mode) or read (concurrent mode).
+    /// Exclusive ops (drop_cf cleanup): write, always.
+    rw: std::sync::RwLock<()>,
+    /// Concurrent mode only: held slots + the FIFO wait queue.
+    state: Mutex<CompactionGateState>,
+    /// Signalled whenever slots are released or the queue head changes.
+    cv: std::sync::Condvar,
+    /// Mode flag. Resolved from env at construction; an `AtomicBool` (not
+    /// a process-global OnceLock) so unit tests can force concurrent mode
+    /// per-DbImpl without order-dependent env races.
+    concurrent: std::sync::atomic::AtomicBool,
+}
+
+/// Concurrent-mode slot bookkeeping.
+///
+/// FAIRNESS (anti-barging): admission requires not only that the requested
+/// (cf, level) slots are free, but that no OLDER pending request of the
+/// same CF with an intersecting slot set is still waiting. Without this,
+/// freshly-arriving L0 rollups (slots {0, out}) kept barging in on the
+/// shared base-level slot ahead of an already-waiting base→base+1 drain —
+/// measured on the G3 starvation cell as L1 growing 7→14 files while
+/// write-amp plateaued (drain starvation) and probe p50 degrading 981 →
+/// 3 623 µs. FIFO-among-conflicts restores the serial mode's natural
+/// rollup/drain alternation while keeping disjoint admissions parallel.
+#[derive(Default)]
+struct CompactionGateState {
+    /// (cf_id, level) slots held by admitted compactions.
+    held: std::collections::HashSet<(u32, u32)>,
+    /// Waiting requests in arrival order: (ticket, cf_id, levels).
+    pending: Vec<(u64, u32, Vec<u32>)>,
+    next_ticket: u64,
+}
+
+/// RAII permit for one compaction. Holds either the gate's write lock
+/// (serial) or the read lock + the job's (cf, level) slots (concurrent).
+enum CompactionPermit<'a> {
+    #[allow(dead_code)] // the guard IS the payload; never read.
+    Serial(std::sync::RwLockWriteGuard<'a, ()>),
+    Concurrent {
+        #[allow(dead_code)] // the guard IS the payload; never read.
+        shared: std::sync::RwLockReadGuard<'a, ()>,
+        #[allow(dead_code)] // RAII slot release on drop; never read.
+        slots: CompactionSlots<'a>,
+    },
+}
+
+/// Slot half of a concurrent [`CompactionPermit`]; releases the slots and
+/// wakes waiters on drop (also on panic-unwind, so a failed compaction
+/// cannot wedge the gate).
+struct CompactionSlots<'a> {
+    gate: &'a CompactionGate,
+    cf: u32,
+    levels: Vec<u32>,
+}
+
+impl Drop for CompactionSlots<'_> {
+    fn drop(&mut self) {
+        let mut st = self.gate.state.lock().expect("gate state poisoned");
+        for l in &self.levels {
+            st.held.remove(&(self.cf, *l));
+        }
+        drop(st);
+        self.gate.cv.notify_all();
+    }
+}
+
+impl CompactionGate {
+    fn from_env() -> Self {
+        let concurrent = matches!(
+            std::env::var("FRS_COMPACT_CONCURRENT").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        Self {
+            rw: std::sync::RwLock::new(()),
+            state: Mutex::new(CompactionGateState::default()),
+            cv: std::sync::Condvar::new(),
+            concurrent: std::sync::atomic::AtomicBool::new(concurrent),
+        }
+    }
+
+    fn is_concurrent(&self) -> bool {
+        self.concurrent.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Admit one compaction touching `levels` of `cf` (blocking, FIFO-fair
+    /// among conflicting requests — see [`CompactionGateState`]).
+    ///
+    /// `levels` must list EVERY level the job reads from or installs files
+    /// into (deduplicated by the slot set; passing the same level twice is
+    /// harmless).
+    fn acquire(&self, cf: ColumnFamilyId, levels: &[u32]) -> CompactionPermit<'_> {
+        if !self.is_concurrent() {
+            return CompactionPermit::Serial(self.rw.write().expect("compaction gate poisoned"));
+        }
+        let shared = self.rw.read().expect("compaction gate poisoned");
+        let mut st = self.state.lock().expect("gate state poisoned");
+        let ticket = st.next_ticket;
+        st.next_ticket += 1;
+        st.pending.push((ticket, cf.0, levels.to_vec()));
+        loop {
+            let slots_free = levels.iter().all(|l| !st.held.contains(&(cf.0, *l)));
+            let no_older_conflict = !st.pending.iter().any(|(t, c, ls)| {
+                *t < ticket && *c == cf.0 && ls.iter().any(|l| levels.contains(l))
+            });
+            if slots_free && no_older_conflict {
+                st.pending.retain(|(t, _, _)| *t != ticket);
+                for l in levels {
+                    st.held.insert((cf.0, *l));
+                }
+                drop(st);
+                // A younger non-conflicting waiter may have been queued
+                // behind our pending entry's conflict shadow; re-evaluate.
+                self.cv.notify_all();
+                return CompactionPermit::Concurrent {
+                    shared,
+                    slots: CompactionSlots {
+                        gate: self,
+                        cf: cf.0,
+                        levels: levels.to_vec(),
+                    },
+                };
+            }
+            st = self.cv.wait(st).expect("gate state poisoned");
+        }
+    }
+
+    /// Exclusive access (drop_cf cleanup): waits for every in-flight
+    /// compaction to finish and blocks new ones for the guard's lifetime.
+    /// Identical in both modes.
+    fn exclusive(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.rw.write().expect("compaction gate poisoned")
+    }
+
+    /// Test hook: force concurrent mode regardless of env.
+    #[cfg(test)]
+    fn force_concurrent(&self) {
+        self.concurrent
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Cadence at which the snapshot-age ticker polls
 /// [`SnapshotRegistry::check_long_lived`] (spec §6a.3). One second is
 /// far below the 5-minute default warn threshold, so the worst-case
@@ -705,24 +864,40 @@ pub struct DbImpl {
     /// then joining drains the thread within the configured tick
     /// interval (currently 1 second, see `SNAPSHOT_AGE_TICK_MS`).
     snapshot_age_shutdown: Arc<std::sync::atomic::AtomicBool>,
-    /// R44-H1: serializes ALL compactions globally. Per-CF `flush_mutex`
-    /// is insufficient because the `VersionSet` is engine-global — SST
-    /// inputs in `compact_l0_for_cf` / `compact_level_for_cf` are picked
-    /// from `version_set.current()` without a CF filter, so two threads
-    /// compacting different CFs would otherwise both read the same V0
-    /// and both `apply` their edits, producing two L1 files at the same
-    /// level with overlapping ranges (silent stale-read + 2× disk).
+    /// R44-H1 → FRS-M3-CONCURRENT-COMPACTION (2026-06-12 sorted-run
+    /// discipline §4 M3): compaction admission gate.
     ///
-    /// Lock ordering: `compaction_mutex` is acquired BEFORE any per-CF
+    /// Serial mode (default): every compaction takes the gate's WRITE
+    /// lock — byte-identical to the old engine-global `compaction_mutex`
+    /// serialization. Per-CF `flush_mutex` alone is insufficient because
+    /// the `VersionSet` is engine-global — two threads compacting
+    /// different CFs would otherwise both read the same V0 and both
+    /// `apply` their edits, producing two L1 files at the same level
+    /// with overlapping ranges (silent stale-read + 2× disk).
+    ///
+    /// Concurrent mode (`FRS_COMPACT_CONCURRENT=1`, default OFF until the
+    /// design's G3/G4 gates pass): compactions take the READ lock plus
+    /// per-(CF, level) slots, so compactions whose (cf, level) input/output
+    /// sets are disjoint run in parallel (L0→L1 of CF X ∥ L2→L3 of CF X ∥
+    /// anything of CF Y) while same-level-pair picks still serialize —
+    /// input-set disjointness instead of global serialization. The picked
+    /// inputs of two admitted compactions are disjoint BY CONSTRUCTION:
+    /// inputs come only from the locked levels, filtered to the locked CF
+    /// (R49-H1 cf-pure files). drop_cf takes the WRITE lock in both modes,
+    /// preserving the R60-H2 mark→walk→apply exclusion.
+    ///
+    /// Lock ordering: the gate is acquired BEFORE any per-CF
     /// `flush_mutex` (via `lock_flush()`) inside `compact_l0_for_cf` /
     /// `compact_level_for_cf`. No other path acquires them in the
     /// reverse order: `flush_cf_data` only takes `flush_mutex`, and
     /// `run_flush` releases `flush_mutex` before calling
-    /// `maybe_auto_compact` (which then takes `compaction_mutex`).
+    /// `maybe_auto_compact` (which then enqueues to the compaction pool).
     /// Defense-in-depth: `Version::apply_edit` also validates that every
     /// `deleted_files` entry still exists in the current version and
-    /// returns retry-able `ForstError::Busy` otherwise (R44-L2).
-    compaction_mutex: Mutex<()>,
+    /// returns retry-able `ForstError::Busy` otherwise (R44-L2);
+    /// `run_compaction` treats `Busy` as a benign re-pick, not an engine
+    /// error.
+    compaction_gate: CompactionGate,
     /// FRS-WAL Phase 2 (2026-06-06): optional local write-ahead log. `None`
     /// unless `FRS_WAL_DIR` is set, so the default build is byte-identical to
     /// the pre-WAL engine (the append sites are `if let Some(..)` no-ops when
@@ -875,7 +1050,7 @@ impl DbImpl {
             write_buffer_manager,
             snapshot_age_worker: Mutex::new(None),
             snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            compaction_mutex: Mutex::new(()),
+            compaction_gate: CompactionGate::from_env(),
             wal: Mutex::new(None),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
@@ -1533,13 +1708,14 @@ impl DbImpl {
         // `release(oldest.memory_usage())` inside the flush path
         // cannot double-account the same imm.
         //
-        // Lock order: `compaction_mutex` → `flush_mutex` matches the
-        // canonical order documented at db.rs:322-327 (compact path),
-        // so no inversion possible.
-        let _compaction_guard = self
-            .compaction_mutex
-            .lock()
-            .expect("compaction_mutex poisoned");
+        // Lock order: compaction gate → `flush_mutex` matches the
+        // canonical order documented on the `compaction_gate` field
+        // (compact path), so no inversion possible. FRS-M3: this takes
+        // the gate's EXCLUSIVE (write) side in both modes — it drains
+        // every in-flight compaction and blocks new ones for the guard's
+        // lifetime, preserving the R60-H2 exclusion under
+        // `FRS_COMPACT_CONCURRENT=1`.
+        let _compaction_guard = self.compaction_gate.exclusive();
         let _flush_guard = cf_data.lock_flush();
 
         // Release memtable bytes back to the WriteBufferManager. We
@@ -4077,10 +4253,13 @@ impl DbImpl {
         &self,
         cf_data: &Arc<ColumnFamilyData>,
     ) -> ForstResult<Option<SstFileMeta>> {
+        // FRS-M3: in-place rewrite of the bottom level — one slot. The
+        // level count is fixed at engine construction, so reading it
+        // before the gate is race-free.
+        let bottom = (self.options.num_levels as u32).saturating_sub(1);
         let _compaction_guard = self
-            .compaction_mutex
-            .lock()
-            .expect("compaction_mutex poisoned");
+            .compaction_gate
+            .acquire(cf_data.handle().id(), &[bottom]);
         let _guard = cf_data.lock_flush();
 
         if cf_data.is_dropped() {
@@ -4277,12 +4456,12 @@ impl DbImpl {
         cf_data: &Arc<ColumnFamilyData>,
         level: u32,
     ) -> ForstResult<Option<SstFileMeta>> {
-        // R44-H1: engine-global compaction serialization — see the matching
+        // R44-H1 → FRS-M3: compaction-gate admission — see the matching
         // comment in `compact_l0_for_cf`. Acquired BEFORE `flush_mutex`.
+        // This descent reads from `level` and installs into `level + 1`.
         let _compaction_guard = self
-            .compaction_mutex
-            .lock()
-            .expect("compaction_mutex poisoned");
+            .compaction_gate
+            .acquire(cf_data.handle().id(), &[level, level.saturating_add(1)]);
         let _guard = cf_data.lock_flush();
 
         // R60-H1 (companion): same is_dropped gate as compact_l0_for_cf.
@@ -5196,7 +5375,7 @@ impl DbImpl {
             write_buffer_manager,
             snapshot_age_worker: Mutex::new(None),
             snapshot_age_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            compaction_mutex: Mutex::new(()),
+            compaction_gate: CompactionGate::from_env(),
             wal: Mutex::new(None),
             l0_point_get_block_reads: AtomicU64::new(0),
         });
@@ -5937,20 +6116,18 @@ impl DbImpl {
         &self,
         cf_data: &Arc<ColumnFamilyData>,
     ) -> ForstResult<Option<SstFileMeta>> {
-        // R44-H1: serialize ALL compactions globally before doing anything
-        // else. VersionSet is engine-global, so two compactions running on
-        // different CFs would otherwise both read the same V0 and produce
-        // overlapping L1 files. The per-CF `flush_mutex` only protects
-        // intra-CF flush/compaction interleaving; cross-CF compaction
-        // races need this engine-global mutex.
+        // R44-H1 → FRS-M3: admit this rollup through the compaction gate.
+        // Serial mode = the old engine-global serialization; concurrent
+        // mode (`FRS_COMPACT_CONCURRENT=1`) locks this CF's L0+L1 slots so
+        // disjoint (cf, level) compactions proceed in parallel. The rollup
+        // reads from L0 and installs into L1, so those are the two slots.
         //
-        // Lock ordering (see `compaction_mutex` field docs): this mutex is
+        // Lock ordering (see `compaction_gate` field docs): the gate is
         // acquired BEFORE the per-CF `flush_mutex`. No other path takes
         // them in the reverse order.
         let _compaction_guard = self
-            .compaction_mutex
-            .lock()
-            .expect("compaction_mutex poisoned");
+            .compaction_gate
+            .acquire(cf_data.handle().id(), &[0, 1]);
         // Serialize compaction per CF so two callers cannot both pick the
         // same L0 files. We piggyback on the flush_mutex since flush and
         // compaction both rewrite the on-disk layer.
@@ -5959,10 +6136,11 @@ impl DbImpl {
         // re-acquire for the apply — letting flush proceed concurrently so the
         // foreground does not stall on write-backpressure during a 20s burst
         // (the q4 trough). Safe: flush only ADDS L0 (never deletes the
-        // compaction's immutable inputs), compactions are serialized by
-        // compaction_mutex (held throughout), and version_set.apply serializes
-        // via its apply_lock + validates inputs-still-present, so concurrent
-        // flush+compaction applies compose.
+        // compaction's immutable inputs), same-(cf, level) compactions are
+        // serialized by the compaction gate (held throughout), and
+        // version_set.apply serializes via its apply_lock + validates
+        // inputs-still-present, so concurrent flush+compaction applies
+        // compose.
         let mut flush_guard = Some(cf_data.lock_flush());
 
         // R60-H1: gate compaction on `is_dropped()`. drop_cf flips the
@@ -5971,10 +6149,11 @@ impl DbImpl {
         // and producing a fresh L1 SST stamped with this CF's id would
         // either be unlinked by drop_cf (file leak) or — worse — survive
         // drop_cf and become an orphan visible to manifest replay. The
-        // compaction_mutex above serializes us against drop_cf's
-        // mark→walk→apply pair (drop_cf takes compaction_mutex first,
-        // see R60-H2), so observing `is_dropped()` here means drop_cf
-        // has already finished or is queued behind us.
+        // compaction-gate permit above serializes us against drop_cf's
+        // mark→walk→apply pair (drop_cf takes the gate's EXCLUSIVE side
+        // first, see R60-H2 — which waits out read-side permits in
+        // concurrent mode too), so observing `is_dropped()` here means
+        // drop_cf has already finished or is queued behind us.
         if cf_data.is_dropped() {
             return Ok(None);
         }
@@ -8193,7 +8372,23 @@ impl DbImpl {
         bg_compact_pool().submit(Box::new(move || {
             if let Some(db) = weak.upgrade() {
                 if let Err(e) = db.run_compaction(&cf_data) {
-                    db.record_flush_error(e);
+                    // FRS-M3: `Busy` is the apply-side stale-edit reject
+                    // (R44-L2) — a benign racing-pick outcome under
+                    // concurrent compactions, not an engine failure. The
+                    // staged outputs were already cleaned up at the reject
+                    // site; re-enqueue so the work is re-picked against the
+                    // fresh Version instead of poisoning the next write
+                    // with a spurious flush error.
+                    if e.is_busy() {
+                        tracing::debug!(
+                            cf_id = cf_data.handle().id().0,
+                            error = %e,
+                            "compaction lost a racing pick; re-enqueueing"
+                        );
+                        db.enqueue_compaction(cf_data.clone());
+                    } else {
+                        db.record_flush_error(e);
+                    }
                 }
             }
             // `run_compaction` clears `compaction_queued` itself; if the engine
@@ -15688,6 +15883,243 @@ mod tests {
                 db.get(&cf, format!("z{i:04}").as_bytes()).unwrap().as_deref(),
                 Some(b"v2" as &[u8])
             );
+        }
+    }
+
+    // --- FRS-M3-CONCURRENT-COMPACTION (sorted-run-discipline §4 M3) ---
+
+    /// Gate unit semantics: disjoint (cf, level) slot sets are admitted
+    /// concurrently; conflicting ones block until release; `exclusive()`
+    /// drains all permits.
+    #[test]
+    fn m3_gate_admits_disjoint_blocks_conflicting() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        let gate = Arc::new(CompactionGate::from_env());
+        gate.force_concurrent();
+        let cf1 = ColumnFamilyId(1);
+        let cf2 = ColumnFamilyId(2);
+
+        let p1 = gate.acquire(cf1, &[0, 1]);
+        // Disjoint levels of the same CF: admitted immediately.
+        let p2 = gate.acquire(cf1, &[2, 3]);
+        // Same levels of a DIFFERENT CF: admitted immediately.
+        let p3 = gate.acquire(cf2, &[0, 1]);
+
+        // Conflicting (shares level 1 of cf1): must block until p1 drops.
+        let entered = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            std::thread::spawn(move || {
+                let _p = gate.acquire(cf1, &[1, 2]);
+                entered.store(true, AOrd::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !entered.load(AOrd::SeqCst),
+            "conflicting permit was admitted while its level slot was held"
+        );
+        drop(p1);
+        drop(p2); // also frees level 2 for the waiter
+        handle.join().expect("waiter join");
+        assert!(entered.load(AOrd::SeqCst));
+        drop(p3);
+
+        // exclusive() admits once everything has drained.
+        let _x = gate.exclusive();
+    }
+
+    #[test]
+    fn m3_gate_exclusive_blocks_while_permit_held() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        let gate = Arc::new(CompactionGate::from_env());
+        gate.force_concurrent();
+        let p = gate.acquire(ColumnFamilyId(1), &[0, 1]);
+        let entered = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered);
+            std::thread::spawn(move || {
+                let _x = gate.exclusive();
+                entered.store(true, AOrd::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!entered.load(AOrd::SeqCst), "exclusive admitted past a live permit");
+        drop(p);
+        handle.join().expect("exclusive join");
+        assert!(entered.load(AOrd::SeqCst));
+    }
+
+    /// FIFO anti-barging: a YOUNGER request whose slots are free must NOT
+    /// overtake an OLDER waiting request with an intersecting slot set —
+    /// the G3-starvation-cell fix (L0 rollups kept barging in on the
+    /// shared base-level slot ahead of the waiting drain).
+    #[test]
+    fn m3_gate_fifo_no_barging() {
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+        let gate = Arc::new(CompactionGate::from_env());
+        gate.force_concurrent();
+        let cf = ColumnFamilyId(1);
+
+        let p1 = gate.acquire(cf, &[1]);
+
+        // Older waiter: needs slot 1 (held) + 2 (free).
+        let entered_old = Arc::new(AtomicBool::new(false));
+        let release_old = Arc::new(AtomicBool::new(false));
+        let t_old = {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered_old);
+            let release = Arc::clone(&release_old);
+            std::thread::spawn(move || {
+                let _p = gate.acquire(cf, &[1, 2]);
+                entered.store(true, AOrd::SeqCst);
+                while !release.load(AOrd::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(80));
+
+        // Younger request: slots {2, 3} are FREE, but it intersects the
+        // older waiter on slot 2 — it must queue behind it.
+        let entered_young = Arc::new(AtomicBool::new(false));
+        let t_young = {
+            let gate = Arc::clone(&gate);
+            let entered = Arc::clone(&entered_young);
+            std::thread::spawn(move || {
+                let _p = gate.acquire(cf, &[2, 3]);
+                entered.store(true, AOrd::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(
+            !entered_young.load(AOrd::SeqCst),
+            "younger request barged past the older waiting one"
+        );
+
+        // Release the blocker: the OLDER waiter must be admitted first.
+        drop(p1);
+        while !entered_old.load(AOrd::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            !entered_young.load(AOrd::SeqCst),
+            "younger request admitted while the older holds slot 2"
+        );
+        release_old.store(true, AOrd::SeqCst);
+        t_old.join().expect("old join");
+        t_young.join().expect("young join");
+        assert!(entered_young.load(AOrd::SeqCst));
+    }
+
+    /// FRS-M3 racing-pick property test (design §7 G3/G4): N writer threads,
+    /// one CF each, concurrently write/delete/flush/compact with the gate in
+    /// CONCURRENT mode while a prober reads. Afterwards every CF must hold
+    /// exactly its model's data and every level ≥ 1 must be non-overlapping
+    /// per CF. Run ×5 by the gate script (deterministic seeds per thread).
+    #[test]
+    fn m3_racing_compactions_property() {
+        let db = open();
+        db.compaction_gate.force_concurrent();
+        let n_threads = 3usize;
+        let cfs: Vec<ColumnFamilyHandle> = (0..n_threads)
+            .map(|t| {
+                db.create_column_family(ColumnFamilyDescriptor::new(format!("race{t}")))
+                    .unwrap()
+            })
+            .collect();
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Prober: continuous reads across all CFs while compactions race.
+        let prober = {
+            let db = Arc::clone(&db);
+            let cfs = cfs.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    for cf in &cfs {
+                        let k = format!("t{:01}-{:05}", i % 3, i % 400);
+                        let _ = db.get(cf, k.as_bytes()).expect("probe get");
+                    }
+                    i += 1;
+                }
+            })
+        };
+
+        let writers: Vec<_> = (0..n_threads)
+            .map(|t| {
+                let db = Arc::clone(&db);
+                let cf = cfs[t].clone();
+                std::thread::spawn(move || {
+                    use std::collections::BTreeMap;
+                    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+                    for round in 0..6u32 {
+                        for i in 0..400u32 {
+                            let k = format!("t{t}-{i:05}").into_bytes();
+                            if (i + round) % 7 == 0 {
+                                db.delete(&cf, &k).expect("delete");
+                                model.remove(&k);
+                            } else {
+                                let v = format!("v{round}-{i}").into_bytes();
+                                db.put(&cf, &k, &v).expect("put");
+                                model.insert(k, v);
+                            }
+                        }
+                        db.switch_and_flush(&cf).expect("flush");
+                        // Race the compactions: L0 rollup + any over-budget
+                        // level, concurrently across the 3 CFs.
+                        db.compact_l0(&cf).expect("compact_l0");
+                        let _ = db.compact_once_for(&cf).expect("compact_once");
+                    }
+                    model
+                })
+            })
+            .collect();
+
+        let models: Vec<_> = writers
+            .into_iter()
+            .map(|h| h.join().expect("writer join"))
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        prober.join().expect("prober join");
+
+        // Verify models.
+        for (t, model) in models.iter().enumerate() {
+            for i in 0..400u32 {
+                let k = format!("t{t}-{i:05}").into_bytes();
+                let got = db.get(&cfs[t], &k).expect("verify get");
+                assert_eq!(
+                    got.as_deref(),
+                    model.get(&k).map(|v| v.as_slice()),
+                    "cf race{t} key {} diverged from model",
+                    String::from_utf8_lossy(&k)
+                );
+            }
+        }
+        // Level invariant: per CF, every level ≥ 1 pairwise non-overlapping.
+        let v = db.version_set.current();
+        for cf in &cfs {
+            for lvl in 1..v.num_levels() {
+                let files: Vec<&SstFileMeta> = v.levels[lvl]
+                    .files
+                    .iter()
+                    .filter(|f| f.cf_id == cf.id())
+                    .collect();
+                for (i, f1) in files.iter().enumerate() {
+                    for f2 in files.iter().skip(i + 1) {
+                        assert!(
+                            f1.largest_key < f2.smallest_key || f2.largest_key < f1.smallest_key,
+                            "cf {} level {lvl}: overlap between {} and {}",
+                            cf.id().0,
+                            f1.file_number,
+                            f2.file_number
+                        );
+                    }
+                }
+            }
         }
     }
 
