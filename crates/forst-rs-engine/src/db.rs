@@ -772,6 +772,38 @@ fn remote_nonsst_local_env() -> bool {
         .unwrap_or(false)
 }
 
+/// FRS-PHASE2-C3U3 (design §4.1.1): `FRS_RESTORE_BG_FILL=1` turns the
+/// instant-link restore's lazy cache warm into a PACED background fill of
+/// the adopted physicals (read pool + Bottom/Skip admission policy,
+/// budget-capped — see `forst_rs_storage::background_fill`). Default OFF:
+/// restore stays lazy-warm (pre-seed hints only). Tuning:
+/// `FRS_RESTORE_BG_FILL_WORKERS` (read pool size, default 2) and
+/// `FRS_RESTORE_BG_FILL_PACE_MB` (MiB/s pacing budget, default 64; 0 =
+/// unpaced).
+fn restore_bg_fill_params_env() -> Option<forst_rs_storage::background_fill::BackgroundFillParams>
+{
+    let on = std::env::var("FRS_RESTORE_BG_FILL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !on {
+        return None;
+    }
+    let defaults = forst_rs_storage::background_fill::BackgroundFillParams::default();
+    let workers = std::env::var("FRS_RESTORE_BG_FILL_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(defaults.workers);
+    let pace_bytes_per_sec = std::env::var("FRS_RESTORE_BG_FILL_PACE_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(defaults.pace_bytes_per_sec);
+    Some(forst_rs_storage::background_fill::BackgroundFillParams {
+        workers,
+        pace_bytes_per_sec,
+    })
+}
+
 /// FRS-PHASE2-C3U2: wraps a remote-primary FS stack in the non-SST-local
 /// router when [`remote_nonsst_local_env`] is set (no-op passthrough
 /// otherwise). The local leg is the plain POSIX filesystem — `db_path` and
@@ -871,6 +903,12 @@ pub struct DbImpl {
     /// stays in front of it: the guard protects process-local
     /// readers/snapshots; the mapping governs durable lifetime (§2.2).
     file_mapping: std::sync::OnceLock<Arc<forst_rs_io::FileMappingManager>>,
+    /// FRS-PHASE2-C3U3 (design §4.1.1): handle of the post-restore
+    /// background cache fill, when one was started (env
+    /// `FRS_RESTORE_BG_FILL=1` on the remote instant-restore path; `None`
+    /// by default). Held so engine drop cancels + joins the read pool
+    /// (its `Drop` is cancel-then-join, bounded by one in-flight fetch).
+    background_fill: Mutex<Option<forst_rs_storage::background_fill::BackgroundFill>>,
     /// Monotonic sequence number shared across all CFs. Incremented on every
     /// successful mutation.
     sequence_number: AtomicU64,
@@ -1155,6 +1193,7 @@ impl DbImpl {
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
             file_mapping: std::sync::OnceLock::new(),
+            background_fill: Mutex::new(None),
             sequence_number: AtomicU64::new(0),
             write_controller: Arc::new(WriteController::new(wc_config)),
             write_mutex: Mutex::new(()),
@@ -6389,6 +6428,7 @@ impl DbImpl {
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
             file_mapping: std::sync::OnceLock::new(),
+            background_fill: Mutex::new(None),
             // D-R7-H1: A-R6-H3 patched the VersionSet seed but missed
             // this sibling — `DbImpl::sequence_number` is the source of
             // every write's allocated seq via `fetch_add`. A stale
@@ -7606,18 +7646,75 @@ impl DbImpl {
                  local cache at {cache_dir:?}: {e}"
             )))
         })?;
-        let cached_fs: Arc<dyn FileSystem> =
-            Arc::new(CachedFileSystem::new(remote_fs, Arc::new(cache)));
+        let cached_concrete = Arc::new(CachedFileSystem::new(remote_fs, Arc::new(cache)));
+        let cached_fs: Arc<dyn FileSystem> = cached_concrete.clone();
         // FRS-PHASE2-C3U2 (default OFF): pin non-SST chatter local. The
         // restore target's journal/blob then live beside the working dir on
         // local disk; SST physicals keep resolving through the cache stack.
         let cached_fs = wrap_nonsst_local(cached_fs);
-        Self::open_from_linked_checkpoint_instant_with_default_cf(
+        let db = Self::open_from_linked_checkpoint_instant_with_default_cf(
             cached_fs,
             ckpt_dir,
             target_dir,
             default_desc,
-        )
+        )?;
+        // FRS-PHASE2-C3U3 (default OFF): paced background fill of the
+        // adopted working set — the §4.1.1 upgrade of the lazy warm.
+        if let Some(params) = restore_bg_fill_params_env() {
+            db.start_restore_background_fill(cached_concrete, params);
+        }
+        Ok(db)
+    }
+
+    /// FRS-PHASE2-C3U3 (design §4.1.1): starts the post-restore background
+    /// cache fill over every live SST's mapped physical (the adopted set; a
+    /// fresh working SST degrades to `AlreadyCached` via its write-through
+    /// copy). `cached` must be the cache stack the engine reads through —
+    /// the fill populates the same `LocalCache` at the COLD end
+    /// (Bottom/Skip policy, budget-capped, paced; see
+    /// [`forst_rs_storage::background_fill::BackgroundFill`]). The handle is
+    /// stowed on the engine so drop cancels + joins the read pool. No-op if
+    /// a fill is already running. Inert unless explicitly invoked (the env
+    /// route is `FRS_RESTORE_BG_FILL=1` on the remote restore path).
+    pub fn start_restore_background_fill(
+        &self,
+        cached: Arc<CachedFileSystem>,
+        params: forst_rs_storage::background_fill::BackgroundFillParams,
+    ) {
+        let mut slot = self.background_fill.lock().expect("lock poisoned");
+        if slot.is_some() {
+            return;
+        }
+        let mut paths: Vec<PathBuf> = Vec::new();
+        if let Some(mgr) = self.file_mapping.get() {
+            for f in self.version_set.current().live_sst_files() {
+                let working = sst_file_path(Path::new(&self.db_path), f.file_number);
+                if let Some(physical) = mgr.resolve(&working) {
+                    paths.push(PathBuf::from(physical));
+                }
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        tracing::info!(
+            files = paths.len(),
+            workers = params.workers,
+            pace_bytes_per_sec = params.pace_bytes_per_sec,
+            "FRS-PHASE2-C3U3: starting post-restore background cache fill"
+        );
+        *slot = Some(forst_rs_storage::background_fill::BackgroundFill::start(
+            cached, paths, params,
+        ));
+    }
+
+    /// FRS-PHASE2-C3U3: cancels + joins a running background fill (if any)
+    /// and returns its report. `None` when no fill was started.
+    pub fn finish_restore_background_fill(
+        &self,
+    ) -> Option<forst_rs_storage::background_fill::BackgroundFillReport> {
+        let bf = self.background_fill.lock().expect("lock poisoned").take()?;
+        Some(bf.wait())
     }
 
     /// FRS-WAL Phase 4 / FRS-PHASE2-S4 (design §3.3, §9 D6): replays a
@@ -20837,6 +20934,77 @@ mod tests {
                 "restore mismatch at {k}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-C3U3 gate (design §4.1.1): post-restore background fill
+    // ------------------------------------------------------------------
+
+    /// C3U3 engine IT: after an instant-link restore over a COLD cache
+    /// stack, the background fill warms every adopted physical into the
+    /// local cache (Bottom inserts, zero errors) and the restored state
+    /// stays byte-exact. Default-OFF gate: without an explicit start (or
+    /// the env on the remote path), no fill runs.
+    #[test]
+    fn test_phase2_c3u3_restore_background_fill_warms_adopted_set() {
+        use forst_rs_io::MemoryFileSystem;
+        use forst_rs_storage::background_fill::BackgroundFillParams;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = s3_fixture(&fs);
+
+        let cache_dir = tempfile::TempDir::new().expect("tempdir");
+        let cached = Arc::new(CachedFileSystem::new(
+            fs.clone(),
+            Arc::new(LocalCache::open(cache_dir.path(), 64 * 1024 * 1024).unwrap()),
+        ));
+        let restored = DbImpl::open_from_linked_checkpoint_instant(
+            cached.clone() as Arc<dyn FileSystem>,
+            &chk_dir,
+            "/restore-bgfill",
+        )
+        .unwrap();
+
+        // Default OFF: nothing started a fill.
+        assert!(restored.finish_restore_background_fill().is_none());
+
+        restored.start_restore_background_fill(
+            cached.clone(),
+            BackgroundFillParams {
+                workers: 2,
+                pace_bytes_per_sec: 0,
+            },
+        );
+        let report = restored
+            .finish_restore_background_fill()
+            .expect("fill was started");
+        assert!(report.filled > 0, "{report:?}");
+        assert_eq!(report.errors, 0, "{report:?}");
+        assert_eq!(report.cancelled, 0, "{report:?}");
+
+        // Every adopted physical is now cache-resident.
+        let mgr = restored.file_mapping().unwrap();
+        for f in restored.version_set.current().live_sst_files() {
+            let working = sst_file_path(Path::new("/restore-bgfill"), f.file_number);
+            let physical = mgr.resolve(&working).expect("adopted mapping");
+            assert!(
+                cached.cache().contains(&physical),
+                "adopted physical {physical} must be warmed"
+            );
+        }
+        // Idempotent start guard: a second start over the warmed set only
+        // reports AlreadyCached.
+        restored.start_restore_background_fill(
+            cached.clone(),
+            BackgroundFillParams {
+                workers: 1,
+                pace_bytes_per_sec: 0,
+            },
+        );
+        let report2 = restored.finish_restore_background_fill().unwrap();
+        assert_eq!(report2.filled, 0, "{report2:?}");
+        assert!(report2.already_cached > 0, "{report2:?}");
+
+        s3_assert_snapshot_state(&restored);
     }
 
     // ------------------------------------------------------------------

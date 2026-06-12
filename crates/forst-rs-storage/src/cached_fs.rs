@@ -319,6 +319,44 @@ impl CachedFileSystem {
         // Await any in-flight write-back upload before sizing/reading (see
         // `remote_size_awaiting_upload`): the sequential / whole-file path is
         // used by checkpoint staging, which must not race the async upload.
+        let bytes = self.read_remote_whole(path)?;
+        // Best-effort cache write; failures here just mean the next read
+        // pays the same miss, so we swallow the error (the streamed
+        // bytes are still good) rather than failing an otherwise-good
+        // SST read. Pre-R78-M1 the `?` at the end of the chain
+        // propagated the cache-put error, contradicting the comment
+        // and turning a transient cache-disk hiccup (ENOSPC, EACCES on
+        // cache_dir) into a hard read failure. `forst-rs-storage` does
+        // not pull in `tracing` so the diagnostic is via `eprintln!`
+        // to stderr — the engine layer above relays anything important.
+        //
+        // FRS-CACHE-ADMISSION: demand-read fills consult the admission policy
+        // first (`force_admit=false`); a rejected fill serves the streamed
+        // bytes pass-through, exactly the paper's split between *serving*
+        // reads and *loading* files into cache.
+        if force_admit || self.cache.admit_read_fill(&key) {
+            if let Err(e) = self.cache.put(&key, &bytes) {
+                eprintln!(
+                    "CachedFileSystem cache put for {} failed: {} \
+                     (continuing with the streamed bytes; next read will retry)",
+                    path.display(),
+                    e
+                );
+            }
+        }
+        // Zero-copy hand-off into the refcounted Bytes container. Callers
+        // can slice / share without recopying the full payload.
+        Ok(Bytes::from(bytes))
+    }
+
+    /// Whole-file remote read with the FRS-S3-SHORTREAD-FIX discipline:
+    /// size-bounded RANGED reads against the metadata-reported length
+    /// (await-upload-aware), refusing to return a short body (R75-M2 —
+    /// a truncated buffer must never be admitted into the cache). Streaming
+    /// fallback only when metadata is unavailable. Factored out of
+    /// [`Self::fetch_through_cache_inner`] so the background fill
+    /// ([`Self::fill_file_cold`]) reuses the exact same correctness logic.
+    fn read_remote_whole(&self, path: &Path) -> ForstResult<Vec<u8>> {
         let cap_hint = self
             .remote_size_awaiting_upload(path)
             .map(|s| s as usize)
@@ -369,34 +407,76 @@ impl CachedFileSystem {
                 path.display()
             )));
         }
-        // Best-effort cache write; failures here just mean the next read
-        // pays the same miss, so we swallow the error (the streamed
-        // bytes are still good) rather than failing an otherwise-good
-        // SST read. Pre-R78-M1 the `?` at the end of the chain
-        // propagated the cache-put error, contradicting the comment
-        // and turning a transient cache-disk hiccup (ENOSPC, EACCES on
-        // cache_dir) into a hard read failure. `forst-rs-storage` does
-        // not pull in `tracing` so the diagnostic is via `eprintln!`
-        // to stderr — the engine layer above relays anything important.
-        //
-        // FRS-CACHE-ADMISSION: demand-read fills consult the admission policy
-        // first (`force_admit=false`); a rejected fill serves the streamed
-        // bytes pass-through, exactly the paper's split between *serving*
-        // reads and *loading* files into cache.
-        if force_admit || self.cache.admit_read_fill(&key) {
-            if let Err(e) = self.cache.put(&key, &bytes) {
-                eprintln!(
-                    "CachedFileSystem cache put for {} failed: {} \
-                     (continuing with the streamed bytes; next read will retry)",
-                    path.display(),
-                    e
-                );
-            }
-        }
-        // Zero-copy hand-off into the refcounted Bytes container. Callers
-        // can slice / share without recopying the full payload.
-        Ok(Bytes::from(bytes))
+        Ok(bytes)
     }
+
+    /// FRS-PHASE2-C3U3 (design §4.1.1): one background-fill step — load
+    /// `path` into the local cache at the COLD end of the LRU
+    /// ([`LocalCache::put_cold`], ForSt "Bottom"), or SKIP it per the merged
+    /// admission machinery:
+    ///
+    /// - already cached → [`BackgroundFillOutcome::AlreadyCached`] (no I/O);
+    /// - key blocked by the `promote_limit` anti-thrash cap →
+    ///   [`BackgroundFillOutcome::SkippedBlocked`] (a proven thrasher must
+    ///   not be speculatively re-loaded);
+    /// - the fill would not fit in the FREE budget headroom →
+    ///   [`BackgroundFillOutcome::SkippedBudget`] — a background fill never
+    ///   evicts live entries (budget-capped warming; foreground demand
+    ///   fills keep the normal evict-to-fit behavior).
+    ///
+    /// Bytes are read with the same short-read-refusing remote path as
+    /// demand fetches. The cold insert means an unread prefill is the first
+    /// eviction victim, so even a mis-predicted warm set costs no hot-set
+    /// recency.
+    pub fn fill_file_cold(&self, path: &Path) -> ForstResult<BackgroundFillOutcome> {
+        let key = self.cache_key(path)?.to_string();
+        if self.cache.contains(&key) {
+            return Ok(BackgroundFillOutcome::AlreadyCached);
+        }
+        if self.cache.is_admission_blocked(&key) {
+            return Ok(BackgroundFillOutcome::SkippedBlocked);
+        }
+        // Budget probe BEFORE the remote read (skip early, don't waste the
+        // GET); re-checked by the post-read guard since concurrent demand
+        // fills may consume headroom while the read is in flight.
+        let size = self
+            .remote_size_awaiting_upload(path)
+            .or_else(|| self.remote.get_file_metadata(path).ok().map(|m| m.size))
+            .unwrap_or(0);
+        let headroom = self
+            .cache
+            .capacity_bytes()
+            .saturating_sub(self.cache.current_bytes());
+        if size == 0 || size > headroom {
+            return Ok(BackgroundFillOutcome::SkippedBudget);
+        }
+        let bytes = self.read_remote_whole(path)?;
+        let headroom = self
+            .cache
+            .capacity_bytes()
+            .saturating_sub(self.cache.current_bytes());
+        if bytes.len() as u64 > headroom {
+            return Ok(BackgroundFillOutcome::SkippedBudget);
+        }
+        self.cache
+            .put_cold(&key, &bytes)
+            .map_err(|e| ForstError::Io(std::io::Error::other(format!("cache put_cold: {e}"))))?;
+        Ok(BackgroundFillOutcome::Filled(bytes.len() as u64))
+    }
+}
+
+/// Outcome of one [`CachedFileSystem::fill_file_cold`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundFillOutcome {
+    /// The file is already cache-resident — nothing to do.
+    AlreadyCached,
+    /// Skipped: the key is blocked by the anti-thrash cap (`promote_limit`).
+    SkippedBlocked,
+    /// Skipped: the fill does not fit in the free budget headroom (or the
+    /// remote size could not be established).
+    SkippedBudget,
+    /// Loaded into the cache (cold end); carries the byte count.
+    Filled(u64),
 }
 
 impl FileSystem for CachedFileSystem {
