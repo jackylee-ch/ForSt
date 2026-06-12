@@ -222,7 +222,10 @@ fn one_run(args: &Args, run_idx: usize, workroot: &std::path::Path) -> RunResult
     });
 
     let t0 = Instant::now();
-    let out_meta = db.compact_l0(&cf).expect("compact_l0").expect("had L0 input");
+    let out_meta = db
+        .compact_l0(&cf)
+        .expect("compact_l0")
+        .expect("had L0 input");
     let wall = t0.elapsed();
 
     stop.store(true, Ordering::Relaxed);
@@ -319,7 +322,10 @@ fn main() {
         results.len()
     );
     if args.smoke {
-        assert!(results[0].output_bytes > 0, "smoke: output must be non-empty");
+        assert!(
+            results[0].output_bytes > 0,
+            "smoke: output must be non-empty"
+        );
         println!("SMOKE OK");
     }
 }

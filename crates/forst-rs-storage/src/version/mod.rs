@@ -563,7 +563,7 @@ impl Version {
     /// `None`).
     ///
     /// A2 (PMC cycle-4): this is the precomputed-per-CF-index upgrade the
-    /// A-H2 comment named. The lazy [`ScanIndex`] resolves the layout once
+    /// A-H2 comment named. The lazy `ScanIndex` resolves the layout once
     /// per immutable Version:
     ///   * single-CF layout + matching `cf_id` → full-array binary search
     ///     (rightmost `smallest_key <= key` + containment check), gated on
@@ -688,7 +688,7 @@ impl Version {
     /// requires `largest_key` to be monotonic across the level — true
     /// per-CF (L1+ non-overlap) but NOT guaranteed across CFs sharing the
     /// level array (nested/interleaved cross-CF ranges). The per-level
-    /// soundness flag (cached once per immutable Version in [`ScanIndex`])
+    /// soundness flag (cached once per immutable Version in `ScanIndex`)
     /// gates the binary search; when a level is non-monotonic the lower
     /// bound falls back to the L0-style linear left-skip, which applies the
     /// flat path's own `largest_key >= lower` predicate per file and
@@ -863,9 +863,9 @@ impl Version {
                     } else {
                         // FAST arm (the A2 point): lower-bound binary search
                         // on the CF's monotone largest_key sub-sequence.
-                        let start = view
-                            .file_idx
-                            .partition_point(|&fi| files[fi as usize].largest_key.as_slice() < lower);
+                        let start = view.file_idx.partition_point(|&fi| {
+                            files[fi as usize].largest_key.as_slice() < lower
+                        });
                         for &fi in &view.file_idx[start.min(end)..end] {
                             out.push(&files[fi as usize]);
                         }
@@ -1420,7 +1420,10 @@ mod tests {
         // binary-search arm at L1+ — the per-CF largest_key sub-sequences
         // ([m, t] for cf_a, [c] for cf_b) are monotone even though the full
         // array ([m, c, t]) is not.
-        assert!(v.has_per_cf_scan_views(), "multi-CF layout must build views");
+        assert!(
+            v.has_per_cf_scan_views(),
+            "multi-CF layout must build views"
+        );
         for cf in [cf_a, cf_b] {
             for lvl in 1..v.num_levels() {
                 assert!(
@@ -1646,7 +1649,9 @@ mod tests {
                     .filter(|f| {
                         f.cf_id == cf
                             && f.largest_key >= lower
-                            && upper.as_deref().is_none_or(|u| f.smallest_key.as_slice() < u)
+                            && upper
+                                .as_deref()
+                                .is_none_or(|u| f.smallest_key.as_slice() < u)
                     })
                     .map(|f| f.file_number)
                     .collect();
@@ -1672,8 +1677,7 @@ mod tests {
                 let key = format!("{}{:04}", rng(3), rng(10000)).into_bytes();
                 for level in 1..=2usize {
                     let got = v.find_sst_for_key_in_cf(level, &key, cf);
-                    let want =
-                        Version::find_sst_linear_in_cf(&v.levels[level].files, &key, cf);
+                    let want = Version::find_sst_linear_in_cf(&v.levels[level].files, &key, cf);
                     match (got, want) {
                         (Some(g), Some(w)) => {
                             // Per-CF non-overlap ⇒ unique container.

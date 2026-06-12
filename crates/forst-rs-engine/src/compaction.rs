@@ -1671,8 +1671,7 @@ mod tests {
         edit.new_files
             .iter()
             .map(|(_, meta)| {
-                std::fs::read(out_dir.join(format!("{:06}.sst", meta.file_number.value())))
-                    .unwrap()
+                std::fs::read(out_dir.join(format!("{:06}.sst", meta.file_number.value()))).unwrap()
             })
             .collect()
     }
@@ -1730,9 +1729,7 @@ mod tests {
                             bottommost,
                             Some(w),
                         );
-                        windowed
-                            .iter_mut()
-                            .for_each(|b| normalize_creation_time(b));
+                        windowed.iter_mut().for_each(|b| normalize_creation_time(b));
                         assert_eq!(
                             windowed.len(),
                             demand.len(),

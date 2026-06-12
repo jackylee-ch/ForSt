@@ -62,7 +62,7 @@
 //! 1. full-file scan `[0, n_blocks)` with a FIXED window from the start (no
 //!    cold state, no ramp — sequentiality is known a priori; the engine
 //!    clamps the window size against the fan-in budget);
-//! 2. [`CacheFillPolicy::Skip`]: cache-first READ stays (recently-flushed
+//! 2. `CacheFillPolicy::Skip`: cache-first READ stays (recently-flushed
 //!    blocks are served for free — the 27ae792c3 lesson), but compaction
 //!    input blocks are NEVER inserted — each input block is read exactly
 //!    once and future reads hit the compaction *output*, so inserting (even

@@ -462,9 +462,15 @@ mod tests {
             Some(4)
         );
         // One more input pushes below the floor → Demand fallback.
-        assert_eq!(compaction_window_blocks(129, KIB64, 2 * MIB, 64 * MIB), None);
+        assert_eq!(
+            compaction_window_blocks(129, KIB64, 2 * MIB, 64 * MIB),
+            None
+        );
         // Grossly over-fanned job → Demand fallback.
-        assert_eq!(compaction_window_blocks(4096, KIB64, 2 * MIB, 64 * MIB), None);
+        assert_eq!(
+            compaction_window_blocks(4096, KIB64, 2 * MIB, 64 * MIB),
+            None
+        );
     }
 
     #[test]

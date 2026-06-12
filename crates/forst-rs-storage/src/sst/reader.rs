@@ -1403,8 +1403,10 @@ impl SstBlockCursor {
     /// `CompactionJob::run_streaming`) gates this behind `FRS_COMPACT_WINDOWED`
     /// and clamps `window_blocks` against the fan-in prefetch budget.
     pub fn new_windowed(reader: Arc<SstReaderImpl>, window_blocks: u32) -> ForstResult<Self> {
-        let prefetcher =
-            crate::sst::prefetch::BlockPrefetcher::for_compaction(Arc::clone(&reader), window_blocks);
+        let prefetcher = crate::sst::prefetch::BlockPrefetcher::for_compaction(
+            Arc::clone(&reader),
+            window_blocks,
+        );
         let mut c = Self {
             reader,
             next_block: 0,
