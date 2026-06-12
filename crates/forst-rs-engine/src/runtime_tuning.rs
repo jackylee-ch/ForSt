@@ -106,6 +106,82 @@ pub fn global_wbm_used_bytes() -> u64 {
     GLOBAL_WBM_USED.load(Ordering::Relaxed)
 }
 
+// ---------------------------------------------------------------------------
+// L4 (2026-06-12 compaction windowed-readpath design §2.3): compaction-input
+// windowed-read knobs. The budget constants live HERE (one place) so the M3
+// scan-prefetch budget fix can share the accounting when it lands.
+// ---------------------------------------------------------------------------
+
+/// `FRS_COMPACT_WINDOWED=1|true` turns ON windowed, double-buffered,
+/// cache-Skip compaction-input reads (design W1-W3). Default OFF.
+pub fn compaction_windowed_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_COMPACT_WINDOWED").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// Per-input compaction read window in BYTES (`FRS_COMPACT_WINDOW_BYTES`).
+/// Default 2 MiB = 32 blocks at the 64 KiB default block size — RocksDB's
+/// `compaction_readahead_size = 2 MB` class.
+pub fn compaction_window_bytes() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FRS_COMPACT_WINDOW_BYTES")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2 * 1024 * 1024)
+    })
+}
+
+/// Aggregate compaction prefetch budget in BYTES
+/// (`FRS_COMPACT_PREFETCH_BUDGET`; the design doc names the env without a
+/// unit — bytes chosen for consistency with `FRS_COMPACT_WINDOW_BYTES`).
+/// Worst case held by one job = fan-in × (1 ready + 1 inflight) windows, so
+/// the per-input window is clamped to `budget / (2 × inputs × block_size)`.
+/// Default 64 MiB.
+pub fn compaction_prefetch_budget_bytes() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FRS_COMPACT_PREFETCH_BUDGET")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(64 * 1024 * 1024)
+    })
+}
+
+/// L4 §2.3 fan-in budget clamp (pure — unit-testable without env):
+/// `window_blocks = min(window_bytes/block_size, budget/(2 × inputs ×
+/// block_size))`, floor 4 blocks. Below the floor returns `None` — the job
+/// falls back to Demand-mode cursors (windowing a sliver isn't worth the
+/// pool traffic).
+pub fn compaction_window_blocks(
+    n_inputs: usize,
+    block_size: usize,
+    window_bytes: u64,
+    budget_bytes: u64,
+) -> Option<u32> {
+    /// Minimum useful window (blocks); below this, fall back to Demand.
+    const WINDOW_FLOOR_BLOCKS: u64 = 4;
+    if n_inputs == 0 || block_size == 0 {
+        return None;
+    }
+    let bs = block_size as u64;
+    let default_blocks = (window_bytes / bs).max(1);
+    let budget_blocks = budget_bytes / (2 * n_inputs as u64 * bs);
+    let w = default_blocks.min(budget_blocks);
+    if w < WINDOW_FLOOR_BLOCKS {
+        None
+    } else {
+        Some(w.min(u32::MAX as u64) as u32)
+    }
+}
+
 /// Cross-CF memtable budget tracker (spec §6d "WriteBufferManager").
 ///
 /// Each engine owns one [`WriteBufferManager`] shared across every column
@@ -346,5 +422,68 @@ mod tests {
     fn capacity_bytes_round_trips_construction_arg() {
         let wbm = WriteBufferManager::new(42);
         assert_eq!(wbm.capacity_bytes(), 42);
+    }
+
+    // -- L4 compaction windowed-read budget clamp (design §2.3) --------------
+
+    const KIB64: usize = 64 * 1024;
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn compact_window_default_unclamped_small_fanin() {
+        // 2 MiB window / 64 KiB blocks = 32; 1 input: budget 64 MiB allows
+        // 512 blocks → window stays the default 32.
+        assert_eq!(
+            compaction_window_blocks(1, KIB64, 2 * MIB, 64 * MIB),
+            Some(32)
+        );
+        // 8 inputs: budget allows 64 blocks/input → still 32.
+        assert_eq!(
+            compaction_window_blocks(8, KIB64, 2 * MIB, 64 * MIB),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn compact_window_budget_clamps_high_fanin() {
+        // 20-input L0→L1 job: 64 MiB / (2 × 20 × 64 KiB) = 25.6 → 25 < 32.
+        assert_eq!(
+            compaction_window_blocks(20, KIB64, 2 * MIB, 64 * MIB),
+            Some(25)
+        );
+    }
+
+    #[test]
+    fn compact_window_floor_boundary() {
+        // Exactly the floor: budget/(2·n·bs) = 4 → Some(4).
+        // 4 = 64 MiB / (2 × n × 64 KiB) ⇒ n = 128.
+        assert_eq!(
+            compaction_window_blocks(128, KIB64, 2 * MIB, 64 * MIB),
+            Some(4)
+        );
+        // One more input pushes below the floor → Demand fallback.
+        assert_eq!(compaction_window_blocks(129, KIB64, 2 * MIB, 64 * MIB), None);
+        // Grossly over-fanned job → Demand fallback.
+        assert_eq!(compaction_window_blocks(4096, KIB64, 2 * MIB, 64 * MIB), None);
+    }
+
+    #[test]
+    fn compact_window_small_window_env_floor() {
+        // A window-bytes override below 4 blocks also falls back to Demand.
+        assert_eq!(
+            compaction_window_blocks(1, KIB64, 3 * 64 * 1024, 64 * MIB),
+            None
+        );
+        // ... and exactly 4 blocks is accepted.
+        assert_eq!(
+            compaction_window_blocks(1, KIB64, 4 * 64 * 1024, 64 * MIB),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn compact_window_degenerate_inputs() {
+        assert_eq!(compaction_window_blocks(0, KIB64, 2 * MIB, 64 * MIB), None);
+        assert_eq!(compaction_window_blocks(1, 0, 2 * MIB, 64 * MIB), None);
     }
 }
