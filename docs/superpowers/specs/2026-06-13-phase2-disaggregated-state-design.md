@@ -568,3 +568,10 @@ cache-pressure IT.**
   per-batch concurrent warm. The q9-class 10M soak on a real box remains
   open Stage-5 scope, as does the §4.1.1 background-fill scheduler and the
   pluggable-policy trait formalization.
+- **Stage-3 prep — restore pre-seed API** (ForSt §2.1.6
+  `registerInCache`): `LocalCache::pre_seed_admission(key)` seeds the
+  tracker to threshold−1 so a restored file's FIRST foreground touch
+  admits its load-back (never resurrects a promote-limit-blocked key;
+  background touches still never admit; pure no-op when admission is off).
+  Ready for the Stage-3 restore path to call per linked SST. UT covers all
+  four properties.

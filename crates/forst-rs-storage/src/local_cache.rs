@@ -537,6 +537,44 @@ impl LocalCache {
         admit
     }
 
+    /// FRS-CACHE-ADMISSION restore pre-seed (ForSt §2.1.6,
+    /// `FileBasedCache.registerInCache`): primes the admission tracker for a
+    /// file known to belong to the restored working set, so its FIRST
+    /// foreground touch reaches the count-to-promote threshold and loads it
+    /// back into the cache ASAP — pairs with instant-link restore (Stage 3:
+    /// link first, cache warms by-demand-but-eagerly). The bytes are NOT
+    /// fetched here; only the counter is seeded (count = threshold − 1).
+    /// No-op when admission is disabled or the key is blocked/already ahead.
+    pub fn pre_seed_admission(&self, key: &str) {
+        let Some(params) = self.policy.admission else {
+            return;
+        };
+        if params.access_before_promote <= 1 {
+            return; // first touch admits anyway
+        }
+        let seed = params.access_before_promote - 1;
+        let mut guard = self
+            .admission
+            .lock()
+            .expect("admission tracker mutex poisoned");
+        let tracker = &mut *guard; // split-borrow fields through the guard
+        if tracker.evictions.get(key).copied().unwrap_or(0) >= params.promote_limit {
+            return; // blocked keys are not resurrected by a restore seed
+        }
+        match tracker.counts.get_mut(key) {
+            Some(c) => *c = (*c).max(seed),
+            None => {
+                tracker.counts.insert(key.to_string(), seed);
+                tracker.counts_order.push_back(key.to_string());
+                AdmissionTracker::trim(
+                    &mut tracker.counts,
+                    &mut tracker.counts_order,
+                    params.tracker_cap,
+                );
+            }
+        }
+    }
+
     /// Returns `(admitted, rejected)` read-fill admission decisions so far
     /// (both 0 when admission is disabled).
     pub fn admission_stats(&self) -> (u64, u64) {
@@ -1724,6 +1762,56 @@ mod tests {
         );
         // And the cache ends up holding a stable resident subset.
         assert!(!adm.is_empty(), "a resident subset survives");
+    }
+
+    #[test]
+    fn pre_seed_makes_first_touch_admit_but_never_unblocks() {
+        // ForSt §2.1.6 restore pre-seeding: a seeded key's FIRST foreground
+        // touch reaches count-to-promote; unseeded keys still need K touches.
+        // Capacity fits exactly two 100-byte entries so the blocked-key
+        // section below can actually thrash /v out promote_limit times.
+        let (_tmp, cache) = policy_cache(220, admission_on());
+        cache.pre_seed_admission("/db/restored.sst");
+        assert!(
+            cache.admit_read_fill("/db/restored.sst"),
+            "seeded key admits on the first touch"
+        );
+        assert!(
+            !cache.admit_read_fill("/db/unseeded.sst"),
+            "unseeded keys keep the normal threshold"
+        );
+
+        // Seeding must not resurrect a thrash-blocked key.
+        let block = vec![0xAB; 100];
+        for round in 0..3 {
+            assert!(!cache.admit_read_fill("/v"));
+            assert!(cache.admit_read_fill("/v"));
+            assert!(cache.put("/v", &block).unwrap());
+            assert!(cache.put(&format!("/h1-{round}"), &block).unwrap());
+            assert!(cache.put(&format!("/h2-{round}"), &block).unwrap());
+        }
+        cache.pre_seed_admission("/v");
+        assert!(
+            !cache.admit_read_fill("/v"),
+            "pre-seed must not override the promote-limit block"
+        );
+
+        // Background pre-seeded key: bg touches still never admit.
+        cache.pre_seed_admission("/db/restored2.sst");
+        {
+            let _bg = crate::requester::BackgroundScope::enter();
+            assert!(!cache.admit_read_fill("/db/restored2.sst"));
+        }
+        assert!(
+            cache.admit_read_fill("/db/restored2.sst"),
+            "seed credit preserved for the first FOREGROUND touch"
+        );
+
+        // Disabled policy: a pure no-op.
+        let (_t2, legacy) = fresh_cache(1024);
+        legacy.pre_seed_admission("/x");
+        assert!(legacy.admit_read_fill("/x"));
+        assert_eq!(legacy.admission_stats(), (0, 0));
     }
 
     #[test]
