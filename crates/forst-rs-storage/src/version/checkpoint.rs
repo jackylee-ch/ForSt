@@ -46,6 +46,7 @@
 //! |       min_sequence: u64 (LE)             |
 //! |       max_sequence: u64 (LE)             |
 //! |       num_entries: u64 (LE)              |
+//! |       max_death: u64 (LE)         [v3+]  |
 //! +------------------------------------------+
 //! | CF Descriptors                    [v2+]  |
 //! |   num_cfs: u32 (LE)                      |
@@ -57,6 +58,10 @@
 //! |     merge_op_name: [u8] (empty = None)   |
 //! |     filter_name_len: u32 (LE)            |
 //! |     filter_name: [u8] (empty = None)     |
+//! |     lifecycle_ordinal: u8         [v4+]  |
+//! |     lifecycle_ttl: u64 (LE)       [v4+]  |
+//! |     watermark: u64 (LE)           [v4+]  |
+//! |     max_event_time: u64 (LE)      [v4+]  |
 //! +------------------------------------------+
 //! | Footer (12 bytes)                        |
 //! |   checksum: u32 (CRC32C of all above)    |
@@ -87,8 +92,17 @@ const CHECKPOINT_MAGIC: &[u8; 4] = b"FRCP";
 ///   serializes as v2, byte-identical to pre-V1 (downgrade-safe while the
 ///   default-OFF `FRS_LIFECYCLE_SEGMENTS` flag is unused). v1/v2 blobs
 ///   decode with `max_death = 0` ("never expires whole-file").
+/// * `4` — FRS-WA-V1 R10: appends per-CF lifecycle state to each CF
+///   descriptor record (`lifecycle_ordinal: u8`, `lifecycle_ttl: u64`,
+///   `watermark: u64`, `max_event_time: u64`) so expiry resumes after
+///   restore without re-declaration. **Emitted ONLY when at least one CF
+///   carries non-default lifecycle state**; v4 also always carries the v3
+///   per-file `max_death` field (stamped or not). No-lifecycle snapshots
+///   keep serializing as v2 (or v3 when only orphan stamps exist),
+///   byte-identical to before. v1-v3 blobs decode with all four fields 0.
 const FORMAT_VERSION: u16 = 2;
 const FORMAT_VERSION_V3: u16 = 3;
+const FORMAT_VERSION_V4: u16 = 4;
 
 /// R49-H2: defense-in-depth cap on the number of CF descriptors in a blob.
 /// Way above any sane user limit; protects against OOM-DoS from a crafted blob.
@@ -132,11 +146,19 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
         .levels
         .iter()
         .any(|lvl| lvl.files.iter().any(|f| f.max_death != 0));
-    let emit_version = if needs_v3 {
+    // FRS-WA-V1 R10: emit v4 only when some CF carries lifecycle state.
+    let needs_v4 = snapshot.cf_descriptors.iter().any(|cf| {
+        cf.lifecycle_ordinal != 0 || cf.watermark != 0 || cf.max_event_time != 0
+    });
+    let emit_version = if needs_v4 {
+        FORMAT_VERSION_V4
+    } else if needs_v3 {
         FORMAT_VERSION_V3
     } else {
         FORMAT_VERSION
     };
+    // v4 always carries the per-file stamp field too (v4 ⊇ v3).
+    let write_death = emit_version >= FORMAT_VERSION_V3;
 
     // --- Header (placeholder for blob_size, filled later) ---
     buf.extend_from_slice(CHECKPOINT_MAGIC);
@@ -173,7 +195,7 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
             put_fixed64(&mut buf, file.max_sequence.value());
             put_fixed64(&mut buf, file.num_entries);
             // FRS-WA-V1: per-file death stamp (v3+ only).
-            if needs_v3 {
+            if write_death {
                 put_fixed64(&mut buf, file.max_death);
             }
         }
@@ -192,6 +214,13 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
         let filter_bytes = cf.filter_name.as_bytes();
         put_fixed32(&mut buf, filter_bytes.len() as u32);
         buf.extend_from_slice(filter_bytes);
+        // FRS-WA-V1 R10: per-CF lifecycle state (v4 only).
+        if emit_version >= FORMAT_VERSION_V4 {
+            buf.push(cf.lifecycle_ordinal);
+            put_fixed64(&mut buf, cf.lifecycle_ttl);
+            put_fixed64(&mut buf, cf.watermark);
+            put_fixed64(&mut buf, cf.max_event_time);
+        }
     }
 
     // --- Footer ---
@@ -224,7 +253,7 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         return Err(ForstError::corruption("invalid checkpoint magic"));
     }
     let version = u16::from_le_bytes([data[4], data[5]]);
-    if version != 1 && version != FORMAT_VERSION && version != FORMAT_VERSION_V3 {
+    if !(1..=FORMAT_VERSION_V4).contains(&version) {
         return Err(ForstError::corruption(format!(
             "unsupported checkpoint format version: {}",
             version
@@ -232,6 +261,7 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
     }
     let is_v2 = version >= 2;
     let is_v3 = version >= 3;
+    let is_v4 = version >= 4;
     // flags at [6..8] -- reserved, ignore
     let blob_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
     if blob_size != data.len() as u64 {
@@ -372,11 +402,40 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
             let merge_op_name =
                 read_bounded_string(data, &mut pos, footer_start, "cf merge_op name")?;
             let filter_name = read_bounded_string(data, &mut pos, footer_start, "cf filter name")?;
+            // FRS-WA-V1 R10: per-CF lifecycle state (v4 only; zeros before).
+            let (lifecycle_ordinal, lifecycle_ttl, watermark, max_event_time) = if is_v4 {
+                if pos >= footer_start {
+                    return Err(ForstError::corruption(
+                        "checkpoint v4 cf descriptor truncated (lifecycle ordinal)",
+                    ));
+                }
+                let ordinal = data[pos];
+                pos += 1;
+                if ordinal > 2 {
+                    return Err(ForstError::corruption(format!(
+                        "checkpoint v4 cf descriptor: unknown lifecycle ordinal {}",
+                        ordinal
+                    )));
+                }
+                let (ttl, n) = get_fixed64(&data[pos..])?;
+                pos += n;
+                let (wm, n) = get_fixed64(&data[pos..])?;
+                pos += n;
+                let (met, n) = get_fixed64(&data[pos..])?;
+                pos += n;
+                (ordinal, ttl, wm, met)
+            } else {
+                (0, 0, 0, 0)
+            };
             cfs.push(crate::version::CfDescriptor {
                 cf_id: ColumnFamilyId(cf_id_raw),
                 name,
                 merge_op_name,
                 filter_name,
+                lifecycle_ordinal,
+                lifecycle_ttl,
+                watermark,
+                max_event_time,
             });
         }
         cfs
@@ -532,6 +591,85 @@ mod tests {
         assert!(restore_from_blob(&corrupted).is_err());
     }
 
+    /// FRS-WA-V1 R10: blob format v4 — per-CF lifecycle state round-trips;
+    /// v4 is emitted ONLY when a CF carries lifecycle state (no-lifecycle
+    /// blobs stay v2/v3, the default-path-unchanged discipline); unknown
+    /// lifecycle ordinals are rejected as corruption.
+    #[test]
+    fn test_wa_v1_r10_blob_v4_lifecycle_roundtrip_and_v2_when_default() {
+        use crate::version::CfDescriptor;
+        let plain_cf = CfDescriptor {
+            cf_id: forst_rs_common::DEFAULT_CF_ID,
+            name: "default".to_string(),
+            merge_op_name: String::new(),
+            filter_name: String::new(),
+            lifecycle_ordinal: 0,
+            lifecycle_ttl: 0,
+            watermark: 0,
+            max_event_time: 0,
+        };
+        let life_cf = CfDescriptor {
+            cf_id: ColumnFamilyId(9),
+            name: "window-state".to_string(),
+            merge_op_name: String::new(),
+            filter_name: String::new(),
+            lifecycle_ordinal: 1, // Windowed
+            lifecycle_ttl: 4_000_000,
+            watermark: 77_000,
+            max_event_time: 81_000,
+        };
+
+        // (a) All-default lifecycle ⇒ v2 header (byte-identical discipline).
+        let mut snap = make_snapshot(vec![(0, make_file(1, b"a", b"m"))]);
+        snap.cf_descriptors = vec![plain_cf.clone()];
+        let blob = serialize_to_blob(&snap).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([blob[4], blob[5]]),
+            FORMAT_VERSION,
+            "no lifecycle state ⇒ emit v2"
+        );
+        let restored = restore_from_blob(&blob).unwrap();
+        assert_eq!(restored.cf_descriptors[0].lifecycle_ordinal, 0);
+        assert_eq!(restored.cf_descriptors[0].watermark, 0);
+
+        // (b) Lifecycle state present ⇒ v4; everything round-trips,
+        // including the per-file stamp field (v4 ⊇ v3) on an UNSTAMPED
+        // file, and the sibling CF's defaults.
+        let mut snap = make_snapshot(vec![(0, make_file(1, b"a", b"m"))]);
+        snap.cf_descriptors = vec![plain_cf, life_cf];
+        let blob = serialize_to_blob(&snap).unwrap();
+        assert_eq!(u16::from_le_bytes([blob[4], blob[5]]), FORMAT_VERSION_V4);
+        let restored = restore_from_blob(&blob).unwrap();
+        assert_eq!(restored.version.levels[0].files[0].max_death, 0);
+        let d = &restored.cf_descriptors[0];
+        assert_eq!((d.lifecycle_ordinal, d.lifecycle_ttl), (0, 0));
+        assert_eq!((d.watermark, d.max_event_time), (0, 0));
+        let l = &restored.cf_descriptors[1];
+        assert_eq!(l.cf_id, ColumnFamilyId(9));
+        assert_eq!(l.name, "window-state");
+        assert_eq!(l.lifecycle_ordinal, 1);
+        assert_eq!(l.lifecycle_ttl, 4_000_000);
+        assert_eq!(l.watermark, 77_000);
+        assert_eq!(l.max_event_time, 81_000);
+
+        // (c) Unknown lifecycle ordinal ⇒ corruption (CRC recomputed so the
+        // ordinal check itself is what rejects).
+        let mut bad = blob.clone();
+        // The ordinal byte of the LAST descriptor sits 25 bytes before the
+        // footer (ordinal(1) + ttl(8) + wm(8) + met(8)).
+        let footer_start = bad.len() - FOOTER_SIZE;
+        let ord_idx = footer_start - 25;
+        assert_eq!(bad[ord_idx], 1, "self-check: located the ordinal byte");
+        bad[ord_idx] = 9;
+        let crc = crc32c(&bad[..footer_start]);
+        bad[footer_start..footer_start + 4].copy_from_slice(&crc.to_le_bytes());
+        let err = restore_from_blob(&bad).unwrap_err();
+        assert!(
+            err.to_string().contains("lifecycle ordinal"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_serialize_empty_snapshot() {
         let snap = VersionSetSnapshot {
@@ -575,12 +713,20 @@ mod tests {
                     name: "default".to_string(),
                     merge_op_name: String::new(),
                     filter_name: String::new(),
+                    lifecycle_ordinal: 0,
+                    lifecycle_ttl: 0,
+                    watermark: 0,
+                    max_event_time: 0,
                 },
                 CfDescriptor {
                     cf_id: ColumnFamilyId(7),
                     name: "windows".to_string(),
                     merge_op_name: "ListAppend".to_string(),
                     filter_name: "TtlFilter(7d)".to_string(),
+                    lifecycle_ordinal: 0,
+                    lifecycle_ttl: 0,
+                    watermark: 0,
+                    max_event_time: 0,
                 },
             ],
         };

@@ -2332,3 +2332,14 @@ M4 score-based pick+dynamic targets (largest cell), M5 L0 20/36+LZ4-remote,
 M6 shadow budget; S1-S5 staged, G1-G3 micro falsifiers, G5 remote A/B.
 Expected q7 2376→1400-1700. ACCEPTANCE GATE: 2 of 3 conditions met (iostat ✓,
 microbench ✓); clean q7 pair (re-baseline, in flight) completes it.
+
+### INTEGRITY SWEEP interim (6/22 pairs, tip b6dec7d7b, MAXSEC=3600, /ssd1):
+q0 tie (120.3/119.8) | q1 tie (109.4/110.0) | q2 frs +6% (101.3/107.5) |
+q3 frs (144.2/146.5; ⚠rows differ 0.16% across ALL THREE backends incl.
+historical rdb — investigate) | **q4 frs DECISIVE (1033.3 vs ForSt DNF@3600,
+stalled 63.5M)** | q5: frs crash-loop (TM heartbeat ~600s — retry queued;
+passed 604.5s yesterday ⇒ suspect box-state not code), forst pending.
+ZERO ForSt wins so far. Sweep continues autonomously (driver setsid, ledger
+SUMMARY-INTEGRITY.md, restart-safe; mystery episodic docker-killer 22:18-22:52
+unresolved — forensic recorders armed). BRIDGE DOWN (relay died 00:39) —
+fingerprint needed to resume observation; sweep unaffected.

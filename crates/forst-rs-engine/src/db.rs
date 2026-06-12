@@ -3528,7 +3528,9 @@ impl DbImpl {
     fn maybe_auto_compact(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
         // FRS-WA-V1: stamped lifecycle segments are exempt from the rollup
         // trigger (reclaimed by expiry, fan-out-bounded by cohort merge).
-        let l0_count = self.backpressure_l0_count(&self.version_set.current());
+        // R2: deliberately the UNCAPPED exemption (`rollup_l0_count`, not
+        // `backpressure_l0_count`) — see the two count methods' docs.
+        let l0_count = self.rollup_l0_count(&self.version_set.current());
         // FRS-COMPACT-BG (2026-06-03): use the dedicated LOW
         // `l0_compaction_trigger` (default 4), NOT `l0_slowdown_trigger` (40).
         // Keeping L0 shallow cuts the per-point-read SST scan count
@@ -3637,7 +3639,46 @@ impl DbImpl {
     /// backlog compaction is never going to drain (the survey's cell-F
     /// artifact: writer throttled to 111K rows/s at 41 segments). Flag OFF ⇒
     /// no stamps exist ⇒ identical to `l0_files().len()`.
+    ///
+    /// R2 (PMC review 2026-06-12): the exemption is CAPPED. If the watermark
+    /// stalls while writes continue (idle source, broken wiring), stamped
+    /// segments accumulate with nothing pushing back — cohort merge-once
+    /// bounds FRESH segments but cohorts themselves grow ~1 per merge batch,
+    /// and probes degrade along the P9 dose curve unbounded. Stamped runs
+    /// ABOVE [`lifecycle_stamped_ceiling`] (generous: 4× the cohort trigger
+    /// by default, far past any healthy steady state) count back into the
+    /// slowdown/stop triggers, throttling the writer until the watermark
+    /// resumes and expiry drains the backlog. Deliberately NOT wired into
+    /// the rollup trigger ([`Self::rollup_l0_count`]): a forced rollup over
+    /// a stamped+unstamped mix emits an UNSTAMPED (immortal) output
+    /// (`CompactionJob::output_max_death`), destroying dropability — the
+    /// valve is backpressure, never compaction.
     fn backpressure_l0_count(&self, version: &Version) -> u32 {
+        if lifecycle_segments_enabled() {
+            let mut stamped = 0usize;
+            let mut unstamped = 0u32;
+            for f in version.l0_files() {
+                if f.max_death == 0 {
+                    unstamped += 1;
+                } else {
+                    stamped += 1;
+                }
+            }
+            unstamped + stamped.saturating_sub(lifecycle_stamped_ceiling()) as u32
+        } else {
+            version.l0_files().len() as u32
+        }
+    }
+
+    /// FRS-WA-V1: the L0 count fed to the NORMAL rollup-compaction trigger
+    /// ([`Self::maybe_auto_compact`]). Death-stamped lifecycle segments are
+    /// FULLY exempt here — no ceiling — because `compact_l0_for_cf` sweeps
+    /// every L0 file of the CF, and merging stamped with unstamped inputs
+    /// yields an unstamped (never-expiring) output: re-paying exactly the
+    /// write-amp the design removes AND forfeiting whole-segment drops.
+    /// Stamped-segment pressure relief is expiry + cohort merge-once +
+    /// (under a stalled watermark) the R2 backpressure ceiling.
+    fn rollup_l0_count(&self, version: &Version) -> u32 {
         if lifecycle_segments_enabled() {
             version
                 .l0_files()
@@ -6289,6 +6330,42 @@ impl DbImpl {
             // engine's id-preserving path used at open time for the default
             // CF; reusing it here preserves the on-disk cf_id mapping.
             db.create_cf_with_id(cf.cf_id, desc)?;
+        }
+
+        // FRS-WA-V1 R10: re-apply persisted lifecycle state (descriptor +
+        // watermark/event-time clocks, blob v4) to every restored CF —
+        // including the default CF, which the loop above `continue`s past.
+        // Pre-v4 blobs decode all-zero ⇒ this is a no-op for them. With the
+        // state restored, segment expiry resumes on the next maintenance
+        // tick instead of waiting for the backend to re-declare the
+        // lifecycle and re-advance the watermark, and the first
+        // post-restore flush stamps from a sound event-time bound.
+        for cf in &snapshot.cf_descriptors {
+            if cf.lifecycle_ordinal == 0
+                && cf.watermark == 0
+                && cf.max_event_time == 0
+            {
+                continue;
+            }
+            let cf_data = db.lookup_cf_by_id(cf.cf_id)?;
+            match crate::column_family::CfLifecycle::from_ordinal(
+                cf.lifecycle_ordinal as i32,
+                cf.lifecycle_ttl,
+            ) {
+                Some(crate::column_family::CfLifecycle::Unbounded) => {}
+                Some(lifecycle) => cf_data.set_lifecycle(lifecycle),
+                None => {
+                    // The blob decoder already rejects unknown ordinals;
+                    // defense-in-depth for any future decoder relaxation.
+                    return Err(ForstError::corruption(format!(
+                        "checkpoint cf_descriptor for '{}' carries unknown \
+                         lifecycle ordinal {}",
+                        cf.name, cf.lifecycle_ordinal
+                    )));
+                }
+            }
+            cf_data.advance_watermark(cf.watermark);
+            cf_data.note_max_event_time(cf.max_event_time);
         }
 
         Self::init_self_weak(&db);
@@ -11432,11 +11509,29 @@ impl DbImpl {
                 .map(|f| f.name())
                 .unwrap_or_default();
             check("compaction_filter name", cf_id, &filter_name)?;
+            // FRS-WA-V1 R10: persist the lifecycle descriptor + clocks so
+            // whole-segment expiry resumes after restore without waiting
+            // for the backend to re-declare/re-advance. Both clocks are
+            // monotone bounds sampled under the snapshot's apply-locked
+            // view: the watermark restores ≤ its true crash-time value
+            // (drops only deferred, never premature) and the event-time
+            // bound covers every entry the snapshot contains (so the first
+            // post-restore flush stamps soundly instead of emitting an
+            // immortal stamp-0 segment — review R10 consequence (b)).
+            let lifecycle = cf.lifecycle();
+            let lifecycle_ttl = match lifecycle {
+                crate::column_family::CfLifecycle::Windowed { ttl } => ttl,
+                _ => 0,
+            };
             out.push(CfDescriptor {
                 cf_id,
                 name,
                 merge_op_name,
                 filter_name,
+                lifecycle_ordinal: lifecycle.ordinal() as u8,
+                lifecycle_ttl,
+                watermark: cf.watermark(),
+                max_event_time: cf.max_event_time(),
             });
         }
         Ok(out)
@@ -12711,6 +12806,40 @@ static LIFECYCLE_COHORT_TRIGGER_OVERRIDE: std::sync::atomic::AtomicUsize =
 #[cfg(test)]
 pub(crate) fn set_lifecycle_cohort_trigger_override(v: usize) {
     LIFECYCLE_COHORT_TRIGGER_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// FRS-WA-V1 R2 (PMC review 2026-06-12): ceiling on how many death-stamped
+/// lifecycle segments stay EXEMPT from write backpressure
+/// (`FRS_LIFECYCLE_STAMPED_CEILING`, default 4 × [`lifecycle_cohort_trigger`]
+/// = 96, floor 8). Healthy steady states sit far below it (q7-shaped churn:
+/// ~16 segments unmerged, ~trigger/2 + a few cohorts with merging engaged);
+/// only a STALLED watermark with continuing writes can cross it, and then
+/// the excess re-enters the slowdown/stop triggers
+/// ([`DbImpl::backpressure_l0_count`]) so the writer throttles instead of
+/// growing probe fan-out without bound.
+fn lifecycle_stamped_ceiling() -> usize {
+    let ov = LIFECYCLE_STAMPED_CEILING_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov > 0 {
+        return ov;
+    }
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FRS_LIFECYCLE_STAMPED_CEILING")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&v| v >= 8)
+            .unwrap_or_else(|| lifecycle_cohort_trigger() * 4)
+    })
+}
+
+/// Test override for [`lifecycle_stamped_ceiling`] (0 = env/default).
+static LIFECYCLE_STAMPED_CEILING_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_lifecycle_stamped_ceiling_override(v: usize) {
+    LIFECYCLE_STAMPED_CEILING_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// FRS-WA-V1 snapshot policy for whole-segment expiry
@@ -14830,6 +14959,145 @@ mod tests {
             "fresh segments unaffected by cohort expiry"
         );
         set_lifecycle_cohort_trigger_override(0);
+        set_lifecycle_segments_override(None);
+    }
+
+    /// FRS-WA-V1 R2 (PMC review 2026-06-12): stalled-watermark fan-out
+    /// ceiling. Stamped lifecycle segments are backpressure-exempt only up
+    /// to a generous ceiling; the EXCESS counts back into the write
+    /// controller's L0 slowdown/stop triggers, so a stalled watermark
+    /// (idle source, broken wiring) eventually THROTTLES the writer
+    /// instead of growing probe fan-out unbounded. The normal-rollup
+    /// trigger stays FULLY exempt: compacting a stamped+unstamped mix
+    /// produces an UNSTAMPED (immortal) output (`output_max_death` rule),
+    /// so the relief valve is backpressure, never compaction.
+    #[test]
+    fn test_wa_v1_r2_stamped_ceiling_counts_excess_into_backpressure() {
+        use crate::column_family::CfLifecycle;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_lifecycle_segments_override(Some(true));
+        set_lifecycle_stamped_ceiling_override(4);
+        let db = open();
+        const TTL: u64 = 1_000_000;
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("r2ceiling")
+                    .with_lifecycle(CfLifecycle::Windowed { ttl: TTL }),
+            )
+            .unwrap();
+        let cf_data = db.lookup_cf_by_id(cf.id()).unwrap();
+
+        // Six stamped segments, watermark NEVER advanced (the stall).
+        for s in 1..=6u64 {
+            db.note_cf_max_event_time(&cf, s).unwrap();
+            db.put(&cf, format!("k{s:04}").as_bytes(), b"v").unwrap();
+            let m = db.switch_and_flush(&cf).unwrap().expect("flushed");
+            assert_eq!(m.max_death, s + TTL, "segment must be stamped");
+        }
+        let v = db.version_set.current();
+        assert_eq!(
+            v.l0_files()
+                .iter()
+                .filter(|f| f.cf_id == cf.id() && f.max_death != 0)
+                .count(),
+            6,
+            "six stamped segments live in L0"
+        );
+
+        // Ceiling 4 ⇒ the two over-ceiling segments count toward
+        // backpressure again (R2's pushback when the watermark stalls).
+        assert_eq!(
+            db.backpressure_l0_count(&v),
+            2,
+            "stamped excess over the ceiling must count into backpressure"
+        );
+
+        // The rollup trigger remains FULLY exempt (trigger default 4 would
+        // otherwise fire here and fold stamped files into an immortal mix).
+        assert!(
+            db.cfs_due_for_compaction()
+                .iter()
+                .all(|c| c.handle().id() != cf.id()),
+            "stamped segments must never count toward the rollup trigger"
+        );
+
+        // Watermark resumes ⇒ expiry drains the backlog ⇒ pushback clears.
+        db.advance_cf_watermark(&cf, 6 + TTL + 1).unwrap();
+        assert_eq!(db.lifecycle_drop_expired(&cf_data).unwrap(), 6);
+        assert_eq!(db.backpressure_l0_count(&db.version_set.current()), 0);
+
+        set_lifecycle_stamped_ceiling_override(0);
+        set_lifecycle_segments_override(None);
+    }
+
+    /// FRS-WA-V1 R10 (PMC review 2026-06-12, blob v4): lifecycle
+    /// descriptor + watermark/event-time clocks PERSIST through a
+    /// checkpoint-restore cycle, so (a) expiry resumes without the backend
+    /// re-declaring/re-advancing anything, and (b) the first post-restore
+    /// flush stamps from the restored event-time bound instead of emitting
+    /// an immortal stamp-0 segment.
+    #[test]
+    fn test_wa_v1_r10_lifecycle_state_persists_across_restore() {
+        use crate::column_family::CfLifecycle;
+        use forst_rs_io::MemoryFileSystem;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_lifecycle_segments_override(Some(true));
+        const TTL: u64 = 100;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("life-restore")
+                    .with_lifecycle(CfLifecycle::Windowed { ttl: TTL }),
+            )
+            .unwrap();
+        // One stamped segment (events ≤ 50 ⇒ stamp 150) + clocks advanced.
+        for i in 1..=50u64 {
+            db.note_cf_max_event_time(&cf, i).unwrap();
+            db.put(&cf, format!("k{i:04}").as_bytes(), b"v").unwrap();
+        }
+        let meta = db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert_eq!(meta.max_death, 150);
+        db.advance_cf_watermark(&cf, 120).unwrap();
+
+        db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
+
+        let opts = EngineOptions {
+            db_path: "/ckpt".to_string(),
+            ..EngineOptions::default()
+        };
+        let restored = DbImpl::open_from_checkpoint(opts, fs).unwrap();
+        let rcf = restored
+            .column_family("life-restore")
+            .expect("CF restored by name");
+
+        // (a) Descriptor + clocks restored — NO re-declaration happened.
+        assert_eq!(
+            restored.cf_lifecycle(&rcf).unwrap(),
+            CfLifecycle::Windowed { ttl: TTL }
+        );
+        assert_eq!(restored.cf_watermark(&rcf).unwrap(), 120);
+        assert_eq!(restored.cf_max_event_time(&rcf).unwrap(), 50);
+
+        // (b) A post-restore flush stamps from the RESTORED bound (50+TTL),
+        // not stamp-0 (the pre-R10 immortal-segment consequence).
+        restored.put(&rcf, b"post-restore", b"v").unwrap();
+        let meta = restored.switch_and_flush(&rcf).unwrap().expect("flushed");
+        assert_eq!(meta.max_death, 150, "stamp must use the restored bound");
+
+        // (c) Expiry resumes purely from restored state: advance past the
+        // stamp (the backend re-emits watermarks on restore — but the
+        // DESCRIPTOR needed no re-declaration) and the segments drop whole.
+        let rcf_data = restored.lookup_cf_by_id(rcf.id()).unwrap();
+        restored.advance_cf_watermark(&rcf, 151).unwrap();
+        assert_eq!(restored.lifecycle_drop_expired(&rcf_data).unwrap(), 2);
+        assert_eq!(restored.get(&rcf, b"k0001").unwrap(), None);
+
+        // (d) Round-trip of a restored-then-checkpointed engine keeps the
+        // monotone clocks (restore→checkpoint→restore is stable).
+        restored
+            .create_checkpoint(std::path::Path::new("/ckpt2"))
+            .unwrap();
         set_lifecycle_segments_override(None);
     }
 

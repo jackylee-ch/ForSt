@@ -926,6 +926,27 @@ pub struct CfDescriptor {
     pub merge_op_name: String,
     /// Empty string when the CF was created without a compaction filter.
     pub filter_name: String,
+    /// FRS-WA-V1 R10 (blob v4): the CF's declared state-lifecycle kind
+    /// (0 = Unbounded/default, 1 = Windowed, 2 = Timer — the engine's
+    /// `CfLifecycle::ordinal` encoding). Persisted so whole-segment expiry
+    /// resumes after restore WITHOUT waiting for the backend to re-declare
+    /// the lifecycle. `0` for pre-v4 blobs.
+    pub lifecycle_ordinal: u8,
+    /// FRS-WA-V1 R10 (blob v4): TTL in the CF's clock units; meaningful
+    /// only when `lifecycle_ordinal == 1` (Windowed). `0` otherwise.
+    pub lifecycle_ttl: u64,
+    /// FRS-WA-V1 R10 (blob v4): the CF watermark sampled at snapshot time.
+    /// Monotone, so restoring it is conservative (≤ the true watermark at
+    /// crash time — drops can only be deferred, never premature). `0` for
+    /// pre-v4 blobs ("no watermark seen yet").
+    pub watermark: u64,
+    /// FRS-WA-V1 R10 (blob v4): the written-event-time upper bound sampled
+    /// at snapshot time. Covers every entry the snapshot contains (the
+    /// bound is advanced BEFORE the writes it covers and the snapshot is
+    /// taken under the apply lock), so a post-restore flush of replayed
+    /// state stamps soundly instead of emitting an immortal stamp-0
+    /// segment. `0` for pre-v4 blobs.
+    pub max_event_time: u64,
 }
 
 /// A frozen snapshot of the VersionSet state at a point in time.
