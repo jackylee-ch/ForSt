@@ -7017,13 +7017,26 @@ impl DbImpl {
         // SST metadata (no per-scan clone of every SstFileMeta + its keys).
         // FRS-PERLEVEL-SCAN (2026-06-04): locate the overlapping SSTs per level
         // via a binary-search-bounded walk instead of a flat O(total_files)
-        // range check over `live_sst_files_iter()`. The locator applies the
-        // SAME overlap predicate (`largest_key >= prefix && smallest_key <
-        // upper`), so the considered file set is byte-for-byte identical — it
-        // just bounds each level's scan to the files that start before `upper`.
+        // range check over `live_sst_files_iter()`.
+        // A2 (PMC cycle-4, E5 follow-up): CF-FILTERED locator. Per R49-H1
+        // every SST is cf_id-stamped at write, so another CF's files can
+        // never hold this CF's entries — the pre-A2 cf-agnostic walk only
+        // ever opened them to find nothing (their foreign keys were dropped
+        // by the cf-gated value resolution). Filtering at the locator (a)
+        // skips those useless opens and (b) restores the L1+ binary-search
+        // arm for multi-CF layouts: the CF's OWN level view is monotone by
+        // construction, so interleaved cross-CF byte ranges no longer park
+        // shared levels on the E5 linear fallback (the q4-class A_fanout
+        // decay OPT-N04's per-state CFs would have re-triggered at scale).
+        // Single-CF layouts take the byte-identical legacy walk.
         let mut overlapping_ssts: Vec<&forst_rs_storage::version::SstFileMeta> = Vec::new();
         let locate_t = bulk_start.map(|_| std::time::Instant::now());
-        version.overlapping_ssts_in_range(prefix, upper_slice, &mut overlapping_ssts);
+        version.overlapping_ssts_in_range_for_cf(
+            cf.id(),
+            prefix,
+            upper_slice,
+            &mut overlapping_ssts,
+        );
         if let Some(t) = locate_t {
             bulk_locate_ns = t.elapsed().as_nanos() as u64;
             bulk_n_overlap = overlapping_ssts.len() as u64;
@@ -7232,9 +7245,11 @@ impl DbImpl {
         // filter as the prefix path. 2026-05-29 PERF: borrow (no clone).
         let version = self.version_set.current();
         // FRS-PERLEVEL-SCAN (2026-06-04): per-level binary-search-bounded
-        // overlap location (identical file set to the flat range check).
+        // overlap location. A2: CF-FILTERED (see the prefix-path sister
+        // comment) — this CF's files only, fast L1+ arm even when multi-CF
+        // byte ranges interleave in the shared level arrays.
         let mut overlapping_ssts: Vec<&forst_rs_storage::version::SstFileMeta> = Vec::new();
-        version.overlapping_ssts_in_range(lower, upper, &mut overlapping_ssts);
+        version.overlapping_ssts_in_range_for_cf(cf.id(), lower, upper, &mut overlapping_ssts);
         for sst in overlapping_ssts {
             let reader = self.get_or_open_sst_reader(sst)?;
             // FRS-PREFIX-SEEK: seek to the first index block >= lower (see sister
@@ -16440,6 +16455,16 @@ mod tests {
             "fixture must produce a non-monotonic largest_key L1 (nested ranges)"
         );
 
+        // A2: the per-CF level views must mark BOTH CFs' L1 sub-sequences
+        // binary-searchable despite the non-monotonic full array — multi-CF
+        // scans no longer degrade to the E5 linear fallback.
+        assert!(version.has_per_cf_scan_views());
+        assert!(version.lower_bsearch_sound_for(1, l1[0].cf_id));
+        assert!(version.lower_bsearch_sound_for(1, l1[1].cf_id));
+        #[cfg(debug_assertions)]
+        let a2_probes_before =
+            forst_rs_storage::version::scan_locator_probes::l1plus_linear_levels();
+
         // The killer probes: scan lower bounds PAST the nested cf_b file's
         // largest_key — pre-fix release the partition_point skipped cf_a's
         // own [a:1..z:1] file and these came back empty.
@@ -16474,6 +16499,17 @@ mod tests {
         assert_eq!(
             db.get(&cf_b, b"m:2").unwrap().as_deref(),
             Some(b"vm2".as_ref())
+        );
+
+        // A2: every scan above must have taken the FAST locator arm — zero
+        // L1+ linear fallbacks on this thread across all probes.
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            forst_rs_storage::version::scan_locator_probes::l1plus_linear_levels()
+                - a2_probes_before,
+            0,
+            "A2: multi-CF engine scans must binary-search their per-CF views, \
+             not fall back to the E5 linear arm"
         );
     }
 
@@ -16555,6 +16591,19 @@ mod tests {
             "fixture must produce a non-monotonic largest_key L1 (nested mid CF)"
         );
 
+        // A2: all three CFs' L1 sub-sequences must be fast-arm eligible.
+        assert!(version.has_per_cf_scan_views());
+        for cf in cfs {
+            assert!(
+                version.lower_bsearch_sound_for(1, cf.id()),
+                "A2: cf {} L1 view must be bsearch-sound",
+                cf.id().0
+            );
+        }
+        #[cfg(debug_assertions)]
+        let a2_probes_before =
+            forst_rs_storage::version::scan_locator_probes::l1plus_linear_levels();
+
         // Every bucket: the owner's prefix scan returns EXACTLY its own rows,
         // byte-sorted, values intact.
         for b in 0..60u32 {
@@ -16570,6 +16619,15 @@ mod tests {
                 "bucket {b} (cf {cf_idx}): prefix scan must return exactly the owner's rows"
             );
         }
+
+        // A2: every bucket scan took the FAST arm (zero L1+ linear fallbacks).
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            forst_rs_storage::version::scan_locator_probes::l1plus_linear_levels()
+                - a2_probes_before,
+            0,
+            "A2: interleaved-bucket multi-CF scans must stay on the bsearch arm"
+        );
     }
 
     /// OPT-N04 E1: the promoted cross-CF compaction-input check is a HARD

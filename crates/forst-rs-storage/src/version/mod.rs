@@ -96,29 +96,100 @@ impl LevelMeta {
     }
 }
 
+/// E5/A2: per-CF view of one level's file array — the indices (into
+/// `LevelMeta::files`, ascending, i.e. stored smallest_key order) of the
+/// files stamped with one `cf_id`, plus the search-soundness flags computed
+/// over that SUB-SEQUENCE. Built lazily, and ONLY for multi-CF layouts
+/// (see [`CfLayout::Multi`]); a single-CF Version never allocates these.
+#[derive(Debug)]
+struct CfLevelView {
+    cf_id: ColumnFamilyId,
+    /// Indices into the level's `files`, ascending. The stored array is
+    /// sorted by `smallest_key`, and a subsequence of a sorted sequence is
+    /// sorted, so this view is smallest_key-sorted by construction.
+    file_idx: Vec<u32>,
+    /// E5 premise, per-CF: `largest_key` monotonic non-decreasing along
+    /// this CF's sub-sequence — exactly what the lower-bound
+    /// `partition_point` needs. For L1+ single-CF keyspaces this is true
+    /// by construction (per-CF non-overlap), but it is VERIFIED here, not
+    /// assumed (E5 lesson).
+    lower_bsearch_sound: bool,
+    /// Strict per-CF non-overlap (`prev.largest_key < next.smallest_key`):
+    /// the stronger premise the POINT-GET binary search needs (a key can
+    /// be contained by at most one file, so the rightmost
+    /// `smallest_key <= key` candidate is the only candidate). Implies
+    /// `lower_bsearch_sound`.
+    point_bsearch_sound: bool,
+}
+
+/// A2: which column families the Version's file layout spans. Detected once
+/// (lazily) per immutable Version.
+#[derive(Debug)]
+enum CfLayout {
+    /// No SST files at all (fresh DB / all-memtable state).
+    NoFiles,
+    /// Every file in every level carries this one `cf_id` — the common
+    /// production case. The legacy full-array search arms are used as-is
+    /// and NO per-CF views are allocated (zero overhead vs pre-A2).
+    Single(ColumnFamilyId),
+    /// Files from 2+ CFs share the level arrays (OPT-N04 era). Outer Vec is
+    /// per level; inner Vec holds one view per cf_id present at that level
+    /// (in first-appearance order — single-digit CFs, linear find).
+    Multi(Vec<Vec<CfLevelView>>),
+}
+
+/// E5/A2: the lazily-computed scan-locator index over an immutable
+/// `Version`'s level layout. One `OnceLock` init computes everything in a
+/// single O(total files) pass on the first scan.
+#[derive(Debug)]
+struct ScanIndex {
+    /// E5: per-level FULL-ARRAY `largest_key` monotonicity — the soundness
+    /// flag for the cf-agnostic lower-bound binary search in
+    /// [`Version::overlapping_ssts_in_range`].
+    lower_bsearch_sound: Vec<bool>,
+    /// A2: per-level FULL-ARRAY strict non-overlap — the soundness flag for
+    /// the single-CF point-get binary search in
+    /// [`Version::find_sst_for_key_in_cf`].
+    point_bsearch_sound: Vec<bool>,
+    /// A2: CF layout + per-CF views (multi-CF only).
+    cf_layout: CfLayout,
+}
+
+/// A2 test probe: thread-local count of L1+ levels resolved via the LINEAR
+/// fallback arm of the range-scan locator (the E5 degraded arm). Debug-only
+/// (compiled out of release — the hot path carries no counter). The E5/A2
+/// regression tests assert this stays ZERO for multi-CF scans through the
+/// per-CF views, i.e. that multi-CF no longer parks L1+ on the linear arm.
+#[cfg(debug_assertions)]
+pub mod scan_locator_probes {
+    use std::cell::Cell;
+    thread_local! {
+        static L1PLUS_LINEAR_LEVELS: Cell<u64> = const { Cell::new(0) };
+    }
+    /// Total L1+ linear-fallback level visits on this thread.
+    pub fn l1plus_linear_levels() -> u64 {
+        L1PLUS_LINEAR_LEVELS.with(|c| c.get())
+    }
+    pub(super) fn bump_l1plus_linear() {
+        L1PLUS_LINEAR_LEVELS.with(|c| c.set(c.get() + 1));
+    }
+}
+
 /// A single immutable version: the complete SST file layout at a point in time.
 #[derive(Debug)]
 pub struct Version {
     pub levels: Vec<LevelMeta>,
-    /// E5 (PMC cycle-3 §E1-F2): lazily-computed, per-level soundness flags
-    /// for the L1+ lower-bound binary search in
-    /// [`Self::overlapping_ssts_in_range`]. `true` iff that level's
-    /// `largest_key` sequence is monotonic non-decreasing in stored
-    /// (smallest_key-sorted) order — the EXACT premise the
-    /// `partition_point` on `largest_key` needs. Single-CF levels always
-    /// satisfy it (L1+ non-overlap); multi-CF levels with nested/
-    /// interleaved cross-CF ranges may not, and then the locator must
-    /// fall back to the linear left-skip (see E5 in
-    /// `overlapping_ssts_in_range`).
+    /// E5/A2: lazily-computed scan-locator index (per-level search-soundness
+    /// flags + per-CF level views for multi-CF layouts). See [`ScanIndex`].
     ///
     /// Lazy + cached per Version: a `Version` is immutable once published
-    /// (ArcSwap install / restore), so the flags are computed at most once
+    /// (ArcSwap install / restore), so the index is computed at most once
     /// (O(total files)) on the first scan and amortized across every scan
     /// of that version. Deliberately NOT an eager field so that every
     /// construction path (apply_edit, checkpoint restore's struct literal,
     /// tests that build levels by direct mutation before first use) stays
     /// correct without having to remember to recompute it.
-    scan_lower_bsearch_sound: OnceLock<Vec<bool>>,
+    scan_index: OnceLock<ScanIndex>,
 }
 
 // E5: manual impls — the OnceLock cache must not participate in
@@ -152,7 +223,127 @@ impl Version {
     pub fn from_levels(levels: Vec<LevelMeta>) -> Self {
         Self {
             levels,
-            scan_lower_bsearch_sound: OnceLock::new(),
+            scan_index: OnceLock::new(),
+        }
+    }
+
+    /// E5/A2: get-or-build the lazy scan-locator index. One O(total files)
+    /// pass: full-array per-level flags (E5) + CF-layout detection, and —
+    /// ONLY when 2+ distinct cf_ids are present — per-CF level views (A2).
+    /// Single-CF Versions allocate nothing beyond the two flag Vecs the E5
+    /// fix already paid for.
+    fn scan_index(&self) -> &ScanIndex {
+        self.scan_index.get_or_init(|| {
+            let mut lower_bsearch_sound = Vec::with_capacity(self.levels.len());
+            let mut point_bsearch_sound = Vec::with_capacity(self.levels.len());
+            let mut single_cf: Option<ColumnFamilyId> = None;
+            let mut multi_cf = false;
+            for lvl in &self.levels {
+                let mut lower_ok = true;
+                let mut point_ok = true;
+                for w in lvl.files.windows(2) {
+                    if w[0].largest_key > w[1].largest_key {
+                        lower_ok = false;
+                    }
+                    if w[0].largest_key >= w[1].smallest_key {
+                        point_ok = false;
+                    }
+                }
+                lower_bsearch_sound.push(lower_ok);
+                point_bsearch_sound.push(point_ok && lower_ok);
+                for f in &lvl.files {
+                    match single_cf {
+                        None => single_cf = Some(f.cf_id),
+                        Some(cf) if cf != f.cf_id => multi_cf = true,
+                        Some(_) => {}
+                    }
+                }
+            }
+            let cf_layout = if multi_cf {
+                CfLayout::Multi(self.build_per_cf_views())
+            } else {
+                match single_cf {
+                    Some(cf) => CfLayout::Single(cf),
+                    None => CfLayout::NoFiles,
+                }
+            };
+            ScanIndex {
+                lower_bsearch_sound,
+                point_bsearch_sound,
+                cf_layout,
+            }
+        })
+    }
+
+    /// A2: build the per-level per-CF views for a multi-CF layout. Indices
+    /// are appended in stored (smallest_key-sorted) order, so each view's
+    /// sub-sequence is smallest_key-sorted by construction; the two
+    /// soundness flags are computed over the sub-sequence as it is built.
+    fn build_per_cf_views(&self) -> Vec<Vec<CfLevelView>> {
+        self.levels
+            .iter()
+            .map(|lvl| {
+                let mut views: Vec<CfLevelView> = Vec::new();
+                for (i, f) in lvl.files.iter().enumerate() {
+                    let view = match views.iter_mut().find(|v| v.cf_id == f.cf_id) {
+                        Some(v) => v,
+                        None => {
+                            views.push(CfLevelView {
+                                cf_id: f.cf_id,
+                                file_idx: Vec::new(),
+                                lower_bsearch_sound: true,
+                                point_bsearch_sound: true,
+                            });
+                            views.last_mut().expect("just pushed")
+                        }
+                    };
+                    if let Some(&prev) = view.file_idx.last() {
+                        let prev = &lvl.files[prev as usize];
+                        if prev.largest_key > f.largest_key {
+                            view.lower_bsearch_sound = false;
+                        }
+                        if prev.largest_key >= f.smallest_key {
+                            view.point_bsearch_sound = false;
+                        }
+                    }
+                    view.file_idx.push(i as u32);
+                }
+                for v in &mut views {
+                    // point premise implies the lower premise; keep the
+                    // invariant explicit (mirrors the full-array flags).
+                    v.point_bsearch_sound = v.point_bsearch_sound && v.lower_bsearch_sound;
+                }
+                views
+            })
+            .collect()
+    }
+
+    /// A2 introspection (tests): whether this Version's lazy scan index
+    /// detected a multi-CF layout and built per-CF level views. Single-CF
+    /// Versions must return `false` (zero-overhead requirement).
+    #[doc(hidden)]
+    pub fn has_per_cf_scan_views(&self) -> bool {
+        matches!(self.scan_index().cf_layout, CfLayout::Multi(_))
+    }
+
+    /// A2 introspection (tests): would the range-scan locator take the FAST
+    /// (binary-search) lower-bound arm for `(level, cf_id)`? L0 always
+    /// answers `false` (linear by design — overlapping flushed memtables).
+    /// A CF with no files at the level answers `true` (nothing to probe —
+    /// the locator skips the level entirely, which is trivially fast).
+    #[doc(hidden)]
+    pub fn lower_bsearch_sound_for(&self, level: usize, cf_id: ColumnFamilyId) -> bool {
+        if level == 0 || level >= self.levels.len() {
+            return false;
+        }
+        let idx = self.scan_index();
+        match &idx.cf_layout {
+            CfLayout::NoFiles => true,
+            CfLayout::Single(cf) => *cf != cf_id || idx.lower_bsearch_sound[level],
+            CfLayout::Multi(views) => views[level]
+                .iter()
+                .find(|v| v.cf_id == cf_id)
+                .is_none_or(|v| v.lower_bsearch_sound),
         }
     }
 
@@ -337,6 +528,7 @@ impl Version {
     /// (today's layout) MUST use [`Self::find_sst_for_key_in_cf`]
     /// instead, otherwise multi-CF deployments with overlapping
     /// byte-range keyspaces silently miss point reads at L1+.
+    #[deprecated(note = "cross-CF unsound — use find_sst_for_key_in_cf (A-H2/E5/A2)")]
     pub fn find_sst_for_key(&self, level: usize, key: &[u8]) -> Option<usize> {
         if level == 0 || level >= self.levels.len() {
             return None;
@@ -370,11 +562,21 @@ impl Version {
     /// search, so the result is always the correct CF's file (or
     /// `None`).
     ///
-    /// Cost: linear scan filtered by cf_id is O(N_level). For the
-    /// audited deployment (≤ thousands of files per level, single-
-    /// digit CFs) the cache-friendly linear scan is faster in
-    /// practice than building a per-CF sorted view. If profiling
-    /// shows this becomes hot, switch to a precomputed per-CF index.
+    /// A2 (PMC cycle-4): this is the precomputed-per-CF-index upgrade the
+    /// A-H2 comment named. The lazy [`ScanIndex`] resolves the layout once
+    /// per immutable Version:
+    ///   * single-CF layout + matching `cf_id` → full-array binary search
+    ///     (rightmost `smallest_key <= key` + containment check), gated on
+    ///     the per-level strict-non-overlap flag (a key can be contained by
+    ///     at most one file, so the rightmost candidate is the ONLY
+    ///     candidate — the premise is VERIFIED, not assumed);
+    ///   * single-CF layout + other `cf_id` → `None` (no files of that CF);
+    ///   * multi-CF layout → binary search over THIS CF's level view (its
+    ///     sub-sequence is smallest_key-sorted by construction), same
+    ///     per-view non-overlap gate;
+    ///   * any level whose (sub-)sequence fails the non-overlap premise
+    ///     falls back to the pre-A2 linear first-match walk — identical
+    ///     result to the old code on every input.
     pub fn find_sst_for_key_in_cf(
         &self,
         level: usize,
@@ -385,10 +587,63 @@ impl Version {
             return None;
         }
         let files = &self.levels[level].files;
-        // Per-CF, files at L1+ are non-overlapping. Walk in order and
-        // find the file whose range contains `key`. We cannot binary
-        // search the unfiltered slice (see A-H2 above); the filtered
-        // sub-sequence preserves order so a single pass suffices.
+        if files.is_empty() {
+            return None;
+        }
+        let idx = self.scan_index();
+        match &idx.cf_layout {
+            CfLayout::NoFiles => None,
+            CfLayout::Single(cf) => {
+                if *cf != cf_id {
+                    return None;
+                }
+                if idx.point_bsearch_sound[level] {
+                    // Rightmost file with smallest_key <= key; under strict
+                    // non-overlap it is the only possible container.
+                    let i = files.partition_point(|f| f.smallest_key.as_slice() <= key);
+                    if i == 0 {
+                        return None;
+                    }
+                    if key <= files[i - 1].largest_key.as_slice() {
+                        Some(i - 1)
+                    } else {
+                        None
+                    }
+                } else {
+                    Self::find_sst_linear_in_cf(files, key, cf_id)
+                }
+            }
+            CfLayout::Multi(views) => {
+                let view = views[level].iter().find(|v| v.cf_id == cf_id)?;
+                if view.point_bsearch_sound {
+                    let i = view
+                        .file_idx
+                        .partition_point(|&fi| files[fi as usize].smallest_key.as_slice() <= key);
+                    if i == 0 {
+                        return None;
+                    }
+                    let candidate = view.file_idx[i - 1] as usize;
+                    if key <= files[candidate].largest_key.as_slice() {
+                        Some(candidate)
+                    } else {
+                        None
+                    }
+                } else {
+                    Self::find_sst_linear_in_cf(files, key, cf_id)
+                }
+            }
+        }
+    }
+
+    /// Pre-A2 fallback: linear first-match walk filtered by cf_id. Per-CF,
+    /// files at L1+ are non-overlapping, so the first containing file is
+    /// the only one; on (invariant-violating) overlapping layouts this
+    /// preserves the old code's first-match answer exactly.
+    fn find_sst_linear_in_cf(
+        files: &[SstFileMeta],
+        key: &[u8],
+        cf_id: forst_rs_common::ColumnFamilyId,
+    ) -> Option<usize> {
         for (idx, f) in files.iter().enumerate() {
             if f.cf_id != cf_id {
                 continue;
@@ -421,39 +676,32 @@ impl Version {
     /// is the per-level `partition_point` upper cut, which is sound because
     /// files within a level are sorted by `smallest_key` — every file at or
     /// after the cut has `smallest_key >= upper` and is excluded by the flat
-    /// path's `smallest_key >= upper` test too. No CF filtering is applied
-    /// (the flat scan does none either — it relies on the byte-range check),
-    /// so multi-CF deployments observe exactly the same files as before.
-    /// `upper == None` means unbounded above (scan to each level's end).
+    /// path's `smallest_key >= upper` test too. NO CF filtering is applied
+    /// here (cf-AGNOSTIC variant — used by the oracle tests and cf-blind
+    /// callers); per-CF readers use
+    /// [`Self::overlapping_ssts_in_range_for_cf`] (A2), which prunes to the
+    /// CF's own files AND keeps the fast lower-bound arm on multi-CF
+    /// layouts. `upper == None` means unbounded above (scan to each level's
+    /// end).
     ///
     /// E5 (PMC cycle-3 §E1-F2): the LOWER-bound binary search additionally
     /// requires `largest_key` to be monotonic across the level — true
     /// per-CF (L1+ non-overlap) but NOT guaranteed across CFs sharing the
     /// level array (nested/interleaved cross-CF ranges). The per-level
-    /// soundness flag (cached once per immutable Version, see
-    /// `Self::scan_lower_bsearch_sound`) gates the binary search; when a
-    /// level is non-monotonic the lower bound falls back to the L0-style
-    /// linear left-skip, which applies the flat path's own
-    /// `largest_key >= lower` predicate per file and therefore cannot miss
-    /// a file. Single-CF deployments always take the binary-search arm —
-    /// the hot path is unchanged except for one cached-bool branch per
-    /// level.
+    /// soundness flag (cached once per immutable Version in [`ScanIndex`])
+    /// gates the binary search; when a level is non-monotonic the lower
+    /// bound falls back to the L0-style linear left-skip, which applies the
+    /// flat path's own `largest_key >= lower` predicate per file and
+    /// therefore cannot miss a file. Single-CF deployments always take the
+    /// binary-search arm — the hot path is unchanged except for one cached
+    /// flag load + branch per level.
     pub fn overlapping_ssts_in_range<'a>(
         &'a self,
         lower: &[u8],
         upper: Option<&[u8]>,
         out: &mut Vec<&'a SstFileMeta>,
     ) {
-        let lower_bsearch_sound = self.scan_lower_bsearch_sound.get_or_init(|| {
-            self.levels
-                .iter()
-                .map(|lvl| {
-                    lvl.files
-                        .windows(2)
-                        .all(|w| w[0].largest_key <= w[1].largest_key)
-                })
-                .collect()
-        });
+        let lower_bsearch_sound = &self.scan_index().lower_bsearch_sound;
         for (lvl_idx, level) in self.levels.iter().enumerate() {
             let files = &level.files;
             // Binary-search the upper cut: first file whose smallest_key is
@@ -476,8 +724,15 @@ impl Version {
                 // overlapping files (release) or tripped a debug_assert. The
                 // linear arm applies the exact flat-path predicate per file, so
                 // the result set stays identical to the flat scan. Cost is
-                // O(files-before-range) only on such multi-CF levels; today's
-                // single-CF production layout never enters this arm at L1+.
+                // O(files-before-range) only on such multi-CF levels. A2: the
+                // engine's per-CF scans use overlapping_ssts_in_range_for_cf,
+                // which binary-searches the CF's OWN (monotone) view instead of
+                // entering this arm — this cf-agnostic entry point remains for
+                // oracle tests and cf-blind callers.
+                #[cfg(debug_assertions)]
+                if lvl_idx > 0 {
+                    scan_locator_probes::bump_l1plus_linear();
+                }
                 for f in &files[..end] {
                     if f.largest_key.as_slice() < lower {
                         continue;
@@ -498,6 +753,107 @@ impl Version {
                 let start = files.partition_point(|f| f.largest_key.as_slice() < lower);
                 for f in &files[start.min(end)..end] {
                     out.push(f);
+                }
+            }
+        }
+    }
+
+    /// A2 (PMC cycle-4 advisory, E5 follow-up): CF-FILTERED range locator —
+    /// appends the SSTs **of `cf_id`** that may contain a key in
+    /// `[lower, upper)` to `out` (level-ascending, per-level smallest_key
+    /// order within the CF).
+    ///
+    /// WHY: keys are NOT CF-prefixed, so once 2+ CFs with interleaving byte
+    /// ranges share the level arrays, the full-array `largest_key` sequence
+    /// becomes DURABLY non-monotonic and the cf-agnostic locator above
+    /// permanently parks those levels on the E5 linear arm (the q4-class
+    /// O(files) A_fanout decay). A CF's OWN sub-sequence, however, is
+    /// internally sorted and (L1+) non-overlapping, so its `largest_key`
+    /// view is monotone by construction — the per-CF views restore the
+    /// binary-search arm for every CF.
+    ///
+    /// Arms (per level):
+    ///   * single-CF layout, matching `cf_id` → byte-identical to the
+    ///     cf-agnostic path (every file IS this CF's); no views allocated;
+    ///   * single-CF layout, other `cf_id` → nothing (this CF has no SSTs);
+    ///   * multi-CF layout → binary search over this CF's level view
+    ///     (upper cut on `smallest_key`, lower cut on `largest_key`), gated
+    ///     on the per-view monotonicity flag (VERIFIED at view build, not
+    ///     assumed); a failing view falls back to a linear walk over the
+    ///     view's indices (still CF-pruned, never the whole level).
+    ///
+    /// CORRECTNESS — result set ≡ the flat scan RESTRICTED to `cf_id`
+    /// (`f.cf_id == cf_id && largest_key >= lower && smallest_key < upper`):
+    /// the view holds exactly the level's `cf_id` files in stored order, the
+    /// upper cut excludes exactly the `smallest_key >= upper` tail (sorted
+    /// sub-sequence), and the lower cut excludes exactly the
+    /// `largest_key < lower` prefix (monotone sub-sequence, same
+    /// partition_point argument as E5 §2). L0 stays linear (overlapping
+    /// flushed memtables), as in the cf-agnostic path.
+    ///
+    /// Callers that previously used the cf-agnostic locator and dropped
+    /// foreign-CF rows downstream (per-key cf-gated `get`) get the same
+    /// final rows with strictly fewer SSTs opened: per R49-H1 every SST is
+    /// cf_id-stamped at write, so a file of another CF can never hold this
+    /// CF's entries.
+    pub fn overlapping_ssts_in_range_for_cf<'a>(
+        &'a self,
+        cf_id: ColumnFamilyId,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        out: &mut Vec<&'a SstFileMeta>,
+    ) {
+        let idx = self.scan_index();
+        match &idx.cf_layout {
+            CfLayout::NoFiles => {}
+            CfLayout::Single(cf) => {
+                if *cf == cf_id {
+                    // Every file is this CF's: the cf-agnostic walk IS the
+                    // cf-filtered walk. Zero overhead vs pre-A2 (one enum
+                    // discriminant load + cf compare per scan).
+                    self.overlapping_ssts_in_range(lower, upper, out);
+                }
+            }
+            CfLayout::Multi(level_views) => {
+                for (lvl_idx, views) in level_views.iter().enumerate() {
+                    let Some(view) = views.iter().find(|v| v.cf_id == cf_id) else {
+                        continue;
+                    };
+                    let files = &self.levels[lvl_idx].files;
+                    // Upper cut on the CF's sorted sub-sequence: first view
+                    // entry whose smallest_key is >= upper.
+                    let end = match upper {
+                        Some(hi) => view
+                            .file_idx
+                            .partition_point(|&fi| files[fi as usize].smallest_key.as_slice() < hi),
+                        None => view.file_idx.len(),
+                    };
+                    if lvl_idx == 0 || !view.lower_bsearch_sound {
+                        // L0 (overlapping flushed memtables) or a view whose
+                        // monotonicity premise failed: linear left-skip over
+                        // the CF's OWN indices — the flat predicate per file,
+                        // cannot miss; still never walks other CFs' files.
+                        #[cfg(debug_assertions)]
+                        if lvl_idx > 0 {
+                            scan_locator_probes::bump_l1plus_linear();
+                        }
+                        for &fi in &view.file_idx[..end] {
+                            let f = &files[fi as usize];
+                            if f.largest_key.as_slice() < lower {
+                                continue;
+                            }
+                            out.push(f);
+                        }
+                    } else {
+                        // FAST arm (the A2 point): lower-bound binary search
+                        // on the CF's monotone largest_key sub-sequence.
+                        let start = view
+                            .file_idx
+                            .partition_point(|&fi| files[fi as usize].largest_key.as_slice() < lower);
+                        for &fi in &view.file_idx[start.min(end)..end] {
+                            out.push(&files[fi as usize]);
+                        }
+                    }
                 }
             }
         }
@@ -1042,6 +1398,281 @@ mod tests {
                 upper
             );
         }
+
+        // A2: the CF-FILTERED locator on the SAME non-monotonic shape must
+        // (a) equal the cf-filtered flat scan and (b) take the FAST
+        // binary-search arm at L1+ — the per-CF largest_key sub-sequences
+        // ([m, t] for cf_a, [c] for cf_b) are monotone even though the full
+        // array ([m, c, t]) is not.
+        assert!(v.has_per_cf_scan_views(), "multi-CF layout must build views");
+        for cf in [cf_a, cf_b] {
+            for lvl in 1..v.num_levels() {
+                assert!(
+                    v.lower_bsearch_sound_for(lvl, cf),
+                    "A2: cf {} level {lvl} must be bsearch-sound via its own view",
+                    cf.0
+                );
+            }
+        }
+        let flat_cf = |cf: ColumnFamilyId, lower: &[u8], upper: Option<&[u8]>| -> Vec<FileNumber> {
+            let mut nums: Vec<FileNumber> = v
+                .live_sst_files_iter()
+                .filter(|f| {
+                    f.cf_id == cf
+                        && f.largest_key.as_slice() >= lower
+                        && upper.is_none_or(|u| f.smallest_key.as_slice() < u)
+                })
+                .map(|f| f.file_number)
+                .collect();
+            nums.sort_by_key(|n| n.0);
+            nums
+        };
+        #[cfg(debug_assertions)]
+        let probes_before = scan_locator_probes::l1plus_linear_levels();
+        for cf in [cf_a, cf_b] {
+            for (lower, upper) in bounds {
+                let mut got: Vec<&SstFileMeta> = Vec::new();
+                v.overlapping_ssts_in_range_for_cf(cf, lower, *upper, &mut got);
+                let mut got_nums: Vec<FileNumber> = got.iter().map(|f| f.file_number).collect();
+                got_nums.sort_by_key(|n| n.0);
+                assert_eq!(
+                    got_nums,
+                    flat_cf(cf, lower, *upper),
+                    "A2 cf {} range [{:?},{:?}): cf-filtered locator must equal cf-filtered flat scan",
+                    cf.0,
+                    lower,
+                    upper
+                );
+                assert!(
+                    got.iter().all(|f| f.cf_id == cf),
+                    "A2: locator must return only the requested CF's files"
+                );
+            }
+        }
+        #[cfg(debug_assertions)]
+        assert_eq!(
+            scan_locator_probes::l1plus_linear_levels() - probes_before,
+            0,
+            "A2: multi-CF per-CF scans must take the FAST arm at L1+ (zero linear fallbacks)"
+        );
+        // Probe-counter sanity: the cf-AGNOSTIC locator on this shape DOES
+        // hit the linear fallback at the non-monotonic L1 — proving the
+        // counter observes the degraded arm the A2 path avoids.
+        #[cfg(debug_assertions)]
+        {
+            let before = scan_locator_probes::l1plus_linear_levels();
+            let mut sink: Vec<&SstFileMeta> = Vec::new();
+            v.overlapping_ssts_in_range(b"f", Some(b"g"), &mut sink);
+            assert!(
+                scan_locator_probes::l1plus_linear_levels() > before,
+                "cf-agnostic locator must take the linear arm on the non-monotonic L1"
+            );
+        }
+    }
+
+    /// A2: single-CF layouts must NOT build per-CF views (zero-overhead
+    /// requirement) and the cf-filtered locator must be byte-identical to
+    /// the cf-agnostic one for the present CF, and empty for any other CF.
+    #[test]
+    fn test_overlapping_ssts_for_cf_single_cf_layout_a2() {
+        let v = Version::new()
+            .apply_edit(&VersionEdit {
+                new_files: vec![
+                    (0, make_file(1, b"a", b"m")),
+                    (0, make_file(2, b"f", b"z")),
+                    (1, make_file(10, b"a", b"d")),
+                    (1, make_file(11, b"e", b"g")),
+                    (1, make_file(12, b"h", b"k")),
+                    (2, make_file(20, b"a", b"p")),
+                ],
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            !v.has_per_cf_scan_views(),
+            "single-CF layout must not allocate per-CF views"
+        );
+        let bounds: &[(&[u8], Option<&[u8]>)] = &[
+            (b"a", Some(b"b")),
+            (b"e", Some(b"h")),
+            (b"j", None),
+            (b"\x00", Some(b"\xff")),
+            (b"z", None),
+        ];
+        for (lower, upper) in bounds {
+            let mut agnostic: Vec<&SstFileMeta> = Vec::new();
+            v.overlapping_ssts_in_range(lower, *upper, &mut agnostic);
+            let mut filtered: Vec<&SstFileMeta> = Vec::new();
+            v.overlapping_ssts_in_range_for_cf(DEFAULT_CF_ID, lower, *upper, &mut filtered);
+            let a: Vec<FileNumber> = agnostic.iter().map(|f| f.file_number).collect();
+            let f: Vec<FileNumber> = filtered.iter().map(|f| f.file_number).collect();
+            assert_eq!(a, f, "single-CF: for_cf must match the cf-agnostic walk");
+            // A CF with no files sees nothing.
+            let mut other: Vec<&SstFileMeta> = Vec::new();
+            v.overlapping_ssts_in_range_for_cf(
+                forst_rs_common::ColumnFamilyId(9),
+                lower,
+                *upper,
+                &mut other,
+            );
+            assert!(other.is_empty(), "absent CF must see no SSTs");
+        }
+        // Empty version: both layouts degenerate cleanly.
+        let empty = Version::new();
+        assert!(!empty.has_per_cf_scan_views());
+        let mut out: Vec<&SstFileMeta> = Vec::new();
+        empty.overlapping_ssts_in_range_for_cf(DEFAULT_CF_ID, b"a", None, &mut out);
+        assert!(out.is_empty());
+    }
+
+    /// A2 fuzz: randomized multi-CF layouts (per-CF non-overlapping L1/L2,
+    /// overlapping L0, interleaved/nested cross-CF byte ranges) × random
+    /// query ranges. The cf-filtered locator must equal the cf-filtered
+    /// flat scan EXACTLY, and (debug) never hit the L1+ linear fallback —
+    /// per-CF sub-sequences are monotone by construction.
+    #[test]
+    fn test_overlapping_ssts_for_cf_multi_cf_fuzz_a2() {
+        // Deterministic LCG, no external deps.
+        let mut state: u64 = 0x243F6A8885A308D3;
+        let mut rng = move |m: u64| -> u64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m
+        };
+        let cfs = [
+            DEFAULT_CF_ID,
+            forst_rs_common::ColumnFamilyId(3),
+            forst_rs_common::ColumnFamilyId(7),
+        ];
+        for round in 0..40 {
+            let mut new_files: Vec<(u32, SstFileMeta)> = Vec::new();
+            let mut file_num = 1u64;
+            for (cf_pos, &cf) in cfs.iter().enumerate() {
+                // Each CF owns keys `{cf_pos}{4-digit}` — disjoint key SETS
+                // (the backend invariant) with fully interleaved byte ranges
+                // across CFs at every level.
+                let mk_key = |x: u64| format!("{cf_pos}{x:04}").into_bytes();
+                // L0: 0-3 overlapping files per CF.
+                for _ in 0..rng(4) {
+                    let a = rng(9000);
+                    let b = a + rng(1000);
+                    new_files.push((
+                        0,
+                        SstFileMeta {
+                            file_number: FileNumber(file_num),
+                            cf_id: cf,
+                            file_size: 1024,
+                            smallest_key: mk_key(a),
+                            largest_key: mk_key(b),
+                            min_sequence: SequenceNumber(1),
+                            max_sequence: SequenceNumber(100),
+                            num_entries: 10,
+                        },
+                    ));
+                    file_num += 1;
+                }
+                // L1/L2: per-CF NON-overlapping runs (cursor walks forward).
+                for level in 1..=2u32 {
+                    let mut cursor = rng(50);
+                    for _ in 0..rng(6) {
+                        let a = cursor;
+                        let b = a + rng(300);
+                        cursor = b + 1 + rng(200);
+                        if cursor >= 9999 {
+                            break;
+                        }
+                        new_files.push((
+                            level,
+                            SstFileMeta {
+                                file_number: FileNumber(file_num),
+                                cf_id: cf,
+                                file_size: 1024,
+                                smallest_key: mk_key(a),
+                                largest_key: mk_key(b),
+                                min_sequence: SequenceNumber(1),
+                                max_sequence: SequenceNumber(100),
+                                num_entries: 10,
+                            },
+                        ));
+                        file_num += 1;
+                    }
+                }
+            }
+            if new_files.is_empty() {
+                continue;
+            }
+            let v = Version::new()
+                .apply_edit(&VersionEdit {
+                    new_files,
+                    ..Default::default()
+                })
+                .unwrap();
+
+            #[cfg(debug_assertions)]
+            let probes_before = scan_locator_probes::l1plus_linear_levels();
+            for _ in 0..30 {
+                let cf = cfs[rng(3) as usize];
+                let qcf = rng(3) as usize; // query in any CF's byte namespace
+                let a = rng(10000);
+                let lower = format!("{qcf}{a:04}").into_bytes();
+                let upper: Option<Vec<u8>> = if rng(4) == 0 {
+                    None
+                } else {
+                    Some(format!("{}{:04}", rng(3), a + rng(2000)).into_bytes())
+                };
+                let mut got: Vec<&SstFileMeta> = Vec::new();
+                v.overlapping_ssts_in_range_for_cf(cf, &lower, upper.as_deref(), &mut got);
+                let mut got_nums: Vec<FileNumber> = got.iter().map(|f| f.file_number).collect();
+                got_nums.sort_by_key(|n| n.0);
+                let mut want: Vec<FileNumber> = v
+                    .live_sst_files_iter()
+                    .filter(|f| {
+                        f.cf_id == cf
+                            && f.largest_key >= lower
+                            && upper.as_deref().is_none_or(|u| f.smallest_key.as_slice() < u)
+                    })
+                    .map(|f| f.file_number)
+                    .collect();
+                want.sort_by_key(|n| n.0);
+                assert_eq!(
+                    got_nums, want,
+                    "A2 fuzz round {round}: cf {} range [{:?},{:?}) locator != cf-filtered flat scan",
+                    cf.0, lower, upper
+                );
+            }
+            #[cfg(debug_assertions)]
+            assert_eq!(
+                scan_locator_probes::l1plus_linear_levels() - probes_before,
+                0,
+                "A2 fuzz round {round}: per-CF L1+ scans must never take the linear arm"
+            );
+
+            // find_sst_for_key_in_cf cross-check on the same layout: the
+            // (possibly bsearch-accelerated) answer must contain the key and
+            // match the linear reference walk's containment verdict.
+            for _ in 0..30 {
+                let cf = cfs[rng(3) as usize];
+                let key = format!("{}{:04}", rng(3), rng(10000)).into_bytes();
+                for level in 1..=2usize {
+                    let got = v.find_sst_for_key_in_cf(level, &key, cf);
+                    let want =
+                        Version::find_sst_linear_in_cf(&v.levels[level].files, &key, cf);
+                    match (got, want) {
+                        (Some(g), Some(w)) => {
+                            // Per-CF non-overlap ⇒ unique container.
+                            assert_eq!(g, w, "point-get candidate mismatch");
+                        }
+                        (None, None) => {}
+                        other => panic!(
+                            "A2 fuzz round {round}: find_sst_for_key_in_cf {:?} disagrees \
+                             with linear reference for cf {} key {:?} level {level}",
+                            other, cf.0, key
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1103,6 +1734,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // exercising the deprecated cf-agnostic variant on purpose
     fn test_version_find_sst_for_key() {
         let v = Version::new();
         let edit = VersionEdit {
