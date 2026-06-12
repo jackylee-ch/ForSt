@@ -1427,6 +1427,7 @@ impl DbImpl {
         let options = desc.options().clone();
         let merge_op = desc.merge_operator();
         let filter = desc.compaction_filter();
+        let desc_lifecycle = desc.lifecycle();
 
         // R50-H2: validate the (id, name) pair against the engine's CF
         // invariants BEFORE inserting. Restore (`open_from_checkpoint`)
@@ -1491,6 +1492,18 @@ impl DbImpl {
             initial_snapshot,
             self.options.memtable_shards,
         ));
+        // FRS-WA-V0: carry the descriptor's lifecycle hint onto the live CF
+        // state (inert in V0 — observed by diagnostics + the flagged V1
+        // segment machinery only).
+        if desc_lifecycle != crate::column_family::CfLifecycle::Unbounded {
+            cf_data.set_lifecycle(desc_lifecycle);
+            tracing::info!(
+                cf_id = id.value(),
+                cf_name = %cf_data.handle().name(),
+                lifecycle = ?desc_lifecycle,
+                "FRS-WA-V0: column family created with lifecycle descriptor"
+            );
+        }
 
         cfs_guard.insert(id, cf_data.clone());
         // Drop the cfs write guard before grabbing name_map's write guard to
@@ -1609,6 +1622,66 @@ impl DbImpl {
         // Default CF: no homogeneity gate, no lock window needed.
         cf_data.set_compaction_filter(filter);
         Ok(())
+    }
+
+    /// FRS-WA-V0 (write-path redesign survey §3.2): installs (or replaces)
+    /// the CF's state-lifecycle descriptor post-create — Flink configures
+    /// state TTL after the backend opens, mirroring the
+    /// [`Self::set_compaction_filter`] model. V0 is INERT: the engine stores
+    /// the descriptor and logs it; only the (default-OFF, flagged) V1
+    /// death-bucketed-segment machinery reads it.
+    pub fn set_cf_lifecycle(
+        &self,
+        cf: &ColumnFamilyHandle,
+        lifecycle: crate::column_family::CfLifecycle,
+    ) -> ForstResult<()> {
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        cf_data.set_lifecycle(lifecycle);
+        tracing::info!(
+            cf_id = cf.id().value(),
+            cf_name = %cf.name(),
+            lifecycle = ?lifecycle,
+            "FRS-WA-V0: lifecycle descriptor installed"
+        );
+        Ok(())
+    }
+
+    /// FRS-WA-V0: returns the CF's current lifecycle descriptor.
+    pub fn cf_lifecycle(
+        &self,
+        cf: &ColumnFamilyHandle,
+    ) -> ForstResult<crate::column_family::CfLifecycle> {
+        Ok(self.lookup_cf_by_id(cf.id())?.lifecycle())
+    }
+
+    /// FRS-WA-V0: advances the CF's watermark clock (monotonic; stale values
+    /// are no-ops). The backend invokes this from the operator's watermark
+    /// path — clock units are caller-defined (Flink: ms). V0 stores only;
+    /// V1's segment-expiry maintenance compares segment death stamps against
+    /// this value.
+    pub fn advance_cf_watermark(&self, cf: &ColumnFamilyHandle, ts: u64) -> ForstResult<()> {
+        self.lookup_cf_by_id(cf.id())?.advance_watermark(ts);
+        Ok(())
+    }
+
+    /// FRS-WA-V0: current CF watermark (0 = none observed yet).
+    pub fn cf_watermark(&self, cf: &ColumnFamilyHandle) -> ForstResult<u64> {
+        Ok(self.lookup_cf_by_id(cf.id())?.watermark())
+    }
+
+    /// FRS-WA-V0: raises the CF's written-event-time upper bound (monotonic).
+    /// The caller MUST keep this ≥ the event-time of every entry it has
+    /// written to the CF (advance before/with each write); the V1 flush path
+    /// reads it after sealing a memtable to derive a sound (never premature)
+    /// segment death stamp.
+    pub fn note_cf_max_event_time(&self, cf: &ColumnFamilyHandle, ts: u64) -> ForstResult<()> {
+        self.lookup_cf_by_id(cf.id())?.note_max_event_time(ts);
+        Ok(())
+    }
+
+    /// FRS-WA-V0: current written-event-time upper bound (0 = none noted).
+    pub fn cf_max_event_time(&self, cf: &ColumnFamilyHandle) -> ForstResult<u64> {
+        Ok(self.lookup_cf_by_id(cf.id())?.max_event_time())
     }
 
     /// Drops a column family (B-Prod-followup-5, spec §6g).
@@ -13325,6 +13398,56 @@ mod tests {
         DbImpl::open_default().expect("open")
     }
 
+    /// FRS-WA-V0 (write-path survey §6 stage V0): the lifecycle/watermark
+    /// plumbing is engine-visible end to end — descriptor at create time,
+    /// post-create install, monotonic clocks — and INERT (no write/read/
+    /// compaction behavior keys off it in V0).
+    #[test]
+    fn test_wa_v0_lifecycle_plumbing_roundtrip() {
+        use crate::column_family::CfLifecycle;
+        let db = open();
+
+        // (a) Create-time descriptor carries through to the live CF.
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("win")
+                    .with_lifecycle(CfLifecycle::Windowed { ttl: 4_000 }),
+            )
+            .expect("create cf");
+        assert_eq!(
+            db.cf_lifecycle(&cf).unwrap(),
+            CfLifecycle::Windowed { ttl: 4_000 }
+        );
+
+        // (b) Post-create install (the Flink configure-after-open model).
+        let cf2 = db
+            .create_column_family(ColumnFamilyDescriptor::new("timer"))
+            .expect("create cf2");
+        assert_eq!(db.cf_lifecycle(&cf2).unwrap(), CfLifecycle::Unbounded);
+        db.set_cf_lifecycle(&cf2, CfLifecycle::Timer).unwrap();
+        assert_eq!(db.cf_lifecycle(&cf2).unwrap(), CfLifecycle::Timer);
+
+        // (c) Watermark + event-time clocks: monotonic, per-CF isolated.
+        db.advance_cf_watermark(&cf, 1_000).unwrap();
+        db.advance_cf_watermark(&cf, 400).unwrap(); // stale: no-op
+        assert_eq!(db.cf_watermark(&cf).unwrap(), 1_000);
+        assert_eq!(db.cf_watermark(&cf2).unwrap(), 0, "per-CF isolation");
+        db.note_cf_max_event_time(&cf, 5_000).unwrap();
+        db.note_cf_max_event_time(&cf, 4_999).unwrap(); // stale: no-op
+        assert_eq!(db.cf_max_event_time(&cf).unwrap(), 5_000);
+
+        // (d) Inertness: a lifecycle CF still writes/reads/flushes exactly
+        // like any other CF in V0.
+        db.put(&cf, b"k1", b"v1").unwrap();
+        db.flush_all().unwrap();
+        assert_eq!(db.get(&cf, b"k1").unwrap().as_deref(), Some(&b"v1"[..]));
+
+        // (e) Dropped CF: the central lookup rejection applies.
+        db.drop_cf(&cf2).unwrap();
+        assert!(db.set_cf_lifecycle(&cf2, CfLifecycle::Unbounded).is_err());
+        assert!(db.advance_cf_watermark(&cf2, 1).is_err());
+    }
+
     /// Step ② (roadmap L1): boundary coverage of the composite garbage-drain
     /// gate — every condition tested at its exact edge, around an all-pass
     /// reference at the env-opt-in 200K threshold (the Mac-recorded sweet
@@ -16615,10 +16738,12 @@ mod tests {
         let v = db.version_set.current();
         // The overlapped old file must be gone (consumed by the rollup).
         for f in &v.levels[1].files {
+            // (clippy nonminimal_bool: "old file overlapping [k0020, k0029]
+            // must not survive" — written De-Morganized.)
             assert!(
-                !old_files.contains(&f.file_number.value())
-                    || !(f.smallest_key.as_slice() <= b"k0029".as_slice()
-                        && f.largest_key.as_slice() >= b"k0020".as_slice()),
+                !(old_files.contains(&f.file_number.value())
+                    && f.smallest_key.as_slice() <= b"k0029".as_slice()
+                    && f.largest_key.as_slice() >= b"k0020".as_slice()),
                 "overlapped L1 file {} survived the rollup",
                 f.file_number
             );

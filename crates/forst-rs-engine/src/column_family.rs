@@ -20,7 +20,7 @@
 //! creating/opening a column family. [`ColumnFamilyData`] holds the per-CF
 //! mutable state (active memtable, immutable list, cached snapshot view).
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use arc_swap::ArcSwap;
@@ -158,6 +158,71 @@ pub fn global_resident_shadow_used_bytes() -> usize {
 use crate::compaction_filter::CompactionFilter;
 use crate::snapshot_view::SnapshotView;
 
+/// FRS-WA-V0 (2026-06-13 write-path redesign survey §3.2): per-CF state
+/// LIFECYCLE descriptor — the backend→engine contract that tells the engine
+/// *when state dies*, so the write path can stop compacting soon-dead bytes
+/// (the measured 87 % of physical writes) and instead drop whole death-bucketed
+/// segments at the watermark (measured floor: write-amp 0.98, survey cell F).
+///
+/// V0 is **inert plumbing**: the engine stores the descriptor + the
+/// watermark/event-time clocks and logs them; no behavior depends on them
+/// until the death-bucketed segment stage (V1) reads them behind its own
+/// default-OFF flag.
+///
+/// Clock units are caller-defined (Flink passes milliseconds; benches may
+/// pass row sequence numbers) — the engine only ever COMPARES timestamps
+/// from the same CF's clock, never interprets them.
+///
+/// Precedent for exporting this knowledge across the boundary: ForSt C++
+/// ships `FlinkCompactionFilter` (`utilities/flink/flink_compaction_filter.h`)
+/// whose only job is dropping ttl-expired Flink state DURING compaction —
+/// the TTL contract already crosses FFI today, but only as a filter *inside*
+/// compaction (still paying the rewrite). This descriptor moves the same
+/// knowledge to where it can prevent the rewrite entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CfLifecycle {
+    /// No death contract: state may live forever (general-purpose CFs,
+    /// unbounded aggregations). The CF stays on the classic leveled
+    /// compaction path.
+    #[default]
+    Unbounded,
+    /// Windowed / TTL state: every entry written at event-time `t` is dead —
+    /// guaranteed never read by the backend — once the CF watermark passes
+    /// `t + ttl` (window state, interval-join state, TTL-configured state).
+    Windowed {
+        /// Time-to-live in the CF's clock units (Flink: ms).
+        ttl: u64,
+    },
+    /// Timer queue state: entries die when they FIRE (key-embedded
+    /// timestamp passes the watermark). Reserved for a later stage; V0/V1
+    /// treat it as a declared-but-unacted hint.
+    Timer,
+}
+
+impl CfLifecycle {
+    /// Stable ordinal for FFI transport (`frs_cf_set_lifecycle`).
+    /// 0 = Unbounded, 1 = Windowed, 2 = Timer.
+    pub fn ordinal(&self) -> i32 {
+        match self {
+            CfLifecycle::Unbounded => 0,
+            CfLifecycle::Windowed { .. } => 1,
+            CfLifecycle::Timer => 2,
+        }
+    }
+
+    /// Inverse of [`Self::ordinal`]. `ttl` is only meaningful for
+    /// `Windowed` (ordinal 1). Unknown ordinals return `None` so the FFI
+    /// can reject them with INVALID_ARGUMENT instead of guessing.
+    pub fn from_ordinal(ordinal: i32, ttl: u64) -> Option<Self> {
+        match ordinal {
+            0 => Some(CfLifecycle::Unbounded),
+            1 => Some(CfLifecycle::Windowed { ttl }),
+            2 => Some(CfLifecycle::Timer),
+            _ => None,
+        }
+    }
+}
+
 /// Lightweight handle to an open column family.
 ///
 /// Contains the numeric id and a shared pointer to the name. Clone is O(1)
@@ -237,6 +302,8 @@ pub struct ColumnFamilyDescriptor {
     options: CfOptions,
     merge_operator: Option<Arc<dyn MergeOperator>>,
     compaction_filter: Option<Arc<dyn CompactionFilter>>,
+    /// FRS-WA-V0: per-CF state lifecycle hint (default [`CfLifecycle::Unbounded`]).
+    lifecycle: CfLifecycle,
 }
 
 impl ColumnFamilyDescriptor {
@@ -247,6 +314,7 @@ impl ColumnFamilyDescriptor {
             options: CfOptions::default(),
             merge_operator: None,
             compaction_filter: None,
+            lifecycle: CfLifecycle::default(),
         }
     }
 
@@ -271,6 +339,15 @@ impl ColumnFamilyDescriptor {
         self
     }
 
+    /// FRS-WA-V0: declares the CF's state lifecycle at create time. The
+    /// post-create [`ColumnFamilyData::set_lifecycle`] path (driven by
+    /// `frs_cf_set_lifecycle`) is equivalent — Flink configures state TTL
+    /// after the backend opens, mirroring the compaction-filter model.
+    pub fn with_lifecycle(mut self, lifecycle: CfLifecycle) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
     /// Returns the column family name.
     pub fn name(&self) -> &str {
         &self.name
@@ -290,6 +367,11 @@ impl ColumnFamilyDescriptor {
     pub fn compaction_filter(&self) -> Option<Arc<dyn CompactionFilter>> {
         self.compaction_filter.clone()
     }
+
+    /// FRS-WA-V0: returns the declared lifecycle.
+    pub fn lifecycle(&self) -> CfLifecycle {
+        self.lifecycle
+    }
 }
 
 impl std::fmt::Debug for ColumnFamilyDescriptor {
@@ -304,6 +386,7 @@ impl std::fmt::Debug for ColumnFamilyDescriptor {
                 // temporary.
                 &self.merge_operator.as_ref().map(|op| op.name()),
             )
+            .field("lifecycle", &self.lifecycle)
             .finish()
     }
 }
@@ -405,6 +488,22 @@ pub struct ColumnFamilyData {
     /// stable for the entry's lifetime, and dropping an entry is always safe
     /// (the data is still on the SST).
     resident_flushed: RwLock<Vec<ResidentEntry>>,
+    /// FRS-WA-V0: the CF's declared state lifecycle. Post-create swappable
+    /// (Flink configures TTL after open — same model as `compaction_filter`).
+    /// Read on flush/maintenance paths only, so the RwLock cost is
+    /// irrelevant.
+    lifecycle: RwLock<CfLifecycle>,
+    /// FRS-WA-V0: the CF's watermark clock (caller-defined units; Flink ms).
+    /// Monotonic via `fetch_max`. `0` = "no watermark seen yet" — nothing may
+    /// expire. Advanced by `frs_cf_advance_watermark` from the operator's
+    /// watermark path.
+    watermark: AtomicU64,
+    /// FRS-WA-V0: monotonic upper bound on the event-time of every entry
+    /// WRITTEN so far (caller advances it before/with each write). The flush
+    /// path (V1) reads it AFTER sealing a memtable, so the value is ≥ the max
+    /// event-time inside the sealed memtable — the sound (never premature)
+    /// basis for a segment's death stamp `max_event_time + ttl`.
+    max_event_time: AtomicU64,
 }
 
 /// FRS-RESIDENT-FLUSHED entry: a flushed memtable retained in RAM, tagged with
@@ -493,7 +592,47 @@ impl ColumnFamilyData {
             flush_mutex: Mutex::new(()),
             shard_count,
             resident_flushed: RwLock::new(Vec::new()),
+            lifecycle: RwLock::new(CfLifecycle::default()),
+            watermark: AtomicU64::new(0),
+            max_event_time: AtomicU64::new(0),
         }
+    }
+
+    /// FRS-WA-V0: returns the CF's declared lifecycle.
+    pub fn lifecycle(&self) -> CfLifecycle {
+        *self.lifecycle.read().expect("lifecycle lock poisoned")
+    }
+
+    /// FRS-WA-V0: installs (or replaces) the CF's lifecycle descriptor.
+    /// V0 is inert — nothing reads this except diagnostics and the (flagged,
+    /// default-OFF) V1 segment machinery.
+    pub fn set_lifecycle(&self, lifecycle: CfLifecycle) {
+        *self.lifecycle.write().expect("lifecycle lock poisoned") = lifecycle;
+    }
+
+    /// FRS-WA-V0: current CF watermark (0 = none observed yet).
+    pub fn watermark(&self) -> u64 {
+        self.watermark.load(Ordering::Acquire)
+    }
+
+    /// FRS-WA-V0: advances the CF watermark monotonically (`fetch_max`) —
+    /// a stale/duplicate watermark can never move it backwards.
+    pub fn advance_watermark(&self, ts: u64) {
+        self.watermark.fetch_max(ts, Ordering::AcqRel);
+    }
+
+    /// FRS-WA-V0: monotonic upper bound on event-time of entries written so
+    /// far (0 = none noted yet).
+    pub fn max_event_time(&self) -> u64 {
+        self.max_event_time.load(Ordering::Acquire)
+    }
+
+    /// FRS-WA-V0: raises the written-event-time upper bound (`fetch_max`).
+    /// Callers MUST invoke this with `ts >= event-time` before (or atomically
+    /// with) writing an entry carrying that event-time, so a later memtable
+    /// seal observes a bound covering every sealed entry.
+    pub fn note_max_event_time(&self, ts: u64) {
+        self.max_event_time.fetch_max(ts, Ordering::AcqRel);
     }
 
     /// Returns the handle for this column family.
@@ -1126,6 +1265,65 @@ mod tests {
             used_after_add.saturating_sub(used_after_prune) >= 2 * one,
             "prune must RELEASE the charge (after_add={used_after_add}, after_prune={used_after_prune}, one={one})"
         );
+    }
+
+    // --- FRS-WA-V0: lifecycle descriptor + watermark clocks ---
+
+    #[test]
+    fn test_lifecycle_default_is_unbounded() {
+        assert_eq!(CfLifecycle::default(), CfLifecycle::Unbounded);
+        let d = ColumnFamilyDescriptor::new("w");
+        assert_eq!(d.lifecycle(), CfLifecycle::Unbounded);
+    }
+
+    #[test]
+    fn test_descriptor_with_lifecycle() {
+        let d = ColumnFamilyDescriptor::new("w")
+            .with_lifecycle(CfLifecycle::Windowed { ttl: 4_000_000 });
+        assert_eq!(d.lifecycle(), CfLifecycle::Windowed { ttl: 4_000_000 });
+        let dbg = format!("{:?}", d);
+        assert!(dbg.contains("Windowed"), "Debug must surface lifecycle: {dbg}");
+    }
+
+    #[test]
+    fn test_lifecycle_ordinal_roundtrip() {
+        for lc in [
+            CfLifecycle::Unbounded,
+            CfLifecycle::Windowed { ttl: 123 },
+            CfLifecycle::Timer,
+        ] {
+            let ttl = match lc {
+                CfLifecycle::Windowed { ttl } => ttl,
+                _ => 0,
+            };
+            assert_eq!(CfLifecycle::from_ordinal(lc.ordinal(), ttl), Some(lc));
+        }
+        // Unknown ordinals are rejected, not guessed.
+        assert_eq!(CfLifecycle::from_ordinal(3, 0), None);
+        assert_eq!(CfLifecycle::from_ordinal(-1, 0), None);
+    }
+
+    #[test]
+    fn test_cf_data_lifecycle_set_get_and_clocks_monotonic() {
+        let handle = ColumnFamilyHandle::new(ColumnFamilyId(9), "wcf");
+        let data = ColumnFamilyData::new(handle, CfOptions::default(), None, empty_snapshot());
+        // Defaults: Unbounded, clocks at 0.
+        assert_eq!(data.lifecycle(), CfLifecycle::Unbounded);
+        assert_eq!(data.watermark(), 0);
+        assert_eq!(data.max_event_time(), 0);
+        // Post-create install (the Flink configure-after-open model).
+        data.set_lifecycle(CfLifecycle::Windowed { ttl: 1000 });
+        assert_eq!(data.lifecycle(), CfLifecycle::Windowed { ttl: 1000 });
+        // Watermark: monotonic — stale values never move it backwards.
+        data.advance_watermark(500);
+        data.advance_watermark(300);
+        assert_eq!(data.watermark(), 500);
+        data.advance_watermark(501);
+        assert_eq!(data.watermark(), 501);
+        // Event-time bound: same monotonic contract.
+        data.note_max_event_time(900);
+        data.note_max_event_time(100);
+        assert_eq!(data.max_event_time(), 900);
     }
 
     #[test]
