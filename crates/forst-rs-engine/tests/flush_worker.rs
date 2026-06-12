@@ -40,6 +40,18 @@ use forst_rs_io::{
 // cross-test backlog interference.
 static FLUSH_WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// Serializes the tests WITHOUT poisoning-cascade: if one test panics (e.g. a
+/// stall-timeout flake on an overloaded instrumented CI runner), the remaining
+/// tests must still run on their own merits instead of insta-failing with
+/// `PoisonError` at the lock acquisition. The guard's only job is mutual
+/// exclusion; the protected "data" is `()`, so a poisoned lock is still a
+/// perfectly valid lock.
+fn serialize_tests() -> std::sync::MutexGuard<'static, ()> {
+    FLUSH_WORKER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ---------------------------------------------------------------------
 // SlowFs — wraps MemoryFileSystem and adds a configurable per-write
 // sleep. Lets us prove flushes run off the writer's stack: we can
@@ -216,7 +228,7 @@ fn small_buf_options() -> EngineOptions {
 /// writer's call wraps up in much less than 200 ms.
 #[test]
 fn test_flush_runs_off_writer_thread() {
-    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+    let _guard = serialize_tests();
 
     let fs = SlowFs::new(Duration::from_millis(200));
     let fs_dyn: Arc<dyn FileSystem> = fs.clone();
@@ -257,7 +269,7 @@ fn test_flush_runs_off_writer_thread() {
 ///   - measuring that one of the puts blocked >= 50 ms.
 #[test]
 fn test_max_write_buffer_number_backpressure() {
-    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+    let _guard = serialize_tests();
 
     let fs = SlowFs::new(Duration::from_millis(100));
     let fs_dyn: Arc<dyn FileSystem> = fs.clone();
@@ -343,7 +355,7 @@ fn test_max_write_buffer_number_backpressure() {
 /// readable.
 #[test]
 fn test_close_drains_pending_flushes() {
-    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+    let _guard = serialize_tests();
 
     let mem_fs = Arc::new(MemoryFileSystem::new());
     let fs_dyn: Arc<dyn FileSystem> = mem_fs.clone();
@@ -378,7 +390,7 @@ fn test_close_drains_pending_flushes() {
 /// the next put must return Err.
 #[test]
 fn test_flush_error_propagates_to_next_writer() {
-    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+    let _guard = serialize_tests();
 
     let fs = FailingFs::new(0); // every write fails
     let opts = EngineOptions {
@@ -442,7 +454,7 @@ fn test_flush_error_propagates_to_next_writer() {
 /// must be consistent: every value we wrote must be readable via `get`.
 #[test]
 fn test_concurrent_writers_with_async_flush() {
-    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+    let _guard = serialize_tests();
 
     let opts = EngineOptions {
         db_path: "/db".to_string(),
@@ -489,7 +501,7 @@ fn test_concurrent_writers_with_async_flush() {
 /// without leaving imms behind.
 #[test]
 fn test_flush_all_drains_after_async_path() {
-    let _guard = FLUSH_WORKER_TEST_LOCK.lock().unwrap();
+    let _guard = serialize_tests();
 
     let opts = EngineOptions {
         db_path: "/db".to_string(),
