@@ -93,12 +93,52 @@ case "$cmd" in
       # $FLINK/lib is shared). CLUSTER defaults to the run tag.
       CLUSTER="${CLUSTER:-frs-$TAG}"
       NET="$CLUSTER-net"
-      CTMP="$WORKENV/frs-tmp/$CLUSTER"
+      # FRS_CTMP_BASE (2026-06-12 R3 box fix): on boxes where frs-tmp is a
+      # SEPARATE mount under $WORKENV, dockerd's `-v $WORKENV:$WORKENV` bind
+      # does not traverse the submount — the container sees an EMPTY frs-tmp
+      # and $CCONF (FLINK_CONF_DIR, resolved by HOST-absolute path inside
+      # the containers) is unreachable. Point the cluster scratch base at a
+      # dockerd-servable dir via FRS_CTMP_BASE; the base is ALSO bind-mounted
+      # directly at its host path (below) so $CCONF resolves regardless of
+      # where the base lives — including the default-under-$WORKENV case.
+      CTMP_BASE="${FRS_CTMP_BASE:-$WORKENV/frs-tmp}"
+      CTMP="$CTMP_BASE/$CLUSTER"
       CCONF="$CTMP/flink-conf"
       mkdir -p "$CTMP"
       rm -rf "$CCONF" && cp -r "$FLINK/conf" "$CCONF"
-      SPLIT_TMP=(-v "$CTMP:/tmp")
-      docker network create "$NET" >/dev/null 2>&1 || true
+      # /tmp = the per-cluster scratch; the direct base mount makes the
+      # host-absolute $CCONF path (and any other $CTMP path the harness
+      # passes through env) visible inside the containers.
+      SPLIT_TMP=(-v "$CTMP:/tmp" -v "$CTMP_BASE:$CTMP_BASE")
+      # NETWORK (2026-06-12 R3 box fix): plain `docker network create` can
+      # fail when the daemon's default-address-pools are exhausted or
+      # conflict with host routes ("could not find an available,
+      # non-overlapping IPv4 address pool") — the old `|| true` swallowed
+      # that, the containers fell back to the default bridge, and
+      # $CLUSTER-jm never resolved. Try the plain create first (unchanged
+      # behavior on healthy boxes); on failure retry with an explicit
+      # subnet: FRS_NET_SUBNET (full CIDR override) if set, else
+      # FRS_NET_SUBNET_BASE (first two octets, default 172.99) with a
+      # per-cluster third octet derived from the cluster name (cksum),
+      # probing a few successors on residual collisions. Hard-fail if no
+      # subnet works — a cluster on the wrong network wedges silently.
+      if ! docker network inspect "$NET" >/dev/null 2>&1 \
+         && ! docker network create "$NET" >/dev/null 2>&1; then
+        if [ -n "${FRS_NET_SUBNET:-}" ]; then
+          docker network create --subnet "$FRS_NET_SUBNET" "$NET" >/dev/null \
+            || { echo "FATAL: docker network create $NET --subnet $FRS_NET_SUBNET failed"; exit 1; }
+        else
+          NET_BASE="${FRS_NET_SUBNET_BASE:-172.99}"
+          NET_OCT=$(( $(printf '%s' "$CLUSTER" | cksum | cut -d' ' -f1) % 240 ))
+          NET_OK=
+          for NET_TRY in 0 1 2 3 4 5 6 7; do
+            if docker network create --subnet "$NET_BASE.$(( (NET_OCT + NET_TRY) % 240 )).0/24" "$NET" >/dev/null 2>&1; then
+              NET_OK=1; break
+            fi
+          done
+          [ -n "$NET_OK" ] || { echo "FATAL: docker network create $NET failed even with explicit --subnet ($NET_BASE.x.0/24; set FRS_NET_SUBNET to force one)"; exit 1; }
+        fi
+      fi
       docker rm -f "$CLUSTER-jm" "$CLUSTER-tm1" "$CLUSTER-tm2" >/dev/null 2>&1 || true
       # TM JVM allocator: jemalloc via LD_PRELOAD (uniform across ALL backends —
       # an environment property of the box, like the kernel). The engine's own
