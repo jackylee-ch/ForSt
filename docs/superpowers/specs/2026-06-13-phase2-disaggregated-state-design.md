@@ -406,3 +406,35 @@ restore wall-times are ~flat in state size (link-mode), with zero data re-upload
 unchanged SSTs (object-count assert); (3) q0–q22 5M correctness sweep passes in
 remote-primary link-mode; (4) local-primary defaults and benchmarks unchanged. The S3
 performance race vs ForSt — including remote compaction — is Phase 3.
+
+---
+
+## 8. Evidence (stage gates, recorded as they land)
+
+### Stage 0 — probe script committed + recorded probe report
+
+`scripts/probe-s3.sh` wraps `crates/forst-rs-io/examples/s3bw.rs --probe`
+(RTT / up+down MB/s / PUT+DELETE latency / read-after-write visibility) and
+applies the §Stage-0 decision matrix. Recorded fs-emulation SELF-TEST report
+(dev Mac, 2026-06-12 — validates the probe machinery end-to-end; NOT S3
+evidence; the BOS verdict must be re-recorded on the co-located remote box):
+
+```
+PROBE rtt_ms_median=0.019 rtt_ms_p90=0.033 rtt_samples=20
+PROBE put_ms_median=4.016 put_ms_p90=5.289 put_bytes=4096 put_samples=20
+PROBE raw_visibility=strong raw_max_attempts=1 raw_trials=10
+PROBE upload_mbps=1300.4 upload_mb=50 upload_secs=0.04
+PROBE download_mbps=3832.9 download_mb=50 download_secs=0.01
+PROBE delete_ms_median=0.062 delete_ms_p90=0.103 delete_samples=20
+probe-s3 REPORT: mode=selftest rtt_ms_median=0.019 upload_mbps=1300.4
+  download_mbps=3832.9 raw_visibility=strong decision=bos-usable
+```
+
+Standing baseline for the dev box stays as recorded 2026-06-01: dev-Mac→BOS =
+10.2 MB/s, ~23 ms RTT ⇒ **fs-emulation only** on this box (decision matrix
+would emit `fs-emulation-only`); all Stage-1+ partial benches below are
+emulation-based per §5.
+
+### Stage 1 — FileMappingManager (filled by the Stage-1 commit)
+
+- 10k-file link-vs-copy bench pair: *pending*
