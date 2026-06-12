@@ -60,14 +60,14 @@ Detail sections below are chronological (oldest first after the legacy lock).
 | q17 | 72.8 M | 92,000,000 | 77.7 M / R 387-423 ±4.5% ×3 | 92,000,000 ✓ | 253.0 M | ✓ | PASS (0.94× M; R rdb pin owed; R box measurement-grade) |
 | q18 | 366.4 M | 92,000,000 | 222.9 M | 92,000,000 | DNF M | ✓ | PASS (beats BOTH; ForSt DNF) |
 | q19 | 310.2 M | 92,000,000 | 527.9 M | 92,000,000 | 308.1 M | ✓ | FAIL both (0.59×) — R-long levers apply; remote re-run owed |
-| q20 | 1557.6 R / 1034.4 M | 93,200,471 R | 2011.1 R / 2045.8 M | 93,199,005 R (out==src) | 1535.9 M | ✓ | near-miss on R (1.29×; was 1.98× M); beats ForSt-M wall |
+| q20 | 1557.6 R / 1034.4 M | 93,200,471 R | 2011.1 R / 2045.8 M | 93,199,005 R (out==src) | 1535.9 M | ✓ | near-miss on R (1.29×); vs ForSt: SLOWER on M (2045.8>1535.9; pre-timer-fix 1477.7 beat it) — ForSt remote pin owed |
 | q21 | 60.0 M | 100,000,000 | 53.9 M | 100,000,000 | 58.3 M | ✓ | PASS |
 | q22 | 44.2 M | 100,000,000 | 43.6 M | 100,000,000 | 46.3 M | ✓ | PASS |
 
 SUMMARY: clear PASS 13 (q1,q2,q3,q9-R,q10,q13,q15,q16,q17,q18,q21,q22 + q20-beats-ForSt
 clause), ~PASS 2 (q0,q14 ForSt-parity), correctness-fixed-pending-remeasure 1 (q5),
-FAIL-vs-ForSt-only 3 (q7 big, q8 +4.4s, q12 +9.9s), FAIL-RDB-perf 4 (q4,q11,q19 + q7-R),
-near-miss 1 (q20-R 1.29×). Old q5/q8 correctness bugs FIXED; q9/q20 DNFs ELIMINATED.
+slower-than-ForSt 6 (q7 2.5×, q11 2.0×, q19 1.7×, q20 1.33×, q12 +9.9s, q8 +4.4s — all M-pop;
+ForSt remote pin OWED), FAIL-RDB-perf 4 (q4,q11,q19 + q7-R), near-miss 1 (q20-R 1.29×). Old q5/q8 correctness bugs FIXED; q9/q20 DNFs ELIMINATED.
 
 All 100M events, 8c/32g Docker, each backend with its own timer. `out_rows` = sink vertex
 read-records (accuracy: forst-rs must match RocksDB). Bar: forst-rs ≥0.8× RocksDB OR ≤+50s,
