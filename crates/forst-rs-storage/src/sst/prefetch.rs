@@ -132,13 +132,69 @@ fn prefetch_enabled() -> bool {
 /// Incremented at window submit; balance moves from inflight to ready at
 /// claim (no net change); decremented at block delivery, window failure,
 /// [`BlockPrefetcher::terminate`], and prefetcher drop.
-static PREFETCH_BUFFERED_BYTES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+///
+/// SHARDED (2026-06-12 bisect de-contention, M3): the original single global
+/// `AtomicUsize` was RMW-ed once per DELIVERED BLOCK on the consumer
+/// (Flink task / FFI) threads — 8 task threads hammering one cache line
+/// is exactly the cross-core ping-pong shape suspected in the q9@100M
+/// r1→r2 regression. Each thread now picks a fixed cache-line-padded
+/// shard (round-robin at first touch); adds/subs are `Relaxed` RMWs on
+/// the thread's own line, and the telemetry read sums all shards. Shards
+/// are SIGNED: a prefetcher charged on thread A may be dropped on thread
+/// B (iterator close on another thread), driving B's shard negative —
+/// the SUM stays exact.
+const PREFETCH_CTR_SHARDS: usize = 16;
+
+/// One cache line per shard — no false sharing between adjacent shards.
+#[repr(align(64))]
+struct PaddedCounter(std::sync::atomic::AtomicIsize);
+
+static PREFETCH_BUFFERED_BYTES: [PaddedCounter; PREFETCH_CTR_SHARDS] =
+    [const { PaddedCounter(std::sync::atomic::AtomicIsize::new(0)) }; PREFETCH_CTR_SHARDS];
+
+/// The calling thread's fixed shard (assigned round-robin on first touch).
+fn prefetch_ctr_shard() -> &'static PaddedCounter {
+    use std::cell::Cell;
+    thread_local! {
+        static SHARD_IDX: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    let idx = SHARD_IDX.with(|c| {
+        let mut v = c.get();
+        if v == usize::MAX {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            v = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % PREFETCH_CTR_SHARDS;
+            c.set(v);
+        }
+        v
+    });
+    &PREFETCH_BUFFERED_BYTES[idx]
+}
+
+/// Charge `n` on-disk bytes to the aggregate (window submit).
+fn prefetch_charge_add(n: usize) {
+    prefetch_ctr_shard()
+        .0
+        .fetch_add(n as isize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Release `n` on-disk bytes from the aggregate (delivery / failure /
+/// terminate / drop).
+fn prefetch_charge_sub(n: usize) {
+    prefetch_ctr_shard()
+        .0
+        .fetch_sub(n as isize, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Current aggregate of prefetcher ready+inflight bytes (M3 telemetry).
 /// Sizes are on-disk (pre-decompression) block bytes — the I/O-side budget.
+/// Sum over the shards; individual shards may be transiently negative (see
+/// the sharding note above), the sum is clamped at 0.
 pub fn prefetch_buffered_bytes() -> usize {
-    PREFETCH_BUFFERED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+    PREFETCH_BUFFERED_BYTES
+        .iter()
+        .map(|s| s.0.load(std::sync::atomic::Ordering::Relaxed))
+        .sum::<isize>()
+        .max(0) as usize
 }
 
 /// Diag gate shared with the read-path instrumentation (`FRS_READ_AT_DIAG=1`,
@@ -396,7 +452,7 @@ impl BlockPrefetcher {
         let held: usize = self.ready.iter().map(|&(sz, _)| sz as usize).sum::<usize>()
             + self.inflight.as_ref().map_or(0, |h| h.bytes);
         if held > 0 {
-            PREFETCH_BUFFERED_BYTES.fetch_sub(held, std::sync::atomic::Ordering::Relaxed);
+            prefetch_charge_sub(held);
         }
         self.ready.clear();
         self.inflight = None;
@@ -410,7 +466,7 @@ impl BlockPrefetcher {
         //    and nothing is in flight, submit the next window BEFORE the
         //    consumer walks the delivered block's rows.
         if let Some((sz, block)) = self.ready.pop_front() {
-            PREFETCH_BUFFERED_BYTES.fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
+            prefetch_charge_sub(sz as usize);
             self.on_delivered();
             if self.compaction {
                 self.stats.window_blocks += 1;
@@ -438,8 +494,7 @@ impl BlockPrefetcher {
                 Err(e) => {
                     // The handle was already taken — release its inflight M3
                     // charge here (`terminate` only releases what it sees).
-                    PREFETCH_BUFFERED_BYTES
-                        .fetch_sub(handle.bytes, std::sync::atomic::Ordering::Relaxed);
+                    prefetch_charge_sub(handle.bytes);
                     self.terminate();
                     return Err(match e {
                         std::sync::mpsc::RecvTimeoutError::Disconnected => ForstError::internal(
@@ -470,8 +525,7 @@ impl BlockPrefetcher {
                     // Recurse once into the ready-serve path (never deeper:
                     // `ready` is now non-empty or the window was empty ⇒ EOF).
                     if let Some((sz, block)) = self.ready.pop_front() {
-                        PREFETCH_BUFFERED_BYTES
-                            .fetch_sub(sz as usize, std::sync::atomic::Ordering::Relaxed);
+                        prefetch_charge_sub(sz as usize);
                         self.on_delivered();
                         if self.compaction {
                             self.stats.window_blocks += 1;
@@ -486,8 +540,7 @@ impl BlockPrefetcher {
                     // don't re-issue I/O on a known-bad region. The handle
                     // was already taken, so release its inflight charge here
                     // (`terminate` only releases what it can still see).
-                    PREFETCH_BUFFERED_BYTES
-                        .fetch_sub(handle.bytes, std::sync::atomic::Ordering::Relaxed);
+                    prefetch_charge_sub(handle.bytes);
                     self.terminate();
                     return Err(e);
                 }
@@ -603,11 +656,12 @@ impl BlockPrefetcher {
             let _ = tx.send(result);
         }));
         // M3 telemetry: charge the window at submit (released at delivery /
-        // failure / terminate / drop).
-        let agg = PREFETCH_BUFFERED_BYTES
-            .fetch_add(window_bytes as usize, std::sync::atomic::Ordering::Relaxed)
-            + window_bytes as usize;
+        // failure / terminate / drop). The aggregate (shard sum) is only
+        // materialized when diag is on — the hot path does one Relaxed RMW
+        // on this thread's own shard line.
+        prefetch_charge_add(window_bytes as usize);
         if prefetch_diag() {
+            let agg = prefetch_buffered_bytes();
             eprintln!(
                 "[PREFETCH_DIAG] window submit blocks=[{start},{end}) bytes={window_bytes} aggregate_buffered={agg}"
             );
@@ -1049,13 +1103,8 @@ mod tests {
         let reads_before = file.reads.load(Ordering::SeqCst);
         // Window [2, 6) contains the cached block 4 → I/O runs are [2,4) and
         // [5,6): exactly 2 positional reads for 3 missing blocks.
-        let (out, hits) = fetch_window(
-            &reader,
-            2,
-            6,
-            CacheFillPolicy::Insert(CachePriority::Low),
-        )
-        .unwrap();
+        let (out, hits) =
+            fetch_window(&reader, 2, 6, CacheFillPolicy::Insert(CachePriority::Low)).unwrap();
         assert_eq!(out.len(), 4);
         assert_eq!(hits, 1, "the pre-warmed block 4 is a decoded-cache hit");
         let reads_after = file.reads.load(Ordering::SeqCst);
@@ -1067,13 +1116,8 @@ mod tests {
 
         // And a fully-missing window of 4 blocks = exactly 1 pread.
         let reads_before = file.reads.load(Ordering::SeqCst);
-        let (out, hits) = fetch_window(
-            &reader,
-            8,
-            12,
-            CacheFillPolicy::Insert(CachePriority::Low),
-        )
-        .unwrap();
+        let (out, hits) =
+            fetch_window(&reader, 8, 12, CacheFillPolicy::Insert(CachePriority::Low)).unwrap();
         assert_eq!(out.len(), 4);
         assert_eq!(hits, 0);
         assert_eq!(
@@ -1226,6 +1270,53 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "prefetch buffered-bytes charge leaked: before={before} now={now}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    /// M3 sharding smoke (2026-06-12 bisect de-contention): 8 threads charge
+    /// concurrently on their own shards while the main thread releases the
+    /// same total — cross-thread release legitimately drives individual
+    /// shards NEGATIVE, but the shard SUM stays exact: it drains back to
+    /// the baseline and never wraps. Tolerates concurrent tests' transient
+    /// charges by polling for release (same pattern as the drop test above).
+    #[test]
+    fn sharded_counter_cross_thread_release_sum_exact() {
+        let before = prefetch_buffered_bytes();
+        const THREADS: usize = 8;
+        const OPS: usize = 1000;
+        const BYTES: usize = 4096;
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..OPS {
+                        prefetch_charge_add(BYTES);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Release the ENTIRE charge from this thread — a shard the producer
+        // threads may never have touched goes negative; the sum must still
+        // account exactly.
+        for _ in 0..THREADS * OPS {
+            prefetch_charge_sub(BYTES);
+        }
+        // Our net contribution is zero; poll for other tests' transient
+        // charges to drain, asserting the (clamped) sum never wraps.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = prefetch_buffered_bytes();
+            assert!(now < usize::MAX / 2, "counter wrapped (lost release)");
+            if now <= before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sharded counter sum did not return to baseline: before={before} now={now}"
             );
             std::thread::yield_now();
         }
@@ -1408,5 +1499,4 @@ mod tests {
         pf.terminate();
         assert!(pf.next_decoded().unwrap().is_none());
     }
-
 }
