@@ -182,6 +182,15 @@ struct Args {
     /// correctness falsifier firing (process exits non-zero). Forces the
     /// engine flag ON via `set_lifecycle_segments_override` (no env needed).
     lifecycle: bool,
+    /// FRS-WA-V2a-2 gate cell (2026-06-13 survey §6 stage V2 / §10.1 item
+    /// 3): flush-time KV separation mode. Forces `FRS_KV_SEPARATION` ON via
+    /// `set_kv_separation_override` (no env needed). The workload's 200-B
+    /// values exceed the default 128-B blob threshold, so every flushed Put
+    /// separates: compaction then moves 21-B pointers instead of values —
+    /// the cell measures the REAL assembled write-amp the §3.1 model
+    /// predicts (~1.36×) plus the probe-side deref cost (gate ≤1.3× warm
+    /// baseline p50).
+    kvsep: bool,
 }
 
 impl Args {
@@ -203,6 +212,7 @@ impl Args {
             wbuf_mib: 0,
             cfs: 1,
             lifecycle: false,
+            kvsep: false,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -230,6 +240,7 @@ impl Args {
                 "--wbuf-mib" => a.wbuf_mib = take(&mut i).parse().unwrap(),
                 "--cfs" => a.cfs = take(&mut i).parse().unwrap(),
                 "--lifecycle" => a.lifecycle = true,
+                "--kvsep" => a.kvsep = true,
                 other => panic!("unknown arg {other}"),
             }
             i += 1;
@@ -350,6 +361,10 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     // (default OFF everywhere else; the override is the test-safe hook).
     if args.lifecycle {
         forst_rs_engine::set_lifecycle_segments_override(Some(true));
+    }
+    // FRS-WA-V2a-2: kvsep cell — force the engine flag ON for this process.
+    if args.kvsep {
+        forst_rs_engine::set_kv_separation_override(Some(true));
     }
     let db = DbImpl::open_with_fs(opts, fs).expect("open");
     // FRS-M3 G3: cf[0] = default; cf[1..] = extra churn CFs. Bucket-affine

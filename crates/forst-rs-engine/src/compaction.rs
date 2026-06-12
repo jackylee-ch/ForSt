@@ -234,6 +234,8 @@ impl CompactionJob {
                 new_files: Vec::new(),
                 next_file_number: None,
                 last_sequence: last_seq,
+                new_vlog_segments: Vec::new(),
+                deleted_vlog_segments: Vec::new(),
             }));
         }
 
@@ -550,6 +552,8 @@ impl CompactionJob {
                 new_files: Vec::new(),
                 next_file_number: None,
                 last_sequence: last_seq,
+                new_vlog_segments: Vec::new(),
+                deleted_vlog_segments: Vec::new(),
             }));
         }
 
@@ -596,6 +600,8 @@ impl CompactionJob {
             deleted_files: deleted,
             next_file_number: None,
             last_sequence: last_seq,
+            new_vlog_segments: Vec::new(),
+            deleted_vlog_segments: Vec::new(),
         }))
     }
 
@@ -684,6 +690,8 @@ impl CompactionJob {
                 new_files: Vec::new(),
                 next_file_number: None,
                 last_sequence: last_seq,
+                new_vlog_segments: Vec::new(),
+                deleted_vlog_segments: Vec::new(),
             }));
         }
 
@@ -913,6 +921,8 @@ impl CompactionJob {
                 new_files: Vec::new(),
                 next_file_number: None,
                 last_sequence: last_seq,
+                new_vlog_segments: Vec::new(),
+                deleted_vlog_segments: Vec::new(),
             }));
         }
 
@@ -949,6 +959,8 @@ impl CompactionJob {
             deleted_files: deleted,
             next_file_number: None,
             last_sequence: last_seq,
+            new_vlog_segments: Vec::new(),
+            deleted_vlog_segments: Vec::new(),
         }))
     }
 

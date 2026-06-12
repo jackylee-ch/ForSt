@@ -155,10 +155,20 @@ impl VlogWriter {
     }
 }
 
+/// FRS-WA-V2a-2 deref-cost: forward read-ahead granule for [`VlogReader`].
+/// Scan-path derefs have strong intra-segment locality (a flush appends
+/// values in KEY order, so the rows one prefix-scan emits from one segment
+/// sit contiguously) — caching the last-read chunk turns ~chunk/record
+/// consecutive derefs into ONE pread. Random point-gets pay at most one
+/// page-cache-warm 64 KiB read + memcpy per miss.
+const VLOG_READ_CHUNK: usize = 64 * 1024;
+
 /// Random-access reader for a value-log segment (the post-visibility
-/// dereference of the V2 read path — one read per VISIBLE result row).
+/// dereference of the V2 read path).
 pub struct VlogReader {
     file: Box<dyn RandomAccessFile>,
+    /// Last-read chunk `(start_offset, bytes)` — see [`VLOG_READ_CHUNK`].
+    chunk: std::sync::Mutex<Option<(u64, Vec<u8>)>>,
 }
 
 impl VlogReader {
@@ -166,32 +176,54 @@ impl VlogReader {
         let path = vlog_segment_path(db_path, segment_id);
         Ok(Self {
             file: fs.open_random_access_file(&path)?,
+            chunk: std::sync::Mutex::new(None),
         })
     }
 
     /// Reads + CRC-verifies the value `ptr` points at. `ptr.segment_id` must
     /// match the opened segment (caller routes by id).
     pub fn get(&self, ptr: &ValuePointer) -> ForstResult<Vec<u8>> {
-        let mut header = [0u8; VLOG_RECORD_HEADER];
-        let n = self.file.read_at(ptr.offset, &mut header)?;
-        if n != VLOG_RECORD_HEADER {
-            return Err(ForstError::corruption("vlog record header short read"));
+        let total = VLOG_RECORD_HEADER + ptr.len as usize;
+        // Oversized records bypass the chunk cache (one direct pread).
+        if total > VLOG_READ_CHUNK {
+            let mut record = vec![0u8; total];
+            let n = self.file.read_at(ptr.offset, &mut record)?;
+            if n != total {
+                return Err(ForstError::corruption("vlog record short read"));
+            }
+            return Self::parse_record(&record, ptr);
         }
-        let stored_len = u32::from_le_bytes(header[0..4].try_into().expect("4 bytes"));
-        let stored_crc = u32::from_le_bytes(header[4..8].try_into().expect("4 bytes"));
+        let mut guard = self.chunk.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((start, bytes)) = guard.as_ref() {
+            if ptr.offset >= *start && ptr.offset + total as u64 <= *start + bytes.len() as u64 {
+                let lo = (ptr.offset - *start) as usize;
+                return Self::parse_record(&bytes[lo..lo + total], ptr);
+            }
+        }
+        // Miss: read forward from the record start (scans walk forward).
+        let mut buf = vec![0u8; VLOG_READ_CHUNK];
+        let n = self.file.read_at(ptr.offset, &mut buf)?;
+        if n < total {
+            return Err(ForstError::corruption("vlog record short read"));
+        }
+        buf.truncate(n);
+        let out = Self::parse_record(&buf[..total], ptr);
+        *guard = Some((ptr.offset, buf));
+        out
+    }
+
+    /// Validates one framed record (`record` spans exactly header+payload)
+    /// against `ptr` and returns the owned payload.
+    fn parse_record(record: &[u8], ptr: &ValuePointer) -> ForstResult<Vec<u8>> {
+        let stored_len = u32::from_le_bytes(record[0..4].try_into().expect("4 bytes"));
+        let stored_crc = u32::from_le_bytes(record[4..8].try_into().expect("4 bytes"));
         if stored_len != ptr.len {
             return Err(ForstError::corruption(format!(
                 "vlog pointer/record length mismatch: pointer {} record {}",
                 ptr.len, stored_len
             )));
         }
-        let mut payload = vec![0u8; ptr.len as usize];
-        let n = self
-            .file
-            .read_at(ptr.offset + VLOG_RECORD_HEADER as u64, &mut payload)?;
-        if n != payload.len() {
-            return Err(ForstError::corruption("vlog payload short read"));
-        }
+        let payload = record[VLOG_RECORD_HEADER..].to_vec();
         if crc32c(&payload) != stored_crc {
             return Err(ForstError::corruption("vlog payload checksum mismatch"));
         }

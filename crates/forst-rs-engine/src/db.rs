@@ -818,6 +818,12 @@ pub struct DbImpl {
     /// more (bounded, documented; correctness-neutral). Entries are pruned
     /// when their file is dropped/retired.
     lifecycle_merged: Mutex<std::collections::HashSet<FileNumber>>,
+    /// FRS-WA-V2a-2: open value-log segment readers, keyed by segment id.
+    /// Segments are immutable once published, so a cached reader never goes
+    /// stale; the map only grows while segments are live (V2b GC will prune
+    /// alongside segment deletion). Default path (no KV separation) never
+    /// touches it.
+    vlog_readers: RwLock<HashMap<u64, Arc<forst_rs_storage::vlog::VlogReader>>>,
     /// FRS-PHASE2-S1 (2026-06-13 design §2): optional file-mapping /
     /// ownership layer (UFS-equivalent: logical→physical mapping +
     /// refcounts, hard-link semantics over object stores). `None` by
@@ -1105,6 +1111,7 @@ impl DbImpl {
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
+            vlog_readers: RwLock::new(HashMap::new()),
             file_mapping: std::sync::OnceLock::new(),
             sequence_number: AtomicU64::new(0),
             write_controller: Arc::new(WriteController::new(wc_config)),
@@ -3042,6 +3049,22 @@ impl DbImpl {
                     return Err(ForstError::corruption(
                         "iter_versions_of: Merge entry missing operand payload (SST)",
                     ));
+                }
+                // FRS-WA-V2a-2: dereference BlobRef rows AT COLLECTION and
+                // rewrite the version as a semantically-identical Put, so
+                // every mvcc consumer (get_at, get_at_with_merge, scan_at)
+                // sees value bytes — never raw pointer bytes. Same seq ⇒
+                // identical visibility/shadowing semantics.
+                if matches!(op, OpType::BlobRef) {
+                    let ptr_bytes = v.ok_or_else(|| {
+                        ForstError::corruption(
+                            "iter_versions_of: BlobRef missing pointer payload (SST)",
+                        )
+                    })?;
+                    let value = self.vlog_deref(&ptr_bytes)?;
+                    let ik = InternalKey::new(k, SequenceNumber::new(seq), OpType::Put);
+                    entries.push((ik, value));
+                    continue;
                 }
                 let ik = InternalKey::new(k, SequenceNumber::new(seq), op);
                 entries.push((ik, v.unwrap_or_default()));
@@ -5610,7 +5633,19 @@ impl DbImpl {
             .version_set
             .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
                 let live = snap.version.live_sst_files();
-                let file_numbers: Vec<FileNumber> = live.iter().map(|f| f.file_number).collect();
+                // FRS-WA-V2a-2: pin vlog segments too (same FileNumber
+                // counter); inert today (V2a never deletes segments) but
+                // keeps the V2b GC honest by construction.
+                let file_numbers: Vec<FileNumber> = live
+                    .iter()
+                    .map(|f| f.file_number)
+                    .chain(
+                        snap.version
+                            .vlog_segments
+                            .iter()
+                            .map(|s| FileNumber(s.segment_id)),
+                    )
+                    .collect();
                 let pin = self.deletion_guard.pin_batch(&file_numbers);
                 let descriptors = self.collect_cf_descriptors();
                 (snap.clone(), live, pin, descriptors)
@@ -5650,8 +5685,26 @@ impl DbImpl {
         // synced.
         self.fs.create_dir_all(target_dir)?;
 
-        let (sst_bytes, sst_files) =
+        let (sst_bytes, mut sst_files) =
             copy_live_ssts(self.fs.as_ref(), &self.db_path, target_dir, &live)?;
+
+        // FRS-WA-V2a-2: copy live value-log segments alongside the SSTs —
+        // a checkpoint that captured pointer rows without their value bytes
+        // would be unrestorable. Copied BEFORE the blob (same R49-M1
+        // crash-anchor ordering as the SSTs).
+        let mut vlog_bytes = 0u64;
+        for seg in &snapshot.version.vlog_segments {
+            let src = forst_rs_storage::vlog::vlog_segment_path(
+                Path::new(&self.db_path),
+                seg.segment_id,
+            );
+            let dst =
+                forst_rs_storage::vlog::vlog_segment_path(target_dir, seg.segment_id);
+            vlog_bytes += crate::checkpoint::copy_file(self.fs.as_ref(), &src, &dst)?;
+            sst_files.push(dst);
+        }
+        let sst_bytes = sst_bytes + vlog_bytes;
+        let sst_files = sst_files;
 
         write_blob(self.fs.as_ref(), target_dir, &blob)?;
 
@@ -5930,6 +5983,17 @@ impl DbImpl {
                 )));
             }
         }
+        // FRS-WA-V2a-2: and every referenced value-log segment.
+        for seg in &snapshot.version.vlog_segments {
+            let path =
+                forst_rs_storage::vlog::vlog_segment_path(&db_path, seg.segment_id);
+            if !fs.file_exists(&path)? {
+                return Err(ForstError::corruption(format!(
+                    "checkpoint references missing vlog segment: {}",
+                    path.display()
+                )));
+            }
+        }
 
         // R28-M1 + R29-H1: scan db_path for SST files NOT referenced by the
         // snapshot. The snapshot's `next_file_number` is the writer-side
@@ -5983,6 +6047,28 @@ impl DbImpl {
                                 max_observed = num;
                             }
                             if !referenced.contains(&num) {
+                                orphans.push(entry.path.clone());
+                            }
+                        }
+                        continue;
+                    }
+                    // FRS-WA-V2a-2: `.vlog` segments share the SST file-
+                    // number counter — a crash-orphaned segment (created by
+                    // a flush whose manifest update never landed) must both
+                    // advance `max_observed` (so a fresh flush cannot
+                    // collide on `CreateNew`) and be renamed out of the
+                    // active naming space when unreferenced.
+                    if let Some(stem) = name.strip_suffix(".vlog") {
+                        if let Ok(num) = stem.parse::<u64>() {
+                            if num > max_observed {
+                                max_observed = num;
+                            }
+                            let vlog_referenced = snapshot
+                                .version
+                                .vlog_segments
+                                .iter()
+                                .any(|s| s.segment_id == num);
+                            if !vlog_referenced {
                                 orphans.push(entry.path.clone());
                             }
                         }
@@ -6212,6 +6298,7 @@ impl DbImpl {
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
+            vlog_readers: RwLock::new(HashMap::new()),
             file_mapping: std::sync::OnceLock::new(),
             // D-R7-H1: A-R6-H3 patched the VersionSet seed but missed
             // this sibling — `DbImpl::sequence_number` is the source of
@@ -6586,7 +6673,19 @@ impl DbImpl {
             .version_set
             .snapshot_with_locked_view(|snap: &VersionSetSnapshot| {
                 let live = snap.version.live_sst_files();
-                let file_numbers: Vec<FileNumber> = live.iter().map(|f| f.file_number).collect();
+                // FRS-WA-V2a-2: pin vlog segments too (same FileNumber
+                // counter); inert today (V2a never deletes segments) but
+                // keeps the V2b GC honest by construction.
+                let file_numbers: Vec<FileNumber> = live
+                    .iter()
+                    .map(|f| f.file_number)
+                    .chain(
+                        snap.version
+                            .vlog_segments
+                            .iter()
+                            .map(|s| FileNumber(s.segment_id)),
+                    )
+                    .collect();
                 let pin = self.deletion_guard.pin_batch(&file_numbers);
                 let descriptors = self.collect_cf_descriptors();
                 (snap.clone(), pin, descriptors)
@@ -6606,6 +6705,15 @@ impl DbImpl {
         for file in version_snapshot.version.live_sst_files() {
             let sst_path = crate::flush::sst_file_path(Path::new(&self.db_path), file.file_number);
             self.fs.await_upload(&sst_path)?;
+        }
+        // FRS-WA-V2a-2: same scoped barrier for the value-log segments the
+        // manifest references (pointer rows are useless without them).
+        for seg in &version_snapshot.version.vlog_segments {
+            let seg_path = forst_rs_storage::vlog::vlog_segment_path(
+                Path::new(&self.db_path),
+                seg.segment_id,
+            );
+            self.fs.await_upload(&seg_path)?;
         }
 
         // The checkpoint's canonical directory (holds CHECKPOINT.blob; in
@@ -6657,6 +6765,31 @@ impl DbImpl {
                 })?;
                 mgr.link(&working, &target_dir.join(basename))?;
             }
+            // FRS-WA-V2a-2: vlog segments are SST-class immutable files —
+            // identical register-once + link flow (additive FileMappingManager
+            // use; the disagg lane owns the registry semantics).
+            for seg in &version_snapshot.version.vlog_segments {
+                let working = forst_rs_storage::vlog::vlog_segment_path(
+                    Path::new(&self.db_path),
+                    seg.segment_id,
+                );
+                let key = working.to_str().ok_or_else(|| {
+                    ForstError::invalid_argument(format!(
+                        "link-mode checkpoint: non-utf8 vlog path {}",
+                        working.display()
+                    ))
+                })?;
+                if !mgr.is_registered(&working) {
+                    mgr.register(&working, key, seg.file_size)?;
+                }
+                let basename = working.file_name().ok_or_else(|| {
+                    ForstError::corruption(format!(
+                        "link-mode checkpoint: vlog path has no file name: {}",
+                        working.display()
+                    ))
+                })?;
+                mgr.link(&working, &target_dir.join(basename))?;
+            }
             mgr.sync_journal()?;
         }
 
@@ -6680,7 +6813,12 @@ impl DbImpl {
             .collect();
 
         let base_dir = self.incremental_checkpoint_dir(base_checkpoint_id);
-        let base_live: std::collections::HashSet<FileNumber> = if base_checkpoint_id != 0
+        // FRS-WA-V2a-2: track the base checkpoint's vlog segments alongside
+        // its SSTs so segments split new/shared identically.
+        let (base_live, base_vlogs): (
+            std::collections::HashSet<FileNumber>,
+            std::collections::HashSet<u64>,
+        ) = if base_checkpoint_id != 0
             && self.fs.file_exists(&base_dir.join(CHECKPOINT_BLOB_NAME))?
         {
             use crate::checkpoint::{deserialize_snapshot, read_blob, split_mapping_trailer};
@@ -6688,14 +6826,25 @@ impl DbImpl {
             // FRS-PHASE2-S1: the base checkpoint may carry a mapping trailer.
             let (base_bytes, _mapping) = split_mapping_trailer(&base_blob)?;
             let base_snap = deserialize_snapshot(base_bytes)?;
-            base_snap
-                .version
-                .live_sst_files()
-                .iter()
-                .map(|f| f.file_number)
-                .collect()
+            (
+                base_snap
+                    .version
+                    .live_sst_files()
+                    .iter()
+                    .map(|f| f.file_number)
+                    .collect(),
+                base_snap
+                    .version
+                    .vlog_segments
+                    .iter()
+                    .map(|s| s.segment_id)
+                    .collect(),
+            )
         } else {
-            std::collections::HashSet::new()
+            (
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            )
         };
 
         let mut new_ssts: Vec<LiveFileInfo> = Vec::new();
@@ -6744,6 +6893,44 @@ impl DbImpl {
                     (true, true) => linked_shared_ssts.push(info),
                     (true, false) => linked_new_ssts.push(info),
                 }
+            }
+        }
+        // FRS-WA-V2a-2: vlog segments ride the SAME handle lists (the Java
+        // uploader/registry copies/links by path; the `.vlog` basename keeps
+        // the two file kinds distinct end-to-end). Shared/new split mirrors
+        // the SSTs via the base manifest's segment table.
+        for seg in &version_snapshot.version.vlog_segments {
+            let cf_name = cf_id_to_name
+                .get(&seg.cf_id)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_CF_NAME.to_string());
+            let working_path = forst_rs_storage::vlog::vlog_segment_path(
+                Path::new(&self.db_path),
+                seg.segment_id,
+            );
+            let path = if link_mode {
+                let basename = working_path.file_name().ok_or_else(|| {
+                    ForstError::corruption(format!(
+                        "link-mode checkpoint: vlog path has no file name: {}",
+                        working_path.display()
+                    ))
+                })?;
+                target_dir.join(basename)
+            } else {
+                working_path
+            };
+            let info = LiveFileInfo {
+                path,
+                size: seg.file_size,
+                sequence: 0,
+                level: 0,
+                cf_name,
+            };
+            match (link_mode, base_vlogs.contains(&seg.segment_id)) {
+                (false, true) => shared_ssts.push(info),
+                (false, false) => new_ssts.push(info),
+                (true, true) => linked_shared_ssts.push(info),
+                (true, false) => linked_new_ssts.push(info),
             }
         }
 
@@ -8329,6 +8516,13 @@ impl DbImpl {
             let (key_arc, decision) = inner.next_with_value()?;
             match decision {
                 ValueDecision::Put(value) => return Some(Ok((key_arc, value))),
+                // FRS-WA-V2a-2: deref the value log once (no LSM re-walk).
+                ValueDecision::Blob(ptr) => {
+                    return Some(
+                        db.vlog_deref(ptr.as_ref())
+                            .map(|v| (Arc::clone(&key_arc), Arc::<[u8]>::from(v))),
+                    );
+                }
                 ValueDecision::Fallback => {
                     match db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX) {
                         Ok(Some(value)) => return Some(Ok((key_arc, Arc::<[u8]>::from(value)))),
@@ -8939,6 +9133,13 @@ impl DbImpl {
             let (key_arc, decision) = inner.next_with_value()?;
             match decision {
                 ValueDecision::Put(value) => return Some(Ok((key_arc, value))),
+                // FRS-WA-V2a-2: deref the value log once (no LSM re-walk).
+                ValueDecision::Blob(ptr) => {
+                    return Some(
+                        db.vlog_deref(ptr.as_ref())
+                            .map(|v| (Arc::clone(&key_arc), Arc::<[u8]>::from(v))),
+                    );
+                }
                 ValueDecision::Fallback => {
                     match db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX) {
                         Ok(Some(value)) => return Some(Ok((key_arc, Arc::<[u8]>::from(value)))),
@@ -9396,7 +9597,7 @@ impl DbImpl {
             compression: self.options.compression,
             cf_id: cf_data.handle().id(),
         };
-        let job = FlushJob::new(
+        let mut job = FlushJob::new(
             oldest.clone(),
             file_number,
             cf_data.handle().id(),
@@ -9404,7 +9605,12 @@ impl DbImpl {
             writer_opts,
             self.fs.clone(),
         );
-        let mut meta = job.run()?;
+        // FRS-WA-V2a-2: arm flush-time KV separation for eligible CFs.
+        let kv_spec = self.kv_sep_spec_for(cf_data);
+        if let Some(spec) = kv_spec {
+            job = job.with_kv_separation(spec);
+        }
+        let (mut meta, vlog_meta) = job.run_kv()?;
 
         // FRS-WA-V1: death-stamp the fresh L0 segment for lifecycle CFs.
         // Soundness: `max_event_time` is a monotonic bound the writer
@@ -9435,6 +9641,16 @@ impl DbImpl {
         // sampled this CF.
         if cf_data.is_dropped() {
             let _ = self.fs.delete_file(&path);
+            // FRS-WA-V2a-2: the fresh vlog segment dies with its SST — no
+            // pointer into it was ever installed in any Version.
+            if let Some(seg) = &vlog_meta {
+                let _ = self.fs.delete_file(
+                    &forst_rs_storage::vlog::vlog_segment_path(
+                        Path::new(&self.db_path),
+                        seg.segment_id,
+                    ),
+                );
+            }
             let leaked = oldest.memory_usage() as u64;
             cf_data.pop_oldest_imm();
             if leaked > 0 {
@@ -9469,6 +9685,9 @@ impl DbImpl {
             } else {
                 None
             },
+            // FRS-WA-V2a-2: register the flush's vlog segment atomically
+            // with the SST that points into it.
+            new_vlog_segments: vlog_meta.into_iter().collect(),
             ..Default::default()
         };
         // FRS-RESIDENT-FLUSHED-ORDER (2026-05-30): enroll the resident RAM shadow
@@ -10163,11 +10382,11 @@ impl DbImpl {
                     match entry.op_type {
                         OpType::Put => resolved[i] = Some(entry.value),
                         OpType::Delete | OpType::SingleDelete => resolved[i] = Some(None),
-                        // FRS-WA-V2a-1: memtables never hold pointer entries;
-                        // fail loud rather than hand pointer bytes to a user.
+                        // FRS-WA-V2a-2: separation happens at FLUSH time only —
+                        // memtables never hold pointer rows. Fail loud.
                         OpType::BlobRef => {
                             return Err(ForstError::corruption(
-                                "batch imm get: BlobRef dereference not wired (FRS-WA-V2a-1)",
+                                "batch imm get: BlobRef in a memtable tier (separation is flush-time only)",
                             ));
                         }
                         OpType::Merge => {
@@ -10212,10 +10431,12 @@ impl DbImpl {
                     match entry.op_type {
                         OpType::Put => resolved[i] = Some(entry.value),
                         OpType::Delete | OpType::SingleDelete => resolved[i] = Some(None),
-                        // FRS-WA-V2a-1: fail loud (see imm-stage sister arm).
+                        // FRS-WA-V2a-2: the resident shadow enrolls the
+                        // PRE-separation memtable (full values), so a
+                        // BlobRef here is a contract violation. Fail loud.
                         OpType::BlobRef => {
                             return Err(ForstError::corruption(
-                                "batch resident get: BlobRef dereference not wired (FRS-WA-V2a-1)",
+                                "batch resident get: BlobRef in a memtable tier (separation is flush-time only)",
                             ));
                         }
                         OpType::Merge => {
@@ -10328,11 +10549,21 @@ impl DbImpl {
                                 }
                                 break 'l0_files;
                             }
-                            // FRS-WA-V2a-1: fail loud (no deref path yet).
+                            // FRS-WA-V2a-2: pointer row — deref the value
+                            // log (P12: BlobRef under merge is corrupt).
                             OpType::BlobRef => {
-                                return Err(ForstError::corruption(
-                                    "batch_get_vectorized: BlobRef dereference not wired (FRS-WA-V2a-1)",
-                                ));
+                                if had_merge_operand {
+                                    return Err(ForstError::corruption(
+                                        "batch_get_vectorized: BlobRef base under a merge chain (P12)",
+                                    ));
+                                }
+                                let ptr_bytes = res.value.ok_or_else(|| {
+                                    ForstError::corruption(
+                                        "batch_get_vectorized: L0 BlobRef missing pointer payload",
+                                    )
+                                })?;
+                                resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                                break 'l0_files;
                             }
                             OpType::Merge => {
                                 had_merge_operand = true;
@@ -10416,11 +10647,21 @@ impl DbImpl {
                             }
                             break;
                         }
-                        // FRS-WA-V2a-1: fail loud (no deref path yet).
+                        // FRS-WA-V2a-2: pointer row — deref the value log
+                        // (P12: BlobRef under merge is corrupt).
                         OpType::BlobRef => {
-                            return Err(ForstError::corruption(
-                                "batch_get_vectorized: BlobRef dereference not wired (FRS-WA-V2a-1)",
-                            ));
+                            if had_merge_operand {
+                                return Err(ForstError::corruption(
+                                    "batch_get_vectorized: BlobRef base under a merge chain (P12)",
+                                ));
+                            }
+                            let ptr_bytes = res.value.ok_or_else(|| {
+                                ForstError::corruption(
+                                    "batch_get_vectorized: L0 BlobRef missing pointer payload",
+                                )
+                            })?;
+                            resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                            break;
                         }
                         OpType::Merge => {
                             // Defer the chain to per-key get_internal — the
@@ -10504,11 +10745,22 @@ impl DbImpl {
                                 decided = true;
                                 break;
                             }
-                            // FRS-WA-V2a-1: fail loud (no deref path yet).
+                            // FRS-WA-V2a-2: pointer row — deref the value
+                            // log (P12: BlobRef under merge is corrupt).
                             OpType::BlobRef => {
-                                return Err(ForstError::corruption(
-                                    "batch_get_vectorized: BlobRef dereference not wired (FRS-WA-V2a-1)",
-                                ));
+                                if had_merge_operand {
+                                    return Err(ForstError::corruption(
+                                        "batch_get_vectorized: BlobRef base under a merge chain (P12)",
+                                    ));
+                                }
+                                let ptr_bytes = res.value.ok_or_else(|| {
+                                    ForstError::corruption(
+                                        "batch_get_vectorized: L1+ BlobRef missing pointer payload",
+                                    )
+                                })?;
+                                resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                                decided = true;
+                                break;
                             }
                             OpType::Merge => {
                                 had_merge_operand = true;
@@ -10757,11 +11009,11 @@ impl DbImpl {
             match entry.op_type {
                 OpType::Put => return Ok(entry.value),
                 OpType::Delete | OpType::SingleDelete => return Ok(None),
-                // FRS-WA-V2a-1: memtables never hold pointer entries; fail
-                // loud rather than hand pointer bytes to a caller.
+                // FRS-WA-V2a-2: separation happens at FLUSH time only —
+                // memtables never hold pointer rows. Fail loud.
                 OpType::BlobRef => {
                     return Err(ForstError::corruption(
-                        "get_internal(imm): BlobRef dereference not wired (FRS-WA-V2a-1)",
+                        "get_internal(imm): BlobRef in a memtable tier (separation is flush-time only)",
                     ));
                 }
                 OpType::Merge => {
@@ -10828,12 +11080,13 @@ impl DbImpl {
             match entry.op_type {
                 OpType::Put => return Ok(entry.value),
                 OpType::Delete | OpType::SingleDelete => return Ok(None),
-                // FRS-WA-V2a-1: resident-flushed memtables mirror L0 SST
-                // bytes — once flush-time separation lands they CAN hold
-                // pointer entries; until the deref path exists, fail loud.
+                // FRS-WA-V2a-2: the resident shadow enrolls the
+                // PRE-separation memtable (full values, the same logical
+                // content as the separated L0 SST), so a BlobRef here is a
+                // contract violation. Fail loud.
                 OpType::BlobRef => {
                     return Err(ForstError::corruption(
-                        "get_internal(resident): BlobRef dereference not wired (FRS-WA-V2a-1)",
+                        "get_internal(resident): BlobRef in a memtable tier (separation is flush-time only)",
                     ));
                 }
                 OpType::Merge => {
@@ -10899,10 +11152,21 @@ impl DbImpl {
                 self.apply_merge_operator(cf_data, key, None, std::mem::take(merge_operands))
                     .map(|v| ControlFlow::Break(Some(v)))
             }
-            // FRS-WA-V2a-1: fail loud (no deref path yet).
-            OpType::BlobRef => Err(ForstError::corruption(
-                "sst_get: BlobRef dereference not wired (FRS-WA-V2a-1)",
-            )),
+            // FRS-WA-V2a-2: pointer row — dereference the value log. A
+            // BlobRef base under accumulated merge operands violates P12
+            // (merge CFs are exempt from separation) ⇒ corruption.
+            OpType::BlobRef => {
+                if !merge_operands.is_empty() {
+                    return Err(ForstError::corruption(
+                        "sst_get: BlobRef base under a merge chain (P12)",
+                    ));
+                }
+                let ptr_bytes = res.value.ok_or_else(|| {
+                    ForstError::corruption("sst_get: L0 BlobRef missing pointer payload")
+                })?;
+                self.vlog_deref(&ptr_bytes)
+                    .map(|v| ControlFlow::Break(Some(v)))
+            }
             OpType::Merge => match res.value {
                 // A-R6-H2: surface corruption on a missing operand payload.
                 Some(v) => {
@@ -11032,11 +11296,20 @@ impl DbImpl {
             versions.sort_by_key(|x| std::cmp::Reverse(x.sequence));
             for res in versions {
                 match res.op_type {
-                    // FRS-WA-V2a-1: fail loud (no deref path yet).
+                    // FRS-WA-V2a-2: pointer row — dereference the value log
+                    // (P12: a BlobRef base under merge operands is corrupt).
                     OpType::BlobRef => {
-                        return Err(ForstError::corruption(
-                            "sst_get: L1+ BlobRef dereference not wired (FRS-WA-V2a-1)",
-                        ));
+                        if !merge_operands.is_empty() {
+                            return Err(ForstError::corruption(
+                                "sst_get: L1+ BlobRef base under a merge chain (P12)",
+                            ));
+                        }
+                        let ptr_bytes = res.value.ok_or_else(|| {
+                            ForstError::corruption(
+                                "sst_get: L1+ BlobRef missing pointer payload",
+                            )
+                        })?;
+                        return self.vlog_deref(&ptr_bytes).map(Some);
                     }
                     OpType::Put => {
                         // B-R27-NEW-H1 (L1+ sibling): Put-with-None is
@@ -11115,6 +11388,70 @@ impl DbImpl {
         }
         let reader = self.get_or_open_sst_reader(meta)?;
         reader.get_versions(key)
+    }
+
+    /// FRS-WA-V2a-2: per-CF KV-separation eligibility (survey §3.1
+    /// exclusions). Eligible = flag ON ∧ `Unbounded` lifecycle (lifecycle
+    /// CFs ride the V1 drop-whole path — their values expire for free) ∧ no
+    /// merge operator (P12: pointers don't concat) ∧ no compaction filter
+    /// (filters inspect VALUE bytes; a pointer row would be uninspectable).
+    /// Returns the armed spec (with a freshly allocated segment id) or None.
+    fn kv_sep_spec_for(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+    ) -> Option<crate::flush::KvSepSpec> {
+        if !kv_separation_enabled() {
+            return None;
+        }
+        if !matches!(
+            cf_data.lifecycle(),
+            crate::column_family::CfLifecycle::Unbounded
+        ) {
+            return None;
+        }
+        if cf_data.merge_operator().is_some() || cf_data.compaction_filter().is_some() {
+            return None;
+        }
+        Some(crate::flush::KvSepSpec {
+            segment_id: self.version_set.allocate_file_number(),
+            min_blob_size: kv_min_blob_size(),
+        })
+    }
+
+    /// FRS-WA-V2a-2: cached open of a value-log segment reader. Segments
+    /// are immutable once any pointer to them is version-visible, so a
+    /// cached reader never goes stale.
+    fn get_or_open_vlog_reader(
+        &self,
+        segment_id: u64,
+    ) -> ForstResult<Arc<forst_rs_storage::vlog::VlogReader>> {
+        {
+            let cache = self.vlog_readers.read().expect("lock poisoned");
+            if let Some(r) = cache.get(&segment_id) {
+                return Ok(r.clone());
+            }
+        }
+        // Open WITHOUT the lock held (mirrors get_or_open_sst_reader's
+        // FRS-SST-OPEN-NOLOCK rationale), then double-checked insert.
+        let reader = Arc::new(forst_rs_storage::vlog::VlogReader::open(
+            self.fs.as_ref(),
+            Path::new(&self.db_path),
+            segment_id,
+        )?);
+        let mut cache = self.vlog_readers.write().expect("lock poisoned");
+        Ok(cache.entry(segment_id).or_insert(reader).clone())
+    }
+
+    /// FRS-WA-V2a-2: dereference a `BlobRef` row's pointer bytes to the
+    /// value bytes in the owning vlog segment (CRC-verified). The pointer
+    /// bytes are the SST row's stored value; malformed bytes are corruption
+    /// (a BlobRef row's payload is ALWAYS a `ValuePointer` — discrimination
+    /// rides the op type, never the bytes).
+    pub(crate) fn vlog_deref(&self, ptr_bytes: &[u8]) -> ForstResult<Vec<u8>> {
+        let ptr = forst_rs_storage::vlog::ValuePointer::decode(ptr_bytes).ok_or_else(|| {
+            ForstError::corruption("BlobRef row carries malformed value-pointer bytes")
+        })?;
+        self.get_or_open_vlog_reader(ptr.segment_id)?.get(&ptr)
     }
 
     fn get_or_open_sst_reader(&self, meta: &SstFileMeta) -> ForstResult<Arc<SstReaderImpl>> {
@@ -12936,6 +13273,75 @@ fn lifecycle_drop_ignore_snapshots() -> bool {
     })
 }
 
+// ---------------------------------------------------------------------------
+// FRS-WA-V2a-2 (2026-06-13 write-path redesign survey §3.1/§6 stage V2):
+// flush-time KV separation — flag-gated, DEFAULT OFF.
+// ---------------------------------------------------------------------------
+
+/// Test override for [`kv_separation_enabled`]: 0 = env, 1 = forced off,
+/// 2 = forced on. Same pattern as `LIFECYCLE_SEGMENTS_OVERRIDE`.
+static KV_SEPARATION_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Forces the FRS-WA-V2a-2 KV-separation write path on/off for tests
+/// (`None` = defer to the `FRS_KV_SEPARATION` env). Safe to flip in a
+/// shared test process: with the flag ON, behavior changes ONLY for flushes
+/// of ELIGIBLE CFs (Unbounded lifecycle, no merge operator, no compaction
+/// filter) whose values reach [`kv_min_blob_size`]; everything else is
+/// byte-identical either way, and already-written BlobRef rows keep
+/// dereferencing regardless of the flag (the read path is always wired).
+pub fn set_kv_separation_override(v: Option<bool>) {
+    KV_SEPARATION_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-WA-V2a-2 master flag (`FRS_KV_SEPARATION=1`, DEFAULT OFF). When ON,
+/// flushes of eligible CFs (see [`DbImpl::kv_sep_spec_for`]) write values
+/// ≥ [`kv_min_blob_size`] to an append-once value-log segment
+/// (`<id>.vlog`, [`forst_rs_storage::vlog`]) and store a 21-byte
+/// `BlobRef(ValuePointer)` row in the SST instead — so compaction moves
+/// pointers, not values (survey §3.1: measured key-LSM write-amp 2.10× on
+/// pointer-sized rows vs 7.8× carrying values; assembled model ≈ 1.36×).
+/// OFF (default): no separation, byte-identical to pre-V2a-2.
+pub fn kv_separation_enabled() -> bool {
+    use std::sync::OnceLock;
+    match KV_SEPARATION_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_KV_SEPARATION").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-WA-V2a-2 separation threshold (`FRS_KV_MIN_BLOB_SIZE`, bytes,
+/// default 128, floor 22): values STRICTLY SHORTER stay inline. The floor
+/// is `VALUE_POINTER_LEN + 1` — separating a value the size of its own
+/// pointer can never win. Default 128 keeps small ValueState rows inline
+/// (cold-deref bound, survey §3.1 exclusion) while catching the join/list
+/// payloads that dominate the q7/q9-class churn byte volume.
+pub fn kv_min_blob_size() -> usize {
+    use std::sync::OnceLock;
+    static V: OnceLock<usize> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FRS_KV_MIN_BLOB_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&v| v > forst_rs_storage::vlog::VALUE_POINTER_LEN)
+            .unwrap_or(128)
+    })
+}
+
 /// S2 (pinned-rows + loser-tree design, 2026-06-12): test/bench override for
 /// [`s2_pinned_enabled`]. 0 = unset (read the env), 1 = forced OFF,
 /// 2 = forced ON. Programmatic (not env) so in-process A/B fixtures and the
@@ -13890,6 +14296,16 @@ enum PinnedStep {
         /// Row index within the winning source's pinned buffer.
         row: usize,
     },
+    /// FRS-WA-V2a-2: newest version is an SST-resident BlobRef whose
+    /// POINTER bytes are pinned in `sources[src]` at row `row` — the
+    /// consumer derefs the value log once (an owned value; the only
+    /// alloc-bearing emit on the pinned path besides Fallback).
+    Blob {
+        /// Winning source index.
+        src: usize,
+        /// Row index within the winning source's pinned buffer.
+        row: usize,
+    },
     /// Resolve via `get_internal` (memtable winner / merge chain / corrupt
     /// Put) — the correctness path, allocs allowed.
     Fallback,
@@ -14117,6 +14533,13 @@ impl LazyPrefixIter {
                                 *deferred_refight = Some(w);
                                 break Some(PinnedStep::Put { src: wi, row });
                             }
+                            // FRS-WA-V2a-2: pinned pointer bytes — same pin
+                            // + deferred-refight contract as Put (the emit
+                            // reads `rows[row]` to deref the value log).
+                            (OpType::BlobRef, true) => {
+                                *deferred_refight = Some(w);
+                                break Some(PinnedStep::Blob { src: wi, row });
+                            }
                             (OpType::Delete, _) | (OpType::SingleDelete, _) => {
                                 // Tombstone winner hides the key — skip.
                                 ensure_head_pinned(
@@ -14255,9 +14678,10 @@ impl LazyPrefixIter {
                     continue;
                 }
                 Some((_, _, _, OpType::Merge, _)) => Some(PinnedStep::Fallback),
-                // FRS-WA-V2a-1: deref not wired — defer to get_internal,
-                // which surfaces the not-wired corruption error.
-                Some((_, _, _, OpType::BlobRef, _)) => Some(PinnedStep::Fallback),
+                // FRS-WA-V2a-2: pinned pointer bytes — the consumer derefs
+                // the value log once. Missing payload → get_internal raises.
+                Some((src, row, _, OpType::BlobRef, true)) => Some(PinnedStep::Blob { src, row }),
+                Some((_, _, _, OpType::BlobRef, false)) => Some(PinnedStep::Fallback),
                 // No head info though min came from a source — conservative.
                 None => Some(PinnedStep::Fallback),
             };
@@ -14409,8 +14833,11 @@ impl LazyPrefixIter {
                 Some((_, OpType::Put, None)) => return Some((min, ValueDecision::Fallback)),
                 Some((_, OpType::Delete, _)) | Some((_, OpType::SingleDelete, _)) => continue,
                 Some((_, OpType::Merge, _)) => return Some((min, ValueDecision::Fallback)),
-                // FRS-WA-V2a-1: deref not wired — defer to get_internal.
-                Some((_, OpType::BlobRef, _)) => return Some((min, ValueDecision::Fallback)),
+                // FRS-WA-V2a-2: carry the pointer bytes out — the consumer
+                // derefs the value log once. Missing payload (corrupt row)
+                // defers to get_internal, which surfaces the corruption.
+                Some((_, OpType::BlobRef, Some(v))) => return Some((min, ValueDecision::Blob(v))),
+                Some((_, OpType::BlobRef, None)) => return Some((min, ValueDecision::Fallback)),
                 // No source produced head info though `min` came from one —
                 // be conservative and let get_internal resolve it.
                 None => return Some((min, ValueDecision::Fallback)),
@@ -14423,6 +14850,10 @@ impl LazyPrefixIter {
 enum ValueDecision {
     /// Newest version is an SST-resident Put; the value is final.
     Put(Arc<[u8]>),
+    /// FRS-WA-V2a-2: newest version is an SST-resident BlobRef; the carried
+    /// bytes are the VALUE POINTER — the consumer derefs the value log ONCE
+    /// (no per-key LSM re-walk, unlike Fallback).
+    Blob(Arc<[u8]>),
     /// Resolve via `get_internal` (memtable tier, merge-chain, or corrupt Put).
     Fallback,
 }
@@ -14499,6 +14930,20 @@ impl PrefixScanStream {
                             return Ok(FillOutcome::SinkFull);
                         }
                     }
+                    PinnedStep::Blob { src, row } => {
+                        // FRS-WA-V2a-2: deref the value log from the pinned
+                        // pointer bytes (one owned alloc; no LSM re-walk).
+                        let value = {
+                            let inner = &self.inner;
+                            let ptr = inner.sources[src].pinned_row_value(row).ok_or_else(|| {
+                                ForstError::internal("S2: pinned Blob winner lost its pointer")
+                            })?;
+                            self.db.vlog_deref(ptr)?
+                        };
+                        if !sink.push(self.inner.last_emitted_buf.as_slice(), &value) {
+                            return Ok(FillOutcome::SinkFull);
+                        }
+                    }
                     PinnedStep::Fallback => {
                         // Correctness path (memtable winner / merge chain /
                         // corrupt Put): owned resolution, allocs allowed.
@@ -14527,6 +14972,13 @@ impl PrefixScanStream {
                 match decision {
                     ValueDecision::Put(v) => {
                         if !sink.push(key_arc.as_ref(), v.as_ref()) {
+                            return Ok(FillOutcome::SinkFull);
+                        }
+                    }
+                    // FRS-WA-V2a-2: deref the value log once.
+                    ValueDecision::Blob(ptr) => {
+                        let value = self.db.vlog_deref(ptr.as_ref())?;
+                        if !sink.push(key_arc.as_ref(), &value) {
                             return Ok(FillOutcome::SinkFull);
                         }
                     }
@@ -15199,6 +15651,239 @@ mod tests {
         assert_eq!(db.lifecycle_drop_expired(&cf_data).unwrap(), 0);
         assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(&b"v"[..]));
         set_lifecycle_segments_override(None);
+    }
+
+    /// FRS-WA-V2a-2 (survey §3.1/§6 stage V2): flush-time KV separation
+    /// round-trip — values ≥ the blob threshold leave the key-LSM at flush
+    /// (BlobRef pointer rows + a vlog segment registered in the version);
+    /// EVERY read path dereferences byte-exactly: point-get, batch get
+    /// (vectorized L0/L1+ arms), prefix scan (value-carrying merge),
+    /// snapshot get, and post-compaction reads (pointers survive compaction
+    /// without value rewrite — the write-amp win).
+    #[test]
+    fn test_wa_v2a2_kvsep_flush_separates_and_derefs() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("unb"))
+            .unwrap();
+
+        let big1: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+        let big2 = vec![0xAB; 4096];
+        let small = b"tiny".to_vec();
+        db.put(&cf, b"k-big1", &big1).unwrap();
+        db.put(&cf, b"k-big2", &big2).unwrap();
+        db.put(&cf, b"k-small", &small).unwrap();
+        let meta = db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert_eq!(meta.num_entries, 3);
+
+        // The vlog segment is registered in the version, owned by this CF,
+        // and holds at least the two separated payloads.
+        let v = db.version_set.current();
+        assert_eq!(v.vlog_segments.len(), 1, "one segment per flush");
+        let seg = v.vlog_segments[0].clone();
+        assert_eq!(seg.cf_id, cf.id());
+        assert!(
+            seg.file_size >= (big1.len() + big2.len()) as u64,
+            "segment must hold the separated values"
+        );
+        // The .vlog file exists on the engine FS.
+        let seg_path = forst_rs_storage::vlog::vlog_segment_path(
+            std::path::Path::new(&db.options.db_path),
+            seg.segment_id,
+        );
+        assert!(db.fs.file_exists(&seg_path).unwrap());
+
+        // Point-get (sst_get arms).
+        assert_eq!(db.get(&cf, b"k-big1").unwrap().as_deref(), Some(&big1[..]));
+        assert_eq!(db.get(&cf, b"k-big2").unwrap().as_deref(), Some(&big2[..]));
+        assert_eq!(db.get(&cf, b"k-small").unwrap().as_deref(), Some(&small[..]));
+
+        // Vectorized batch get (multi-key path).
+        let got = db
+            .batch_get(&cf, &[b"k-big1", b"k-small", b"k-miss", b"k-big2"])
+            .unwrap();
+        assert_eq!(got[0].as_deref(), Some(&big1[..]));
+        assert_eq!(got[1].as_deref(), Some(&small[..]));
+        assert_eq!(got[2], None);
+        assert_eq!(got[3].as_deref(), Some(&big2[..]));
+
+        // Prefix scan — the value-carrying merge derefs inline.
+        let rows = db.prefix_scan(&cf, b"k-").unwrap();
+        assert_eq!(rows.len(), 3);
+        let by_key = |k: &[u8]| {
+            rows.iter()
+                .find(|(rk, _)| rk == k)
+                .map(|(_, rv)| rv.clone())
+                .unwrap()
+        };
+        assert_eq!(by_key(b"k-big1"), big1);
+        assert_eq!(by_key(b"k-big2"), big2);
+        assert_eq!(by_key(b"k-small"), small);
+
+        // Snapshot read (iter_versions_of → mvcc path).
+        let snap = db.snapshot();
+        assert_eq!(
+            db.get_at_cf(&cf, &snap, b"k-big1").unwrap().as_deref(),
+            Some(&big1[..])
+        );
+        drop(snap);
+
+        // Overwrite one key, flush again, compact everything: BlobRef rows
+        // pass through compaction as pointers, both segments stay live, and
+        // every read still derefs exactly.
+        db.put(&cf, b"k-big1", &big2).unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        db.compact_all().unwrap();
+        assert_eq!(db.get(&cf, b"k-big1").unwrap().as_deref(), Some(&big2[..]));
+        assert_eq!(db.get(&cf, b"k-big2").unwrap().as_deref(), Some(&big2[..]));
+        assert_eq!(db.get(&cf, b"k-small").unwrap().as_deref(), Some(&small[..]));
+        assert_eq!(
+            db.version_set.current().vlog_segments.len(),
+            2,
+            "compaction must not drop vlog segments (GC is V2b)"
+        );
+        let rows = db.prefix_scan(&cf, b"k-").unwrap();
+        assert_eq!(rows.len(), 3);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-WA-V2a-2 policy gates: (a) flag OFF ⇒ byte-path unchanged (no
+    /// segment, no .vlog, plain Put rows); (b) merge-operator CFs are
+    /// EXEMPT (P12 — pointers don't concat); (c) lifecycle (Windowed) CFs
+    /// are exempt (their bytes ride the V1 drop-whole path); (d) sub-
+    /// threshold values stay inline even on eligible CFs.
+    #[test]
+    fn test_wa_v2a2_kvsep_policy_exemptions_and_flag_off() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let big = vec![7u8; 1024];
+
+        // (a) Flag OFF: no separation anywhere.
+        set_kv_separation_override(Some(false));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("off"))
+            .unwrap();
+        db.put(&cf, b"k", &big).unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert!(
+            db.version_set.current().vlog_segments.is_empty(),
+            "flag OFF must not separate"
+        );
+        assert_eq!(db.get(&cf, b"k").unwrap().as_deref(), Some(&big[..]));
+
+        // (b)+(c) Flag ON: merge-op CF and Windowed CF stay exempt.
+        set_kv_separation_override(Some(true));
+        let db = open();
+        let mcf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("merge")
+                    .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma())),
+            )
+            .unwrap();
+        let lcf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("windowed")
+                    .with_lifecycle(crate::column_family::CfLifecycle::Windowed { ttl: 100 }),
+            )
+            .unwrap();
+        db.put(&mcf, b"k", &big).unwrap();
+        db.put(&lcf, b"k", &big).unwrap();
+        db.switch_and_flush(&mcf).unwrap().expect("flushed");
+        db.switch_and_flush(&lcf).unwrap().expect("flushed");
+        assert!(
+            db.version_set.current().vlog_segments.is_empty(),
+            "merge-op and lifecycle CFs must not separate"
+        );
+        assert_eq!(db.get(&mcf, b"k").unwrap().as_deref(), Some(&big[..]));
+        assert_eq!(db.get(&lcf, b"k").unwrap().as_deref(), Some(&big[..]));
+
+        // (d) Sub-threshold values stay inline on an eligible CF.
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("inline"))
+            .unwrap();
+        db.put(&cf, b"k", b"sub-threshold").unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert!(db.version_set.current().vlog_segments.is_empty());
+        assert_eq!(
+            db.get(&cf, b"k").unwrap().as_deref(),
+            Some(&b"sub-threshold"[..])
+        );
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-WA-V2a-2 checkpoint/restore with a LIVE vlog: the full
+    /// checkpoint copies the segments, the manifest (blob v5) carries the
+    /// table, restore re-adopts them, and every read path derefs
+    /// byte-exactly post-restore. Restore-then-checkpoint is stable.
+    #[test]
+    fn test_wa_v2a2_kvsep_checkpoint_restore_with_live_vlog() {
+        use forst_rs_io::MemoryFileSystem;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("kv"))
+            .unwrap();
+        let big: Vec<u8> = (0..2048u32).map(|i| (i % 241) as u8).collect();
+        db.put(&cf, b"k-big", &big).unwrap();
+        db.put(&cf, b"k-small", b"s").unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert_eq!(db.version_set.current().vlog_segments.len(), 1);
+
+        db.create_checkpoint(std::path::Path::new("/ckpt")).unwrap();
+
+        // The checkpoint dir physically contains the segment.
+        let seg_id = db.version_set.current().vlog_segments[0].segment_id;
+        let ckpt_seg = forst_rs_storage::vlog::vlog_segment_path(
+            std::path::Path::new("/ckpt"),
+            seg_id,
+        );
+        assert!(
+            fs.file_exists(&ckpt_seg).unwrap(),
+            "checkpoint must copy live vlog segments"
+        );
+
+        let opts = EngineOptions {
+            db_path: "/ckpt".to_string(),
+            ..EngineOptions::default()
+        };
+        let restored = DbImpl::open_from_checkpoint(opts, fs.clone()).unwrap();
+        let rcf = restored.column_family("kv").expect("CF restored");
+        assert_eq!(
+            restored.version_set.current().vlog_segments.len(),
+            1,
+            "restore must adopt the segment table"
+        );
+        assert_eq!(
+            restored.get(&rcf, b"k-big").unwrap().as_deref(),
+            Some(&big[..]),
+            "post-restore deref must be byte-exact"
+        );
+        assert_eq!(
+            restored.get(&rcf, b"k-small").unwrap().as_deref(),
+            Some(&b"s"[..])
+        );
+        let rows = restored.prefix_scan(&rcf, b"k-").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Restore → checkpoint again (stability of the v5 round-trip).
+        restored
+            .create_checkpoint(std::path::Path::new("/ckpt2"))
+            .unwrap();
+        let opts2 = EngineOptions {
+            db_path: "/ckpt2".to_string(),
+            ..EngineOptions::default()
+        };
+        let restored2 = DbImpl::open_from_checkpoint(opts2, fs).unwrap();
+        let rcf2 = restored2.column_family("kv").expect("CF restored");
+        assert_eq!(
+            restored2.get(&rcf2, b"k-big").unwrap().as_deref(),
+            Some(&big[..])
+        );
+        set_kv_separation_override(None);
     }
 
     /// Step ② (roadmap L1): boundary coverage of the composite garbage-drain
@@ -22281,7 +22966,7 @@ mod tests {
             let mut keys: Vec<Vec<u8>> = Vec::new();
             while let Some(step) = iter.next_step_pinned() {
                 match step {
-                    PinnedStep::Put { .. } | PinnedStep::Fallback => {
+                    PinnedStep::Put { .. } | PinnedStep::Blob { .. } | PinnedStep::Fallback => {
                         keys.push(iter.last_emitted_buf.clone());
                     }
                 }

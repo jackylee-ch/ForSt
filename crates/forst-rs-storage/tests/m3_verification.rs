@@ -530,6 +530,7 @@ fn test_m3_checkpoint_serialize_restore_consistent() {
         new_files: vec![(1, make_file(4, b"aaa", b"hhh"))],
         next_file_number: Some(FileNumber(5)),
         last_sequence: Some(SequenceNumber(300)),
+        ..Default::default()
     })
     .unwrap();
 

@@ -63,6 +63,13 @@
 //! |     watermark: u64 (LE)           [v4+]  |
 //! |     max_event_time: u64 (LE)      [v4+]  |
 //! +------------------------------------------+
+//! | Vlog segment table                [v5+]  |
+//! |   num_vlog_segments: u32 (LE)            |
+//! |   for each segment:                      |
+//! |     segment_id: u64 (LE)                 |
+//! |     cf_id: u32 (LE)                      |
+//! |     file_size: u64 (LE)                  |
+//! +------------------------------------------+
 //! | Footer (12 bytes)                        |
 //! |   checksum: u32 (CRC32C of all above)    |
 //! |   blob_length: u64 (LE, total incl footer)|
@@ -100,9 +107,18 @@ const CHECKPOINT_MAGIC: &[u8; 4] = b"FRCP";
 ///   per-file `max_death` field (stamped or not). No-lifecycle snapshots
 ///   keep serializing as v2 (or v3 when only orphan stamps exist),
 ///   byte-identical to before. v1-v3 blobs decode with all four fields 0.
+/// * `5` — FRS-WA-V2a-2: appends a value-log segment table after the CF
+///   descriptors (`num_vlog_segments: u32`, then per segment `segment_id:
+///   u64`, `cf_id: u32`, `file_size: u64`) so KV-separated value bytes are
+///   checkpoint-addressable and restore re-adopts them. **Emitted ONLY when
+///   at least one vlog segment is live**; v5 always carries the v3 per-file
+///   and v4 per-CF fields (v5 ⊇ v4 ⊇ v3). No-kvsep snapshots keep
+///   serializing as v2/v3/v4, byte-identical to before. v1-v4 blobs decode
+///   with an empty segment table.
 const FORMAT_VERSION: u16 = 2;
 const FORMAT_VERSION_V3: u16 = 3;
 const FORMAT_VERSION_V4: u16 = 4;
+const FORMAT_VERSION_V5: u16 = 5;
 
 /// R49-H2: defense-in-depth cap on the number of CF descriptors in a blob.
 /// Way above any sane user limit; protects against OOM-DoS from a crafted blob.
@@ -150,14 +166,18 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
     let needs_v4 = snapshot.cf_descriptors.iter().any(|cf| {
         cf.lifecycle_ordinal != 0 || cf.watermark != 0 || cf.max_event_time != 0
     });
-    let emit_version = if needs_v4 {
+    // FRS-WA-V2a-2: emit v5 only when a vlog segment is live.
+    let needs_v5 = !snapshot.version.vlog_segments.is_empty();
+    let emit_version = if needs_v5 {
+        FORMAT_VERSION_V5
+    } else if needs_v4 {
         FORMAT_VERSION_V4
     } else if needs_v3 {
         FORMAT_VERSION_V3
     } else {
         FORMAT_VERSION
     };
-    // v4 always carries the per-file stamp field too (v4 ⊇ v3).
+    // v4+ always carries the per-file stamp field too (v5 ⊇ v4 ⊇ v3).
     let write_death = emit_version >= FORMAT_VERSION_V3;
 
     // --- Header (placeholder for blob_size, filled later) ---
@@ -223,6 +243,16 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
         }
     }
 
+    // --- FRS-WA-V2a-2: vlog segment table (v5 only) ---
+    if emit_version >= FORMAT_VERSION_V5 {
+        put_fixed32(&mut buf, snapshot.version.vlog_segments.len() as u32);
+        for seg in &snapshot.version.vlog_segments {
+            put_fixed64(&mut buf, seg.segment_id);
+            put_fixed32(&mut buf, seg.cf_id.value());
+            put_fixed64(&mut buf, seg.file_size);
+        }
+    }
+
     // --- Footer ---
     // Compute total size first so we can fill in the header before checksumming.
     // total = current buf len + checksum(4) + blob_length(8)
@@ -253,7 +283,7 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         return Err(ForstError::corruption("invalid checkpoint magic"));
     }
     let version = u16::from_le_bytes([data[4], data[5]]);
-    if !(1..=FORMAT_VERSION_V4).contains(&version) {
+    if !(1..=FORMAT_VERSION_V5).contains(&version) {
         return Err(ForstError::corruption(format!(
             "unsupported checkpoint format version: {}",
             version
@@ -262,6 +292,7 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
     let is_v2 = version >= 2;
     let is_v3 = version >= 3;
     let is_v4 = version >= 4;
+    let is_v5 = version >= 5;
     // flags at [6..8] -- reserved, ignore
     let blob_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
     if blob_size != data.len() as u64 {
@@ -443,6 +474,38 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
         Vec::new()
     };
 
+    // FRS-WA-V2a-2: vlog segment table (v5 only; empty before).
+    let vlog_segments = if is_v5 {
+        let (num_segs, n) = get_fixed32(&data[pos..])?;
+        pos += n;
+        // Defense-in-depth: same OOM-DoS cap class as the per-level file
+        // count (a segment is roughly one flush, so the SST cap is an
+        // upper bound on any legitimate segment count too).
+        if num_segs > MAX_FILES_PER_LEVEL_CHECKPOINT {
+            return Err(ForstError::corruption(format!(
+                "checkpoint num_vlog_segments {} exceeds cap {}",
+                num_segs, MAX_FILES_PER_LEVEL_CHECKPOINT
+            )));
+        }
+        let mut segs = Vec::with_capacity(num_segs as usize);
+        for _ in 0..num_segs {
+            let (segment_id, n) = get_fixed64(&data[pos..])?;
+            pos += n;
+            let (cf_raw, n) = get_fixed32(&data[pos..])?;
+            pos += n;
+            let (file_size, n) = get_fixed64(&data[pos..])?;
+            pos += n;
+            segs.push(crate::version::VlogSegmentMeta {
+                segment_id,
+                cf_id: ColumnFamilyId(cf_raw),
+                file_size,
+            });
+        }
+        segs
+    } else {
+        Vec::new()
+    };
+
     // R31-M2: after parsing N levels × M files (+ optional v2 CF table),
     // `pos` must land exactly on the footer start. Any gap means the
     // encoder wrote extra padding (or a mismatched length field
@@ -457,7 +520,7 @@ pub fn restore_from_blob(data: &[u8]) -> ForstResult<VersionSetSnapshot> {
     }
 
     Ok(VersionSetSnapshot {
-        version: std::sync::Arc::new(Version::from_levels(levels)),
+        version: std::sync::Arc::new(Version::from_levels_and_vlogs(levels, vlog_segments)),
         next_file_number,
         last_sequence,
         cf_descriptors,
@@ -668,6 +731,60 @@ mod tests {
             err.to_string().contains("lifecycle ordinal"),
             "unexpected error: {err}"
         );
+    }
+
+    /// FRS-WA-V2a-2: blob format v5 — the vlog segment table round-trips;
+    /// v5 is emitted ONLY when at least one vlog segment exists (no-kvsep
+    /// snapshots stay byte-identical v2/v3/v4, the default-path-unchanged
+    /// discipline); the table is CRC-guarded like everything else.
+    #[test]
+    fn test_wa_v2a2_blob_v5_vlog_segments_roundtrip_and_v2_when_absent() {
+        use crate::version::VlogSegmentMeta;
+        // (a) No vlog segments ⇒ v2 header; restore yields an empty table.
+        let snap_plain = make_snapshot(vec![(0, make_file(1, b"a", b"m"))]);
+        let blob_plain = serialize_to_blob(&snap_plain).unwrap();
+        assert_eq!(
+            u16::from_le_bytes([blob_plain[4], blob_plain[5]]),
+            FORMAT_VERSION,
+            "no vlog segments ⇒ emit v2 (byte-identical to pre-V2a-2)"
+        );
+        let restored = restore_from_blob(&blob_plain).unwrap();
+        assert!(restored.version.vlog_segments.is_empty());
+
+        // (b) Vlog segments present ⇒ v5; the table round-trips exactly and
+        // the v3/v4 per-file + per-CF fields still decode (v5 ⊇ v4 ⊇ v3).
+        let segs = vec![
+            VlogSegmentMeta {
+                segment_id: 9,
+                cf_id: ColumnFamilyId(3),
+                file_size: 12_345,
+            },
+            VlogSegmentMeta {
+                segment_id: 11,
+                cf_id: forst_rs_common::DEFAULT_CF_ID,
+                file_size: 7,
+            },
+        ];
+        let mut snap = make_snapshot(vec![(0, make_file(1, b"a", b"m"))]);
+        let mut version = (*snap.version).clone();
+        version.vlog_segments = segs.clone();
+        snap.version = Arc::new(version);
+        let blob = serialize_to_blob(&snap).unwrap();
+        assert_eq!(u16::from_le_bytes([blob[4], blob[5]]), FORMAT_VERSION_V5);
+        let restored = restore_from_blob(&blob).unwrap();
+        assert_eq!(restored.version.vlog_segments, segs);
+        assert_eq!(restored.version.levels[0].files[0].max_death, 0);
+
+        // (c) restore_version_set (the engine restore path) carries the
+        // table through its Version clone.
+        let vs = restore_version_set(&blob).unwrap();
+        assert_eq!(vs.current().vlog_segments, segs);
+
+        // (d) CRC still guards the v5 payload (corrupt a table byte).
+        let mut corrupted = blob.clone();
+        let idx = corrupted.len() - FOOTER_SIZE - 4; // inside the vlog table
+        corrupted[idx] ^= 0xFF;
+        assert!(restore_from_blob(&corrupted).is_err());
     }
 
     #[test]

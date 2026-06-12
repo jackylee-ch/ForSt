@@ -28,11 +28,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, Weak};
 
-use arrow::array::{Array, BinaryArray, UInt64Array, UInt8Array};
+use arrow::array::{Array, BinaryArray, BinaryBuilder, UInt64Array, UInt8Array};
 use forst_rs_common::{ColumnFamilyId, FileNumber, ForstError, ForstResult, SequenceNumber};
 use forst_rs_io::{FileSystem, WriteMode};
 use forst_rs_storage::sst::{SstFileInfo, SstWriterImpl, SstWriterOptions};
-use forst_rs_storage::version::SstFileMeta;
+use forst_rs_storage::version::{SstFileMeta, VlogSegmentMeta};
+use forst_rs_storage::vlog::{vlog_segment_path, VlogWriter};
 
 use crate::column_family::{ColumnFamilyData, SharedMemTable};
 
@@ -64,6 +65,23 @@ pub(crate) fn sst_temp_path(path: &Path) -> PathBuf {
     base
 }
 
+/// FRS-WA-V2a-2 (write-path redesign survey §3.1/§6 stage V2): per-flush
+/// KV-separation directive. Present ⇒ this flush diverts Put values whose
+/// length is `>= min_blob_size` into the append-once value-log segment
+/// `<segment_id>.vlog` (created LAZILY on the first qualifying value — a
+/// flush with no qualifying value creates no file and reports no segment)
+/// and stores `BlobRef(ValuePointer)` rows in the SST instead. Eligibility
+/// (per-CF policy: Unbounded + no merge operator + no compaction filter) is
+/// decided by the CALLER ([`crate::DbImpl`]) — the job applies the
+/// directive mechanically.
+#[derive(Debug, Clone, Copy)]
+pub struct KvSepSpec {
+    /// Pre-allocated segment file id (same counter as SST numbers).
+    pub segment_id: FileNumber,
+    /// Values shorter than this stay inline.
+    pub min_blob_size: usize,
+}
+
 /// A single flush operation: one frozen memtable → one SST file.
 pub struct FlushJob {
     memtable: SharedMemTable,
@@ -75,6 +93,8 @@ pub struct FlushJob {
     file_path: PathBuf,
     options: SstWriterOptions,
     fs: Arc<dyn FileSystem>,
+    /// FRS-WA-V2a-2: KV-separation directive (None = classic flush).
+    kv_sep: Option<KvSepSpec>,
 }
 
 impl FlushJob {
@@ -103,7 +123,14 @@ impl FlushJob {
             file_path,
             options,
             fs,
+            kv_sep: None,
         }
+    }
+
+    /// FRS-WA-V2a-2: arms KV separation for this flush (builder-style).
+    pub fn with_kv_separation(mut self, spec: KvSepSpec) -> Self {
+        self.kv_sep = Some(spec);
+        self
     }
 
     /// Runs the flush synchronously. Returns the metadata describing the
@@ -116,6 +143,15 @@ impl FlushJob {
     /// one in-flight Arrow data block plus the bloom + sparse-index
     /// sections (proportional to block count, not byte count).
     pub fn run(self) -> ForstResult<SstFileMeta> {
+        self.run_kv().map(|(meta, _)| meta)
+    }
+
+    /// FRS-WA-V2a-2: variant of [`Self::run`] that also reports the value-log
+    /// segment this flush produced (None when KV separation was not armed or
+    /// no value qualified). Durability order: the vlog segment is fsynced
+    /// BEFORE the SST finishes/publishes, so a published pointer row can
+    /// never reference un-durable value bytes (the WiscKey ordering).
+    pub fn run_kv(self) -> ForstResult<(SstFileMeta, Option<VlogSegmentMeta>)> {
         // 1. Pull sorted RecordBatches from the sharded memtable.
         //    `to_flush_batches` requires every shard to be frozen; the
         //    engine must have done that via `ShardedMemTable::freeze`
@@ -177,6 +213,10 @@ impl FlushJob {
         // leave `.<num>.sst.tmp` orphaned in-process until the restore orphan-scan picked it up
         // on next restart. Mirrors the same wrapper in `compaction.rs` so all SST-write sites
         // share one tmp-leak-safe contract.
+        // FRS-WA-V2a-2: lazily-created value-log writer (lives outside the
+        // closure so the segment meta survives it; the error path below
+        // deletes the partial segment alongside the partial SST).
+        let mut vlog: Option<VlogWriter> = None;
         let info_result: ForstResult<SstFileInfo> = (|| {
             let mut writable = self.fs.open_writable_file(&write_path, write_mode)?;
             let writer_inner = SstWriterImpl::with_options(self.options.clone());
@@ -234,9 +274,26 @@ impl FlushJob {
                     })
                     .count() as u64;
                 crate::db::note_flushed_tombstones(tombs, ops.len() as u64);
+                // FRS-WA-V2a-2: divert qualifying values to the value log and
+                // substitute BlobRef pointer rows. Batches with no qualifying
+                // row pass through untouched (zero-copy default path).
+                if let Some(spec) = self.kv_sep {
+                    if let Some((sep_values, sep_ops)) =
+                        self.separate_batch_values(spec, values, ops, &mut vlog)?
+                    {
+                        writer.add_batch(keys, &sep_values, seqs, &sep_ops)?;
+                        continue;
+                    }
+                }
                 writer.add_batch(keys, values, seqs, ops)?;
             }
 
+            // FRS-WA-V2a-2 durability order: the value log is fsynced BEFORE
+            // the SST finishes (and thus before the rename/close publishes
+            // any pointer row referencing it).
+            if let Some(w) = vlog.as_mut() {
+                w.sync()?;
+            }
             let info = writer.finish()?;
             writable.flush()?;
             writable.sync()?;
@@ -247,6 +304,13 @@ impl FlushJob {
             Err(e) => {
                 // Best-effort cleanup; orphan-scan on restart still covers any residual file.
                 let _ = self.fs.delete_file(&write_path);
+                // FRS-WA-V2a-2: also drop the partial value-log segment — no
+                // pointer into it was ever published (the SST died with it).
+                if let (Some(spec), true) = (self.kv_sep, vlog.is_some()) {
+                    let _ = self
+                        .fs
+                        .delete_file(&vlog_segment_path(parent, spec.segment_id.value()));
+                }
                 return Err(e);
             }
         };
@@ -262,6 +326,12 @@ impl FlushJob {
             // `.*.sst.tmp` and renames it out of the active naming space.
             if let Err(e) = self.fs.rename(&write_path, &self.file_path) {
                 let _ = self.fs.delete_file(&write_path);
+                // FRS-WA-V2a-2: the SST never published — drop its segment.
+                if let (Some(spec), true) = (self.kv_sep, vlog.is_some()) {
+                    let _ = self
+                        .fs
+                        .delete_file(&vlog_segment_path(parent, spec.segment_id.value()));
+                }
                 return Err(e);
             }
             // R49-H3: fsync(parent_dir) so the rename's directory entry change
@@ -280,8 +350,73 @@ impl FlushJob {
             }
         }
 
-        // 4. Build the SstFileMeta that the VersionSet will record.
-        Ok(Self::info_to_meta(self.file_number, self.cf_id, info))
+        // 4. Build the SstFileMeta (and, FRS-WA-V2a-2, the vlog segment
+        //    meta) that the VersionSet will record.
+        let vlog_meta = match (self.kv_sep, vlog) {
+            (Some(spec), Some(w)) => Some(VlogSegmentMeta {
+                segment_id: spec.segment_id.value(),
+                cf_id: self.cf_id,
+                file_size: w.size(),
+            }),
+            _ => None,
+        };
+        Ok((
+            Self::info_to_meta(self.file_number, self.cf_id, info),
+            vlog_meta,
+        ))
+    }
+
+    /// FRS-WA-V2a-2: if `values`/`ops` contain at least one qualifying row
+    /// (a non-null `Put` payload of `>= spec.min_blob_size` bytes), append
+    /// those payloads to the value log (creating the segment lazily) and
+    /// return substituted `(values, ops)` arrays where each qualifying row
+    /// became `(ValuePointer bytes, BlobRef)`. Returns `None` when nothing
+    /// qualifies — the caller keeps the original arrays untouched.
+    fn separate_batch_values(
+        &self,
+        spec: KvSepSpec,
+        values: &BinaryArray,
+        ops: &UInt8Array,
+        vlog: &mut Option<VlogWriter>,
+    ) -> ForstResult<Option<(BinaryArray, UInt8Array)>> {
+        let put = forst_rs_common::OpType::Put as u8;
+        let qualifies = |row: usize| {
+            ops.value(row) == put
+                && !values.is_null(row)
+                && values.value(row).len() >= spec.min_blob_size
+        };
+        let rows = ops.len();
+        if !(0..rows).any(qualifies) {
+            return Ok(None);
+        }
+        let dir = self.file_path.parent().ok_or_else(|| {
+            ForstError::invalid_argument("flush target has no parent directory")
+        })?;
+        let mut new_values = BinaryBuilder::new();
+        let mut new_ops: Vec<u8> = Vec::with_capacity(rows);
+        for row in 0..rows {
+            if qualifies(row) {
+                if vlog.is_none() {
+                    *vlog = Some(VlogWriter::create(
+                        self.fs.as_ref(),
+                        dir,
+                        spec.segment_id.value(),
+                    )?);
+                }
+                let w = vlog.as_mut().expect("vlog writer just ensured");
+                let ptr = w.append(values.value(row))?;
+                new_values.append_value(ptr.encode());
+                new_ops.push(forst_rs_common::OpType::BlobRef as u8);
+            } else {
+                if values.is_null(row) {
+                    new_values.append_null();
+                } else {
+                    new_values.append_value(values.value(row));
+                }
+                new_ops.push(ops.value(row));
+            }
+        }
+        Ok(Some((new_values.finish(), UInt8Array::from(new_ops))))
     }
 
     fn temp_path(&self) -> PathBuf {

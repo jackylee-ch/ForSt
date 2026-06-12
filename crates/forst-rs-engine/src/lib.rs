@@ -111,9 +111,10 @@ pub use compaction_filter::{
     TtlStateType,
 };
 pub use db::{
-    lifecycle_segments_enabled, s2_pinned_enabled, set_lifecycle_segments_override,
-    set_s2_pinned_override, DbImpl, FillOutcome, IncrementalCheckpointResult,
-    LinkedCheckpointDiscard, LiveFileInfo, PrefixScanStream, RowSink, DEFAULT_CF_NAME,
+    kv_min_blob_size, kv_separation_enabled, lifecycle_segments_enabled, s2_pinned_enabled,
+    set_kv_separation_override, set_lifecycle_segments_override, set_s2_pinned_override, DbImpl,
+    FillOutcome, IncrementalCheckpointResult, LinkedCheckpointDiscard, LiveFileInfo,
+    PrefixScanStream, RowSink, DEFAULT_CF_NAME,
 };
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};

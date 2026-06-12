@@ -91,6 +91,26 @@ impl SstFileMeta {
     }
 }
 
+/// FRS-WA-V2a-2 (write-path redesign survey §3.1/§6 stage V2): metadata for
+/// one immutable value-log segment (`<segment_id:06>.vlog` under the db dir;
+/// see [`crate::vlog`]). Segments are SST-class files in the version
+/// lifecycle: added by a flush `VersionEdit` (the flush that separated the
+/// values), carried in every descendant Version, linked into checkpoints,
+/// adopted on restore, and removed only by a (V2b) GC `VersionEdit` once no
+/// live pointer references them. Persisted in checkpoint-blob format v5
+/// (older blobs decode as "no segments").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VlogSegmentMeta {
+    /// Segment file id — allocated from the SAME counter as SST file
+    /// numbers, so ids never collide across the two file kinds.
+    pub segment_id: u64,
+    /// Column family whose flush produced the segment (KV separation is a
+    /// per-CF policy; a segment never mixes CFs).
+    pub cf_id: ColumnFamilyId,
+    /// Size in bytes at seal time (segments are append-once / immutable).
+    pub file_size: u64,
+}
+
 /// Metadata for a single LSM-tree level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LevelMeta {
@@ -191,6 +211,11 @@ pub mod scan_locator_probes {
 #[derive(Debug)]
 pub struct Version {
     pub levels: Vec<LevelMeta>,
+    /// FRS-WA-V2a-2: live value-log segments, sorted by `segment_id`.
+    /// Empty for every pre-KV-separation Version (and for every Version
+    /// while `FRS_KV_SEPARATION` stays OFF) — the default path allocates
+    /// nothing and serializes byte-identically.
+    pub vlog_segments: Vec<VlogSegmentMeta>,
     /// E5/A2: lazily-computed scan-locator index (per-level search-soundness
     /// flags + per-CF level views for multi-CF layouts). See [`ScanIndex`].
     ///
@@ -211,13 +236,13 @@ pub struct Version {
 // computed from the source's pre-mutation file layout.
 impl Clone for Version {
     fn clone(&self) -> Self {
-        Self::from_levels(self.levels.clone())
+        Self::from_levels_and_vlogs(self.levels.clone(), self.vlog_segments.clone())
     }
 }
 
 impl PartialEq for Version {
     fn eq(&self, other: &Self) -> bool {
-        self.levels == other.levels
+        self.levels == other.levels && self.vlog_segments == other.vlog_segments
     }
 }
 
@@ -233,8 +258,18 @@ impl Version {
     /// `apply_edit` output). The E5 scan-soundness cache starts empty and
     /// is computed lazily from `levels` on first scan.
     pub fn from_levels(levels: Vec<LevelMeta>) -> Self {
+        Self::from_levels_and_vlogs(levels, Vec::new())
+    }
+
+    /// FRS-WA-V2a-2: explicit-vlog constructor (restore path, `apply_edit`
+    /// output, `Clone`). The E5 scan-soundness cache starts empty either way.
+    pub fn from_levels_and_vlogs(
+        levels: Vec<LevelMeta>,
+        vlog_segments: Vec<VlogSegmentMeta>,
+    ) -> Self {
         Self {
             levels,
+            vlog_segments,
             scan_index: OnceLock::new(),
         }
     }
@@ -494,7 +529,28 @@ impl Version {
                 .sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
         }
 
-        Ok(Version::from_levels(new_levels))
+        // FRS-WA-V2a-2: vlog segment add/remove, mirroring the SST rules —
+        // duplicate ids are a stale-edit hazard (Busy, symmetric with
+        // new_files), and the table stays sorted by id.
+        let mut new_vlogs = self.vlog_segments.clone();
+        if !edit.deleted_vlog_segments.is_empty() {
+            new_vlogs.retain(|s| !edit.deleted_vlog_segments.contains(&s.segment_id));
+        }
+        for seg in &edit.new_vlog_segments {
+            if new_vlogs.iter().any(|s| s.segment_id == seg.segment_id) {
+                return Err(ForstError::busy(format!(
+                    "Version::apply_edit: stale edit inserts vlog segment {} but a segment \
+                     with that id is already present — caller should discard and retry",
+                    seg.segment_id
+                )));
+            }
+            new_vlogs.push(seg.clone());
+        }
+        if !edit.new_vlog_segments.is_empty() {
+            new_vlogs.sort_by_key(|s| s.segment_id);
+        }
+
+        Ok(Version::from_levels_and_vlogs(new_levels, new_vlogs))
     }
 
     /// Collect all live SST file metadata across all levels.
@@ -911,6 +967,10 @@ pub struct VersionEdit {
     pub next_file_number: Option<FileNumber>,
     /// Updated last sequence number (if changed).
     pub last_sequence: Option<SequenceNumber>,
+    /// FRS-WA-V2a-2: new value-log segments (flush-time KV separation).
+    pub new_vlog_segments: Vec<VlogSegmentMeta>,
+    /// FRS-WA-V2a-2: value-log segments to remove (V2b GC), by segment id.
+    pub deleted_vlog_segments: Vec<u64>,
 }
 
 /// R49-H2: a single column family's identity, persisted in the checkpoint
@@ -1087,17 +1147,25 @@ impl VersionSetImpl {
         // and makes `Arc::strong_count` below over-report readers. With
         // load_full everywhere, a replaced version's strong count reflects only
         // genuine reader holds, so the `retain` prune is reliable.
-        let mut referenced: HashSet<FileNumber> = self
-            .current
-            .load_full()
+        let current = self.current.load_full();
+        let mut referenced: HashSet<FileNumber> = current
             .live_sst_files_iter()
             .map(|f| f.file_number)
             .collect();
+        // FRS-WA-V2a-2/V2b: vlog segments share the file-number counter and
+        // the same reclamation rule — a segment listed by ANY still-held
+        // version must survive (an in-flight scan may deref into it).
+        for s in &current.vlog_segments {
+            referenced.insert(FileNumber(s.segment_id));
+        }
         let mut retiring = self.retiring.lock().expect("retiring lock poisoned");
         retiring.retain(|v| Arc::strong_count(v) > 1);
         for v in retiring.iter() {
             for f in v.live_sst_files_iter() {
                 referenced.insert(f.file_number);
+            }
+            for s in &v.vlog_segments {
+                referenced.insert(FileNumber(s.segment_id));
             }
         }
         referenced
@@ -1194,6 +1262,64 @@ mod tests {
             num_entries: 50,
             max_death: 0,
         }
+    }
+
+    /// FRS-WA-V2a-2 (KV separation): vlog segments ride the VersionEdit /
+    /// Version pipeline like SSTs — added by flush edits, removed by
+    /// (future V2b GC) edits, carried through `Clone` (the
+    /// `restore_version_set` path clones the restored Version), and
+    /// duplicate-id inserts rejected as `Busy` (stale-edit symmetry).
+    #[test]
+    fn test_wa_v2a2_version_edit_vlog_segments_add_remove_clone() {
+        let seg = |id: u64, size: u64| VlogSegmentMeta {
+            segment_id: id,
+            cf_id: DEFAULT_CF_ID,
+            file_size: size,
+        };
+        let v = Version::new();
+        assert!(v.vlog_segments.is_empty(), "fresh version has no vlogs");
+
+        // Add two segments (out of id order — apply must sort by id).
+        let v2 = v
+            .apply_edit(&VersionEdit {
+                new_vlog_segments: vec![seg(7, 100), seg(3, 50)],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            v2.vlog_segments,
+            vec![seg(3, 50), seg(7, 100)],
+            "segments sorted by id"
+        );
+
+        // Clone carries them (restore_version_set clones the Version).
+        let cloned = v2.clone();
+        assert_eq!(cloned.vlog_segments, v2.vlog_segments);
+
+        // SST-only edits leave them untouched.
+        let v3 = v2
+            .apply_edit(&VersionEdit {
+                new_files: vec![(0, make_file(1, b"a", b"c"))],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(v3.vlog_segments, v2.vlog_segments);
+
+        // Duplicate segment id ⇒ Busy (stale-edit symmetry with new_files).
+        let dup = v3.apply_edit(&VersionEdit {
+            new_vlog_segments: vec![seg(7, 1)],
+            ..Default::default()
+        });
+        assert!(dup.is_err(), "duplicate vlog segment id must be rejected");
+
+        // Deletion removes exactly the named segment.
+        let v4 = v3
+            .apply_edit(&VersionEdit {
+                deleted_vlog_segments: vec![3],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(v4.vlog_segments, vec![seg(7, 100)]);
     }
 
     #[test]

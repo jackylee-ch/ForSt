@@ -592,18 +592,62 @@ Reading: the R2 ceiling (96) sits far above the healthy steady state (17
 runs) — the lifecycle cell is bit-for-bit the §9 ttlseg-v1 regime (0.98 /
 914 / 17 / 0-miss) with the stall-protection now in place.
 
+## 10.2 V2a-2 delivery — flush-time KV separation (2026-06-13, standing write-amp agent, cycle 2)
+
+§10.1 item 3 IMPLEMENTED (flag `FRS_KV_SEPARATION`, DEFAULT OFF; threshold
+`FRS_KV_MIN_BLOB_SIZE` default 128 B, floor `VALUE_POINTER_LEN+1`):
+
+- **Write path**: `FlushJob::run_kv` diverts qualifying Put values (eligible
+  CF ∧ len ≥ threshold) into a lazily-created `<id>.vlog` segment
+  (`VlogWriter`, fsynced BEFORE the SST publishes — WiscKey ordering) and
+  emits 21-B `BlobRef(ValuePointer)` rows. Eligibility
+  (`DbImpl::kv_sep_spec_for`): Unbounded lifecycle ∧ no merge operator (P12)
+  ∧ no compaction filter. Segment ids come from the SST file-number counter.
+- **Manifest**: `VlogSegmentMeta` rides `VersionEdit::new_vlog_segments` →
+  `Version::vlog_segments` (sorted, dup-id = Busy); checkpoint blob **v5**
+  appends the segment table, emitted ONLY when a segment is live (default
+  snapshots stay byte-identical v2/v3/v4 — the same conditional-envelope
+  discipline as v3/v4).
+- **Read paths — every fail-loud V2a-1 arm is now a deref**: `sst_get`
+  L0/L1+, `batch_get_vectorized` ×3 arms, `iter_versions_of` (mvcc/snapshot
+  reads — BlobRef rewritten to a same-seq Put at collection), value-carrying
+  scans (`ValueDecision::Blob`), S2 pinned scans (`PinnedStep::Blob`), all
+  via a cached `VlogReader` per segment with a 64 KiB forward read-ahead
+  chunk (scan derefs have flush-order locality; the chunk turned the probe
+  gate from FAIL 1.51× into PASS 1.15×). Memtable tiers stay fail-loud
+  (separation is flush-time only). `referenced_file_numbers` covers vlog ids
+  (current + retiring versions), so future deletion is guarded like SSTs.
+- **Checkpoint/restore**: full checkpoint copies live segments (+ verifies +
+  `.vlog` orphan-scan arm incl. `max_observed` counter safety);
+  incremental checkpoints split segments new/shared via the base manifest
+  and ride the SAME handle lists as SSTs; link-mode registers+links them in
+  FileMappingManager (additive use); checkpoint pins cover segment ids.
+
+Gate cells (Mac, 3 × 90 s medians, methodology §2; raw
+`target/churn_results_wa/*-v2a2*.log`):
+
+| Cell | write-amp | p50 late (µs) | rows/s | verdict |
+|---|---|---|---|---|
+| default-v2a2post (flag OFF) | **7.46** | 544 | 200 K | no-regression ✓ (recorded band 7.32–7.46) |
+| kvsep-v2a2 (flag ON, 2-pread deref) | **1.55** | 822 | **200 K unthrottled** | write-amp gate ✓ (model 1.36 ±20 % ⇒ ≤1.63); probe gate ✗ (1.51×) |
+| kvsep-v2a2-chunk (+64 KiB deref chunk) | **1.55** | **635** (= 1.17×) | 200 K | **both gates ✓** (probe ≤ 1.3× = ≤707 µs; n=3: 627/635/647) |
+
+Reading: q7-shaped churn write-amp **7.46 → ~1.5×** at full rate with
+correctness (engine ITs: byte-exact point/batch/scan/snapshot reads,
+flag-OFF inertness, merge/lifecycle/sub-threshold exemptions,
+checkpoint→restore→checkpoint with live vlog, compaction passes pointers
+without value rewrite). The ~0.2 over the 1.36 model is the assembled
+workload's tombstone+key bytes still riding the key-LSM cascade — V2b GC
+(item 3b) and the sorted-run lane own that residue.
+
 ### 10.1 Remaining for "solved" (supersedes §9.3)
 
 1. V1 gate (c): remote q7 iostat A/B (≥3× write-volume cut) — needs the
    remote box; blocks default-ON and validates P3 before more V2 spend.
 2. Flink adoption: splice `wa-java/` + run ADOPTION-GATES C1-C6.
-3. V2a-2: flag-gated flush-time separation (`FRS_KV_SEPARATION`, per-CF
-   policy: Unbounded + no merge operator + no value-inspecting filter +
-   value ≥ threshold) + vlog deref on the read paths (the fail-loud arms
-   become dereferences) + vlog segments in checkpoint manifests (the v4
-   pattern extends; segments are SST-class immutable files under
-   FileMappingManager). Gate: kvsep churn cell toward the 1.36× model,
-   probe ≤ 1.3× warm baseline.
+3. ~~V2a-2: flag-gated flush-time separation~~ — **DONE 2026-06-13 cycle 2,
+   §10.2** (both gates pass; flag stays DEFAULT OFF pending Flink adoption
+   + remote A/B).
 3. V2b: BlobDB-style age-cutoff GC coupled to key-LSM compaction.
 4. V3: link-compaction (disagg agent owns file_mapping.rs — public API
    only; Stage-2/3 of its lane landed 2026-06-13, the link/adopt surface
