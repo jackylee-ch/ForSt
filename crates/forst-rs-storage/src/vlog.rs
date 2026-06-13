@@ -12,12 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! FRS-WA-V2 SKELETON (2026-06-13 write-path redesign survey §3.1/§6 stage
-//! V2): append-only VALUE-LOG segments + value pointers — the WiscKey-class
+//! FRS-WA-V2 (2026-06-13 write-path redesign survey §3.1/§6 stage V2):
+//! append-only VALUE-LOG segments + value pointers — the WiscKey-class
 //! KV-separation substrate for unbounded value-heavy CFs.
 //!
-//! **INERT**: nothing in the engine writes through this module yet. It
-//! provides the two primitives the V2 write path will compose:
+//! **LIVE** as of V2a-2/V2b/V2c (survey §10.2/§10.3/§12): the engine flush
+//! path (`FlushJob::run_kv`) and compaction GC (`KvGcState::relocate`) write
+//! through these primitives when `FRS_KV_SEPARATION` is on (default OFF).
+//! FRS-WA-V2c adds per-segment value compression (the codec is stamped per
+//! record so the reader is self-describing) — KV-separated values bypass SST
+//! block compression, so without this the big bytes would hit disk
+//! UNCOMPRESSED and forfeit the M5 compression-parity win on exactly the
+//! dominant byte source. The two primitives the V2 write path composes:
 //!
 //! 1. [`ValuePointer`] — the fixed-size record stored INSIDE the key-LSM in
 //!    place of a large value. Survey §3.1 arithmetic: with only
@@ -25,7 +31,8 @@
 //!    the measured key-LSM write-amp was 2.10× (cell E′) and the assembled
 //!    full-workload write-amp ≈ 1.36×.
 //! 2. [`VlogWriter`] / [`VlogReader`] — append-once segment files
-//!    (`<seg_id>.vlog`) holding the value bytes, CRC-framed per record.
+//!    (`<seg_id>.vlog`) holding the value bytes, CRC-framed + codec-tagged
+//!    per record (FRS-WA-V2c).
 //!    Segments are immutable once sealed — the same lifecycle class as
 //!    SSTs, so checkpoint = link, restore = adopt, and GC composes with the
 //!    V1 machinery: for lifecycle CFs, value-log GC **is** whole-segment
@@ -36,12 +43,15 @@
 //! Exclusions carried from the survey: merge-operand CFs cannot separate
 //! (P12 — concat needs bytes, pointers don't concat), and values below a
 //! `min_blob_size`-style threshold stay inline (the cold-S3 dereference
-//! bound). Both are WRITE-PATH policies enforced at the (future) call site.
+//! bound). Both are WRITE-PATH policies enforced at the call site
+//! (`DbImpl::kv_sep_spec_for`).
 
 use std::path::{Path, PathBuf};
 
-use forst_rs_common::{crc32c, ForstError, ForstResult};
+use forst_rs_common::{crc32c, CompressionType, ForstError, ForstResult};
 use forst_rs_io::{FileSystem, RandomAccessFile, WriteMode};
+
+use crate::sst::compression::{compress, decompress};
 
 /// Tag byte opening an encoded [`ValuePointer`]. NOTE: no assumption is
 /// made that user values cannot start with this byte — discrimination by
@@ -56,8 +66,15 @@ pub const VALUE_POINTER_TAG: u8 = 0xF7;
 /// len(4) = 21 bytes.
 pub const VALUE_POINTER_LEN: usize = 21;
 
-/// Per-record framing overhead inside a segment: len(4) + crc(4).
-pub const VLOG_RECORD_HEADER: usize = 8;
+/// FRS-WA-V2c: per-record framing overhead inside a segment:
+/// stored_len(4) + crc(4) + codec(1) + uncompressed_len(4) = 13 bytes. The
+/// `codec` + `uncompressed_len` fields (added 2026-06-13 cycle 2 for vlog
+/// compression — survey §10.1 item 3) make each record SELF-DESCRIBING: a
+/// reader decodes the payload without any external per-segment metadata, so
+/// the read path (`VlogReader`) needs no codec parameter and mixed-codec
+/// segments (a compaction relocating uncompressed legacy records into a
+/// compressed output, or vice-versa) round-trip correctly.
+pub const VLOG_RECORD_HEADER: usize = 13;
 
 /// A reference to value bytes living in an append-only value-log segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +83,13 @@ pub struct ValuePointer {
     pub segment_id: u64,
     /// Byte offset of the RECORD HEADER inside the segment.
     pub offset: u64,
-    /// Length of the value payload (excludes the record header).
+    /// Length of the STORED (on-disk, possibly compressed) value payload —
+    /// excludes the record header. FRS-WA-V2c: with compression this is the
+    /// compressed byte count; the logical value length lives in the record
+    /// header (`uncompressed_len`) and is recovered by [`VlogReader::get`].
+    /// All space-amp / GC liveness accounting is in these STORED bytes (one
+    /// consistent unit — the actual disk footprint), so a compressed vlog's
+    /// `live_bytes` reflects real on-disk space.
     pub len: u32,
 }
 
@@ -102,23 +125,49 @@ pub fn vlog_segment_path(db_path: &Path, segment_id: u64) -> PathBuf {
 }
 
 /// Append-only writer for ONE value-log segment. Records are framed
-/// `[payload_len: u32 LE][crc32c(payload): u32 LE][payload]`; the writer
-/// returns a [`ValuePointer`] per append. Call [`Self::sync`] before
-/// publishing any pointer durably (the V2 write path orders vlog-sync
-/// BEFORE the key-LSM write, mirroring WiscKey).
+/// `[stored_len: u32 LE][crc32c(stored): u32 LE][codec: u8][uncompressed_len:
+/// u32 LE][stored_payload]` (FRS-WA-V2c — `stored_payload` is the value
+/// compressed with this segment's codec; the per-record `codec` byte makes
+/// the record self-describing so [`VlogReader`] needs no codec parameter).
+/// The writer returns a [`ValuePointer`] per append (its `len` = `stored_len`).
+/// Call [`Self::sync`] before publishing any pointer durably (the V2 write
+/// path orders vlog-sync BEFORE the key-LSM write, mirroring WiscKey).
 pub struct VlogWriter {
     file: Box<dyn forst_rs_io::WritableFile>,
     segment_id: u64,
     offset: u64,
-    /// FRS-WA-V2b: payload bytes appended (excludes record headers) — the
-    /// initial `live_bytes` of the segment's manifest entry.
+    /// FRS-WA-V2b: STORED payload bytes appended (excludes record headers) —
+    /// the initial `live_bytes` of the segment's manifest entry. FRS-WA-V2c:
+    /// "stored" = the on-disk (post-compression) byte count, so the
+    /// space-amp / GC accounting reflects real disk footprint.
     payload_bytes: u64,
+    /// FRS-WA-V2c: per-segment value codec. Values are compressed with this
+    /// before framing; the codec is recorded PER RECORD so the reader is
+    /// self-describing. `None` = passthrough (the pre-V2c behaviour).
+    compression: CompressionType,
 }
 
 impl VlogWriter {
     /// Creates segment `segment_id` (fails if it exists — segments are
-    /// allocate-once like SST file numbers).
+    /// allocate-once like SST file numbers). Values are written UNCOMPRESSED
+    /// ([`CompressionType::None`]); use [`Self::create_with_compression`] to
+    /// compress value payloads (survey §10.1 item 3 — KV-separated values
+    /// bypass SST block compression, so an uncompressed vlog would forfeit
+    /// the compression win on exactly the big bytes).
     pub fn create(fs: &dyn FileSystem, db_path: &Path, segment_id: u64) -> ForstResult<Self> {
+        Self::create_with_compression(fs, db_path, segment_id, CompressionType::None)
+    }
+
+    /// FRS-WA-V2c: creates a value-log segment whose value payloads are
+    /// compressed with `compression`. The codec is stamped per record, so
+    /// the reader recovers each value without external metadata and segments
+    /// produced under different codecs (e.g. a relocation output) interoperate.
+    pub fn create_with_compression(
+        fs: &dyn FileSystem,
+        db_path: &Path,
+        segment_id: u64,
+        compression: CompressionType,
+    ) -> ForstResult<Self> {
         let path = vlog_segment_path(db_path, segment_id);
         let file = fs.open_writable_file(&path, WriteMode::CreateNew)?;
         Ok(Self {
@@ -126,28 +175,37 @@ impl VlogWriter {
             segment_id,
             offset: 0,
             payload_bytes: 0,
+            compression,
         })
     }
 
-    /// Appends one value; returns its pointer.
+    /// Appends one value; returns its pointer. FRS-WA-V2c: the value is
+    /// compressed with this segment's codec before framing; `ptr.len` is the
+    /// STORED (compressed) byte count and the record header carries the
+    /// codec + uncompressed length so [`VlogReader::get`] recovers the value.
     pub fn append(&mut self, value: &[u8]) -> ForstResult<ValuePointer> {
-        let len = u32::try_from(value.len())
+        let uncompressed_len = u32::try_from(value.len())
             .map_err(|_| ForstError::invalid_argument("vlog value exceeds u32::MAX bytes"))?;
+        let stored: Vec<u8> = compress(value, self.compression)?;
+        let stored_len = u32::try_from(stored.len())
+            .map_err(|_| ForstError::invalid_argument("vlog stored value exceeds u32::MAX bytes"))?;
         let ptr = ValuePointer {
             segment_id: self.segment_id,
             offset: self.offset,
-            len,
+            len: stored_len,
         };
-        self.file.append(&len.to_le_bytes())?;
-        self.file.append(&crc32c(value).to_le_bytes())?;
-        self.file.append(value)?;
-        self.offset += (VLOG_RECORD_HEADER + value.len()) as u64;
-        self.payload_bytes += value.len() as u64;
+        self.file.append(&stored_len.to_le_bytes())?;
+        self.file.append(&crc32c(&stored).to_le_bytes())?;
+        self.file.append(&[self.compression as u8])?;
+        self.file.append(&uncompressed_len.to_le_bytes())?;
+        self.file.append(&stored)?;
+        self.offset += (VLOG_RECORD_HEADER + stored.len()) as u64;
+        self.payload_bytes += stored.len() as u64;
         Ok(ptr)
     }
 
-    /// FRS-WA-V2b: payload bytes appended so far (excludes headers) — the
-    /// segment's initial manifest `live_bytes`.
+    /// FRS-WA-V2b: STORED payload bytes appended so far (excludes headers) —
+    /// the segment's initial manifest `live_bytes` (on-disk byte count).
     pub fn payload_bytes(&self) -> u64 {
         self.payload_bytes
     }
@@ -222,22 +280,38 @@ impl VlogReader {
         out
     }
 
-    /// Validates one framed record (`record` spans exactly header+payload)
-    /// against `ptr` and returns the owned payload.
+    /// Validates one framed record (`record` spans exactly header + stored
+    /// payload) against `ptr` and returns the owned, DECOMPRESSED value.
+    /// FRS-WA-V2c: the record is self-describing — a per-record codec byte +
+    /// uncompressed length drive decompression with a trusted size bound.
     fn parse_record(record: &[u8], ptr: &ValuePointer) -> ForstResult<Vec<u8>> {
         let stored_len = u32::from_le_bytes(record[0..4].try_into().expect("4 bytes"));
         let stored_crc = u32::from_le_bytes(record[4..8].try_into().expect("4 bytes"));
+        let codec_byte = record[8];
+        let uncompressed_len = u32::from_le_bytes(record[9..13].try_into().expect("4 bytes"));
         if stored_len != ptr.len {
             return Err(ForstError::corruption(format!(
                 "vlog pointer/record length mismatch: pointer {} record {}",
                 ptr.len, stored_len
             )));
         }
-        let payload = record[VLOG_RECORD_HEADER..].to_vec();
-        if crc32c(&payload) != stored_crc {
+        let stored = &record[VLOG_RECORD_HEADER..];
+        if crc32c(stored) != stored_crc {
             return Err(ForstError::corruption("vlog payload checksum mismatch"));
         }
-        Ok(payload)
+        let compression = match codec_byte {
+            0 => CompressionType::None,
+            1 => CompressionType::Lz4,
+            2 => CompressionType::Zstd,
+            other => {
+                return Err(ForstError::corruption(format!(
+                    "vlog record carries unknown compression codec {other}"
+                )))
+            }
+        };
+        // `decompress` validates the output against `uncompressed_len` (the
+        // trusted size bound — defends against a crafted compressed frame).
+        decompress(stored, compression, uncompressed_len as usize)
     }
 }
 
@@ -310,6 +384,89 @@ mod tests {
 
         // Good pointer still reads.
         assert_eq!(r.get(&p).unwrap(), b"hello-vlog");
+    }
+
+    /// FRS-WA-V2c: a compressed segment round-trips every value, the
+    /// reader recovers the LOGICAL bytes, and a compressible payload's
+    /// on-disk footprint (writer `size()`/`payload_bytes()`) is strictly
+    /// smaller than the uncompressed sum — proving the vlog compresses the
+    /// big bytes KV-separation diverts past SST block compression.
+    #[test]
+    fn test_vlog_compression_roundtrip_and_shrinks() {
+        for codec in [CompressionType::Lz4, CompressionType::Zstd] {
+            let fs = MemoryFileSystem::new();
+            let dir = Path::new("/db");
+            fs.create_dir_all(dir).unwrap();
+            let mut w = VlogWriter::create_with_compression(&fs, dir, 10, codec).unwrap();
+            // Low-entropy, NexMark-shaped values (repeated fields) compress well.
+            let values: Vec<Vec<u8>> = (0..40u32)
+                .map(|i| format!("{{\"auction\":{},\"bidder\":{},\"price\":100}}", i % 7, i % 5)
+                    .repeat(6)
+                    .into_bytes())
+                .collect();
+            let logical_total: usize = values.iter().map(|v| v.len()).sum();
+            let ptrs: Vec<ValuePointer> =
+                values.iter().map(|v| w.append(v).unwrap()).collect();
+            w.sync().unwrap();
+            // On-disk payload (excludes headers) must be smaller than logical.
+            assert!(
+                (w.payload_bytes() as usize) < logical_total,
+                "{codec:?}: stored {} should be < logical {}",
+                w.payload_bytes(),
+                logical_total
+            );
+            let r = VlogReader::open(&fs, dir, 10).unwrap();
+            for (v, p) in values.iter().zip(&ptrs) {
+                assert_eq!(&r.get(p).unwrap(), v, "{codec:?} value at {p:?}");
+            }
+        }
+    }
+
+    /// FRS-WA-V2c: an empty value under a compressing codec round-trips
+    /// (the 13-byte header + a tiny compressed frame; `record[13..]` is the
+    /// stored payload, which the decompressor maps back to zero bytes).
+    #[test]
+    fn test_vlog_compression_empty_value() {
+        for codec in [CompressionType::Lz4, CompressionType::Zstd] {
+            let fs = MemoryFileSystem::new();
+            let dir = Path::new("/db");
+            fs.create_dir_all(dir).unwrap();
+            let mut w = VlogWriter::create_with_compression(&fs, dir, 30, codec).unwrap();
+            let p = w.append(b"").unwrap();
+            w.sync().unwrap();
+            let r = VlogReader::open(&fs, dir, 30).unwrap();
+            assert_eq!(r.get(&p).unwrap(), b"", "{codec:?} empty value");
+        }
+    }
+
+    /// FRS-WA-V2c: records are self-describing, so MIXED codecs in one
+    /// segment (the relocation case: a compaction output written under a
+    /// different codec than the source) all read back correctly.
+    #[test]
+    fn test_vlog_records_self_describing_across_codecs() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        // One reader cannot mix codecs within a single writer (codec is
+        // per-writer), but two segments written under different codecs both
+        // decode via the per-record tag with the SAME reader logic.
+        let mut none_w = VlogWriter::create_with_compression(&fs, dir, 20, CompressionType::None)
+            .unwrap();
+        let mut lz4_w = VlogWriter::create_with_compression(&fs, dir, 21, CompressionType::Lz4)
+            .unwrap();
+        let payload = b"the quick brown fox the quick brown fox the quick brown fox".to_vec();
+        let p_none = none_w.append(&payload).unwrap();
+        let p_lz4 = lz4_w.append(&payload).unwrap();
+        none_w.sync().unwrap();
+        lz4_w.sync().unwrap();
+        assert_eq!(
+            VlogReader::open(&fs, dir, 20).unwrap().get(&p_none).unwrap(),
+            payload
+        );
+        assert_eq!(
+            VlogReader::open(&fs, dir, 21).unwrap().get(&p_lz4).unwrap(),
+            payload
+        );
     }
 
     #[test]

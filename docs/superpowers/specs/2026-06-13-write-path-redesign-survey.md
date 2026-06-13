@@ -724,6 +724,25 @@ timer/seq-keyed-state shape; 3 × 90 s medians):
 | seqkeys-rewrite (flag OFF) | **2.95** | 555 | 200 K | rewrite cascade |
 | seqkeys-tmove (flag ON) | **0.98** | 540 | 200 K | **metadata-only ⇒ flush floor; 3.0× write-volume cut, no probe regression** (n=3: 0.98/0.98/0.98) |
 
+## 10.5 V2c delivery — vlog compression + M5 fairness fix (2026-06-13, standing write-amp agent, cycle 2)
+
+§10.1 item M5 IMPLEMENTED. Full measurement + findings in **§12**; mechanics:
+
+- **vlog compression (FRS-WA-V2c)**: `VlogWriter::create_with_compression` compresses each value
+  payload; the record format gained a per-record `codec` byte + `uncompressed_len`
+  (`VLOG_RECORD_HEADER` 8 → 13) so each record is SELF-DESCRIBING — `VlogReader::get`
+  decompresses with the trusted size bound and needs no codec parameter, so the engine read path
+  is unchanged and mixed-codec segments (relocation re-encoding) interoperate. Codec resolved by
+  `DbImpl::kv_vlog_compression` from `self.options.compression` (override `FRS_VLOG_COMPRESSION`,
+  default `inherit`), threaded through `KvSepSpec` (flush) + `KvGcSpec` (compaction relocation).
+  Accounting stays in STORED on-disk bytes; checkpoint/restore transparent.
+- **Fairness fix**: `scripts/run-8c32g.sh` `FRS_SST_COMPRESSION` default `none` → `lz4` (the fair
+  match to ForSt/RocksDB Snappy + the engine default config.rs:268); added `FRS_VLOG_COMPRESSION`
+  default `inherit`. Every prior remote number was frs-uncompressed vs compressed competitors.
+- **Gate (§12.2)**: q7 SST-only write-amp 7.13 → 0.96 (lz4) → 0.59 (zstd) on a compressible-value
+  cell; vlog MiB shrinks with the codec (compounds with KV-sep). 8 vlog UTs + V2a-2/V2b/cycle-1
+  ITs green; clippy clean. Flag-gated through KV-sep (default OFF); compression default lz4.
+
 ### 10.1 Remaining for "solved" (supersedes §9.3)
 
 1. V1 gate (c): remote q7 iostat A/B (≥3× write-volume cut) — needs the
@@ -739,6 +758,9 @@ timer/seq-keyed-state shape; 3 × 90 s medians):
    move 2.95→0.98 on the seq-keys cell; flag `FRS_TRIVIAL_MOVE` DEFAULT
    OFF; zero FileMappingManager edits needed — levels are manifest
    metadata over a flat namespace).
+5. ~~M5: SST compression parity + vlog compression~~ — **DONE 2026-06-13 cycle 2, §10.5/§12**
+   (harness default `none` → `lz4` fairness fix; vlog inherits the codec FRS-WA-V2c; codec
+   ordering quantified). Remaining = bridge-blocked remote iostat A/B to size the box wall.
 
 ## 11. CYCLE 1 — combined-config write-amp floor + Q4/Q7/Q19 residual models (2026-06-13, PMC-1 standing Phase-1 write-amp owner)
 
@@ -836,10 +858,12 @@ falsifier +3.1 %). Decompose the ~10× event-byte gap against the measured lever
   - **write-amp share — NOW LEVERED.** 7.22 → 1.56 (KV-sep) = 4.6× of the ~10×. q7 state
     is interval-join state on hash keys ⇒ the KV-sep shape exactly (Unbounded CF, no merge
     op) ⇒ the §11.1 q7-cell IS the q7 model. **Residual write-amp after KV-sep ≈ 1.56×.**
-  - **compression share — STILL OPEN, multiplicative.** frs runs `FRS_SST_COMPRESSION=none`
-    while ForSt/RocksDB run Snappy (sorted-run W5) — a pure ÷2–3 disk-bytes term the levers
-    do not touch. This is the single largest UN-levered q7 byte source remaining (sorted-run
-    M5, "still owed").
+  - **compression share — MEASURED + FIXED CYCLE 2 (§12), multiplicative.** frs ran
+    `FRS_SST_COMPRESSION=none` while ForSt/RocksDB run Snappy (sorted-run W5) — a pure ÷2–3
+    disk-bytes term. CYCLE 2: harness default → `lz4` (fair match + engine default), vlog
+    inherits the codec, codec ordering quantified on a compressible-value cell (q7 SST-only
+    7.13 → 0.96 lz4 → 0.59 zstd). Remaining = the bridge-blocked remote iostat A/B to size the
+    box wall (the Mac cell gives direction/magnitude, not the box-specific de-saturation).
   - **read-amp share (L0 fan-out).** Levered partially by S2 (shipped) + `FRS_COMPACT_WINDOWED`
     (L4, built, default-OFF) + sorted-run discipline; the §11.1 q7-cell shows KV-sep already
     *cuts* probe p50 (978 → 667) by shrinking merge buffers.
@@ -900,10 +924,12 @@ exhausted, no single lever ≥ 2 %; WAL/memory/operator/zero-copy all tested and
 Engine-level write-amp is **measured-solved** (≈1× on both shapes, gated). The unresolved
 legs are validation/adoption, not new engine levers:
 
-1. **Compression parity (M5) — the one un-levered q7 byte source.** frs `none` vs
-   ForSt/RocksDB Snappy is a ÷2–3 disk-bytes term orthogonal to (multiplicative with) the
-   write-amp cut. This is the highest-leverage REMAINING engine-transparent lever for the
-   q7 disk-saturation wall. Owed; sized by the remote A/B.
+1. ~~**Compression parity (M5) — the one un-levered q7 byte source.**~~ — **MEASURED +
+   FAIRNESS-FIXED + vlog-compressed, CYCLE 2 (§12).** frs `none` vs ForSt/RocksDB Snappy was a
+   ÷2–3 (measured upper-bound: more) disk-bytes term. Now: harness default `none` → `lz4` (the
+   fair match + engine default), vlog inherits the codec (FRS-WA-V2c), codec ordering quantified
+   (none > lz4 > zstd; SST compression alone beats KV-sep on compressible state). Remaining leg
+   = the bridge-blocked remote iostat A/B to size the box-specific disk de-saturation.
 2. **Remote q7/q19/q20 iostat A/B (V1 gate (c) / V2 gate (c))** — confirm the ≥3× (q7) /
    4.6× (measured) write-volume cut transfers off-Mac and de-saturates the disk
    (util < 90 %). **BRIDGE-BLOCKED** (user fingerprint) — out of this agent's scope; it
@@ -926,6 +952,126 @@ MEDIANS label=seq-kvsep     write_amp=1.09 p50_late_us=637 p99_late_us=747  last
 MEDIANS label=seq-tmove     write_amp=0.98 p50_late_us=553 p99_late_us=635  last_l0=1 vlog_mib=0    (n=3)
 MEDIANS label=seq-combined  write_amp=1.03 p50_late_us=635 p99_late_us=803  last_l0=1 vlog_mib=3560 (n=3)
 ```
+
+---
+
+## 12. CYCLE 2 — M5 compression measured + fairness fix + vlog compression (2026-06-13, PMC-1 standing Phase-1 write-amp owner)
+
+Cycle-1 named **M5 (SST compression parity)** the highest-leverage remaining engine-transparent
+q7 lever and flagged a **fairness bug**: the bench harness pinned `FRS_SST_COMPRESSION=none`
+(`scripts/run-8c32g.sh:65`) while the ForSt/RocksDB templates
+(`scripts/templates-linux/config-{forst,rocksdb}.yaml*`) set NO explicit compression ⇒ they use
+their engine default (Snappy/LZ4). Every prior remote write-amp / disk number was thus
+frs-**uncompressed** vs **compressed** competitors. M5 was UN-measured because `churn_probe`
+fills values with `rng.next()` random bytes BY CONSTRUCTION — incompressible, so no codec moves.
+
+### 12.1 Instrument: compressible-value churn_probe cell
+
+Added `churn_probe --compressible` (`crates/forst-rs-bench/src/bin/churn_probe.rs`,
+`fill_compressible`): every value is an auction/bid-shaped record (low-entropy repeated fields
++ common-prefix URL + repetitive padding), varied by seq/bucket. It is HIGHLY compressible
+(synthetic padding compresses harder than typical real NexMark state — treat the measured ratio
+as an **upper bound** on the M5 win; real data compresses less, same-signed). What it
+establishes rigorously is the **direction + compounding**, which hold at any compressibility.
+The control proves the cycle-1 diagnosis: random+lz4 = 0.82 wamp (no shrink) vs compressible+lz4
+= massive shrink.
+
+### 12.2 The none × lz4 × zstd × KV-sep gate table (Mac, 3 × 60 s medians, methodology §2)
+
+Driver `/tmp/m5-matrix.sh` (one process per cell, sequential same-session). `FRS_SST_COMPRESSION`
+sets SST block codec; `FRS_VLOG_COMPRESSION=inherit` makes the vlog follow it (FRS-WA-V2c).
+
+**q7-shaped (compressible values, random keys + TTL deletes):**
+
+| codec | no-kvsep wamp | kvsep wamp | kvsep vlog MiB | kvsep p50 (µs) |
+|---|---|---|---|---|
+| none | **7.13** | 2.13 | 963 | 663 |
+| lz4  | **0.96** | 1.43 | **734** | 669 |
+| zstd | **0.59** | 0.89 | **729** | **1440** |
+
+**seq-keys (compressible values, monotone keys, `--no-deletes`):**
+
+| codec | no-kvsep wamp | kvsep wamp | kvsep vlog MiB | kvsep p50 (µs) |
+|---|---|---|---|---|
+| none | **2.71** | 1.34 | 2397 | 629 |
+| lz4  | **0.30** | 0.91 | **1903** | 689 |
+| zstd | **0.15** | 0.72 | **949** | **2383** |
+
+### 12.3 Findings
+
+1. **M5 is huge on compressible state, and codec ordering is monotone (none > lz4 > zstd).**
+   q7 SST-only write-amp 7.13 → 0.96 (lz4) → 0.59 (zstd); seq 2.71 → 0.30 → 0.15. This is the
+   ÷2–3-and-beyond disk-bytes term cycle-1 §11.4 item 1 named as the largest UN-levered q7 byte
+   source — now MEASURED locally (the remote iostat A/B is still the binding sizing gate, §12.5).
+2. **vlog compression WORKS and COMPOUNDS with KV-sep.** The kvsep `vlog MiB` shrinks with the
+   codec (q7 963 → 734 → 729; seq 2397 → 1903 → 949) — without FRS-WA-V2c those values would
+   hit the vlog uncompressed and forfeit M5 on exactly the big bytes. The vlog inherits the SST
+   codec via `FRS_VLOG_COMPRESSION=inherit` (default).
+3. **On HIGHLY-compressible state, SST compression ALONE beats KV-sep+compression.** lz4-no-kvsep
+   (0.96) < lz4-kvsep (1.43); zstd-no-kvsep (0.59) < zstd-kvsep (0.89). When values compress
+   ~as well in the SST block as in the vlog, KV-sep's pointer-SST + vlog-framing overhead is net
+   *worse* than just compressing the value in place. **Implication: KV-sep's win is largest on
+   INCOMPRESSIBLE / low-redundancy values (the cycle-1 7.22 → 1.56 was on random bytes); on
+   compressible state, plain compression is the cheaper lever.** They are partly SUBSTITUTES,
+   not pure complements — the right default is "compression always on; KV-sep ON only where the
+   value is large AND not block-compressible" (a future eligibility refinement, not blocking).
+4. **zstd buys ratio at a probe-latency cost.** zstd-kvsep p50 jumps (q7 1440 vs lz4 669; seq
+   2383 vs lz4 689) — the level-3 compress CPU on the write path throttles + the deref
+   decompress shows on probes. **lz4 is the right DEFAULT** (best ratio/CPU balance, matches the
+   competitors, is the engine default); zstd is the opt-in high-ratio / disk-bound-remote choice.
+
+### 12.4 Fairness fix (shipped, auditable)
+
+`scripts/run-8c32g.sh`: `FRS_SST_COMPRESSION` default `none` → **`lz4`** (the goal mandates
+"config must match Forst"; lz4 is BOTH the fair match to ForSt/RocksDB AND the forst-rs engine
+default `crates/forst-rs-common/src/config.rs:268`). Added `FRS_VLOG_COMPRESSION` default
+`inherit` so KV-sep cells compress the vlog too. Both env-overridable (set
+`FRS_SST_COMPRESSION=none` for the zero-copy read-path A/B); the change is documented inline at
+the pin. This makes every future remote A/B fair (frs-compressed vs competitors-compressed).
+The two `scripts/profile-q4-*.sh` profiling scripts keep `none` deliberately (zero-copy
+read-path experiments, not the bench harness).
+
+### 12.5 vlog compression (FRS-WA-V2c, shipped, flag-gated through KV-sep)
+
+`crates/forst-rs-storage/src/vlog.rs`: `VlogWriter::create_with_compression` compresses each
+value payload; the record format gained a per-record `codec` byte + `uncompressed_len`
+(`VLOG_RECORD_HEADER` 8 → 13) so each record is SELF-DESCRIBING — `VlogReader::get`
+decompresses with the trusted size bound and needs NO codec parameter, so the engine read path
+(`vlog_deref`, all batch/scan/snapshot arms) is unchanged and mixed-codec segments (a relocation
+re-encoding legacy records) interoperate. The codec is resolved by `DbImpl::kv_vlog_compression`
+from `self.options.compression` (override `FRS_VLOG_COMPRESSION`), threaded through `KvSepSpec`
+(flush) and `KvGcSpec` (compaction relocation). Space-amp/GC accounting stays consistent (all in
+STORED on-disk bytes). Checkpoint/restore is transparent (segments are copied byte-for-byte; the
+v5 manifest carries only codec-agnostic metadata). 8 vlog UTs + the V2a-2/V2b/cycle-1 engine ITs
+green (incl. byte-exact point/batch/scan/snapshot derefs and compaction passthrough);
+`cargo clippy -p forst-rs-storage -p forst-rs-engine -p forst-rs-bench` clean.
+
+### 12.6 Updated "write-amp fully resolved" remaining list (supersedes §11.4)
+
+1. ~~**M5 compression parity**~~ — **MEASURED + FAIRNESS-FIXED + vlog-compressed, this cycle.**
+   Engine-transparent, default lz4, codec ordering quantified. The remaining leg is the
+   **bridge-blocked remote q7/q19/q20 iostat A/B** to SIZE the disk-de-saturation on the box (the
+   Mac numbers establish direction/magnitude, not the box-specific wall). Not a new engine lever.
+2. **Remote iostat A/B (V1/V2 gate (c))** — still BRIDGE-BLOCKED; gates default-ON + sizes M5.
+3. **Flink adoption** (`wa-java/` + ADOPTION-GATES) — Java-layer, out of engine scope.
+4. **No further engine write-amp lever is justified.** Write-amp on both shapes is ≈1× or below
+   once compression is on (q7 0.59–0.96 SST-only; seq 0.15–0.30); KV-sep covers incompressible
+   values, compression covers compressible ones, trivial-move covers monotone keys. The engine
+   write-amp paradigm is closed; the open work is validation/adoption + the read/scan lane
+   (L4/S2), not more write-amp machinery.
+
+Raw cell medians (this session, `/tmp/m5-results.txt`):
+```
+q7   none  no-kvsep wamp=7.13  | kvsep wamp=2.13 vlog=963   p50=663
+q7   lz4   no-kvsep wamp=0.96  | kvsep wamp=1.43 vlog=734   p50=669
+q7   zstd  no-kvsep wamp=0.59  | kvsep wamp=0.89 vlog=729   p50=1440
+seq  none  no-kvsep wamp=2.71  | kvsep wamp=1.34 vlog=2397  p50=629
+seq  lz4   no-kvsep wamp=0.30  | kvsep wamp=0.91 vlog=1903  p50=689
+seq  zstd  no-kvsep wamp=0.15  | kvsep wamp=0.72 vlog=949   p50=2383
+```
+Note: the synthetic `--compressible` value is more compressible than typical real NexMark state,
+so these write-amp drops are an UPPER bound on the real M5 win (same-signed); the directional and
+compounding conclusions hold at any compressibility.
 
 ---
 

@@ -62,7 +62,19 @@ case "$cmd" in
     ENVS=(
       -e QUERY="$Q" -e CONFIG="$CFG" -e MAXSEC="$MS" -e EVENTS_NUM="${EVENTS_NUM:-}" -e TPS="${TPS:-}" \
       -e S3_ENDPOINT=x -e S3_ACCESS_KEY=x -e S3_SECRET_KEY=x -e S3_BUCKET=x -e S3_REGION=x -e S3_PREFIX=x \
-      -e FRS_BLOCK_SIZE_KB=8 -e FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-none}" \
+      # FRS-M5 FAIRNESS FIX (2026-06-13 cycle 2, PMC-1): the default was pinned
+      # to `none` (a 2026-06-02 zero-copy read-path experiment), which forced
+      # forst-rs to write SST blocks UNCOMPRESSED while the ForSt and RocksDB
+      # bench templates (scripts/templates-linux/config-{forst,rocksdb}.yaml*)
+      # set NO explicit compression → they use their engine default (Snappy/
+      # LZ4). Every prior remote write-amp / disk number was thus frs-uncompressed
+      # vs compressed competitors — an unfair ÷2-3 disk-bytes handicap on every
+      # write-heavy query. The goal mandates "config must match Forst"; the
+      # forst-rs engine default is also LZ4 (crates/forst-rs-common config.rs:268),
+      # so LZ4 is BOTH the fair match AND the engine default. Override with
+      # FRS_SST_COMPRESSION=none for the zero-copy read-path A/B. See survey §12.
+      -e FRS_BLOCK_SIZE_KB=8 -e FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}" \
+      -e FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}" \
       -e FRS_BG_COMPACT_THREADS="${FRS_BG_COMPACT_THREADS:-}" -e FRS_BG_FLUSH_THREADS="${FRS_BG_FLUSH_THREADS:-}" \
       -e FRS_L0_STOP_TRIGGER="${FRS_L0_STOP_TRIGGER:-}" -e FRS_L0_COMPACTION_TRIGGER="${FRS_L0_COMPACTION_TRIGGER:-}" \
       -e FRS_DECAY_DIAG="${FRS_DECAY_DIAG:-}" -e FRS_BULK_SAMPLE="${FRS_BULK_SAMPLE:-}" -e FRS_ITER_DIAG="${FRS_ITER_DIAG:-}" \
