@@ -17458,18 +17458,23 @@ mod tests {
         // Two key-disjoint flushes, each value ≥128 B ⇒ separated to vlog.
         let mk = |seed: u8| -> Vec<u8> { (0..300u32).map(|i| (i as u8) ^ seed).collect() };
         for i in 0..100u32 {
-            db.put(&cf, format!("a{i:04}").as_bytes(), &mk(0x11)).unwrap();
+            db.put(&cf, format!("a{i:04}").as_bytes(), &mk(0x11))
+                .unwrap();
         }
         let m1 = db.switch_and_flush(&cf).unwrap().expect("flushed");
         for i in 0..100u32 {
-            db.put(&cf, format!("b{i:04}").as_bytes(), &mk(0x22)).unwrap();
+            db.put(&cf, format!("b{i:04}").as_bytes(), &mk(0x22))
+                .unwrap();
         }
         let m2 = db.switch_and_flush(&cf).unwrap().expect("flushed");
 
         // Values were separated: a vlog segment per flush.
         let v0 = db.version_set.current();
         assert_eq!(
-            v0.vlog_segments.iter().filter(|s| s.cf_id == cf.id()).count(),
+            v0.vlog_segments
+                .iter()
+                .filter(|s| s.cf_id == cf.id())
+                .count(),
             2,
             "each big-value flush must separate to its own vlog segment"
         );
@@ -17497,8 +17502,14 @@ mod tests {
 
         // Byte-exact derefs survive the metadata-only move (point, batch,
         // scan, snapshot).
-        assert_eq!(db.get(&cf, b"a0000").unwrap().as_deref(), Some(&mk(0x11)[..]));
-        assert_eq!(db.get(&cf, b"b0099").unwrap().as_deref(), Some(&mk(0x22)[..]));
+        assert_eq!(
+            db.get(&cf, b"a0000").unwrap().as_deref(),
+            Some(&mk(0x11)[..])
+        );
+        assert_eq!(
+            db.get(&cf, b"b0099").unwrap().as_deref(),
+            Some(&mk(0x22)[..])
+        );
         let got = db.batch_get(&cf, &[b"a0050", b"b0050", b"zmiss"]).unwrap();
         assert_eq!(got[0].as_deref(), Some(&mk(0x11)[..]));
         assert_eq!(got[1].as_deref(), Some(&mk(0x22)[..]));
