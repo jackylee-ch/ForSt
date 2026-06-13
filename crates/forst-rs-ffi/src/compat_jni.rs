@@ -97,8 +97,9 @@ use crate::{
     frs_db_open_cf, frs_db_open_from_checkpoint, frs_delete, frs_flush, frs_flush_cf, frs_get,
     frs_iterator_close, frs_iterator_next, frs_iterator_next_chunk, frs_iterator_open,
     frs_iterator_seek, frs_l0_file_count, frs_lookup_kv, frs_merge, frs_prefix_lookup_close,
-    frs_prefix_lookup_open, frs_put, frs_sequence_number, FrsBytes, FrsCfHandle, FrsDb,
-    FrsIterator, FRS_STATUS_NOT_FOUND, FRS_STATUS_OK,
+    frs_prefix_lookup_open, frs_put, frs_sequence_number, frs_vec_iter_prefix_close,
+    frs_vec_iter_prefix_next_limited, frs_vec_iter_prefix_open_limited, FrsBytes, FrsCfHandle,
+    FrsDb, FrsIterator, FRS_STATUS_NOT_FOUND, FRS_STATUS_OK,
 };
 
 static DB_PATH_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
@@ -934,6 +935,33 @@ fn direct_buffer_arg(
 
 fn pack_prefix_chunk_result(count: u32, eof: bool) -> jlong {
     ((eof as jlong) << 32) | (count as jlong & 0xffff_ffff)
+}
+
+const PREFIX_OPEN_FIRST_META_BYTES: usize = 24;
+const PREFIX_OPEN_FIRST_META_HANDLE_OFFSET: usize = 0;
+const PREFIX_OPEN_FIRST_META_COUNT_OFFSET: usize = 8;
+const PREFIX_OPEN_FIRST_META_EOF_OFFSET: usize = 12;
+const PREFIX_OPEN_FIRST_META_BYTES_USED_OFFSET: usize = 16;
+const PREFIX_OPEN_FIRST_META_RESERVED_OFFSET: usize = 20;
+
+fn write_prefix_open_first_meta(
+    meta: &mut [u8],
+    handle: jlong,
+    count: u32,
+    eof: bool,
+    bytes_used: u32,
+) {
+    debug_assert!(meta.len() >= PREFIX_OPEN_FIRST_META_BYTES);
+    meta[PREFIX_OPEN_FIRST_META_HANDLE_OFFSET..PREFIX_OPEN_FIRST_META_HANDLE_OFFSET + 8]
+        .copy_from_slice(&handle.to_ne_bytes());
+    meta[PREFIX_OPEN_FIRST_META_COUNT_OFFSET..PREFIX_OPEN_FIRST_META_COUNT_OFFSET + 4]
+        .copy_from_slice(&count.to_ne_bytes());
+    meta[PREFIX_OPEN_FIRST_META_EOF_OFFSET..PREFIX_OPEN_FIRST_META_EOF_OFFSET + 4]
+        .copy_from_slice(&(eof as u32).to_ne_bytes());
+    meta[PREFIX_OPEN_FIRST_META_BYTES_USED_OFFSET..PREFIX_OPEN_FIRST_META_BYTES_USED_OFFSET + 4]
+        .copy_from_slice(&bytes_used.to_ne_bytes());
+    meta[PREFIX_OPEN_FIRST_META_RESERVED_OFFSET..PREFIX_OPEN_FIRST_META_RESERVED_OFFSET + 4]
+        .copy_from_slice(&0_u32.to_ne_bytes());
 }
 
 fn normalize_db_path_for_java(path: String) -> String {
@@ -3209,6 +3237,186 @@ fn prefix_lookup_open_inner(
     iter as jlong
 }
 
+enum CompatPrefixScanHandle {
+    Materialized(FrsIterator),
+    Vector(u64),
+}
+
+fn wrap_compat_prefix_scan_handle(handle: CompatPrefixScanHandle) -> jlong {
+    Box::into_raw(Box::new(handle)) as jlong
+}
+
+unsafe fn compat_prefix_scan_handle_mut(
+    handle: jlong,
+) -> Option<&'static mut CompatPrefixScanHandle> {
+    if handle == 0 {
+        None
+    } else {
+        Some(&mut *(handle as *mut CompatPrefixScanHandle))
+    }
+}
+
+struct PrefixChunkBuffers {
+    key_offsets: DirectBufferArg,
+    key_data: DirectBufferArg,
+    value_offsets: DirectBufferArg,
+    value_data: DirectBufferArg,
+    value_validity: DirectBufferArg,
+    rows: usize,
+}
+
+fn prefix_chunk_buffers(
+    env: &mut JNIEnv,
+    max_rows: jint,
+    key_offsets: &JByteBuffer,
+    key_data: &JByteBuffer,
+    value_offsets: &JByteBuffer,
+    value_data: &JByteBuffer,
+    value_validity: &JByteBuffer,
+    context: &str,
+) -> Option<PrefixChunkBuffers> {
+    if max_rows < 0 {
+        throw_rocksdb(env, &format!("{context}: negative maxRows"));
+        return None;
+    }
+    let rows = max_rows as usize;
+    let offsets_cap = match rows.checked_add(1).and_then(|n| n.checked_mul(4)) {
+        Some(cap) => cap,
+        None => {
+            throw_rocksdb(
+                env,
+                &format!("{context}: maxRows overflows offsets capacity"),
+            );
+            return None;
+        }
+    };
+    let key_offsets = direct_buffer_arg(env, key_offsets, context, "keyOffsets", offsets_cap, 4)?;
+    let value_offsets =
+        direct_buffer_arg(env, value_offsets, context, "valueOffsets", offsets_cap, 4)?;
+    let value_validity = direct_buffer_arg(env, value_validity, context, "valueValidity", rows, 1)?;
+    let key_data = direct_buffer_arg(env, key_data, context, "keyData", 0, 1)?;
+    let value_data = direct_buffer_arg(env, value_data, context, "valueData", 0, 1)?;
+
+    Some(PrefixChunkBuffers {
+        key_offsets,
+        key_data,
+        value_offsets,
+        value_data,
+        value_validity,
+        rows,
+    })
+}
+
+fn vec_prefix_chunk_scratch_cap(
+    env: &mut JNIEnv,
+    buffers: &PrefixChunkBuffers,
+    context: &str,
+) -> Option<usize> {
+    let cap = buffers
+        .rows
+        .checked_mul(8)?
+        .checked_add(buffers.key_data.cap)?
+        .checked_add(buffers.value_data.cap)?;
+    if cap > u32::MAX as usize {
+        throw_rocksdb(
+            env,
+            &format!("{context}: chunk buffer capacity exceeds u32::MAX"),
+        );
+        None
+    } else {
+        Some(cap)
+    }
+}
+
+fn decode_vec_prefix_chunk_to_buffers(
+    env: &mut JNIEnv,
+    chunk: &[u8],
+    row_count: u32,
+    buffers: &PrefixChunkBuffers,
+    context: &str,
+) -> Option<()> {
+    let row_count = row_count as usize;
+    if row_count > buffers.rows {
+        throw_rocksdb(env, &format!("{context}: native row count exceeds maxRows"));
+        return None;
+    }
+
+    let mut pos = 0_usize;
+    let mut key_pos = 0_usize;
+    let mut value_pos = 0_usize;
+
+    unsafe {
+        *(buffers.key_offsets.ptr as *mut i32) = 0;
+        *(buffers.value_offsets.ptr as *mut i32) = 0;
+    }
+
+    for row in 0..row_count {
+        let header_end = match pos.checked_add(8) {
+            Some(end) if end <= chunk.len() => end,
+            _ => {
+                throw_rocksdb(env, &format!("{context}: malformed vector chunk header"));
+                return None;
+            }
+        };
+        let key_len = u32::from_le_bytes(chunk[pos..pos + 4].try_into().ok()?) as usize;
+        let value_len = u32::from_le_bytes(chunk[pos + 4..header_end].try_into().ok()?) as usize;
+        pos = header_end;
+
+        let key_end = match pos.checked_add(key_len) {
+            Some(end) if end <= chunk.len() => end,
+            _ => {
+                throw_rocksdb(env, &format!("{context}: malformed vector chunk key"));
+                return None;
+            }
+        };
+        let next_key_pos = match key_pos.checked_add(key_len) {
+            Some(end) if end <= buffers.key_data.cap && end <= i32::MAX as usize => end,
+            _ => {
+                throw_rocksdb(env, &format!("{context}: keyData capacity too small"));
+                return None;
+            }
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                chunk[pos..key_end].as_ptr(),
+                buffers.key_data.ptr.add(key_pos),
+                key_len,
+            );
+            *(buffers.key_offsets.ptr as *mut i32).add(row + 1) = next_key_pos as i32;
+        }
+        key_pos = next_key_pos;
+        pos = key_end;
+
+        let value_end = match pos.checked_add(value_len) {
+            Some(end) if end <= chunk.len() => end,
+            _ => {
+                throw_rocksdb(env, &format!("{context}: malformed vector chunk value"));
+                return None;
+            }
+        };
+        let next_value_pos = match value_pos.checked_add(value_len) {
+            Some(end) if end <= buffers.value_data.cap && end <= i32::MAX as usize => end,
+            _ => {
+                throw_rocksdb(env, &format!("{context}: valueData capacity too small"));
+                return None;
+            }
+        };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                chunk[pos..value_end].as_ptr(),
+                buffers.value_data.ptr.add(value_pos),
+                value_len,
+            );
+            *(buffers.value_offsets.ptr as *mut i32).add(row + 1) = next_value_pos as i32;
+            *buffers.value_validity.ptr.add(row) = 1;
+        }
+        value_pos = next_value_pos;
+        pos = value_end;
+    }
+
+    Some(())
+}
+
 fn prefix_lookup_close_inner(env: &mut JNIEnv, iter_handle: jlong, context: &str) {
     // SAFETY: nullity handled inside frs_prefix_lookup_close.
     let status = unsafe { frs_prefix_lookup_close(iter_handle as FrsIterator) };
@@ -3226,45 +3434,19 @@ fn prefix_lookup_next_chunk_inner(
     value_validity: &JByteBuffer,
     context: &str,
 ) -> jlong {
-    if max_rows < 0 {
-        throw_rocksdb(env, &format!("{context}: negative maxRows"));
+    let Some(buffers) = prefix_chunk_buffers(
+        env,
+        max_rows,
+        key_offsets,
+        key_data,
+        value_offsets,
+        value_data,
+        value_validity,
+        context,
+    ) else {
         return -1;
-    }
+    };
     let max_rows = max_rows as u32;
-    let rows = max_rows as usize;
-    let offsets_cap = match rows.checked_add(1).and_then(|n| n.checked_mul(4)) {
-        Some(cap) => cap,
-        None => {
-            throw_rocksdb(
-                env,
-                &format!("{context}: maxRows overflows offsets capacity"),
-            );
-            return -1;
-        }
-    };
-    let key_offsets =
-        match direct_buffer_arg(env, key_offsets, context, "keyOffsets", offsets_cap, 4) {
-            Some(buf) => buf,
-            None => return -1,
-        };
-    let value_offsets =
-        match direct_buffer_arg(env, value_offsets, context, "valueOffsets", offsets_cap, 4) {
-            Some(buf) => buf,
-            None => return -1,
-        };
-    let value_validity =
-        match direct_buffer_arg(env, value_validity, context, "valueValidity", rows, 1) {
-            Some(buf) => buf,
-            None => return -1,
-        };
-    let key_data = match direct_buffer_arg(env, key_data, context, "keyData", 0, 1) {
-        Some(buf) => buf,
-        None => return -1,
-    };
-    let value_data = match direct_buffer_arg(env, value_data, context, "valueData", 0, 1) {
-        Some(buf) => buf,
-        None => return -1,
-    };
 
     let mut count = 0_u32;
     let mut eof = false;
@@ -3274,13 +3456,13 @@ fn prefix_lookup_next_chunk_inner(
         frs_iterator_next_chunk(
             iter_handle as FrsIterator,
             max_rows,
-            key_offsets.ptr as *mut i32,
-            key_data.ptr,
-            key_data.cap,
-            value_offsets.ptr as *mut i32,
-            value_data.ptr,
-            value_data.cap,
-            value_validity.ptr,
+            buffers.key_offsets.ptr as *mut i32,
+            buffers.key_data.ptr,
+            buffers.key_data.cap,
+            buffers.value_offsets.ptr as *mut i32,
+            buffers.value_data.ptr,
+            buffers.value_data.cap,
+            buffers.value_validity.ptr,
             &mut count,
             &mut eof,
         )
@@ -3289,6 +3471,271 @@ fn prefix_lookup_next_chunk_inner(
         return -1;
     }
     pack_prefix_chunk_result(count, eof)
+}
+
+fn prefix_lookup_open_compat_handle_inner(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: jlong,
+    prefix: &JByteArray,
+    prefix_off: jint,
+    prefix_len: jint,
+    context: &str,
+) -> jlong {
+    let raw = prefix_lookup_open_inner(
+        env, handle, cf_handle, prefix, prefix_off, prefix_len, context,
+    );
+    if raw == 0 {
+        0
+    } else {
+        wrap_compat_prefix_scan_handle(CompatPrefixScanHandle::Materialized(raw as FrsIterator))
+    }
+}
+
+fn prefix_lookup_open_first_chunk_inner(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: jlong,
+    prefix: &JByteArray,
+    prefix_off: jint,
+    prefix_len: jint,
+    max_rows: jint,
+    result_meta: &JByteBuffer,
+    key_offsets: &JByteBuffer,
+    key_data: &JByteBuffer,
+    value_offsets: &JByteBuffer,
+    value_data: &JByteBuffer,
+    value_validity: &JByteBuffer,
+    context: &str,
+) -> jlong {
+    let Some(frs_cf) = cf_from_java_or_default(env, handle, cf_handle, context) else {
+        return 0;
+    };
+    let meta = match direct_buffer_arg(
+        env,
+        result_meta,
+        context,
+        "resultMeta",
+        PREFIX_OPEN_FIRST_META_BYTES,
+        8,
+    ) {
+        Some(buf) => buf,
+        None => return -1,
+    };
+    let Some(buffers) = prefix_chunk_buffers(
+        env,
+        max_rows,
+        key_offsets,
+        key_data,
+        value_offsets,
+        value_data,
+        value_validity,
+        context,
+    ) else {
+        return -1;
+    };
+    let max_rows = max_rows as u32;
+    let Some(chunk_cap) = vec_prefix_chunk_scratch_cap(env, &buffers, context) else {
+        return -1;
+    };
+    let mut chunk = vec![0_u8; chunk_cap];
+
+    let prefix_obj: &JObject = prefix.as_ref();
+    let prefix_bytes = if prefix_obj.is_null() || prefix_len == 0 {
+        None
+    } else {
+        match read_byte_slice(env, prefix, prefix_off, prefix_len) {
+            Some(p) => Some(p),
+            None => return 0,
+        }
+    };
+    let (prefix_ptr, prefix_len) = match prefix_bytes.as_ref() {
+        Some(p) => match u32::try_from(p.len()) {
+            Ok(len) => (p.as_ptr(), len),
+            Err(_) => {
+                throw_rocksdb(env, &format!("{context}: prefix length exceeds u32::MAX"));
+                return -1;
+            }
+        },
+        None => (ptr::null(), 0),
+    };
+
+    let mut vec_handle = 0_u64;
+    let mut row_count = 0_u32;
+    let mut bytes_used = 0_u32;
+    let mut eof = 0_u8;
+    let status = unsafe {
+        frs_vec_iter_prefix_open_limited(
+            handle as FrsDb,
+            frs_cf,
+            prefix_ptr,
+            prefix_len,
+            max_rows,
+            chunk.as_mut_ptr(),
+            chunk.len() as u32,
+            &mut vec_handle,
+            &mut row_count,
+            &mut bytes_used,
+            &mut eof,
+        )
+    };
+    if check_status(env, status, context) {
+        return -1;
+    }
+    let bytes_used_usize = bytes_used as usize;
+    if bytes_used_usize > chunk.len() {
+        if vec_handle != 0 {
+            let _ = frs_vec_iter_prefix_close(vec_handle);
+        }
+        throw_rocksdb(
+            env,
+            &format!("{context}: native bytesUsed exceeds chunk capacity"),
+        );
+        return -1;
+    }
+    if decode_vec_prefix_chunk_to_buffers(
+        env,
+        &chunk[..bytes_used_usize],
+        row_count,
+        &buffers,
+        context,
+    )
+    .is_none()
+    {
+        if vec_handle != 0 {
+            let _ = frs_vec_iter_prefix_close(vec_handle);
+        }
+        return -1;
+    }
+
+    let eof = eof != 0;
+    let compat_handle = if eof {
+        0
+    } else {
+        wrap_compat_prefix_scan_handle(CompatPrefixScanHandle::Vector(vec_handle))
+    };
+    let meta = unsafe { std::slice::from_raw_parts_mut(meta.ptr, PREFIX_OPEN_FIRST_META_BYTES) };
+    write_prefix_open_first_meta(meta, compat_handle, row_count, eof, bytes_used);
+    compat_handle
+}
+
+fn prefix_vec_next_chunk_inner(
+    env: &mut JNIEnv,
+    vec_handle: u64,
+    max_rows: jint,
+    key_offsets: &JByteBuffer,
+    key_data: &JByteBuffer,
+    value_offsets: &JByteBuffer,
+    value_data: &JByteBuffer,
+    value_validity: &JByteBuffer,
+    context: &str,
+) -> jlong {
+    let Some(buffers) = prefix_chunk_buffers(
+        env,
+        max_rows,
+        key_offsets,
+        key_data,
+        value_offsets,
+        value_data,
+        value_validity,
+        context,
+    ) else {
+        return -1;
+    };
+    let Some(chunk_cap) = vec_prefix_chunk_scratch_cap(env, &buffers, context) else {
+        return -1;
+    };
+    let mut chunk = vec![0_u8; chunk_cap];
+    let max_rows = max_rows as u32;
+    let mut row_count = 0_u32;
+    let mut bytes_used = 0_u32;
+    let mut eof = 0_u8;
+    let status = unsafe {
+        frs_vec_iter_prefix_next_limited(
+            vec_handle,
+            max_rows,
+            chunk.as_mut_ptr(),
+            chunk.len() as u32,
+            &mut row_count,
+            &mut bytes_used,
+            &mut eof,
+        )
+    };
+    if check_status(env, status, context) {
+        return -1;
+    }
+    let bytes_used_usize = bytes_used as usize;
+    if bytes_used_usize > chunk.len() {
+        throw_rocksdb(
+            env,
+            &format!("{context}: native bytesUsed exceeds chunk capacity"),
+        );
+        return -1;
+    }
+    if decode_vec_prefix_chunk_to_buffers(
+        env,
+        &chunk[..bytes_used_usize],
+        row_count,
+        &buffers,
+        context,
+    )
+    .is_none()
+    {
+        return -1;
+    }
+    pack_prefix_chunk_result(row_count, eof != 0)
+}
+
+fn prefix_lookup_next_chunk_compat_handle_inner(
+    env: &mut JNIEnv,
+    iter_handle: jlong,
+    max_rows: jint,
+    key_offsets: &JByteBuffer,
+    key_data: &JByteBuffer,
+    value_offsets: &JByteBuffer,
+    value_data: &JByteBuffer,
+    value_validity: &JByteBuffer,
+    context: &str,
+) -> jlong {
+    let Some(handle) = (unsafe { compat_prefix_scan_handle_mut(iter_handle) }) else {
+        return pack_prefix_chunk_result(0, true);
+    };
+    match handle {
+        CompatPrefixScanHandle::Materialized(iter) => prefix_lookup_next_chunk_inner(
+            env,
+            *iter as jlong,
+            max_rows,
+            key_offsets,
+            key_data,
+            value_offsets,
+            value_data,
+            value_validity,
+            context,
+        ),
+        CompatPrefixScanHandle::Vector(vec_handle) => prefix_vec_next_chunk_inner(
+            env,
+            *vec_handle,
+            max_rows,
+            key_offsets,
+            key_data,
+            value_offsets,
+            value_data,
+            value_validity,
+            context,
+        ),
+    }
+}
+
+fn prefix_lookup_close_compat_handle_inner(env: &mut JNIEnv, iter_handle: jlong, context: &str) {
+    if iter_handle == 0 {
+        return;
+    }
+    let handle = unsafe { Box::from_raw(iter_handle as *mut CompatPrefixScanHandle) };
+    let status = match *handle {
+        CompatPrefixScanHandle::Materialized(iter) => unsafe { frs_prefix_lookup_close(iter) },
+        CompatPrefixScanHandle::Vector(vec_handle) => frs_vec_iter_prefix_close(vec_handle),
+    };
+    check_status(env, status, context);
 }
 
 /// `org.forstdb.RocksDB.prefixLookupOpen(long handle, long cfHandle,
@@ -3437,7 +3884,7 @@ pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNat
         &mut env,
         || 0_i64,
         |env| {
-            prefix_lookup_open_inner(
+            prefix_lookup_open_compat_handle_inner(
                 env,
                 handle,
                 cf_handle,
@@ -3445,6 +3892,57 @@ pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNat
                 prefix_off,
                 prefix_len,
                 "ForStRsLibPrefixScanNative.prefixLookupOpen0",
+            )
+        },
+    )
+}
+
+/// `ForStRsLibPrefixScanNative.prefixLookupOpenFirstChunk0(long dbHandle, long cfHandle,
+///                                                          byte[] prefix, int off, int len,
+///                                                          int maxRows, ByteBuffer resultMeta,
+///                                                          ByteBuffer keyOffsets,
+///                                                          ByteBuffer keyData,
+///                                                          ByteBuffer valueOffsets,
+///                                                          ByteBuffer valueData,
+///                                                          ByteBuffer valueValidity) -> long`
+#[no_mangle]
+pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupOpenFirstChunk0<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    cf_handle: jlong,
+    prefix: JByteArray<'local>,
+    prefix_off: jint,
+    prefix_len: jint,
+    max_rows: jint,
+    result_meta: JByteBuffer<'local>,
+    key_offsets: JByteBuffer<'local>,
+    key_data: JByteBuffer<'local>,
+    value_offsets: JByteBuffer<'local>,
+    value_data: JByteBuffer<'local>,
+    value_validity: JByteBuffer<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || -1_i64,
+        |env| {
+            prefix_lookup_open_first_chunk_inner(
+                env,
+                handle,
+                cf_handle,
+                &prefix,
+                prefix_off,
+                prefix_len,
+                max_rows,
+                &result_meta,
+                &key_offsets,
+                &key_data,
+                &value_offsets,
+                &value_data,
+                &value_validity,
+                "ForStRsLibPrefixScanNative.prefixLookupOpenFirstChunk0",
             )
         },
     )
@@ -3477,7 +3975,7 @@ pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNat
         &mut env,
         || -1_i64,
         |env| {
-            prefix_lookup_next_chunk_inner(
+            prefix_lookup_next_chunk_compat_handle_inner(
                 env,
                 iter_handle,
                 max_rows,
@@ -3505,7 +4003,7 @@ pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNat
         &mut env,
         || (),
         |env| {
-            prefix_lookup_close_inner(
+            prefix_lookup_close_compat_handle_inner(
                 env,
                 iter_handle,
                 "ForStRsLibPrefixScanNative.prefixLookupClose0",
@@ -10896,6 +11394,7 @@ mod tests {
             // are intentionally outside org.forstdb.RocksDB because Flink's
             // RocksDB class comes from the external forstjni jar.
             "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupOpen0",
+            "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupOpenFirstChunk0",
             "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupNextChunk0",
             "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupClose0",
             "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_isAvailable0",

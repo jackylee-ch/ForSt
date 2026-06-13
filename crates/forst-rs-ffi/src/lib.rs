@@ -5499,6 +5499,15 @@ unsafe fn fill_chunk_from_iter(
     buf: *mut u8,
     cap: usize,
 ) -> (u32, u32, bool) {
+    fill_chunk_from_iter_limited(iter, buf, cap, u32::MAX)
+}
+
+unsafe fn fill_chunk_from_iter_limited(
+    iter: &mut IterHandle,
+    buf: *mut u8,
+    cap: usize,
+    row_cap: u32,
+) -> (u32, u32, bool) {
     // Aborted iters return an empty chunk — preserve the abort semantic
     // (treated as exhausted so callers free the shell).
     if iter.is_aborted() {
@@ -5509,11 +5518,20 @@ unsafe fn fill_chunk_from_iter(
     // Arc traffic). Split borrows: `inner` and `last_error` are disjoint
     // fields.
     if let IterBackend::Pinned(p) = &mut iter.inner {
-        return fill_chunk_from_pinned(p, &iter.last_error, buf, cap);
+        return fill_chunk_from_pinned(p, &iter.last_error, buf, cap, row_cap);
     }
     let mut off = 0usize;
     let mut row_count = 0u32;
     loop {
+        if row_count >= row_cap {
+            return match iter.next_row() {
+                None => (off as u32, row_count, true),
+                Some(row) => {
+                    iter.put_back(row);
+                    (off as u32, row_count, false)
+                }
+            };
+        }
         let (k, v) = match iter.next_row() {
             // `None` ⟹ the iterator is genuinely exhausted (no rows left).
             None => return (off as u32, row_count, true),
@@ -5564,10 +5582,19 @@ struct ChunkSink<'a> {
     pending_key: &'a mut Vec<u8>,
     pending_val: &'a mut Vec<u8>,
     pending_set: &'a mut bool,
+    row_cap: u32,
 }
 
 impl forst_rs_engine::RowSink for ChunkSink<'_> {
     fn push(&mut self, key: &[u8], value: &[u8]) -> bool {
+        if self.rows >= self.row_cap {
+            self.pending_key.clear();
+            self.pending_key.extend_from_slice(key);
+            self.pending_val.clear();
+            self.pending_val.extend_from_slice(value);
+            *self.pending_set = true;
+            return false;
+        }
         let row_size = 8 + key.len() + value.len();
         if self.off + row_size > self.cap {
             // Chunk full: stash the delivered row (reused capacity — zero
@@ -5624,11 +5651,15 @@ unsafe fn fill_chunk_from_pinned(
     last_error: &Arc<Mutex<Option<forst_rs_common::ForstError>>>,
     buf: *mut u8,
     cap: usize,
+    row_cap: u32,
 ) -> (u32, u32, bool) {
     let mut off = 0usize;
     let mut rows = 0u32;
     // Deliver the chunk-overflow stash first (it was already produced).
     if p.pending_set {
+        if rows >= row_cap {
+            return (off as u32, rows, false);
+        }
         let row_size = 8 + p.pending_key.len() + p.pending_val.len();
         if row_size > cap {
             // Row larger than the whole chunk — same non-progress contract
@@ -5660,6 +5691,7 @@ unsafe fn fill_chunk_from_pinned(
         pending_key: &mut p.pending_key,
         pending_val: &mut p.pending_val,
         pending_set: &mut p.pending_set,
+        row_cap,
     };
     loop {
         match p.stream.fill_into(&mut sink) {
@@ -5910,6 +5942,134 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
     })
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_iter_prefix_open_limited(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    prefix_ptr: *const u8,
+    prefix_len: u32,
+    max_rows: u32,
+    chunk_buf_ptr: *mut u8,
+    chunk_buf_cap: u32,
+    out_handle: *mut u64,
+    out_row_count: *mut u32,
+    out_bytes_used: *mut u32,
+    out_eof: *mut u8,
+) -> i32 {
+    guarded_vec(|| {
+        if out_handle.is_null()
+            || out_row_count.is_null()
+            || out_bytes_used.is_null()
+            || out_eof.is_null()
+        {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if chunk_buf_ptr.is_null() && chunk_buf_cap > 0 {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let Some(db_ref) = db_from_handle(db) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        let Some(cf_ref_) = cf_ref(&cf) else {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        };
+        if (prefix_len as usize) > MAX_KEY_LEN {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let prefix = if prefix_ptr.is_null() || prefix_len == 0 {
+            &[][..]
+        } else {
+            slice::from_raw_parts(prefix_ptr, prefix_len as usize)
+        };
+
+        let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
+            Arc::new(Mutex::new(None));
+        let mut handle_state = if forst_rs_engine::s2_pinned_enabled() {
+            match db_ref.prefix_scan_stream_with_error_slot(
+                cf_ref_,
+                prefix,
+                Arc::clone(&error_slot),
+            ) {
+                Ok(stream) => IterHandle::new_pinned_with_error_slot(stream, error_slot),
+                Err(_) => return FrsErrorCode::EngineIo as i32,
+            }
+        } else {
+            let owned_iter = match db_ref.prefix_scan_iter_owned_arc_with_error_slot(
+                cf_ref_,
+                prefix,
+                Arc::clone(&error_slot),
+            ) {
+                Ok(it) => it,
+                Err(_) => return FrsErrorCode::EngineIo as i32,
+            };
+            let error_slot_inner = Arc::clone(&error_slot);
+            let inner: Box<dyn Iterator<Item = (IterKey, IterValue)> + Send> =
+                Box::new(owned_iter.filter_map(move |r| match r {
+                    Ok((k, v)) => Some((IterKey::Arc(k), IterValue::Arc(v))),
+                    Err(e) => {
+                        let mut guard = error_slot_inner.lock().unwrap_or_else(|p| p.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(e);
+                        }
+                        None
+                    }
+                }));
+            IterHandle::new_with_error_slot(inner, error_slot)
+        };
+
+        let (bytes_used, row_count, iter_exhausted) = fill_chunk_from_iter_limited(
+            &mut handle_state,
+            chunk_buf_ptr,
+            chunk_buf_cap as usize,
+            max_rows,
+        );
+        if row_count == 0 && !iter_exhausted {
+            handle_state.drop_inner();
+            *out_handle = 0;
+            *out_row_count = 0;
+            *out_bytes_used = 0;
+            *out_eof = 0;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if iter_exhausted {
+            handle_state.drop_inner();
+        }
+
+        let mut deferred_error_stashed = false;
+        if let Some(err) = handle_state.take_last_error() {
+            if row_count == 0 {
+                *out_row_count = 0;
+                *out_bytes_used = 0;
+                *out_handle = 0;
+                *out_eof = 1;
+                return error_to_frs_code(&err);
+            }
+            handle_state.set_deferred_error(err);
+            deferred_error_stashed = true;
+        }
+
+        if iter_exhausted && !deferred_error_stashed {
+            *out_handle = 0;
+            *out_row_count = row_count;
+            *out_bytes_used = bytes_used;
+            *out_eof = 1;
+            return FrsErrorCode::Ok as i32;
+        }
+
+        let handle_id = NEXT_ITER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        shard_for(handle_id)
+            .lock()
+            .unwrap()
+            .insert(handle_id, handle_state);
+
+        *out_handle = handle_id;
+        *out_row_count = row_count;
+        *out_bytes_used = bytes_used;
+        *out_eof = 0;
+        FrsErrorCode::Ok as i32
+    })
+}
+
 /// Fetch the next chunk from a previously opened iterator.
 ///
 /// On success (`FrsErrorCode::Ok`):
@@ -6017,6 +6177,73 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_next(
                 return error_to_frs_code(&err);
             }
             iter.set_deferred_error(err);
+        }
+        FrsErrorCode::Ok as i32
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn frs_vec_iter_prefix_next_limited(
+    handle: u64,
+    max_rows: u32,
+    chunk_buf_ptr: *mut u8,
+    chunk_buf_cap: u32,
+    out_row_count: *mut u32,
+    out_bytes_used: *mut u32,
+    out_eof: *mut u8,
+) -> i32 {
+    guarded_vec(|| {
+        if out_row_count.is_null() || out_bytes_used.is_null() || out_eof.is_null() {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if chunk_buf_ptr.is_null() && chunk_buf_cap > 0 {
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        let mut guard = shard_for(handle).lock().unwrap_or_else(|p| p.into_inner());
+        let iter = match guard.get_mut(&handle) {
+            Some(it) => it,
+            None => {
+                *out_row_count = 0;
+                *out_bytes_used = 0;
+                *out_eof = 1;
+                return FrsErrorCode::Ok as i32;
+            }
+        };
+        if iter.is_terminal() {
+            *out_row_count = 0;
+            *out_bytes_used = 0;
+            *out_eof = 1;
+            return FrsErrorCode::Ok as i32;
+        }
+        if let Some(err) = iter.take_deferred_error() {
+            *out_row_count = 0;
+            *out_bytes_used = 0;
+            *out_eof = 1;
+            iter.mark_terminal();
+            return error_to_frs_code(&err);
+        }
+        let (bytes_used, row_count, iter_exhausted) =
+            fill_chunk_from_iter_limited(iter, chunk_buf_ptr, chunk_buf_cap as usize, max_rows);
+        if row_count == 0 && !iter_exhausted {
+            *out_row_count = 0;
+            *out_bytes_used = 0;
+            *out_eof = 0;
+            return FrsErrorCode::BatchHeaderMalformed as i32;
+        }
+        if iter_exhausted {
+            iter.drop_inner();
+        }
+        *out_row_count = row_count;
+        *out_bytes_used = bytes_used;
+        *out_eof = if iter_exhausted { 1 } else { 0 };
+        if let Some(err) = iter.take_last_error() {
+            if row_count == 0 {
+                iter.mark_terminal();
+                *out_eof = 1;
+                return error_to_frs_code(&err);
+            }
+            iter.set_deferred_error(err);
+            *out_eof = 0;
         }
         FrsErrorCode::Ok as i32
     })
