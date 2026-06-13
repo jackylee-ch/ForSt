@@ -7706,6 +7706,7 @@ mod tests {
                 max_background_flushes: 0,
                 block_cache_capacity_bytes: 0,
                 write_buffer_manager_capacity_bytes: 0,
+                sst_compression: 0,
             };
             let mut db: FrsDb = ptr::null_mut();
             assert_eq!(frs_db_open_with_options(&opts, &mut db), FRS_STATUS_OK);
@@ -7730,6 +7731,7 @@ mod tests {
                 max_background_flushes: 0,
                 block_cache_capacity_bytes: 1024 * 1024 * 1024,
                 write_buffer_manager_capacity_bytes: 256 * 1024 * 1024,
+                sst_compression: 0,
             };
             let mut db: FrsDb = ptr::null_mut();
             assert_eq!(frs_db_open_with_options(&opts, &mut db), FRS_STATUS_OK);
@@ -9610,6 +9612,7 @@ mod tests {
                 max_background_flushes: 1,
                 block_cache_capacity_bytes: 32 * 1024 * 1024,
                 write_buffer_manager_capacity_bytes: 96 * 1024 * 1024,
+                sst_compression: 0,
             };
 
             let mut db: FrsDb = ptr::null_mut();
