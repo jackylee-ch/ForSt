@@ -171,6 +171,24 @@ fn prefix_bloom_enabled() -> bool {
     })
 }
 
+/// FRS-SCAN-COLD-PRIME (Phase-2 cycle 2): gate for the concurrent k-way scan
+/// cold-start prime (design `2026-06-13-concurrent-scan-cold-start-prime`).
+/// Default-OFF: when unset the merge cold-starts exactly as before
+/// (byte-identical, no prime step called). When `FRS_SCAN_COLD_PRIME=1`, a
+/// multi-source scan submits all REMOTE SST sources' cold first blocks to the
+/// read-I/O pool concurrently before the merge's first head-seed, so the K
+/// independent cache-miss GETs overlap instead of paying K × remote-RTT
+/// serially. The prime is timing-only — emitted bytes and merge order are
+/// unchanged (proved by the OFF-vs-ON byte-identity IT). Read LIVE (not
+/// `OnceLock`-cached) so the regression tests can toggle it per-case; the check
+/// runs once per scan at cold-start (one `env::var` lookup), off the hot path.
+fn cold_prime_enabled() -> bool {
+    matches!(
+        std::env::var("FRS_SCAN_COLD_PRIME").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
 /// FRS-GARBAGE-DRAIN (2026-06-10): tombstone entries flushed to L0 since the
 /// last forced deep (L1→L2) drain. The 2026-06-10 q9 discriminator showed the
 /// engine dir growing 2.4→28GB while live state plateaued — size-budget
@@ -15680,6 +15698,25 @@ pub struct LazyPrefixIter {
     /// over-includes (e.g. the prefix path's cursors keyed on `prefix`, or a
     /// WAL-DELTA-restored memtable cursor).
     clip: Option<Arc<KeyRange>>,
+    /// FRS-SCAN-COLD-PRIME (Phase-2 cycle 2): set once on the first merge step
+    /// after the cold-start prime wave is submitted, so the prime runs EXACTLY
+    /// ONCE (before any source's first head-seed) regardless of which merge
+    /// dispatch (pinned tree / pinned linear / legacy key / value-carrying)
+    /// drives the first step. Always `true`-initialised path is the flag-OFF
+    /// fast skip — the prime entry point early-returns before this is touched.
+    cold_prime_done: bool,
+    /// FRS-SCAN-COLD-PRIME diag/test hook: number of SST sources whose cold
+    /// first block was actually submitted to the read-I/O pool by the prime
+    /// wave. 0 when the flag is OFF, the scan is warm/local/single-source, or
+    /// the prime has not run yet — the "zero pool jobs when warm" gate reads
+    /// this.
+    cold_primed_sources: u32,
+    /// FRS-SCAN-COLD-PRIME test override: forces the prime gate decision per
+    /// iterator instead of the process-global `FRS_SCAN_COLD_PRIME` env var, so
+    /// the regression tests toggle OFF-vs-ON without an env race against the
+    /// parallel suite. `None` (every non-test path) ⇒ the live env gate.
+    #[cfg(test)]
+    cold_prime_force: Option<bool>,
 }
 
 /// S2-3 (W2): sources at or below this count keep the LINEAR pinned merge —
@@ -15895,7 +15932,81 @@ impl LazyPrefixIter {
             tree_dup_drains: 0,
             tree_abandoned: false,
             clip,
+            cold_prime_done: false,
+            cold_primed_sources: 0,
+            #[cfg(test)]
+            cold_prime_force: None,
         })
+    }
+
+    /// FRS-SCAN-COLD-PRIME (Phase-2 cycle 2): submit every cold REMOTE SST
+    /// source's first block to the read-I/O pool concurrently, ONCE, before the
+    /// merge's first head-seed. Each `BlockPrefetcher::prime_first_window` is
+    /// submit-only (it enqueues a 1-block window job and returns), so this loop
+    /// fans out all K cold GETs into the pool without blocking; the merge's
+    /// subsequent per-source `peek` → `next_decoded` then claims an
+    /// already-in-flight handle instead of issuing a cold synchronous read.
+    /// The K independent cache-miss round-trips overlap (bounded by the pool
+    /// width) instead of running serially.
+    ///
+    /// Idempotent + byte-identical:
+    /// - flag-OFF (`FRS_SCAN_COLD_PRIME` unset) ⇒ returns immediately, the
+    ///   prime never runs, the merge cold-starts exactly as before;
+    /// - runs at most once (guarded by `cold_prime_done`);
+    /// - K ≤ 1 ⇒ nothing to overlap, skip (no submit);
+    /// - each prefetcher applies its own §2.2 no-op guards (local / warm /
+    ///   compaction / disabled / mid-stream) inside `prime_first_window`, so a
+    ///   warm or local scan submits ZERO pool jobs;
+    /// - memtable sources are skipped (no I/O surface).
+    ///
+    /// Timing-only: priming submits exactly the 1-block window the cold demand
+    /// path would have read, at the same cache priority — emitted bytes and
+    /// merge order are unchanged.
+    fn prime_cold_sources_concurrent(&mut self) {
+        if self.cold_prime_done {
+            return;
+        }
+        self.cold_prime_done = true;
+        #[cfg(test)]
+        let on = self.cold_prime_force.unwrap_or_else(cold_prime_enabled);
+        #[cfg(not(test))]
+        let on = cold_prime_enabled();
+        if !on {
+            return;
+        }
+        // K = 1 (or 0): a single source has nothing to overlap.
+        if self.sources.len() <= 1 {
+            return;
+        }
+        let mut primed = 0u32;
+        for src in self.sources.iter_mut() {
+            if let TierKeySource::Sst { fetcher, .. } = src {
+                // Each fetcher's own guards (remote/cold/non-resident/enabled)
+                // decide whether a job is actually scheduled. Count only the
+                // ones that submitted — the "zero jobs when warm" property.
+                let was_cold = fetcher.wants_priming();
+                if was_cold {
+                    fetcher.prime_first_window();
+                    primed += 1;
+                }
+            }
+        }
+        self.cold_primed_sources = primed;
+    }
+
+    /// FRS-SCAN-COLD-PRIME test/diag hook: SST sources actually primed by the
+    /// cold-start wave (0 until the first merge step runs; 0 forever when the
+    /// flag is OFF or the scan is warm/local/single-source).
+    #[cfg(test)]
+    pub(crate) fn cold_primed_sources(&self) -> u32 {
+        self.cold_primed_sources
+    }
+
+    /// FRS-SCAN-COLD-PRIME test hook: force the prime gate ON/OFF for this
+    /// iterator, bypassing the process-global env var (no parallel-suite race).
+    #[cfg(test)]
+    pub(crate) fn set_cold_prime_force(&mut self, on: bool) {
+        self.cold_prime_force = Some(on);
     }
 
     /// W3 diag counters: `(rows_emitted, merge_comparisons, mat_allocs)`.
@@ -15921,6 +16032,10 @@ impl LazyPrefixIter {
     /// tree (`(1+dups)·log₂ n` comparisons per key); smaller fan-outs keep
     /// the linear scan (it wins there — the R-short guard).
     fn next_step_pinned(&mut self) -> Option<PinnedStep> {
+        // FRS-SCAN-COLD-PRIME: fan out the cold first-block GETs once, before
+        // the first head-seed in either pinned merge path (no-op when OFF /
+        // already primed — see `prime_cold_sources_concurrent`).
+        self.prime_cold_sources_concurrent();
         if self.sources.len() >= S2_TREE_MIN_SOURCES && !self.tree_disabled && !self.tree_abandoned
         {
             return self.next_step_pinned_tree();
@@ -16281,6 +16396,9 @@ impl LazyPrefixIter {
     }
 
     fn next_with_value_inner(&mut self) -> Option<(Arc<[u8]>, ValueDecision)> {
+        // FRS-SCAN-COLD-PRIME: fan out cold first-block GETs once, before this
+        // (value-carrying) merge's first head-seed (no-op when OFF).
+        self.prime_cold_sources_concurrent();
         // Owned outcome of one source `peek()` — computed while the source is
         // borrowed, acted on AFTER the borrow ends (so the dup-`advance()` and
         // `record_peek_error()` `&mut self` calls do not alias the source).
@@ -16674,6 +16792,9 @@ impl Iterator for LazyPrefixIter {
 
 impl LazyPrefixIter {
     fn next_inner(&mut self) -> Option<Arc<[u8]>> {
+        // FRS-SCAN-COLD-PRIME: fan out cold first-block GETs once, before this
+        // (non-pinned, key-only) merge's first head-seed (no-op when OFF).
+        self.prime_cold_sources_concurrent();
         // Drop already-emitted duplicates from all tiers + find the min
         // pending key across all sources. On error from a tier source we
         // currently swallow it (matches the previous BTreeSet behaviour
@@ -26960,5 +27081,194 @@ mod tests {
         }
 
         set_kv_separation_override(None);
+    }
+
+    // =======================================================================
+    // FRS-SCAN-COLD-PRIME (Phase-2 cycle 2) — engine regression gates
+    // (design `2026-06-13-concurrent-scan-cold-start-prime-design.md`)
+    // =======================================================================
+
+    /// Drains one prefix through `fill_into` in the requested pinned mode with
+    /// the cold-prime gate forced ON/OFF (per-iterator, no env race), returning
+    /// the rows AND the number of SST sources the prime actually submitted.
+    fn cold_prime_drain_prefix(
+        db: &Arc<DbImpl>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+        pinned: bool,
+        prime_on: bool,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, u32) {
+        let mut stream = db
+            .prefix_scan_stream_with_mode(cf, prefix, Arc::new(Mutex::new(None)), pinned)
+            .unwrap();
+        stream.inner.set_cold_prime_force(prime_on);
+        let mut sink = S2Collect(Vec::new());
+        assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+        let primed = stream.inner.cold_primed_sources();
+        (sink.0, primed)
+    }
+
+    /// (a) OFF-vs-ON byte-identity — THE gate. Across a multi-tier fixture
+    /// (overlapping L1 + L0 SSTs + memtable) on BOTH the pinned and legacy
+    /// merge paths, the emitted (key, value) sequence with the prime forced ON
+    /// is byte-identical to the prime forced OFF and to the independent
+    /// `prefix_scan` oracle. The prime is timing-only — it must NEVER change
+    /// the merge's output.
+    #[test]
+    fn cold_prime_off_vs_on_byte_identical_non_kvsep() {
+        let (db, cf) = s2_multi_tier_fixture();
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            let reference = db.prefix_scan(&cf, &prefix).unwrap();
+            for pinned in [false, true] {
+                let (off, _) = cold_prime_drain_prefix(&db, &cf, &prefix, pinned, false);
+                let (on, _) = cold_prime_drain_prefix(&db, &cf, &prefix, pinned, true);
+                assert_eq!(
+                    off, on,
+                    "bucket={b} pinned={pinned}: cold-prime ON changed the merge output"
+                );
+                assert_eq!(
+                    on, reference,
+                    "bucket={b} pinned={pinned}: cold-prime ON != prefix_scan oracle"
+                );
+            }
+        }
+    }
+
+    /// (a, KV-sep arm) OFF-vs-ON byte-identity with KV-separation ON, so the
+    /// primed path's pinned blocks deref vlog BlobRefs identically. `#[ignore]`
+    /// for the same process-global KV-sep-override race as
+    /// `s2_kvsep_pinned_byte_equality_combined` (run explicitly in the gate).
+    #[test]
+    #[ignore = "toggles process-global KV-sep override; run explicitly in the cycle-2 gate"]
+    fn cold_prime_off_vs_on_byte_identical_kvsep() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        let (db, cf) = s2_kvsep_large_value_fixture();
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            let reference = db.prefix_scan(&cf, &prefix).unwrap();
+            assert!(!reference.is_empty(), "fixture must yield rows for {b}");
+            for pinned in [false, true] {
+                let (off, _) = cold_prime_drain_prefix(&db, &cf, &prefix, pinned, false);
+                let (on, _) = cold_prime_drain_prefix(&db, &cf, &prefix, pinned, true);
+                assert_eq!(
+                    off, on,
+                    "KV-sep bucket={b} pinned={pinned}: prime changed output"
+                );
+                assert_eq!(
+                    on, reference,
+                    "KV-sep bucket={b} pinned={pinned}: prime != oracle"
+                );
+            }
+        }
+        set_kv_separation_override(None);
+    }
+
+    /// (b) Zero pool jobs on the warm/local path: a local-tempdir fixture's SST
+    /// files report `is_local()` ⇒ every prefetcher's §2.2 local guard fires,
+    /// so even with the prime forced ON the scan submits ZERO cold-prime jobs.
+    /// (Local preads are µs-class — there is no serial RTT to overlap.)
+    #[test]
+    fn cold_prime_submits_zero_jobs_on_local_regime() {
+        let (db, cf) = s2_multi_tier_fixture();
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            for pinned in [false, true] {
+                let (_, primed) = cold_prime_drain_prefix(&db, &cf, &prefix, pinned, true);
+                assert_eq!(
+                    primed, 0,
+                    "bucket={b} pinned={pinned}: local sources must prime zero jobs"
+                );
+            }
+        }
+    }
+
+    /// (c) Skip-guards early-return: flag-OFF and the K<=1 (single-source)
+    /// fixture both submit zero jobs and the gate runs exactly once. A
+    /// single-SST CF over a single flushed wave (no memtable dups, one prefix)
+    /// yields one SST source ⇒ K<=1 ⇒ no overlap to schedule.
+    #[test]
+    fn cold_prime_skip_guards_early_return() {
+        // Flag OFF over the multi-tier fixture: zero jobs regardless of K.
+        let (db, cf) = s2_multi_tier_fixture();
+        let prefix = b"p:00:";
+        let (_, primed_off) = cold_prime_drain_prefix(&db, &cf, prefix, true, false);
+        assert_eq!(primed_off, 0, "flag OFF must submit zero cold-prime jobs");
+
+        // K <= 1: a single flushed SST, single prefix, no overlapping tier.
+        let db2 = open();
+        let cf2 = db2
+            .create_column_family(ColumnFamilyDescriptor::new("cold-prime-k1"))
+            .unwrap();
+        for i in 0..40u32 {
+            db2.put(&cf2, format!("k:{i:04}").as_bytes(), b"v").unwrap();
+        }
+        db2.switch_and_flush(&cf2).unwrap().unwrap();
+        // Scan with the prime forced ON — but only one source spans the prefix.
+        let mut stream = db2
+            .prefix_scan_stream_with_mode(&cf2, b"k:", Arc::new(Mutex::new(None)), true)
+            .unwrap();
+        stream.inner.set_cold_prime_force(true);
+        let n_sources = {
+            // Touch the first step so the prime gate runs (drain fully).
+            let mut sink = S2Collect(Vec::new());
+            assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+            stream.inner.sources.len()
+        };
+        assert!(
+            n_sources <= 1,
+            "single-SST fixture must yield <=1 source (got {n_sources})"
+        );
+        assert_eq!(
+            stream.inner.cold_primed_sources(),
+            0,
+            "K<=1 must submit zero cold-prime jobs"
+        );
+    }
+
+    /// (d) Cancellation / no-leak: dropping a scan mid-drain with the prime
+    /// forced ON releases any primed-but-unconsumed window — the global M3
+    /// prefetch buffered-bytes charge returns to baseline (no leaked primed
+    /// windows from an abandoned iterator). Local fixture primes zero jobs, so
+    /// this also asserts the prime adds no charge it fails to release. Polls
+    /// for release to tolerate concurrent tests' transient charges.
+    #[test]
+    fn cold_prime_no_leaked_windows_on_mid_scan_drop() {
+        use forst_rs_storage::sst::prefetch::prefetch_buffered_bytes;
+        let (db, cf) = s2_multi_tier_fixture();
+        let before = prefetch_buffered_bytes();
+        {
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, b"p:01:", Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            stream.inner.set_cold_prime_force(true);
+            // Pull a single chunk (first step runs the prime), then drop the
+            // stream mid-scan WITHOUT exhausting it.
+            struct OneRow(bool);
+            impl RowSink for OneRow {
+                fn push(&mut self, _k: &[u8], _v: &[u8]) -> bool {
+                    let was = self.0;
+                    self.0 = true;
+                    !was // accept exactly one row, then report full
+                }
+            }
+            let mut sink = OneRow(false);
+            let _ = stream.fill_into(&mut sink).unwrap();
+            // stream dropped here mid-scan.
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = prefetch_buffered_bytes();
+            assert!(now < usize::MAX / 2, "counter wrapped (double release)");
+            if now <= before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cold-prime leaked buffered bytes: before={before} now={now}"
+            );
+            std::thread::yield_now();
+        }
     }
 }

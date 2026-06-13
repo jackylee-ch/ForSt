@@ -230,3 +230,60 @@ reproduce the ≥2× cold-start reduction at K≥4 from §1.4 on the real merge 
 **Constraints honored:** vectorized/batch/zero-copy (prime touches whole
 windows, no per-key/byte work; no `byte[]`/copy added); config unchanged
 (noflush=false, 1 G write buffer); flag default-OFF byte-identical.
+
+---
+
+## 5. CYCLE-2 IMPLEMENTATION — LANDED (2026-06-13)
+
+Implemented exactly as specced; flag `FRS_SCAN_COLD_PRIME` default-OFF,
+byte-identical when OFF.
+
+- **`BlockPrefetcher::prime_first_window()` + `wants_priming()`**
+  (`prefetch.rs`): submit-only (enqueues the 1-block `[next_block,next_block+1)`
+  window the cold demand path would read, at the same `Insert(Low)` priority),
+  regime-preserving (ramp still entered by `next_decoded` at `consumed>=2`),
+  idempotent (no double-submit — `wants_priming` returns false once in-flight).
+  No-op guards: disabled / compaction / local / mid-stream / EOF / first-block
+  cache-resident. 6 new unit tests (byte-identity OFF-vs-ON across formats,
+  idempotence, each skip-guard, warm no-op, terminate releases the charge).
+- **`prime_cold_sources_concurrent()`** (`db.rs`, on `LazyPrefixIter`): runs
+  ONCE (guarded by `cold_prime_done`) at the top of `next_step_pinned`
+  (pinned tree + linear), `next_inner` (legacy key), and
+  `next_with_value_inner` (value-carrying) — i.e. before every merge path's
+  first head-seed. Submits all REMOTE cold SST sources' first windows to the
+  read-I/O pool, then the merge's per-source `peek`→`next_decoded` claims the
+  in-flight handle (the barrier is the existing in-flight-claim await). Guards:
+  flag-OFF / K≤1 / per-source guards. `cold_primed_sources()` test hook counts
+  actual submits (the "zero jobs when warm" gate).
+- **Cancellation**: reuses `BlockPrefetcher::terminate` + oneshot-drop; no new
+  lifetime. Unit + engine drop tests confirm `prefetch_buffered_bytes()`
+  returns to baseline after a mid-scan drop (no leaked primed windows).
+
+### Results
+
+- **OFF-vs-ON byte-identity (THE gate): PASS.** Engine ITs assert the emitted
+  (key,value) sequence with the prime forced ON is byte-identical to OFF AND to
+  the `prefix_scan` oracle, on BOTH the pinned and legacy merge paths, across
+  the multi-tier fixture (overlapping L1+L0 SSTs + memtable) — non-KV-sep AND
+  KV-separation-ON (vlog BlobRef deref). Plus the prefetcher byte-identity unit
+  test across v1/v2 block formats × None/LZ4.
+- **Engine-driven bench arm** (`scan_cold_start.rs`, real `DbImpl` prefix scan
+  over K overlapping SSTs behind a `LatencyFileSystem`, remote regime, full
+  cold-drain wall, OFF vs ON):
+
+  | SSTs K | OFF (ms) | ON (ms) | speedup | (RTT) |
+  |---|---|---|---|---|
+  | 2 | 37.5 | 22.6 | 1.66× | 15 ms |
+  | 4 | 74.7 | 23.1 | 3.24× | 15 ms |
+  | 8 | 154.6 | 40.7 | 3.79× | 15 ms |
+  | 4 | 27.7 | 7.9 | 3.51× | 5 ms (smoke) |
+  | 8 | 58.6 | 14.8 | 3.95× | 5 ms (smoke) |
+
+  The real merge path reproduces the §1.4 model: ~1.7–4× cold-start reduction,
+  bounded at ~min(K, pool=6). Zero pool jobs on the local/warm path (asserted).
+- **Suites**: storage lib 461/0, engine lib 382/0 (+ 2 explicit KV-sep gates),
+  prefetcher 22/0; `cargo fmt --all --check` + `clippy --all-targets`
+  (storage+engine+bench+ffi) clean. Additive only — no FFI ABI change.
+
+The end-to-end NexMark win still requires the online-box S3 A/B (user-gated),
+per standing rules; this is the in-repo design→implementation→evidence stage.

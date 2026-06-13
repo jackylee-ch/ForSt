@@ -52,8 +52,17 @@
 //! Run: `cargo run -p forst-rs-bench --release --bin scan_cold_start`
 //!      `cargo run -p forst-rs-bench --release --bin scan_cold_start -- --smoke`
 
+use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+use forst_rs_common::config::EngineOptions;
+use forst_rs_common::ForstResult;
+use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl};
+use forst_rs_io::{
+    FileMetadata, FileSystem, MemoryFileSystem, RandomAccessFile, SequentialFile, WritableFile,
+    WriteMode,
+};
 
 /// Pool size the proposed concurrent prime would use: the existing read-I/O
 /// pool is `clamp(cores/2, 2, 6)` (`prefetch.rs:280-285`). Model the same.
@@ -175,6 +184,185 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
+// ===========================================================================
+// Engine-driven arm (design §2.5): a real `DbImpl` prefix scan over K
+// overlapping SSTs behind a `LatencyFileSystem` that (1) reports the readers
+// as REMOTE (`is_local()==false`, so the prefetcher takes the remote regime
+// and the cold-prime guard engages) and (2) injects `FRS_MODEL_RTT_MS` on the
+// FIRST `read_at` of each opened SST file (the cold cache-miss GET). We measure
+// the wall to the FIRST emitted row of a fresh cold prefix scan with
+// `FRS_SCAN_COLD_PRIME` OFF vs ON — the real merge path, not a model.
+// ===========================================================================
+
+/// A `RandomAccessFile` modeling a remote object store: EVERY positional read
+/// is an uncached `GetObject` that pays `rtt` (disaggregated state has no
+/// resident block cache for cold scan blocks), and `is_local()==false` so the
+/// engine's `BlockPrefetcher` takes the remote regime (and `wants_priming()`
+/// returns true for the cold first block). The cold-start prime overlaps the
+/// k INDEPENDENT first-block GETs across the read-I/O pool instead of issuing
+/// them serially in the merge head-seed loop.
+struct LatencyFile {
+    inner: Box<dyn RandomAccessFile>,
+    rtt: Duration,
+}
+
+impl RandomAccessFile for LatencyFile {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
+        std::thread::sleep(self.rtt);
+        self.inner.read_at(offset, buf)
+    }
+    fn file_size(&self) -> ForstResult<u64> {
+        self.inner.file_size()
+    }
+    fn is_local(&self) -> bool {
+        false
+    }
+}
+
+/// Wraps an inner `FileSystem`, injecting per-file first-read latency + the
+/// remote regime on every opened random-access (SST) file. All other operations
+/// delegate unchanged.
+struct LatencyFileSystem {
+    inner: Arc<dyn FileSystem>,
+    rtt: Duration,
+}
+
+impl FileSystem for LatencyFileSystem {
+    fn open_sequential_file(&self, path: &Path) -> ForstResult<Box<dyn SequentialFile>> {
+        self.inner.open_sequential_file(path)
+    }
+    fn open_random_access_file(&self, path: &Path) -> ForstResult<Box<dyn RandomAccessFile>> {
+        let inner = self.inner.open_random_access_file(path)?;
+        Ok(Box::new(LatencyFile {
+            inner,
+            rtt: self.rtt,
+        }))
+    }
+    fn open_writable_file(
+        &self,
+        path: &Path,
+        mode: WriteMode,
+    ) -> ForstResult<Box<dyn WritableFile>> {
+        self.inner.open_writable_file(path, mode)
+    }
+    fn file_exists(&self, path: &Path) -> ForstResult<bool> {
+        self.inner.file_exists(path)
+    }
+    fn get_file_metadata(&self, path: &Path) -> ForstResult<FileMetadata> {
+        self.inner.get_file_metadata(path)
+    }
+    fn list_dir(&self, dir: &Path) -> ForstResult<Vec<FileMetadata>> {
+        self.inner.list_dir(dir)
+    }
+    fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+        self.inner.create_dir_all(dir)
+    }
+    fn delete_file(&self, path: &Path) -> ForstResult<()> {
+        self.inner.delete_file(path)
+    }
+    fn delete_dir(&self, path: &Path, recursive: bool) -> ForstResult<()> {
+        self.inner.delete_dir(path, recursive)
+    }
+    fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+        self.inner.rename(src, dst)
+    }
+    fn name(&self) -> &str {
+        "LatencyFileSystem(scan_cold_start bench)"
+    }
+}
+
+/// Builds a CF whose probed prefix spans `k` overlapping L0 SSTs (one flushed
+/// wave per SST, every wave touching the same keyspace so none is prunable),
+/// returns the DB + the prefix. Each SST opens through the `LatencyFileSystem`,
+/// so the merge over them has `k` cold REMOTE sources.
+fn build_k_overlapping_ssts(k: usize, rtt: Duration) -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<u8>) {
+    let opts = EngineOptions {
+        db_path: "/db".to_string(),
+        // Large write buffer so each wave stays in ONE memtable ⇒ exactly one
+        // L0 SST per switch_and_flush (no mid-wave auto-flush).
+        write_buffer_size: 2_000_000_000,
+        max_write_buffer_number: 8,
+        ..EngineOptions::default()
+    };
+    let inner: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+    let fs: Arc<dyn FileSystem> = Arc::new(LatencyFileSystem { inner, rtt });
+    let db = DbImpl::open_with_fs(opts, fs).expect("open");
+    let cf = db
+        .create_column_family(ColumnFamilyDescriptor::new("cold-prime-bench"))
+        .expect("create cf");
+    // Each wave writes the SAME 200 keys under the probed prefix ⇒ all k SSTs
+    // overlap the prefix and every one is a merge source.
+    for wave in 0..k {
+        for i in 0..200u32 {
+            let key = format!("p:{i:05}");
+            let val = format!("w{wave}-{}", "x".repeat(48));
+            db.put(&cf, key.as_bytes(), val.as_bytes()).expect("put");
+        }
+        db.switch_and_flush(&cf)
+            .expect("flush ok")
+            .expect("flushed");
+    }
+    (db, cf, b"p:".to_vec())
+}
+
+/// Wall to the FIRST emitted row of a fresh cold prefix scan over the k SSTs,
+/// with the cold-prime gate set by `prime_on`. A fresh DB per call ⇒ the SST
+/// readers are re-opened cold (first `read_at` pays the modeled RTT).
+fn engine_first_row_wall(k: usize, rtt: Duration, prime_on: bool) -> Duration {
+    if prime_on {
+        std::env::set_var("FRS_SCAN_COLD_PRIME", "1");
+    } else {
+        std::env::remove_var("FRS_SCAN_COLD_PRIME");
+    }
+    let (db, cf, prefix) = build_k_overlapping_ssts(k, rtt);
+    // One row from the scan = the cold-start cost (every source's first block
+    // seeded). `prefix_scan` collects all rows; we time the WHOLE drain but the
+    // cold-start (k first-block GETs) dominates the modeled wall at these RTTs.
+    let t0 = Instant::now();
+    let rows = db.prefix_scan(&cf, &prefix).expect("scan");
+    let elapsed = t0.elapsed();
+    assert!(!rows.is_empty(), "scan must yield rows (k={k})");
+    elapsed
+}
+
+fn run_engine_arm(smoke: bool, rtt: Duration) {
+    let fanouts: &[usize] = if smoke { &[4, 8] } else { &[2, 4, 8, 16] };
+    let reps = if smoke { 1 } else { 3 };
+    println!(
+        "\n== ENGINE-DRIVEN arm (real DbImpl prefix scan over K overlapping SSTs, \
+         LatencyFileSystem first-read RTT = {:.1} ms) ==\n\
+         wall = full cold prefix-scan drain; FRS_SCAN_COLD_PRIME OFF vs ON\n",
+        ms(rtt)
+    );
+    println!(
+        "{:>10} | {:>14} | {:>14} | {:>9}",
+        "SSTs K", "OFF (ms)", "ON (ms)", "speedup"
+    );
+    println!("{}", "-".repeat(56));
+    let median = |mut xs: Vec<f64>| {
+        xs.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        xs[xs.len() / 2]
+    };
+    for &k in fanouts {
+        let mut off = Vec::new();
+        let mut on = Vec::new();
+        for _ in 0..reps {
+            off.push(ms(engine_first_row_wall(k, rtt, false)));
+            on.push(ms(engine_first_row_wall(k, rtt, true)));
+        }
+        let o = median(off);
+        let n = median(on);
+        println!(
+            "{:>10} | {:>14.1} | {:>14.1} | {:>8.2}x",
+            k,
+            o,
+            n,
+            o / n.max(f64::MIN_POSITIVE)
+        );
+    }
+    std::env::remove_var("FRS_SCAN_COLD_PRIME");
+}
+
 fn main() {
     let smoke = std::env::args().any(|a| a == "--smoke");
     let rtt = rtt();
@@ -222,6 +410,16 @@ fn main() {
         );
     }
     pool.shutdown();
+
+    // Engine-driven arm (design §2.5): the REAL merge path over k cold remote
+    // SSTs, OFF vs ON. Lower RTT here (the modeled-arm RTT can be large; the
+    // engine arm actually sleeps it k times in the OFF case, so keep the wall
+    // bounded). Honors FRS_MODEL_RTT_MS but caps the engine-arm RTT for CI.
+    let engine_rtt = {
+        let capped = rtt.min(Duration::from_millis(if smoke { 5 } else { 15 }));
+        capped.max(Duration::from_millis(2))
+    };
+    run_engine_arm(smoke, engine_rtt);
 
     println!(
         "\nReading: the speedup is the cold-start latency removed from every fresh \n\

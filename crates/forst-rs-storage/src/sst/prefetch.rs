@@ -438,6 +438,101 @@ impl BlockPrefetcher {
         self.ra_blocks
     }
 
+    /// FRS-SCAN-COLD-PRIME (Phase-2 cycle 2): does this source have a cold
+    /// first-block remote GET that priming would overlap? `true` only when a
+    /// concurrent prime would actually save a serial round-trip — every other
+    /// case (the §2.2 no-op guards) returns `false` so the caller schedules
+    /// ZERO pool work:
+    /// - speculation disabled (`FRS_RS_BLOCK_PREFETCH=0`) ⇒ no prefetch surface;
+    /// - compaction mode ⇒ already primed at construction;
+    /// - local regime (`is_local_file()`) ⇒ preads are µs-class, RTT≈0;
+    /// - already primed / mid-stream / at EOF (`inflight`, `ready`, or
+    ///   `blocks_consumed > 0`, or cursor past `end_block`) ⇒ nothing cold to
+    ///   overlap (idempotent: a second prime call is a no-op);
+    /// - the first block is already decoded-cache-resident ⇒ the cold
+    ///   `next_decoded` would serve it for free with NO GET (warm scan).
+    ///
+    /// This is a pure predicate — it schedules nothing and mutates nothing, so
+    /// the caller can cheaply check it across all sources before committing to
+    /// the concurrent prime wave.
+    pub fn wants_priming(&self) -> bool {
+        if !self.enabled
+            || self.compaction
+            || self.local
+            || self.inflight.is_some()
+            || !self.ready.is_empty()
+            || self.blocks_consumed > 0
+            || self.next_block >= self.end_block
+        {
+            return false;
+        }
+        // Warm first block ⇒ the cold demand read would be a free cache hit; a
+        // prime would issue zero I/O anyway, so skip it (the "zero jobs when
+        // warm" property).
+        match self.reader.block_region(self.next_block) {
+            Some((off, _)) => self.reader.cache_get_decoded(off).is_none(),
+            None => false,
+        }
+    }
+
+    /// FRS-SCAN-COLD-PRIME: submit the cold first block to the read-I/O pool
+    /// WITHOUT consuming it, so the GET overlaps the merge's other sources'
+    /// cold reads (and the merge's first head-seed) instead of paying a serial
+    /// round-trip. Idempotent + regime-preserving:
+    ///
+    /// 1. No-op unless [`Self::wants_priming`] (all §2.2 guards) — so a double
+    ///    call, a warm/local/compaction/disabled source, or a mid-stream source
+    ///    schedules nothing.
+    /// 2. Submits EXACTLY the 1-block window `[next_block, next_block+1)` the
+    ///    cold demand path would have read, at the SAME `Insert(Low)` priority
+    ///    (`read_decoded_block`'s policy). The block bytes, the cache insert,
+    ///    and the ramp trajectory are therefore IDENTICAL to the unprimed cold
+    ///    start — only the GET's *timing* moves earlier. `next_decoded` then
+    ///    claims this in-flight handle (step 2) instead of issuing the cold
+    ///    synchronous read (step 3); `blocks_consumed`/`ra_blocks` advance the
+    ///    same way, so the merge's emitted bytes and order are unchanged.
+    /// 3. The handle is cancellation-safe exactly like a ramped window: a
+    ///    [`Self::terminate`] / drop before consumption discards it and
+    ///    releases the M3 charge (no leaked primed window).
+    pub fn prime_first_window(&mut self) {
+        if !self.wants_priming() {
+            return;
+        }
+        let start = self.next_block;
+        let end = start + 1;
+        let Some((_, size)) = self.reader.block_region(start) else {
+            return;
+        };
+        let window_bytes = size as u64;
+        // Cold demand reads insert at Low (`read_decoded_block`); match it so
+        // the primed window is byte- AND cache-identical to the cold path.
+        let policy = CacheFillPolicy::Insert(CachePriority::Low);
+        let reader = Arc::clone(&self.reader);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WindowResult>(1);
+        read_io_pool().submit(Box::new(move || {
+            let result = fetch_window(&reader, start, end, policy);
+            let _ = tx.send(result);
+        }));
+        prefetch_charge_add(window_bytes as usize);
+        if prefetch_diag() {
+            let agg = prefetch_buffered_bytes();
+            eprintln!(
+                "[PREFETCH_DIAG] cold-prime submit block=[{start},{end}) bytes={window_bytes} aggregate_buffered={agg}"
+            );
+        }
+        self.inflight = Some(PrefetchHandle {
+            rx,
+            range: (start, end),
+            bytes: window_bytes as usize,
+        });
+        self.next_block = end;
+        // NOTE: `ra_blocks` stays 0 (cold). The ramp is entered by
+        // `next_decoded`'s demand/deliver path exactly as in the unprimed case
+        // once `blocks_consumed >= ramp_after` — priming changes ONLY which
+        // mechanism delivers block 0 (in-flight claim vs synchronous demand),
+        // not the readahead trajectory.
+    }
+
     /// The clamp computed from the sparse index vs the scan's upper bound.
     pub fn end_block(&self) -> usize {
         self.end_block
@@ -1342,6 +1437,168 @@ mod tests {
         let mut pf = BlockPrefetcher::new(Arc::clone(&reader), start, None).with_regime(true, true);
         let got = drain_rows(&mut pf);
         assert_eq!(got, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // FRS-SCAN-COLD-PRIME (Phase-2 cycle 2): concurrent cold-start prime
+    // -----------------------------------------------------------------------
+
+    /// A prefetcher exists in a cold, remote, speculation-enabled regime with a
+    /// non-cache-resident first block (the only case where priming saves a
+    /// serial round-trip).
+    fn fresh_remote(reader: &Arc<SstReaderImpl>) -> BlockPrefetcher {
+        BlockPrefetcher::new(Arc::clone(reader), 0, None).with_regime(false, true)
+    }
+
+    /// G1 byte-identity: a primed cold start delivers EXACTLY the rows of an
+    /// unprimed cold start over the same source (the prime moves only the
+    /// timing of block 0's read), for both block formats × compression.
+    #[test]
+    fn primed_drain_equals_unprimed_drain_all_formats() {
+        for kv in [false, true] {
+            for compression in [CompressionType::None, CompressionType::Lz4] {
+                let data = build_sst_with(400, compression, Some(kv));
+                let (reader, _file) = open_reader(&data, None, &data);
+                assert!(reader.index_entry_count() >= 8);
+                // Reference: unprimed remote cold start.
+                let mut unprimed = fresh_remote(&reader);
+                let expected = drain_rows(&mut unprimed);
+                // Primed remote cold start.
+                let mut primed = fresh_remote(&reader);
+                assert!(primed.wants_priming(), "fresh remote source wants priming");
+                primed.prime_first_window();
+                let got = drain_rows(&mut primed);
+                assert_eq!(got, expected, "kv={kv} compression={compression:?}");
+            }
+        }
+    }
+
+    /// Idempotence: a second `prime_first_window` after the first does NOT
+    /// double-submit (the source already has its block 0 in flight), and the
+    /// rows are still the unprimed reference.
+    #[test]
+    fn prime_is_idempotent() {
+        let data = build_sst(400);
+        let (reader, _file) = open_reader(&data, None, &data);
+        let mut unprimed = fresh_remote(&reader);
+        let expected = drain_rows(&mut unprimed);
+
+        let mut pf = fresh_remote(&reader);
+        pf.prime_first_window();
+        let range_after_first = pf.inflight.as_ref().map(|h| h.range);
+        // Second call must early-return (already in flight ⇒ wants_priming false).
+        assert!(
+            !pf.wants_priming(),
+            "already-primed source must not re-prime"
+        );
+        pf.prime_first_window();
+        assert_eq!(
+            pf.inflight.as_ref().map(|h| h.range),
+            range_after_first,
+            "second prime must not replace / double-submit the in-flight window"
+        );
+        let got = drain_rows(&mut pf);
+        assert_eq!(got, expected);
+    }
+
+    /// §2.2 guards: each no-op case reports `wants_priming() == false` and
+    /// `prime_first_window` schedules nothing (no in-flight handle appears).
+    #[test]
+    fn prime_skip_guards_are_no_ops() {
+        let data = build_sst(400);
+
+        // (a) local regime — preads are µs-class.
+        let (reader, _f) = open_reader(&data, None, &data);
+        let mut local = BlockPrefetcher::new(Arc::clone(&reader), 0, None).with_regime(true, true);
+        assert!(!local.wants_priming(), "local regime must skip");
+        local.prime_first_window();
+        assert!(local.inflight.is_none(), "local prime scheduled nothing");
+
+        // (b) speculation disabled.
+        let (reader, _f) = open_reader(&data, None, &data);
+        let mut disabled =
+            BlockPrefetcher::new(Arc::clone(&reader), 0, None).with_regime(false, false);
+        assert!(!disabled.wants_priming(), "disabled must skip");
+        disabled.prime_first_window();
+        assert!(disabled.inflight.is_none());
+
+        // (c) mid-stream (already consumed a block) — nothing cold to overlap.
+        let (reader, _f) = open_reader(&data, None, &data);
+        let mut mid = fresh_remote(&reader);
+        assert!(mid.next_decoded().unwrap().is_some());
+        assert!(!mid.wants_priming(), "consumed source must skip");
+
+        // (d) compaction mode — already primed at construction.
+        let (reader, _f) = open_reader(&data, None, &data);
+        let comp = BlockPrefetcher::for_compaction(Arc::clone(&reader), 4);
+        assert!(!comp.wants_priming(), "compaction mode must skip");
+
+        // (e) EOF — empty range after a tight upper bound.
+        let (reader, _f) = open_reader(&data, None, &data);
+        let upper = b"key_00000".to_vec(); // clamps end_block to 0 (or near it)
+        let pf_eof = BlockPrefetcher::new(
+            Arc::clone(&reader),
+            reader.index_entry_count(),
+            Some(&upper),
+        )
+        .with_regime(false, true);
+        assert!(!pf_eof.wants_priming(), "at-EOF source must skip");
+    }
+
+    /// Warm-path no-op (the "zero pool jobs when warm" property): with the
+    /// first block already decoded-cache-resident, a remote cold start would
+    /// issue no GET, so priming must schedule nothing.
+    #[test]
+    fn prime_no_op_when_first_block_cache_resident() {
+        let data = build_sst(400);
+        let cache = Arc::new(RecordingCache::new());
+        let (reader, _file) = open_reader(&data, Some(cache.clone()), &data);
+        // Pre-warm block 0 into the decoded cache.
+        let (off0, size0) = reader.block_region(0).unwrap();
+        let d = reader.read_decoded_block(off0, size0).unwrap();
+        reader.cache_insert_decoded(off0, &d, CachePriority::Low);
+
+        let mut pf = fresh_remote(&reader);
+        assert!(
+            !pf.wants_priming(),
+            "cache-resident first block must skip priming"
+        );
+        pf.prime_first_window();
+        assert!(
+            pf.inflight.is_none(),
+            "warm first block primes nothing (zero pool jobs)"
+        );
+    }
+
+    /// Cancellation: a primed-but-unconsumed window is released on terminate /
+    /// drop — the M3 buffered-bytes charge returns to baseline (no leak).
+    #[test]
+    fn primed_window_released_on_terminate() {
+        let data = build_sst(400);
+        let (reader, _file) = open_reader(&data, None, &data);
+        let before = prefetch_buffered_bytes();
+        {
+            let mut pf = fresh_remote(&reader);
+            pf.prime_first_window();
+            assert!(pf.inflight.is_some(), "prime put a window in flight");
+            pf.terminate();
+            assert!(pf.inflight.is_none(), "terminate dropped the primed window");
+            assert!(pf.next_decoded().unwrap().is_none(), "parked at EOF");
+        }
+        // The charge must drain back to baseline (poll for concurrent tests).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = prefetch_buffered_bytes();
+            assert!(now < usize::MAX / 2, "counter wrapped (double release)");
+            if now <= before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "primed-window charge leaked: before={before} now={now}"
+            );
+            std::thread::yield_now();
+        }
     }
 
     // -----------------------------------------------------------------------
