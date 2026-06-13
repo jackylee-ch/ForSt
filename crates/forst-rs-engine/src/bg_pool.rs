@@ -164,18 +164,27 @@ mod tests {
             }));
         }
 
-        // Wait until the pool is saturated (active == CAP) or timeout.
+        // Wait until the pool is saturated, observed via the HIGH-WATER mark
+        // (`max_seen`), not `active`. The workers do `fetch_add(active)` then a
+        // separate `fetch_max(max_seen)`; a thread that bumps `active` to CAP
+        // has not necessarily run its `fetch_max` yet, so polling `active`
+        // could read CAP while `max_seen` still lags at CAP-1 — the source of
+        // the intermittent CI failure "high-water != cap". `max_seen` reaching
+        // CAP is the true saturation signal (all jobs park on the gate, so once
+        // CAP run concurrently they stay until released). We still assert the
+        // ceiling is never exceeded every iteration.
         let start = Instant::now();
-        while active.load(Ordering::SeqCst) < CAP {
+        while max_seen.load(Ordering::SeqCst) < CAP {
             assert!(
                 active.load(Ordering::SeqCst) <= CAP,
                 "concurrency exceeded cap"
             );
             if start.elapsed() > Duration::from_secs(5) {
                 panic!(
-                    "pool never saturated to {} (active={})",
+                    "pool never saturated to {} (active={}, max_seen={})",
                     CAP,
-                    active.load(Ordering::SeqCst)
+                    active.load(Ordering::SeqCst),
+                    max_seen.load(Ordering::SeqCst)
                 );
             }
             std::thread::yield_now();
