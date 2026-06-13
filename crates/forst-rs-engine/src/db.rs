@@ -21486,19 +21486,33 @@ mod tests {
     #[test]
     fn test_empty_prefix_scan_stops_at_upper_bound() {
         use forst_rs_io::MemoryFileSystem;
+        // This test asserts SST BLOCK-LEVEL scan termination: its precondition is
+        // a multi-block SST. The ORIGINAL fixture built blocks from ~1 KiB INLINE
+        // values, but KV separation (the cycle-3 fair baseline) relocates values
+        // ≥ the blob threshold to the vlog, leaving only key+pointer rows → the
+        // SST collapses to a single block and `total_blocks >= 8` fails. Rather
+        // than toggle the process-global KV-sep override (which races with
+        // concurrent compaction/file-deletion tests in the parallel suite), make
+        // the SST span many blocks via LARGE KEYS: keys are NEVER separated, so
+        // the block count is robust whether or not KV-sep is on. The behavior
+        // under test (upper-bound early-termination of the block walk) is
+        // unchanged. (cycle-3 read/scan interaction finding.)
         let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
         {
             let db = open_in_shared_fs("/db", fs.clone());
             let cf = db.default_cf();
-            // Namespaces p000..p099 with a GAP at p050. ~1 KiB values so the data
-            // spans many 64 KiB SST blocks (the tail after the gap is many blocks).
-            let val = vec![0xEEu8; 1024];
+            // Namespaces p000..p099 with a GAP at p050. ~240 B keys (padded) so
+            // the data spans many 64 KiB SST blocks from the KEYS alone — the
+            // tail after the gap is many blocks regardless of value placement.
+            let val = vec![0xEEu8; 64];
             for ns in 0..100u32 {
                 if ns == 50 {
                     continue; // p050 is the empty probed prefix
                 }
                 for i in 0..20u32 {
-                    let k = format!("p{:03}_{:05}", ns, i);
+                    // Prefix `pNNN_IIIII` stays sortable; pad the tail so each
+                    // key is ~240 B (keys are never KV-separated).
+                    let k = format!("p{:03}_{:05}_{:0<220}", ns, i, "");
                     db.put(&cf, k.as_bytes(), &val).unwrap();
                 }
             }
@@ -26626,5 +26640,158 @@ mod tests {
             rows, expected,
             "rows after the error must still be delivered"
         );
+    }
+
+    // =======================================================================
+    // Cycle-3 read/scan: S2 × KV-separation interaction gate.
+    //
+    // KV separation relocates values ≥ the blob threshold to the vlog at
+    // flush, leaving BlobRef pointer rows in the key-LSM. The S2 pinned scan
+    // path (alloc-free pinned-block replenish + loser-tree merge) must
+    // dereference those pointers byte-exactly — i.e. the pinned drain WITH
+    // KV-sep ON must equal both the legacy (flag-OFF) drain AND the
+    // independent point-get oracle. This is the realistic combined config the
+    // remote macro-gate would run; the pre-existing S2 byte-equality test
+    // uses tiny inline values and default-OFF KV-sep, so it never exercised
+    // the vlog-deref read path under the pinned merge.
+    // =======================================================================
+
+    /// Multi-tier fixture whose values are LARGE (≥ blob threshold) so that,
+    /// with KV-separation ON, every flushed value lives in the vlog and the
+    /// scan must deref a BlobRef. Memtable rows stay inline (separation is a
+    /// flush-time transform), so the fixture also covers the inline-memtable
+    /// vs vlog-SST mix on a single key. Returns the db, cf, and the point-get
+    /// oracle for every probed prefix's live keys.
+    fn s2_kvsep_large_value_fixture() -> (Arc<DbImpl>, ColumnFamilyHandle) {
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("s2-kvsep-fixture"))
+            .unwrap();
+        let key = |b: u32, i: u32| format!("p:{b:02}:{i:04}").into_bytes();
+        // 2 KiB values — comfortably above the default blob threshold, so
+        // every flushed value is vlog-resident under KV-sep.
+        let big = |tag: &str, i: u32| {
+            let mut v = format!("{tag}-{i}-").into_bytes();
+            v.resize(2048, (i % 251) as u8);
+            v
+        };
+
+        // Wave 1 + wave 2 → two L0 SSTs (each flush separates values to vlog).
+        for wave in 0..2u32 {
+            for b in 0..4u32 {
+                for i in 0..30u32 {
+                    let k = key(b, i);
+                    if (i + wave) % 4 == 0 {
+                        db.delete(&cf, &k).unwrap();
+                    } else {
+                        db.put(&cf, &k, &big(&format!("w{wave}"), i)).unwrap();
+                    }
+                }
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        db.compact_l0(&cf).unwrap().expect("L0→L1 rollup");
+
+        // Wave 3 → one L0 SST overlapping L1 (dup keys → multi-version vlog).
+        for b in 0..4u32 {
+            for i in (0..30u32).step_by(2) {
+                let k = key(b, i);
+                if i % 6 == 0 {
+                    db.delete(&cf, &k).unwrap();
+                } else {
+                    db.put(&cf, &k, &big("l0", i)).unwrap();
+                }
+            }
+        }
+        db.switch_and_flush(&cf).unwrap().unwrap();
+
+        // Memtable rows on top: inline large values + fresh keys + deletes,
+        // duplicating flushed (vlog-resident) keys so the winner-selection
+        // must compare an inline memtable value against a vlog-SST value.
+        for b in 0..4u32 {
+            for i in (0..36u32).step_by(3) {
+                let k = key(b, i);
+                if i % 9 == 0 {
+                    db.delete(&cf, &k).unwrap();
+                } else {
+                    db.put(&cf, &k, &big("mem", i)).unwrap();
+                }
+            }
+        }
+        db.put(&cf, b"zz:tail", b"outside").unwrap();
+        (db, cf)
+    }
+
+    /// Cycle-3 gate: with KV-separation ON, the S2 pinned scan (flag-ON)
+    /// drains byte-identically to the legacy scan (flag-OFF) AND to the
+    /// independent point-get oracle, across the prefix and range paths.
+    /// Proves S2's pinned-block / loser-tree path derefs vlog BlobRefs
+    /// correctly (the realistic KV-sep + S2 combined config).
+    ///
+    /// `#[ignore]` (run explicitly: `cargo test -p forst-rs-engine
+    /// s2_kvsep_pinned_byte_equality_combined -- --ignored`). This test toggles
+    /// the PROCESS-GLOBAL `set_kv_separation_override`; the override is read
+    /// `Relaxed` and only `WA_V1_TEST_LOCK`-holding tests serialize on it, so in
+    /// the default PARALLEL suite a concurrent compaction/file-deletion test can
+    /// observe KV-sep ON mid-flight and flake (a pre-existing global-state race
+    /// the other `test_wa_v2a2_*` togglers share). Ignoring it keeps the default
+    /// `cargo test` deterministic while leaving the gate fully runnable; the
+    /// cycle-3 correctness gate runs it explicitly (results doc §5).
+    #[test]
+    #[ignore = "toggles process-global KV-sep override; run explicitly in the cycle-3 gate"]
+    fn s2_kvsep_pinned_byte_equality_combined() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+
+        let (db, cf) = s2_kvsep_large_value_fixture();
+
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            let legacy = s2_drain_prefix(&db, &cf, &prefix, false);
+            let pinned = s2_drain_prefix(&db, &cf, &prefix, true);
+            assert!(!legacy.is_empty(), "fixture must yield rows for {b}");
+            assert_eq!(
+                pinned, legacy,
+                "prefix {b}: KV-sep pinned drain != legacy (vlog deref mismatch)"
+            );
+            // Independent oracle: prefix_scan collector (also derefs vlog).
+            let reference = db.prefix_scan(&cf, &prefix).unwrap();
+            assert_eq!(pinned, reference, "prefix {b}: pinned != prefix_scan oracle");
+            // Per-key point-get oracle: every emitted value must equal the
+            // value the point-get path resolves for that key.
+            for (k, v) in &pinned {
+                let got = db.get(&cf, k).unwrap();
+                assert_eq!(
+                    got.as_deref(),
+                    Some(v.as_slice()),
+                    "prefix {b}: scan value for {k:?} != point-get value"
+                );
+                assert_eq!(v.len(), 2048, "vlog value must round-trip full length");
+            }
+        }
+
+        // Range path: full and bounded windows, pinned == legacy.
+        for (lo, hi) in [
+            (b"p:".as_ref(), None),
+            (b"p:01:".as_ref(), Some(b"p:02:0015".as_ref())),
+        ] {
+            let mk = |pinned: bool| -> Vec<(Vec<u8>, Vec<u8>)> {
+                let mut stream = db
+                    .range_scan_stream_with_mode(&cf, lo, hi, Arc::new(Mutex::new(None)), pinned)
+                    .unwrap();
+                let mut sink = S2Collect(Vec::new());
+                assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+                sink.0
+            };
+            let legacy = mk(false);
+            let pinned = mk(true);
+            assert!(!legacy.is_empty());
+            assert_eq!(
+                pinned, legacy,
+                "range {lo:?}..{hi:?}: KV-sep pinned != legacy"
+            );
+        }
+
+        set_kv_separation_override(None);
     }
 }
