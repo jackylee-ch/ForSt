@@ -7992,6 +7992,21 @@ impl DbImpl {
             // load-back when the FS stack has an admission-gated cache.
             fs.pre_seed_admission(Path::new(physical));
         }
+        // FRS-WA-V2a-2 × disagg (2026-06-13): KV-separated values live in
+        // `.vlog` segments the checkpoint linked at chk-namespace paths exactly
+        // like SSTs (link path build, db.rs ~7328). The instant-adopt loop must
+        // map them too, or the first deref of a separated value fails
+        // `Corruption("checkpoint references missing vlog segment")`. Mirror the
+        // SST adopt (resolve → tombstone/paranoia gate → adopt → pre-seed).
+        Self::adopt_linked_vlog_segments(
+            &snap,
+            ckpt_dir,
+            &target,
+            &view,
+            tail.as_ref(),
+            &mgr,
+            &fs,
+        )?;
         mgr.sync_journal()?;
         // Persist the STRIPPED base blob; the restored engine's mapping
         // lives in its own journal (the adopted entries), not the source
@@ -8010,6 +8025,68 @@ impl DbImpl {
         // checkpoints; no-op for FLUSH-mode checkpoints).
         Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir, &view)?;
         Ok(db)
+    }
+
+    /// FRS-WA-V2a-2 × disagg helper: adopt the live `.vlog` segments of a
+    /// link-mode checkpoint into the restore target's mapping, mirroring the
+    /// SST adopt loop (resolve the chk-namespace linked path through the
+    /// embedded mapping snapshot, honour the live journal's tombstone/paranoia
+    /// truths, then `adopt` + lazy-warm pre-seed). Shared by the plain and
+    /// clipped instant-restore paths so KV-separated state restores correctly
+    /// on both. A checkpoint with no separated values has an empty segment
+    /// table → this is a no-op (byte-identical to the pre-fix non-KV path).
+    fn adopt_linked_vlog_segments(
+        snap: &forst_rs_storage::version::VersionSetSnapshot,
+        ckpt_dir: &Path,
+        target: &Path,
+        view: &forst_rs_io::MappingSnapshotView,
+        tail: Option<&forst_rs_io::MappingJournalView>,
+        mgr: &Arc<forst_rs_io::FileMappingManager>,
+        fs: &Arc<dyn FileSystem>,
+    ) -> ForstResult<()> {
+        for seg in &snap.version.vlog_segments {
+            let canonical = forst_rs_storage::vlog::vlog_segment_path(target, seg.segment_id);
+            let basename = canonical.file_name().ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "open_from_linked_checkpoint_instant: vlog path has no file name: {}",
+                    canonical.display()
+                ))
+            })?;
+            let linked = ckpt_dir.join(basename);
+            let physical = view.resolve(&linked).ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "open_from_linked_checkpoint_instant: manifest references vlog {} but \
+                     the embedded mapping snapshot has no entry for it",
+                    linked.display()
+                ))
+            })?;
+            if let Some(tail) = tail {
+                if tail.is_tombstoned(physical) {
+                    return Err(ForstError::invalid_argument(format!(
+                        "open_from_linked_checkpoint_instant: vlog physical object {} \
+                         (for linked path {}) carries a JM-discard tombstone — \
+                         refusing to adopt state scheduled for deletion",
+                        physical,
+                        linked.display()
+                    )));
+                }
+                if let Some(current) = tail.resolve(&linked) {
+                    if current != physical {
+                        return Err(ForstError::corruption(format!(
+                            "open_from_linked_checkpoint_instant: linked vlog path {} \
+                             resolves to {} in the source journal but {} in the \
+                             blob snapshot — checkpoint namespace corrupted",
+                            linked.display(),
+                            current,
+                            physical
+                        )));
+                    }
+                }
+            }
+            mgr.adopt(&canonical, physical)?;
+            fs.pre_seed_admission(Path::new(physical));
+        }
+        Ok(())
     }
 
     /// FRS-PHASE2-C2U3 (rescale-by-clip, design §10): INSTANT-LINK restore of
@@ -8144,6 +8221,19 @@ impl DbImpl {
             mgr.adopt(&canonical, physical)?;
             fs.pre_seed_admission(Path::new(physical));
         }
+        // FRS-WA-V2a-2 × disagg: adopt the KV-separated `.vlog` segments too
+        // (the clip carries the segment table through unchanged — the read-path
+        // clip prunes out-of-range pointers, but the segments themselves must
+        // still be mapped for any in-range separated value to deref).
+        Self::adopt_linked_vlog_segments(
+            &snap,
+            ckpt_dir,
+            &target,
+            &view,
+            tail.as_ref(),
+            &mgr,
+            &fs,
+        )?;
         mgr.sync_journal()?;
         // Persist the CLIPPED base blob (disjoint SSTs removed) — the restored
         // engine's Version reflects only the adopted set.
@@ -17716,6 +17806,57 @@ mod tests {
         assert_eq!(
             restored2.get(&rcf2, b"k-big").unwrap().as_deref(),
             Some(&big[..])
+        );
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-PHASE2 disagg × KV-separation interaction (2026-06-13, found by the
+    /// NexMark-shaped disagg-S3 validation bench): a LINK checkpoint of
+    /// KV-separated state, instant-restored, must adopt the live `.vlog`
+    /// segments alongside the SSTs — otherwise the first deref of a separated
+    /// value fails `Corruption("checkpoint references missing vlog segment")`
+    /// because `open_from_linked_checkpoint_instant` only adopted SST physicals.
+    /// Regression guard for the vlog adopt loop in BOTH the plain and clipped
+    /// instant paths.
+    #[test]
+    fn test_phase2_instant_restore_adopts_kvsep_vlog_segments() {
+        use forst_rs_io::MemoryFileSystem;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        // A value past the 128-byte separation threshold → lands in a vlog.
+        let big: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+        db.put(&cf, b"k-big", &big).unwrap();
+        db.put(&cf, b"k-small", b"s").unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+        assert_eq!(
+            db.version_set.current().vlog_segments.len(),
+            1,
+            "the big value must have been KV-separated into a vlog segment"
+        );
+
+        let snap = db.snapshot();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 7, 0)
+            .unwrap();
+        assert!(r.link_mode);
+        db.release_snapshot(snap);
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000007");
+
+        // Instant restore + deref the separated value byte-exactly.
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
+        let rcf = restored.default_cf();
+        assert_eq!(
+            restored.get(&rcf, b"k-big").unwrap().as_deref(),
+            Some(&big[..]),
+            "post-instant-restore deref of the KV-separated value must be byte-exact"
+        );
+        assert_eq!(
+            restored.get(&rcf, b"k-small").unwrap().as_deref(),
+            Some(&b"s"[..])
         );
         set_kv_separation_override(None);
     }
