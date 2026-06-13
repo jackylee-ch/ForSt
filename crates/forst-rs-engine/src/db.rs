@@ -26756,7 +26756,10 @@ mod tests {
             );
             // Independent oracle: prefix_scan collector (also derefs vlog).
             let reference = db.prefix_scan(&cf, &prefix).unwrap();
-            assert_eq!(pinned, reference, "prefix {b}: pinned != prefix_scan oracle");
+            assert_eq!(
+                pinned, reference,
+                "prefix {b}: pinned != prefix_scan oracle"
+            );
             // Per-key point-get oracle: every emitted value must equal the
             // value the point-get path resolves for that key.
             for (k, v) in &pinned {
