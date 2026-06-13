@@ -38,6 +38,15 @@
 //!   (64 KiB chunks, FRS_CHUNK_EOF auto-close honored), 100 prefixes ×
 //!   1000 rows/prefix
 //! - `iter_open_batch` — `frs_vec_iter_prefix_open_batch_parallel`, K=64
+//! - `q7_iter_probe_ffi` — q7-like many-prefix, tiny-result probes
+//!   comparing serial `frs_vec_iter_prefix_open` with batched parallel open
+//! - `q19_iter_topn_ffi` — q19 TopN-like many small prefixes with K={64,256}
+//! - `q19_append_merge_chain_ffi` — `frs_vec_merge_append_batch` distinct-key
+//!   and same-key-chain shapes, verified via `frs_vectorized_batch_get`
+//! - `q19_merge_chain_read_lifecycle_ffi` — merge-chain reads while
+//!   memtable-resident, after flush, and after compaction
+//! - `q19_iter_open_alloc_split_ffi` — separates batch-open caller allocation
+//!   cost from native open/fill cost with reused caller buffers
 //!
 //! After the criterion groups, `boundary_tax_summary()` prints the derived
 //! headline number per size: tax ns/row = (FFI ns/row) − (engine ns/row),
@@ -48,19 +57,21 @@
 //! Linux runs can additionally set `FRS_MEM_DIAG=1` for jemalloc stats.
 
 use std::ffi::CString;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use criterion::{criterion_group, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 
 use forst_rs_common::EngineOptions;
 use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, DEFAULT_CF_NAME};
 use forst_rs_ffi::{
-    frs_db_create_cf_with_merge, frs_db_open, frs_vec_iter_prefix_close, frs_vec_iter_prefix_next,
-    frs_vec_iter_prefix_open, frs_vec_iter_prefix_open_batch_parallel, frs_vectorized_batch_get,
-    frs_vectorized_batch_mixed, frs_vectorized_batch_put, FrsCfHandle, FrsChunk, FrsDb,
-    FRS_CHUNK_EOF, FRS_STATUS_OK,
+    frs_compact_cf, frs_db_create_cf_with_merge, frs_db_open, frs_flush_cf,
+    frs_vec_iter_prefix_close, frs_vec_iter_prefix_next, frs_vec_iter_prefix_open,
+    frs_vec_iter_prefix_open_batch, frs_vec_iter_prefix_open_batch_parallel,
+    frs_vec_merge_append_batch, frs_vectorized_batch_get, frs_vectorized_batch_mixed,
+    frs_vectorized_batch_put, FrsCfHandle, FrsChunk, FrsDb, FRS_CHUNK_EOF, FRS_STATUS_OK,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem};
 use forst_rs_storage::merge_operator::RawConcatMergeOperator;
@@ -72,6 +83,13 @@ const ITER_PREFIXES: usize = 100;
 const ITER_ROWS_PER_PREFIX: usize = 1000;
 const OPEN_BATCH_K: usize = 64;
 const GET_POOL: usize = 10_000;
+const Q7_PREFIX_COUNTS: &[usize] = &[64, 256];
+const Q7_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16];
+const Q19_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16, 32];
+const Q19_BATCH_OPEN_K: &[usize] = &[64, 256];
+const Q19_ALLOC_SPLIT_ROWS_PER_PREFIX: &[usize] = &[1, 16, 32];
+const Q19_MERGE_KEYS: usize = 64;
+const Q19_CHAIN_LENGTHS: &[usize] = &[1, 4, 16];
 
 // ---------------------------------------------------------------------------
 // DB fixtures
@@ -223,6 +241,571 @@ fn mixed_value_cols(kinds: &[u8], vsize: usize) -> Cols {
         offs.push(data.len() as i32);
     }
     Cols { offs, data }
+}
+
+fn q_iter_prefix(ns: &str, prefix_id: usize) -> Vec<u8> {
+    format!("{ns}/p{prefix_id:05}/").into_bytes()
+}
+
+fn q_iter_key(ns: &str, prefix_id: usize, row: usize) -> Vec<u8> {
+    format!("{ns}/p{prefix_id:05}/r{row:04}").into_bytes()
+}
+
+fn q_iter_value(ns: &str, prefix_id: usize, row: usize) -> Vec<u8> {
+    format!("{ns}/v{prefix_id:05}/{row:04}").into_bytes()
+}
+
+fn populate_iter_fixture(
+    d: &FfiDb,
+    ns: &str,
+    prefix_count: usize,
+    rows_per_prefix: usize,
+) -> (Vec<Vec<u8>>, Vec<Vec<(Vec<u8>, Vec<u8>)>>) {
+    let eng = d.engine().clone();
+    let cfh = d.engine_cf();
+    let prefixes: Vec<Vec<u8>> = (0..prefix_count).map(|p| q_iter_prefix(ns, p)).collect();
+    let mut expected = Vec::with_capacity(prefix_count);
+    for p in 0..prefix_count {
+        let mut rows = Vec::with_capacity(rows_per_prefix);
+        for r in 0..rows_per_prefix {
+            let key = q_iter_key(ns, p, r);
+            let value = q_iter_value(ns, p, r);
+            eng.put(&cfh, &key, &value).expect("iter fixture put");
+            rows.push((key, value));
+        }
+        expected.push(rows);
+    }
+    (prefixes, expected)
+}
+
+fn decode_chunk_rows(buf: &[u8], bytes_used: u32, row_count: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::with_capacity(row_count as usize);
+    let mut pos = 0usize;
+    let limit = bytes_used as usize;
+    for _ in 0..row_count {
+        assert!(pos + 8 <= limit, "chunk row header truncated");
+        let klen = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let vlen = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        assert!(pos + klen + vlen <= limit, "chunk row payload truncated");
+        let key = buf[pos..pos + klen].to_vec();
+        pos += klen;
+        let value = buf[pos..pos + vlen].to_vec();
+        pos += vlen;
+        out.push((key, value));
+    }
+    assert_eq!(pos, limit, "chunk bytes_used must match decoded rows");
+    out
+}
+
+fn drain_prefix_rows_serial(d: &FfiDb, prefix: &[u8], buf: &mut [u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut handle = 0u64;
+    let mut rows = 0u32;
+    let mut bytes = 0u32;
+    let rc = unsafe {
+        frs_vec_iter_prefix_open(
+            d.db,
+            d.cf,
+            prefix.as_ptr(),
+            prefix.len() as u32,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut handle,
+            &mut rows,
+            &mut bytes,
+        )
+    };
+    assert_eq!(rc, 0, "frs_vec_iter_prefix_open failed: {rc}");
+    let mut out = decode_chunk_rows(buf, bytes, rows);
+    if handle != 0 {
+        loop {
+            let rc = unsafe {
+                frs_vec_iter_prefix_next(
+                    handle,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut rows,
+                    &mut bytes,
+                )
+            };
+            assert_eq!(rc, 0, "frs_vec_iter_prefix_next failed: {rc}");
+            if rows == 0 {
+                frs_vec_iter_prefix_close(handle);
+                break;
+            }
+            out.extend(decode_chunk_rows(buf, bytes, rows));
+        }
+    }
+    out
+}
+
+fn drain_prefixes_batch_parallel(
+    d: &FfiDb,
+    prefixes: &[Vec<u8>],
+    chunk_cap: u32,
+) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+    let prefix_cols = cols_from(prefixes.iter().map(|p| p.as_slice()));
+    let offs_u32: Vec<u32> = prefix_cols.offs.iter().map(|&o| o as u32).collect();
+    let mut bufs: Vec<Vec<u8>> = (0..prefixes.len())
+        .map(|_| vec![0u8; chunk_cap as usize])
+        .collect();
+    let mut handles = vec![0u64; prefixes.len()];
+    let mut chunks: Vec<FrsChunk> = bufs
+        .iter_mut()
+        .map(|bb| FrsChunk {
+            buf_ptr: bb.as_mut_ptr(),
+            buf_cap: chunk_cap,
+            row_count: 0,
+            bytes_used: 0,
+            _reserved: 0,
+        })
+        .collect();
+    let rc = unsafe {
+        frs_vec_iter_prefix_open_batch_parallel(
+            d.db,
+            d.cf,
+            offs_u32.as_ptr(),
+            prefix_cols.data.as_ptr(),
+            prefixes.len() as u32,
+            handles.as_mut_ptr(),
+            chunks.as_mut_ptr(),
+            chunk_cap,
+        )
+    };
+    assert_eq!(rc, 0, "open_batch_parallel failed: {rc}");
+
+    let mut all = Vec::with_capacity(prefixes.len());
+    for i in 0..prefixes.len() {
+        assert_ne!(handles[i], 0, "batch probe {i} handle must be non-zero");
+        let mut rows = decode_chunk_rows(&bufs[i], chunks[i].bytes_used, chunks[i].row_count);
+        let eof = chunks[i]._reserved & FRS_CHUNK_EOF != 0;
+        if !eof {
+            loop {
+                let mut n_rows = 0u32;
+                let mut n_bytes = 0u32;
+                let rc = unsafe {
+                    frs_vec_iter_prefix_next(
+                        handles[i],
+                        bufs[i].as_mut_ptr(),
+                        chunk_cap,
+                        &mut n_rows,
+                        &mut n_bytes,
+                    )
+                };
+                assert_eq!(rc, 0, "batch probe {i} next failed: {rc}");
+                if n_rows == 0 {
+                    frs_vec_iter_prefix_close(handles[i]);
+                    break;
+                }
+                rows.extend(decode_chunk_rows(&bufs[i], n_bytes, n_rows));
+            }
+        }
+        all.push(rows);
+    }
+    all
+}
+
+fn assert_iter_fixture_correct(
+    d: &FfiDb,
+    prefixes: &[Vec<u8>],
+    expected: &[Vec<(Vec<u8>, Vec<u8>)>],
+) {
+    let mut buf = vec![0u8; CHUNK_CAP as usize];
+    for (i, prefix) in prefixes.iter().enumerate() {
+        let rows = drain_prefix_rows_serial(d, prefix, &mut buf);
+        assert_eq!(rows, expected[i], "serial rows mismatch for prefix {i}");
+    }
+    let batch_rows = drain_prefixes_batch_parallel(d, prefixes, CHUNK_CAP);
+    assert_eq!(batch_rows.len(), expected.len());
+    for (i, rows) in batch_rows.into_iter().enumerate() {
+        assert_eq!(rows, expected[i], "parallel rows mismatch for prefix {i}");
+    }
+}
+
+fn drain_prefixes_serial_count(d: &FfiDb, prefixes: &[Vec<u8>], buf: &mut [u8]) -> u64 {
+    prefixes
+        .iter()
+        .map(|prefix| drain_prefix(d, prefix, buf).0)
+        .sum()
+}
+
+fn drain_prefixes_parallel_count(d: &FfiDb, prefixes: &[Vec<u8>]) -> u64 {
+    drain_prefixes_batch_parallel(d, prefixes, CHUNK_CAP)
+        .iter()
+        .map(|rows| rows.len() as u64)
+        .sum()
+}
+
+fn build_batch_chunks(n: usize, chunk_cap: u32) -> (Vec<Vec<u8>>, Vec<FrsChunk>) {
+    let mut bufs: Vec<Vec<u8>> = (0..n).map(|_| vec![0u8; chunk_cap as usize]).collect();
+    let chunks = bufs
+        .iter_mut()
+        .map(|bb| FrsChunk {
+            buf_ptr: bb.as_mut_ptr(),
+            buf_cap: chunk_cap,
+            row_count: 0,
+            bytes_used: 0,
+            _reserved: 0,
+        })
+        .collect();
+    (bufs, chunks)
+}
+
+type PrefixBatchOpenFn = unsafe extern "C" fn(
+    FrsDb,
+    FrsCfHandle,
+    *const u32,
+    *const u8,
+    u32,
+    *mut u64,
+    *mut FrsChunk,
+    u32,
+) -> i32;
+
+fn open_batch_count_close_with(
+    d: &FfiDb,
+    prefix_cols: &Cols,
+    offs_u32: &[u32],
+    handles: &mut [u64],
+    chunks: &mut [FrsChunk],
+    chunk_cap: u32,
+    open_batch: PrefixBatchOpenFn,
+    label: &str,
+) -> u64 {
+    handles.fill(0);
+    for chunk in chunks.iter_mut() {
+        chunk.row_count = 0;
+        chunk.bytes_used = 0;
+        chunk._reserved = 0;
+    }
+    let rc = unsafe {
+        open_batch(
+            d.db,
+            d.cf,
+            offs_u32.as_ptr(),
+            prefix_cols.data.as_ptr(),
+            handles.len() as u32,
+            handles.as_mut_ptr(),
+            chunks.as_mut_ptr(),
+            chunk_cap,
+        )
+    };
+    assert_eq!(rc, 0, "{label} failed: {rc}");
+
+    let mut rows = 0u64;
+    for (i, &handle) in handles.iter().enumerate() {
+        assert_ne!(handle, 0, "batch probe {i} handle must be non-zero");
+        rows += chunks[i].row_count as u64;
+        if chunks[i]._reserved & FRS_CHUNK_EOF == 0 {
+            frs_vec_iter_prefix_close(handle);
+        }
+    }
+    rows
+}
+
+fn open_batch_count_close(
+    d: &FfiDb,
+    prefix_cols: &Cols,
+    offs_u32: &[u32],
+    handles: &mut [u64],
+    chunks: &mut [FrsChunk],
+    chunk_cap: u32,
+) -> u64 {
+    open_batch_count_close_with(
+        d,
+        prefix_cols,
+        offs_u32,
+        handles,
+        chunks,
+        chunk_cap,
+        frs_vec_iter_prefix_open_batch_parallel,
+        "open_batch_parallel",
+    )
+}
+
+struct BatchOpenOnlyFixture {
+    prefix_cols: Cols,
+    offs_u32: Vec<u32>,
+    _bufs: Vec<Vec<u8>>,
+    handles: Vec<u64>,
+    chunks: Vec<FrsChunk>,
+    chunk_cap: u32,
+}
+
+impl BatchOpenOnlyFixture {
+    fn new(prefixes: &[Vec<u8>], chunk_cap: u32) -> Self {
+        let prefix_cols = cols_from(prefixes.iter().map(|p| p.as_slice()));
+        let offs_u32: Vec<u32> = prefix_cols.offs.iter().map(|&o| o as u32).collect();
+        let (bufs, chunks) = build_batch_chunks(prefixes.len(), chunk_cap);
+        Self {
+            prefix_cols,
+            offs_u32,
+            _bufs: bufs,
+            handles: vec![0u64; prefixes.len()],
+            chunks,
+            chunk_cap,
+        }
+    }
+
+    fn open_count_close(&mut self, d: &FfiDb) -> u64 {
+        open_batch_count_close(
+            d,
+            &self.prefix_cols,
+            &self.offs_u32,
+            &mut self.handles,
+            &mut self.chunks,
+            self.chunk_cap,
+        )
+    }
+
+    fn open_count_close_with(
+        &mut self,
+        d: &FfiDb,
+        open_batch: PrefixBatchOpenFn,
+        label: &str,
+    ) -> u64 {
+        open_batch_count_close_with(
+            d,
+            &self.prefix_cols,
+            &self.offs_u32,
+            &mut self.handles,
+            &mut self.chunks,
+            self.chunk_cap,
+            open_batch,
+            label,
+        )
+    }
+}
+
+fn batch_open_count_alloc_each_iter_with(
+    d: &FfiDb,
+    prefix_cols: &Cols,
+    offs_u32: &[u32],
+    open_batch: PrefixBatchOpenFn,
+    label: &str,
+) -> u64 {
+    let n = offs_u32.len() - 1;
+    let (_bufs, mut chunks) = build_batch_chunks(n, CHUNK_CAP);
+    let mut handles = vec![0u64; n];
+    open_batch_count_close_with(
+        d,
+        prefix_cols,
+        offs_u32,
+        &mut handles,
+        &mut chunks,
+        CHUNK_CAP,
+        open_batch,
+        label,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MergeShape {
+    DistinctKeys,
+    SameKeyChain,
+}
+
+struct MergeBatchFixture {
+    keys_off: Vec<u32>,
+    keys_data: Vec<u8>,
+    ops_off: Vec<u32>,
+    ops_data: Vec<u8>,
+    read_keys: Vec<Vec<u8>>,
+    expected_values: Vec<Vec<u8>>,
+    rows: usize,
+}
+
+struct MergeReadFixture {
+    keys: Cols,
+    expected_values: Vec<Vec<u8>>,
+    out_offsets: Vec<i32>,
+    out_data: Vec<u8>,
+    out_validity: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum MergeReadStage {
+    Memtable,
+    Flushed,
+    Compacted,
+}
+
+impl MergeReadStage {
+    fn label(self) -> &'static str {
+        match self {
+            MergeReadStage::Memtable => "memtable_read",
+            MergeReadStage::Flushed => "flushed_read",
+            MergeReadStage::Compacted => "compacted_read",
+        }
+    }
+}
+
+fn append_u32_col(col_off: &mut Vec<u32>, col_data: &mut Vec<u8>, value: &[u8]) {
+    col_data.extend_from_slice(value);
+    col_off.push(col_data.len() as u32);
+}
+
+fn merge_operand(salt: usize, key_id: usize, chain_idx: usize) -> Vec<u8> {
+    format!("op/{salt:08}/{key_id:04}/{chain_idx:02};").into_bytes()
+}
+
+fn build_merge_batch_fixture(
+    shape: MergeShape,
+    chain_len: usize,
+    salt: usize,
+) -> MergeBatchFixture {
+    let mut keys_off = vec![0u32];
+    let mut keys_data = Vec::new();
+    let mut ops_off = vec![0u32];
+    let mut ops_data = Vec::new();
+    let mut read_keys = Vec::new();
+    let mut expected_values = Vec::new();
+
+    match shape {
+        MergeShape::DistinctKeys => {
+            let rows = Q19_MERGE_KEYS * chain_len;
+            read_keys.reserve(rows);
+            expected_values.reserve(rows);
+            for row in 0..rows {
+                let key = format!("q19/distinct/{salt:08}/k{row:05}").into_bytes();
+                let operand = merge_operand(salt, row, 0);
+                append_u32_col(&mut keys_off, &mut keys_data, &key);
+                append_u32_col(&mut ops_off, &mut ops_data, &operand);
+                read_keys.push(key);
+                expected_values.push(operand);
+            }
+        }
+        MergeShape::SameKeyChain => {
+            read_keys.reserve(Q19_MERGE_KEYS);
+            expected_values.reserve(Q19_MERGE_KEYS);
+            for key_id in 0..Q19_MERGE_KEYS {
+                let key = format!("q19/chain/{salt:08}/k{key_id:04}").into_bytes();
+                let mut expected = Vec::new();
+                for chain_idx in 0..chain_len {
+                    let operand = merge_operand(salt, key_id, chain_idx);
+                    append_u32_col(&mut keys_off, &mut keys_data, &key);
+                    append_u32_col(&mut ops_off, &mut ops_data, &operand);
+                    expected.extend_from_slice(&operand);
+                }
+                read_keys.push(key);
+                expected_values.push(expected);
+            }
+        }
+    }
+
+    let rows = keys_off.len() - 1;
+    MergeBatchFixture {
+        keys_off,
+        keys_data,
+        ops_off,
+        ops_data,
+        read_keys,
+        expected_values,
+        rows,
+    }
+}
+
+fn run_merge_append_batch(d: &FfiDb, fixture: &MergeBatchFixture) {
+    let rc = unsafe {
+        frs_vec_merge_append_batch(
+            d.db,
+            d.cf,
+            fixture.keys_off.as_ptr(),
+            fixture.keys_data.as_ptr(),
+            fixture.keys_data.len(),
+            fixture.ops_off.as_ptr(),
+            fixture.ops_data.as_ptr(),
+            fixture.ops_data.len(),
+            fixture.rows as u32,
+        )
+    };
+    assert_eq!(rc, 0, "frs_vec_merge_append_batch failed: {rc}");
+}
+
+fn ffi_flush_cf(d: &FfiDb) {
+    let rc = unsafe { frs_flush_cf(d.db, d.cf) };
+    assert_eq!(rc, FRS_STATUS_OK, "frs_flush_cf failed: {rc}");
+}
+
+fn ffi_compact_cf(d: &FfiDb) {
+    let rc = unsafe { frs_compact_cf(d.db, d.cf) };
+    assert_eq!(rc, FRS_STATUS_OK, "frs_compact_cf failed: {rc}");
+}
+
+fn build_merge_read_fixture(fixture: &MergeBatchFixture) -> MergeReadFixture {
+    let keys = cols_from(fixture.read_keys.iter().map(|k| k.as_slice()));
+    let expected_bytes: usize = fixture.expected_values.iter().map(|v| v.len()).sum();
+    MergeReadFixture {
+        keys,
+        expected_values: fixture.expected_values.clone(),
+        out_offsets: vec![0i32; fixture.read_keys.len() + 1],
+        out_data: vec![0u8; expected_bytes + fixture.read_keys.len() * 8 + 1],
+        out_validity: vec![0u8; fixture.read_keys.len()],
+    }
+}
+
+fn run_merge_read_get(d: &FfiDb, fixture: &mut MergeReadFixture) -> usize {
+    fixture.out_offsets.fill(0);
+    fixture.out_validity.fill(0);
+    let mut out_len = 0usize;
+    let rc = unsafe {
+        frs_vectorized_batch_get(
+            d.db,
+            d.cf,
+            fixture.keys.offs.as_ptr(),
+            fixture.keys.data.as_ptr(),
+            fixture.keys.data.len(),
+            fixture.expected_values.len(),
+            fixture.out_offsets.as_mut_ptr(),
+            fixture.out_data.as_mut_ptr(),
+            fixture.out_validity.as_mut_ptr(),
+            fixture.out_data.len(),
+            &mut out_len,
+        )
+    };
+    assert_eq!(rc, 0, "frs_vectorized_batch_get failed: {rc}");
+    for i in 0..fixture.expected_values.len() {
+        assert_eq!(
+            fixture.out_validity[i], 1,
+            "missing merge value for key {i}"
+        );
+        let start = fixture.out_offsets[i] as usize;
+        let end = fixture.out_offsets[i + 1] as usize;
+        assert_eq!(
+            &fixture.out_data[start..end],
+            fixture.expected_values[i].as_slice(),
+            "merged value mismatch for key {i}"
+        );
+    }
+    assert_eq!(
+        fixture.out_offsets[fixture.expected_values.len()] as usize,
+        out_len
+    );
+    out_len
+}
+
+fn assert_merge_fixture_readable(d: &FfiDb, fixture: &MergeBatchFixture) {
+    let mut read_fixture = build_merge_read_fixture(fixture);
+    run_merge_read_get(d, &mut read_fixture);
+}
+
+fn prepare_merge_read_db(
+    shape: MergeShape,
+    chain_len: usize,
+    salt: usize,
+    stage: MergeReadStage,
+) -> (FfiDb, MergeReadFixture) {
+    let d = FfiDb::open();
+    let fixture = build_merge_batch_fixture(shape, chain_len, salt);
+    run_merge_append_batch(&d, &fixture);
+    match stage {
+        MergeReadStage::Memtable => {}
+        MergeReadStage::Flushed => ffi_flush_cf(&d),
+        MergeReadStage::Compacted => ffi_compact_cf(&d),
+    }
+    let mut read_fixture = build_merge_read_fixture(&fixture);
+    run_merge_read_get(&d, &mut read_fixture);
+    (d, read_fixture)
 }
 
 // ---------------------------------------------------------------------------
@@ -674,6 +1257,280 @@ fn bench_iter(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// q7/q19 probes: many tiny prefix iterators + merge append chains
+// ---------------------------------------------------------------------------
+
+fn bench_q7_iter_probe_ffi(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ffi_vectorized/q7_iter_probe_ffi");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_millis(800));
+    group.warm_up_time(std::time::Duration::from_millis(200));
+
+    for &prefix_count in Q7_PREFIX_COUNTS {
+        for &rows_per_prefix in Q7_ROWS_PER_PREFIX {
+            let d = FfiDb::open();
+            let ns = format!("q7/p{prefix_count}/r{rows_per_prefix}");
+            let (prefixes, expected) =
+                populate_iter_fixture(&d, &ns, prefix_count, rows_per_prefix);
+            assert_iter_fixture_correct(&d, &prefixes, &expected);
+            let expected_rows = (prefix_count * rows_per_prefix) as u64;
+            let label = format!("p{prefix_count}_r{rows_per_prefix}");
+
+            group.throughput(Throughput::Elements(prefix_count as u64));
+            let mut serial_buf = vec![0u8; CHUNK_CAP as usize];
+            group.bench_with_input(
+                BenchmarkId::new("serial_open_next_close", &label),
+                &prefix_count,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_serial_count(&d, &prefixes, &mut serial_buf);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("batch_open_parallel", &label),
+                &prefix_count,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_parallel_count(&d, &prefixes);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_q19_iter_topn_ffi(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ffi_vectorized/q19_iter_topn_ffi");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_millis(800));
+    group.warm_up_time(std::time::Duration::from_millis(200));
+
+    for &batch_k in Q19_BATCH_OPEN_K {
+        for &rows_per_prefix in Q19_ROWS_PER_PREFIX {
+            let d = FfiDb::open();
+            let ns = format!("q19/topn/k{batch_k}/r{rows_per_prefix}");
+            let (prefixes, expected) = populate_iter_fixture(&d, &ns, batch_k, rows_per_prefix);
+            assert_iter_fixture_correct(&d, &prefixes, &expected);
+            let expected_rows = (batch_k * rows_per_prefix) as u64;
+            let label = format!("k{batch_k}_r{rows_per_prefix}");
+
+            group.throughput(Throughput::Elements(batch_k as u64));
+            let mut serial_buf = vec![0u8; CHUNK_CAP as usize];
+            group.bench_with_input(
+                BenchmarkId::new("serial_open_next_close", &label),
+                &batch_k,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_serial_count(&d, &prefixes, &mut serial_buf);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("batch_open_parallel", &label),
+                &batch_k,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_parallel_count(&d, &prefixes);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_q19_append_merge_chain_ffi(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ffi_vectorized/q19_append_merge_chain_ffi");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_millis(800));
+    group.warm_up_time(std::time::Duration::from_millis(200));
+
+    for &chain_len in Q19_CHAIN_LENGTHS {
+        for &(shape_name, shape) in &[
+            ("distinct_keys", MergeShape::DistinctKeys),
+            ("same_key_chain", MergeShape::SameKeyChain),
+        ] {
+            let d = FfiDb::open();
+            let fixture = build_merge_batch_fixture(shape, chain_len, 0);
+            run_merge_append_batch(&d, &fixture);
+            assert_merge_fixture_readable(&d, &fixture);
+
+            let rows = fixture.rows;
+            let label = format!("{shape_name}_chain{chain_len}");
+            let salt = AtomicU64::new(1);
+            group.throughput(Throughput::Elements(rows as u64));
+            group.bench_with_input(
+                BenchmarkId::new("merge_append_batch", &label),
+                &rows,
+                |b, _| {
+                    b.iter_batched(
+                        || {
+                            let next_salt = salt.fetch_add(1, Ordering::Relaxed) as usize;
+                            build_merge_batch_fixture(shape, chain_len, next_salt)
+                        },
+                        |fixture| {
+                            run_merge_append_batch(&d, &fixture);
+                            std::hint::black_box(fixture.rows);
+                        },
+                        BatchSize::SmallInput,
+                    )
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn bench_q19_merge_chain_read_lifecycle_ffi(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ffi_vectorized/q19_merge_chain_read_lifecycle_ffi");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_millis(800));
+    group.warm_up_time(std::time::Duration::from_millis(200));
+
+    let mut salt = 10_000usize;
+    for &chain_len in Q19_CHAIN_LENGTHS {
+        for &(shape_name, shape) in &[
+            ("distinct_keys", MergeShape::DistinctKeys),
+            ("same_key_chain", MergeShape::SameKeyChain),
+        ] {
+            for &stage in &[
+                MergeReadStage::Memtable,
+                MergeReadStage::Flushed,
+                MergeReadStage::Compacted,
+            ] {
+                salt += 1;
+                let (d, mut read_fixture) = prepare_merge_read_db(shape, chain_len, salt, stage);
+                let returned_keys = read_fixture.expected_values.len();
+                let label = format!("{shape_name}_chain{chain_len}");
+
+                group.throughput(Throughput::Elements(returned_keys as u64));
+                group.bench_with_input(
+                    BenchmarkId::new(stage.label(), &label),
+                    &returned_keys,
+                    |b, _| {
+                        b.iter(|| {
+                            let bytes = run_merge_read_get(&d, &mut read_fixture);
+                            std::hint::black_box(bytes);
+                        })
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
+fn bench_q19_iter_open_alloc_split_ffi(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ffi_vectorized/q19_iter_open_alloc_split_ffi");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_millis(800));
+    group.warm_up_time(std::time::Duration::from_millis(200));
+
+    for &batch_k in Q19_BATCH_OPEN_K {
+        for &rows_per_prefix in Q19_ALLOC_SPLIT_ROWS_PER_PREFIX {
+            let d = FfiDb::open();
+            let ns = format!("q19/allocsplit/k{batch_k}/r{rows_per_prefix}");
+            let (prefixes, expected) = populate_iter_fixture(&d, &ns, batch_k, rows_per_prefix);
+            assert_iter_fixture_correct(&d, &prefixes, &expected);
+            let expected_rows = (batch_k * rows_per_prefix) as u64;
+            let label = format!("k{batch_k}_r{rows_per_prefix}");
+
+            let prefix_cols = cols_from(prefixes.iter().map(|p| p.as_slice()));
+            let offs_u32: Vec<u32> = prefix_cols.offs.iter().map(|&o| o as u32).collect();
+            let mut serial_buf = vec![0u8; CHUNK_CAP as usize];
+            let mut serial_batch_reuse_fixture = BatchOpenOnlyFixture::new(&prefixes, CHUNK_CAP);
+            let mut parallel_batch_reuse_fixture = BatchOpenOnlyFixture::new(&prefixes, CHUNK_CAP);
+
+            group.throughput(Throughput::Elements(batch_k as u64));
+            group.bench_with_input(
+                BenchmarkId::new("serial_reuse_buf", &label),
+                &batch_k,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_serial_count(&d, &prefixes, &mut serial_buf);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("serial_batch_alloc_each_iter", &label),
+                &batch_k,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = batch_open_count_alloc_each_iter_with(
+                            &d,
+                            &prefix_cols,
+                            &offs_u32,
+                            frs_vec_iter_prefix_open_batch,
+                            "open_batch_serial",
+                        );
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("serial_batch_reuse_caller_buffers", &label),
+                &batch_k,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = serial_batch_reuse_fixture.open_count_close_with(
+                            &d,
+                            frs_vec_iter_prefix_open_batch,
+                            "open_batch_serial",
+                        );
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("parallel_batch_alloc_each_iter", &label),
+                &batch_k,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = batch_open_count_alloc_each_iter_with(
+                            &d,
+                            &prefix_cols,
+                            &offs_u32,
+                            frs_vec_iter_prefix_open_batch_parallel,
+                            "open_batch_parallel",
+                        );
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("parallel_batch_reuse_caller_buffers", &label),
+                &batch_k,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = parallel_batch_reuse_fixture.open_count_close(&d);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Boundary-tax summary (the §B1 headline derived number)
 // ---------------------------------------------------------------------------
 
@@ -850,7 +1707,44 @@ impl RssSampler {
     }
 }
 
-criterion_group!(benches, bench_put, bench_mixed, bench_get, bench_iter);
+fn should_run_boundary_tax_summary<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    match std::env::var("FRS_FFI_BOUNDARY_SUMMARY").ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") => return true,
+        Some("0") | Some("false") | Some("FALSE") => return false,
+        _ => {}
+    }
+
+    let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let user_args = args.get(1..).unwrap_or(&[]);
+    if user_args.iter().any(|a| {
+        let s = a.to_string_lossy();
+        matches!(s.as_ref(), "--test" | "--list" | "--help" | "-h")
+    }) {
+        return false;
+    }
+
+    !user_args.iter().any(|a| {
+        let s = a.to_string_lossy();
+        !s.starts_with('-')
+    })
+}
+
+criterion_group!(
+    benches,
+    bench_put,
+    bench_mixed,
+    bench_get,
+    bench_iter,
+    bench_q7_iter_probe_ffi,
+    bench_q19_iter_topn_ffi,
+    bench_q19_append_merge_chain_ffi,
+    bench_q19_merge_chain_read_lifecycle_ffi,
+    bench_q19_iter_open_alloc_split_ffi
+);
 
 fn main() {
     println!(
@@ -864,6 +1758,13 @@ fn main() {
     criterion::Criterion::default()
         .configure_from_args()
         .final_summary();
-    boundary_tax_summary();
+    if should_run_boundary_tax_summary(std::env::args_os()) {
+        boundary_tax_summary();
+    } else {
+        println!(
+            "[B1 boundary-tax summary] skipped for filtered/test run; set \
+             FRS_FFI_BOUNDARY_SUMMARY=1 to force it."
+        );
+    }
     sampler.report();
 }
