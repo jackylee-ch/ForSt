@@ -95,6 +95,42 @@ run-to-run stable, not single-run luck.
 No DIFF was found, so no row-level investigation was required; on a DIFF the
 comparator prints up to 20 over-represented rows per side automatically.
 
+## 100K scale (CI) + GHA wiring — 2026-06-13
+
+Two homes, by faithfulness vs. runner cost:
+
+1. **Engine-level gate (hosted GHA, every push)** —
+   `.github/workflows/accuracy-gate.yml` runs
+   `crates/forst-rs-bench/tests/accuracy_gate.rs` under the `rocksdb-baseline`
+   feature. It replays a DETERMINISTIC fixed-seed, NEXMark-windowed-state-shaped
+   workload (per-key aggregation churn + window-expiry tombstones + a
+   full-range scan at every window-fire — the q5 hop / q11 session read+write
+   path) through BOTH the ForSt-RS engine and the vendored RocksDB baseline on
+   byte-identical input, then compares the materialized `(key,value)` state and
+   FAILS on any divergence. Default scale = **100K events / 2000 keys / window
+   2000** (≈50 window boundaries, the same ~100 s-span profile the CSV harness
+   targets). Runs in ~3 s after the (cached) RocksDB build. Verified locally:
+   frs_sha == rdb_sha (`0xc114001b61bfd9de`, 1998 keys) at 100K; a deliberate
+   `+1` perturbation on the RocksDB arm was caught (DIFF rows printed, job
+   failed) — the gate is non-vacuous. Tunable via `FRS_ACC_{EVENTS,KEYS,WINDOW,SEED}`
+   or `workflow_dispatch` inputs. This is the smallest faithful variant that
+   still catches engine accuracy regressions without a Flink cluster.
+
+2. **Full Flink harness (self-hosted / box, on demand)** — the `scripts/`
+   harness now takes `EVENTS_NUM`:
+   ```bash
+   EVENTS_NUM=100000 bash scripts/accuracy-gate/run-matrix.sh   # 100K CI scale
+   EVENTS_NUM=1000000 bash scripts/accuracy-gate/run-matrix.sh  # full (default)
+   ```
+   `gen-fixed-csv.sh` AUTO-DERIVES `GEN_TPS = EVENTS_NUM / 100` so the event-time
+   span stays ~100 s and windows populate at any scale (100K → GEN_TPS=1000 →
+   ~50 hop windows; pin `GEN_TPS` to override). CSV dirs are scale-tagged
+   (`nexmark-fixed-csv-100k` vs `…-1m`) so datasets never collide, and the q12
+   invariant's expected bid count scales with `EVENTS_NUM` (BP=46/50 → 92000 at
+   100K). This needs a Flink 2.2.1 dist + Hadoop + sql-gateway + JDK25 cluster,
+   so it does NOT run on hosted ubuntu-latest — it is the on-demand faithful
+   E2E gate for a self-hosted / box runner.
+
 ## Scope and caveats
 
 - This is a CORRECTNESS gate, not perf: 1M events, local Mac docker. Wall

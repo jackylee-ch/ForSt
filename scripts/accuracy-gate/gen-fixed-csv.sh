@@ -13,14 +13,28 @@ export FLINK_HOME="${FLINK_HOME:-/Users/lijunqing/Downloads/workenv/flink-2.2.1}
 NEXMARK_HOME="${NEXMARK_HOME:-/Users/lijunqing/Code/stczwd/ForSt/nexmark/nexmark-flink/target/nexmark-flink-bin/nexmark-flink}"
 export HADOOP_CLASSPATH="$(find "${HADOOP_HOME:-/Users/lijunqing/Downloads/workenv/hadoop-3.4.3}/share/hadoop" -name '*.jar' 2>/dev/null | tr '\n' ':')"
 JDK17="${JDK17:-/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home}"
-CSV_DIR="${CSV_DIR:-/tmp/nexmark-fixed-csv-1m}"
 EVENTS_NUM="${EVENTS_NUM:-1000000}"
+# Default CSV dir is scale-tagged so 1M and 100K datasets never collide.
+case "$EVENTS_NUM" in
+  100000)  CSV_DIR="${CSV_DIR:-/tmp/nexmark-fixed-csv-100k}" ;;
+  1000000) CSV_DIR="${CSV_DIR:-/tmp/nexmark-fixed-csv-1m}" ;;
+  *)       CSV_DIR="${CSV_DIR:-/tmp/nexmark-fixed-csv-$EVENTS_NUM}" ;;
+esac
 # GEN_TPS sets the datagen rate, which ALSO fixes the EVENT-TIME span of the
-# dataset (timestamps = baseTime + i/rate). At 10M tps, 1M events span only
-# ~0.1s of event time -> a single 10s window -> windowed queries degenerate
-# (q5 emitted 5 rows). 10k tps -> ~100s span -> ~50 hop windows, matching the
-# remote fixed-CSV baseline profile (q5 = 54 rows). Generation wall time ~100s.
-TPS="${GEN_TPS:-10000}"; PP=1; AP=3; BP=46
+# dataset (timestamps = baseTime + i/rate). The span = EVENTS_NUM / GEN_TPS,
+# and windowed queries need a span of ~100 s (hop=10 s -> ~50 windows) or they
+# DEGENERATE: at 10M tps, 1M events span ~0.1 s -> ONE 10 s window -> q5 = 5
+# rows (the trap documented in 2026-06-12-fixed-csv-accuracy-gate.md).
+#   1M  events @ GEN_TPS=10000 -> 100 s span -> ~50 hop windows (q5 = 54-56 rows)
+#   100K events @ GEN_TPS=1000  -> 100 s span -> ~50 hop windows (CI scale)
+# So GEN_TPS must SHRINK with EVENTS_NUM to hold the span. Auto-derive it from
+# EVENTS_NUM (target 100 s span) unless the caller pins GEN_TPS explicitly.
+if [ -n "${GEN_TPS:-}" ]; then
+  TPS="$GEN_TPS"
+else
+  TPS=$(( EVENTS_NUM / 100 )); [ "$TPS" -lt 1 ] && TPS=1
+fi
+PP=1; AP=3; BP=46
 RUN_ID="gencsv-$(date +%H%M%S)"
 
 rm -rf "$CSV_DIR"; mkdir -p "$CSV_DIR"

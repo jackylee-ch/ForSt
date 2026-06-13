@@ -1,0 +1,124 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# NEXMark accuracy gate (engine-level, 100K scale).
+#
+# Catches ForSt-RS engine accuracy regressions by replaying a DETERMINISTIC
+# fixed-seed, NEXMark-windowed-state-shaped workload (per-key aggregation churn
+# + tombstones + full-range scan = the q5 hop / q11 session read+write path)
+# through BOTH the ForSt-RS engine and the vendored RocksDB baseline on
+# IDENTICAL input, then byte-comparing the materialized state. Any divergence
+# fails the job.
+#
+# Why engine-level on hosted GHA (not the full Flink NEXMark harness):
+#   The faithful end-to-end gate is the fixed-CSV harness in
+#   `scripts/accuracy-gate/` (forst-rs vs rocksdb on byte-identical CSV through
+#   the real Flink backend). It needs a full Flink 2.2.1 distribution + Hadoop +
+#   sql-gateway + a JDK25 cluster + the nexmark-flink jar — multi-step and
+#   cluster-flaky, so it belongs on a self-hosted / box runner, NOT hosted
+#   ubuntu-latest. This workflow is the smallest faithful variant that still
+#   runs on every push: it exercises the exact engine read/write/scan/tombstone
+#   ordering the windowed queries depend on, deterministically, in ~3 s.
+#
+# The companion full-harness instructions live in
+#   docs/superpowers/specs/2026-06-12-fixed-csv-accuracy-gate.md
+# (100K params: GEN_TPS=1000 EVENTS_NUM=100000 — keeps the ~100 s event-time
+# span so windows still populate; see the degeneracy trap in that spec).
+
+name: accuracy-gate
+
+on:
+  push:
+    branches: [forst-rs, main]
+    paths:
+      - 'crates/**'
+      - '.github/workflows/accuracy-gate.yml'
+  pull_request:
+    branches: [forst-rs, main]
+    paths:
+      - 'crates/**'
+      - '.github/workflows/accuracy-gate.yml'
+  workflow_dispatch:
+    inputs:
+      events:
+        description: "Events to replay (NEXMark 100K CI scale by default)"
+        required: false
+        default: "100000"
+      keys:
+        description: "Distinct auction keys"
+        required: false
+        default: "2000"
+      window:
+        description: "Events per window-fire (flush + tombstone cadence)"
+        required: false
+        default: "2000"
+
+permissions: read-all
+
+env:
+  # CI portability: .cargo/config.toml uses target-cpu=native for local/prod
+  # perf; hosted runners are CPU-heterogeneous, so pin a universal baseline so
+  # the test binary never SIGILLs on a different runner class.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+
+jobs:
+  nexmark-accuracy:
+    name: "NEXMark accuracy (forst-rs engine vs rocksdb, 100K)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install RocksDB build deps (vendored C++ baseline)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libclang-dev clang cmake \
+            libsnappy-dev liblz4-dev libzstd-dev zlib1g-dev libbz2-dev
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-accgate-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-accgate-
+
+      - name: Cache target dir (vendored RocksDB cold build ~15 min)
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-accgate-${{ hashFiles('Cargo.lock', 'crates/forst-rs-bench/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-target-accgate-
+
+      - name: Build accuracy-gate test (rocksdb-baseline feature)
+        run: |
+          cargo test --release -p forst-rs-bench \
+            --features rocksdb-baseline --test accuracy_gate --no-run
+
+      - name: Run NEXMark accuracy gate (fails on any hash mismatch)
+        env:
+          FRS_ACC_EVENTS: ${{ github.event.inputs.events || '100000' }}
+          FRS_ACC_KEYS: ${{ github.event.inputs.keys || '2000' }}
+          FRS_ACC_WINDOW: ${{ github.event.inputs.window || '2000' }}
+        run: |
+          cargo test --release -p forst-rs-bench \
+            --features rocksdb-baseline --test accuracy_gate -- --nocapture

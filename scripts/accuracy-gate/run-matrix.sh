@@ -17,7 +17,18 @@ QUERIES="${QUERIES:-q3 q5 q8 q11 q12}"
 CONFIGS="${CONFIGS:-forst-rs-ffm-local rocksdb}"
 TAG="${TAG:-accgate-$(date +%m%d%H%M)}"
 MAXSEC="${MAXSEC:-900}"
-CSV_HOST="$WORKENV/frs-tmp/nexmark-fixed-csv-1m"   # container /tmp/nexmark-fixed-csv-1m
+# Scale knob: EVENTS_NUM picks the dataset size + its scale-tagged CSV dir.
+# 100000 = the CI/fast scale (GEN_TPS auto-derived to 1000 by gen-fixed-csv.sh
+# so the ~100 s event-time span -> ~50 hop windows is preserved); 1000000 = the
+# proven full scale. See 2026-06-12-fixed-csv-accuracy-gate.md.
+EVENTS_NUM="${EVENTS_NUM:-1000000}"
+case "$EVENTS_NUM" in
+  100000)  CSV_NAME="nexmark-fixed-csv-100k" ;;
+  1000000) CSV_NAME="nexmark-fixed-csv-1m" ;;
+  *)       CSV_NAME="nexmark-fixed-csv-$EVENTS_NUM" ;;
+esac
+CSV_HOST="$WORKENV/frs-tmp/$CSV_NAME"          # container /tmp/$CSV_NAME
+CSV_CONTAINER="/tmp/$CSV_NAME"
 RESULTS="$REPO/target-linux/accuracy-gate-results/$TAG"
 SO="$REPO/target-linux/release/libforst_rs_ffi.so"
 [ -f "$SO" ] || { echo "missing $SO — run: scripts/run-8c32g.sh build"; exit 1; }
@@ -36,8 +47,10 @@ DKR_COMMON=(--platform "$PLAT"
   -w "$REPO")
 
 if [ -n "${FORCE_GEN:-}" ] || [ ! -d "$CSV_HOST/bid" ]; then
-  echo "== generating fixed 1M CSV dataset (once) =="
-  docker run --rm --cpus=8 --memory=32g "${DKR_COMMON[@]}" "$IMG" bash -lc \
+  echo "== generating fixed $EVENTS_NUM-event CSV dataset (once) -> $CSV_CONTAINER =="
+  docker run --rm --cpus=8 --memory=32g "${DKR_COMMON[@]}" \
+    -e EVENTS_NUM="$EVENTS_NUM" -e CSV_DIR="$CSV_CONTAINER" ${GEN_TPS:+-e GEN_TPS="$GEN_TPS"} \
+    "$IMG" bash -lc \
     "bash scripts/accuracy-gate/gen-fixed-csv.sh" 2>&1 | tee "$RESULTS/gen.log"
   grep -q "GEN OK" "$RESULTS/gen.log" || { echo "CSV generation FAILED"; exit 1; }
 else
@@ -51,6 +64,7 @@ for q in $QUERIES; do
     echo "== RUN $q [$cfg] =="
     docker run --rm --cpus=8 --memory=32g --memory-swap=32g "${DKR_COMMON[@]}" \
       -e QUERY="$q" -e CONFIG="$cfg" -e MAXSEC="$MAXSEC" -e OUT_FILE="$out_c" \
+      -e CSV_DIR="$CSV_CONTAINER" -e EXPECTED_BIDS="${EXPECTED_BIDS:-}" \
       "$IMG" bash -lc "
         mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
         cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
@@ -69,7 +83,10 @@ echo "== A/B comparison =="
 for q in $QUERIES; do
   frs="$RESULTS/$q-forst-rs-ffm-local.rows"; rdb="$RESULTS/$q-rocksdb.rows"
   if [ -s "$frs" ] && [ -s "$rdb" ]; then
-    python3 "$REPO/scripts/accuracy-gate/compare-print.py" "$q" "$frs" "$rdb" 2>&1 | tee -a "$RESULTS/compare.txt"
+    # q12 invariant needs the dataset's bid count (BP=46/50 of EVENTS_NUM):
+    # 1M -> 920000, 100K -> 92000. Caller may override via EXPECTED_BIDS.
+    EB="${EXPECTED_BIDS:-$(( EVENTS_NUM * 46 / 50 ))}"
+    python3 "$REPO/scripts/accuracy-gate/compare-print.py" "$q" "$frs" "$rdb" "$EB" 2>&1 | tee -a "$RESULTS/compare.txt"
   else
     echo "COMPARE_TSV	$q	NO_DATA	frs=$([ -s "$frs" ] && echo ok || echo missing)	rdb=$([ -s "$rdb" ] && echo ok || echo missing)" | tee -a "$RESULTS/compare.txt"
   fi

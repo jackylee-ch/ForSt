@@ -864,6 +864,10 @@ fn one_run_rocksdb(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
             l0: *per_level.first().unwrap_or(&0),
             files_per_level: per_level,
             live_bytes,
+            // RocksDB-baseline arm has no vlog segments (KV-separation is a
+            // forst-rs engine feature); report 0 so the Sample initializer is
+            // complete under --features rocksdb-baseline.
+            vlog_bytes: 0,
             phys_write_bytes: phys_bytes(&opts),
             logical_bytes: logical.load(Ordering::Relaxed),
             rows_written: rows.load(Ordering::Relaxed),
