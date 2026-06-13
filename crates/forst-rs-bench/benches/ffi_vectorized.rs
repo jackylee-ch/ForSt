@@ -49,7 +49,8 @@
 //!   cost from native open/fill cost with reused caller buffers
 //! - `q7_q19_open_first_slice_ffi` — small q7/q19-like first-chunk slice
 //!   comparing row-limited serial open-first with batch-open first-chunk
-//!   lower bounds
+//!   lower bounds for K={64,256,1024}, rows/limit={1,4,16}, S2 pinned
+//!   off/on
 //! - `compat_jni_prefix_proxy` — Rust-level proxy for compat JNI
 //!   `prefixLookupNext` / `iteratorNext` row-at-a-time scans vs the chunked
 //!   prefix iterator lower bound
@@ -73,7 +74,9 @@ use std::time::Instant;
 use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 
 use forst_rs_common::EngineOptions;
-use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, DEFAULT_CF_NAME};
+use forst_rs_engine::{
+    set_s2_pinned_override, ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, DEFAULT_CF_NAME,
+};
 use forst_rs_ffi::{
     frs_batch_get, frs_bytes_free, frs_compact_cf, frs_db_create_cf_with_merge, frs_db_open,
     frs_flush_cf, frs_get, frs_iterator_close, frs_iterator_next, frs_iterator_next_chunk,
@@ -99,9 +102,9 @@ const Q7_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16];
 const Q19_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16, 32];
 const Q19_BATCH_OPEN_K: &[usize] = &[64, 256];
 const Q19_ALLOC_SPLIT_ROWS_PER_PREFIX: &[usize] = &[1, 16, 32];
-const Q7_Q19_OPEN_FIRST_K: &[usize] = &[64, 256];
+const Q7_Q19_OPEN_FIRST_K: &[usize] = &[64, 256, 1024];
 const Q7_Q19_OPEN_FIRST_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16];
-const Q7_Q19_OPEN_FIRST_ROW_LIMITS: &[usize] = &[1, 4];
+const Q7_Q19_OPEN_FIRST_ROW_LIMITS: &[usize] = &[1, 4, 16];
 const Q19_MERGE_KEYS: usize = 64;
 const Q19_CHAIN_LENGTHS: &[usize] = &[1, 4, 16];
 const COMPAT_PROXY_PREFIX_COUNTS: &[usize] = &[64, 256];
@@ -1676,97 +1679,106 @@ fn bench_q7_q19_open_first_slice_ffi(c: &mut Criterion) {
     group.measurement_time(std::time::Duration::from_millis(500));
     group.warm_up_time(std::time::Duration::from_millis(100));
 
-    for &batch_k in Q7_Q19_OPEN_FIRST_K {
-        for &rows_per_prefix in Q7_Q19_OPEN_FIRST_ROWS_PER_PREFIX {
-            for &row_limit in Q7_Q19_OPEN_FIRST_ROW_LIMITS {
-                if row_limit > rows_per_prefix {
-                    continue;
+    for &(s2_label, s2_enabled) in &[("s2off", false), ("s2on", true)] {
+        set_s2_pinned_override(Some(s2_enabled));
+        for &batch_k in Q7_Q19_OPEN_FIRST_K {
+            for &rows_per_prefix in Q7_Q19_OPEN_FIRST_ROWS_PER_PREFIX {
+                for &row_limit in Q7_Q19_OPEN_FIRST_ROW_LIMITS {
+                    if row_limit > rows_per_prefix {
+                        continue;
+                    }
+                    let d = FfiDb::open();
+                    let ns = format!(
+                        "q7q19/openfirst/{s2_label}/k{batch_k}/r{rows_per_prefix}/l{row_limit}"
+                    );
+                    let (prefixes, expected) =
+                        populate_iter_fixture(&d, &ns, batch_k, rows_per_prefix);
+                    assert_iter_fixture_correct(&d, &prefixes, &expected);
+
+                    let chunk_cap = first_chunk_cap_for_row_limit(&expected[0], row_limit);
+                    let compat_scratch_cap =
+                        (COMPAT_OPEN_FIRST_INITIAL_DATA_CAP * 2 + row_limit * 8) as u32;
+                    let expected_first_rows = (batch_k * row_limit) as u64;
+                    let label =
+                        format!("{s2_label}_k{batch_k}_r{rows_per_prefix}_limit{row_limit}");
+
+                    group.throughput(Throughput::Elements(expected_first_rows));
+                    group.bench_with_input(
+                        BenchmarkId::new("serial_open_limited_alloc_each_prefix", &label),
+                        &expected_first_rows,
+                        |b, _| {
+                            b.iter(|| {
+                                let rows = open_first_limited_prefixes_count_alloc_each(
+                                    &d,
+                                    &prefixes,
+                                    row_limit,
+                                    compat_scratch_cap,
+                                );
+                                assert_eq!(rows, expected_first_rows);
+                                std::hint::black_box(rows);
+                            })
+                        },
+                    );
+
+                    let mut serial_buf = vec![0_u8; compat_scratch_cap as usize];
+                    group.bench_with_input(
+                        BenchmarkId::new("serial_open_limited_first_chunk", &label),
+                        &expected_first_rows,
+                        |b, _| {
+                            b.iter(|| {
+                                let rows = open_first_limited_prefixes_count(
+                                    &d,
+                                    &prefixes,
+                                    row_limit,
+                                    &mut serial_buf,
+                                );
+                                assert_eq!(rows, expected_first_rows);
+                                std::hint::black_box(rows);
+                            })
+                        },
+                    );
+
+                    let mut serial_batch_fixture = BatchOpenFirstFixture::new(&prefixes, chunk_cap);
+                    group.bench_with_input(
+                        BenchmarkId::new("serial_batch_open_first_cap_limited", &label),
+                        &expected_first_rows,
+                        |b, _| {
+                            b.iter(|| {
+                                let rows = serial_batch_fixture.open_first_count_close_with(
+                                    &d,
+                                    row_limit,
+                                    frs_vec_iter_prefix_open_batch,
+                                    "open_batch_serial",
+                                );
+                                assert_eq!(rows, expected_first_rows);
+                                std::hint::black_box(rows);
+                            })
+                        },
+                    );
+
+                    let mut parallel_batch_fixture =
+                        BatchOpenFirstFixture::new(&prefixes, chunk_cap);
+                    group.bench_with_input(
+                        BenchmarkId::new("parallel_batch_open_first_cap_limited", &label),
+                        &expected_first_rows,
+                        |b, _| {
+                            b.iter(|| {
+                                let rows = parallel_batch_fixture.open_first_count_close_with(
+                                    &d,
+                                    row_limit,
+                                    frs_vec_iter_prefix_open_batch_parallel,
+                                    "open_batch_parallel",
+                                );
+                                assert_eq!(rows, expected_first_rows);
+                                std::hint::black_box(rows);
+                            })
+                        },
+                    );
                 }
-                let d = FfiDb::open();
-                let ns = format!("q7q19/openfirst/k{batch_k}/r{rows_per_prefix}/l{row_limit}");
-                let (prefixes, expected) = populate_iter_fixture(&d, &ns, batch_k, rows_per_prefix);
-                assert_iter_fixture_correct(&d, &prefixes, &expected);
-
-                let chunk_cap = first_chunk_cap_for_row_limit(&expected[0], row_limit);
-                let compat_scratch_cap =
-                    (COMPAT_OPEN_FIRST_INITIAL_DATA_CAP * 2 + row_limit * 8) as u32;
-                let expected_first_rows = (batch_k * row_limit) as u64;
-                let label = format!("k{batch_k}_r{rows_per_prefix}_limit{row_limit}");
-
-                group.throughput(Throughput::Elements(expected_first_rows));
-                group.bench_with_input(
-                    BenchmarkId::new("serial_open_limited_alloc_each_prefix", &label),
-                    &expected_first_rows,
-                    |b, _| {
-                        b.iter(|| {
-                            let rows = open_first_limited_prefixes_count_alloc_each(
-                                &d,
-                                &prefixes,
-                                row_limit,
-                                compat_scratch_cap,
-                            );
-                            assert_eq!(rows, expected_first_rows);
-                            std::hint::black_box(rows);
-                        })
-                    },
-                );
-
-                let mut serial_buf = vec![0_u8; compat_scratch_cap as usize];
-                group.bench_with_input(
-                    BenchmarkId::new("serial_open_limited_first_chunk", &label),
-                    &expected_first_rows,
-                    |b, _| {
-                        b.iter(|| {
-                            let rows = open_first_limited_prefixes_count(
-                                &d,
-                                &prefixes,
-                                row_limit,
-                                &mut serial_buf,
-                            );
-                            assert_eq!(rows, expected_first_rows);
-                            std::hint::black_box(rows);
-                        })
-                    },
-                );
-
-                let mut serial_batch_fixture = BatchOpenFirstFixture::new(&prefixes, chunk_cap);
-                group.bench_with_input(
-                    BenchmarkId::new("serial_batch_open_first_cap_limited", &label),
-                    &expected_first_rows,
-                    |b, _| {
-                        b.iter(|| {
-                            let rows = serial_batch_fixture.open_first_count_close_with(
-                                &d,
-                                row_limit,
-                                frs_vec_iter_prefix_open_batch,
-                                "open_batch_serial",
-                            );
-                            assert_eq!(rows, expected_first_rows);
-                            std::hint::black_box(rows);
-                        })
-                    },
-                );
-
-                let mut parallel_batch_fixture = BatchOpenFirstFixture::new(&prefixes, chunk_cap);
-                group.bench_with_input(
-                    BenchmarkId::new("parallel_batch_open_first_cap_limited", &label),
-                    &expected_first_rows,
-                    |b, _| {
-                        b.iter(|| {
-                            let rows = parallel_batch_fixture.open_first_count_close_with(
-                                &d,
-                                row_limit,
-                                frs_vec_iter_prefix_open_batch_parallel,
-                                "open_batch_parallel",
-                            );
-                            assert_eq!(rows, expected_first_rows);
-                            std::hint::black_box(rows);
-                        })
-                    },
-                );
             }
         }
     }
+    set_s2_pinned_override(None);
     group.finish();
 }
 
