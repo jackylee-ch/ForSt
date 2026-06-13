@@ -47,6 +47,9 @@
 //!   memtable-resident, after flush, and after compaction
 //! - `q19_iter_open_alloc_split_ffi` — separates batch-open caller allocation
 //!   cost from native open/fill cost with reused caller buffers
+//! - `q7_q19_open_first_slice_ffi` — small q7/q19-like first-chunk slice
+//!   comparing row-limited serial open-first with batch-open first-chunk
+//!   lower bounds
 //! - `compat_jni_prefix_proxy` — Rust-level proxy for compat JNI
 //!   `prefixLookupNext` / `iteratorNext` row-at-a-time scans vs the chunked
 //!   prefix iterator lower bound
@@ -76,9 +79,10 @@ use forst_rs_ffi::{
     frs_flush_cf, frs_get, frs_iterator_close, frs_iterator_next, frs_iterator_next_chunk,
     frs_prefix_lookup_open, frs_vec_iter_prefix_close, frs_vec_iter_prefix_next,
     frs_vec_iter_prefix_open, frs_vec_iter_prefix_open_batch,
-    frs_vec_iter_prefix_open_batch_parallel, frs_vec_merge_append_batch, frs_vectorized_batch_get,
-    frs_vectorized_batch_mixed, frs_vectorized_batch_put, FrsBytes, FrsCfHandle, FrsChunk, FrsDb,
-    FrsIterator, FRS_CHUNK_EOF, FRS_STATUS_OK,
+    frs_vec_iter_prefix_open_batch_parallel, frs_vec_iter_prefix_open_limited,
+    frs_vec_merge_append_batch, frs_vectorized_batch_get, frs_vectorized_batch_mixed,
+    frs_vectorized_batch_put, FrsBytes, FrsCfHandle, FrsChunk, FrsDb, FrsIterator, FRS_CHUNK_EOF,
+    FRS_STATUS_OK,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem};
 use forst_rs_storage::merge_operator::RawConcatMergeOperator;
@@ -95,12 +99,16 @@ const Q7_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16];
 const Q19_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16, 32];
 const Q19_BATCH_OPEN_K: &[usize] = &[64, 256];
 const Q19_ALLOC_SPLIT_ROWS_PER_PREFIX: &[usize] = &[1, 16, 32];
+const Q7_Q19_OPEN_FIRST_K: &[usize] = &[64, 256];
+const Q7_Q19_OPEN_FIRST_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16];
+const Q7_Q19_OPEN_FIRST_ROW_LIMITS: &[usize] = &[1, 4];
 const Q19_MERGE_KEYS: usize = 64;
 const Q19_CHAIN_LENGTHS: &[usize] = &[1, 4, 16];
 const COMPAT_PROXY_PREFIX_COUNTS: &[usize] = &[64, 256];
 const COMPAT_PROXY_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16, 32];
 const COMPAT_PROXY_NEXT_CHUNK_ROWS: usize = 64;
 const COMPAT_PROXY_NEXT_CHUNK_DATA_CAP: usize = 64 * 1024;
+const COMPAT_OPEN_FIRST_INITIAL_DATA_CAP: usize = 1024 * 1024;
 const COMPAT_MULTIGET_BATCH_GROUP_THRESHOLD: usize = 64;
 
 // ---------------------------------------------------------------------------
@@ -609,6 +617,175 @@ fn batch_open_count_alloc_each_iter_with(
         open_batch,
         label,
     )
+}
+
+fn first_chunk_cap_for_row_limit(rows: &[(Vec<u8>, Vec<u8>)], row_limit: usize) -> u32 {
+    let cap: usize = rows
+        .iter()
+        .take(row_limit)
+        .map(|(k, v)| 8 + k.len() + v.len())
+        .sum();
+    u32::try_from(cap).expect("first chunk cap fits u32")
+}
+
+fn open_first_limited_count_close(
+    d: &FfiDb,
+    prefix: &[u8],
+    row_limit: usize,
+    buf: &mut [u8],
+) -> u64 {
+    let mut handle = 0_u64;
+    let mut row_count = 0_u32;
+    let mut bytes_used = 0_u32;
+    let mut eof = 0_u8;
+    let rc = unsafe {
+        frs_vec_iter_prefix_open_limited(
+            d.db,
+            d.cf,
+            prefix.as_ptr(),
+            prefix.len() as u32,
+            row_limit as u32,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut handle,
+            &mut row_count,
+            &mut bytes_used,
+            &mut eof,
+        )
+    };
+    assert_eq!(
+        rc, FRS_STATUS_OK,
+        "frs_vec_iter_prefix_open_limited failed: {rc}"
+    );
+    assert!(
+        row_count as usize <= row_limit,
+        "open_limited emitted more rows than requested"
+    );
+    std::hint::black_box((&buf[..bytes_used as usize], eof));
+    if handle != 0 {
+        let rc = frs_vec_iter_prefix_close(handle);
+        assert_eq!(rc, FRS_STATUS_OK, "frs_vec_iter_prefix_close failed: {rc}");
+    }
+    row_count as u64
+}
+
+fn open_first_limited_prefixes_count(
+    d: &FfiDb,
+    prefixes: &[Vec<u8>],
+    row_limit: usize,
+    buf: &mut [u8],
+) -> u64 {
+    prefixes
+        .iter()
+        .map(|prefix| open_first_limited_count_close(d, prefix, row_limit, buf))
+        .sum()
+}
+
+fn open_first_limited_prefixes_count_alloc_each(
+    d: &FfiDb,
+    prefixes: &[Vec<u8>],
+    row_limit: usize,
+    chunk_cap: u32,
+) -> u64 {
+    prefixes
+        .iter()
+        .map(|prefix| {
+            let mut buf = vec![0_u8; chunk_cap as usize];
+            open_first_limited_count_close(d, prefix, row_limit, &mut buf)
+        })
+        .sum()
+}
+
+fn batch_open_first_count_close_with(
+    d: &FfiDb,
+    prefix_cols: &Cols,
+    offs_u32: &[u32],
+    handles: &mut [u64],
+    chunks: &mut [FrsChunk],
+    chunk_cap: u32,
+    row_limit: usize,
+    open_batch: PrefixBatchOpenFn,
+    label: &str,
+) -> u64 {
+    handles.fill(0);
+    for chunk in chunks.iter_mut() {
+        chunk.row_count = 0;
+        chunk.bytes_used = 0;
+        chunk._reserved = 0;
+    }
+    let rc = unsafe {
+        open_batch(
+            d.db,
+            d.cf,
+            offs_u32.as_ptr(),
+            prefix_cols.data.as_ptr(),
+            handles.len() as u32,
+            handles.as_mut_ptr(),
+            chunks.as_mut_ptr(),
+            chunk_cap,
+        )
+    };
+    assert_eq!(rc, FRS_STATUS_OK, "{label} failed: {rc}");
+
+    let mut rows = 0_u64;
+    for (i, handle) in handles.iter().copied().enumerate() {
+        assert!(
+            chunks[i].row_count as usize <= row_limit,
+            "{label} emitted more first-chunk rows than the cap-derived limit"
+        );
+        rows += chunks[i].row_count as u64;
+        std::hint::black_box((chunks[i].bytes_used, chunks[i]._reserved & FRS_CHUNK_EOF));
+        if handle != 0 {
+            let rc = frs_vec_iter_prefix_close(handle);
+            assert_eq!(rc, FRS_STATUS_OK, "{label} close failed: {rc}");
+        }
+    }
+    rows
+}
+
+struct BatchOpenFirstFixture {
+    prefix_cols: Cols,
+    offs_u32: Vec<u32>,
+    _bufs: Vec<Vec<u8>>,
+    handles: Vec<u64>,
+    chunks: Vec<FrsChunk>,
+    chunk_cap: u32,
+}
+
+impl BatchOpenFirstFixture {
+    fn new(prefixes: &[Vec<u8>], chunk_cap: u32) -> Self {
+        let prefix_cols = cols_from(prefixes.iter().map(|p| p.as_slice()));
+        let offs_u32: Vec<u32> = prefix_cols.offs.iter().map(|&o| o as u32).collect();
+        let (bufs, chunks) = build_batch_chunks(prefixes.len(), chunk_cap);
+        Self {
+            prefix_cols,
+            offs_u32,
+            _bufs: bufs,
+            handles: vec![0u64; prefixes.len()],
+            chunks,
+            chunk_cap,
+        }
+    }
+
+    fn open_first_count_close_with(
+        &mut self,
+        d: &FfiDb,
+        row_limit: usize,
+        open_batch: PrefixBatchOpenFn,
+        label: &str,
+    ) -> u64 {
+        batch_open_first_count_close_with(
+            d,
+            &self.prefix_cols,
+            &self.offs_u32,
+            &mut self.handles,
+            &mut self.chunks,
+            self.chunk_cap,
+            row_limit,
+            open_batch,
+            label,
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1493,6 +1670,106 @@ fn bench_q19_iter_topn_ffi(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_q7_q19_open_first_slice_ffi(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ffi_vectorized/q7_q19_open_first_slice_ffi");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_millis(500));
+    group.warm_up_time(std::time::Duration::from_millis(100));
+
+    for &batch_k in Q7_Q19_OPEN_FIRST_K {
+        for &rows_per_prefix in Q7_Q19_OPEN_FIRST_ROWS_PER_PREFIX {
+            for &row_limit in Q7_Q19_OPEN_FIRST_ROW_LIMITS {
+                if row_limit > rows_per_prefix {
+                    continue;
+                }
+                let d = FfiDb::open();
+                let ns = format!("q7q19/openfirst/k{batch_k}/r{rows_per_prefix}/l{row_limit}");
+                let (prefixes, expected) = populate_iter_fixture(&d, &ns, batch_k, rows_per_prefix);
+                assert_iter_fixture_correct(&d, &prefixes, &expected);
+
+                let chunk_cap = first_chunk_cap_for_row_limit(&expected[0], row_limit);
+                let compat_scratch_cap =
+                    (COMPAT_OPEN_FIRST_INITIAL_DATA_CAP * 2 + row_limit * 8) as u32;
+                let expected_first_rows = (batch_k * row_limit) as u64;
+                let label = format!("k{batch_k}_r{rows_per_prefix}_limit{row_limit}");
+
+                group.throughput(Throughput::Elements(expected_first_rows));
+                group.bench_with_input(
+                    BenchmarkId::new("serial_open_limited_alloc_each_prefix", &label),
+                    &expected_first_rows,
+                    |b, _| {
+                        b.iter(|| {
+                            let rows = open_first_limited_prefixes_count_alloc_each(
+                                &d,
+                                &prefixes,
+                                row_limit,
+                                compat_scratch_cap,
+                            );
+                            assert_eq!(rows, expected_first_rows);
+                            std::hint::black_box(rows);
+                        })
+                    },
+                );
+
+                let mut serial_buf = vec![0_u8; compat_scratch_cap as usize];
+                group.bench_with_input(
+                    BenchmarkId::new("serial_open_limited_first_chunk", &label),
+                    &expected_first_rows,
+                    |b, _| {
+                        b.iter(|| {
+                            let rows = open_first_limited_prefixes_count(
+                                &d,
+                                &prefixes,
+                                row_limit,
+                                &mut serial_buf,
+                            );
+                            assert_eq!(rows, expected_first_rows);
+                            std::hint::black_box(rows);
+                        })
+                    },
+                );
+
+                let mut serial_batch_fixture = BatchOpenFirstFixture::new(&prefixes, chunk_cap);
+                group.bench_with_input(
+                    BenchmarkId::new("serial_batch_open_first_cap_limited", &label),
+                    &expected_first_rows,
+                    |b, _| {
+                        b.iter(|| {
+                            let rows = serial_batch_fixture.open_first_count_close_with(
+                                &d,
+                                row_limit,
+                                frs_vec_iter_prefix_open_batch,
+                                "open_batch_serial",
+                            );
+                            assert_eq!(rows, expected_first_rows);
+                            std::hint::black_box(rows);
+                        })
+                    },
+                );
+
+                let mut parallel_batch_fixture = BatchOpenFirstFixture::new(&prefixes, chunk_cap);
+                group.bench_with_input(
+                    BenchmarkId::new("parallel_batch_open_first_cap_limited", &label),
+                    &expected_first_rows,
+                    |b, _| {
+                        b.iter(|| {
+                            let rows = parallel_batch_fixture.open_first_count_close_with(
+                                &d,
+                                row_limit,
+                                frs_vec_iter_prefix_open_batch_parallel,
+                                "open_batch_parallel",
+                            );
+                            assert_eq!(rows, expected_first_rows);
+                            std::hint::black_box(rows);
+                        })
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+}
+
 fn drain_prefix_compat_row_by_row(d: &FfiDb, prefix: &[u8], copy_payloads: bool) -> u64 {
     let mut iter: FrsIterator = std::ptr::null_mut();
     let rc =
@@ -2106,6 +2383,7 @@ criterion_group!(
     bench_iter,
     bench_q7_iter_probe_ffi,
     bench_q19_iter_topn_ffi,
+    bench_q7_q19_open_first_slice_ffi,
     bench_compat_jni_prefix_proxy,
     bench_q19_append_merge_chain_ffi,
     bench_q19_merge_chain_read_lifecycle_ffi,

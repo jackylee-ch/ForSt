@@ -70,6 +70,7 @@
 //! 4. Restart the Flink TaskManager. `System.loadLibrary("forstjni")`
 //!    will now resolve into forst-rs.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -107,6 +108,11 @@ static DB_LOG_REGISTRY: OnceLock<Mutex<HashMap<usize, CompatDbLogState>>> = Once
 static FLINK_ENV_BASE_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
 // Same-box microbench gate: <=64 keeps a small-batch win; larger groups keep the old scalar path.
 const MULTI_GET_BATCH_GROUP_THRESHOLD: usize = 64;
+const PREFIX_CHUNK_SCRATCH_REUSE_MAX: usize = 8 * 1024 * 1024;
+
+thread_local! {
+    static PREFIX_CHUNK_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 struct CompatDbLogState {
     dir: String,
@@ -3328,6 +3334,20 @@ fn vec_prefix_chunk_scratch_cap(
     }
 }
 
+fn with_prefix_chunk_scratch<R>(cap: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    if cap > PREFIX_CHUNK_SCRATCH_REUSE_MAX {
+        let mut chunk = vec![0_u8; cap];
+        return f(&mut chunk);
+    }
+    PREFIX_CHUNK_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        if scratch.len() < cap {
+            scratch.resize(cap, 0);
+        }
+        f(&mut scratch[..cap])
+    })
+}
+
 fn decode_vec_prefix_chunk_to_buffers(
     env: &mut JNIEnv,
     chunk: &[u8],
@@ -3538,7 +3558,6 @@ fn prefix_lookup_open_first_chunk_inner(
     let Some(chunk_cap) = vec_prefix_chunk_scratch_cap(env, &buffers, context) else {
         return -1;
     };
-    let mut chunk = vec![0_u8; chunk_cap];
 
     let prefix_obj: &JObject = prefix.as_ref();
     let prefix_bytes = if prefix_obj.is_null() || prefix_len == 0 {
@@ -3560,63 +3579,66 @@ fn prefix_lookup_open_first_chunk_inner(
         None => (ptr::null(), 0),
     };
 
-    let mut vec_handle = 0_u64;
-    let mut row_count = 0_u32;
-    let mut bytes_used = 0_u32;
-    let mut eof = 0_u8;
-    let status = unsafe {
-        frs_vec_iter_prefix_open_limited(
-            handle as FrsDb,
-            frs_cf,
-            prefix_ptr,
-            prefix_len,
-            max_rows,
-            chunk.as_mut_ptr(),
-            chunk.len() as u32,
-            &mut vec_handle,
-            &mut row_count,
-            &mut bytes_used,
-            &mut eof,
-        )
-    };
-    if check_status(env, status, context) {
-        return -1;
-    }
-    let bytes_used_usize = bytes_used as usize;
-    if bytes_used_usize > chunk.len() {
-        if vec_handle != 0 {
-            let _ = frs_vec_iter_prefix_close(vec_handle);
+    with_prefix_chunk_scratch(chunk_cap, |chunk| {
+        let mut vec_handle = 0_u64;
+        let mut row_count = 0_u32;
+        let mut bytes_used = 0_u32;
+        let mut eof = 0_u8;
+        let status = unsafe {
+            frs_vec_iter_prefix_open_limited(
+                handle as FrsDb,
+                frs_cf,
+                prefix_ptr,
+                prefix_len,
+                max_rows,
+                chunk.as_mut_ptr(),
+                chunk.len() as u32,
+                &mut vec_handle,
+                &mut row_count,
+                &mut bytes_used,
+                &mut eof,
+            )
+        };
+        if check_status(env, status, context) {
+            return -1;
         }
-        throw_rocksdb(
+        let bytes_used_usize = bytes_used as usize;
+        if bytes_used_usize > chunk.len() {
+            if vec_handle != 0 {
+                let _ = frs_vec_iter_prefix_close(vec_handle);
+            }
+            throw_rocksdb(
+                env,
+                &format!("{context}: native bytesUsed exceeds chunk capacity"),
+            );
+            return -1;
+        }
+        if decode_vec_prefix_chunk_to_buffers(
             env,
-            &format!("{context}: native bytesUsed exceeds chunk capacity"),
-        );
-        return -1;
-    }
-    if decode_vec_prefix_chunk_to_buffers(
-        env,
-        &chunk[..bytes_used_usize],
-        row_count,
-        &buffers,
-        context,
-    )
-    .is_none()
-    {
-        if vec_handle != 0 {
-            let _ = frs_vec_iter_prefix_close(vec_handle);
+            &chunk[..bytes_used_usize],
+            row_count,
+            &buffers,
+            context,
+        )
+        .is_none()
+        {
+            if vec_handle != 0 {
+                let _ = frs_vec_iter_prefix_close(vec_handle);
+            }
+            return -1;
         }
-        return -1;
-    }
 
-    let eof = eof != 0;
-    let compat_handle = if eof {
-        0
-    } else {
-        wrap_compat_prefix_scan_handle(CompatPrefixScanHandle::Vector(vec_handle))
-    };
-    let meta = unsafe { std::slice::from_raw_parts_mut(meta.ptr, PREFIX_OPEN_FIRST_META_BYTES) };
-    write_prefix_open_first_meta(meta, compat_handle, row_count, eof, bytes_used);
-    compat_handle
+        let eof = eof != 0;
+        let compat_handle = if eof {
+            0
+        } else {
+            wrap_compat_prefix_scan_handle(CompatPrefixScanHandle::Vector(vec_handle))
+        };
+        let meta =
+            unsafe { std::slice::from_raw_parts_mut(meta.ptr, PREFIX_OPEN_FIRST_META_BYTES) };
+        write_prefix_open_first_meta(meta, compat_handle, row_count, eof, bytes_used);
+        compat_handle
+    })
 }
 
 fn prefix_vec_next_chunk_inner(
@@ -3645,45 +3667,46 @@ fn prefix_vec_next_chunk_inner(
     let Some(chunk_cap) = vec_prefix_chunk_scratch_cap(env, &buffers, context) else {
         return -1;
     };
-    let mut chunk = vec![0_u8; chunk_cap];
     let max_rows = max_rows as u32;
-    let mut row_count = 0_u32;
-    let mut bytes_used = 0_u32;
-    let mut eof = 0_u8;
-    let status = unsafe {
-        frs_vec_iter_prefix_next_limited(
-            vec_handle,
-            max_rows,
-            chunk.as_mut_ptr(),
-            chunk.len() as u32,
-            &mut row_count,
-            &mut bytes_used,
-            &mut eof,
-        )
-    };
-    if check_status(env, status, context) {
-        return -1;
-    }
-    let bytes_used_usize = bytes_used as usize;
-    if bytes_used_usize > chunk.len() {
-        throw_rocksdb(
+    with_prefix_chunk_scratch(chunk_cap, |chunk| {
+        let mut row_count = 0_u32;
+        let mut bytes_used = 0_u32;
+        let mut eof = 0_u8;
+        let status = unsafe {
+            frs_vec_iter_prefix_next_limited(
+                vec_handle,
+                max_rows,
+                chunk.as_mut_ptr(),
+                chunk.len() as u32,
+                &mut row_count,
+                &mut bytes_used,
+                &mut eof,
+            )
+        };
+        if check_status(env, status, context) {
+            return -1;
+        }
+        let bytes_used_usize = bytes_used as usize;
+        if bytes_used_usize > chunk.len() {
+            throw_rocksdb(
+                env,
+                &format!("{context}: native bytesUsed exceeds chunk capacity"),
+            );
+            return -1;
+        }
+        if decode_vec_prefix_chunk_to_buffers(
             env,
-            &format!("{context}: native bytesUsed exceeds chunk capacity"),
-        );
-        return -1;
-    }
-    if decode_vec_prefix_chunk_to_buffers(
-        env,
-        &chunk[..bytes_used_usize],
-        row_count,
-        &buffers,
-        context,
-    )
-    .is_none()
-    {
-        return -1;
-    }
-    pack_prefix_chunk_result(row_count, eof != 0)
+            &chunk[..bytes_used_usize],
+            row_count,
+            &buffers,
+            context,
+        )
+        .is_none()
+        {
+            return -1;
+        }
+        pack_prefix_chunk_result(row_count, eof != 0)
+    })
 }
 
 fn prefix_lookup_next_chunk_compat_handle_inner(
