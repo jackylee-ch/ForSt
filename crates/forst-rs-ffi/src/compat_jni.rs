@@ -3186,35 +3186,22 @@ fn prefix_lookup_open_inner(
     prefix_len: jint,
     context: &str,
 ) -> jlong {
+    let Some(frs_cf) = cf_from_java_or_default(env, handle, cf_handle, context) else {
+        return 0_i64;
+    };
     // null prefix or len==0 -> full scan (matches FFI semantics).
     let prefix_obj: &JObject = prefix.as_ref();
     let is_empty = prefix_obj.is_null() || prefix_len == 0;
     let mut iter: FrsIterator = ptr::null_mut();
     let status = if is_empty {
         // SAFETY: NULL prefix is allowed by frs_prefix_lookup_open.
-        unsafe {
-            frs_prefix_lookup_open(
-                handle as FrsDb,
-                cf_handle as FrsCfHandle,
-                ptr::null(),
-                0,
-                &mut iter,
-            )
-        }
+        unsafe { frs_prefix_lookup_open(handle as FrsDb, frs_cf, ptr::null(), 0, &mut iter) }
     } else {
         let Some(p) = read_byte_slice(env, prefix, prefix_off, prefix_len) else {
             return 0_i64;
         };
         // SAFETY: p is a stack-local Vec<u8>; engine copies bounds.
-        unsafe {
-            frs_prefix_lookup_open(
-                handle as FrsDb,
-                cf_handle as FrsCfHandle,
-                p.as_ptr(),
-                p.len(),
-                &mut iter,
-            )
-        }
+        unsafe { frs_prefix_lookup_open(handle as FrsDb, frs_cf, p.as_ptr(), p.len(), &mut iter) }
     };
     if check_status(env, status, context) {
         return 0_i64;
