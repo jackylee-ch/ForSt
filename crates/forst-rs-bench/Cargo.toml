@@ -148,3 +148,11 @@ path = "src/bin/scan_cold_start.rs"
 [[bin]]
 name = "nexmark_disagg_s3"
 path = "src/bin/nexmark_disagg_s3.rs"
+
+# FRS-WA-V2a-2-LRU (q9 KV-sep OOM fix, 2026-06-14): resident vlog-reader
+# footprint, uncapped (pre-fix) vs bounded (cap=2048), over a wide live-segment
+# set. Shows the bound takes footprint from O(segments) to O(cap). Wall-clock
+# bin (not criterion); takes --smoke for CI (asserts the bound holds).
+[[bin]]
+name = "vlog_reader_cache_footprint"
+path = "src/bin/vlog_reader_cache_footprint.rs"

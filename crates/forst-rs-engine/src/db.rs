@@ -120,6 +120,27 @@ fn apply_block_size_env_override(block_size: usize) -> usize {
     }
 }
 
+/// FRS-WA-V2a-2-LRU (q9 KV-sep OOM fix, 2026-06-14): cap on the number of
+/// open value-log [`VlogReader`] handles kept resident, configurable via
+/// `FRS_VLOG_READER_CACHE_CAP`. The prior cache was an UNBOUNDED `HashMap` —
+/// under `FRS_KV_SEPARATION` + a scattered-death join (q9), segments never
+/// reach `live_bytes == 0` so the reader set (open handle + 64 KiB chunk each)
+/// grew with the run and busted the 16 g/TM cgroup (root-cause note
+/// `docs/superpowers/specs/2026-06-14-q9-kvsep-oom-rootcause.md`). The default
+/// ([`DEFAULT_VLOG_READER_CACHE_CAP`] = 2048) keeps the working set warm; a
+/// miss simply re-opens the immutable segment (correctness-trivial). Setting
+/// the knob to `0` selects the legacy UNCAPPED behaviour (mini-bench / A-B
+/// repro only). An unset/invalid value uses the default.
+fn vlog_reader_cache_cap() -> usize {
+    match std::env::var("FRS_VLOG_READER_CACHE_CAP")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+    {
+        Some(cap) => cap, // 0 == uncapped (legacy); >0 == bounded
+        None => forst_rs_storage::vlog::DEFAULT_VLOG_READER_CACHE_CAP,
+    }
+}
+
 /// FRS-SST-COMPRESSION env override (perf experiment, 2026-06-02): force the
 /// SST block compression via `FRS_SST_COMPRESSION=none|lz4|zstd`. A differential
 /// q7 profile showed LZ4 `decompress` is ~43% of the heavy-join prefix-iter CPU
@@ -972,10 +993,16 @@ pub struct DbImpl {
     lifecycle_merged: Mutex<std::collections::HashSet<FileNumber>>,
     /// FRS-WA-V2a-2: open value-log segment readers, keyed by segment id.
     /// Segments are immutable once published, so a cached reader never goes
-    /// stale; the map only grows while segments are live (V2b GC will prune
-    /// alongside segment deletion). Default path (no KV separation) never
-    /// touches it.
-    vlog_readers: RwLock<HashMap<u64, Arc<forst_rs_storage::vlog::VlogReader>>>,
+    /// stale. Default path (no KV separation) never touches it.
+    ///
+    /// FRS-WA-V2a-2-LRU (q9 KV-sep OOM fix, 2026-06-14): a BOUNDED LRU
+    /// ([`forst_rs_storage::vlog::VlogReaderCache`]) replaces the prior
+    /// unbounded `HashMap`. Cap via `FRS_VLOG_READER_CACHE_CAP` (default 2048;
+    /// `0` == legacy uncapped). Eviction drops the LRU reader (handle + 64 KiB
+    /// chunk freed); a miss re-opens the immutable segment (byte-identical).
+    /// This makes resident vlog-reader cost `O(cap)` instead of `O(segments)`,
+    /// the structure that OOM'd q9 under scattered-death joins.
+    vlog_readers: forst_rs_storage::vlog::VlogReaderCache,
     /// FRS-WA-V2b: vlog segments whose reclaim was deferred by a deletion-
     /// guard pin or a retiring-version reference (sister of
     /// `pending_deletions`); drained by `reap_pending_deletions`.
@@ -1303,7 +1330,9 @@ impl DbImpl {
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
-            vlog_readers: RwLock::new(HashMap::new()),
+            vlog_readers: forst_rs_storage::vlog::VlogReaderCache::with_capacity(
+                vlog_reader_cache_cap(),
+            ),
             pending_vlog_deletions: Mutex::new(Vec::new()),
             file_mapping: std::sync::OnceLock::new(),
             background_fill: Mutex::new(None),
@@ -2204,10 +2233,7 @@ impl DbImpl {
                         self.delete_file_guarded(*file_number);
                     }
                     for segment_id in &deleted_vlogs {
-                        self.vlog_readers
-                            .write()
-                            .expect("lock poisoned")
-                            .remove(segment_id);
+                        self.vlog_readers.remove(*segment_id);
                         self.delete_vlog_guarded(*segment_id);
                     }
                     self.reap_pending_deletions();
@@ -6764,7 +6790,9 @@ impl DbImpl {
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
-            vlog_readers: RwLock::new(HashMap::new()),
+            vlog_readers: forst_rs_storage::vlog::VlogReaderCache::with_capacity(
+                vlog_reader_cache_cap(),
+            ),
             pending_vlog_deletions: Mutex::new(Vec::new()),
             file_mapping: std::sync::OnceLock::new(),
             background_fill: Mutex::new(None),
@@ -12674,10 +12702,7 @@ impl DbImpl {
         for seg in &dead {
             // Drop the cached reader BEFORE unlinking so a later (buggy)
             // re-open cannot resurrect a stale handle by id.
-            self.vlog_readers
-                .write()
-                .expect("lock poisoned")
-                .remove(seg);
+            self.vlog_readers.remove(*seg);
             self.delete_vlog_guarded(*seg);
         }
         tracing::info!(
@@ -12736,21 +12761,19 @@ impl DbImpl {
         &self,
         segment_id: u64,
     ) -> ForstResult<Arc<forst_rs_storage::vlog::VlogReader>> {
-        {
-            let cache = self.vlog_readers.read().expect("lock poisoned");
-            if let Some(r) = cache.get(&segment_id) {
-                return Ok(r.clone());
-            }
-        }
-        // Open WITHOUT the lock held (mirrors get_or_open_sst_reader's
-        // FRS-SST-OPEN-NOLOCK rationale), then double-checked insert.
-        let reader = Arc::new(forst_rs_storage::vlog::VlogReader::open(
-            self.fs.as_ref(),
-            Path::new(&self.db_path),
-            segment_id,
-        )?);
-        let mut cache = self.vlog_readers.write().expect("lock poisoned");
-        Ok(cache.entry(segment_id).or_insert(reader).clone())
+        // BOUNDED LRU (FRS-WA-V2a-2-LRU): a hit returns the cached reader and
+        // promotes it to MRU; a miss opens WITHOUT the cache lock held (the
+        // `open` closure runs lock-free, mirroring get_or_open_sst_reader's
+        // FRS-SST-OPEN-NOLOCK rationale), installs it, and evicts the LRU
+        // victim if the cap is exceeded. Re-open on a miss is byte-identical
+        // because a published segment is immutable.
+        self.vlog_readers.get_or_open(segment_id, || {
+            forst_rs_storage::vlog::VlogReader::open(
+                self.fs.as_ref(),
+                Path::new(&self.db_path),
+                segment_id,
+            )
+        })
     }
 
     /// FRS-WA-V2a-2: dereference a `BlobRef` row's pointer bytes to the
@@ -17537,6 +17560,91 @@ mod tests {
         );
         let rows = db.prefix_scan(&cf, b"k-").unwrap();
         assert_eq!(rows.len(), 3);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-WA-V2a-2-LRU (q9 KV-sep OOM fix, 2026-06-14): the bounded
+    /// vlog-reader cache is byte-identical to the unbounded version under a
+    /// KV-sep workload that touches FAR more segments than the cap (the q9
+    /// "wide live-segment set" shape that OOM'd). Proves end-to-end through
+    /// `vlog_deref`: (a) reads after eviction return identical values (a miss
+    /// re-opens the immutable segment); (b) the resident reader count never
+    /// exceeds the cap; (c) the cache holds at most `cap` readers at the end
+    /// (evicted readers were dropped — no handle leak).
+    #[test]
+    fn test_wa_v2a2_lru_bounded_vlog_reader_cache_evict_then_read() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        // Tiny cap, set BEFORE open() so the DB builds its VlogReaderCache
+        // with it (the knob is read at construction).
+        std::env::set_var("FRS_VLOG_READER_CACHE_CAP", "4");
+        let cap = 4usize;
+
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("unb"))
+            .unwrap();
+
+        // Each flush of a KV-sep CF creates exactly ONE vlog segment. Drive
+        // 40 segments (10× the cap) with a distinct big (>min_blob_size)
+        // value per key so a wrong-segment re-open would be caught byte-wise.
+        let n = 40u32;
+        let mk_val = |i: u32| -> Vec<u8> {
+            (0..300u32)
+                .map(|j| (i.wrapping_mul(131).wrapping_add(j)) as u8)
+                .collect()
+        };
+        let mut expected: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let key = format!("k-{i:04}").into_bytes();
+            let val = mk_val(i);
+            db.put(&cf, &key, &val).unwrap();
+            db.switch_and_flush(&cf).unwrap().expect("flushed");
+            expected.push((key, val));
+        }
+        assert_eq!(
+            db.version_set.current().vlog_segments.len(),
+            n as usize,
+            "one live segment per flush (GC is V2b; cutoff 0 here)"
+        );
+
+        // (a)+(b): read EVERY key back (most segments are evicted → re-open
+        // path) and assert byte-identical, with the cap held throughout.
+        for (key, val) in &expected {
+            assert_eq!(
+                db.get(&cf, key).unwrap().as_deref(),
+                Some(&val[..]),
+                "value for {:?} after eviction must be byte-identical",
+                String::from_utf8_lossy(key)
+            );
+            assert!(
+                db.vlog_readers.len() <= cap,
+                "resident vlog readers {} exceeded cap {}",
+                db.vlog_readers.len(),
+                cap
+            );
+        }
+
+        // (c): no handle leak — at the end the cache holds at most `cap`
+        // readers even though n=40 segments were dereferenced.
+        assert!(
+            db.vlog_readers.len() <= cap,
+            "final resident readers {} must be <= cap {} (evicted readers dropped)",
+            db.vlog_readers.len(),
+            cap
+        );
+        assert_eq!(db.vlog_readers.capacity(), cap);
+
+        // A vectorized batch get spanning many evicted segments also derefs
+        // byte-exactly (the vectorized read arm shares vlog_deref).
+        let keys: Vec<&[u8]> = expected.iter().map(|(k, _)| k.as_slice()).collect();
+        let got = db.batch_get(&cf, &keys).unwrap();
+        for (i, (_, val)) in expected.iter().enumerate() {
+            assert_eq!(got[i].as_deref(), Some(&val[..]), "batch deref row {i}");
+        }
+        assert!(db.vlog_readers.len() <= cap, "batch get held the cap too");
+
+        std::env::remove_var("FRS_VLOG_READER_CACHE_CAP");
         set_kv_separation_override(None);
     }
 

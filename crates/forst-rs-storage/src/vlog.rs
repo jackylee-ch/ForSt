@@ -47,6 +47,7 @@
 //! (`DbImpl::kv_sep_spec_for`).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use forst_rs_common::{crc32c, CompressionType, ForstError, ForstResult};
 use forst_rs_io::{FileSystem, RandomAccessFile, WriteMode};
@@ -316,6 +317,161 @@ impl VlogReader {
     }
 }
 
+/// FRS-WA-V2a-2-LRU (q9 KV-sep OOM fix, 2026-06-14): default cap on the
+/// number of open [`VlogReader`] handles a DB keeps resident. See the
+/// root-cause note `docs/superpowers/specs/2026-06-14-q9-kvsep-oom-rootcause.md`:
+/// the prior cache was an UNBOUNDED `HashMap<u64, Arc<VlogReader>>` — under
+/// `FRS_KV_SEPARATION` + a scattered-death join (q9), segments never reach
+/// `live_bytes == 0`, so the reader set (open file handle + 64 KiB chunk
+/// buffer each) grew with the run and busted the cgroup. A generous default
+/// keeps the working set warm; re-open on a miss is always safe because a
+/// segment is immutable once any pointer to it is version-visible.
+pub const DEFAULT_VLOG_READER_CACHE_CAP: usize = 2048;
+
+/// Bounded LRU cache of open [`VlogReader`] handles, keyed by segment id.
+///
+/// **Correctness:** byte-identical to an unbounded cache for every read — a
+/// vlog segment is immutable once published, so an evicted reader simply
+/// re-opens on the next access and returns the same bytes. Eviction drops the
+/// victim `Arc<VlogReader>` (closing its file handle + freeing its chunk
+/// buffer once no in-flight `get` still holds a clone).
+///
+/// **Bound:** the resident reader count never exceeds `cap` (proved by
+/// [`Self::len`] in tests). Resident vlog-reader cost is therefore `O(cap)`,
+/// independent of the number of segments the run ever touches.
+///
+/// **Discipline:** mirrors the lazy-LRU recency deque used by the SST block
+/// `local_cache` (`local_cache.rs`) — a `VecDeque<u64>` records access order,
+/// dedup happens at eviction time, and a victim is only evicted once it is no
+/// longer the live MRU entry. A `cap == 0` configuration is treated as
+/// "uncapped" so a mini-bench / A-B can reproduce the pre-fix behaviour.
+pub struct VlogReaderCache {
+    inner: std::sync::Mutex<VlogReaderCacheInner>,
+    cap: usize,
+}
+
+struct VlogReaderCacheInner {
+    /// O(1) lookup of resident readers by segment id.
+    readers: std::collections::HashMap<u64, Arc<VlogReader>>,
+    /// Access-recency order (front = LRU victim, back = MRU). May hold stale
+    /// duplicates; the live entry is the one still present in `readers`.
+    lru: std::collections::VecDeque<u64>,
+}
+
+impl VlogReaderCache {
+    /// Builds a cache bounded to `cap` resident readers. `cap == 0` means
+    /// UNCAPPED (used only by the mini-bench / pre-fix A-B arm).
+    pub fn with_capacity(cap: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(VlogReaderCacheInner {
+                readers: std::collections::HashMap::new(),
+                lru: std::collections::VecDeque::new(),
+            }),
+            cap,
+        }
+    }
+
+    /// The configured capacity (0 == uncapped).
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Number of resident readers. Never exceeds `cap` when `cap > 0`.
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .readers
+            .len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the resident reader for `segment_id` if present, promoting it
+    /// to MRU. Used for the lock-free fast path before an open.
+    pub fn get(&self, segment_id: u64) -> Option<Arc<VlogReader>> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(r) = g.readers.get(&segment_id).cloned() {
+            g.lru.push_back(segment_id);
+            Some(r)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the cached reader for `segment_id`, or opens one via `open`,
+    /// inserting it and evicting the LRU victim if the cap is exceeded. The
+    /// `open` closure runs WITHOUT the cache lock held; a concurrent open of
+    /// the same id resolves to a single resident reader (first writer wins,
+    /// the loser's freshly-opened handle is dropped).
+    pub fn get_or_open<F>(&self, segment_id: u64, open: F) -> ForstResult<Arc<VlogReader>>
+    where
+        F: FnOnce() -> ForstResult<VlogReader>,
+    {
+        if let Some(r) = self.get(segment_id) {
+            return Ok(r);
+        }
+        let opened = Arc::new(open()?);
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        // Double-check: a racing opener may have installed it meanwhile.
+        if let Some(r) = g.readers.get(&segment_id).cloned() {
+            g.lru.push_back(segment_id);
+            return Ok(r);
+        }
+        g.readers.insert(segment_id, opened.clone());
+        g.lru.push_back(segment_id);
+        Self::evict_to_cap(&mut g, self.cap);
+        Ok(opened)
+    }
+
+    /// Explicitly drops the reader for a dead/retired segment (called when a
+    /// segment reaches `live_bytes == 0` and is unlinked). Idempotent.
+    pub fn remove(&self, segment_id: u64) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.readers.remove(&segment_id);
+        // The stale `lru` entry (if any) is pruned lazily at eviction time.
+    }
+
+    /// Lazy-LRU eviction: while over `cap`, pop the front of the recency
+    /// deque and evict it IFF it is still the live entry AND not a stale
+    /// duplicate (a later access re-pushed it to the back). Bounded work per
+    /// call: each pop either evicts (reduces `readers`) or skips a stale id.
+    fn evict_to_cap(g: &mut VlogReaderCacheInner, cap: usize) {
+        if cap == 0 {
+            return; // uncapped (mini-bench / pre-fix arm)
+        }
+        while g.readers.len() > cap {
+            let Some(victim) = g.lru.pop_front() else {
+                break; // recency deque drained; nothing more to evict
+            };
+            // Skip stale duplicates: an id later in the deque means this is
+            // not the true LRU position for `victim`.
+            if g.lru.contains(&victim) {
+                continue;
+            }
+            // Live victim → evict (drop the Arc; handle + buffer free once
+            // any in-flight `get` clone is released).
+            g.readers.remove(&victim);
+        }
+        // Keep the recency deque from growing without bound under heavy
+        // re-touch: if it has accumulated many stale duplicates, rebuild it
+        // from the resident set (mirrors local_cache.rs's stale-compaction).
+        if g.lru.len() > g.readers.len().saturating_mul(2) + 64 {
+            let mut fresh: std::collections::VecDeque<u64> =
+                std::collections::VecDeque::with_capacity(g.readers.len());
+            let mut seen = std::collections::HashSet::with_capacity(g.readers.len());
+            for id in g.lru.iter().rev() {
+                if g.readers.contains_key(id) && seen.insert(*id) {
+                    fresh.push_front(*id);
+                }
+            }
+            g.lru = fresh;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +644,195 @@ mod tests {
             VlogWriter::create(&fs, dir, 3).is_err(),
             "segment ids are allocate-once"
         );
+    }
+
+    // ---- FRS-WA-V2a-2-LRU: bounded vlog-reader cache (q9 OOM fix) ----
+
+    /// Writes `n_segments` single-value segments to `dir`, returning the
+    /// (segment_id, pointer, expected_bytes) for each so a test can read back
+    /// and byte-compare across eviction.
+    fn write_kvsep_segments(
+        fs: &MemoryFileSystem,
+        dir: &Path,
+        n_segments: u64,
+    ) -> Vec<(u64, ValuePointer, Vec<u8>)> {
+        let mut out = Vec::with_capacity(n_segments as usize);
+        for seg in 1..=n_segments {
+            // Distinct payload per segment (carries the segment id) so an
+            // eviction-induced re-open that returned the WRONG segment's bytes
+            // would be caught.
+            let payload: Vec<u8> = (0..200u32)
+                .map(|i| (seg.wrapping_mul(31).wrapping_add(i as u64)) as u8)
+                .collect();
+            let mut w = VlogWriter::create(fs, dir, seg).unwrap();
+            let p = w.append(&payload).unwrap();
+            w.sync().unwrap();
+            out.push((seg, p, payload));
+        }
+        out
+    }
+
+    /// (b) The cache never exceeds its cap when the touched-segment set far
+    /// exceeds the cap (the q9 "wide live-segment set" shape).
+    #[test]
+    fn test_vlog_reader_cache_respects_cap() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 200);
+
+        let cap = 16;
+        let cache = VlogReaderCache::with_capacity(cap);
+        for (seg, _p, _v) in &segs {
+            let s = *seg;
+            cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+            assert!(
+                cache.len() <= cap,
+                "resident readers {} exceeded cap {}",
+                cache.len(),
+                cap
+            );
+        }
+        assert_eq!(cache.len(), cap, "warm cache should be exactly at cap");
+    }
+
+    /// (a) Reads AFTER eviction return byte-identical values (a miss just
+    /// re-opens the immutable segment). Workload exceeds the cap, so every
+    /// segment except the last `cap` has been evicted and must re-open.
+    #[test]
+    fn test_vlog_reader_cache_evict_then_read_byte_identical() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 128);
+
+        let cap = 8;
+        let cache = VlogReaderCache::with_capacity(cap);
+        // Warm-touch all segments in order → only the last `cap` stay resident.
+        for (seg, _p, _v) in &segs {
+            let s = *seg;
+            cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+        }
+        assert_eq!(cache.len(), cap);
+
+        // Now read EVERY segment back (early ones are evicted → re-open path)
+        // and assert byte-identical to what was written.
+        for (seg, p, expected) in &segs {
+            let s = *seg;
+            let r = cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+            assert_eq!(
+                &r.get(p).unwrap(),
+                expected,
+                "segment {s} bytes after evict"
+            );
+            assert!(cache.len() <= cap, "cap still held during re-read");
+        }
+    }
+
+    /// (c) Evicted readers are actually DROPPED — no handle leak. Holding a
+    /// clone of a reader does not keep it resident in the cache; once evicted
+    /// and the external clone released, the only strong ref is gone.
+    #[test]
+    fn test_vlog_reader_cache_evicts_drop_no_leak() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 64);
+
+        let cap = 4;
+        let cache = VlogReaderCache::with_capacity(cap);
+
+        // Open segment 1 and keep an external clone.
+        let first = segs[0].0;
+        let held = cache
+            .get_or_open(first, || VlogReader::open(&fs, dir, first))
+            .unwrap();
+        // strong refs: cache + `held` == 2.
+        assert_eq!(Arc::strong_count(&held), 2);
+
+        // Touch enough OTHER segments to push segment 1 out of the cache.
+        for (seg, _p, _v) in segs.iter().skip(1) {
+            let s = *seg;
+            cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+        }
+        assert!(cache.get(first).is_none(), "segment 1 must be evicted");
+        // The cache released its strong ref on eviction → only `held` remains.
+        assert_eq!(
+            Arc::strong_count(&held),
+            1,
+            "evicted reader's cache ref must be dropped (no handle leak)"
+        );
+
+        // Explicit remove() of an absent id is a no-op (idempotent).
+        cache.remove(first);
+        assert!(cache.len() <= cap);
+
+        // Drop the external clone → reader fully reclaimed.
+        drop(held);
+
+        // Re-open segment 1 from scratch → byte-identical (proves the evicted
+        // handle did not corrupt or pin anything).
+        let (s1, p1, v1) = &segs[0];
+        let s = *s1;
+        let r = cache
+            .get_or_open(s, || VlogReader::open(&fs, dir, s))
+            .unwrap();
+        assert_eq!(&r.get(p1).unwrap(), v1);
+    }
+
+    /// `cap == 0` means UNCAPPED (the mini-bench / pre-fix A-B arm): the
+    /// resident set grows with the touched-segment count.
+    #[test]
+    fn test_vlog_reader_cache_zero_cap_is_uncapped() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 50);
+
+        let cache = VlogReaderCache::with_capacity(0);
+        for (seg, _p, _v) in &segs {
+            let s = *seg;
+            cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+        }
+        assert_eq!(cache.len(), 50, "cap==0 keeps every reader resident");
+    }
+
+    /// Re-touching an entry promotes it to MRU so it survives eviction (true
+    /// LRU victim selection, mirrors local_cache.rs).
+    #[test]
+    fn test_vlog_reader_cache_lru_promotes_retouched() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 10);
+
+        let cap = 3;
+        let cache = VlogReaderCache::with_capacity(cap);
+        // Fill: 1,2,3 resident.
+        for seg in 1..=3u64 {
+            cache
+                .get_or_open(seg, || VlogReader::open(&fs, dir, seg))
+                .unwrap();
+        }
+        // Re-touch segment 1 → now LRU order is 2 (oldest), 3, 1 (MRU).
+        assert!(cache.get(1).is_some());
+        // Insert segment 4 → evicts segment 2, NOT segment 1.
+        cache
+            .get_or_open(4, || VlogReader::open(&fs, dir, 4))
+            .unwrap();
+        assert!(cache.get(1).is_some(), "re-touched seg 1 must survive");
+        assert!(cache.get(2).is_none(), "seg 2 was the true LRU victim");
+        assert_eq!(cache.len(), cap);
+        let _ = &segs; // segments exist on disk for the re-opens above
     }
 }
