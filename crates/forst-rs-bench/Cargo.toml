@@ -134,6 +134,13 @@ path = "src/bin/disagg_vs_forst.rs"
 name = "remote_compaction_offload"
 path = "src/bin/remote_compaction_offload.rs"
 
+# FRS-PHASE2 cycle-1 evidence: k-way scan cold-start serial-vs-concurrent
+# first-block prime under a modeled remote-GET RTT. Quantifies the L1×L4
+# cache-miss-tail latency the merge head-seed loop pays serially. --smoke for CI.
+[[bin]]
+name = "scan_cold_start"
+path = "src/bin/scan_cold_start.rs"
+
 # FRS-PHASE2 NEXMARK-shaped disagg validation: drives q5/q7/q9-q20/q4 query-
 # shaped state workloads through the full disaggregated path on fs-emulation,
 # disagg-ON vs disagg-OFF, with a correctness gate + S3 bandwidth projection.
