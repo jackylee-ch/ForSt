@@ -23,8 +23,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use arc_swap::ArcSwap;
-use forst_rs_common::types::FileNumber;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use forst_rs_common::types::{FileNumber, KeyRange};
 use forst_rs_common::{CfOptions, ColumnFamilyId};
 use forst_rs_storage::memtable::{MemTableConfig, ShardedMemTable};
 use forst_rs_storage::merge_operator::MergeOperator;
@@ -504,6 +504,17 @@ pub struct ColumnFamilyData {
     /// event-time inside the sealed memtable — the sound (never premature)
     /// basis for a segment's death stamp `max_event_time + ttl`.
     max_event_time: AtomicU64,
+    /// FRS-PHASE2-C2U3 (rescale-by-clip, design §10): when set, the CF only
+    /// SERVES keys within this half-open `KeyRange` — a key-group sub-range
+    /// adopted by a rescaled restore (paper §5.2). Out-of-range keys may
+    /// remain physically present in boundary SSTs / a WAL-DELTA-restored
+    /// memtable, but the read path (point-get + range/prefix scan) prunes
+    /// them at the QUERY boundary so they are never observable. `None` (the
+    /// default for every non-clipped CF) = no restriction; the read path
+    /// takes its exact pre-change branch (byte-identical). Post-create
+    /// swappable like `lifecycle`/`compaction_filter`; reclamation of the
+    /// out-of-range remainder is left to normal compaction (design §10 DR4).
+    clip_range: ArcSwapOption<KeyRange>,
 }
 
 /// FRS-RESIDENT-FLUSHED entry: a flushed memtable retained in RAM, tagged with
@@ -595,6 +606,42 @@ impl ColumnFamilyData {
             lifecycle: RwLock::new(CfLifecycle::default()),
             watermark: AtomicU64::new(0),
             max_event_time: AtomicU64::new(0),
+            clip_range: ArcSwapOption::empty(),
+        }
+    }
+
+    /// FRS-PHASE2-C2U3 (rescale-by-clip, design §10): returns the CF's
+    /// rescale clip range, if one was set (a key-group sub-range adopted by
+    /// a rescaled restore). `None` = no restriction (the default). Cheap
+    /// lock-free load on the read hot path.
+    #[inline]
+    pub fn clip_range(&self) -> Option<Arc<KeyRange>> {
+        self.clip_range.load_full()
+    }
+
+    /// FRS-PHASE2-C2U3: installs (or clears) the CF's rescale clip range.
+    /// Setting an EMPTY range (`start >= end`) is rejected — a CF that
+    /// serves no keys is never the intent (callers pass the assigned
+    /// key-group sub-range). `None` clears the restriction.
+    pub fn set_clip_range(&self, range: Option<KeyRange>) {
+        match range {
+            Some(r) if r.is_empty() => {
+                // Defensive: an empty clip would silently hide ALL state.
+                // Treat as a no-op CLEAR rather than bricking the CF — but
+                // WARN, because a caller that computed an empty sub-range by
+                // mistake will now see the CF's FULL state (the opposite of
+                // "serves no keys"). The restore entry point rejects empties
+                // loudly; this setter is the post-open path.
+                tracing::warn!(
+                    range = %r,
+                    "FRS-PHASE2-C2U3: set_clip_range given an EMPTY range \
+                     (start >= end) — clearing the clip (CF serves FULL state); \
+                     pass the assigned non-empty key-group sub-range"
+                );
+                self.clip_range.store(None);
+            }
+            Some(r) => self.clip_range.store(Some(Arc::new(r))),
+            None => self.clip_range.store(None),
         }
     }
 

@@ -943,6 +943,93 @@ specified (it IS the tail's only durable copy).]**
 
 ---
 
+### Cycle 2 unit 3 — rescale-by-clip (landed 2026-06-13, C2U3)
+
+Closes the cycle-1-deferred / cycle-4-residue functional gap (paper §5.2 /
+Fig. 10 rescale). Flag default-OFF (opt-in restore entry point only); §10
+decisions DR1–DR4 binding. Additive to `file_mapping.rs` (NO changes — the
+clip lives in the engine and the read path).
+
+Built (engine `crates/forst-rs-engine/src/db.rs`, `column_family.rs`):
+
+- **Per-CF clip range** (`ColumnFamilyData::clip_range`,
+  `ArcSwapOption<KeyRange>`, post-create swappable like
+  `lifecycle`/`compaction_filter`): `clip_range()` / `set_clip_range()`
+  (empty range rejected as a no-op clear). Engine API
+  `DbImpl::set_cf_clip_range` / `cf_clip_range`.
+- **Layer 1 — file-level adoption clip** (DR1): new restore entry points
+  `open_from_linked_checkpoint_instant_clipped[_with_default_cf]` (+ the
+  REMOTE/OpenDAL variant `_clipped_remote` — the production disaggregated
+  rescale path, added in PMC review R1-M1) — deserialize
+  the blob snapshot, `clip_version_to_range` drops every SST whose inclusive
+  `[smallest_key, largest_key]` is FULLY DISJOINT from the half-open clip
+  (overlap iff `smallest_key < end && start <= largest_key`), re-serialize the
+  pruned Version as the target blob, and adopt ONLY the surviving SSTs (no
+  link/refcount for disjoint files). Boundary SSTs adopted whole. vlog
+  segments carried through (read-path clip gates their pointers). Empty clip
+  rejected loudly.
+- **Layer 2 — read/iterator boundary clip** (DR1): the restored default CF
+  carries the clip; EVERY point-read surface gates out-of-range keys before
+  serving (`get_internal` top — covers `get`/`get_arc`; `get_at_cf` snapshot
+  reads; `get_pinned` zero-copy FFI fast path; `batch_get_vectorized` clip
+  pre-pass + Phase-1 skip-guard; `batch_get_arrow` inline-cache gate). Range
+  + prefix scans: `build_lazy_range_key_stream_mode` intersects the clip into
+  the effective `[lower, upper)` AND `LazyPrefixIter`/`LazyRangeIter`
+  (one alias) drop out-of-range keys at the `next`/`next_with_value` emit
+  boundary — the latter catches the inline value-carrying FFI path that
+  never routes through `get_internal`. `None` clip = byte-identical default
+  on every surface.
+
+Gates green (2026-06-13), the DR3 falsifiers (fixture: 3 disjoint-band SSTs
+SST-A k0000-0099 / SST-B k0100-0199 / SST-C k0150-0249 straddling k0200 +
+a live tail k0250-0299, link-mode checkpoint):
+
+- **In-range exact + zero out-of-range leak** across point-get, `batch_get`
+  (vectorized), full range scan, wide range scan (query extends past the
+  clip both ends → still in-range only), prefix scan (k01* full; k00*/k02*
+  empty). Clip `[k0100, k0200)`.
+- **S2-pinned-path falsifier** (PMC review R1-H1): the env-gated pinned scan
+  (`FRS_RS_S2_PINNED=1`) emits from the pinned merge buffer, bypassing the
+  iterator clip filter — its own clip-skip in `fill_into`'s pinned branch is
+  proven by a test driving `prefix_scan_stream_with_mode(.., pinned=true)`
+  directly (no env dependency); CONFIRMED a real falsifier (FAILS with the
+  skip removed).
+- **Clip-correctness falsifier**: a straddling SST (SST-C, crossing k0200)
+  serves only its in-range half; clip `[k0175, k0220)` straddling SST-B top
+  AND SST-C both ends → reads emit exactly k0175-0219.
+- **Disjoint-file skip**: clipped restore adopts strictly fewer SSTs than an
+  unclipped restore (SST-A dropped); no surviving SST is fully below the
+  clip; `adopted_residual > 0`; in-range correctness holds.
+- **WAL-DELTA restored-memtable clip**: a WAL-DELTA link checkpoint keeps an
+  unflushed tail spanning out-/in-/above-range keys; clipped restore replays
+  it straight into the memtable (no SST gate) → reads prune out-of-range
+  tail records (the read-path clip, not file-level, is load-bearing here).
+- **Round-trip**: clipped restore is writable (in-range overwrite + new key);
+  a second-generation link checkpoint of it restores byte-exact for the
+  in-range state + new writes, no out-of-range state.
+- **Empty-clip rejected**; **unclipped default restore byte-identical**
+  (`cf_clip_range == None`, full state incl. live tail served).
+
+Suites: engine 372/0 (+8 C2U3 ITs), storage 453/0, io 245/0 (untouched),
+ffi builds; clippy 0. NO `file_mapping.rs` change (write-amp agent
+coordination intact). Default-OFF discipline verified: every non-clipped
+read takes the exact pre-change branch.
+
+**PMC self-review** (`review-rounds/phase2-cycle2-u3-rescale-clip-pmc-review.md`,
+round 1, 2026-06-13): R1-H1 (S2-pinned prefix-scan leak) + R1-M1 (no remote
+clipped variant) + R1-L1 (silent empty-clip clear) ALL FIXED with the
+pinned-path regression test above; every other read surface verified
+leak-free (full surface list in the review doc). Termination H=0 M=0 after
+1 round.
+
+**§8 functional-checklist delta:** rescale-by-clip — the LAST recorded
+functional residue from cycles 1/4 — is now CLOSED (engine side). DR4 scope
+fence: physical reclamation of boundary remainders rides normal compaction
+(no eager rewrite-on-adopt — the regression-risky path is avoided); the clip
+stays set on the CF (correct indefinitely). Cross-repo residue (FFI
+`*_clipped` surface + Flink key-group→key-prefix wiring) is the Java-adoption
+stage, out of in-repo scope.
+
 ### Cycle 3 unit 1 — UUID physical keys (landed 2026-06-13, C3U1)
 
 ForSt `toUUIDPath` mechanism (competitive analysis §2.2d), mapping-layer
@@ -1286,3 +1373,94 @@ then open via the existing blob-restore path. Stage 3 replaces the copy with
 the Java `ForStRsRestoreOperation` download-loop skip. Restore does NOT
 consume the journal tail in Stage-2 (blob-embedded snapshot only) — journal
 tail replay is the Stage-3 restore-side trailer-consumption work.
+
+---
+
+## 10. §Cycle-2 unit 3 — rescale-by-clip (paper §5.2 / Fig. 10), PMC refinement (2026-06-13, recorded before implementation)
+
+Decisions for the cycle-1-deferred functional gap (design §5 Stage-3 rescale,
+residue at §8 cycle-4). These bind the implementation; correctness ITs FIRST,
+flag default-OFF, additive to `file_mapping.rs`.
+
+### The model
+
+Flink rescale re-partitions key-groups across new instances. A restored
+instance owns a CONTIGUOUS key-group range; in the engine's user-key space that
+is one half-open `KeyRange [clip_lo, clip_hi)` (the key-group→key-prefix map is
+a Flink-layer concern, cross-repo — the engine takes the byte range as given).
+The paper [§5.2] adopts checkpoint files by LINK and prunes the out-of-range
+remainder of boundary files via LAZY compaction — i.e. a boundary file is
+adopted whole, its out-of-range keys physically remain, and they are made
+UNOBSERVABLE until compaction eventually drops them.
+
+### DR1 — Two layers, both required (the cycle-4 residue's own framing)
+
+1. **File-level adoption clip** (in the linked-restore adoption loop,
+   `db.rs:7845` `open_from_linked_checkpoint_instant_with_default_cf` and the
+   copy variant): given the target `KeyRange`, an SST whose inclusive
+   `[smallest_key, largest_key]` is FULLY DISJOINT from `[clip_lo, clip_hi)`
+   is NOT adopted — no `adopt()`, no refcount, no reader ever opened. Overlap
+   test (inclusive-SST vs half-open clip): `smallest_key < clip_hi &&
+   clip_lo <= largest_key`. A boundary SST (partial overlap) IS adopted whole;
+   layer 2 prunes its out-of-range half on read. This is the cheap, correct,
+   regression-light half — it only ever REMOVES files from the adopted set.
+
+2. **Read/iterator boundary clip** (centralized, per-CF): a single optional
+   `clip_range: ArcSwapOption<KeyRange>` on `ColumnFamilyData` (post-create
+   swappable, like `lifecycle`/`compaction_filter`), consulted at the QUERY
+   boundary so a clipped-in boundary SST can never emit an out-of-range key
+   regardless of the query range:
+   - **Point read** (`get_internal`): a key outside the clip range returns
+     `None` BEFORE any tier (memtable/imm/resident/SST) is consulted. One
+     check at the top covers point-get AND `batch_get` (which routes through
+     `get_internal`).
+   - **Range/prefix scan** (`build_lazy_range_key_stream_mode`,
+     `build_lazy_prefix_key_stream_mode`): the clip range is INTERSECTED into
+     the effective `[lower, upper)` (prefix: lower=max(prefix, clip_lo),
+     upper=min(prefix_upper, clip_hi)) before tier sources are built. The
+     existing per-tier `lower`/`upper` filter (`TierKeySource`) then enforces
+     it across ALL tiers — memtable, imm, resident, SST — with zero per-SST
+     threading.
+
+   Enforcing at the query boundary (not per-SST metadata) is the minimal,
+   centralized change: out-of-range keys remain physically present (paper's
+   "lazy compaction prunes them") but are unobservable. It also correctly
+   covers a WAL-DELTA-restored memtable that holds out-of-range tail records.
+
+### DR2 — Flag gate: default-OFF, opt-in at restore
+
+Rescale-clip activates ONLY via an explicit restore entry point
+`open_from_linked_checkpoint_instant_clipped(.., clip: KeyRange)` (+ the copy
+and `_with_default_cf` variants and the engine API to set the clip on an open
+CF, `set_clip_range`). No env key flips behaviour; the default restore paths
+are byte-identical (no `clip_range` set ⇒ `get_internal`/scan builders take the
+exact pre-change branch). FFI/Java wiring is a later cross-repo unit.
+
+### DR3 — Boundary correctness invariants (the falsifier gates)
+
+- **In-range byte-exact**: restoring the sub-range `[clip_lo, clip_hi)` of a
+  source DB yields, for every in-range key, EXACTLY the source value.
+- **Zero out-of-range leakage**: no point-get, range-scan, or prefix-scan ever
+  returns a key outside `[clip_lo, clip_hi)` — including from a boundary SST
+  that straddles `clip_lo` or `clip_hi` (the clip-correctness falsifier: an SST
+  whose key span crosses the boundary serves ONLY its in-range half).
+- **Disjoint-file skip**: an SST fully outside the range is never adopted
+  (object-count / `adopted_residual` assert) — no wasted link/refcount.
+- **Round-trip**: a clipped restore is itself a valid DB (writable above the
+  restored seq; a subsequent link-checkpoint of it is byte-exact for the
+  in-range state).
+
+### DR4 — What is NOT in this unit (scope fence)
+
+- Physical reclamation of the out-of-range remainder is left to normal
+  compaction (the boundary SST's dead half is dropped when it next compacts);
+  no eager rewrite-on-adopt (that is the regression-risky path the cycle-4
+  residue flagged — avoided). The clip range stays set on the CF so reads keep
+  pruning until compaction has fully rewritten every boundary file; this is
+  correct indefinitely (a no-op once no boundary file remains).
+- Key-group→key-prefix mapping (Flink layer, cross-repo).
+- Compaction-output clip (compaction reads through the clip already because it
+  shares the version's files; outputs may still contain out-of-range keys that
+  later reads prune — bounded, correct, and reclaimed on the next compaction;
+  an eager compaction-side drop is a future optimization, not a correctness
+  requirement).

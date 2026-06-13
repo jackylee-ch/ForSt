@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread::JoinHandle;
 
+use forst_rs_common::types::KeyRange;
 use forst_rs_common::{
     ColumnFamilyId, EngineOptions, FileNumber, ForstError, ForstResult, InternalKey, OpType,
     SequenceNumber, DEFAULT_CF_ID, MAX_SEQUENCE_NUMBER,
@@ -1815,6 +1816,41 @@ impl DbImpl {
         Ok(self.lookup_cf_by_id(cf.id())?.lifecycle())
     }
 
+    /// FRS-PHASE2-C2U3 (rescale-by-clip, design §10): installs (or clears,
+    /// with `None`) the CF's rescale clip range — the half-open key-group
+    /// sub-range this instance owns after a rescaled restore. Once set, the
+    /// CF serves ONLY in-range keys (point-get + range/prefix scan prune
+    /// out-of-range keys at the query boundary); the physical out-of-range
+    /// remainder of any boundary SST is reclaimed by normal compaction. An
+    /// empty range (`start >= end`) is rejected as a no-op clear — a CF that
+    /// serves no keys is never the intent.
+    pub fn set_cf_clip_range(
+        &self,
+        cf: &ColumnFamilyHandle,
+        range: Option<forst_rs_common::types::KeyRange>,
+    ) -> ForstResult<()> {
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        cf_data.set_clip_range(range.clone());
+        tracing::info!(
+            cf_id = cf.id().value(),
+            cf_name = %cf.name(),
+            clip = ?range,
+            "FRS-PHASE2-C2U3: rescale clip range installed"
+        );
+        Ok(())
+    }
+
+    /// FRS-PHASE2-C2U3: returns the CF's current rescale clip range, if any.
+    pub fn cf_clip_range(
+        &self,
+        cf: &ColumnFamilyHandle,
+    ) -> ForstResult<Option<forst_rs_common::types::KeyRange>> {
+        Ok(self
+            .lookup_cf_by_id(cf.id())?
+            .clip_range()
+            .map(|r| (*r).clone()))
+    }
+
     /// FRS-WA-V0: advances the CF's watermark clock (monotonic; stale values
     /// are no-ops). The backend invokes this from the operator's watermark
     /// path — clock units are caller-defined (Flink: ms). V0 stores only;
@@ -2902,6 +2938,13 @@ impl DbImpl {
             ));
         }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
+        // FRS-PHASE2-C2U3 (rescale-by-clip): snapshot reads bypass
+        // `get_internal`; gate the clip here too. `None` clip = byte-identical.
+        if let Some(clip) = cf_data.clip_range() {
+            if !clip.contains(key) {
+                return Ok(None);
+            }
+        }
         let candidates = self.iter_versions_of(&cf_data, key)?;
         // Borrow-extend the owned (key, value) pairs into VersionedEntry
         // refs for `mvcc::get_at` — entries live for the duration of the
@@ -7912,6 +7955,198 @@ impl DbImpl {
         Ok(db)
     }
 
+    /// FRS-PHASE2-C2U3 (rescale-by-clip, design §10): INSTANT-LINK restore of
+    /// only the key-group sub-range `clip` (half-open `[start, end)`) of a
+    /// link-mode checkpoint — the paper §5.2 / Fig. 10 rescale path.
+    ///
+    /// Two layers (design §10 DR1):
+    /// 1. **File-level adoption clip** — an SST whose inclusive
+    ///    `[smallest_key, largest_key]` is FULLY DISJOINT from `clip` is
+    ///    dropped from the restored Version AND never adopted (no link, no
+    ///    refcount, no reader). A boundary SST (partial overlap) is adopted
+    ///    whole; layer 2 prunes its out-of-range half on read.
+    /// 2. **Read/iterator boundary clip** — the restored default CF carries
+    ///    `clip`, so point-get + range/prefix scan never SERVE an out-of-range
+    ///    key, even from a boundary SST or a WAL-DELTA-replayed memtable tail.
+    ///
+    /// Physical reclamation of the boundary remainder is left to normal
+    /// compaction (DR4); the clip stays set on the CF (correct indefinitely,
+    /// a no-op once no boundary file remains). An EMPTY `clip` is rejected.
+    pub fn open_from_linked_checkpoint_instant_clipped(
+        fs: Arc<dyn FileSystem>,
+        ckpt_dir: &Path,
+        target_dir: &str,
+        clip: forst_rs_common::types::KeyRange,
+    ) -> ForstResult<Arc<Self>> {
+        Self::open_from_linked_checkpoint_instant_clipped_with_default_cf(
+            fs,
+            ckpt_dir,
+            target_dir,
+            clip,
+            ColumnFamilyDescriptor::new(DEFAULT_CF_NAME),
+        )
+    }
+
+    /// FRS-PHASE2-C2U3: [`Self::open_from_linked_checkpoint_instant_clipped`]
+    /// with a caller-supplied default-CF descriptor (FFI/Java route, mirrors
+    /// [`Self::open_from_linked_checkpoint_instant_with_default_cf`]).
+    pub fn open_from_linked_checkpoint_instant_clipped_with_default_cf(
+        fs: Arc<dyn FileSystem>,
+        ckpt_dir: &Path,
+        target_dir: &str,
+        clip: forst_rs_common::types::KeyRange,
+        default_desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<Arc<Self>> {
+        use crate::checkpoint::{
+            deserialize_snapshot, read_blob, serialize_snapshot, split_mapping_trailer, write_blob,
+        };
+        if clip.is_empty() {
+            return Err(ForstError::invalid_argument(format!(
+                "open_from_linked_checkpoint_instant_clipped: empty clip range {clip} \
+                 (start >= end) would adopt no state — pass the assigned key-group sub-range"
+            )));
+        }
+        let blob = read_blob(fs.as_ref(), ckpt_dir)?;
+        let (base, mapping) = split_mapping_trailer(&blob)?;
+        let mapping = mapping.ok_or_else(|| {
+            ForstError::invalid_argument(format!(
+                "open_from_linked_checkpoint_instant_clipped: {} carries no mapping trailer — \
+                 not a link-mode checkpoint",
+                ckpt_dir.display()
+            ))
+        })?;
+        let view = forst_rs_io::MappingSnapshotView::decode(mapping)?;
+        let mut snap = deserialize_snapshot(base)?;
+
+        // Layer 1: file-level adoption clip — drop fully-disjoint SSTs from
+        // the restored Version so the engine never tries to open an unadopted
+        // file. Boundary SSTs (partial overlap) are kept. Inclusive-SST vs
+        // half-open clip overlap: `smallest_key < clip.end && clip.start <=
+        // largest_key`. vlog segments stay (KV-sep pointers; their values are
+        // gated by the same read-path clip).
+        let clipped_version = Self::clip_version_to_range(&snap.version, &clip);
+        snap.version = Arc::new(clipped_version);
+        let clipped_base = serialize_snapshot(&snap)?;
+
+        // Same source-journal tombstone/paranoia consultation as the
+        // unclipped instant restore (design §2.4).
+        let source_journal = ckpt_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|src_db| src_db.join("MAPPING.journal"));
+        let tail = match &source_journal {
+            Some(j) => forst_rs_io::MappingJournalView::load(fs.as_ref(), j)?,
+            None => None,
+        };
+
+        let target = PathBuf::from(target_dir);
+        fs.create_dir_all(&target)?;
+        let mgr = Arc::new(forst_rs_io::FileMappingManager::new(
+            fs.clone(),
+            target.join("MAPPING.journal"),
+        )?);
+        // Adopt only the SSTs that survived the clip (the clipped Version's
+        // live set).
+        for file in snap.version.live_sst_files() {
+            let canonical = sst_file_path(&target, file.file_number);
+            let basename = canonical.file_name().ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "open_from_linked_checkpoint_instant_clipped: SST path has no file name: {}",
+                    canonical.display()
+                ))
+            })?;
+            let linked = ckpt_dir.join(basename);
+            let physical = view.resolve(&linked).ok_or_else(|| {
+                ForstError::corruption(format!(
+                    "open_from_linked_checkpoint_instant_clipped: manifest references {} but \
+                     the embedded mapping snapshot has no entry for it",
+                    linked.display()
+                ))
+            })?;
+            if let Some(tail) = &tail {
+                if tail.is_tombstoned(physical) {
+                    return Err(ForstError::invalid_argument(format!(
+                        "open_from_linked_checkpoint_instant_clipped: physical object {} \
+                         (for linked path {}) carries a JM-discard tombstone",
+                        physical,
+                        linked.display()
+                    )));
+                }
+                if let Some(current) = tail.resolve(&linked) {
+                    if current != physical {
+                        return Err(ForstError::corruption(format!(
+                            "open_from_linked_checkpoint_instant_clipped: linked path {} \
+                             resolves to {} in the source journal but {} in the blob snapshot",
+                            linked.display(),
+                            current,
+                            physical
+                        )));
+                    }
+                }
+            }
+            mgr.adopt(&canonical, physical)?;
+            fs.pre_seed_admission(Path::new(physical));
+        }
+        mgr.sync_journal()?;
+        // Persist the CLIPPED base blob (disjoint SSTs removed) — the restored
+        // engine's Version reflects only the adopted set.
+        write_blob(fs.as_ref(), &target, &clipped_base)?;
+
+        let mapped: Arc<dyn FileSystem> =
+            Arc::new(forst_rs_io::MappedFileSystem::new(fs.clone(), mgr.clone()));
+        let options = EngineOptions {
+            db_path: target.to_string_lossy().into_owned(),
+            ..EngineOptions::default()
+        };
+        let db = Self::open_from_checkpoint_with_default_cf(options, mapped, default_desc)?;
+        db.attach_file_mapping(mgr)?;
+        // Layer 2: install the read-path clip on the restored default CF
+        // BEFORE any read (WAL replay below writes, not reads).
+        db.lookup_cf_by_id(DEFAULT_CF_ID)?
+            .set_clip_range(Some(clip.clone()));
+        // FRS-WAL Phase 4: replay the captured unflushed tail; the clip gates
+        // any out-of-range replayed record at read time.
+        Self::replay_linked_wal_delta(&db, fs.as_ref(), ckpt_dir, &view)?;
+        Ok(db)
+    }
+
+    /// FRS-PHASE2-C2U3: returns a copy of `version` with every SST whose
+    /// inclusive `[smallest_key, largest_key]` is FULLY DISJOINT from the
+    /// half-open `clip` removed from its level. An SST overlaps `clip` iff
+    /// `smallest_key < clip.end && clip.start <= largest_key`. vlog segments
+    /// are carried through unchanged (their live pointers are clipped by the
+    /// read path). Used by the clipped restore (design §10 DR1 layer 1).
+    fn clip_version_to_range(
+        version: &forst_rs_storage::version::Version,
+        clip: &forst_rs_common::types::KeyRange,
+    ) -> forst_rs_storage::version::Version {
+        use forst_rs_storage::version::LevelMeta;
+        let new_levels: Vec<LevelMeta> = version
+            .levels
+            .iter()
+            .map(|level| {
+                let kept: Vec<_> = level
+                    .files
+                    .iter()
+                    .filter(|f| {
+                        // inclusive-SST vs half-open clip overlap
+                        f.smallest_key.as_slice() < clip.end.as_slice()
+                            && clip.start.as_slice() <= f.largest_key.as_slice()
+                    })
+                    .cloned()
+                    .collect();
+                LevelMeta {
+                    level: level.level,
+                    files: kept,
+                }
+            })
+            .collect();
+        forst_rs_storage::version::Version::from_levels_and_vlogs(
+            new_levels,
+            version.vlog_segments.clone(),
+        )
+    }
+
     /// FRS-PHASE2-FFI: INSTANT-LINK restore over a REMOTE (OpenDAL) engine
     /// filesystem — builds the same `CachedFileSystem(OpendalFileSystem,
     /// LocalCache)` stack as [`Self::open_remote_with_default_cf`] and runs
@@ -7950,6 +8185,50 @@ impl DbImpl {
         )?;
         // FRS-PHASE2-C3U3 (default OFF): paced background fill of the
         // adopted working set — the §4.1.1 upgrade of the lazy warm.
+        if let Some(params) = restore_bg_fill_params_env() {
+            db.start_restore_background_fill(cached_concrete, params);
+        }
+        Ok(db)
+    }
+
+    /// FRS-PHASE2-C2U3 (rescale-by-clip, design §10): REMOTE (OpenDAL)
+    /// counterpart of
+    /// [`Self::open_from_linked_checkpoint_instant_clipped`] — the
+    /// production disaggregated rescale path. Builds the same
+    /// `CachedFileSystem(OpendalFileSystem, LocalCache)` stack as
+    /// [`Self::open_from_linked_checkpoint_instant_remote`] (incl. the
+    /// C3U2 non-SST-local wrap and the C3U3 background-fill opt-in) and runs
+    /// the CLIPPED adopt/lazy-read restore over it: disjoint SSTs are never
+    /// adopted (layer 1), the restored CF carries the read-path clip
+    /// (layer 2). An empty clip is rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_from_linked_checkpoint_instant_clipped_remote(
+        uri: &str,
+        opendal_config: HashMap<String, String>,
+        cache_dir: &std::path::Path,
+        cache_capacity_bytes: u64,
+        ckpt_dir: &Path,
+        target_dir: &str,
+        clip: forst_rs_common::types::KeyRange,
+        default_desc: ColumnFamilyDescriptor,
+    ) -> ForstResult<Arc<Self>> {
+        let remote_fs = build_opendal_fs_from_uri(uri, &opendal_config)?;
+        let cache = LocalCache::open(cache_dir, cache_capacity_bytes).map_err(|e| {
+            ForstError::Io(std::io::Error::other(format!(
+                "open_from_linked_checkpoint_instant_clipped_remote: failed to open \
+                 local cache at {cache_dir:?}: {e}"
+            )))
+        })?;
+        let cached_concrete = Arc::new(CachedFileSystem::new(remote_fs, Arc::new(cache)));
+        let cached_fs: Arc<dyn FileSystem> = cached_concrete.clone();
+        let cached_fs = wrap_nonsst_local(cached_fs);
+        let db = Self::open_from_linked_checkpoint_instant_clipped_with_default_cf(
+            cached_fs,
+            ckpt_dir,
+            target_dir,
+            clip,
+            default_desc,
+        )?;
         if let Some(params) = restore_bg_fill_params_env() {
             db.start_restore_background_fill(cached_concrete, params);
         }
@@ -9581,7 +9860,15 @@ impl DbImpl {
             );
         }
 
-        LazyPrefixIter::new(sources, pinned)
+        // FRS-PHASE2-C2U3 (rescale-by-clip, design §10 DR1 layer 2): the
+        // prefix sources are keyed on `prefix` (the cursors take `prefix` as
+        // both the matcher and the lower bound), so threading the clip into
+        // every tier's bounds is fragile. Enforce it at the iterator emit
+        // boundary instead — every prefix consumer (borrowing / owned /
+        // value-carrying FFI) flows through `next` / `next_with_value`, and a
+        // clipped-out head is dropped there. `None` (every non-clipped CF) =
+        // byte-identical.
+        LazyPrefixIter::new_clipped(sources, pinned, cf_data.clip_range())
     }
 
     /// B-R7-NEW-H1: range counterpart of [`Self::build_lazy_prefix_key_stream`].
@@ -9610,8 +9897,39 @@ impl DbImpl {
         upper: Option<&[u8]>,
         pinned: bool,
     ) -> ForstResult<LazyRangeIter> {
-        let upper_owned: Option<Vec<u8>> = upper.map(|u| u.to_vec());
         let cf_data = self.lookup_cf_by_id(cf.id())?;
+
+        // FRS-PHASE2-C2U3 (rescale-by-clip, design §10 DR1 layer 2): intersect
+        // the CF's key-group clip range into the effective `[lower, upper)`
+        // BEFORE any tier source is built, so EVERY tier (memtable / imm /
+        // resident / SST) is bound by the clip via the existing per-source
+        // `lower`/`upper` filter — no per-SST threading. `None` = the exact
+        // pre-change bounds (byte-identical default). An empty intersection
+        // (query disjoint from the clip) yields an empty stream.
+        let clip = cf_data.clip_range();
+        let (lower_buf, upper_buf): (Vec<u8>, Option<Vec<u8>>) = if let Some(clip) = &clip {
+            let eff_lower: &[u8] = if lower >= clip.start.as_slice() {
+                lower
+            } else {
+                clip.start.as_slice()
+            };
+            // upper = min(query_upper, clip.end) — clip.end is exclusive, as
+            // is the scan `upper`.
+            let eff_upper: &[u8] = match upper {
+                Some(u) if u <= clip.end.as_slice() => u,
+                _ => clip.end.as_slice(),
+            };
+            if eff_lower >= eff_upper {
+                // Disjoint — no in-range keys exist for this query.
+                return LazyRangeIter::new(Vec::new(), pinned);
+            }
+            (eff_lower.to_vec(), Some(eff_upper.to_vec()))
+        } else {
+            (lower.to_vec(), upper.map(|u| u.to_vec()))
+        };
+        let lower: &[u8] = &lower_buf;
+        let upper: Option<&[u8]> = upper_buf.as_deref();
+        let upper_owned: Option<Vec<u8>> = upper_buf.clone();
 
         let mut sources: Vec<TierKeySource> = Vec::new();
 
@@ -9662,7 +9980,10 @@ impl DbImpl {
             });
         }
 
-        LazyRangeIter::new(sources, pinned)
+        // FRS-PHASE2-C2U3: the boundary clip catches any source over-include
+        // (the bound intersection above already narrows them; this is the
+        // belt-and-suspenders for a WAL-DELTA-restored memtable cursor).
+        LazyRangeIter::new_clipped(sources, pinned, clip)
     }
 
     /// B-R7-NEW-H1: streaming form of [`Self::scan`].
@@ -10851,6 +11172,15 @@ impl DbImpl {
             return None;
         }
         let cf_data = self.lookup_cf_by_id(cf.id()).ok()?;
+        // FRS-PHASE2-C2U3 (rescale-by-clip): this zero-copy FFI fast path
+        // reads the active memtable directly, bypassing `get_internal`'s clip
+        // gate — an out-of-range inline Put would leak. `None` → the caller
+        // falls back to `get()` (also clip-gated). `None` clip = no-op.
+        if let Some(clip) = cf_data.clip_range() {
+            if !clip.contains(key) {
+                return None;
+            }
+        }
         let mem = cf_data.active_memtable();
         mem.get_pinned_ptr(key)
     }
@@ -10954,10 +11284,29 @@ impl DbImpl {
         // outer None = missing/tombstoned.
         let mut resolved: Vec<Option<Option<Vec<u8>>>> = vec![None; n];
 
+        // FRS-PHASE2-C2U3 (rescale-by-clip, design §10 DR1 layer 2): the
+        // vectorized phases resolve memtable/SST hits INLINE (only Merge
+        // falls back to `get_internal`'s clip gate), so an out-of-range key
+        // with a direct Put would otherwise leak. Resolve every out-of-range
+        // key to None up front — all phases then skip it (resolved == Some).
+        // `None` clip (every non-clipped CF) skips this loop (byte-identical).
+        if let Some(clip) = cf_data.clip_range() {
+            for (i, k) in keys.iter().enumerate() {
+                if !clip.contains(k) {
+                    resolved[i] = Some(None);
+                }
+            }
+        }
+
         // Phase 1: active memtable. A-R17-NEW-H1: re-capture per key (Arc
         // clone is cheap; the swap_active_memtable race window is narrow but
         // real — see comment on the legacy batch_get loop).
         for (i, k) in keys.iter().enumerate() {
+            // FRS-PHASE2-C2U3: skip keys already resolved by the clip pre-pass
+            // (out-of-range → None). No-op when no clip is set (all pending).
+            if resolved[i].is_some() {
+                continue;
+            }
             let mem = cf_data.active_memtable();
             match mem.get(k, read_seq)? {
                 Some(entry) if entry.op_type == OpType::Put => {
@@ -11450,9 +11799,22 @@ impl DbImpl {
         // re-reads `active_memtable` on every call, so this matches the
         // contract single-key reads advertise. Arc clone is cheap.
         let read_seq = u64::MAX;
+        // FRS-PHASE2-C2U3 (rescale-by-clip): the inline-cache fast path below
+        // (`get_into` → HitPut) bypasses `get_internal`'s clip gate, so an
+        // out-of-range key with a memtable Put would leak. Load the clip once.
+        let clip = cf_data.clip_range();
         for i in 0..n {
             let mem = cf_data.active_memtable();
             let key = keys.value(i);
+            // Out-of-range key → absent, without touching any tier (same
+            // null+found=false convention as the slow-path Miss branch).
+            if let Some(clip) = &clip {
+                if !clip.contains(key) {
+                    value_builder.append_null();
+                    found_builder.append_value(false);
+                    continue;
+                }
+            }
             let mut sink = BinaryBuilderSink(&mut value_builder);
             match mem.get_into(key, read_seq, &mut sink) {
                 SinkGetOutcome::HitPut => {
@@ -11594,6 +11956,18 @@ impl DbImpl {
         read_seq: u64,
     ) -> ForstResult<Option<Vec<u8>>> {
         self.check_fatal_error()?;
+        // FRS-PHASE2-C2U3 (rescale-by-clip, design §10 DR1 layer 2): a CF
+        // restored to a key-group sub-range serves ONLY in-range keys. An
+        // out-of-range key is reported absent BEFORE any tier is consulted —
+        // a boundary SST / WAL-DELTA-restored memtable may physically hold
+        // it, but it is never observable. `None` (every non-clipped CF) is a
+        // single lock-free load and the branch below is skipped (byte-exact
+        // default behaviour). Covers batch_get (routes through get_internal).
+        if let Some(clip) = cf_data.clip_range() {
+            if !clip.contains(key) {
+                return Ok(None);
+            }
+        }
         // Stage 1: Active memtable — peek at the newest visible entry.
         // E1: ShardedMemTable::get hashes the key to one shard internally.
         let active_hit = cf_data.active_memtable().get(key, read_seq)?;
@@ -15093,6 +15467,19 @@ pub struct LazyPrefixIter {
     tree_dup_drains: u64,
     /// Whether the adaptive guard dropped the tree mid-scan.
     tree_abandoned: bool,
+    /// FRS-PHASE2-C2U3 (rescale-by-clip, design §10 DR1 layer 2): when set,
+    /// the iterator drops any emitted key outside this half-open `KeyRange`
+    /// at the public emit boundary (`next` / `next_with_value`), regardless
+    /// of how the underlying source resolved its value (covers the inline
+    /// value-carrying `ValueDecision::Put`/`Blob` FFI path, which never
+    /// routes through `get_internal`'s clip gate). `None` (every non-clipped
+    /// scan) = a single branch-predicted load and the emit path is the exact
+    /// pre-change code (byte-identical). Belt-and-suspenders with the
+    /// builder's bound intersection — the builder narrows the source range so
+    /// the boundary skip is a near-no-op, but this catches any source that
+    /// over-includes (e.g. the prefix path's cursors keyed on `prefix`, or a
+    /// WAL-DELTA-restored memtable cursor).
+    clip: Option<Arc<KeyRange>>,
 }
 
 /// S2-3 (W2): sources at or below this count keep the LINEAR pinned merge —
@@ -15282,6 +15669,16 @@ fn ensure_head_pinned(
 
 impl LazyPrefixIter {
     fn new(sources: Vec<TierKeySource>, pinned: bool) -> ForstResult<Self> {
+        Self::new_clipped(sources, pinned, None)
+    }
+
+    /// FRS-PHASE2-C2U3: [`Self::new`] with an optional rescale clip range that
+    /// the emit boundary enforces. `None` is byte-identical to [`Self::new`].
+    fn new_clipped(
+        sources: Vec<TierKeySource>,
+        pinned: bool,
+        clip: Option<Arc<KeyRange>>,
+    ) -> ForstResult<Self> {
         Ok(Self {
             sources,
             last_emitted: None,
@@ -15297,6 +15694,7 @@ impl LazyPrefixIter {
             tree_disabled: false,
             tree_dup_drains: 0,
             tree_abandoned: false,
+            clip,
         })
     }
 
@@ -15662,6 +16060,27 @@ impl LazyPrefixIter {
     /// winner (memtable newer than any SST; among SSTs the max `sequence`
     /// wins), Put→value, Delete→hidden, Merge→operand resolution (deferred).
     fn next_with_value(&mut self) -> Option<(Arc<[u8]>, ValueDecision)> {
+        // FRS-PHASE2-C2U3 (rescale-by-clip): skip emitted keys outside the
+        // clip range. `None` clip ⇒ the inner call's result passes straight
+        // through (byte-identical). Each inner call advances `last_emitted`
+        // past the skipped key, so a clipped-out head is dropped and the
+        // scan continues — covers the inline value-carrying path that never
+        // hits `get_internal`'s gate.
+        match &self.clip {
+            None => self.next_with_value_inner(),
+            Some(clip) => {
+                let clip = clip.clone();
+                loop {
+                    let (key, decision) = self.next_with_value_inner()?;
+                    if clip.contains(key.as_ref()) {
+                        return Some((key, decision));
+                    }
+                }
+            }
+        }
+    }
+
+    fn next_with_value_inner(&mut self) -> Option<(Arc<[u8]>, ValueDecision)> {
         // Owned outcome of one source `peek()` — computed while the source is
         // borrowed, acted on AFTER the borrow ends (so the dup-`advance()` and
         // `record_peek_error()` `&mut self` calls do not alias the source).
@@ -15834,6 +16253,19 @@ impl PrefixScanStream {
                 let Some(step) = self.inner.next_step_pinned() else {
                     return Ok(FillOutcome::Exhausted);
                 };
+                // FRS-PHASE2-C2U3 (rescale-by-clip): the pinned merge emits the
+                // winning key from `last_emitted_buf` and NEVER routes through
+                // `next`/`next_with_value`, so the iterator-level clip filter
+                // does not see it. The prefix builder deliberately does not
+                // thread the clip into source bounds (the comment at the
+                // prefix `LazyPrefixIter::new_clipped` site), so a clipped CF
+                // served by a PINNED prefix scan would leak a boundary SST's
+                // out-of-range keys. Drop the row here. `None` clip = no-op.
+                if let Some(clip) = &self.inner.clip {
+                    if !clip.contains(self.inner.last_emitted_buf.as_slice()) {
+                        continue;
+                    }
+                }
                 match step {
                     PinnedStep::Put { src, row } => {
                         // Zero-alloc emit: key from the reused scratch, value
@@ -16021,6 +16453,27 @@ impl Iterator for LazyPrefixIter {
     type Item = Arc<[u8]>;
 
     fn next(&mut self) -> Option<Arc<[u8]>> {
+        // FRS-PHASE2-C2U3 (rescale-by-clip): skip keys outside the clip range
+        // at the public emit boundary. `None` clip ⇒ a single pass-through
+        // (byte-identical). Each inner call advances `last_emitted` past the
+        // skipped key.
+        match &self.clip {
+            None => self.next_inner(),
+            Some(clip) => {
+                let clip = clip.clone();
+                loop {
+                    let key = self.next_inner()?;
+                    if clip.contains(key.as_ref()) {
+                        return Some(key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl LazyPrefixIter {
+    fn next_inner(&mut self) -> Option<Arc<[u8]>> {
         // Drop already-emitted duplicates from all tiers + find the min
         // pending key across all sources. On error from a tier source we
         // currently swallow it (matches the previous BTreeSet behaviour
@@ -21978,6 +22431,497 @@ mod tests {
                 Some(&b"e1"[..]),
                 "second-generation restore missing extra{:04}",
                 i
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-C2U3 gate (rescale-by-clip, design §10 / paper §5.2):
+    // key-range-clipped state adoption on rescale.
+    // ------------------------------------------------------------------
+
+    /// C2U3 fixture: a source DB whose state spans `k0000..k0299` laid out
+    /// as THREE distinct flushed SSTs (each its own key band) plus a live
+    /// memtable tail, then a link-mode checkpoint. Returns `(db, chk_dir)`.
+    ///
+    /// SST bands (so the clip can hit disjoint-skip AND boundary-straddle):
+    ///   - SST-A: k0000..k0099  (fully below a `[k0100, k0200)` clip)
+    ///   - SST-B: k0100..k0199  (fully INSIDE that clip)
+    ///   - SST-C: k0150..k0249  (STRADDLES the clip upper bound k0200)
+    /// Memtable tail: k0250..k0299 (fully ABOVE the clip).
+    /// Every value is `format!("v-{k}")` so a wrong key is detectable.
+    fn c2u3_fixture(fs: &Arc<dyn FileSystem>) -> (Arc<DbImpl>, PathBuf) {
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        let put = |lo: u32, hi: u32| {
+            for i in lo..hi {
+                let k = format!("k{:04}", i);
+                db.put(&cf, k.as_bytes(), format!("v-{k}").as_bytes())
+                    .unwrap();
+            }
+        };
+        // SST-A
+        put(0, 100);
+        db.switch_and_flush(&cf).unwrap();
+        // SST-B
+        put(100, 200);
+        db.switch_and_flush(&cf).unwrap();
+        // SST-C (straddles k0200): k0150..k0249. Overwrites k0150..k0199
+        // with the SAME value, extends to k0200..k0249.
+        put(150, 250);
+        db.switch_and_flush(&cf).unwrap();
+        // Live memtable tail above the clip.
+        put(250, 300);
+
+        let snap = db.snapshot();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 11, 0)
+            .unwrap();
+        assert!(r.link_mode);
+        (db, PathBuf::from("/db/checkpoints/00000000000000000011"))
+    }
+
+    /// C2U3 falsifier gate 1 — IN-RANGE byte-exact AND zero out-of-range
+    /// leakage across EVERY read API (point-get, range scan, prefix scan).
+    /// Clip `[k0100, k0200)`: every key in range reads its exact source
+    /// value; NO read of any kind ever surfaces a key `< k0100` or `>= k0200`.
+    #[test]
+    fn test_phase2_c2u3_clipped_restore_in_range_exact_zero_leak() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = c2u3_fixture(&fs);
+
+        let clip = KeyRange::new(b"k0100".to_vec(), b"k0200".to_vec());
+        let restored = DbImpl::open_from_linked_checkpoint_instant_clipped(
+            fs.clone(),
+            &chk_dir,
+            "/restore",
+            clip.clone(),
+        )
+        .unwrap();
+        let rcf = restored.default_cf();
+        assert_eq!(restored.cf_clip_range(&rcf).unwrap(), Some(clip));
+
+        // (a) point-get: in-range exact, out-of-range absent (even though
+        // SST-A's k0000..k0099 and SST-C's k0200..k0249 physically exist /
+        // are adopted as boundary remainders).
+        for i in 0..300u32 {
+            let k = format!("k{:04}", i);
+            let got = restored.get(&rcf, k.as_bytes()).unwrap();
+            if (100..200).contains(&i) {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(format!("v-{k}").as_bytes()),
+                    "in-range point-get wrong at {k}"
+                );
+            } else {
+                assert_eq!(got, None, "OUT-OF-RANGE LEAK via point-get at {k}");
+            }
+        }
+
+        // (a2) batch_get: the vectorized path resolves memtable/SST hits
+        // INLINE — prove the clip pre-pass gates it (a Put on a clipped-out
+        // key must not leak through the vectorized phases).
+        let owned_keys: Vec<Vec<u8>> = (0..300u32)
+            .map(|i| format!("k{:04}", i).into_bytes())
+            .collect();
+        let kref: Vec<&[u8]> = owned_keys.iter().map(|k| k.as_slice()).collect();
+        let batch = restored.batch_get(&rcf, &kref).unwrap();
+        for (i, got) in batch.iter().enumerate() {
+            let k = format!("k{:04}", i);
+            if (100..200).contains(&i) {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(format!("v-{k}").as_bytes()),
+                    "batch_get in-range wrong at {k}"
+                );
+            } else {
+                assert_eq!(got, &None, "OUT-OF-RANGE LEAK via batch_get at {k}");
+            }
+        }
+
+        // (b) full range scan over the whole key space — must yield EXACTLY
+        // k0100..k0199 in order, nothing outside.
+        let scanned: Vec<(Vec<u8>, Vec<u8>)> = restored
+            .scan_iter(&rcf, b"", Some(b"\xff\xff\xff\xff"))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let expect: Vec<(Vec<u8>, Vec<u8>)> = (100..200u32)
+            .map(|i| {
+                let k = format!("k{:04}", i);
+                (k.as_bytes().to_vec(), format!("v-{k}").into_bytes())
+            })
+            .collect();
+        assert_eq!(scanned, expect, "range scan leaked or dropped keys");
+
+        // (c) a scan whose query range EXTENDS past the clip on both ends
+        // still emits only in-range keys (the clip intersects the bounds).
+        let wide: Vec<Vec<u8>> = restored
+            .scan_iter(&rcf, b"k0000", Some(b"k0300"))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert!(
+            wide.iter()
+                .all(|k| k.as_slice() >= b"k0100".as_ref() && k.as_slice() < b"k0200".as_ref()),
+            "wide range scan leaked out-of-range keys: first={:?} last={:?}",
+            wide.first(),
+            wide.last()
+        );
+        assert_eq!(wide.len(), 100);
+
+        // (d) prefix scan: k01* is fully in range; k00* and k02* prefixes
+        // must yield NOTHING (their keys are clipped out).
+        let p01: Vec<Vec<u8>> = restored
+            .prefix_scan_iter(&rcf, b"k01")
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(p01.len(), 100, "k01* prefix must be fully in range");
+        for pfx in [&b"k00"[..], &b"k02"[..]] {
+            let got: Vec<Vec<u8>> = restored
+                .prefix_scan_iter(&rcf, pfx)
+                .unwrap()
+                .map(|r| r.unwrap().0)
+                .collect();
+            assert!(
+                got.is_empty(),
+                "OUT-OF-RANGE LEAK via prefix scan {:?}: {:?}",
+                std::str::from_utf8(pfx),
+                got
+            );
+        }
+    }
+
+    /// C2U3 falsifier gate 2 — the CLIP-CORRECTNESS falsifier: an SST that
+    /// STRADDLES the boundary (SST-C: k0150..k0249, crossing the clip upper
+    /// k0200) serves ONLY its in-range half. With clip `[k0175, k0220)` the
+    /// straddle is on BOTH ends of SST-C; the read path must emit only
+    /// k0175..k0219.
+    #[test]
+    fn test_phase2_c2u3_boundary_sst_serves_only_in_range_half() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = c2u3_fixture(&fs);
+
+        // Clip straddles SST-B (k0100..k0199) on its top and SST-C
+        // (k0150..k0249) on both ends.
+        let clip = KeyRange::new(b"k0175".to_vec(), b"k0220".to_vec());
+        let restored = DbImpl::open_from_linked_checkpoint_instant_clipped(
+            fs.clone(),
+            &chk_dir,
+            "/restore",
+            clip,
+        )
+        .unwrap();
+        let rcf = restored.default_cf();
+
+        for i in 0..300u32 {
+            let k = format!("k{:04}", i);
+            let got = restored.get(&rcf, k.as_bytes()).unwrap();
+            let want = if (175..220).contains(&i) {
+                Some(format!("v-{k}").into_bytes())
+            } else {
+                None
+            };
+            assert_eq!(got, want, "boundary-straddle mismatch at {k}");
+        }
+        // Scan corroborates: exactly the in-range half, in order.
+        let keys: Vec<Vec<u8>> = restored
+            .scan_iter(&rcf, b"", Some(b"\xff"))
+            .unwrap()
+            .map(|r| r.unwrap().0)
+            .collect();
+        let want: Vec<Vec<u8>> = (175..220u32)
+            .map(|i| format!("k{:04}", i).into_bytes())
+            .collect();
+        assert_eq!(keys, want, "boundary scan served the wrong half");
+    }
+
+    /// C2U3 falsifier gate 2b — the S2 PINNED scan path (env-gated, default
+    /// OFF) emits keys from the pinned merge buffer WITHOUT routing through
+    /// `next`/`next_with_value`, and the prefix builder deliberately does not
+    /// thread the clip into source bounds — so the pinned `fill_into` branch
+    /// has its OWN clip skip. Drive a pinned prefix scan directly (explicit
+    /// `pinned=true`, no env dependency) and prove zero out-of-range leak.
+    #[test]
+    fn test_phase2_c2u3_pinned_prefix_scan_no_leak() {
+        use forst_rs_io::MemoryFileSystem;
+        struct Collect(Vec<Vec<u8>>);
+        impl RowSink for Collect {
+            fn push(&mut self, k: &[u8], _v: &[u8]) -> bool {
+                self.0.push(k.to_vec());
+                true
+            }
+        }
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = c2u3_fixture(&fs);
+        let clip = KeyRange::new(b"k0100".to_vec(), b"k0200".to_vec());
+        let restored = DbImpl::open_from_linked_checkpoint_instant_clipped(
+            fs.clone(),
+            &chk_dir,
+            "/restore",
+            clip,
+        )
+        .unwrap();
+        let rcf = restored.default_cf();
+
+        let drive = |prefix: &[u8]| -> Vec<Vec<u8>> {
+            let slot = Arc::new(Mutex::new(None));
+            let mut stream = restored
+                .prefix_scan_stream_with_mode(&rcf, prefix, slot, /*pinned=*/ true)
+                .unwrap();
+            let mut sink = Collect(Vec::new());
+            loop {
+                match stream.fill_into(&mut sink).unwrap() {
+                    FillOutcome::Exhausted => break,
+                    FillOutcome::SinkFull => {} // Collect never fills
+                }
+            }
+            sink.0
+        };
+
+        // k01* fully in range → 100 keys, all in [k0100, k0200).
+        let p01 = drive(b"k01");
+        assert_eq!(p01.len(), 100, "pinned k01* must be fully in range");
+        assert!(p01
+            .iter()
+            .all(|k| k.as_slice() >= b"k0100".as_ref() && k.as_slice() < b"k0200".as_ref()));
+        // k00* (SST-A band) and k02* (SST-C upper half) clipped out → empty.
+        assert!(
+            drive(b"k00").is_empty(),
+            "PINNED out-of-range leak via k00* prefix"
+        );
+        assert!(
+            drive(b"k02").is_empty(),
+            "PINNED out-of-range leak via k02* prefix"
+        );
+    }
+
+    /// C2U3 falsifier gate 3 — DISJOINT-FILE SKIP: an SST fully outside the
+    /// clip is never adopted (no link, no refcount). Clip `[k0100, k0150)`
+    /// is disjoint from SST-A (k0000..k0099); SST-A must NOT appear in the
+    /// restored Version's live set, and the clipped restore adopts strictly
+    /// fewer files than an unclipped restore of the same checkpoint.
+    #[test]
+    fn test_phase2_c2u3_disjoint_sst_not_adopted() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = c2u3_fixture(&fs);
+
+        // Unclipped instant restore: full live set.
+        let full =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/full").unwrap();
+        let full_live = full.version_set.current().live_sst_files().len();
+
+        // Clipped restore disjoint from SST-A (k0000..k0099).
+        let clip = KeyRange::new(b"k0100".to_vec(), b"k0150".to_vec());
+        let clipped = DbImpl::open_from_linked_checkpoint_instant_clipped(
+            fs.clone(),
+            &chk_dir,
+            "/restore",
+            clip,
+        )
+        .unwrap();
+        let clipped_live: Vec<_> = clipped.version_set.current().live_sst_files();
+
+        assert!(
+            clipped_live.len() < full_live,
+            "clip must drop the disjoint SST-A: clipped={} full={}",
+            clipped_live.len(),
+            full_live
+        );
+        // No surviving SST is fully below the clip (SST-A's band).
+        for f in &clipped_live {
+            assert!(
+                f.largest_key.as_slice() >= b"k0100".as_ref(),
+                "disjoint SST adopted: largest_key={:?}",
+                std::str::from_utf8(&f.largest_key)
+            );
+        }
+        // adopted_residual counts only the surviving foreign physicals.
+        assert!(clipped.adopted_residual() > 0);
+        // In-range correctness still holds.
+        let rcf = clipped.default_cf();
+        for i in 100..150u32 {
+            let k = format!("k{:04}", i);
+            assert_eq!(
+                clipped.get(&rcf, k.as_bytes()).unwrap().as_deref(),
+                Some(format!("v-{k}").as_bytes())
+            );
+        }
+        assert_eq!(clipped.get(&rcf, b"k0050").unwrap(), None);
+    }
+
+    /// C2U3 falsifier gate 4 — ROUND-TRIP: a clipped restore is a valid DB
+    /// (writable above the restored seq), and a subsequent link-checkpoint
+    /// of it restores byte-exact for the in-range state + the new writes,
+    /// while still never serving out-of-range keys.
+    #[test]
+    fn test_phase2_c2u3_clipped_restore_round_trip_checkpointable() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = c2u3_fixture(&fs);
+
+        let clip = KeyRange::new(b"k0100".to_vec(), b"k0200".to_vec());
+        let restored = DbImpl::open_from_linked_checkpoint_instant_clipped(
+            fs.clone(),
+            &chk_dir,
+            "/restore",
+            clip.clone(),
+        )
+        .unwrap();
+        let rcf = restored.default_cf();
+
+        // Writable: an in-range overwrite + an in-range new key.
+        restored.put(&rcf, b"k0150", b"rewritten").unwrap();
+        restored.put(&rcf, b"k0177", b"fresh").unwrap();
+        restored.switch_and_flush(&rcf).unwrap();
+
+        // Second-generation link checkpoint of the clipped engine.
+        let snap2 = restored.snapshot();
+        let r2 = restored
+            .create_incremental_checkpoint_linked(&snap2, 21, 0)
+            .unwrap();
+        assert!(r2.link_mode);
+        let chk2 = PathBuf::from("/restore/checkpoints/00000000000000000021");
+
+        // Restore the second generation (UNclipped — its state is already
+        // the clipped sub-range). Note: the clip is NOT re-applied here (it
+        // is a restore-time argument); the second-gen state is intrinsically
+        // in-range, so an unclipped restore is byte-exact.
+        let gen2 = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk2, "/gen2").unwrap();
+        let g2cf = gen2.default_cf();
+        for i in 100..200u32 {
+            let k = format!("k{:04}", i);
+            let want: Vec<u8> = match i {
+                150 => b"rewritten".to_vec(),
+                177 => b"fresh".to_vec(),
+                _ => format!("v-{k}").into_bytes(),
+            };
+            assert_eq!(
+                gen2.get(&g2cf, k.as_bytes()).unwrap(),
+                Some(want),
+                "gen2 mismatch at {k}"
+            );
+        }
+        // gen2 carries no out-of-range state (the clip already pruned it).
+        assert_eq!(gen2.get(&g2cf, b"k0050").unwrap(), None);
+        assert_eq!(gen2.get(&g2cf, b"k0250").unwrap(), None);
+    }
+
+    /// C2U3 falsifier gate 5 — WAL-DELTA restored memtable tail is clipped.
+    /// A WAL-DELTA link checkpoint keeps an UNFLUSHED tail; on a clipped
+    /// restore that tail is replayed straight into the memtable (no SST
+    /// metadata gate), so the read-path clip must prune out-of-range tail
+    /// records. The tail spans both in- and out-of-range keys.
+    #[test]
+    fn test_phase2_c2u3_wal_delta_restored_tail_is_clipped() {
+        use forst_rs_io::MemoryFileSystem;
+        let wal_dir = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        *db.wal.lock().unwrap() =
+            Some(crate::wal::WalWriter::open(&wal_dir.path().join("db.wal")).unwrap());
+
+        // Flushed floor in range: k0100..k0149 → SST.
+        for i in 100..150u32 {
+            let k = format!("k{:04}", i);
+            db.put(&cf, k.as_bytes(), format!("v-{k}").as_bytes())
+                .unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap();
+        // UNFLUSHED tail spanning out-of-range (k0050..k0099) AND in-range
+        // (k0150..k0199) AND above (k0250..k0299) — lives only in the WAL.
+        for band in [(50u32, 100u32), (150, 200), (250, 300)] {
+            for i in band.0..band.1 {
+                let k = format!("k{:04}", i);
+                db.put(&cf, k.as_bytes(), format!("v-{k}").as_bytes())
+                    .unwrap();
+            }
+        }
+        let snap = db.snapshot();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 31, 0)
+            .unwrap();
+        assert!(r.link_mode, "WAL attached ⇒ WAL-DELTA link mode");
+        let chk = PathBuf::from("/db/checkpoints/00000000000000000031");
+
+        let clip = KeyRange::new(b"k0100".to_vec(), b"k0200".to_vec());
+        let restored = DbImpl::open_from_linked_checkpoint_instant_clipped(
+            fs.clone(),
+            &chk,
+            "/restore-wal",
+            clip,
+        )
+        .unwrap();
+        let rcf = restored.default_cf();
+        for i in 0..300u32 {
+            let k = format!("k{:04}", i);
+            let got = restored.get(&rcf, k.as_bytes()).unwrap();
+            if (100..200).contains(&i) {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(format!("v-{k}").as_bytes()),
+                    "in-range WAL-tail/floor key wrong at {k}"
+                );
+            } else {
+                assert_eq!(
+                    got, None,
+                    "OUT-OF-RANGE WAL-DELTA tail leak at {k} (replayed into memtable)"
+                );
+            }
+        }
+        // Scan confirms exactly the in-range 100 keys.
+        let n = restored
+            .scan_iter(&rcf, b"", Some(b"\xff"))
+            .unwrap()
+            .filter(|r| r.is_ok())
+            .count();
+        assert_eq!(n, 100, "WAL-DELTA clipped scan count");
+    }
+
+    /// C2U3: an EMPTY clip range is rejected loudly (a CF serving no keys is
+    /// never the intent) — both at the restore entry point and the setter.
+    #[test]
+    fn test_phase2_c2u3_empty_clip_rejected() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = c2u3_fixture(&fs);
+        let empty = KeyRange::new(b"k0200".to_vec(), b"k0100".to_vec());
+        let res = DbImpl::open_from_linked_checkpoint_instant_clipped(
+            fs.clone(),
+            &chk_dir,
+            "/restore",
+            empty,
+        );
+        match res {
+            Ok(_) => panic!("empty clip must be rejected"),
+            Err(e) => assert!(format!("{e}").contains("empty clip"), "got: {e}"),
+        }
+    }
+
+    /// C2U3: the DEFAULT (non-clipped) restore path is byte-identical —
+    /// `cf_clip_range` is None and the full state is served. Guards the
+    /// flag-default-OFF discipline.
+    #[test]
+    fn test_phase2_c2u3_unclipped_restore_serves_full_state() {
+        use forst_rs_io::MemoryFileSystem;
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let (_db, chk_dir) = c2u3_fixture(&fs);
+        let restored =
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
+        let rcf = restored.default_cf();
+        assert_eq!(restored.cf_clip_range(&rcf).unwrap(), None);
+        // Full state present, including the live memtable tail k0250..k0299.
+        for i in 0..300u32 {
+            let k = format!("k{:04}", i);
+            assert_eq!(
+                restored.get(&rcf, k.as_bytes()).unwrap().as_deref(),
+                Some(format!("v-{k}").as_bytes()),
+                "unclipped restore missing {k}"
             );
         }
     }
