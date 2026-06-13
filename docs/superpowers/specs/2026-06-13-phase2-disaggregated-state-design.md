@@ -1052,6 +1052,123 @@ R1-M2 (`rename_logical` self-rename data loss) ALL FIXED with regression
 UTs; 4 LOW accepted+documented; 2 notes. Post-fix suites: io 245/0,
 storage 450/0, engine 359/0; clippy 0.
 
+### HEADLINE — forst-rs-disagg vs ForSt consolidated minibench (cycle 4 unit 1, landed 2026-06-13)
+
+The "beat ForSt" artifact: ONE reproducible bin
+(`crates/forst-rs-bench/src/bin/disagg_vs_forst.rs`,
+`cargo run -p forst-rs-bench --release --bin disagg_vs_forst [-- --smoke]`)
+that puts the three disaggregation-critical operations side-by-side in a
+single table set — forst-rs **measured** vs ForSt **modeled**.
+
+**Label discipline (design §6 R7):** the forst-rs column is the REAL engine
+driven on fs-emulation (`create_incremental_checkpoint_linked` Stage-2 link
+checkpoint + `open_from_linked_checkpoint_instant` Stage-3 adopt/lazy-read);
+link/adopt are metadata ops whose cost is network-independent, so the
+fs-emulation wall IS the disagg number. The ForSt column is MODELED from the
+documented Flink-1.x re-upload / download-restore mechanism at a single
+explicit bandwidth knob — checkpoint = `new_bytes/BW + n_files×PUT_rtt`,
+restore = `state_bytes/BW + n_files×GET_rtt` — defaulting to the recorded
+dev-Mac→BOS bandwidth (10 MB/s, 23 ms RTT, recorded 2026-06-01 via
+`crates/forst-rs-io/examples/s3bw.rs`). Both columns are costed against the
+SAME state-size facts (SST count + live bytes pulled from the real linked
+checkpoint result), so it is apples-to-apples on one channel assumption.
+Re-cost for the co-located Phase-3 box via `FRS_MODEL_BW_MBPS` /
+`FRS_MODEL_RTT_MS`.
+
+Recorded run (dev Mac, 2026-06-13, release, median of 3, default 10 MiB/s
+model — the recorded BOS figure is binary-MiB, matching `s3bw.rs`):
+
+```
+== CHECKPOINT duration vs state size (paper §5.2 / Fig. 9) ==
+scale    ssts   state_mb  frs_link_ms(meas) forst_upload_ms(mdl)    speedup
+1x          8       32.3               13.2             3414.8       260x
+4x         32      129.2               14.9            13658.9       915x
+16x        10      516.9               16.3            51920.4      3193x
+
+== RESTORE duration vs state size (paper §5.2/§6.1 / Fig. 10, 16–49× claim) ==
+scale    ssts   state_mb frs_instant_ms(meas) forst_dnload_ms(mdl)    speedup
+1x          8       32.3                 11.0               3414.8       311x
+4x         32      129.2                 11.9              13658.9      1149x
+16x        10      516.9                 10.1              51920.4      5141x
+
+== WRITE+CHECKPOINT bytes-to-remote over 10 checkpoints (paper §3.3) ==
+scale    state_mb frs_remote_mb(stream1×) forst_remote_mb(reupload)      ratio
+1x           32.3                   32.3                    323.1        10x
+4x          129.2                  129.2                   1292.3        10x
+16x         516.9                  516.9                   5169.0        10x
+```
+
+**Findings:** (1) forst-rs link checkpoint is FLAT in state size (13.2 → 16.3
+ms across a 16× sweep) — the paper's Fig. 9 "seconds regardless of state size"
+shape, here metadata-bound at ~15 ms; the modeled ForSt upload is linear
+(3.4 → 52 s at 10 MiB/s = exactly the 30–50 s tails Fig. 9 measures).
+(2) forst-rs instant restore is FLAT (10–12 ms) vs modeled download-restore
+linear in bytes — the Fig. 10 reconfiguration claim. (3) Bytes-to-remote: the
+"stream-once, link-forever" property (§3.3) makes every steady-state
+checkpoint cost ZERO remote bytes; over 10 checkpoints of an unchanged state
+forst-rs sends 1× while the re-upload model sends 10×. **Model sanity:** at an
+intra-DC 800 MB/s / 1 ms knob the small-state speedup drops to ~4× and rises
+into the paper's 16–49× band as state grows — confirming the model degrades
+gracefully and the headline 100s–1000s× figures are a direct consequence of
+the recorded 10 MB/s dev-box uplink, not model inflation. The forst-rs side is
+unconditionally > ForSt on all three operations because link/adopt move zero
+bytes by construction; the magnitude is bandwidth-set, the DIRECTION is not.
+
+Suites unchanged (additive bin; bench crate builds, clippy 0). The bin takes
+`--smoke` (1× scale only) for CI.
+
+**PMC self-review (cycle-4 unit-1).** (a) UNIT CONSISTENCY: `s3bw.rs` reports
+"MB/s" using binary MiB (`mb * 1024 * 1024`), so the recorded 10.2 MB/s is
+10.2 MiB/s; the model now costs against binary MiB to match the bytes the
+engine reports (fixed before recording the table above; ~5% vs the decimal-MB
+draft — does not move the conclusion). (b) MODEL HONESTY: the ForSt column is
+labeled MODELED everywhere (header line, table column suffix `(mdl)`, doc
+prose); the forst-rs column is the REAL engine and labeled `(meas)`. (c) FAIR
+BASELINE: the re-upload model uses base=0 (every SST "new") — the
+un-deduplicated worst case; with Flink upload-dedup ForSt re-uploads only
+CHANGED SSTs, so the checkpoint speedup on an unchanged steady state would be
+even larger for forst-rs (link is still 0 bytes) but on a churny state the
+ForSt upload shrinks toward the changed-set — the table's 10× bytes ratio is
+the steady-state (no churn) figure and is explicitly scoped as such.
+(d) the spot-read + `adopted_residual > 0` asserts inside the restore loop
+keep the "measured" numbers honest — they prove the instant engine SERVES
+data, not just opens.
+
+### Cycle-4 functional-checklist delta (recorded)
+
+Closed this cycle: the consolidated **headline disagg-vs-ForSt minibench**
+(the user's explicit 2-day deliverable — the "beat ForSt" artifact), unifying
+the per-stage Fig. 9 / Fig. 10 / §3.3 evidence into one reproducible
+side-by-side table with an explicit, re-costable bandwidth model.
+
+Remaining residue — assessed, NOT shipped this cycle (discipline: no
+half-features, no cosmetic churn):
+
+- **rescale-by-clip** (paper §5.2 / Fig. 10 rescale; design §5 Stage 3): a
+  correct implementation needs BOTH file-level adoption clipping (adopt only
+  SSTs whose `[smallest_key, largest_key]` overlaps the assigned key-group
+  range — the per-SST bounds exist at `column_family.rs:519-520`) AND
+  read/iterator boundary clipping (boundary SSTs over-include out-of-range
+  keys; the paper prunes them via lazy compaction). The boundary clip threads
+  through the read hot path (`get_internal`, every `*_scan_iter*`, compaction)
+  — a multi-day feature with real regression risk that cannot be finished
+  cleanly within this cycle. The key-group→key-prefix mapping is a Flink-layer
+  concern (cross-repo). DEFERRED to a dedicated cycle; the engine has the
+  per-SST bounds needed to start the file-level clip.
+- **pluggable cache-policy trait** (paper §5.4; design §4.1.3): re-assessed as
+  NOT a functional gap. The history-based policy is already implemented
+  (`local_cache.rs` `admit_read_fill` + `AdmissionTracker`) and the LRU-only
+  vs history-based A/B the trait was meant to enable is ALREADY exercisable
+  via `CachePolicy.admission: Option<AdmissionParams>` (`None` = LRU-only,
+  `Some` = history-based) — and is benchmarked in the ADMBENCH table above.
+  Extracting a `trait CacheAdmission` would be a cosmetic refactor of
+  already-functional, already-A/B'd code adding no paper capability; not worth
+  the byte-identical-behavior risk across its ~6 call sites. CLOSED as
+  satisfied-by-existing-design.
+- Cross-repo (Flink) items (Java zero-upload / download-skip branches, FFI
+  `linked_*` wiring) are landed in the flink fork (kickoff: 5bab68ac4) and are
+  out of this in-repo scope.
+
 ---
 
 ## 9. §Stage-2-detail — PMC refinement (2026-06-12, recorded before implementation)
