@@ -1030,6 +1030,50 @@ stays set on the CF (correct indefinitely). Cross-repo residue (FFI
 `*_clipped` surface + Flink key-group→key-prefix wiring) is the Java-adoption
 stage, out of in-repo scope.
 
+### Cycle-2 FULL-paper-coverage assessment (recorded 2026-06-13)
+
+With rescale-by-clip closed, the in-repo Phase-2 paper-functional surface
+(§0 six pillars) is COMPLETE. Status of every pillar + every recorded
+residue, swept this cycle:
+
+| Pillar / item | Status (in-repo) |
+|---|---|
+| 1 DFS-primary working dir + continuous streaming | DONE (write-through, remote-primary `open_remote`) |
+| 2 UFS logical→physical mapping + refcounts (FileMappingManager) | DONE (Stage 1; UUID keys C3U1; non-SST-local C3U2) |
+| 3 Checkpoint = metadata + linking, JM-delegated delete | DONE (Stage 2 link-mode + discard/tombstone) |
+| 4 Restore/rescale = link not copy | DONE (Stage 3 instant restore + **rescale-by-clip C2U3**) |
+| 5 Local cache = LRU + History-Based admission, pluggable | DONE (admission + bg-exempt; background-fill C3U3; pluggable-trait CLOSED-as-satisfied) |
+| 6a Async execution (AEC) | DONE (Flink fork production path) |
+| 6b Remote compaction | **DEFERRED — Phase 3** (paper marks experimental; §5 Stage 6 stub) |
+
+Recorded residue, swept — what (if anything) remains in-repo:
+
+- **NONE functional in-repo.** Every recorded RECORDED-RESIDUE item is now
+  either closed or correctly out of scope:
+  - mapping-journal tail replay — CLOSED (C2U2).
+  - abandoned-chk startup sweep — CLOSED (C2U2).
+  - WAL GC dropped-CF / floor-regression precise pin — CLOSED (C3U4).
+  - §4.1.1 background-fill scheduler — CLOSED (C3U3).
+  - pluggable cache-policy trait — CLOSED as satisfied-by-existing-design
+    (the LRU-vs-history A/B is already exercisable; extracting a trait adds
+    no paper capability, cosmetic-refactor risk not taken).
+  - rescale-by-clip — CLOSED this cycle (C2U3).
+- **WAL genuinely-unflushed-tail working-ref pin** — RETAINED BY DESIGN
+  (it is the tail's only durable copy until a covering flush; not a leak,
+  bounded by WBM flush cadence). Not a gap.
+- **Out of in-repo scope (recorded, unchanged):** remote compaction
+  (Phase 3); the E2E S3 perf race vs ForSt (Phase 3, needs the co-located
+  box — dev box is 10 MB/s); Java FFI `*_clipped` wiring + key-group→
+  key-prefix mapping (Flink fork); the q4 5M / q9-class 10M soak A/Bs
+  (NexMark = remote-box only, not on this dev Mac).
+
+Net: Phase-2 FUNCTIONAL reproduction of the ForSt disaggregated model is
+COMPLETE in-repo (pillars 1–5 + AEC); the only remaining paper capability is
+remote compaction, which the design scopes to Phase 3. The §7 acceptance
+criteria (1)(2)(4) are met on fs-emulation; (3) the q0–q22 5M remote-primary
+correctness sweep needs the Java zero-upload branch (cross-repo) + the remote
+box, so it stays the Phase-2→3 handoff gate.
+
 ### Cycle 3 unit 1 — UUID physical keys (landed 2026-06-13, C3U1)
 
 ForSt `toUUIDPath` mechanism (competitive analysis §2.2d), mapping-layer
@@ -1231,17 +1275,19 @@ side-by-side table with an explicit, re-costable bandwidth model.
 Remaining residue — assessed, NOT shipped this cycle (discipline: no
 half-features, no cosmetic churn):
 
-- **rescale-by-clip** (paper §5.2 / Fig. 10 rescale; design §5 Stage 3): a
-  correct implementation needs BOTH file-level adoption clipping (adopt only
-  SSTs whose `[smallest_key, largest_key]` overlaps the assigned key-group
-  range — the per-SST bounds exist at `column_family.rs:519-520`) AND
-  read/iterator boundary clipping (boundary SSTs over-include out-of-range
-  keys; the paper prunes them via lazy compaction). The boundary clip threads
-  through the read hot path (`get_internal`, every `*_scan_iter*`, compaction)
-  — a multi-day feature with real regression risk that cannot be finished
-  cleanly within this cycle. The key-group→key-prefix mapping is a Flink-layer
-  concern (cross-repo). DEFERRED to a dedicated cycle; the engine has the
-  per-SST bounds needed to start the file-level clip.
+- **rescale-by-clip** (paper §5.2 / Fig. 10 rescale; design §5 Stage 3):
+  ✅ **CLOSED (engine side) by cycle-2 unit-3** (see the §8 "Cycle 2 unit 3"
+  evidence + §10 design): both layers shipped — file-level adoption clip
+  (`clip_version_to_range` drops disjoint SSTs at adopt) AND read/iterator
+  boundary clip (per-CF `clip_range` gating EVERY read surface incl. the S2
+  pinned path). Flag default-OFF, dedicated `*_clipped[_remote]` restore
+  entry points; 8 falsifier ITs (incl. the boundary-straddle + S2-pinned
+  falsifiers). The regression risk this item flagged was contained by
+  enforcing the clip at the QUERY boundary (centralized) rather than
+  threading per-SST clip bounds through the merge, and by leaving physical
+  reclamation to normal compaction (no eager rewrite-on-adopt). The
+  key-group→key-prefix mapping + FFI `*_clipped` surface remain the
+  Flink-layer / cross-repo wiring stage.
 - **pluggable cache-policy trait** (paper §5.4; design §4.1.3): re-assessed as
   NOT a functional gap. The history-based policy is already implemented
   (`local_cache.rs` `admit_read_fill` + `AdmissionTracker`) and the LRU-only
