@@ -141,3 +141,14 @@ forst-rs-backend + engine scope alone**. It is correct and sound today (never pr
 but inert until the one operator-layer watermark/event-time feed above is added. The
 backend-side machinery (`ForStRsLifecycleManager.advanceWatermark` / `noteMaxEventTime`,
 the `frs_cf_*` FFI) is already in place and ready to be driven the moment that feed exists.
+
+## DECISION (user, 2026-06-13): KEEP RUNTIME UNTOUCHED
+The lifecycle-segment write-amp fix stays a documented, ready-to-activate
+capability (engine machinery + backend manager wired, default-OFF). No
+flink-runtime change. Effective write-amp reduction relies on the
+engine-transparent mechanisms that need NO operator feed:
+- sorted-run discipline (default-ON, p99 −64%)
+- KV-separation (FRS_KV_SEPARATION): q7-churn 7.46→1.55×, read 1.17×
+- trivial-move (FRS_TRIVIAL_MOVE): non-overlapping compaction 2.95→0.98×
+Lifecycle segments can be activated later by the single AbstractStreamOperator
+call site documented above, if the scope is ever relaxed.
