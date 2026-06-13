@@ -158,9 +158,7 @@ impl KvGcState {
         }
     }
 
-    fn decode_ptr(
-        bytes: Option<&[u8]>,
-    ) -> ForstResult<forst_rs_storage::vlog::ValuePointer> {
+    fn decode_ptr(bytes: Option<&[u8]>) -> ForstResult<forst_rs_storage::vlog::ValuePointer> {
         let bytes = bytes.ok_or_else(|| {
             ForstError::corruption("compaction: BlobRef row missing pointer payload")
         })?;
@@ -586,7 +584,12 @@ impl CompactionJob {
                             // Versions for this key, newest first.
                             let versions = &all[i..key_end];
                             i = key_end;
-                            self.emit_key_versions(&mut writer, versions, &mut file_emitted, &mut None)?;
+                            self.emit_key_versions(
+                                &mut writer,
+                                versions,
+                                &mut file_emitted,
+                                &mut None,
+                            )?;
                             // Roll to the next slot at this user-key boundary when
                             // the file has content, splitting is enabled, we are NOT
                             // on the final slot, the file reached target, and keys
@@ -867,8 +870,7 @@ impl CompactionJob {
 
         // FRS-WA-V2b: vlog-GC working state (None = unarmed; the legacy /
         // parallel paths never arm it).
-        let mut gc_holder: Option<KvGcState> =
-            self.kv_gc.as_ref().map(|_| KvGcState::default());
+        let mut gc_holder: Option<KvGcState> = self.kv_gc.as_ref().map(|_| KvGcState::default());
         let write_outcome: ForstResult<()> = (|| {
             let gc_state = &mut gc_holder;
             while !heap.is_empty() {
@@ -926,12 +928,10 @@ impl CompactionJob {
                                             if cursors[i].op_type()
                                                 == forst_rs_common::OpType::BlobRef
                                             {
-                                                let ptr = KvGcState::decode_ptr(
-                                                    cursors[i].value(),
-                                                )?;
-                                                *gc.freed
-                                                    .entry(ptr.segment_id)
-                                                    .or_insert(0) += u64::from(ptr.len);
+                                                let ptr =
+                                                    KvGcState::decode_ptr(cursors[i].value())?;
+                                                *gc.freed.entry(ptr.segment_id).or_insert(0) +=
+                                                    u64::from(ptr.len);
                                             }
                                         }
                                         cursors[i].advance()?;
@@ -971,7 +971,12 @@ impl CompactionJob {
                             }
                             // Newest-first within the key (index 0 = newest).
                             group.sort_by_key(|b| std::cmp::Reverse(b.effective_seq()));
-                            self.emit_key_versions(&mut writer, &group, &mut file_emitted, gc_state)?;
+                            self.emit_key_versions(
+                                &mut writer,
+                                &group,
+                                &mut file_emitted,
+                                gc_state,
+                            )?;
                         }
 
                         // Roll to the next slot at this user-key boundary once the
@@ -1064,12 +1069,12 @@ impl CompactionJob {
             // relocation segment was ever published; drop the file.
             if let (Some(spec), Some(gc)) = (self.kv_gc.as_ref(), gc_holder.as_ref()) {
                 if gc.out.is_some() {
-                    let _ = self.fs.delete_file(
-                        &forst_rs_storage::vlog::vlog_segment_path(
+                    let _ = self
+                        .fs
+                        .delete_file(&forst_rs_storage::vlog::vlog_segment_path(
                             &spec.db_dir,
                             spec.output_segment_id.value(),
-                        ),
-                    );
+                        ));
                 }
             }
         }
@@ -1100,7 +1105,11 @@ impl CompactionJob {
             // FRS-WA-V2b: every input row was dropped — fold the freed
             // accounting (no relocation can have run: nothing emitted).
             return match gc_holder {
-                Some(gc) => Ok(Some(gc.finish_into(edit, self.kv_gc.as_ref(), self.cf_id)?)),
+                Some(gc) => Ok(Some(gc.finish_into(
+                    edit,
+                    self.kv_gc.as_ref(),
+                    self.cf_id,
+                )?)),
                 None => Ok(Some(edit)),
             };
         }
@@ -1144,7 +1153,11 @@ impl CompactionJob {
         };
         // FRS-WA-V2b: fold freed deltas + the relocation output segment.
         match gc_holder {
-            Some(gc) => Ok(Some(gc.finish_into(edit, self.kv_gc.as_ref(), self.cf_id)?)),
+            Some(gc) => Ok(Some(gc.finish_into(
+                edit,
+                self.kv_gc.as_ref(),
+                self.cf_id,
+            )?)),
             None => Ok(Some(edit)),
         }
     }

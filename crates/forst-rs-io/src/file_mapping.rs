@@ -55,7 +55,7 @@
 //!
 //! JM-side checkpoint discard must never issue a direct S3 delete (the TM
 //! owns the physical lifecycle). Instead the discard writes a
-//! [`MappingRecord::Tombstone`]; the physical object is deleted when its
+//! `MappingRecord::Tombstone`; the physical object is deleted when its
 //! refcount drains to zero (or immediately if already zero), and
 //! [`FileMappingManager::gc_sweep`] consumes tombstones for objects the
 //! mapping no longer references.
@@ -171,7 +171,12 @@ impl MappingState {
                 physical_key,
                 size,
             } => {
-                self.insert_logical(logical, physical_key, *size, FileOwnership::ShareableOwnedByDb);
+                self.insert_logical(
+                    logical,
+                    physical_key,
+                    *size,
+                    FileOwnership::ShareableOwnedByDb,
+                );
             }
             MappingRecord::Link {
                 dst_logical,
@@ -852,7 +857,12 @@ impl FileMappingManager {
 
     /// Number of live logical mappings.
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("lock poisoned").state.logical.len()
+        self.inner
+            .lock()
+            .expect("lock poisoned")
+            .state
+            .logical
+            .len()
     }
 
     /// True when no logical mappings exist.
@@ -923,7 +933,10 @@ impl FileMappingManager {
         // Link records, losing their size on the next journal replay.
         let mut registered: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (path, key) in sorted {
-            let entry = state.physical.get(key.as_str()).expect("snapshot invariant");
+            let entry = state
+                .physical
+                .get(key.as_str())
+                .expect("snapshot invariant");
             let rec = if entry.ownership == FileOwnership::NotOwned {
                 MappingRecord::Adopt {
                     logical: path.clone(),
@@ -975,11 +988,7 @@ impl FileMappingManager {
             if meta.is_dir {
                 continue;
             }
-            let is_sst = meta
-                .path
-                .extension()
-                .map(|e| e == "sst")
-                .unwrap_or(false);
+            let is_sst = meta.path.extension().map(|e| e == "sst").unwrap_or(false);
             if !is_sst {
                 continue;
             }
@@ -1274,11 +1283,7 @@ impl MappedFileSystem {
     /// writer AT the physical key. Journal-before-bytes: a crash after the
     /// mint leaves a mapping to a missing/partial object — the staging sweep
     /// (`.tmp`) or rebind-on-number-reuse reaps it; never data loss (R1).
-    fn mint_and_open(
-        &self,
-        logical: &Path,
-        mode: WriteMode,
-    ) -> ForstResult<Box<dyn WritableFile>> {
+    fn mint_and_open(&self, logical: &Path, mode: WriteMode) -> ForstResult<Box<dyn WritableFile>> {
         let key = FileMappingManager::mint_physical_key(logical)?;
         self.mapping.register(logical, &key, 0)?;
         self.inner.open_writable_file(Path::new(&key), mode)
@@ -1466,7 +1471,9 @@ fn decode_snapshot(bytes: &[u8]) -> ForstResult<MappingState> {
     let (n_logical, n) = get_fixed32(&payload[pos..])?;
     pos += n;
     if n_logical > MAX_SNAPSHOT_ENTRIES {
-        return Err(ForstError::corruption("mapping snapshot entry count implausible"));
+        return Err(ForstError::corruption(
+            "mapping snapshot entry count implausible",
+        ));
     }
     let mut state = MappingState::default();
     let mut pairs: Vec<(PathBuf, String)> = Vec::with_capacity(n_logical as usize);
@@ -1480,7 +1487,9 @@ fn decode_snapshot(bytes: &[u8]) -> ForstResult<MappingState> {
     let (n_physical, n) = get_fixed32(&payload[pos..])?;
     pos += n;
     if n_physical > MAX_SNAPSHOT_ENTRIES {
-        return Err(ForstError::corruption("mapping snapshot entry count implausible"));
+        return Err(ForstError::corruption(
+            "mapping snapshot entry count implausible",
+        ));
     }
     let mut phys_meta: HashMap<String, (u64, FileOwnership, bool)> =
         HashMap::with_capacity(n_physical as usize);
@@ -1655,8 +1664,11 @@ mod tests {
             .unwrap();
         assert_eq!(m.refs("/db/000001.sst"), 1);
 
-        m.link(Path::new("/db/000001.sst"), Path::new("/ckpt/chk-1/000001.sst"))
-            .unwrap();
+        m.link(
+            Path::new("/db/000001.sst"),
+            Path::new("/ckpt/chk-1/000001.sst"),
+        )
+        .unwrap();
         assert_eq!(m.refs("/db/000001.sst"), 2);
         assert_eq!(
             m.resolve(Path::new("/ckpt/chk-1/000001.sst")).as_deref(),
@@ -1763,8 +1775,11 @@ mod tests {
         let m = mgr(&fs);
         m.register(Path::new("/db/000006.sst"), "/db/000006.sst", 1)
             .unwrap();
-        m.link(Path::new("/db/000006.sst"), Path::new("/ckpt/chk-2/000006.sst"))
-            .unwrap();
+        m.link(
+            Path::new("/db/000006.sst"),
+            Path::new("/ckpt/chk-2/000006.sst"),
+        )
+        .unwrap();
 
         // Tombstone with refs held: bytes survive.
         assert!(!m.tombstone("/db/000006.sst").unwrap());
@@ -1811,8 +1826,11 @@ mod tests {
                 .unwrap();
             m.register(Path::new("/db/000011.sst"), "/db/000011.sst", 5)
                 .unwrap();
-            m.link(Path::new("/db/000010.sst"), Path::new("/ckpt/chk-1/000010.sst"))
-                .unwrap();
+            m.link(
+                Path::new("/db/000010.sst"),
+                Path::new("/ckpt/chk-1/000010.sst"),
+            )
+            .unwrap();
             m.unlink(Path::new("/db/000011.sst")).unwrap(); // drains → deleted
             m.sync_journal().unwrap();
         }
@@ -1892,8 +1910,11 @@ mod tests {
         let m = mgr(&fs);
         m.register(Path::new("/db/000014.sst"), "/db/000014.sst", 3)
             .unwrap();
-        m.link(Path::new("/db/000014.sst"), Path::new("/ckpt/chk-3/000014.sst"))
-            .unwrap();
+        m.link(
+            Path::new("/db/000014.sst"),
+            Path::new("/ckpt/chk-3/000014.sst"),
+        )
+        .unwrap();
         m.adopt(Path::new("/db/000015.sst"), "/remote/chk/000015.sst")
             .unwrap();
         m.tombstone("/remote/chk/000015.sst").unwrap();
@@ -1905,7 +1926,8 @@ mod tests {
         // Restore into a fresh manager on an empty journal.
         let fs2: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
         fs2.create_dir_all(Path::new("/db")).unwrap();
-        let m3 = FileMappingManager::new(fs2.clone(), PathBuf::from("/db/MAPPING.journal")).unwrap();
+        let m3 =
+            FileMappingManager::new(fs2.clone(), PathBuf::from("/db/MAPPING.journal")).unwrap();
         m3.restore_snapshot(&snap).unwrap();
         assert_eq!(m3.refs("/db/000014.sst"), 2);
         assert_eq!(
@@ -1913,7 +1935,8 @@ mod tests {
             Some(FileOwnership::NotOwned)
         );
         // The rewritten journal alone reconstructs the restored state.
-        let m4 = FileMappingManager::new(fs2.clone(), PathBuf::from("/db/MAPPING.journal")).unwrap();
+        let m4 =
+            FileMappingManager::new(fs2.clone(), PathBuf::from("/db/MAPPING.journal")).unwrap();
         assert_eq!(m4.snapshot_bytes().unwrap(), m3.snapshot_bytes().unwrap());
     }
 
@@ -2055,9 +2078,11 @@ mod tests {
     #[test]
     fn test_journal_view_absent_journal_is_none() {
         let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
-        assert!(MappingJournalView::load(fs.as_ref(), Path::new("/nope/MAPPING.journal"))
-            .unwrap()
-            .is_none());
+        assert!(
+            MappingJournalView::load(fs.as_ref(), Path::new("/nope/MAPPING.journal"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The view replays the journal's CURRENT state — including records
@@ -2071,23 +2096,38 @@ mod tests {
             .unwrap();
         m.register(Path::new("/db/000002.sst"), "/db/000002.sst", 1)
             .unwrap();
-        m.link(Path::new("/db/000001.sst"), Path::new("/db/checkpoints/00000000000000000001/000001.sst"))
-            .unwrap();
+        m.link(
+            Path::new("/db/000001.sst"),
+            Path::new("/db/checkpoints/00000000000000000001/000001.sst"),
+        )
+        .unwrap();
         // Post-"snapshot" tail: unlink one working ref + tombstone the other.
         m.unlink(Path::new("/db/000002.sst")).unwrap();
-        assert!(!m.tombstone("/db/000001.sst").unwrap(), "refs held → deferred");
+        assert!(
+            !m.tombstone("/db/000001.sst").unwrap(),
+            "refs held → deferred"
+        );
         m.sync_journal().unwrap();
 
         let v = MappingJournalView::load(fs.as_ref(), Path::new("/db/MAPPING.journal"))
             .unwrap()
             .expect("journal exists");
-        assert_eq!(v.resolve(Path::new("/db/000001.sst")), Some("/db/000001.sst"));
+        assert_eq!(
+            v.resolve(Path::new("/db/000001.sst")),
+            Some("/db/000001.sst")
+        );
         assert_eq!(
             v.resolve(Path::new("/db/checkpoints/00000000000000000001/000001.sst")),
             Some("/db/000001.sst")
         );
-        assert!(!v.is_registered(Path::new("/db/000002.sst")), "unlink replayed");
-        assert!(v.is_tombstoned("/db/000001.sst"), "tombstone visible in tail");
+        assert!(
+            !v.is_registered(Path::new("/db/000002.sst")),
+            "unlink replayed"
+        );
+        assert!(
+            v.is_tombstoned("/db/000001.sst"),
+            "tombstone visible in tail"
+        );
         assert!(!v.is_tombstoned("/db/000002.sst"));
         assert_eq!(v.len(), 2);
         // Read-only: loading the view never mutates the journal.
@@ -2143,9 +2183,7 @@ mod tests {
         assert!(m
             .logical_paths_under(Path::new("/db"))
             .contains(&PathBuf::from("/db/000001.sst")));
-        assert!(m
-            .logical_paths_under(Path::new("/elsewhere"))
-            .is_empty());
+        assert!(m.logical_paths_under(Path::new("/elsewhere")).is_empty());
     }
 
     // --- FRS-PHASE2-C3U1: UUID physical keys (competitive analysis §2.2d) --
@@ -2192,10 +2230,7 @@ mod tests {
         fn file_exists(&self, path: &Path) -> ForstResult<bool> {
             self.inner.file_exists(path)
         }
-        fn get_file_metadata(
-            &self,
-            path: &Path,
-        ) -> ForstResult<crate::filesystem::FileMetadata> {
+        fn get_file_metadata(&self, path: &Path) -> ForstResult<crate::filesystem::FileMetadata> {
             self.inner.get_file_metadata(path)
         }
         fn list_dir(&self, dir: &Path) -> ForstResult<Vec<crate::filesystem::FileMetadata>> {
@@ -2247,7 +2282,12 @@ mod tests {
         let mapped = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
         assert!(mapped.uuid_physical_keys());
 
-        write_through(&mapped, "/db/000001.sst", WriteMode::CreateNew, b"sst-bytes");
+        write_through(
+            &mapped,
+            "/db/000001.sst",
+            WriteMode::CreateNew,
+            b"sst-bytes",
+        );
         let key = m.resolve(Path::new("/db/000001.sst")).expect("minted");
         assert!(is_uuid_key(&key), "physical {key} must be uuid-shaped");
         assert!(key.starts_with("/db/"), "same parent dir, got {key}");
@@ -2292,11 +2332,19 @@ mod tests {
         // place (the local-FS convention — supports_atomic_rename is true on
         // the opendal Fs scheme, so this IS the path the engine takes).
         assert!(mapped.supports_atomic_rename());
-        write_through(&mapped, "/db/.000001.sst.tmp", WriteMode::CreateNew, b"sst-1");
+        write_through(
+            &mapped,
+            "/db/.000001.sst.tmp",
+            WriteMode::CreateNew,
+            b"sst-1",
+        );
         let staged_key = m.resolve(Path::new("/db/.000001.sst.tmp")).unwrap();
         assert!(is_uuid_key(&staged_key));
         mapped
-            .rename(Path::new("/db/.000001.sst.tmp"), Path::new("/db/000001.sst"))
+            .rename(
+                Path::new("/db/.000001.sst.tmp"),
+                Path::new("/db/000001.sst"),
+            )
             .unwrap();
 
         assert_eq!(counting.renames(), 0, "rename-free invariant violated");
@@ -2339,9 +2387,13 @@ mod tests {
         fs.create_dir_all(Path::new("/db")).unwrap();
         {
             let m = Arc::new(mgr(&fs));
-            let mapped =
-                MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
-            write_through(&mapped, "/db/.000007.sst.tmp", WriteMode::CreateNew, b"torn");
+            let mapped = MappedFileSystem::with_uuid_physical_keys(fs.clone(), m.clone()).unwrap();
+            write_through(
+                &mapped,
+                "/db/.000007.sst.tmp",
+                WriteMode::CreateNew,
+                b"torn",
+            );
             // crash: no rename, manager dropped (journal survives on fs).
         }
         let m2 = Arc::new(mgr(&fs)); // journal replay resurrects the mapping
@@ -2354,7 +2406,12 @@ mod tests {
             "crashed staging physical must be reaped"
         );
         // Same staging name is creatable again (file-number reuse).
-        write_through(&mapped2, "/db/.000007.sst.tmp", WriteMode::CreateNew, b"retry");
+        write_through(
+            &mapped2,
+            "/db/.000007.sst.tmp",
+            WriteMode::CreateNew,
+            b"retry",
+        );
         assert_eq!(
             read_all(&mapped2, Path::new("/db/.000007.sst.tmp")).unwrap(),
             b"retry".to_vec()
@@ -2405,7 +2462,10 @@ mod tests {
         let m2 = mgr(&fs);
         assert_eq!(m2.resolve(Path::new("/db/000003.sst")).unwrap(), key);
         assert_eq!(m2.refs(&key), 2);
-        assert_eq!(m2.ownership_of(&key), Some(FileOwnership::ShareableOwnedByDb));
+        assert_eq!(
+            m2.ownership_of(&key),
+            Some(FileOwnership::ShareableOwnedByDb)
+        );
 
         // Snapshot → restore_snapshot (journal REWRITE) → re-open again.
         let snap = m2.snapshot_bytes().unwrap();
@@ -2416,7 +2476,10 @@ mod tests {
         let m4 = mgr(&fs); // replays the REWRITTEN journal
         assert_eq!(m4.resolve(Path::new("/db/000003.sst")).unwrap(), key);
         assert_eq!(m4.refs(&key), 2);
-        assert_eq!(m4.ownership_of(&key), Some(FileOwnership::ShareableOwnedByDb));
+        assert_eq!(
+            m4.ownership_of(&key),
+            Some(FileOwnership::ShareableOwnedByDb)
+        );
         assert_eq!(
             read_all(fs.as_ref(), Path::new(&key)).unwrap(),
             b"bytes-3".to_vec()
@@ -2437,7 +2500,12 @@ mod tests {
         let chk = Path::new("/db/checkpoints/00000000000000000003/000004.sst");
         m.link(Path::new("/db/000004.sst"), chk).unwrap();
 
-        write_through(&mapped, "/db/000004.sst", WriteMode::CreateOrTruncate, b"rewritten");
+        write_through(
+            &mapped,
+            "/db/000004.sst",
+            WriteMode::CreateOrTruncate,
+            b"rewritten",
+        );
         let new_key = m.resolve(Path::new("/db/000004.sst")).unwrap();
         assert_ne!(new_key, old_key, "truncate must mint a fresh physical");
         assert_eq!(

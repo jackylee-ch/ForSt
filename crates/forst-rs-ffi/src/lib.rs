@@ -4687,8 +4687,7 @@ pub unsafe extern "C" fn frs_create_incremental_checkpoint_linked(
         if snap_ref.db_id() != db.db_id() {
             return FRS_STATUS_INVALID_ARGUMENT;
         }
-        match db.create_incremental_checkpoint_linked(snap_ref, checkpoint_id, base_checkpoint_id)
-        {
+        match db.create_incremental_checkpoint_linked(snap_ref, checkpoint_id, base_checkpoint_id) {
             Ok(result) => {
                 debug_assert!(
                     result.link_mode && result.new_ssts.is_empty() && result.shared_ssts.is_empty(),
@@ -7632,7 +7631,10 @@ mod tests {
             let v = b"v";
             frs_put(db, cf, k.as_ptr(), k.len(), v.as_ptr(), v.len());
             let mut out = FrsBytes::NULL;
-            assert_eq!(frs_get(db, cf, k.as_ptr(), k.len(), &mut out), FRS_STATUS_OK);
+            assert_eq!(
+                frs_get(db, cf, k.as_ptr(), k.len(), &mut out),
+                FRS_STATUS_OK
+            );
             let slice = slice::from_raw_parts(out.data, out.len);
             assert_eq!(slice, b"v");
             frs_bytes_free(&mut out);

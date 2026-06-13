@@ -179,8 +179,7 @@ impl BackgroundFill {
                             if sh.stop.load(Ordering::Relaxed) {
                                 return;
                             }
-                            let Some(path) =
-                                sh.queue.lock().expect("bgfill queue poisoned").pop()
+                            let Some(path) = sh.queue.lock().expect("bgfill queue poisoned").pop()
                             else {
                                 return;
                             };
@@ -188,10 +187,7 @@ impl BackgroundFill {
                             if sh.stop.load(Ordering::Relaxed) {
                                 // Put the un-filled path back so the report's
                                 // `cancelled` count stays exact.
-                                sh.queue
-                                    .lock()
-                                    .expect("bgfill queue poisoned")
-                                    .push(path);
+                                sh.queue.lock().expect("bgfill queue poisoned").push(path);
                                 return;
                             }
                             match sh.fs.fill_file_cold(&path) {
@@ -276,10 +272,7 @@ mod tests {
         let payload = vec![0xABu8; FILE_KB * 1024];
         for i in 0..n {
             let mut w = fs
-                .open_writable_file(
-                    Path::new(&format!("/db/{i:06}.sst")),
-                    WriteMode::CreateNew,
-                )
+                .open_writable_file(Path::new(&format!("/db/{i:06}.sst")), WriteMode::CreateNew)
                 .unwrap();
             w.append(&payload).unwrap();
             w.sync().unwrap();
@@ -293,14 +286,22 @@ mod tests {
         policy: CachePolicy,
     ) -> (tempfile::TempDir, Arc<CachedFileSystem>) {
         let tmp = tempfile::TempDir::new().unwrap();
-        let cache =
-            LocalCache::open_with_policy(tmp.path(), budget_files * (FILE_KB as u64) * 1024, policy)
-                .unwrap();
-        (tmp, Arc::new(CachedFileSystem::new(remote, Arc::new(cache))))
+        let cache = LocalCache::open_with_policy(
+            tmp.path(),
+            budget_files * (FILE_KB as u64) * 1024,
+            policy,
+        )
+        .unwrap();
+        (
+            tmp,
+            Arc::new(CachedFileSystem::new(remote, Arc::new(cache))),
+        )
     }
 
     fn paths(n: usize) -> Vec<PathBuf> {
-        (0..n).map(|i| PathBuf::from(format!("/db/{i:06}.sst"))).collect()
+        (0..n)
+            .map(|i| PathBuf::from(format!("/db/{i:06}.sst")))
+            .collect()
     }
 
     /// Whole restored set fits the budget: everything is filled, cache-hit
@@ -443,7 +444,9 @@ mod tests {
         // gets evicted promote_limit times.
         fs.cache().put("/db/000000.sst", &payload).unwrap();
         for i in 0..4 {
-            fs.cache().put(&format!("/db/filler-{i}.sst"), &payload).unwrap();
+            fs.cache()
+                .put(&format!("/db/filler-{i}.sst"), &payload)
+                .unwrap();
         }
         assert!(fs.cache().is_admission_blocked("/db/000000.sst"));
         let r = BackgroundFill::start(

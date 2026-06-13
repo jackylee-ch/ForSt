@@ -392,9 +392,10 @@ impl FlushJob {
         if !(0..rows).any(qualifies) {
             return Ok(None);
         }
-        let dir = self.file_path.parent().ok_or_else(|| {
-            ForstError::invalid_argument("flush target has no parent directory")
-        })?;
+        let dir = self
+            .file_path
+            .parent()
+            .ok_or_else(|| ForstError::invalid_argument("flush target has no parent directory"))?;
         let mut new_values = BinaryBuilder::new();
         let mut new_ops: Vec<u8> = Vec::with_capacity(rows);
         for row in 0..rows {

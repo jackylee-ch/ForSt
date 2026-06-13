@@ -1282,7 +1282,10 @@ mod tests {
             .with_lifecycle(CfLifecycle::Windowed { ttl: 4_000_000 });
         assert_eq!(d.lifecycle(), CfLifecycle::Windowed { ttl: 4_000_000 });
         let dbg = format!("{:?}", d);
-        assert!(dbg.contains("Windowed"), "Debug must surface lifecycle: {dbg}");
+        assert!(
+            dbg.contains("Windowed"),
+            "Debug must surface lifecycle: {dbg}"
+        );
     }
 
     #[test]

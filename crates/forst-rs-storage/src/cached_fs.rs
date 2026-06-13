@@ -716,7 +716,7 @@ impl FileSystem for CachedFileSystem {
     /// restored-working-set hint to the [`LocalCache`] admission tracker so
     /// the file's first foreground touch admits its load-back. No bytes move;
     /// pure no-op when admission is off. Non-UTF-8 paths (uncacheable by
-    /// definition — see [`Self::cache_key`]) are silently ignored: this is a
+    /// definition — see `Self::cache_key`) are silently ignored: this is a
     /// best-effort warm hint, not a correctness operation.
     fn pre_seed_admission(&self, path: &Path) {
         if let Ok(key) = self.cache_key(path) {

@@ -160,20 +160,32 @@ fn linked_checkpoint_flush_mode_instant_restore_round_trip() {
         // CLAIM discipline signal: live SSTs still resolve to the source
         // checkpoint's physicals.
         let mut residual: u64 = 0;
-        assert_eq!(frs_db_adopted_residual(restored, &mut residual), FRS_STATUS_OK);
+        assert_eq!(
+            frs_db_adopted_residual(restored, &mut residual),
+            FRS_STATUS_OK
+        );
         assert!(residual > 0, "freshly restored engine is not weaned yet");
         // The SOURCE db has no adopted physicals.
         let mut src_residual: u64 = 7;
-        assert_eq!(frs_db_adopted_residual(db, &mut src_residual), FRS_STATUS_OK);
+        assert_eq!(
+            frs_db_adopted_residual(db, &mut src_residual),
+            FRS_STATUS_OK
+        );
         assert_eq!(src_residual, 0);
 
         // Restored engine is writable.
         put_kv(restored, rcf, "post-restore", "ok");
         assert_get(restored, rcf, "post-restore", "ok");
 
-        assert_eq!(frs_db_linked_checkpoint_result_free(&mut result), FRS_STATUS_OK);
+        assert_eq!(
+            frs_db_linked_checkpoint_result_free(&mut result),
+            FRS_STATUS_OK
+        );
         // Idempotent double-free.
-        assert_eq!(frs_db_linked_checkpoint_result_free(&mut result), FRS_STATUS_OK);
+        assert_eq!(
+            frs_db_linked_checkpoint_result_free(&mut result),
+            FRS_STATUS_OK
+        );
         assert_eq!(frs_db_close(restored), FRS_STATUS_OK);
         assert_eq!(frs_db_close(db), FRS_STATUS_OK);
     }
@@ -265,7 +277,10 @@ fn linked_checkpoint_wal_delta_mode_replays_unflushed_tail() {
             "post-barrier write leaked into the checkpoint"
         );
 
-        assert_eq!(frs_db_linked_checkpoint_result_free(&mut result), FRS_STATUS_OK);
+        assert_eq!(
+            frs_db_linked_checkpoint_result_free(&mut result),
+            FRS_STATUS_OK
+        );
         assert_eq!(frs_db_close(restored), FRS_STATUS_OK);
         assert_eq!(frs_db_close(db), FRS_STATUS_OK);
     }
@@ -312,15 +327,14 @@ fn discard_linked_checkpoint_reports_and_is_not_retriable() {
         );
         let mut out_handle: FrsDb = ptr::null_mut();
         assert_eq!(
-            frs_db_open_from_linked_checkpoint_instant(
-                ptr::null(),
-                ptr::null(),
-                &mut out_handle
-            ),
+            frs_db_open_from_linked_checkpoint_instant(ptr::null(), ptr::null(), &mut out_handle),
             FRS_STATUS_NULL_ARG
         );
 
-        assert_eq!(frs_db_linked_checkpoint_result_free(&mut result), FRS_STATUS_OK);
+        assert_eq!(
+            frs_db_linked_checkpoint_result_free(&mut result),
+            FRS_STATUS_OK
+        );
         assert_eq!(frs_db_close(db), FRS_STATUS_OK);
     }
 }
@@ -346,13 +360,7 @@ fn sweep_abandoned_checkpoints_reaps_journal_only_links() {
         let mut unlinked: u64 = 0;
         let mut deleted: u64 = 99;
         assert_eq!(
-            frs_db_sweep_abandoned_checkpoints(
-                db,
-                ptr::null(),
-                0,
-                &mut unlinked,
-                &mut deleted
-            ),
+            frs_db_sweep_abandoned_checkpoints(db, ptr::null(), 0, &mut unlinked, &mut deleted),
             FRS_STATUS_OK
         );
         assert_eq!(unlinked, linked_count, "abandoned chk-3 links reaped");
@@ -372,18 +380,15 @@ fn sweep_abandoned_checkpoints_reaps_journal_only_links() {
         let (mut r4, _d4) = linked_ckpt(db, 4, 0);
         let live = [4u64];
         assert_eq!(
-            frs_db_sweep_abandoned_checkpoints(
-                db,
-                live.as_ptr(),
-                1,
-                &mut unlinked,
-                &mut deleted
-            ),
+            frs_db_sweep_abandoned_checkpoints(db, live.as_ptr(), 1, &mut unlinked, &mut deleted),
             FRS_STATUS_OK
         );
         assert_eq!(unlinked, 0, "live id untouched");
 
-        assert_eq!(frs_db_linked_checkpoint_result_free(&mut result), FRS_STATUS_OK);
+        assert_eq!(
+            frs_db_linked_checkpoint_result_free(&mut result),
+            FRS_STATUS_OK
+        );
         assert_eq!(frs_db_linked_checkpoint_result_free(&mut r4), FRS_STATUS_OK);
         assert_eq!(frs_db_close(db), FRS_STATUS_OK);
     }

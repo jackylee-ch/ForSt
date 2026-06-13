@@ -255,13 +255,14 @@ impl WalWriter {
         // crashed prior seals AND checkpoint-id retries.
         let mut n = 0u64;
         let sealed_path = loop {
-            let candidate = self
-                .path
-                .with_file_name(format!(
-                    "{}.seal-{:04}",
-                    self.path.file_name().and_then(|s| s.to_str()).unwrap_or("wal"),
-                    n
-                ));
+            let candidate = self.path.with_file_name(format!(
+                "{}.seal-{:04}",
+                self.path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("wal"),
+                n
+            ));
             if !candidate.exists() {
                 break candidate;
             }

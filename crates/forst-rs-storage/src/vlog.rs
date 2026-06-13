@@ -131,9 +131,8 @@ impl VlogWriter {
 
     /// Appends one value; returns its pointer.
     pub fn append(&mut self, value: &[u8]) -> ForstResult<ValuePointer> {
-        let len = u32::try_from(value.len()).map_err(|_| {
-            ForstError::invalid_argument("vlog value exceeds u32::MAX bytes")
-        })?;
+        let len = u32::try_from(value.len())
+            .map_err(|_| ForstError::invalid_argument("vlog value exceeds u32::MAX bytes"))?;
         let ptr = ValuePointer {
             segment_id: self.segment_id,
             offset: self.offset,

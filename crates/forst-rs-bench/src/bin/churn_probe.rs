@@ -384,11 +384,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
         forst_rs_engine::set_kv_separation_override(Some(true));
     }
     // FRS-WA-V3: trivial-move cell.
-    forst_rs_engine::set_trivial_move_override(if args.trivial_move {
-        Some(true)
-    } else {
-        None
-    });
+    forst_rs_engine::set_trivial_move_override(if args.trivial_move { Some(true) } else { None });
     let db = DbImpl::open_with_fs(opts, fs).expect("open");
     // FRS-M3 G3: cf[0] = default; cf[1..] = extra churn CFs. Bucket-affine
     // assignment keeps put/delete/probe for a key on ONE cf.
@@ -422,8 +418,8 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
     let logical = Arc::new(AtomicU64::new(0));
     let rows = Arc::new(AtomicU64::new(0));
     let max_seq = Arc::new(AtomicU64::new(0)); // probe upper bound
-    // FRS-WA-V1: the watermark value last SENT to the engine (verifier reads
-    // it to pick provably-live keys).
+                                               // FRS-WA-V1: the watermark value last SENT to the engine (verifier reads
+                                               // it to pick provably-live keys).
     let wm_sent = Arc::new(AtomicU64::new(0));
 
     // ---- writer thread (both streams interleaved + TTL deletes) ----
@@ -629,9 +625,7 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
         let vlog_bytes: u64 = std::fs::read_dir(&db_path)
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path().extension().and_then(|x| x.to_str()) == Some("vlog")
-                    })
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("vlog"))
                     .filter_map(|e| e.metadata().ok().map(|m| m.len()))
                     .sum()
             })

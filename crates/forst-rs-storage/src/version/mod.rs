@@ -1813,7 +1813,7 @@ mod tests {
                             min_sequence: SequenceNumber(1),
                             max_sequence: SequenceNumber(100),
                             num_entries: 10,
-            max_death: 0,
+                            max_death: 0,
                         },
                     ));
                     file_num += 1;
@@ -1839,7 +1839,7 @@ mod tests {
                                 min_sequence: SequenceNumber(1),
                                 max_sequence: SequenceNumber(100),
                                 num_entries: 10,
-            max_death: 0,
+                                max_death: 0,
                             },
                         ));
                         file_num += 1;
@@ -1946,7 +1946,7 @@ mod tests {
                     min_sequence: SequenceNumber(1),
                     max_sequence: SequenceNumber(100),
                     num_entries: 50,
-            max_death: 0,
+                    max_death: 0,
                 },
             ));
         }

@@ -534,10 +534,7 @@ impl FileSystem for FileSystemRouter {
         }
         for fs in self.scheme_fs.values() {
             if !Arc::ptr_eq(&self.local_fs, fs)
-                && !self
-                    .remote_fs
-                    .as_ref()
-                    .is_some_and(|r| Arc::ptr_eq(r, fs))
+                && !self.remote_fs.as_ref().is_some_and(|r| Arc::ptr_eq(r, fs))
             {
                 fs.await_all_uploads()?;
             }
@@ -1390,10 +1387,7 @@ mod tests {
             fn open_sequential_file(&self, p: &Path) -> ForstResult<Box<dyn SequentialFile>> {
                 self.inner.open_sequential_file(p)
             }
-            fn open_random_access_file(
-                &self,
-                p: &Path,
-            ) -> ForstResult<Box<dyn RandomAccessFile>> {
+            fn open_random_access_file(&self, p: &Path) -> ForstResult<Box<dyn RandomAccessFile>> {
                 self.inner.open_random_access_file(p)
             }
             fn open_writable_file(
@@ -1446,11 +1440,25 @@ mod tests {
             Arc::clone(&remote) as Arc<dyn FileSystem>,
         );
         router.await_upload(Path::new("/db/000001.sst")).unwrap();
-        assert_eq!(remote.awaits.load(Ordering::SeqCst), 1, "SST barrier hits remote");
-        router.await_upload(Path::new("/db/MANIFEST-000001")).unwrap();
-        assert_eq!(remote.awaits.load(Ordering::SeqCst), 1, "non-SST barrier stays local");
+        assert_eq!(
+            remote.awaits.load(Ordering::SeqCst),
+            1,
+            "SST barrier hits remote"
+        );
+        router
+            .await_upload(Path::new("/db/MANIFEST-000001"))
+            .unwrap();
+        assert_eq!(
+            remote.awaits.load(Ordering::SeqCst),
+            1,
+            "non-SST barrier stays local"
+        );
         router.await_all_uploads().unwrap();
-        assert_eq!(remote.awaits.load(Ordering::SeqCst), 2, "global barrier fans out");
+        assert_eq!(
+            remote.awaits.load(Ordering::SeqCst),
+            2,
+            "global barrier fans out"
+        );
     }
 
     /// C3U2: a tiered router's atomic-rename capability is the AND of its
@@ -1462,10 +1470,7 @@ mod tests {
             fn open_sequential_file(&self, p: &Path) -> ForstResult<Box<dyn SequentialFile>> {
                 self.0.open_sequential_file(p)
             }
-            fn open_random_access_file(
-                &self,
-                p: &Path,
-            ) -> ForstResult<Box<dyn RandomAccessFile>> {
+            fn open_random_access_file(&self, p: &Path) -> ForstResult<Box<dyn RandomAccessFile>> {
                 self.0.open_random_access_file(p)
             }
             fn open_writable_file(

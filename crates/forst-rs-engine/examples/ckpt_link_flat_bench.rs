@@ -152,8 +152,14 @@ fn main() {
             copy_med,
             link_med,
             copy_med / link_med,
-            copy_ms.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>(),
-            link_ms.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>(),
+            copy_ms
+                .iter()
+                .map(|x| (x * 10.0).round() / 10.0)
+                .collect::<Vec<_>>(),
+            link_ms
+                .iter()
+                .map(|x| (x * 10.0).round() / 10.0)
+                .collect::<Vec<_>>(),
         );
         drop(db);
     }

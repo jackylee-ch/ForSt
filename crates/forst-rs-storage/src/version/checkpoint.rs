@@ -166,9 +166,10 @@ pub fn serialize_to_blob(snapshot: &VersionSetSnapshot) -> ForstResult<Vec<u8>> 
         .iter()
         .any(|lvl| lvl.files.iter().any(|f| f.max_death != 0));
     // FRS-WA-V1 R10: emit v4 only when some CF carries lifecycle state.
-    let needs_v4 = snapshot.cf_descriptors.iter().any(|cf| {
-        cf.lifecycle_ordinal != 0 || cf.watermark != 0 || cf.max_event_time != 0
-    });
+    let needs_v4 = snapshot
+        .cf_descriptors
+        .iter()
+        .any(|cf| cf.lifecycle_ordinal != 0 || cf.watermark != 0 || cf.max_event_time != 0);
     // FRS-WA-V2a-2: emit v5 only when a vlog segment is live.
     let needs_v5 = !snapshot.version.vlog_segments.is_empty();
     let emit_version = if needs_v5 {
@@ -634,10 +635,7 @@ mod tests {
         // unstamped sibling stays 0.
         let mut stamped = make_file(2, b"a", b"m");
         stamped.max_death = 123_456_789;
-        let snap_v3 = make_snapshot(vec![
-            (0, stamped),
-            (0, make_file(3, b"n", b"z")),
-        ]);
+        let snap_v3 = make_snapshot(vec![(0, stamped), (0, make_file(3, b"n", b"z"))]);
         let blob_v3 = serialize_to_blob(&snap_v3).unwrap();
         assert_eq!(
             u16::from_le_bytes([blob_v3[4], blob_v3[5]]),

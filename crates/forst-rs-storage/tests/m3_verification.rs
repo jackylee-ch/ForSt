@@ -56,7 +56,7 @@ fn make_file(num: u64, smallest: &[u8], largest: &[u8]) -> SstFileMeta {
         min_sequence: SequenceNumber(1),
         max_sequence: SequenceNumber(100),
         num_entries: 50,
-            max_death: 0,
+        max_death: 0,
     }
 }
 

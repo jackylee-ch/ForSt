@@ -780,8 +780,7 @@ fn remote_nonsst_local_env() -> bool {
 /// `FRS_RESTORE_BG_FILL_WORKERS` (read pool size, default 2) and
 /// `FRS_RESTORE_BG_FILL_PACE_MB` (MiB/s pacing budget, default 64; 0 =
 /// unpaced).
-fn restore_bg_fill_params_env() -> Option<forst_rs_storage::background_fill::BackgroundFillParams>
-{
+fn restore_bg_fill_params_env() -> Option<forst_rs_storage::background_fill::BackgroundFillParams> {
     let on = std::env::var("FRS_RESTORE_BG_FILL")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -3411,7 +3410,7 @@ impl DbImpl {
 
     /// FRS-PHASE2-FFI (WAL-DELTA enabler): attaches a write-ahead log at
     /// `path` directly — the env-free, per-DB equivalent of
-    /// [`Self::maybe_init_wal`], for FFI/Java consumers that opt a single
+    /// `Self::maybe_init_wal`, for FFI/Java consumers that opt a single
     /// engine into WAL-DELTA link-mode checkpoints (design §3.3, §9 D10:
     /// the WAL's presence IS the mode switch) without process-global
     /// `FRS_WAL_DIR`. Errors if a WAL is already attached. The WAL is a
@@ -4106,7 +4105,7 @@ impl DbImpl {
     /// Picks the cohort-merge input set for `cf_data`, or `None` when no
     /// merge is due. Candidates are the CF's LIVE (non-expired), UNMERGED,
     /// death-stamped L0 segments; when they exceed
-    /// [`lifecycle_cohort_trigger`], the OLDEST (by `max_sequence`) are
+    /// `lifecycle_cohort_trigger`, the OLDEST (by `max_sequence`) are
     /// selected so the unmerged count returns to ~trigger/2.
     ///
     /// Invariant guarded here: the engine's L0 read path reconstructs global
@@ -4163,8 +4162,7 @@ impl DbImpl {
             if f.cf_id != cf_id || selected.contains(&f.file_number) {
                 continue;
             }
-            let overlaps =
-                f.min_sequence.value() <= span_max && f.max_sequence.value() >= span_min;
+            let overlaps = f.min_sequence.value() <= span_max && f.max_sequence.value() >= span_min;
             if overlaps {
                 tracing::warn!(
                     cf_id = cf_id.0,
@@ -4420,9 +4418,7 @@ impl DbImpl {
                     .l0_files()
                     .iter()
                     .filter(|f| {
-                        f.cf_id == cf_id
-                            && f.max_death != 0
-                            && !merged.contains(&f.file_number)
+                        f.cf_id == cf_id && f.max_death != 0 && !merged.contains(&f.file_number)
                     })
                     .count()
             };
@@ -5348,12 +5344,12 @@ impl DbImpl {
             // FRS-WA-V2b: the relocation segment (if any) was never
             // installed — drop the orphan file.
             for seg in &edit.new_vlog_segments {
-                let _ = self.fs.delete_file(
-                    &forst_rs_storage::vlog::vlog_segment_path(
+                let _ = self
+                    .fs
+                    .delete_file(&forst_rs_storage::vlog::vlog_segment_path(
                         Path::new(&self.db_path),
                         seg.segment_id,
-                    ),
-                );
+                    ));
             }
             return Err(e);
         }
@@ -5826,12 +5822,12 @@ impl DbImpl {
             }
             // FRS-WA-V2b: drop the never-installed relocation segment.
             for seg in &edit.new_vlog_segments {
-                let _ = self.fs.delete_file(
-                    &forst_rs_storage::vlog::vlog_segment_path(
+                let _ = self
+                    .fs
+                    .delete_file(&forst_rs_storage::vlog::vlog_segment_path(
                         Path::new(&self.db_path),
                         seg.segment_id,
-                    ),
-                );
+                    ));
             }
             return Err(e);
         }
@@ -6022,12 +6018,9 @@ impl DbImpl {
         // crash-anchor ordering as the SSTs).
         let mut vlog_bytes = 0u64;
         for seg in &snapshot.version.vlog_segments {
-            let src = forst_rs_storage::vlog::vlog_segment_path(
-                Path::new(&self.db_path),
-                seg.segment_id,
-            );
-            let dst =
-                forst_rs_storage::vlog::vlog_segment_path(target_dir, seg.segment_id);
+            let src =
+                forst_rs_storage::vlog::vlog_segment_path(Path::new(&self.db_path), seg.segment_id);
+            let dst = forst_rs_storage::vlog::vlog_segment_path(target_dir, seg.segment_id);
             vlog_bytes += crate::checkpoint::copy_file(self.fs.as_ref(), &src, &dst)?;
             sst_files.push(dst);
         }
@@ -6313,8 +6306,7 @@ impl DbImpl {
         }
         // FRS-WA-V2a-2: and every referenced value-log segment.
         for seg in &snapshot.version.vlog_segments {
-            let path =
-                forst_rs_storage::vlog::vlog_segment_path(&db_path, seg.segment_id);
+            let path = forst_rs_storage::vlog::vlog_segment_path(&db_path, seg.segment_id);
             if !fs.file_exists(&path)? {
                 return Err(ForstError::corruption(format!(
                     "checkpoint references missing vlog segment: {}",
@@ -6760,10 +6752,7 @@ impl DbImpl {
         // lifecycle and re-advance the watermark, and the first
         // post-restore flush stamps from a sound event-time bound.
         for cf in &snapshot.cf_descriptors {
-            if cf.lifecycle_ordinal == 0
-                && cf.watermark == 0
-                && cf.max_event_time == 0
-            {
+            if cf.lifecycle_ordinal == 0 && cf.watermark == 0 && cf.max_event_time == 0 {
                 continue;
             }
             let cf_data = db.lookup_cf_by_id(cf.cf_id)?;
@@ -7041,10 +7030,8 @@ impl DbImpl {
         // FRS-WA-V2a-2: same scoped barrier for the value-log segments the
         // manifest references (pointer rows are useless without them).
         for seg in &version_snapshot.version.vlog_segments {
-            let seg_path = forst_rs_storage::vlog::vlog_segment_path(
-                Path::new(&self.db_path),
-                seg.segment_id,
-            );
+            let seg_path =
+                forst_rs_storage::vlog::vlog_segment_path(Path::new(&self.db_path), seg.segment_id);
             self.fs.await_upload(&seg_path)?;
         }
 
@@ -7236,10 +7223,8 @@ impl DbImpl {
                 .get(&seg.cf_id)
                 .cloned()
                 .unwrap_or_else(|| DEFAULT_CF_NAME.to_string());
-            let working_path = forst_rs_storage::vlog::vlog_segment_path(
-                Path::new(&self.db_path),
-                seg.segment_id,
-            );
+            let working_path =
+                forst_rs_storage::vlog::vlog_segment_path(Path::new(&self.db_path), seg.segment_id);
             let path = if link_mode {
                 let basename = working_path.file_name().ok_or_else(|| {
                     ForstError::corruption(format!(
@@ -7700,7 +7685,9 @@ impl DbImpl {
         target_dir: &str,
         default_desc: ColumnFamilyDescriptor,
     ) -> ForstResult<Arc<Self>> {
-        use crate::checkpoint::{copy_file, deserialize_snapshot, read_blob, split_mapping_trailer, write_blob};
+        use crate::checkpoint::{
+            copy_file, deserialize_snapshot, read_blob, split_mapping_trailer, write_blob,
+        };
         let blob = read_blob(fs.as_ref(), ckpt_dir)?;
         let (base, mapping) = split_mapping_trailer(&blob)?;
         let mapping = mapping.ok_or_else(|| {
@@ -7738,7 +7725,8 @@ impl DbImpl {
                 return Err(ForstError::not_found(format!(
                     "open_from_linked_checkpoint: physical object {} (for linked \
                      path {}) is missing — refusing to restore partial state",
-                    physical, linked.display()
+                    physical,
+                    linked.display()
                 )));
             }
             // Stage-2 materialization (Stage 3: adopt + lazy read instead).
@@ -8321,10 +8309,7 @@ impl DbImpl {
         {
             let edit = VersionEdit {
                 deleted_files: l0_files.iter().map(|f| (0u32, f.file_number)).collect(),
-                new_files: l0_files
-                    .iter()
-                    .map(|f| (output_level, f.clone()))
-                    .collect(),
+                new_files: l0_files.iter().map(|f| (output_level, f.clone())).collect(),
                 ..Default::default()
             };
             // Busy ⇒ a racing writer changed the version; nothing was
@@ -8470,12 +8455,12 @@ impl DbImpl {
             }
             // FRS-WA-V2b: drop the never-installed relocation segment.
             for seg in &edit.new_vlog_segments {
-                let _ = self.fs.delete_file(
-                    &forst_rs_storage::vlog::vlog_segment_path(
+                let _ = self
+                    .fs
+                    .delete_file(&forst_rs_storage::vlog::vlog_segment_path(
                         Path::new(&self.db_path),
                         seg.segment_id,
-                    ),
-                );
+                    ));
             }
             return Err(e);
         }
@@ -10265,12 +10250,12 @@ impl DbImpl {
             // FRS-WA-V2a-2: the fresh vlog segment dies with its SST — no
             // pointer into it was ever installed in any Version.
             if let Some(seg) = &vlog_meta {
-                let _ = self.fs.delete_file(
-                    &forst_rs_storage::vlog::vlog_segment_path(
+                let _ = self
+                    .fs
+                    .delete_file(&forst_rs_storage::vlog::vlog_segment_path(
                         Path::new(&self.db_path),
                         seg.segment_id,
-                    ),
-                );
+                    ));
             }
             let leaked = oldest.memory_usage() as u64;
             cf_data.pop_oldest_imm();
@@ -11940,9 +11925,7 @@ impl DbImpl {
                             ));
                         }
                         let ptr_bytes = res.value.ok_or_else(|| {
-                            ForstError::corruption(
-                                "sst_get: L1+ BlobRef missing pointer payload",
-                            )
+                            ForstError::corruption("sst_get: L1+ BlobRef missing pointer payload")
                         })?;
                         return self.vlog_deref(&ptr_bytes).map(Some);
                     }
@@ -12031,10 +12014,7 @@ impl DbImpl {
     /// merge operator (P12: pointers don't concat) ∧ no compaction filter
     /// (filters inspect VALUE bytes; a pointer row would be uninspectable).
     /// Returns the armed spec (with a freshly allocated segment id) or None.
-    fn kv_sep_spec_for(
-        &self,
-        cf_data: &Arc<ColumnFamilyData>,
-    ) -> Option<crate::flush::KvSepSpec> {
+    fn kv_sep_spec_for(&self, cf_data: &Arc<ColumnFamilyData>) -> Option<crate::flush::KvSepSpec> {
         if !kv_separation_enabled() {
             return None;
         }
@@ -12146,10 +12126,7 @@ impl DbImpl {
     /// [`Self::delete_sst_physical`]'s mapping-aware unlink (a segment
     /// linked into a checkpoint namespace survives until refs hit 0).
     fn delete_vlog_physical(&self, segment_id: u64) {
-        let path = forst_rs_storage::vlog::vlog_segment_path(
-            Path::new(&self.db_path),
-            segment_id,
-        );
+        let path = forst_rs_storage::vlog::vlog_segment_path(Path::new(&self.db_path), segment_id);
         if let Some(mgr) = self.file_mapping.get() {
             if mgr.is_registered(&path) {
                 if let Err(e) = mgr.unlink(&path) {
@@ -12822,10 +12799,7 @@ impl DbImpl {
         *pending = still_pending;
         drop(pending);
         // FRS-WA-V2b: same deferred-reclaim drain for vlog segments.
-        let mut pending = self
-            .pending_vlog_deletions
-            .lock()
-            .expect("lock poisoned");
+        let mut pending = self.pending_vlog_deletions.lock().expect("lock poisoned");
         let mut still_pending = Vec::with_capacity(pending.len());
         for segment_id in pending.drain(..) {
             if self.can_reclaim_file(FileNumber(segment_id), &referenced) {
@@ -12932,9 +12906,7 @@ impl DbImpl {
     ) -> ForstResult<LinkedCheckpointDiscard> {
         use crate::checkpoint::read_blob;
         let mgr = self.file_mapping.get().ok_or_else(|| {
-            ForstError::invalid_argument(
-                "discard_linked_checkpoint: no file mapping attached",
-            )
+            ForstError::invalid_argument("discard_linked_checkpoint: no file mapping attached")
         })?;
         let dir = self.incremental_checkpoint_dir(checkpoint_id);
         // FRS-PHASE2-C2U3: the unlink loop is NAMESPACE-driven (everything
@@ -14011,7 +13983,7 @@ pub fn set_lifecycle_segments_override(v: Option<bool>) {
 /// measured ~1× write floor); stamped segments are EXEMPT from L0
 /// backpressure accounting and from the normal L0→L1 rollup trigger; fan-out
 /// is bounded by MERGE-ONCE cohort compaction (see
-/// [`lifecycle_cohort_trigger`]). OFF (default): no stamping, no drops, no
+/// `lifecycle_cohort_trigger`). OFF (default): no stamping, no drops, no
 /// accounting change — byte-identical to pre-V1.
 pub fn lifecycle_segments_enabled() -> bool {
     use std::sync::OnceLock;
@@ -14056,7 +14028,7 @@ fn lifecycle_cohort_trigger() -> usize {
     })
 }
 
-/// Test override for [`lifecycle_cohort_trigger`] (0 = env/default).
+/// Test override for `lifecycle_cohort_trigger` (0 = env/default).
 static LIFECYCLE_COHORT_TRIGGER_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -14067,7 +14039,7 @@ pub(crate) fn set_lifecycle_cohort_trigger_override(v: usize) {
 
 /// FRS-WA-V1 R2 (PMC review 2026-06-12): ceiling on how many death-stamped
 /// lifecycle segments stay EXEMPT from write backpressure
-/// (`FRS_LIFECYCLE_STAMPED_CEILING`, default 4 × [`lifecycle_cohort_trigger`]
+/// (`FRS_LIFECYCLE_STAMPED_CEILING`, default 4 × `lifecycle_cohort_trigger`
 /// = 96, floor 8). Healthy steady states sit far below it (q7-shaped churn:
 /// ~16 segments unmerged, ~trigger/2 + a few cohorts with merging engaged);
 /// only a STALLED watermark with continuing writes can cross it, and then
@@ -14151,7 +14123,7 @@ pub fn set_kv_separation_override(v: Option<bool>) {
 }
 
 /// FRS-WA-V2a-2 master flag (`FRS_KV_SEPARATION=1`, DEFAULT OFF). When ON,
-/// flushes of eligible CFs (see [`DbImpl::kv_sep_spec_for`]) write values
+/// flushes of eligible CFs (see `DbImpl::kv_sep_spec_for`) write values
 /// ≥ [`kv_min_blob_size`] to an append-once value-log segment
 /// (`<id>.vlog`, [`forst_rs_storage::vlog`]) and store a 21-byte
 /// `BlobRef(ValuePointer)` row in the SST instead — so compaction moves
@@ -15881,9 +15853,10 @@ impl PrefixScanStream {
                         // pointer bytes (one owned alloc; no LSM re-walk).
                         let value = {
                             let inner = &self.inner;
-                            let ptr = inner.sources[src].pinned_row_value(row).ok_or_else(|| {
-                                ForstError::internal("S2: pinned Blob winner lost its pointer")
-                            })?;
+                            let ptr =
+                                inner.sources[src].pinned_row_value(row).ok_or_else(|| {
+                                    ForstError::internal("S2: pinned Blob winner lost its pointer")
+                                })?;
                             self.db.vlog_deref(ptr)?
                         };
                         if !sink.push(self.inner.last_emitted_buf.as_slice(), &value) {
@@ -16411,7 +16384,9 @@ mod tests {
             for i in 0..10u64 {
                 let t = s * 10 + i;
                 assert_eq!(
-                    db.get(&cf, format!("k{t:06}").as_bytes()).unwrap().as_deref(),
+                    db.get(&cf, format!("k{t:06}").as_bytes())
+                        .unwrap()
+                        .as_deref(),
                     Some(&b"v"[..]),
                     "row k{t:06} lost by cohort merge"
                 );
@@ -16584,8 +16559,7 @@ mod tests {
         let db = open();
         let cf = db
             .create_column_family(
-                ColumnFamilyDescriptor::new("off")
-                    .with_lifecycle(CfLifecycle::Windowed { ttl: 1 }),
+                ColumnFamilyDescriptor::new("off").with_lifecycle(CfLifecycle::Windowed { ttl: 1 }),
             )
             .unwrap();
         let cf_data = db.lookup_cf_by_id(cf.id()).unwrap();
@@ -16644,7 +16618,10 @@ mod tests {
         // Point-get (sst_get arms).
         assert_eq!(db.get(&cf, b"k-big1").unwrap().as_deref(), Some(&big1[..]));
         assert_eq!(db.get(&cf, b"k-big2").unwrap().as_deref(), Some(&big2[..]));
-        assert_eq!(db.get(&cf, b"k-small").unwrap().as_deref(), Some(&small[..]));
+        assert_eq!(
+            db.get(&cf, b"k-small").unwrap().as_deref(),
+            Some(&small[..])
+        );
 
         // Vectorized batch get (multi-key path).
         let got = db
@@ -16684,7 +16661,10 @@ mod tests {
         db.compact_all().unwrap();
         assert_eq!(db.get(&cf, b"k-big1").unwrap().as_deref(), Some(&big2[..]));
         assert_eq!(db.get(&cf, b"k-big2").unwrap().as_deref(), Some(&big2[..]));
-        assert_eq!(db.get(&cf, b"k-small").unwrap().as_deref(), Some(&small[..]));
+        assert_eq!(
+            db.get(&cf, b"k-small").unwrap().as_deref(),
+            Some(&small[..])
+        );
         assert_eq!(
             db.version_set.current().vlog_segments.len(),
             2,
@@ -17028,10 +17008,8 @@ mod tests {
 
         // The checkpoint dir physically contains the segment.
         let seg_id = db.version_set.current().vlog_segments[0].segment_id;
-        let ckpt_seg = forst_rs_storage::vlog::vlog_segment_path(
-            std::path::Path::new("/ckpt"),
-            seg_id,
-        );
+        let ckpt_seg =
+            forst_rs_storage::vlog::vlog_segment_path(std::path::Path::new("/ckpt"), seg_id);
         assert!(
             fs.file_exists(&ckpt_seg).unwrap(),
             "checkpoint must copy live vlog segments"
@@ -21320,7 +21298,10 @@ mod tests {
         assert!(result.new_ssts.is_empty(), "link mode must upload nothing");
         assert!(result.shared_ssts.is_empty());
         assert!(!result.linked_new_ssts.is_empty());
-        assert!(result.linked_shared_ssts.is_empty(), "base 0: nothing shared");
+        assert!(
+            result.linked_shared_ssts.is_empty(),
+            "base 0: nothing shared"
+        );
 
         // Zero-upload object-count assert (design §9 D1): the chk dir holds
         // exactly one physical file — the manifest blob.
@@ -21338,7 +21319,10 @@ mod tests {
             entries.iter().map(|m| m.path.clone()).collect::<Vec<_>>()
         );
         assert!(entries[0].path.ends_with("CHECKPOINT.blob"));
-        let mgr = db.file_mapping().expect("linked ckpt auto-attaches").clone();
+        let mgr = db
+            .file_mapping()
+            .expect("linked ckpt auto-attaches")
+            .clone();
         for info in &result.linked_new_ssts {
             assert!(
                 info.path.starts_with(chk_dir),
@@ -21489,13 +21473,16 @@ mod tests {
             db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
         }
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 7, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 7, 0)
+            .unwrap();
         assert!(r.link_mode);
         let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000007");
 
         // Post-checkpoint churn: overwrite everything, flush, compact.
         for i in 0..200u32 {
-            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post").unwrap();
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post")
+                .unwrap();
         }
         db.switch_and_flush(&cf).unwrap();
         db.compact_l0(&cf).unwrap();
@@ -21588,12 +21575,15 @@ mod tests {
             db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
         }
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 9, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 9, 0)
+            .unwrap();
         assert!(r.link_mode);
         // Post-checkpoint churn: overwrite everything, flush, compact —
         // restore must see SNAPSHOT-time state regardless.
         for i in 0..200u32 {
-            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post").unwrap();
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post")
+                .unwrap();
         }
         db.switch_and_flush(&cf).unwrap();
         db.compact_l0(&cf).unwrap();
@@ -21629,8 +21619,7 @@ mod tests {
         let (_db, chk_dir) = s3_fixture(&fs);
 
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
 
         // ZERO data movement: no physical .sst object exists under the
         // restore target — adopted bytes stay at the source physicals.
@@ -21639,13 +21628,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter(|m| !m.is_dir)
-            .map(|m| {
-                m.path
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
+            .map(|m| m.path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(
             names
@@ -21702,7 +21685,10 @@ mod tests {
             )
             .unwrap();
             partial
-                .adopt(&sst_file_path(Path::new("/restore"), some_linked.0), &physical)
+                .adopt(
+                    &sst_file_path(Path::new("/restore"), some_linked.0),
+                    &physical,
+                )
                 .unwrap();
             partial.sync_journal().unwrap();
             // No CHECKPOINT.blob written — the crash window (D5-class).
@@ -21713,8 +21699,7 @@ mod tests {
 
         // Retry over the SAME target: must complete and be byte-exact.
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
         s3_assert_snapshot_state(&restored);
     }
 
@@ -21732,9 +21717,12 @@ mod tests {
         let (base, _) = crate::checkpoint::split_mapping_trailer(&blob).unwrap();
         let snap = crate::checkpoint::deserialize_snapshot(base).unwrap();
         let victim_linked = chk_dir.join(
-            sst_file_path(Path::new("/db"), snap.version.live_sst_files()[0].file_number)
-                .file_name()
-                .unwrap(),
+            sst_file_path(
+                Path::new("/db"),
+                snap.version.live_sst_files()[0].file_number,
+            )
+            .file_name()
+            .unwrap(),
         );
         let victim = mgr.resolve(&victim_linked).expect("resolves");
         fs.delete_file(Path::new(&victim)).unwrap();
@@ -21760,8 +21748,7 @@ mod tests {
         let (db, chk_dir) = s3_fixture(&fs);
 
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
         assert!(restored.adopted_residual() > 0);
         let mgr = restored.file_mapping().unwrap().clone();
         let adopted_physicals: Vec<String> = restored
@@ -21782,7 +21769,9 @@ mod tests {
         }
         let mut weaned = false;
         for i in 0..16 {
-            restored.put(&rcf, format!("churn{i}").as_bytes(), b"x").unwrap();
+            restored
+                .put(&rcf, format!("churn{i}").as_bytes(), b"x")
+                .unwrap();
             restored.switch_and_flush(&rcf).unwrap();
             restored.compact_l0(&rcf).unwrap();
             restored.reap_pending_deletions();
@@ -21818,7 +21807,8 @@ mod tests {
             {
                 break;
             }
-            db.put(&src_cf, format!("drain{i}").as_bytes(), b"x").unwrap();
+            db.put(&src_cf, format!("drain{i}").as_bytes(), b"x")
+                .unwrap();
             db.switch_and_flush(&src_cf).unwrap();
             db.compact_l0(&src_cf).unwrap();
             db.reap_pending_deletions();
@@ -21855,8 +21845,7 @@ mod tests {
         let (_db, chk_dir) = s3_fixture(&fs);
 
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
         let rcf = restored.default_cf();
         // New data on top of the adopted state, flushed to a NEW working SST.
         for i in 0..50u32 {
@@ -21874,7 +21863,11 @@ mod tests {
         // working dir.
         let mgr = restored.file_mapping().unwrap();
         let mut foreign = 0usize;
-        for info in r2.linked_new_ssts.iter().chain(r2.linked_shared_ssts.iter()) {
+        for info in r2
+            .linked_new_ssts
+            .iter()
+            .chain(r2.linked_shared_ssts.iter())
+        {
             let physical = mgr.resolve(&info.path).expect("chk-1 link resolves");
             assert!(
                 fs.file_exists(Path::new(&physical)).unwrap(),
@@ -21884,7 +21877,10 @@ mod tests {
                 foreign += 1;
             }
         }
-        assert!(foreign > 0, "adopted SSTs must still point at source physicals");
+        assert!(
+            foreign > 0,
+            "adopted SSTs must still point at source physicals"
+        );
 
         // Second-generation instant restore: byte-exact for old AND new data.
         let chk2_dir = PathBuf::from("/restore/checkpoints/00000000000000000001");
@@ -21985,8 +21981,7 @@ mod tests {
         }
 
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let backend: Arc<dyn FileSystem> =
-            Arc::new(OpendalFileSystem::local(tmp.path()).unwrap());
+        let backend: Arc<dyn FileSystem> = Arc::new(OpendalFileSystem::local(tmp.path()).unwrap());
         let counting = Arc::new(SstRenameCountingFs {
             inner: backend,
             sst_renames: AtomicUsize::new(0),
@@ -21998,11 +21993,8 @@ mod tests {
         assert!(fs.supports_atomic_rename());
 
         let mgr = Arc::new(
-            forst_rs_io::FileMappingManager::new(
-                fs.clone(),
-                PathBuf::from("/db/MAPPING.journal"),
-            )
-            .unwrap(),
+            forst_rs_io::FileMappingManager::new(fs.clone(), PathBuf::from("/db/MAPPING.journal"))
+                .unwrap(),
         );
         let mapped: Arc<dyn FileSystem> = Arc::new(
             forst_rs_io::MappedFileSystem::with_uuid_physical_keys(fs.clone(), mgr.clone())
@@ -22023,7 +22015,9 @@ mod tests {
             db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
         }
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         assert!(r.link_mode);
 
         // Every live SST physical is a UUID object in the working dir; the
@@ -22049,7 +22043,8 @@ mod tests {
         // Post-checkpoint churn so working copies get unlinked through the
         // refcount path too.
         for i in 0..200u32 {
-            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post").unwrap();
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"post")
+                .unwrap();
         }
         db.switch_and_flush(&cf).unwrap();
         db.compact_l0(&cf).unwrap();
@@ -22062,8 +22057,7 @@ mod tests {
         // Restore round-trip (instant-link) off the UUID physicals.
         let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
         let rcf = restored.default_cf();
         for i in 0..200u32 {
             let k = format!("k{:04}", i);
@@ -22200,11 +22194,7 @@ mod tests {
             Arc::new(forst_rs_io::LocalFileSystem::new()),
             recording.clone() as Arc<dyn FileSystem>,
         ));
-        let db_path = local_root
-            .path()
-            .join("db")
-            .to_string_lossy()
-            .into_owned();
+        let db_path = local_root.path().join("db").to_string_lossy().into_owned();
         let db = open_in_shared_fs(&db_path, router.clone());
         let cf = db.default_cf();
         for i in 0..200u32 {
@@ -22218,7 +22208,9 @@ mod tests {
         // ---- THE checkpoint cycle: every remote op must be SST-class ----
         let mark = recording.ops_len();
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         assert!(r.link_mode);
         let non_sst = recording.non_sst_ops_since(mark);
         assert!(
@@ -22260,10 +22252,13 @@ mod tests {
         // Instant restore over the same router: byte-exact, and the cycle
         // stays free of non-SST remote ops (blob + journals read locally).
         let mark2 = recording.ops_len();
-        let target = local_root.path().join("restore").to_string_lossy().into_owned();
+        let target = local_root
+            .path()
+            .join("restore")
+            .to_string_lossy()
+            .into_owned();
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(router.clone(), &chk_dir, &target)
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(router.clone(), &chk_dir, &target).unwrap();
         // The only allowed non-SST remote op at open is the R52-M2
         // orphan-scan dir-listing union (once per open, finds remote-
         // resident SST orphans); FILE-level chatter must stay local.
@@ -22383,10 +22378,12 @@ mod tests {
         // Segment 0 content: unflushed records of BOTH CFs.
         for i in 0..10u32 {
             db.put(&cf, format!("k{i:02}").as_bytes(), b"v1").unwrap();
-            db.put(&other, format!("o{i:02}").as_bytes(), b"w1").unwrap();
+            db.put(&other, format!("o{i:02}").as_bytes(), b"w1")
+                .unwrap();
         }
         let snap = db.snapshot();
-        db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        db.create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         let seg0 = PathBuf::from("/db/wal/WAL-000000.seg");
         let mgr = db.file_mapping().expect("attached").clone();
         assert_eq!(
@@ -22414,7 +22411,8 @@ mod tests {
         // Next checkpoint's GC: segment 0 is now fully covered (default
         // flushed, other DROPPED) — the working ref is released.
         let snap2 = db.snapshot();
-        db.create_incremental_checkpoint_linked(&snap2, 2, 1).unwrap();
+        db.create_incremental_checkpoint_linked(&snap2, 2, 1)
+            .unwrap();
         assert!(
             !mgr.is_registered(&seg0),
             "dropped-CF + flushed-default segment must lose its working ref"
@@ -22484,14 +22482,17 @@ mod tests {
 
         for i in 0..10u32 {
             db.put(&cf, format!("k{i:02}").as_bytes(), b"v1").unwrap();
-            db.put(&other, format!("o{i:02}").as_bytes(), b"w1").unwrap();
+            db.put(&other, format!("o{i:02}").as_bytes(), b"w1")
+                .unwrap();
         }
         // Drop `other` BEFORE the barrier; the default tail stays unflushed
         // so the mixed segment MUST stay linked for the live records.
         db.drop_cf(&other).unwrap();
         db.put(&cf, b"k-tail", b"tail").unwrap();
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 3, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 3, 0)
+            .unwrap();
         assert!(r.link_mode);
         let chk3 = PathBuf::from("/db/checkpoints/00000000000000000003");
         let mgr = db.file_mapping().expect("attached").clone();
@@ -22550,7 +22551,8 @@ mod tests {
         db.switch_and_flush(&cf).unwrap();
         // Unflushed tail: 50 new keys + 10 tombstones + 10 overwrites = 70.
         for i in 100..150u32 {
-            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tail").unwrap();
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tail")
+                .unwrap();
         }
         for i in 0..10u32 {
             db.delete(&cf, format!("k{:04}", i).as_bytes()).unwrap();
@@ -22560,7 +22562,9 @@ mod tests {
         }
 
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 4, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 4, 0)
+            .unwrap();
         assert!(r.link_mode);
         // WAL-DELTA mode, Phase-5 rotation: the chk dir is physically
         // blob-ONLY (the D8 invariant tightened) — the sealed tail was
@@ -22606,8 +22610,7 @@ mod tests {
 
         // Instant restore.
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
         verify(&restored);
         // No double-apply: the restored memtable holds EXACTLY the 70 tail
         // records (floor-filtered), none of the 100 flushed ones.
@@ -22638,14 +22641,14 @@ mod tests {
 
         db.put(&cf, b"pre-barrier", b"in").unwrap();
         let snap = db.snapshot();
-        db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        db.create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         // Post-barrier: lands in the live WAL but NOT in chk-1's capture.
         db.put(&cf, b"post-barrier", b"out").unwrap();
 
         let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
         let rcf = restored.default_cf();
         assert_eq!(
             restored.get(&rcf, b"pre-barrier").unwrap().as_deref(),
@@ -22658,7 +22661,10 @@ mod tests {
         );
         // The restored engine allocates writes ABOVE every replayed seq.
         restored.put(&rcf, b"fresh", b"f").unwrap();
-        assert_eq!(restored.get(&rcf, b"fresh").unwrap().as_deref(), Some(&b"f"[..]));
+        assert_eq!(
+            restored.get(&rcf, b"fresh").unwrap().as_deref(),
+            Some(&b"f"[..])
+        );
     }
 
     /// Stage-4 gate: a FLUSH-mode (no WAL) link checkpoint writes NO
@@ -22674,14 +22680,15 @@ mod tests {
             db.put(&cf, format!("k{:04}", i).as_bytes(), b"v").unwrap();
         }
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         assert!(r.link_mode);
         let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
         assert!(!fs.file_exists(&chk_dir.join(WAL_DELTA_NAME)).unwrap());
 
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
         let rcf = restored.default_cf();
         assert_eq!(
             restored.get(&rcf, b"k0000").unwrap().as_deref(),
@@ -22713,20 +22720,22 @@ mod tests {
 
         // Pre-WAL state: active memtable only, never explicitly flushed.
         for i in 0..30u32 {
-            db.put(&cf, format!("pre{:02}", i).as_bytes(), b"p").unwrap();
+            db.put(&cf, format!("pre{:02}", i).as_bytes(), b"p")
+                .unwrap();
         }
         db.attach_wal_at(&wal_dir.path().join("db.wal")).unwrap();
         // Double-attach is rejected.
-        assert!(db
-            .attach_wal_at(&wal_dir.path().join("other.wal"))
-            .is_err());
+        assert!(db.attach_wal_at(&wal_dir.path().join("other.wal")).is_err());
         // Post-attach tail: covered by the WAL.
         for i in 0..10u32 {
-            db.put(&cf, format!("tail{:02}", i).as_bytes(), b"t").unwrap();
+            db.put(&cf, format!("tail{:02}", i).as_bytes(), b"t")
+                .unwrap();
         }
 
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         assert!(r.link_mode);
         assert!(
             !r.linked_new_ssts.is_empty(),
@@ -22735,8 +22744,7 @@ mod tests {
 
         let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore").unwrap();
         let rcf = restored.default_cf();
         for i in 0..30u32 {
             let k = format!("pre{:02}", i);
@@ -22779,11 +22787,13 @@ mod tests {
 
         // Tail A → checkpoint 1 seals + re-homes SEG-000000.
         for i in 100..120u32 {
-            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tailA").unwrap();
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tailA")
+                .unwrap();
         }
         let max_seq_a = db.sequence_number.load(Ordering::Acquire);
         let snap1 = db.snapshot();
-        db.create_incremental_checkpoint_linked(&snap1, 1, 0).unwrap();
+        db.create_incremental_checkpoint_linked(&snap1, 1, 0)
+            .unwrap();
         let seg0 = PathBuf::from("/db/wal/WAL-000000.seg");
         let mgr = db.file_mapping().expect("attached").clone();
         assert!(fs.file_exists(&seg0).unwrap());
@@ -22792,10 +22802,12 @@ mod tests {
         // Tail B → checkpoint 2: the JUST-SEALED copy contains ONLY tail B
         // (flat capture — the Phase-5 point), while chk-2 LINKS both.
         for i in 120..140u32 {
-            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tailB").unwrap();
+            db.put(&cf, format!("k{:04}", i).as_bytes(), b"tailB")
+                .unwrap();
         }
         let snap2 = db.snapshot();
-        db.create_incremental_checkpoint_linked(&snap2, 2, 1).unwrap();
+        db.create_incremental_checkpoint_linked(&snap2, 2, 1)
+            .unwrap();
         let seg1 = PathBuf::from("/db/wal/WAL-000001.seg");
         assert!(fs.file_exists(&seg1).unwrap());
         {
@@ -22826,13 +22838,29 @@ mod tests {
         let chk2 = PathBuf::from("/db/checkpoints/00000000000000000002");
         let r1 = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk1, "/r1").unwrap();
         let r1cf = r1.default_cf();
-        assert_eq!(r1.get(&r1cf, b"k0119").unwrap().as_deref(), Some(&b"tailA"[..]));
-        assert_eq!(r1.get(&r1cf, b"k0125").unwrap(), None, "tail B not in chk-1");
+        assert_eq!(
+            r1.get(&r1cf, b"k0119").unwrap().as_deref(),
+            Some(&b"tailA"[..])
+        );
+        assert_eq!(
+            r1.get(&r1cf, b"k0125").unwrap(),
+            None,
+            "tail B not in chk-1"
+        );
         let r2 = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk2, "/r2").unwrap();
         let r2cf = r2.default_cf();
-        assert_eq!(r2.get(&r2cf, b"k0000").unwrap().as_deref(), Some(&b"v1"[..]));
-        assert_eq!(r2.get(&r2cf, b"k0119").unwrap().as_deref(), Some(&b"tailA"[..]));
-        assert_eq!(r2.get(&r2cf, b"k0139").unwrap().as_deref(), Some(&b"tailB"[..]));
+        assert_eq!(
+            r2.get(&r2cf, b"k0000").unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
+        assert_eq!(
+            r2.get(&r2cf, b"k0119").unwrap().as_deref(),
+            Some(&b"tailA"[..])
+        );
+        assert_eq!(
+            r2.get(&r2cf, b"k0139").unwrap().as_deref(),
+            Some(&b"tailB"[..])
+        );
         assert_eq!(
             r2.lookup_cf_by_id(DEFAULT_CF_ID)
                 .unwrap()
@@ -22847,14 +22875,26 @@ mod tests {
         // empty.
         db.switch_and_flush(&cf).unwrap();
         let snap3 = db.snapshot();
-        db.create_incremental_checkpoint_linked(&snap3, 3, 2).unwrap();
-        assert_eq!(mgr.refs("/db/wal/WAL-000000.seg"), 2, "GC dropped working ref");
-        assert_eq!(mgr.refs("/db/wal/WAL-000001.seg"), 1, "GC dropped working ref");
+        db.create_incremental_checkpoint_linked(&snap3, 3, 2)
+            .unwrap();
+        assert_eq!(
+            mgr.refs("/db/wal/WAL-000000.seg"),
+            2,
+            "GC dropped working ref"
+        );
+        assert_eq!(
+            mgr.refs("/db/wal/WAL-000001.seg"),
+            1,
+            "GC dropped working ref"
+        );
         let chk3 = PathBuf::from("/db/checkpoints/00000000000000000003");
         assert!(!mgr.is_registered(&chk3.join("WAL-000000.seg")));
         let r3 = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk3, "/r3").unwrap();
         let r3cf = r3.default_cf();
-        assert_eq!(r3.get(&r3cf, b"k0139").unwrap().as_deref(), Some(&b"tailB"[..]));
+        assert_eq!(
+            r3.get(&r3cf, b"k0139").unwrap().as_deref(),
+            Some(&b"tailB"[..])
+        );
         assert_eq!(
             r3.lookup_cf_by_id(DEFAULT_CF_ID)
                 .unwrap()
@@ -22867,7 +22907,10 @@ mod tests {
         // Discard chain: chk-1 retains SEG-0 (chk-2 still links it); chk-2
         // deletes BOTH segment physicals exactly once.
         db.discard_linked_checkpoint(1).unwrap();
-        assert!(fs.file_exists(&seg0).unwrap(), "chk-2 still references SEG-0");
+        assert!(
+            fs.file_exists(&seg0).unwrap(),
+            "chk-2 still references SEG-0"
+        );
         let d2 = db.discard_linked_checkpoint(2).unwrap();
         assert!(d2.physicals_deleted >= 2, "both segments drained: {d2:?}");
         assert!(!fs.file_exists(&seg0).unwrap(), "SEG-0 deleted at last ref");
@@ -22875,7 +22918,10 @@ mod tests {
         // chk-3 (SST-only) still restores.
         let r3b = DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk3, "/r3b").unwrap();
         let r3bcf = r3b.default_cf();
-        assert_eq!(r3b.get(&r3bcf, b"k0000").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(
+            r3b.get(&r3bcf, b"k0000").unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
     }
 
     /// FRS-PHASE2-C2U3 (chain-of-restores closure): a restored engine that
@@ -22892,10 +22938,12 @@ mod tests {
         *db.wal.lock().unwrap() =
             Some(crate::wal::WalWriter::open(&wal_dir.path().join("src.wal")).unwrap());
         for i in 0..30u32 {
-            db.put(&cf, format!("t{:02}", i).as_bytes(), b"tail").unwrap();
+            db.put(&cf, format!("t{:02}", i).as_bytes(), b"tail")
+                .unwrap();
         }
         let snap = db.snapshot();
-        db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        db.create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         let chk1 = PathBuf::from("/db/checkpoints/00000000000000000001");
 
         let restored =
@@ -22951,10 +22999,12 @@ mod tests {
         *src.wal.lock().unwrap() =
             Some(crate::wal::WalWriter::open(&wal_dir.path().join("src.wal")).unwrap());
         for i in 0..30u32 {
-            src.put(&cf, format!("t{:02}", i).as_bytes(), b"tail").unwrap();
+            src.put(&cf, format!("t{:02}", i).as_bytes(), b"tail")
+                .unwrap();
         }
         let snap = src.snapshot();
-        src.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        src.create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         let chk1 = PathBuf::from("/src/checkpoints/00000000000000000001");
 
         // Target engine with a WAL ALREADY attached (the env-route shape).
@@ -22965,15 +23015,17 @@ mod tests {
         let blob = read_blob(fs.as_ref(), &chk1).unwrap();
         let (_base, mapping) = split_mapping_trailer(&blob).unwrap();
         let view = forst_rs_io::MappingSnapshotView::decode(mapping.unwrap()).unwrap();
-        let replayed =
-            DbImpl::replay_linked_wal_delta(&tgt, fs.as_ref(), &chk1, &view).unwrap();
+        let replayed = DbImpl::replay_linked_wal_delta(&tgt, fs.as_ref(), &chk1, &view).unwrap();
         assert_eq!(replayed, 30);
 
         // The replayed tail is durable in the TARGET's live WAL.
         let scan = crate::wal::read_segment(&tgt_wal).unwrap();
         assert!(scan.clean_eof);
         assert_eq!(scan.records.len(), 30, "tail re-logged into the live WAL");
-        assert!(scan.records.iter().all(|r| r.value.as_deref() == Some(b"tail")));
+        assert!(scan
+            .records
+            .iter()
+            .all(|r| r.value.as_deref() == Some(b"tail")));
     }
 
     /// FRS-PHASE2-C2U2 crash-point IT (design §9 D5 crash window a): the
@@ -22996,7 +23048,9 @@ mod tests {
         }
         // LIVE checkpoint id=1 (JM acked).
         let snap1 = db.snapshot();
-        let r1 = db.create_incremental_checkpoint_linked(&snap1, 1, 0).unwrap();
+        let r1 = db
+            .create_incremental_checkpoint_linked(&snap1, 1, 0)
+            .unwrap();
         let live_links = r1.linked_new_ssts.len();
         assert!(live_links >= 1);
 
@@ -23006,7 +23060,9 @@ mod tests {
             db.put(&cf, format!("k{:04}", i).as_bytes(), b"v").unwrap();
         }
         let snap2 = db.snapshot();
-        let r2 = db.create_incremental_checkpoint_linked(&snap2, 2, 1).unwrap();
+        let r2 = db
+            .create_incremental_checkpoint_linked(&snap2, 2, 1)
+            .unwrap();
         let chk2_links = r2.linked_new_ssts.len() + r2.linked_shared_ssts.len();
         let chk2_dir = PathBuf::from("/db/checkpoints/00000000000000000002");
 
@@ -23049,7 +23105,9 @@ mod tests {
         // chk-2's leftover dir (blob) is gone; chk-1's blob intact.
         assert!(fs.list_dir(&chk2_dir).map(|v| v.is_empty()).unwrap_or(true));
         assert!(fs
-            .file_exists(Path::new("/db/checkpoints/00000000000000000001/CHECKPOINT.blob"))
+            .file_exists(Path::new(
+                "/db/checkpoints/00000000000000000001/CHECKPOINT.blob"
+            ))
             .unwrap());
 
         // Idempotent: second sweep reaps nothing.
@@ -23059,8 +23117,7 @@ mod tests {
         // The LIVE checkpoint still restores byte-exact after the sweep.
         let chk1_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk1_dir, "/restore")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk1_dir, "/restore").unwrap();
         let rcf = restored.default_cf();
         for i in 0..50u32 {
             let k = format!("k{:04}", i);
@@ -23093,7 +23150,9 @@ mod tests {
             db.put(&cf, format!("k{:04}", i).as_bytes(), b"v").unwrap();
         }
         let snap = db.snapshot();
-        let r = db.create_incremental_checkpoint_linked(&snap, 1, 0).unwrap();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 1, 0)
+            .unwrap();
         let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000001");
 
         // Post-checkpoint tail: the JM-discard protocol tombstones one of
@@ -23120,8 +23179,7 @@ mod tests {
         // still present — the tombstone is deferred).
         fs.delete_file(Path::new("/db/MAPPING.journal")).unwrap();
         let restored =
-            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore2")
-                .unwrap();
+            DbImpl::open_from_linked_checkpoint_instant(fs.clone(), &chk_dir, "/restore2").unwrap();
         let rcf = restored.default_cf();
         assert_eq!(
             restored.get(&rcf, b"k0000").unwrap().as_deref(),
