@@ -1376,6 +1376,76 @@ pub unsafe extern "C" fn frs_cf_set_compaction_filter_ttl(
     })
 }
 
+/// Declares a column-family lifecycle descriptor for Flink's FRS-WA-V0 surface.
+///
+/// V0 is intentionally inert in the engine: Flink uses this ABI while lifecycle
+/// segments are still default-off. The function exists to keep the JDK25 linker
+/// and lifecycle manager compatible with the native surface, while still
+/// validating that the passed DB/CF handles are live.
+///
+/// Returns:
+/// - `FRS_STATUS_OK` for a live DB/CF pair.
+/// - `FRS_STATUS_NULL_ARG` if `db` or `cf` is null/closed.
+#[no_mangle]
+pub unsafe extern "C" fn frs_cf_set_lifecycle(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    _kind: i32,
+    _ttl_ms: u64,
+) -> i32 {
+    guarded(|| {
+        let Some(_db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(_cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        FRS_STATUS_OK
+    })
+}
+
+/// Advances a column-family watermark clock for Flink's FRS-WA-V0 surface.
+///
+/// V0 is intentionally inert in the engine. Keep this as a cheap handle-checked
+/// no-op until lifecycle segments are implemented below the FFI layer.
+#[no_mangle]
+pub unsafe extern "C" fn frs_cf_advance_watermark(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    _watermark_ms: u64,
+) -> i32 {
+    guarded(|| {
+        let Some(_db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(_cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        FRS_STATUS_OK
+    })
+}
+
+/// Notes the maximum event-time observed for a CF in Flink's FRS-WA-V0 surface.
+///
+/// V0 is intentionally inert in the engine. Keep this as a cheap handle-checked
+/// no-op until lifecycle segments are implemented below the FFI layer.
+#[no_mangle]
+pub unsafe extern "C" fn frs_cf_note_max_event_time(
+    db: FrsDb,
+    cf: FrsCfHandle,
+    _event_time_ms: u64,
+) -> i32 {
+    guarded(|| {
+        let Some(_db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        let Some(_cf) = cf_ref(&cf) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        FRS_STATUS_OK
+    })
+}
+
 // ---------------------------------------------------------------------------
 // 3. Point operations
 // ---------------------------------------------------------------------------
@@ -4275,6 +4345,27 @@ pub struct FrsIncrementalCheckpointResult {
     pub flush_done_eventfd: std::os::raw::c_int,
 }
 
+/// Result of a LINK-mode checkpoint capture.
+///
+/// This ABI is already bound by the Flink JDK25 linker, but the engine-side
+/// LINK-mode implementation is not part of this FFI crate yet. Until then the
+/// capture/open calls return `FRS_STATUS_NOT_SUPPORTED` after basic argument
+/// validation, and this struct is only used to keep the ABI layout explicit.
+#[repr(C)]
+pub struct FrsLinkedCheckpointResult {
+    pub manifest_path: *mut c_char,
+    pub linked_new_ssts: *mut FrsLiveFileList,
+    pub linked_shared_ssts: *mut FrsLiveFileList,
+}
+
+impl FrsLinkedCheckpointResult {
+    const EMPTY: Self = Self {
+        manifest_path: std::ptr::null_mut(),
+        linked_new_ssts: std::ptr::null_mut(),
+        linked_shared_ssts: std::ptr::null_mut(),
+    };
+}
+
 /// Captures an incremental checkpoint pinned at `snapshot`.
 ///
 /// `checkpoint_id` is the new checkpoint's identifier; `base_checkpoint_id`
@@ -4420,6 +4511,203 @@ pub unsafe extern "C" fn frs_db_incremental_checkpoint_result_free(
         if !r.manifest_path.is_null() {
             drop(std::ffi::CString::from_raw(r.manifest_path));
             r.manifest_path = std::ptr::null_mut();
+        }
+        FRS_STATUS_OK
+    })
+}
+
+/// FRS-PHASE2 LINK-mode checkpoint ABI placeholder.
+///
+/// LINK-mode is default-off in the Flink side and is not implemented by this
+/// FFI crate yet. Export the symbol so the JDK25 linker can load, but return
+/// `FRS_STATUS_NOT_SUPPORTED` for any well-formed call to avoid silently
+/// producing an invalid checkpoint.
+#[no_mangle]
+pub unsafe extern "C" fn frs_create_incremental_checkpoint_linked(
+    db: FrsDb,
+    snapshot: FrsSnapshot,
+    _checkpoint_id: u64,
+    _base_checkpoint_id: u64,
+    out: *mut FrsLinkedCheckpointResult,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        std::ptr::write(out, FrsLinkedCheckpointResult::EMPTY);
+        let Some(db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if snapshot.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let snap_ref = &(*snapshot).inner;
+        if snap_ref.db_id() != db.db_id() {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        FRS_STATUS_NOT_SUPPORTED
+    })
+}
+
+/// Releases any Rust-owned allocations inside a LINK-mode checkpoint result.
+///
+/// Safe for zero-initialized or partially-initialized results. This mirrors the
+/// incremental-checkpoint free helper so callers can unconditionally clean up
+/// after native calls.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_linked_checkpoint_result_free(
+    out: *mut FrsLinkedCheckpointResult,
+) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_OK;
+        }
+        let r = &mut *out;
+        if !r.linked_new_ssts.is_null() {
+            frs_db_live_file_list_free(r.linked_new_ssts);
+            drop(Box::from_raw(r.linked_new_ssts));
+            r.linked_new_ssts = std::ptr::null_mut();
+        }
+        if !r.linked_shared_ssts.is_null() {
+            frs_db_live_file_list_free(r.linked_shared_ssts);
+            drop(Box::from_raw(r.linked_shared_ssts));
+            r.linked_shared_ssts = std::ptr::null_mut();
+        }
+        if !r.manifest_path.is_null() {
+            drop(std::ffi::CString::from_raw(r.manifest_path));
+            r.manifest_path = std::ptr::null_mut();
+        }
+        FRS_STATUS_OK
+    })
+}
+
+/// Discards a LINK-mode checkpoint namespace.
+///
+/// Placeholder only: LINK-mode is not implemented by this FFI crate yet.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_discard_linked_checkpoint(
+    db: FrsDb,
+    _checkpoint_id: u64,
+    out_unlinked: *mut u64,
+    out_physicals_deleted: *mut u64,
+) -> i32 {
+    guarded(|| {
+        let Some(_db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if !out_unlinked.is_null() {
+            *out_unlinked = 0;
+        }
+        if !out_physicals_deleted.is_null() {
+            *out_physicals_deleted = 0;
+        }
+        FRS_STATUS_NOT_SUPPORTED
+    })
+}
+
+/// Local instant restore from LINK-mode checkpoint.
+///
+/// Placeholder only: return NOT_SUPPORTED after validating required pointers.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant(
+    ckpt_dir: *const c_char,
+    target_dir: *const c_char,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if ckpt_dir.is_null() || target_dir.is_null() || out_handle.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        *out_handle = std::ptr::null_mut();
+        FRS_STATUS_NOT_SUPPORTED
+    })
+}
+
+/// Remote-primary instant restore from LINK-mode checkpoint.
+///
+/// Placeholder only: return NOT_SUPPORTED after validating required pointers.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant_remote(
+    uri: *const c_char,
+    _opendal_config_json: *const c_char,
+    cache_dir: *const c_char,
+    _cache_capacity_bytes: u64,
+    ckpt_dir: *const c_char,
+    target_dir: *const c_char,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if uri.is_null()
+            || cache_dir.is_null()
+            || ckpt_dir.is_null()
+            || target_dir.is_null()
+            || out_handle.is_null()
+        {
+            return FRS_STATUS_NULL_ARG;
+        }
+        *out_handle = std::ptr::null_mut();
+        FRS_STATUS_NOT_SUPPORTED
+    })
+}
+
+/// Number of adopted foreign SST references still live in the DB.
+///
+/// Without LINK-mode restore there can be no adopted residuals, so this
+/// default-off ABI returns zero for a valid DB.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_adopted_residual(db: FrsDb, out: *mut u64) -> i32 {
+    guarded(|| {
+        if out.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(_db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        *out = 0;
+        FRS_STATUS_OK
+    })
+}
+
+/// Attaches a WAL-delta file for LINK-mode checkpointing.
+///
+/// Placeholder only: WAL-delta is not implemented by this FFI crate yet.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_attach_wal(db: FrsDb, wal_path: *const c_char) -> i32 {
+    guarded(|| {
+        if wal_path.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let Some(_db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        FRS_STATUS_NOT_SUPPORTED
+    })
+}
+
+/// Sweeps abandoned LINK-mode checkpoint namespaces.
+///
+/// Placeholder only: reports zero work for a valid DB while LINK-mode is not
+/// implemented. A non-null `live_ids` pointer is required when `live_count > 0`.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_sweep_abandoned_checkpoints(
+    db: FrsDb,
+    live_ids: *const u64,
+    live_count: usize,
+    out_unlinked: *mut u64,
+    out_physicals_deleted: *mut u64,
+) -> i32 {
+    guarded(|| {
+        let Some(_db) = db_from_handle(db) else {
+            return FRS_STATUS_NULL_ARG;
+        };
+        if live_count > 0 && live_ids.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        if !out_unlinked.is_null() {
+            *out_unlinked = 0;
+        }
+        if !out_physicals_deleted.is_null() {
+            *out_physicals_deleted = 0;
         }
         FRS_STATUS_OK
     })
@@ -8293,6 +8581,197 @@ mod tests {
             );
 
             assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// `frs_cf_set_lifecycle` is the FRS-WA-V0 ABI required by Flink's
+    /// JDK25 linker. V0 is intentionally inert engine-side, but the exported
+    /// symbol must exist and validate handles so Flink can load the full FFI
+    /// surface before lifecycle segments are enabled.
+    #[test]
+    fn test_frs_cf_set_lifecycle_v0_abi() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            assert_eq!(frs_cf_set_lifecycle(db, cf, 0, 0), FRS_STATUS_OK);
+            assert_eq!(frs_cf_set_lifecycle(db, cf, 1, 60_000), FRS_STATUS_OK);
+            assert_eq!(frs_cf_set_lifecycle(db, cf, 2, 0), FRS_STATUS_OK);
+            assert_eq!(
+                frs_cf_set_lifecycle(ptr::null_mut(), cf, 0, 0),
+                FRS_STATUS_NULL_ARG
+            );
+            assert_eq!(
+                frs_cf_set_lifecycle(db, ptr::null_mut(), 0, 0),
+                FRS_STATUS_NULL_ARG
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// `frs_cf_advance_watermark` is the companion V0 lifecycle-clock ABI.
+    /// It is currently inert, but must be callable and handle-checked for the
+    /// Flink linker and lifecycle manager smoke path.
+    #[test]
+    fn test_frs_cf_advance_watermark_v0_abi() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            assert_eq!(frs_cf_advance_watermark(db, cf, 123_456), FRS_STATUS_OK);
+            assert_eq!(
+                frs_cf_advance_watermark(ptr::null_mut(), cf, 123_456),
+                FRS_STATUS_NULL_ARG
+            );
+            assert_eq!(
+                frs_cf_advance_watermark(db, ptr::null_mut(), 123_456),
+                FRS_STATUS_NULL_ARG
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// `frs_cf_note_max_event_time` completes the FRS-WA-V0 lifecycle-clock
+    /// ABI required by Flink's JDK25 linker. V0 is inert, but must validate
+    /// handles and be callable before lifecycle segments are enabled.
+    #[test]
+    fn test_frs_cf_note_max_event_time_v0_abi() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+
+            assert_eq!(frs_cf_note_max_event_time(db, cf, 123_456), FRS_STATUS_OK);
+            assert_eq!(
+                frs_cf_note_max_event_time(ptr::null_mut(), cf, 123_456),
+                FRS_STATUS_NULL_ARG
+            );
+            assert_eq!(
+                frs_cf_note_max_event_time(db, ptr::null_mut(), 123_456),
+                FRS_STATUS_NULL_ARG
+            );
+
+            assert_eq!(frs_cf_close(cf), FRS_STATUS_OK);
+            assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+        }
+    }
+
+    /// LINK-mode checkpoint symbols are exported for Flink's eager JDK25
+    /// linker, but the engine implementation is not enabled in this FFI crate
+    /// yet. Well-formed calls must fail explicitly with NOT_SUPPORTED and keep
+    /// output structs/handles in a free-safe empty state.
+    #[test]
+    fn test_linked_checkpoint_v0_abi_placeholders() {
+        unsafe {
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+
+            let mut snapshot: FrsSnapshot = ptr::null_mut();
+            assert_eq!(frs_db_snapshot(db, &mut snapshot), FRS_STATUS_OK);
+
+            let mut linked = FrsLinkedCheckpointResult {
+                manifest_path: std::ptr::dangling_mut::<c_char>(),
+                linked_new_ssts: std::ptr::dangling_mut::<FrsLiveFileList>(),
+                linked_shared_ssts: std::ptr::dangling_mut::<FrsLiveFileList>(),
+            };
+            assert_eq!(
+                frs_create_incremental_checkpoint_linked(db, snapshot, 1, 0, &mut linked),
+                FRS_STATUS_NOT_SUPPORTED
+            );
+            assert!(linked.manifest_path.is_null());
+            assert!(linked.linked_new_ssts.is_null());
+            assert!(linked.linked_shared_ssts.is_null());
+            assert_eq!(
+                frs_db_linked_checkpoint_result_free(&mut linked),
+                FRS_STATUS_OK
+            );
+
+            let mut unlinked = 99u64;
+            let mut deleted = 88u64;
+            assert_eq!(
+                frs_db_discard_linked_checkpoint(db, 1, &mut unlinked, &mut deleted),
+                FRS_STATUS_NOT_SUPPORTED
+            );
+            assert_eq!(unlinked, 0);
+            assert_eq!(deleted, 0);
+
+            let mut residual = 99u64;
+            assert_eq!(frs_db_adopted_residual(db, &mut residual), FRS_STATUS_OK);
+            assert_eq!(residual, 0);
+
+            let live_ids = [1u64, 2u64];
+            let mut swept = 99u64;
+            assert_eq!(
+                frs_db_sweep_abandoned_checkpoints(
+                    db,
+                    live_ids.as_ptr(),
+                    live_ids.len(),
+                    &mut swept,
+                    ptr::null_mut()
+                ),
+                FRS_STATUS_OK
+            );
+            assert_eq!(swept, 0);
+            assert_eq!(
+                frs_db_sweep_abandoned_checkpoints(
+                    db,
+                    ptr::null(),
+                    live_ids.len(),
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                FRS_STATUS_NULL_ARG
+            );
+
+            let wal_path = CString::new("/tmp/frs-wal-placeholder").unwrap();
+            assert_eq!(
+                frs_db_attach_wal(db, wal_path.as_ptr()),
+                FRS_STATUS_NOT_SUPPORTED
+            );
+
+            let ckpt_dir = CString::new("/tmp/frs-linked-ckpt").unwrap();
+            let target_dir = CString::new("/tmp/frs-linked-target").unwrap();
+            let mut restored: FrsDb = ptr::null_mut();
+            assert_eq!(
+                frs_db_open_from_linked_checkpoint_instant(
+                    ckpt_dir.as_ptr(),
+                    target_dir.as_ptr(),
+                    &mut restored
+                ),
+                FRS_STATUS_NOT_SUPPORTED
+            );
+            assert!(restored.is_null());
+
+            let uri = CString::new("memory://frs-linked").unwrap();
+            let cache_dir = CString::new("/tmp/frs-linked-cache").unwrap();
+            assert_eq!(
+                frs_db_open_from_linked_checkpoint_instant_remote(
+                    uri.as_ptr(),
+                    ptr::null(),
+                    cache_dir.as_ptr(),
+                    0,
+                    ckpt_dir.as_ptr(),
+                    target_dir.as_ptr(),
+                    &mut restored
+                ),
+                FRS_STATUS_NOT_SUPPORTED
+            );
+            assert!(restored.is_null());
+
+            assert_eq!(frs_db_release_snapshot(db, snapshot), FRS_STATUS_OK);
             assert_eq!(frs_db_close(db), FRS_STATUS_OK);
         }
     }
