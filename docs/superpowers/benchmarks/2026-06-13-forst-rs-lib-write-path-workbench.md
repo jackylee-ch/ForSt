@@ -272,6 +272,55 @@ Interpretation:
 - The added `output_copy_only` cells separate result-buffer copy from engine lookup/merge work. In the filtered bench, output copy was roughly 150 ns for chain1 and roughly 2.3 us for distinct chain16, while full reads were roughly 16-17 us and 301-318 us respectively. That makes output buffer copy a small term for this q19 case; the next q19 bottleneck is lookup/merge-chain resolution.
 - This does not close q7/q19 by itself. The next bottlenecks are caller scratch reuse, serial/parallel adaptive prefix probing, and merge-chain compaction/read-amplification policy.
 
+### ForStBackend compat JNI q7/q19 proxy update
+
+Flink ForStBackend path check:
+
+- `ForStGeneralMultiGetOperation` calls `RocksDB.multiGetAsList(...)`.
+- `ForStMapState.buildDBIterRequest(...)` builds `ForStDBMap*IterRequest`.
+- `ForStDBIterRequest.process(...)` opens `db.newIterator(cf)`, seeks the key prefix, then loops through `isValid/key/value/next`.
+
+Implication:
+
+- `ForStBackend + forst-rs-lib` is not the same path as the pure ForSt-RS FFM backend. q7/q19 MapState prefix iteration still uses the RocksDB-compatible `RocksIterator` Java surface.
+- Native-only prefix work is not enough: the Java loop owns prefix-stop logic, `cacheSizeLimit`, and entry/key/value deserialization mode. A real prefix chunk fast path needs a Flink Java call-site change plus a compat JNI chunk API.
+
+Proxy benchmarks added:
+
+```bash
+cargo bench -p forst-rs-bench --bench ffi_vectorized compat_jni_prefix_proxy -- --test
+cargo bench -p forst-rs-bench --bench ffi_vectorized compat_jni_multiget_proxy -- --test
+cargo bench -p forst-rs-bench --bench ffi_vectorized compat_jni_multiget_proxy -- --noplot
+cargo test -p forst-rs-ffi --features compat-jni test_multi_get
+```
+
+Prefix proxy result:
+
+| Cell | Row-native | Row-copy proxy | Chunked lower bound |
+|---|---:|---:|---:|
+| p64 r1 | 20.98 us | 22.50 us | 25.64 us |
+| p64 r16 | 159.87 us | 181.48 us | 155.73 us |
+| p256 r16 | 680.99 us | 782.15 us | 678.74 us |
+| p256 r32 | 1.274 ms | 1.485 ms | 1.313 ms |
+
+Interpretation: Rust-only row iteration is close to the chunked lower bound. The suspected production cost is Java/JNI per-row `isValid/key/value/next` and Java `byte[]` allocation, so the next proof must be a Flink-side JMH or small ForStBackend benchmark, not another Rust-only prefix benchmark.
+
+Compat `multiGetAsList` update:
+
+- `RocksDB.batchGet` already used `frs_batch_get`, but compat `RocksDB.multiGet` still looped over `frs_get`.
+- The native shim now groups keys by CF and uses `frs_batch_get` only for small groups (`<=64` rows). Larger groups keep the old scalar loop to avoid the 1024-row batch-risk seen in the first run.
+- `test_multi_get` now verifies multi-CF, out-of-order, and missing-key behavior through the grouped helper.
+
+Threshold-64 proxy result:
+
+| Rows | Scalar loop | Batch single-CF | Adaptive grouped |
+|---:|---:|---:|---:|
+| 64 | 5.747 us | 5.502 us | 5.385 us |
+| 256 | 24.027 us | 24.306 us | 24.066 us |
+| 1024 | 109.08 us | 109.47 us | 109.33 us |
+
+Interpretation: this is a narrow native-only win for small `multiGetAsList` groups and keeps medium/large groups at scalar-loop parity. It helps q19/list/raw-get style batches, but it does not solve MapState prefix iterator cost.
+
 Next production patch candidate:
 
 1. Flink/ForSt-RS iterator caller scratch reuse: reuse prefix offsets, handles, `FrsChunk` descriptors, and chunk buffers per vectorized executor or task thread.

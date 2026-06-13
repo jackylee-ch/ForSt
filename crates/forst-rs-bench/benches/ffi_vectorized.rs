@@ -47,6 +47,11 @@
 //!   memtable-resident, after flush, and after compaction
 //! - `q19_iter_open_alloc_split_ffi` — separates batch-open caller allocation
 //!   cost from native open/fill cost with reused caller buffers
+//! - `compat_jni_prefix_proxy` — Rust-level proxy for compat JNI
+//!   `prefixLookupNext` / `iteratorNext` row-at-a-time scans vs the chunked
+//!   prefix iterator lower bound
+//! - `compat_jni_multiget_proxy` — Rust-level proxy for compat JNI
+//!   `multiGetAsList`: scalar `frs_get` loop vs single-CF `frs_batch_get`
 //!
 //! After the criterion groups, `boundary_tax_summary()` prints the derived
 //! headline number per size: tax ns/row = (FFI ns/row) − (engine ns/row),
@@ -67,11 +72,13 @@ use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 use forst_rs_common::EngineOptions;
 use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, DEFAULT_CF_NAME};
 use forst_rs_ffi::{
-    frs_compact_cf, frs_db_create_cf_with_merge, frs_db_open, frs_flush_cf,
+    frs_batch_get, frs_bytes_free, frs_compact_cf, frs_db_create_cf_with_merge, frs_db_open,
+    frs_flush_cf, frs_get, frs_iterator_close, frs_iterator_next, frs_prefix_lookup_open,
     frs_vec_iter_prefix_close, frs_vec_iter_prefix_next, frs_vec_iter_prefix_open,
     frs_vec_iter_prefix_open_batch, frs_vec_iter_prefix_open_batch_parallel,
     frs_vec_merge_append_batch, frs_vectorized_batch_get, frs_vectorized_batch_mixed,
-    frs_vectorized_batch_put, FrsCfHandle, FrsChunk, FrsDb, FRS_CHUNK_EOF, FRS_STATUS_OK,
+    frs_vectorized_batch_put, FrsBytes, FrsCfHandle, FrsChunk, FrsDb, FrsIterator, FRS_CHUNK_EOF,
+    FRS_STATUS_OK,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem};
 use forst_rs_storage::merge_operator::RawConcatMergeOperator;
@@ -90,6 +97,9 @@ const Q19_BATCH_OPEN_K: &[usize] = &[64, 256];
 const Q19_ALLOC_SPLIT_ROWS_PER_PREFIX: &[usize] = &[1, 16, 32];
 const Q19_MERGE_KEYS: usize = 64;
 const Q19_CHAIN_LENGTHS: &[usize] = &[1, 4, 16];
+const COMPAT_PROXY_PREFIX_COUNTS: &[usize] = &[64, 256];
+const COMPAT_PROXY_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16, 32];
+const COMPAT_MULTIGET_BATCH_GROUP_THRESHOLD: usize = 64;
 
 // ---------------------------------------------------------------------------
 // DB fixtures
@@ -1111,6 +1121,117 @@ fn bench_get(c: &mut Criterion) {
     }
 }
 
+fn compat_scalar_get_loop_once(d: &FfiDb, keys: &[Vec<u8>]) -> usize {
+    let mut found = 0usize;
+    for key in keys {
+        let mut out = FrsBytes {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let rc = unsafe { frs_get(d.db, d.cf, key.as_ptr(), key.len(), &mut out) };
+        assert_eq!(rc, FRS_STATUS_OK, "frs_get failed: {rc}");
+        assert!(!out.data.is_null(), "missing key");
+        found += 1;
+        unsafe {
+            let _ = frs_bytes_free(&mut out);
+        }
+    }
+    found
+}
+
+fn compat_batch_get_single_cf_once(d: &FfiDb, keys: &[Vec<u8>]) -> usize {
+    let key_ptrs: Vec<*const u8> = keys.iter().map(|k| k.as_ptr()).collect();
+    let key_lens: Vec<usize> = keys.iter().map(|k| k.len()).collect();
+    let mut out_slots: Vec<FrsBytes> = (0..keys.len())
+        .map(|_| FrsBytes {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        })
+        .collect();
+    let rc = unsafe {
+        frs_batch_get(
+            d.db,
+            d.cf,
+            key_ptrs.as_ptr(),
+            key_lens.as_ptr(),
+            keys.len(),
+            out_slots.as_mut_ptr(),
+        )
+    };
+    assert_eq!(rc, FRS_STATUS_OK, "frs_batch_get failed: {rc}");
+    let found = out_slots.iter().filter(|slot| !slot.data.is_null()).count();
+    assert_eq!(found, keys.len(), "missing key");
+    for slot in out_slots.iter_mut() {
+        unsafe {
+            let _ = frs_bytes_free(slot);
+        }
+    }
+    found
+}
+
+fn compat_adaptive_get_once(d: &FfiDb, keys: &[Vec<u8>]) -> usize {
+    if keys.len() <= COMPAT_MULTIGET_BATCH_GROUP_THRESHOLD {
+        compat_batch_get_single_cf_once(d, keys)
+    } else {
+        compat_scalar_get_loop_once(d, keys)
+    }
+}
+
+fn bench_compat_jni_multiget_proxy(c: &mut Criterion) {
+    const VSIZE: usize = 64;
+    let mut group = c.benchmark_group("ffi_vectorized/compat_jni_multiget_proxy");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_millis(900));
+    group.warm_up_time(std::time::Duration::from_millis(300));
+
+    let d = FfiDb::open();
+    {
+        let eng = d.engine().clone();
+        let cfh = d.engine_cf();
+        populate_get_pool(
+            &mut |k, v| {
+                eng.put(&cfh, k, v).expect("put");
+            },
+            VSIZE,
+        );
+    }
+
+    for &rows in ROW_COUNTS {
+        let fixture = get_fixture(rows, VSIZE);
+        let keys = fixture.key_slices_owned;
+        assert_eq!(compat_scalar_get_loop_once(&d, &keys), rows);
+        assert_eq!(compat_batch_get_single_cf_once(&d, &keys), rows);
+        assert_eq!(compat_adaptive_get_once(&d, &keys), rows);
+
+        group.throughput(Throughput::Elements(rows as u64));
+        group.bench_with_input(BenchmarkId::new("scalar_get_loop", rows), &rows, |b, _| {
+            b.iter(|| {
+                let found = compat_scalar_get_loop_once(&d, &keys);
+                std::hint::black_box(found);
+            })
+        });
+        group.bench_with_input(
+            BenchmarkId::new("batch_get_single_cf", rows),
+            &rows,
+            |b, _| {
+                b.iter(|| {
+                    let found = compat_batch_get_single_cf_once(&d, &keys);
+                    std::hint::black_box(found);
+                })
+            },
+        );
+        group.bench_with_input(BenchmarkId::new("adaptive_grouped", rows), &rows, |b, _| {
+            b.iter(|| {
+                let found = compat_adaptive_get_once(&d, &keys);
+                std::hint::black_box(found);
+            })
+        });
+    }
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // iter: chunked prefix drain + batched parallel open
 // ---------------------------------------------------------------------------
@@ -1360,6 +1481,117 @@ fn bench_q19_iter_topn_ffi(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         let rows = drain_prefixes_parallel_count(&d, &prefixes);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn drain_prefix_compat_row_by_row(d: &FfiDb, prefix: &[u8], copy_payloads: bool) -> u64 {
+    let mut iter: FrsIterator = std::ptr::null_mut();
+    let rc =
+        unsafe { frs_prefix_lookup_open(d.db, d.cf, prefix.as_ptr(), prefix.len(), &mut iter) };
+    assert_eq!(rc, FRS_STATUS_OK, "frs_prefix_lookup_open failed: {rc}");
+    let mut rows = 0u64;
+    loop {
+        let mut key = FrsBytes {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let mut value = FrsBytes {
+            data: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let mut valid = false;
+        let rc = unsafe { frs_iterator_next(iter, &mut key, &mut value, &mut valid) };
+        assert_eq!(rc, FRS_STATUS_OK, "frs_iterator_next failed: {rc}");
+        if !valid {
+            unsafe {
+                let _ = frs_bytes_free(&mut key);
+                let _ = frs_bytes_free(&mut value);
+            }
+            break;
+        }
+        if copy_payloads {
+            let key_slice = unsafe { std::slice::from_raw_parts(key.data, key.len) };
+            let value_slice = unsafe { std::slice::from_raw_parts(value.data, value.len) };
+            std::hint::black_box((key_slice.to_vec(), value_slice.to_vec()));
+        }
+        unsafe {
+            let _ = frs_bytes_free(&mut key);
+            let _ = frs_bytes_free(&mut value);
+        }
+        rows += 1;
+    }
+    let rc = unsafe { frs_iterator_close(iter) };
+    assert_eq!(rc, FRS_STATUS_OK, "frs_iterator_close failed: {rc}");
+    rows
+}
+
+fn drain_prefixes_compat_row_by_row_count(
+    d: &FfiDb,
+    prefixes: &[Vec<u8>],
+    copy_payloads: bool,
+) -> u64 {
+    prefixes
+        .iter()
+        .map(|prefix| drain_prefix_compat_row_by_row(d, prefix, copy_payloads))
+        .sum()
+}
+
+fn bench_compat_jni_prefix_proxy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ffi_vectorized/compat_jni_prefix_proxy");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_millis(800));
+    group.warm_up_time(std::time::Duration::from_millis(200));
+
+    for &prefix_count in COMPAT_PROXY_PREFIX_COUNTS {
+        for &rows_per_prefix in COMPAT_PROXY_ROWS_PER_PREFIX {
+            let d = FfiDb::open();
+            let ns = format!("compat/p{prefix_count}/r{rows_per_prefix}");
+            let (prefixes, expected) =
+                populate_iter_fixture(&d, &ns, prefix_count, rows_per_prefix);
+            assert_iter_fixture_correct(&d, &prefixes, &expected);
+            let expected_rows = (prefix_count * rows_per_prefix) as u64;
+            let label = format!("p{prefix_count}_r{rows_per_prefix}");
+
+            group.throughput(Throughput::Elements(expected_rows));
+            group.bench_with_input(
+                BenchmarkId::new("compat_row_native", &label),
+                &expected_rows,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_compat_row_by_row_count(&d, &prefixes, false);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+            group.bench_with_input(
+                BenchmarkId::new("compat_row_copy_proxy", &label),
+                &expected_rows,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_compat_row_by_row_count(&d, &prefixes, true);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+
+            let mut chunk_buf = vec![0u8; CHUNK_CAP as usize];
+            group.bench_with_input(
+                BenchmarkId::new("chunked_prefix_lower_bound", &label),
+                &expected_rows,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_serial_count(&d, &prefixes, &mut chunk_buf);
                         assert_eq!(rows, expected_rows);
                         std::hint::black_box(rows);
                     })
@@ -1779,9 +2011,11 @@ criterion_group!(
     bench_put,
     bench_mixed,
     bench_get,
+    bench_compat_jni_multiget_proxy,
     bench_iter,
     bench_q7_iter_probe_ffi,
     bench_q19_iter_topn_ffi,
+    bench_compat_jni_prefix_proxy,
     bench_q19_append_merge_chain_ffi,
     bench_q19_merge_chain_read_lifecycle_ffi,
     bench_q19_iter_open_alloc_split_ffi

@@ -104,6 +104,8 @@ use crate::{
 static DB_PATH_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
 static DB_LOG_REGISTRY: OnceLock<Mutex<HashMap<usize, CompatDbLogState>>> = OnceLock::new();
 static FLINK_ENV_BASE_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
+// Same-box microbench gate: <=64 keeps a small-batch win; larger groups keep the old scalar path.
+const MULTI_GET_BATCH_GROUP_THRESHOLD: usize = 64;
 
 struct CompatDbLogState {
     dir: String,
@@ -8835,6 +8837,96 @@ fn multi_get_cf_list<'env, 'arr>(
     Some(out)
 }
 
+fn free_frs_bytes_slots(slots: &mut [FrsBytes]) {
+    for slot in slots {
+        unsafe {
+            let _ = crate::frs_bytes_free(slot);
+        }
+    }
+}
+
+fn multi_get_grouped_batch(
+    handle: FrsDb,
+    keys: &[Vec<u8>],
+    cf_list: &[FrsCfHandle],
+) -> Result<Vec<FrsBytes>, i32> {
+    debug_assert_eq!(keys.len(), cf_list.len());
+    let count = keys.len();
+    let mut out_slots: Vec<FrsBytes> = (0..count)
+        .map(|_| FrsBytes {
+            data: ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        })
+        .collect();
+    if count == 0 {
+        return Ok(out_slots);
+    }
+
+    let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (idx, cf) in cf_list.iter().enumerate() {
+        groups.entry(*cf as usize).or_default().push(idx);
+    }
+
+    for indices in groups.values() {
+        let cf = cf_list[indices[0]];
+        if indices.len() > MULTI_GET_BATCH_GROUP_THRESHOLD {
+            for &out_idx in indices {
+                let key = &keys[out_idx];
+                let mut out = FrsBytes {
+                    data: ptr::null_mut(),
+                    len: 0,
+                    capacity: 0,
+                };
+                let status = unsafe { frs_get(handle, cf, key.as_ptr(), key.len(), &mut out) };
+                if status == FRS_STATUS_NOT_FOUND {
+                    continue;
+                }
+                if status != FRS_STATUS_OK {
+                    unsafe {
+                        let _ = crate::frs_bytes_free(&mut out);
+                    }
+                    free_frs_bytes_slots(&mut out_slots);
+                    return Err(status);
+                }
+                out_slots[out_idx] = out;
+            }
+            continue;
+        }
+        let key_ptrs: Vec<*const u8> = indices.iter().map(|&idx| keys[idx].as_ptr()).collect();
+        let key_lens: Vec<usize> = indices.iter().map(|&idx| keys[idx].len()).collect();
+        let mut group_slots: Vec<FrsBytes> = (0..indices.len())
+            .map(|_| FrsBytes {
+                data: ptr::null_mut(),
+                len: 0,
+                capacity: 0,
+            })
+            .collect();
+
+        let status = unsafe {
+            frs_batch_get(
+                handle,
+                cf,
+                key_ptrs.as_ptr(),
+                key_lens.as_ptr(),
+                indices.len(),
+                group_slots.as_mut_ptr(),
+            )
+        };
+        if status != FRS_STATUS_OK {
+            free_frs_bytes_slots(&mut group_slots);
+            free_frs_bytes_slots(&mut out_slots);
+            return Err(status);
+        }
+
+        for (slot_idx, &out_idx) in indices.iter().enumerate() {
+            out_slots[out_idx] = std::mem::take(&mut group_slots[slot_idx]);
+        }
+    }
+
+    Ok(out_slots)
+}
+
 fn multi_get_impl<'env, 'arr>(
     env: &mut JNIEnv<'env>,
     handle: jlong,
@@ -8866,37 +8958,23 @@ fn multi_get_impl<'env, 'arr>(
         }
     };
 
-    for (i, key) in ks.iter().enumerate() {
-        let mut out = FrsBytes {
-            data: ptr::null_mut(),
-            len: 0,
-            capacity: 0,
-        };
-        let st = unsafe {
-            frs_get(
-                handle as FrsDb,
-                cf_list[i],
-                key.as_ptr(),
-                key.len(),
-                &mut out,
-            )
-        };
-        if st == FRS_STATUS_NOT_FOUND {
-            continue;
-        }
-        if check_status(env, st, &format!("RocksDB.multiGet[{i}]")) {
+    let mut out_slots = match multi_get_grouped_batch(handle as FrsDb, &ks, &cf_list) {
+        Ok(slots) => slots,
+        Err(status) => {
+            check_status(env, status, "RocksDB.multiGet(batch)");
             return ptr::null_mut();
         }
-        if out.data.is_null() {
+    };
+
+    for i in 0..out_slots.len() {
+        if out_slots[i].data.is_null() {
             continue;
         }
-        let s = unsafe { std::slice::from_raw_parts(out.data, out.len) };
+        let s = unsafe { std::slice::from_raw_parts(out_slots[i].data, out_slots[i].len) };
         let arr = match env.byte_array_from_slice(s) {
             Ok(a) => a,
             Err(e) => {
-                unsafe {
-                    let _ = crate::frs_bytes_free(&mut out);
-                }
+                free_frs_bytes_slots(&mut out_slots);
                 throw_rocksdb(
                     env,
                     &format!("RocksDB.multiGet[{i}]: byte_array_from_slice: {e}"),
@@ -8905,19 +8983,15 @@ fn multi_get_impl<'env, 'arr>(
             }
         };
         if let Err(e) = env.set_object_array_element(&outer, i as jint, &arr) {
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
-            }
+            free_frs_bytes_slots(&mut out_slots);
             throw_rocksdb(
                 env,
                 &format!("RocksDB.multiGet[{i}]: set_object_array_element: {e}"),
             );
             return ptr::null_mut();
         }
-        unsafe {
-            let _ = crate::frs_bytes_free(&mut out);
-        }
     }
+    free_frs_bytes_slots(&mut out_slots);
     outer.into_raw()
 }
 
@@ -11864,8 +11938,8 @@ mod tests {
     }
 
     /// Multi-CF `multiGet`: open db with default + a second CF, put one
-    /// entry into each, drive a `(cf1,k1) + (cf2,k2)` multi-CF lookup
-    /// inline, verify both come back with the right values.
+    /// entry into each, drive an out-of-order multi-CF lookup through the
+    /// grouped batch helper, verify ordering and missing-key semantics.
     #[test]
     fn test_multi_get() {
         use std::ffi::CString;
@@ -11894,31 +11968,24 @@ mod tests {
         let st = unsafe { crate::frs_put(db, extra_cf, b"b".as_ptr(), 1, b"2".as_ptr(), 1) };
         assert_eq!(st, FRS_STATUS_OK);
 
-        // Mirror multiGet's per-pair frs_get loop.
-        let cf_list = [default_cf, extra_cf];
-        let keys: [&[u8]; 2] = [b"a", b"b"];
-        let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(2);
-        for (i, key) in keys.iter().enumerate() {
-            let mut out = FrsBytes {
-                data: ptr::null_mut(),
-                len: 0,
-                capacity: 0,
-            };
-            // SAFETY: pointers / out valid.
-            let st = unsafe { frs_get(db, cf_list[i], key.as_ptr(), key.len(), &mut out) };
-            assert!(st == FRS_STATUS_OK || st == FRS_STATUS_NOT_FOUND);
-            if st == FRS_STATUS_NOT_FOUND || out.data.is_null() {
+        let cf_list = vec![extra_cf, default_cf, default_cf];
+        let keys = vec![b"b".to_vec(), b"missing".to_vec(), b"a".to_vec()];
+        let mut slots = multi_get_grouped_batch(db, &keys, &cf_list).expect("grouped batch get");
+        let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(slots.len());
+        for slot in slots.iter_mut() {
+            if slot.data.is_null() {
                 results.push(None);
             } else {
                 // SAFETY: out describes Rust-owned buffer.
-                let vec = unsafe { std::slice::from_raw_parts(out.data, out.len).to_vec() };
+                let vec = unsafe { std::slice::from_raw_parts(slot.data, slot.len).to_vec() };
                 results.push(Some(vec));
             }
-            unsafe {
-                let _ = crate::frs_bytes_free(&mut out);
-            }
         }
-        assert_eq!(results, vec![Some(b"1".to_vec()), Some(b"2".to_vec())]);
+        free_frs_bytes_slots(&mut slots);
+        assert_eq!(
+            results,
+            vec![Some(b"2".to_vec()), None, Some(b"1".to_vec())]
+        );
 
         // Cleanup.
         // SAFETY: handles came from prior calls.
