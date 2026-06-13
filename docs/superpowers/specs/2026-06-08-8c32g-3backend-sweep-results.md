@@ -2466,22 +2466,38 @@ fingerprint needed to resume observation; sweep unaffected.
 #
 # query | frs wall (rows)        | rdb wall (rows)        | forst wall (rows)       | frs/rdb | RDB bar (<=1.25x) | vs ForSt (<ForSt) | net
 # ------|------------------------|------------------------|-------------------------|---------|-------------------|-------------------|----
-# q9    | DNF (OOM x2)           | 909.3 (91,813,372)     | 1661.6 (91,813,372)     | n/a     | n/a (frs DNF)     | n/a (frs DNF)     | frs DNF (OOM)
+# q9    | DNF (OOM x3)           | 909.3 (91,813,372)     | 1661.6 (91,813,372)     | n/a     | n/a (frs DNF)     | n/a (frs DNF)     | frs DNF (OOM) — bounded-LRU fix NOT sufficient
 #         CORRECTNESS: rdb & forst rows BYTE-IDENTICAL (91,813,372 both;
 #         src_out 98,000,000 both). frs DNF'd before producing a final count.
 #         Note: ForSt C++ q9 = 1661.6s is 1.83x SLOWER than RocksDB 909.3s here
 #         -> q9 is hard for ForSt too; had frs fit in RAM it would only need to
 #         beat 1661.6s to beat ForSt. The blocker is purely the 16g/TM cgroup
 #         OOM, not engine speed.
-#         q9-frs DNF: TM container OOM-killed (exit 137) at ~80-83M of 100M,
-#         REPRODUCIBLE across 2 serial attempts (att1 crashed @83.3M / 922s;
-#         att2 @~80M / 882s). Root cause = MEMORY PRESSURE on the 35G Mac:
+#         q9-frs DNF (att1/att2): TM container OOM-killed (exit 137) at ~80-83M
+#         of 100M, REPRODUCIBLE across 2 serial attempts (att1 crashed @83.3M /
+#         922s; att2 @~80M / 882s). Root cause = MEMORY PRESSURE on the 35G Mac:
 #         2 TM x16g + 1 JM x4g = 36g > physical RAM; q9's heavy interval-join
 #         + Rank state pushes a TM past its 16g cgroup limit -> kernel SIGKILL
 #         ("remote task manager was lost" / RecipientUnreachableException ->
 #         crash-loop -> harness abort). Mac-population RESOURCE DNF (not a
 #         correctness or MAXSEC-timeout DNF). q9 is the single heaviest join in
 #         the set. Bottleneck = join+rank state footprint vs 16g/TM cgroup.
+#         ── CONFIRM RUN 2026-06-14 (bounded-LRU fix 9e0438eb7, cap 2048): STILL
+#         OOM (att3). Rebuilt .so at tip 9e0438eb7 (FRS_VLOG_READER_CACHE_CAP=
+#         FRS_VLOG_READER_CACHE_CAP symbol present; q1@1M smoke PASS out_rows=
+#         1,000,000). Flag-ON @100M TOPO=split: BOTH TMs exit 137 at ~75.04M of
+#         98M (job-time ~862s; then RESTARTING crash-loop). Peak TM RSS ~15.25
+#         GiB/16g just before SIGKILL. The bounded LRU DID work at the engine
+#         layer (block-cache hit ~80%, no engine-cache runaway; resident
+#         oscillated 9-14 GiB for most of the run rather than monotonic growth)
+#         BUT the TM still OOM'd: the dominant final-phase pressure is the
+#         FLINK-SIDE join+rank state heap, NOT the vlog-reader cache. So the
+#         vlog cap is necessary-but-NOT-sufficient on this 35G Mac — q9 needs
+#         the Mac population's 36g (2x16+4) trimmed (e.g. 1 TM, or smaller
+#         per-TM heap) or candidates #2/#3 from the root-cause doc to land. NET
+#         UNCHANGED: q9 remains a Mac-population RESOURCE DNF; rebuild fix did
+#         not flip it. The OOM is NOT resolved on this box. NOTE crashed slightly
+#         EARLIER (75M vs 80-83M) — within box noise (busy-disk single run).
 # q12   | 40.6 (92,000,000)      | 40.2 (92,000,000)      | 40.8 (92,000,000)       | 1.01x   | PASS              | PASS 1.005x       | PASS both (source-bound parity)
 #         CORRECTNESS: all 3 rows IDENTICAL (92,000,000; src_out 92,000,000).
 #         q12 is a lightweight proctime tumbling agg = SOURCE-BOUND; all 3
