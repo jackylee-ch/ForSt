@@ -120,6 +120,11 @@ pub struct KvGcSpec {
     pub output_segment_id: FileNumber,
     /// Engine db dir (vlog segments live at its root).
     pub db_dir: PathBuf,
+    /// FRS-WA-V2c: codec for the relocation OUTPUT segment. Records are
+    /// self-describing, so a relocation may re-encode legacy uncompressed
+    /// source records into a compressed output (and reads still work);
+    /// resolved by the caller from the engine's compression policy.
+    pub vlog_compression: forst_rs_common::CompressionType,
 }
 
 /// FRS-WA-V2b: per-job vlog-GC working state (freed-byte deltas + the lazy
@@ -186,10 +191,11 @@ impl KvGcState {
         };
         let value = reader.get(ptr)?;
         if self.out.is_none() {
-            self.out = Some(forst_rs_storage::vlog::VlogWriter::create(
+            self.out = Some(forst_rs_storage::vlog::VlogWriter::create_with_compression(
                 fs,
                 &spec.db_dir,
                 spec.output_segment_id.value(),
+                spec.vlog_compression,
             )?);
         }
         let w = self.out.as_mut().expect("relocation writer just ensured");

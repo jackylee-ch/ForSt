@@ -199,6 +199,22 @@ struct Args {
     seq_keys: bool,
     /// FRS-WA-V3: force `FRS_TRIVIAL_MOVE` ON for this process.
     trivial_move: bool,
+    /// FRS-M5 cell (2026-06-13 cycle 2): generate COMPRESSIBLE,
+    /// NexMark-shaped values instead of the default random (incompressible)
+    /// fill. The default fill is random bytes BY CONSTRUCTION, so neither SST
+    /// block compression nor vlog compression can shrink it — which is why
+    /// cycle-1 could not measure M5 (the compression-parity lever). With this
+    /// flag every value is an auction/bid-shaped record (low-entropy repeated
+    /// fields + a common-prefix URL + repetitive padding). It is HIGHLY
+    /// compressible (the synthetic padding compresses harder than typical
+    /// real NexMark state — treat the measured ratio as an UPPER bound on the
+    /// M5 win; real data compresses less, same-signed). What it establishes
+    /// rigorously is the DIRECTION + COMPOUNDING (none<lz4<zstd ordering; does
+    /// compression stack with KV-sep), which hold at any compressibility.
+    /// Combined with `FRS_SST_COMPRESSION={none|lz4|zstd}` (SST blocks) and
+    /// `FRS_VLOG_COMPRESSION={inherit|none|lz4|zstd}` (vlog under --kvsep)
+    /// this measures write-amp + bytes-to-disk for the codec × KV-sep matrix.
+    compressible: bool,
 }
 
 impl Args {
@@ -223,6 +239,7 @@ impl Args {
             kvsep: false,
             seq_keys: false,
             trivial_move: false,
+            compressible: false,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -253,6 +270,7 @@ impl Args {
                 "--kvsep" => a.kvsep = true,
                 "--seq-keys" => a.seq_keys = true,
                 "--trivial-move" => a.trivial_move = true,
+                "--compressible" => a.compressible = true,
                 other => panic!("unknown arg {other}"),
             }
             i += 1;
@@ -297,6 +315,42 @@ fn make_key(stream: u8, bucket: u64, seq: u64) -> Vec<u8> {
 
 fn make_prefix(stream: u8, bucket: u64) -> Vec<u8> {
     format!("{}{:06}|", stream as char, bucket).into_bytes()
+}
+
+/// FRS-M5: fill `value` with a COMPRESSIBLE, NexMark-shaped record (write the
+/// bytes in place to keep the writer's zero-alloc hot loop). Real NexMark
+/// auction/bid state is low-entropy: small integer ids drawn from a bounded
+/// universe, a channel string from a tiny set, a URL sharing a long common
+/// prefix, and free-text padding with repetition — LZ4/Snappy shrink it
+/// ~2-3×, unlike the random default fill. `seq`/`bucket` vary the leading
+/// fields so rows are not byte-identical (that would over-state the ratio).
+fn fill_compressible(value: &mut [u8], seq: u64, bucket: u64) {
+    // A canonical NexMark-ish bid/auction JSON-ish line. The trailing URL +
+    // "extra" padding is the bulk and is highly repetitive (the realistic
+    // compressible part). Low-cardinality fields (bucket-derived) repeat
+    // across rows; seq keeps each row distinct.
+    let head = format!(
+        "{{\"auction\":{},\"bidder\":{},\"price\":{},\"channel\":\"channel-{}\",\
+         \"url\":\"https://www.nexmark.com/item/path/to/auction?id=",
+        bucket,
+        seq % 1000,
+        (seq % 950) + 50,
+        bucket % 8,
+    );
+    let head = head.as_bytes();
+    let n = value.len();
+    let mut pos = 0usize;
+    let copy = head.len().min(n);
+    value[..copy].copy_from_slice(&head[..copy]);
+    pos += copy;
+    // Pad the remainder with a repeating low-entropy filler (the "extra"
+    // NexMark field is generated this way: a fixed phrase repeated).
+    const FILLER: &[u8] = b"+item&category=10&price&channel&AAAAAAAA ";
+    while pos < n {
+        let take = FILLER.len().min(n - pos);
+        value[pos..pos + take].copy_from_slice(&FILLER[..take]);
+        pos += take;
+    }
 }
 
 /// Windowed probe-latency accumulator: probes push ns, sampler swaps out.
@@ -462,9 +516,17 @@ fn one_run(args: &Args, run_idx: usize, workroot: &Path) -> RunSummary {
                 } else {
                     make_key(stream, bucket, seq)
                 };
-                for chunk in value.chunks_mut(8) {
-                    let w = rng.next().to_le_bytes();
-                    chunk.copy_from_slice(&w[..chunk.len()]);
+                // FRS-M5: compressible (NexMark-shaped) vs the default
+                // random/incompressible fill. The random fill makes ANY codec
+                // a no-op — the compressible mode is the only one that can
+                // measure the compression-parity lever.
+                if a.compressible {
+                    fill_compressible(&mut value, seq, bucket);
+                } else {
+                    for chunk in value.chunks_mut(8) {
+                        let w = rng.next().to_le_bytes();
+                        chunk.copy_from_slice(&w[..chunk.len()]);
+                    }
                 }
                 let cf = &cfs[(bucket % cfs.len() as u64) as usize];
                 db.put(cf, &key, &value).expect("put");

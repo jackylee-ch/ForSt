@@ -80,6 +80,12 @@ pub struct KvSepSpec {
     pub segment_id: FileNumber,
     /// Values shorter than this stay inline.
     pub min_blob_size: usize,
+    /// FRS-WA-V2c: codec for the value-log payloads this flush separates.
+    /// Resolved by the caller from the engine's SST compression policy (so
+    /// the diverted big bytes get the same treatment the SSTs would have);
+    /// the on-disk record stamps it per record so the reader is
+    /// self-describing.
+    pub vlog_compression: forst_rs_common::CompressionType,
 }
 
 /// A single flush operation: one frozen memtable → one SST file.
@@ -401,10 +407,11 @@ impl FlushJob {
         for row in 0..rows {
             if qualifies(row) {
                 if vlog.is_none() {
-                    *vlog = Some(VlogWriter::create(
+                    *vlog = Some(VlogWriter::create_with_compression(
                         self.fs.as_ref(),
                         dir,
                         spec.segment_id.value(),
+                        spec.vlog_compression,
                     )?);
                 }
                 let w = vlog.as_mut().expect("vlog writer just ensured");

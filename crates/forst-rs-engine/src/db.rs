@@ -12030,6 +12030,7 @@ impl DbImpl {
         Some(crate::flush::KvSepSpec {
             segment_id: self.version_set.allocate_file_number(),
             min_blob_size: kv_min_blob_size(),
+            vlog_compression: kv_vlog_compression(self.options.compression),
         })
     }
 
@@ -12067,6 +12068,7 @@ impl DbImpl {
             relocate,
             output_segment_id: self.version_set.allocate_file_number(),
             db_dir: PathBuf::from(&self.db_path),
+            vlog_compression: kv_vlog_compression(self.options.compression),
         })
     }
 
@@ -14258,6 +14260,32 @@ pub fn kv_min_blob_size() -> usize {
             .filter(|&v| v > forst_rs_storage::vlog::VALUE_POINTER_LEN)
             .unwrap_or(128)
     })
+}
+
+/// FRS-WA-V2c (vlog compression — survey §10.1 item 3): resolves the codec
+/// used for KV-separated value payloads written to `*.vlog` segments. The
+/// big bytes KV-separation diverts past SST block compression would
+/// otherwise hit disk UNCOMPRESSED, forfeiting M5's win on exactly the
+/// dominant byte source. The codec follows the engine's configured SST
+/// `compression` (so vlog values get the same treatment the SSTs would
+/// have) unless `FRS_VLOG_COMPRESSION` overrides it:
+///   - unset / `inherit` ⇒ `engine_compression` (the matching-policy default)
+///   - `none` / `lz4` / `zstd` ⇒ force that codec for the vlog only
+///
+/// This keeps the vlog codec auditable and lets the compressible-value
+/// churn_probe cell A/B `none` vs `lz4` vs `zstd` on the vlog in isolation.
+/// Note: KV separation itself is DEFAULT OFF, so this only takes effect once
+/// a CF opts into separation.
+fn kv_vlog_compression(
+    engine_compression: forst_rs_common::CompressionType,
+) -> forst_rs_common::CompressionType {
+    use forst_rs_common::CompressionType;
+    match std::env::var("FRS_VLOG_COMPRESSION").ok().as_deref() {
+        Some("none") | Some("None") | Some("NONE") => CompressionType::None,
+        Some("lz4") | Some("Lz4") | Some("LZ4") => CompressionType::Lz4,
+        Some("zstd") | Some("Zstd") | Some("ZSTD") => CompressionType::Zstd,
+        Some("inherit") | Some("INHERIT") | None | Some(_) => engine_compression,
+    }
 }
 
 /// S2 (pinned-rows + loser-tree design, 2026-06-12): test/bench override for
@@ -16604,9 +16632,20 @@ mod tests {
         assert_eq!(v.vlog_segments.len(), 1, "one segment per flush");
         let seg = v.vlog_segments[0].clone();
         assert_eq!(seg.cf_id, cf.id());
+        // FRS-WA-V2c: the default engine compression is Lz4, so the vlog now
+        // COMPRESSES the separated values (inheriting the SST codec). big2 is
+        // 4 KiB of one byte → compresses to almost nothing, so the segment is
+        // strictly SMALLER than the logical payload sum. The win is exactly
+        // M5 reaching the KV-separated big bytes; correctness (the values
+        // round-trip) is proven by the reads below. The segment must still be
+        // non-empty (it holds two compressed records + framing).
+        assert!(seg.file_size > 0, "segment must hold the separated values");
         assert!(
-            seg.file_size >= (big1.len() + big2.len()) as u64,
-            "segment must hold the separated values"
+            seg.file_size < (big1.len() + big2.len()) as u64,
+            "Lz4 vlog compression should shrink these compressible payloads: \
+             file_size {} vs logical {}",
+            seg.file_size,
+            big1.len() + big2.len()
         );
         // The .vlog file exists on the engine FS.
         let seg_path = forst_rs_storage::vlog::vlog_segment_path(
