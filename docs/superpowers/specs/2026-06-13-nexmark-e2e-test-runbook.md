@@ -3,6 +3,66 @@
 Self-contained guide: anyone with repo access + a Linux box (or Apple-Silicon
 Mac) can build, run, and interpret the 3-backend NexMark @100M benchmark.
 
+## 0. REMOTE FIRE SEQUENCE (x86 Linux box — copy/paste, top to bottom)
+This is THE staged sequence for the binding REMOTE-x86 @100M run. It is
+**fire-ready the instant (a) is unblocked**. Sections §2-§9 are the reference
+detail behind each step. Run it on the remote box (sshdata00 → yq01), NOT the
+Mac. **MOCK S3 only — never the real endpoint (§11). STRICTLY SERIAL — one
+cluster at a time (§12).**
+
+```
+(a) BRIDGE AUTH  ── BLOCKED on user physical fingerprint touch ──
+    /tmp/relay-bridge.exp  →  /tmp/relay-cmd.fifo  →  /tmp/relay-out.log
+    relay-cli -t fp <fingerprint>          # needs the user's physical touch.
+    Verify the channel is live before anything else:
+      echo 'whoami; hostname' > /tmp/relay-cmd.fifo ; tail -5 /tmp/relay-out.log
+    Everything below runs THROUGH this bridge on the remote box.
+
+(b) PULL WORKTREE to /ssd2/jackylee  (the NVMe; repo path the harness expects)
+      cd /ssd2/jackylee && git -C ForSt fetch origin forst-rs \
+        && git -C ForSt checkout forst-rs && git -C ForSt reset --hard origin/forst-rs
+      git -C flink fetch origin forst-rs-jdk25 && git -C flink checkout forst-rs-jdk25 \
+        && git -C flink reset --hard origin/forst-rs-jdk25     # backend jar source
+
+(c) BUILD image + in-image .so + jar   (3 commands, see §3/§4)
+    # c1: bench image (docker 19.03-safe; JDK25 copied from build ctx, libjemalloc2 baked):
+      mkdir -p /ssd2/jackylee/frs-bench/imgctx
+      cp -a ~/workenv/jdk25.0.2-linux_x64_gcc12 /ssd2/jackylee/frs-bench/imgctx/jdk25
+      cp /ssd2/jackylee/ForSt/docker/bench-remote.Dockerfile /ssd2/jackylee/frs-bench/imgctx/Dockerfile
+      docker build -t forst-bench:x86 /ssd2/jackylee/frs-bench/imgctx
+    # c2: engine .so — built NATIVELY on the host (host glibc ≤ jammy 2.35);
+    #     verify it loads in the image ONCE: docker run --rm -v <so>:/t/x.so forst-bench:x86 bash -c 'ldd /t/x.so'
+      cd /ssd2/jackylee/ForSt && CARGO_TARGET_DIR=$PWD/target-linux cargo build --release -p forst-rs-ffi
+    # c3: backend jar (host maven, JDK25) → copied into $WORKENV/flink-2.2.1/lib/
+      REPO=/ssd2/jackylee/ForSt WORKENV=~/workenv FLINK=~/workenv/flink-2.2.1 \
+        IMG=forst-bench:x86 PLAT=linux/amd64 bash /ssd2/jackylee/ForSt/scripts/run-8c32g.sh jar
+
+(d) SWEEP  q4 q7 q11 q19 q20 × {forst-rs-ffm-local, rocksdb, forst-local}
+    SPLIT TOPO, @100M, STRICTLY SERIAL (one cluster at a time — self-contention
+    was a real local failure mode). Pick a FREE disk first; reuse it for the
+    whole sweep so populations don't mix:
+      BASE=$(bash /ssd2/jackylee/ForSt/scripts/pick-disk.sh)     # e.g. /ssd2/jackylee
+    Per (query, arm) — wait for the previous cluster to fully tear down before
+    the next `run` returns (the harness rm's its own containers/network):
+      Q=q9; CFG=forst-rs-ffm-local; TAG=rx86-$Q-$CFG
+      TOPO=split REPO=/ssd2/jackylee/ForSt WORKENV=~/workenv FLINK=~/workenv/flink-2.2.1 \
+        IMG=forst-bench:x86 PLAT=linux/amd64 NEXMARK_HOME=~/workenv/nexmark-flink \
+        FRS_CTMP_BASE=$BASE/frs-bench-tmp CLUSTER=$TAG \
+        FRS_KV_SEPARATION=1 FRS_KV_MIN_BLOB_SIZE=256 FRS_TRIVIAL_MOVE=1 FRS_RS_S2_PINNED=1 \
+        bash /ssd2/jackylee/ForSt/scripts/run-8c32g.sh run $Q $CFG 3600 $TAG
+      # rocksdb / forst-local arms: DROP the FRS_* lever flags (engines ignore them).
+      # io_uring: TMs run with seccomp=unconfined under split-topo on this box (q7
+      #   needs io_uring or it DNFs); FRS_IO_URING falls back to pread silently.
+    Loop the 5 queries × 3 arms = 15 clusters, serial, with a ledger (§8) so a
+    re-run fills only missing tags. Canaries to sanity-check (§10): q8 rows in
+    [3.064M, 3.066M]; q9 frs out_rows canonical 91,813,372.
+
+(e) RECORD into docs/superpowers/specs/2026-06-08-8c32g-3backend-sweep-results.md
+    Append each result to the REMOTE scoreboard, tagged **REMOTE-x86** with the
+    disk used. This is a SEPARATE population — NEVER cross-compare with the Mac
+    pins in that file (rule §9.10). Update CURRENT STATUS at the top.
+```
+
 ## 1. Repos & branches
 | Repo | Branch | Role |
 |---|---|---|
@@ -52,10 +112,33 @@ scripts/run-8c32g.sh jar            # builds + copies into $WORKENV/flink-2.2.1/
 # Single run:  scripts/run-8c32g.sh run <query> <config> <maxsec> [tag]
 TOPO=split REPO=$PWD WORKENV=$HOME/workenv FLINK=$HOME/workenv/flink-2.2.1 \
   IMG=forst-bench:x86 PLAT=linux/amd64 NEXMARK_HOME=$HOME/workenv/nexmark-flink \
+  FRS_KV_SEPARATION=1 FRS_KV_MIN_BLOB_SIZE=256 FRS_TRIVIAL_MOVE=1 FRS_RS_S2_PINNED=1 \
   scripts/run-8c32g.sh run q9 forst-rs-ffm-local 3600 mytag
 ```
 - Configs: `forst-rs-ffm-local` (JDK25) | `rocksdb` (JDK17) | `forst-local`
-  (JDK17 + ForSt jars) | `forst-rs-ffm-s3` (S3 creds via S3_* envs).
+  (JDK17 + ForSt jars) | `forst-rs-ffm-s3` (S3 creds via S3_* envs — **PERF: DO
+  NOT USE**, see §11 MOCK-S3-ONLY).
+
+### 5.1 forst-rs flag-ON lever stack (PMC-1 validated locally; carry to REMOTE)
+run-8c32g.sh now FORWARDS these into the TM/JM containers; pass them on the
+`run` line for the forst-rs arm. The PMC-1-validated stack:
+| env | value | what |
+|---|---|---|
+| `FRS_SST_COMPRESSION` | `lz4` (HARNESS DEFAULT) | fair vs ForSt/RocksDB engine default; also the forst-rs engine default (common config.rs:268) |
+| `FRS_KV_SEPARATION` | `1` | KV-separation (blob) — keeps big values out of the LSM, cuts compaction write-amp |
+| `FRS_KV_MIN_BLOB_SIZE` | `256` | min value bytes to separate into the blob/vlog |
+| `FRS_TRIVIAL_MOVE` | `1` | trivial-move compaction (no rewrite when key ranges don't overlap) |
+| `FRS_RS_S2_PINNED` | `1` | S2 pinned-rows + loser-tree merge (q7/join lever; micro: join_probe_open 9.2× on 128-SST) |
+- `FRS_SST_COMPRESSION=lz4` is the harness default — only override it (`=none`)
+  for the zero-copy read-path A/B. The other four are OFF by default (merged
+  flag-OFF) and MUST be set explicitly on the forst-rs arm.
+- `FRS_VLOG_COMPRESSION` defaults to `inherit` (follows SST compression).
+- `FRS_REMOTE_COMPACTION` is also forwarded but stays OFF for this sweep (mock
+  S3, no remote-compaction worker provisioned).
+- **rocksdb / forst-local arms IGNORE these flags** (different engines) — set
+  them ONLY on `forst-rs-ffm-local`. The lz4 default already makes SST
+  compression fair across all three (prior remote write-amp numbers were
+  frs-uncompressed-vs-compressed — invalid).
 - `TOPO=split` (RECOMMENDED, the official topology): 2 TM containers 4c/16g +
   JM container 2c/4g (8c/32g budget = TM-only). `TOPO=single` = legacy 1×8c/32g.
 - Every run is namespaced (`CLUSTER=frs-<tag>`): own containers, network, conf,
@@ -120,6 +203,43 @@ lives on the bench box at `/ssd2/jackylee/frs-bench/run-integrity.sh` (ledger
   (frs, exact); q17/q5 rows = 92M/30M-class.
 - All historical results + methodology: docs/superpowers/specs/
   2026-06-08-8c32g-3backend-sweep-results.md (CURRENT STATUS at top).
+
+## 11. ★ MOCK S3 ONLY — do NOT touch the real S3 endpoint for perf
+Real S3 credentials (`S3_ENDPOINT/_ACCESS_KEY/_SECRET_KEY/_BUCKET/_REGION/
+_PREFIX`) ARE present in the environment and the harness wires them through
+(run-8c32g.sh passes `-e S3_*`, measure-sql.sh `envsubst`s them into the
+`forst-rs-ffm-s3` / `config-forst-rs.yaml.tpl` template). **They stay UNUSED for
+perf** — the current env's S3 connect perf is bad, so real-S3 numbers are
+meaningless until the user green-lights the ≥50 Gb/s co-located online box.
+- **All perf validation uses MOCK S3** = LocalFileSystem / latency-emulated FS
+  with `FRS_MODEL_BW_MBPS` (project the online box at **6250** ≈ 50 Gb/s).
+  The disagg minibench `crates/forst-rs-bench/src/bin/disagg_vs_forst.rs`
+  already does this: it drives the REAL engine link/adopt-checkpoint paths over
+  `LocalFileSystem` and costs the ForSt comparison column at
+  `FRS_MODEL_BW_MBPS` / `FRS_MODEL_RTT_MS` (defaults 10 MB/s / 23 ms = the
+  recorded dev-Mac→BOS baseline; override to 6250 for the online-box projection).
+- **The NexMark sweep arm is `forst-rs-ffm-local`** (LocalFileSystem state dir
+  on the NVMe), NOT `forst-rs-ffm-s3`. Do not select the s3 config for any perf
+  run. Real-S3 E2E perf is a user-gated Phase-3 item — record nothing under it
+  until then.
+
+## 12. Concurrency etiquette (shared box — don't collide with other tenants)
+- **≤3 concurrent remote services** total on the box. For THIS sweep, run
+  STRICTLY SERIAL (one NexMark cluster at a time) — self-contention on one box
+  was a real local failure mode and corrupts perf numbers.
+- **Per-cluster namespacing**: every `run` gets its own `CLUSTER=` (own
+  containers `$CLUSTER-{jm,tm1,tm2}`, network `$CLUSTER-net`, conf dir, and
+  `/tmp` scratch). Cleanup MUST stay namespaced — never `docker rm -f` by a
+  bare name that could hit another tenant's cluster.
+- **Distinct `FRS_CTMP_BASE` disks for concurrent clusters**: if anything DOES
+  run alongside this sweep, point each cluster's scratch at a DIFFERENT disk via
+  `FRS_CTMP_BASE` (pick-disk.sh spreads across `/ssd2 /ssd1 /tmp jackylee`).
+  A/B pairs (same query, two arms) reuse the SAME disk so the comparison is fair
+  — but they still run serially here.
+- **Never collide with other tenants' NexMark**: check the box for existing
+  `*-jm/*-tm*` containers and load (`uptime`) before launching; wait for idle.
+  The bench .so / jar in `$FLINK/lib` is SHARED — concurrent clusters must be the
+  same engine build.
 
 ### 9.1 sql-client wrapper (verbatim)
 ```bash
