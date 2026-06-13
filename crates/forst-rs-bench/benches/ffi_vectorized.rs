@@ -73,12 +73,12 @@ use forst_rs_common::EngineOptions;
 use forst_rs_engine::{ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, DEFAULT_CF_NAME};
 use forst_rs_ffi::{
     frs_batch_get, frs_bytes_free, frs_compact_cf, frs_db_create_cf_with_merge, frs_db_open,
-    frs_flush_cf, frs_get, frs_iterator_close, frs_iterator_next, frs_prefix_lookup_open,
-    frs_vec_iter_prefix_close, frs_vec_iter_prefix_next, frs_vec_iter_prefix_open,
-    frs_vec_iter_prefix_open_batch, frs_vec_iter_prefix_open_batch_parallel,
-    frs_vec_merge_append_batch, frs_vectorized_batch_get, frs_vectorized_batch_mixed,
-    frs_vectorized_batch_put, FrsBytes, FrsCfHandle, FrsChunk, FrsDb, FrsIterator, FRS_CHUNK_EOF,
-    FRS_STATUS_OK,
+    frs_flush_cf, frs_get, frs_iterator_close, frs_iterator_next, frs_iterator_next_chunk,
+    frs_prefix_lookup_open, frs_vec_iter_prefix_close, frs_vec_iter_prefix_next,
+    frs_vec_iter_prefix_open, frs_vec_iter_prefix_open_batch,
+    frs_vec_iter_prefix_open_batch_parallel, frs_vec_merge_append_batch, frs_vectorized_batch_get,
+    frs_vectorized_batch_mixed, frs_vectorized_batch_put, FrsBytes, FrsCfHandle, FrsChunk, FrsDb,
+    FrsIterator, FRS_CHUNK_EOF, FRS_STATUS_OK,
 };
 use forst_rs_io::{FileSystem, LocalFileSystem};
 use forst_rs_storage::merge_operator::RawConcatMergeOperator;
@@ -99,6 +99,8 @@ const Q19_MERGE_KEYS: usize = 64;
 const Q19_CHAIN_LENGTHS: &[usize] = &[1, 4, 16];
 const COMPAT_PROXY_PREFIX_COUNTS: &[usize] = &[64, 256];
 const COMPAT_PROXY_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16, 32];
+const COMPAT_PROXY_NEXT_CHUNK_ROWS: usize = 64;
+const COMPAT_PROXY_NEXT_CHUNK_DATA_CAP: usize = 64 * 1024;
 const COMPAT_MULTIGET_BATCH_GROUP_THRESHOLD: usize = 64;
 
 // ---------------------------------------------------------------------------
@@ -1545,6 +1547,83 @@ fn drain_prefixes_compat_row_by_row_count(
         .sum()
 }
 
+struct CompatNextChunkBuffers {
+    key_offsets: Vec<i32>,
+    value_offsets: Vec<i32>,
+    key_data: Vec<u8>,
+    value_data: Vec<u8>,
+    value_validity: Vec<u8>,
+}
+
+impl CompatNextChunkBuffers {
+    fn new() -> Self {
+        Self {
+            key_offsets: vec![0_i32; COMPAT_PROXY_NEXT_CHUNK_ROWS + 1],
+            value_offsets: vec![0_i32; COMPAT_PROXY_NEXT_CHUNK_ROWS + 1],
+            key_data: vec![0_u8; COMPAT_PROXY_NEXT_CHUNK_DATA_CAP],
+            value_data: vec![0_u8; COMPAT_PROXY_NEXT_CHUNK_DATA_CAP],
+            value_validity: vec![0_u8; COMPAT_PROXY_NEXT_CHUNK_ROWS],
+        }
+    }
+}
+
+fn drain_prefix_compat_next_chunk_count(
+    d: &FfiDb,
+    prefix: &[u8],
+    buffers: &mut CompatNextChunkBuffers,
+) -> u64 {
+    let mut iter: FrsIterator = std::ptr::null_mut();
+    let rc =
+        unsafe { frs_prefix_lookup_open(d.db, d.cf, prefix.as_ptr(), prefix.len(), &mut iter) };
+    assert_eq!(rc, FRS_STATUS_OK, "frs_prefix_lookup_open failed: {rc}");
+
+    let mut rows = 0_u64;
+
+    loop {
+        let mut count = 0_u32;
+        let mut eof = false;
+        let rc = unsafe {
+            frs_iterator_next_chunk(
+                iter,
+                COMPAT_PROXY_NEXT_CHUNK_ROWS as u32,
+                buffers.key_offsets.as_mut_ptr(),
+                buffers.key_data.as_mut_ptr(),
+                buffers.key_data.len(),
+                buffers.value_offsets.as_mut_ptr(),
+                buffers.value_data.as_mut_ptr(),
+                buffers.value_data.len(),
+                buffers.value_validity.as_mut_ptr(),
+                &mut count,
+                &mut eof,
+            )
+        };
+        assert_eq!(rc, FRS_STATUS_OK, "frs_iterator_next_chunk failed: {rc}");
+        rows += count as u64;
+        std::hint::black_box((
+            &buffers.key_offsets,
+            &buffers.key_data,
+            &buffers.value_offsets,
+            &buffers.value_data,
+        ));
+        if eof {
+            break;
+        }
+        assert_ne!(count, 0, "next_chunk made no progress before eof");
+    }
+
+    let rc = unsafe { frs_iterator_close(iter) };
+    assert_eq!(rc, FRS_STATUS_OK, "frs_iterator_close failed: {rc}");
+    rows
+}
+
+fn drain_prefixes_compat_next_chunk_count(d: &FfiDb, prefixes: &[Vec<u8>]) -> u64 {
+    let mut buffers = CompatNextChunkBuffers::new();
+    prefixes
+        .iter()
+        .map(|prefix| drain_prefix_compat_next_chunk_count(d, prefix, &mut buffers))
+        .sum()
+}
+
 fn bench_compat_jni_prefix_proxy(c: &mut Criterion) {
     let mut group = c.benchmark_group("ffi_vectorized/compat_jni_prefix_proxy");
     group.sample_size(10);
@@ -1579,6 +1658,18 @@ fn bench_compat_jni_prefix_proxy(c: &mut Criterion) {
                 |b, _| {
                     b.iter(|| {
                         let rows = drain_prefixes_compat_row_by_row_count(&d, &prefixes, true);
+                        assert_eq!(rows, expected_rows);
+                        std::hint::black_box(rows);
+                    })
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new("compat_next_chunk_offsets", &label),
+                &expected_rows,
+                |b, _| {
+                    b.iter(|| {
+                        let rows = drain_prefixes_compat_next_chunk_count(&d, &prefixes);
                         assert_eq!(rows, expected_rows);
                         std::hint::black_box(rows);
                     })

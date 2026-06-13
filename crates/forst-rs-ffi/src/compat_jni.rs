@@ -78,7 +78,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::ThreadId;
 
 use jni::objects::{
-    GlobalRef, JByteArray, JClass, JObject, JObjectArray, JPrimitiveArray, JString,
+    GlobalRef, JByteArray, JByteBuffer, JClass, JObject, JObjectArray, JPrimitiveArray, JString,
 };
 use jni::sys::{
     jboolean, jbyte, jbyteArray, jint, jlong, jobjectArray, JNI_FALSE, JNI_TRUE, JNI_VERSION_1_8,
@@ -95,10 +95,10 @@ use crate::{
     frs_batch_get, frs_batch_put, frs_compact_all, frs_compact_cf, frs_create_checkpoint,
     frs_db_close, frs_db_create_cf, frs_db_create_cf_with_merge, frs_db_default_cf, frs_db_open,
     frs_db_open_cf, frs_db_open_from_checkpoint, frs_delete, frs_flush, frs_flush_cf, frs_get,
-    frs_iterator_close, frs_iterator_next, frs_iterator_open, frs_iterator_seek, frs_l0_file_count,
-    frs_lookup_kv, frs_merge, frs_prefix_lookup_close, frs_prefix_lookup_open, frs_put,
-    frs_sequence_number, FrsBytes, FrsCfHandle, FrsDb, FrsIterator, FRS_STATUS_NOT_FOUND,
-    FRS_STATUS_OK,
+    frs_iterator_close, frs_iterator_next, frs_iterator_next_chunk, frs_iterator_open,
+    frs_iterator_seek, frs_l0_file_count, frs_lookup_kv, frs_merge, frs_prefix_lookup_close,
+    frs_prefix_lookup_open, frs_put, frs_sequence_number, FrsBytes, FrsCfHandle, FrsDb,
+    FrsIterator, FRS_STATUS_NOT_FOUND, FRS_STATUS_OK,
 };
 
 static DB_PATH_REGISTRY: OnceLock<Mutex<HashMap<usize, String>>> = OnceLock::new();
@@ -883,6 +883,57 @@ fn read_string(env: &mut JNIEnv, s: &JString) -> Option<String> {
             None
         }
     }
+}
+
+struct DirectBufferArg {
+    ptr: *mut u8,
+    cap: usize,
+}
+
+fn direct_buffer_arg(
+    env: &mut JNIEnv,
+    buf: &JByteBuffer,
+    context: &str,
+    name: &str,
+    min_cap: usize,
+    align: usize,
+) -> Option<DirectBufferArg> {
+    let ptr = match env.get_direct_buffer_address(buf) {
+        Ok(ptr) => ptr,
+        Err(e) => {
+            throw_rocksdb(
+                env,
+                &format!("{context}: {name} must be a direct ByteBuffer: {e}"),
+            );
+            return None;
+        }
+    };
+    let cap = match env.get_direct_buffer_capacity(buf) {
+        Ok(cap) => cap,
+        Err(e) => {
+            throw_rocksdb(env, &format!("{context}: {name} capacity unavailable: {e}"));
+            return None;
+        }
+    };
+    if cap < min_cap {
+        throw_rocksdb(
+            env,
+            &format!("{context}: {name} capacity {cap} < required {min_cap}"),
+        );
+        return None;
+    }
+    if align > 1 && (ptr as usize) % align != 0 {
+        throw_rocksdb(
+            env,
+            &format!("{context}: {name} address is not {align}-byte aligned"),
+        );
+        return None;
+    }
+    Some(DirectBufferArg { ptr, cap })
+}
+
+fn pack_prefix_chunk_result(count: u32, eof: bool) -> jlong {
+    ((eof as jlong) << 32) | (count as jlong & 0xffff_ffff)
 }
 
 fn normalize_db_path_for_java(path: String) -> String {
@@ -3126,6 +3177,133 @@ pub extern "system" fn Java_org_forstdb_RocksDB_writeBatch<'local>(
     )
 }
 
+fn prefix_lookup_open_inner(
+    env: &mut JNIEnv,
+    handle: jlong,
+    cf_handle: jlong,
+    prefix: &JByteArray,
+    prefix_off: jint,
+    prefix_len: jint,
+    context: &str,
+) -> jlong {
+    // null prefix or len==0 -> full scan (matches FFI semantics).
+    let prefix_obj: &JObject = prefix.as_ref();
+    let is_empty = prefix_obj.is_null() || prefix_len == 0;
+    let mut iter: FrsIterator = ptr::null_mut();
+    let status = if is_empty {
+        // SAFETY: NULL prefix is allowed by frs_prefix_lookup_open.
+        unsafe {
+            frs_prefix_lookup_open(
+                handle as FrsDb,
+                cf_handle as FrsCfHandle,
+                ptr::null(),
+                0,
+                &mut iter,
+            )
+        }
+    } else {
+        let Some(p) = read_byte_slice(env, prefix, prefix_off, prefix_len) else {
+            return 0_i64;
+        };
+        // SAFETY: p is a stack-local Vec<u8>; engine copies bounds.
+        unsafe {
+            frs_prefix_lookup_open(
+                handle as FrsDb,
+                cf_handle as FrsCfHandle,
+                p.as_ptr(),
+                p.len(),
+                &mut iter,
+            )
+        }
+    };
+    if check_status(env, status, context) {
+        return 0_i64;
+    }
+    iter as jlong
+}
+
+fn prefix_lookup_close_inner(env: &mut JNIEnv, iter_handle: jlong, context: &str) {
+    // SAFETY: nullity handled inside frs_prefix_lookup_close.
+    let status = unsafe { frs_prefix_lookup_close(iter_handle as FrsIterator) };
+    check_status(env, status, context);
+}
+
+fn prefix_lookup_next_chunk_inner(
+    env: &mut JNIEnv,
+    iter_handle: jlong,
+    max_rows: jint,
+    key_offsets: &JByteBuffer,
+    key_data: &JByteBuffer,
+    value_offsets: &JByteBuffer,
+    value_data: &JByteBuffer,
+    value_validity: &JByteBuffer,
+    context: &str,
+) -> jlong {
+    if max_rows < 0 {
+        throw_rocksdb(env, &format!("{context}: negative maxRows"));
+        return -1;
+    }
+    let max_rows = max_rows as u32;
+    let rows = max_rows as usize;
+    let offsets_cap = match rows.checked_add(1).and_then(|n| n.checked_mul(4)) {
+        Some(cap) => cap,
+        None => {
+            throw_rocksdb(
+                env,
+                &format!("{context}: maxRows overflows offsets capacity"),
+            );
+            return -1;
+        }
+    };
+    let key_offsets =
+        match direct_buffer_arg(env, key_offsets, context, "keyOffsets", offsets_cap, 4) {
+            Some(buf) => buf,
+            None => return -1,
+        };
+    let value_offsets =
+        match direct_buffer_arg(env, value_offsets, context, "valueOffsets", offsets_cap, 4) {
+            Some(buf) => buf,
+            None => return -1,
+        };
+    let value_validity =
+        match direct_buffer_arg(env, value_validity, context, "valueValidity", rows, 1) {
+            Some(buf) => buf,
+            None => return -1,
+        };
+    let key_data = match direct_buffer_arg(env, key_data, context, "keyData", 0, 1) {
+        Some(buf) => buf,
+        None => return -1,
+    };
+    let value_data = match direct_buffer_arg(env, value_data, context, "valueData", 0, 1) {
+        Some(buf) => buf,
+        None => return -1,
+    };
+
+    let mut count = 0_u32;
+    let mut eof = false;
+    // SAFETY: all pointers come from direct ByteBuffers. offset/validity
+    // buffers were pre-checked for the sizes frs_iterator_next_chunk writes.
+    let status = unsafe {
+        frs_iterator_next_chunk(
+            iter_handle as FrsIterator,
+            max_rows,
+            key_offsets.ptr as *mut i32,
+            key_data.ptr,
+            key_data.cap,
+            value_offsets.ptr as *mut i32,
+            value_data.ptr,
+            value_data.cap,
+            value_validity.ptr,
+            &mut count,
+            &mut eof,
+        )
+    };
+    if check_status(env, status, context) {
+        return -1;
+    }
+    pack_prefix_chunk_result(count, eof)
+}
+
 /// `org.forstdb.RocksDB.prefixLookupOpen(long handle, long cfHandle,
 ///                                        byte[] prefix, int prefixOff,
 ///                                        int prefixLen) -> long iterHandle`
@@ -3148,40 +3326,15 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupOpen<'local>(
         &mut env,
         || 0_i64,
         |env| {
-            // null prefix or len==0 → full scan (matches FFI semantics).
-            let prefix_obj: &JObject = prefix.as_ref();
-            let is_empty = prefix_obj.is_null() || prefix_len == 0;
-            let mut iter: FrsIterator = ptr::null_mut();
-            let status = if is_empty {
-                // SAFETY: NULL prefix is allowed by frs_prefix_lookup_open.
-                unsafe {
-                    frs_prefix_lookup_open(
-                        handle as FrsDb,
-                        cf_handle as FrsCfHandle,
-                        ptr::null(),
-                        0,
-                        &mut iter,
-                    )
-                }
-            } else {
-                let Some(p) = read_byte_slice(env, &prefix, prefix_off, prefix_len) else {
-                    return 0_i64;
-                };
-                // SAFETY: p is a stack-local Vec<u8>; engine copies bounds.
-                unsafe {
-                    frs_prefix_lookup_open(
-                        handle as FrsDb,
-                        cf_handle as FrsCfHandle,
-                        p.as_ptr(),
-                        p.len(),
-                        &mut iter,
-                    )
-                }
-            };
-            if check_status(env, status, "RocksDB.prefixLookupOpen") {
-                return 0_i64;
-            }
-            iter as jlong
+            prefix_lookup_open_inner(
+                env,
+                handle,
+                cf_handle,
+                &prefix,
+                prefix_off,
+                prefix_len,
+                "RocksDB.prefixLookupOpen",
+            )
         },
     )
 }
@@ -3202,6 +3355,50 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupNext<'local>(
     Java_org_forstdb_RocksDB_iteratorNext(env, class, iter_handle)
 }
 
+/// `org.forstdb.RocksDB.prefixLookupNextChunk(long iterHandle, int maxRows,
+///                                            ByteBuffer keyOffsets,
+///                                            ByteBuffer keyData,
+///                                            ByteBuffer valueOffsets,
+///                                            ByteBuffer valueData,
+///                                            ByteBuffer valueValidity) -> long`
+///
+/// Java signature: `(JILjava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)J`
+///
+/// Direct-ByteBuffer wrapper over [`frs_iterator_next_chunk`]. Packed
+/// return layout is: low 32 bits = row count, high 32 bits = EOF flag
+/// (`0` or `1`). Throws `RocksDBException` for non-direct buffers,
+/// undersized offset/validity buffers, or a native status error.
+#[no_mangle]
+pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupNextChunk<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    iter_handle: jlong,
+    max_rows: jint,
+    key_offsets: JByteBuffer<'local>,
+    key_data: JByteBuffer<'local>,
+    value_offsets: JByteBuffer<'local>,
+    value_data: JByteBuffer<'local>,
+    value_validity: JByteBuffer<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || -1_i64,
+        |env| {
+            prefix_lookup_next_chunk_inner(
+                env,
+                iter_handle,
+                max_rows,
+                &key_offsets,
+                &key_data,
+                &value_offsets,
+                &value_data,
+                &value_validity,
+                "RocksDB.prefixLookupNextChunk",
+            )
+        },
+    )
+}
+
 /// `org.forstdb.RocksDB.prefixLookupClose(long iterHandle)`
 ///
 /// Java signature: `(J)V`
@@ -3216,10 +3413,116 @@ pub extern "system" fn Java_org_forstdb_RocksDB_prefixLookupClose<'local>(
     jni_guard(
         &mut env,
         || (),
+        |env| prefix_lookup_close_inner(env, iter_handle, "RocksDB.prefixLookupClose"),
+    )
+}
+
+/// `org.apache.flink.state.forst.ForStRsLibPrefixScanNative.isAvailable0() -> boolean`
+///
+/// Helper-class symbol for Flink's ForStBackend integration. This class
+/// lives in Flink, so it can be added without modifying the external
+/// `com.ververica:forstjni` `org.forstdb.RocksDB` class.
+#[no_mangle]
+pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_isAvailable0<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    jni_guard(&mut env, || JNI_FALSE, |_env| JNI_TRUE)
+}
+
+/// `ForStRsLibPrefixScanNative.prefixLookupOpen0(long dbHandle, long cfHandle,
+///                                                byte[] prefix, int off, int len) -> long`
+#[no_mangle]
+pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupOpen0<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    cf_handle: jlong,
+    prefix: JByteArray<'local>,
+    prefix_off: jint,
+    prefix_len: jint,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || 0_i64,
         |env| {
-            // SAFETY: nullity handled inside frs_prefix_lookup_close.
-            let status = unsafe { frs_prefix_lookup_close(iter_handle as FrsIterator) };
-            check_status(env, status, "RocksDB.prefixLookupClose");
+            prefix_lookup_open_inner(
+                env,
+                handle,
+                cf_handle,
+                &prefix,
+                prefix_off,
+                prefix_len,
+                "ForStRsLibPrefixScanNative.prefixLookupOpen0",
+            )
+        },
+    )
+}
+
+/// `ForStRsLibPrefixScanNative.prefixLookupNextChunk0(long iterHandle, int maxRows,
+///                                                     ByteBuffer keyOffsets,
+///                                                     ByteBuffer keyData,
+///                                                     ByteBuffer valueOffsets,
+///                                                     ByteBuffer valueData,
+///                                                     ByteBuffer valueValidity) -> long`
+///
+/// Packed return layout: low 32 bits = row count, high 32 bits = EOF
+/// flag (`0` or `1`).
+#[no_mangle]
+pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupNextChunk0<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    iter_handle: jlong,
+    max_rows: jint,
+    key_offsets: JByteBuffer<'local>,
+    key_data: JByteBuffer<'local>,
+    value_offsets: JByteBuffer<'local>,
+    value_data: JByteBuffer<'local>,
+    value_validity: JByteBuffer<'local>,
+) -> jlong {
+    jni_guard(
+        &mut env,
+        || -1_i64,
+        |env| {
+            prefix_lookup_next_chunk_inner(
+                env,
+                iter_handle,
+                max_rows,
+                &key_offsets,
+                &key_data,
+                &value_offsets,
+                &value_data,
+                &value_validity,
+                "ForStRsLibPrefixScanNative.prefixLookupNextChunk0",
+            )
+        },
+    )
+}
+
+/// `ForStRsLibPrefixScanNative.prefixLookupClose0(long iterHandle)`
+#[no_mangle]
+pub extern "system" fn Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupClose0<
+    'local,
+>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    iter_handle: jlong,
+) {
+    jni_guard(
+        &mut env,
+        || (),
+        |env| {
+            prefix_lookup_close_inner(
+                env,
+                iter_handle,
+                "ForStRsLibPrefixScanNative.prefixLookupClose0",
+            )
         },
     )
 }
@@ -10461,6 +10764,17 @@ mod tests {
     }
 
     #[test]
+    fn test_prefix_chunk_packed_result_layout() {
+        let packed = pack_prefix_chunk_result(0x89ab_cdef, true);
+        assert_eq!(packed as u32, 0x89ab_cdef);
+        assert_eq!(((packed as u64) >> 32) & 1, 1);
+
+        let packed = pack_prefix_chunk_result(7, false);
+        assert_eq!(packed as u32, 7);
+        assert_eq!(((packed as u64) >> 32) & 1, 0);
+    }
+
+    #[test]
     fn test_resolve_db_path_with_env_keeps_absolute_paths() {
         assert_eq!(
             resolve_db_path_with_env(
@@ -10589,7 +10903,15 @@ mod tests {
             "Java_org_forstdb_RocksDB_writeBatch",
             "Java_org_forstdb_RocksDB_prefixLookupOpen",
             "Java_org_forstdb_RocksDB_prefixLookupNext",
+            "Java_org_forstdb_RocksDB_prefixLookupNextChunk",
             "Java_org_forstdb_RocksDB_prefixLookupClose",
+            // Flink helper class symbols for prefix-scan chunking. These
+            // are intentionally outside org.forstdb.RocksDB because Flink's
+            // RocksDB class comes from the external forstjni jar.
+            "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupOpen0",
+            "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupNextChunk0",
+            "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_prefixLookupClose0",
+            "Java_org_apache_flink_state_forst_ForStRsLibPrefixScanNative_isAvailable0",
             "Java_org_forstdb_RocksDB_isClosed",
             "Java_org_forstdb_RocksDB_getColumnFamilyHandle",
             "Java_org_forstdb_RocksDB_remove",
