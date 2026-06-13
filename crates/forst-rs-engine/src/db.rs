@@ -1092,6 +1092,21 @@ pub struct DbImpl {
     /// and discarded 39). Read by the regression test that pins the
     /// short-circuit and by perf diagnostics.
     l0_point_get_block_reads: AtomicU64,
+    /// FRS-REMOTE-COMPACTION (paper pillar 6b, `2026-06-13-remote-compaction-design.md`):
+    /// the strategy for EXECUTING a picked compaction's merge. DEFAULT
+    /// [`crate::compaction_executor::LocalCompactionExecutor`] = in-process
+    /// `job.run()` (byte-identical to pre-feature behaviour). When
+    /// `FRS_REMOTE_COMPACTION=1` (or a test calls
+    /// [`Self::set_compaction_executor`]) this is a
+    /// [`crate::compaction_executor::RemoteEmulatedCompactionExecutor`] that
+    /// offloads the merge to a separate worker pool reading/writing through the
+    /// (remote, opendal-emulated) FS — the TM does ~0 compaction CPU/IO. The
+    /// PICK and the INSTALL (`version_set.apply`) are unchanged; only the byte
+    /// work moves. Swappable at runtime (a `Mutex` — compaction is heavy and
+    /// infrequent, so one lock per compaction to clone the `Arc` is negligible;
+    /// `arc_swap` does not support an unsized `Arc<dyn _>` payload) so tests can
+    /// A/B the same engine, mirroring the `set_trivial_move_override` pattern.
+    compaction_executor: Mutex<Arc<dyn crate::compaction_executor::CompactionMergeExecutor>>,
 }
 
 impl DbImpl {
@@ -1236,6 +1251,7 @@ impl DbImpl {
             wal_sealed: Mutex::new(Vec::new()),
             wal_flushed_floors: Mutex::new(HashMap::new()),
             l0_point_get_block_reads: AtomicU64::new(0),
+            compaction_executor: Mutex::new(default_compaction_executor_from_env()),
         });
 
         db.create_cf_with_id(DEFAULT_CF_ID, default_desc)?;
@@ -5199,6 +5215,44 @@ impl DbImpl {
         self.compact_range_for_cf(&cf_data)
     }
 
+    /// FRS-REMOTE-COMPACTION (pillar 6b): swap the compaction execution
+    /// strategy on a live engine. The PICK and INSTALL paths are unchanged;
+    /// only WHERE the merge runs changes. Used by the byte-identical falsifier
+    /// IT (run the same picked compaction Local vs Remote-emulated) and by the
+    /// offload mini-bench. Default at open is env-resolved
+    /// (`FRS_REMOTE_COMPACTION`), almost always [`crate::compaction_executor::
+    /// LocalCompactionExecutor`].
+    pub fn set_compaction_executor(
+        &self,
+        executor: Arc<dyn crate::compaction_executor::CompactionMergeExecutor>,
+    ) {
+        *self
+            .compaction_executor
+            .lock()
+            .expect("executor lock poisoned") = executor;
+    }
+
+    /// The kind of compaction executor currently in force (diagnostics / asserts).
+    pub fn compaction_executor_kind(
+        &self,
+    ) -> crate::compaction_executor::CompactionMergeExecutorKind {
+        self.compaction_executor
+            .lock()
+            .expect("executor lock poisoned")
+            .kind()
+    }
+
+    /// Snapshot of the current compaction executor (clone the `Arc` under the
+    /// lock, then release it so the heavy `execute` runs lock-free).
+    fn current_compaction_executor(
+        &self,
+    ) -> Arc<dyn crate::compaction_executor::CompactionMergeExecutor> {
+        self.compaction_executor
+            .lock()
+            .expect("executor lock poisoned")
+            .clone()
+    }
+
     /// Runs compaction for every column family. For each CF, this drains
     /// every L0 file and then keeps picking any level that exceeds its
     /// target size until the entire LSM is balanced. Useful in tests and
@@ -5835,7 +5889,9 @@ impl DbImpl {
             kv_gc: self.kv_gc_spec_for_compaction(cf_data),
         };
 
-        let Some(edit) = job.run()? else {
+        // FRS-REMOTE-COMPACTION (pillar 6b): execute through the configured
+        // executor (Local default / Remote-emulated offload). Install unchanged.
+        let Some(edit) = self.current_compaction_executor().execute(job)? else {
             return Ok(None);
         };
         // R44-H1 / R44-L2: apply may return `Busy` if a stale-edit slipped
@@ -6695,6 +6751,7 @@ impl DbImpl {
             wal_sealed: Mutex::new(Vec::new()),
             wal_flushed_floors: Mutex::new(HashMap::new()),
             l0_point_get_block_reads: AtomicU64::new(0),
+            compaction_executor: Mutex::new(default_compaction_executor_from_env()),
         });
         db.maybe_init_wal();
 
@@ -8691,7 +8748,13 @@ impl DbImpl {
         if compact_release_lock() {
             flush_guard = None;
         }
-        let Some(edit) = job.run()? else {
+        // FRS-REMOTE-COMPACTION (pillar 6b): execute the merge through the
+        // configured executor. DEFAULT = LocalCompactionExecutor (in-process
+        // `job.run()`, byte-identical). When the remote-emulated executor is
+        // installed the merge + its input/output I/O run on a separate pool
+        // (TM does ~0 compaction work); either way the returned VersionEdit is
+        // installed identically below.
+        let Some(edit) = self.current_compaction_executor().execute(job)? else {
             return Ok(None);
         };
         if flush_guard.is_none() {
@@ -14604,6 +14667,25 @@ pub fn trivial_move_enabled() -> bool {
             Some("1") | Some("true") | Some("TRUE")
         )
     })
+}
+
+/// FRS-REMOTE-COMPACTION (pillar 6b): the executor a freshly-opened engine
+/// uses. `FRS_REMOTE_COMPACTION=1` selects the locally-emulated offload path;
+/// every other value (the default) selects the in-process local executor —
+/// byte-identical to the pre-feature engine. Resolved at open per `DbImpl`
+/// (not a process-global `OnceLock`) so a test can hold one engine on local
+/// and another on remote-emulated without env races.
+fn default_compaction_executor_from_env(
+) -> Arc<dyn crate::compaction_executor::CompactionMergeExecutor> {
+    let remote = matches!(
+        std::env::var("FRS_REMOTE_COMPACTION").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    );
+    if remote {
+        Arc::new(crate::compaction_executor::RemoteEmulatedCompactionExecutor::new())
+    } else {
+        Arc::new(crate::compaction_executor::LocalCompactionExecutor)
+    }
 }
 
 /// FRS-WA-V3: strict mutual key-disjointness over a set of SST metas (the

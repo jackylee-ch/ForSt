@@ -975,7 +975,7 @@ impl Default for Version {
 // `Version::apply_edit`.
 
 /// Description of a version change (Flush/Compaction result).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VersionEdit {
     /// New SST files to add: (level, file_meta).
     pub new_files: Vec<(u32, SstFileMeta)>,

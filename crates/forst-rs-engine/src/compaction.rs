@@ -110,7 +110,7 @@ pub struct CompactionJob {
 
 /// FRS-WA-V2b: vlog-GC directive for one compaction (built by
 /// `DbImpl::kv_gc_spec_for`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KvGcSpec {
     /// Segment ids eligible for relocation (the oldest age-cutoff fraction
     /// of the CF's live segments). Empty = accounting only, no rewrites.

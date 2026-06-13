@@ -1101,6 +1101,7 @@ dependencies = [
  "forst-rs-ffi",
  "forst-rs-io",
  "forst-rs-storage",
+ "libc",
  "rocksdb",
  "tempfile",
  "testcontainers",

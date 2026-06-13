@@ -1044,7 +1044,7 @@ residue, swept this cycle:
 | 4 Restore/rescale = link not copy | DONE (Stage 3 instant restore + **rescale-by-clip C2U3**) |
 | 5 Local cache = LRU + History-Based admission, pluggable | DONE (admission + bg-exempt; background-fill C3U3; pluggable-trait CLOSED-as-satisfied) |
 | 6a Async execution (AEC) | DONE (Flink fork production path) |
-| 6b Remote compaction | **DEFERRED — Phase 3** (paper marks experimental; §5 Stage 6 stub) |
+| 6b Remote compaction | **DONE (functionally, local-emulated) — Cycle 3** (`CompactionMergeExecutor` trait Local/Remote-emulated, portable `CompactionJobDescriptor`, byte-identical falsifier; see `2026-06-13-remote-compaction-design.md`). True out-of-process transport + S3 E2E perf race stay Phase 3. |
 
 Recorded residue, swept — what (if anything) remains in-repo:
 
@@ -1301,6 +1301,69 @@ half-features, no cosmetic churn):
 - Cross-repo (Flink) items (Java zero-upload / download-skip branches, FFI
   `linked_*` wiring) are landed in the flink fork (kickoff: 5bab68ac4) and are
   out of this in-repo scope.
+
+### Cycle 3 unit 5 — remote / offloaded compaction (pillar 6b, landed 2026-06-13, C3U5)
+
+The LAST paper pillar. Full design + engine mechanism in
+`docs/superpowers/specs/2026-06-13-remote-compaction-design.md` (paper §5.3 +
+RocksDB `CompactionService` study). Flag-gated, default OFF
+(`FRS_REMOTE_COMPACTION=1` or `DbImpl::set_compaction_executor`):
+
+- **Seam:** a `CompactionMergeExecutor` trait at the one clean
+  `job.run()? → version_set.apply(&edit)` boundary in `compact_l0_for_cf` /
+  `compact_level_for_cf`. `LocalCompactionExecutor` (DEFAULT) = in-process
+  `job.run()`, byte-identical to before. `RemoteEmulatedCompactionExecutor`
+  offloads the merge to a dedicated `WorkerPool::new_background` reading
+  inputs / writing outputs through the job's own `Arc<dyn FileSystem>` (the
+  opendal/cached remote stack on the disagg mode) — the calling (TM) thread
+  blocks on the result channel; install is unchanged.
+- **Portable unit:** `CompactionJobDescriptor` (inputs by identity + output
+  file numbers + snapshot horizon + merge/filter by name + kv-gc spec), manual
+  little-endian encode/decode (no serde dep). The "describe → serialize →
+  reconstruct → execute" path is exercised in-process via
+  `FRS_REMOTE_COMPACTION_SERIALIZE=1` and a round-trip-identity UT.
+- **Composition (subsume or compose?):** remote compaction does NOT subsume V3
+  link-compaction — trivial-move short-circuits qualifying rollups to a
+  metadata-only edit BEFORE any job is built (never reaches the executor; TM 0,
+  remote 0), so V3 runs first and remote offloads only the residual real
+  merges. KV-sep vlog GC composes (the descriptor carries `KvGcSpec`).
+- **MVCC / failure:** same `min_active_snapshot` + `mvcc::should_drop`; worker
+  panic ⇒ `recv` Disconnected ⇒ hard error, version untouched, re-pick;
+  crash-between-execute-and-install leaves a consistent version + reapable
+  orphan (existing orphan-cleanup path); idempotent re-run = byte-identical.
+
+Falsifier gate green (`tests/remote_compaction_it.rs`, 4/4): byte-identical
+version state Local vs Remote (logical content EXACTLY equal + raw SST bytes
+identical modulo the per-write `creation_time` footer field); descriptor
+round-trip idempotent; crash-between consistent; correct end-to-end over the
+`memory://` opendal-fs emulation. Mini-bench
+(`remote_compaction_offload`, dev Mac, n≥3): caller(TM)-thread compaction CPU
+**Local 13.0 ms → Remote 0.1 ms (~180× cut)** at comparable wall (20.1 / 19.3 ms)
+— the paper §5.3 "TM does ~0 compaction work" property. Additive: `VersionEdit`
++ `KvGcSpec` gain `PartialEq, Eq`; engine lib 377/0, io 245/0, storage 453/0;
+clippy 0; fmt clean; local-primary defaults unchanged.
+
+**PMC self-review** (`docs/superpowers/specs/review-rounds/phase2-cycle3-u5-remote-compaction-pmc-review.md`,
+round 1): 11 findings — R1-H1 (trait-name collision with `flush.rs::CompactionExecutor`
+→ renamed `CompactionMergeExecutor`), R1-H2 (false byte-falsifier on `creation_time`
+→ logical-content + bytes-modulo-creation_time), R1-M1 (`ArcSwap` can't hold unsized
+`dyn` → `Mutex`) FIXED; R1-M2/M3 (panic→recv-Disconnected, MVCC horizon) VERIFIED
+SAFE; 3 LOW accepted+documented; 2 notes. Termination H=0 M=0 after 1 round.
+
+### Cycle-3-unit-5 FULL-paper-coverage update (recorded 2026-06-13)
+
+With pillar 6b functionally landed (local-emulated), **ALL SIX paper pillars
+are now functionally reproduced in-repo** (pillars 1–5 + AEC + remote
+compaction). The earlier "the only remaining paper capability is remote
+compaction, which the design scopes to Phase 3" statement is SUPERSEDED: the
+remote-compaction *functional mechanism* (executor + portable descriptor +
+byte-identical falsifier + offload bench) is now in-repo behind a default-OFF
+flag. What remains Phase 3 is strictly NON-functional / cross-boundary: a true
+out-of-process worker + RPC transport (the descriptor is the unit it carries;
+the serialize path is CI-exercised), and the real-S3 E2E *performance* race vs
+ForSt (co-located box; dev box is 10 MB/s). The §7 acceptance criterion (3) —
+the q0–q22 5M remote-primary correctness sweep — still needs the Java
+zero-upload branch + remote box (the Phase-2→3 handoff gate, unchanged).
 
 ---
 

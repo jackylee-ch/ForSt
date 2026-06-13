@@ -90,6 +90,7 @@ pub(crate) mod bg_pool;
 pub mod checkpoint;
 pub mod column_family;
 pub mod compaction;
+pub mod compaction_executor;
 pub mod compaction_filter;
 pub mod db;
 pub mod file_deletion_guard;

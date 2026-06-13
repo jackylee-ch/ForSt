@@ -35,6 +35,10 @@ forst-rs-engine = { workspace = true }
 forst-rs-ffi = { workspace = true }
 forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
+# remote_compaction_offload bench: per-thread CPU time (CLOCK_THREAD_CPUTIME_ID)
+# to show the calling (TM) thread does ~0 compaction work under the offload
+# executor. Build-only standard dep; no run-time service.
+libc = "0.2"
 # Optional RocksDB comparison baseline. Pulled in only when the
 # `rocksdb-baseline` feature is on (gates a long ~15 min build of the
 # bundled C++ rocksdb sources). Lives under `[dependencies]` rather
@@ -122,3 +126,10 @@ path = "src/bin/compaction_throughput.rs"
 [[bin]]
 name = "disagg_vs_forst"
 path = "src/bin/disagg_vs_forst.rs"
+
+# FRS-PHASE2 pillar 6b: TM-side CPU during a compaction with the Local vs
+# Remote-emulated CompactionMergeExecutor — the offload should show the
+# calling (TM) thread doing ~0 compaction CPU. Wall-clock loop; takes --smoke.
+[[bin]]
+name = "remote_compaction_offload"
+path = "src/bin/remote_compaction_offload.rs"
