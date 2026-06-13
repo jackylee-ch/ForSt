@@ -22,3 +22,4 @@ docs/superpowers/specs/*.log
 /org/
 docs/superpowers/specs/v5-bench-data/
 target-linux/
+target-linux-clean/

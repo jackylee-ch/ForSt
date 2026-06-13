@@ -399,6 +399,8 @@ impl CompactionJobDescriptor {
                 }
                 b.extend_from_slice(&spec.output_segment_id.0.to_le_bytes());
                 put_str(&mut b, &path_to_string(&spec.db_dir));
+                // FRS-WA-V2c: relocation output codec (self-describing records).
+                b.push(spec.vlog_compression as u8);
             }
         }
         b
@@ -459,10 +461,21 @@ impl CompactionJobDescriptor {
                 }
                 let output_segment_id = FileNumber(c.u64()?);
                 let db_dir = std::path::PathBuf::from(c.string()?);
+                let vlog_compression = match c.u8()? {
+                    0 => CompressionType::None,
+                    1 => CompressionType::Lz4,
+                    2 => CompressionType::Zstd,
+                    b => {
+                        return Err(ForstError::corruption(format!(
+                            "compaction descriptor: invalid vlog_compression byte {b}"
+                        )))
+                    }
+                };
                 Some(KvGcSpec {
                     relocate,
                     output_segment_id,
                     db_dir,
+                    vlog_compression,
                 })
             }
         };
@@ -641,6 +654,7 @@ mod tests {
                     relocate,
                     output_segment_id: FileNumber(99),
                     db_dir: std::path::PathBuf::from("/db"),
+                    vlog_compression: forst_rs_common::CompressionType::Lz4,
                 })
             } else {
                 None
