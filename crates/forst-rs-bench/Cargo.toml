@@ -114,3 +114,11 @@ harness = false
 [[bin]]
 name = "compaction_throughput"
 path = "src/bin/compaction_throughput.rs"
+
+# FRS-PHASE2 HEADLINE: forst-rs-disagg (measured link/instant) vs ForSt
+# (modeled upload/download at the recorded BOS bandwidth) on the three
+# disaggregation-critical operations — checkpoint/restore/bytes-to-remote.
+# Wall-clock loop (not criterion); takes --smoke for CI.
+[[bin]]
+name = "disagg_vs_forst"
+path = "src/bin/disagg_vs_forst.rs"
