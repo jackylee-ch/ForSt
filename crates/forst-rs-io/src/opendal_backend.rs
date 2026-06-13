@@ -1586,6 +1586,14 @@ impl FileSystem for OpendalFileSystem {
         // `op.info().scheme()` (which returns a `Scheme` enum, not `&str`).
         &self.name
     }
+
+    /// FRS-SCAN-OPEN-FANOUT: OpenDAL random-access files always take the remote
+    /// regime (`OpendalRandomAccessFile::is_local()==false`), so opens can pay a
+    /// round-trip — report NOT-local at the FS level so the scan open-fanout
+    /// engages.
+    fn is_local(&self) -> bool {
+        false
+    }
 }
 
 impl Drop for OpendalFileSystem {

@@ -752,6 +752,15 @@ impl FileSystem for CachedFileSystem {
         &self.name
     }
 
+    /// FRS-SCAN-OPEN-FANOUT: a caching FS wraps a remote backend, so an open
+    /// can pay a remote round-trip (footer + index) whenever the file is not
+    /// locally resident — report NOT-local so the scan open-fanout engages. The
+    /// per-reader warmth guard (the engine's `sst_readers` cache) already skips
+    /// already-open readers, so this never schedules work for warm scans.
+    fn is_local(&self) -> bool {
+        false
+    }
+
     fn ensure_cached(&self, path: &Path) -> ForstResult<()> {
         let key = self.cache_key(path)?;
         if self.cache.contains(key) {

@@ -219,12 +219,19 @@ impl RandomAccessFile for LatencyFile {
     }
 }
 
-/// Wraps an inner `FileSystem`, injecting per-file first-read latency + the
-/// remote regime on every opened random-access (SST) file. All other operations
-/// delegate unchanged.
+/// Wraps an inner `FileSystem`, injecting latency on TWO SEPARATE axes:
+/// - `open_rtt` on `open_random_access_file` (the OPEN — footer + sparse-index
+///   round-trip that catalog item #1 / `FRS_SCAN_OPEN_FANOUT` overlaps), and
+/// - `read_rtt` on the first `read_at` of each opened file (the cold first-block
+///   GET that `FRS_SCAN_COLD_PRIME` overlaps).
+///
+/// `is_local()==false` (per-file AND at the FS level) puts the engine in the
+/// remote regime so BOTH the open-fanout's local guard and the per-source
+/// cold-prime guard engage. All other operations delegate unchanged.
 struct LatencyFileSystem {
     inner: Arc<dyn FileSystem>,
-    rtt: Duration,
+    open_rtt: Duration,
+    read_rtt: Duration,
 }
 
 impl FileSystem for LatencyFileSystem {
@@ -232,11 +239,17 @@ impl FileSystem for LatencyFileSystem {
         self.inner.open_sequential_file(path)
     }
     fn open_random_access_file(&self, path: &Path) -> ForstResult<Box<dyn RandomAccessFile>> {
+        // The OPEN round-trip (footer + sparse-index fetch) — the latency term
+        // catalog item #1's open-fanout overlaps across the read-I/O pool.
+        std::thread::sleep(self.open_rtt);
         let inner = self.inner.open_random_access_file(path)?;
         Ok(Box::new(LatencyFile {
             inner,
-            rtt: self.rtt,
+            rtt: self.read_rtt,
         }))
+    }
+    fn is_local(&self) -> bool {
+        false
     }
     fn open_writable_file(
         &self,
@@ -274,8 +287,13 @@ impl FileSystem for LatencyFileSystem {
 /// Builds a CF whose probed prefix spans `k` overlapping L0 SSTs (one flushed
 /// wave per SST, every wave touching the same keyspace so none is prunable),
 /// returns the DB + the prefix. Each SST opens through the `LatencyFileSystem`,
-/// so the merge over them has `k` cold REMOTE sources.
-fn build_k_overlapping_ssts(k: usize, rtt: Duration) -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<u8>) {
+/// so the merge over them has `k` cold REMOTE sources that pay BOTH an open RTT
+/// (footer/index) and a first-read RTT (data block).
+fn build_k_overlapping_ssts(
+    k: usize,
+    open_rtt: Duration,
+    read_rtt: Duration,
+) -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<u8>) {
     let opts = EngineOptions {
         db_path: "/db".to_string(),
         // Large write buffer so each wave stays in ONE memtable ⇒ exactly one
@@ -285,10 +303,17 @@ fn build_k_overlapping_ssts(k: usize, rtt: Duration) -> (Arc<DbImpl>, ColumnFami
         ..EngineOptions::default()
     };
     let inner: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
-    let fs: Arc<dyn FileSystem> = Arc::new(LatencyFileSystem { inner, rtt });
+    // No injected latency during the LOAD (writes/flushes) — only the cold
+    // read-path opens/reads should pay RTT. We build with zero RTT then the scan
+    // re-opens cold through the latency FS below.
+    let fs: Arc<dyn FileSystem> = Arc::new(LatencyFileSystem {
+        inner,
+        open_rtt,
+        read_rtt,
+    });
     let db = DbImpl::open_with_fs(opts, fs).expect("open");
     let cf = db
-        .create_column_family(ColumnFamilyDescriptor::new("cold-prime-bench"))
+        .create_column_family(ColumnFamilyDescriptor::new("open-fanout-bench"))
         .expect("create cf");
     // Each wave writes the SAME 200 keys under the probed prefix ⇒ all k SSTs
     // overlap the prefix and every one is a merge source.
@@ -305,24 +330,113 @@ fn build_k_overlapping_ssts(k: usize, rtt: Duration) -> (Arc<DbImpl>, ColumnFami
     (db, cf, b"p:".to_vec())
 }
 
-/// Wall to the FIRST emitted row of a fresh cold prefix scan over the k SSTs,
-/// with the cold-prime gate set by `prime_on`. A fresh DB per call ⇒ the SST
-/// readers are re-opened cold (first `read_at` pays the modeled RTT).
-fn engine_first_row_wall(k: usize, rtt: Duration, prime_on: bool) -> Duration {
-    if prime_on {
-        std::env::set_var("FRS_SCAN_COLD_PRIME", "1");
-    } else {
-        std::env::remove_var("FRS_SCAN_COLD_PRIME");
+/// The three flag arms compared by the engine-driven cold-start bench.
+#[derive(Clone, Copy)]
+enum Arm {
+    /// Baseline: both flags OFF (serial opens, serial first-block GETs).
+    Off,
+    /// `FRS_SCAN_OPEN_FANOUT=1` only (concurrent reader OPENs).
+    OpenFanout,
+    /// `FRS_SCAN_COLD_PRIME=1` only (concurrent first DATA blocks; cycle-2).
+    ColdPrime,
+    /// Both flags ON (concurrent OPENs AND concurrent first DATA blocks).
+    OpenFanoutPlusColdPrime,
+}
+
+fn set_arm(arm: Arm) {
+    match arm {
+        Arm::Off => {
+            std::env::remove_var("FRS_SCAN_OPEN_FANOUT");
+            std::env::remove_var("FRS_SCAN_COLD_PRIME");
+        }
+        Arm::OpenFanout => {
+            std::env::set_var("FRS_SCAN_OPEN_FANOUT", "1");
+            std::env::remove_var("FRS_SCAN_COLD_PRIME");
+        }
+        Arm::ColdPrime => {
+            std::env::remove_var("FRS_SCAN_OPEN_FANOUT");
+            std::env::set_var("FRS_SCAN_COLD_PRIME", "1");
+        }
+        Arm::OpenFanoutPlusColdPrime => {
+            std::env::set_var("FRS_SCAN_OPEN_FANOUT", "1");
+            std::env::set_var("FRS_SCAN_COLD_PRIME", "1");
+        }
     }
-    let (db, cf, prefix) = build_k_overlapping_ssts(k, rtt);
-    // One row from the scan = the cold-start cost (every source's first block
-    // seeded). `prefix_scan` collects all rows; we time the WHOLE drain but the
-    // cold-start (k first-block GETs) dominates the modeled wall at these RTTs.
+}
+
+/// Wall of a fresh cold prefix-scan drain over the k SSTs under the given flag
+/// arm. A fresh DB per call ⇒ the SST readers are re-opened cold (each open
+/// pays `open_rtt`, each first read pays `read_rtt`).
+fn engine_scan_wall(k: usize, open_rtt: Duration, read_rtt: Duration, arm: Arm) -> Duration {
+    set_arm(arm);
+    let (db, cf, prefix) = build_k_overlapping_ssts(k, open_rtt, read_rtt);
+    // The flush that built each SST OPENED its reader (warming the reader
+    // cache); the decoded-block cache, by contrast, is only filled on READ so it
+    // is already cold. Evict the reader cache so the timed scan re-opens every
+    // SST COLD (each open pays `open_rtt`) — the reader-cache-cold state the
+    // open-fanout targets (fresh instance / restore / reader LRU pressure).
+    db.evict_all_sst_readers();
     let t0 = Instant::now();
     let rows = db.prefix_scan(&cf, &prefix).expect("scan");
     let elapsed = t0.elapsed();
     assert!(!rows.is_empty(), "scan must yield rows (k={k})");
     elapsed
+}
+
+/// FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3) engine-driven gate: real `DbImpl`
+/// prefix scan over K overlapping cold REMOTE SSTs behind a `LatencyFileSystem`
+/// that injects RTT on OPEN (footer/index) SEPARATELY from first read (data
+/// block). Compares wall OFF vs open-fanout vs open-fanout+cold-prime at
+/// K=4/8/16 — the contention-robust modeled-RTT measurement (the OFF arm's
+/// serial K×open-RTT + K×read-RTT dominates host CPU noise).
+fn run_open_fanout_arm(smoke: bool, open_rtt: Duration, read_rtt: Duration) {
+    let fanouts: &[usize] = if smoke { &[4, 8] } else { &[4, 8, 16] };
+    let reps = if smoke { 1 } else { 3 };
+    println!(
+        "\n== OPEN-FANOUT engine arm (real DbImpl prefix scan over K cold REMOTE SSTs) ==\n\
+         LatencyFileSystem: open RTT = {:.1} ms (footer/index), read RTT = {:.1} ms (data block)\n\
+         wall = full cold prefix-scan drain\n",
+        ms(open_rtt),
+        ms(read_rtt)
+    );
+    println!(
+        "{:>7} | {:>12} | {:>16} | {:>22} | {:>10} | {:>10}",
+        "K", "OFF (ms)", "open-fanout (ms)", "open-fanout+prime (ms)", "OF speedup", "OF+P spdup"
+    );
+    println!("{}", "-".repeat(92));
+    let median = |mut xs: Vec<f64>| {
+        xs.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        xs[xs.len() / 2]
+    };
+    for &k in fanouts {
+        let mut off = Vec::new();
+        let mut of = Vec::new();
+        let mut ofp = Vec::new();
+        for _ in 0..reps {
+            off.push(ms(engine_scan_wall(k, open_rtt, read_rtt, Arm::Off)));
+            of.push(ms(engine_scan_wall(k, open_rtt, read_rtt, Arm::OpenFanout)));
+            ofp.push(ms(engine_scan_wall(
+                k,
+                open_rtt,
+                read_rtt,
+                Arm::OpenFanoutPlusColdPrime,
+            )));
+        }
+        let o = median(off);
+        let f = median(of);
+        let p = median(ofp);
+        println!(
+            "{:>7} | {:>12.1} | {:>16.1} | {:>22.1} | {:>9.2}x | {:>9.2}x",
+            k,
+            o,
+            f,
+            p,
+            o / f.max(f64::MIN_POSITIVE),
+            o / p.max(f64::MIN_POSITIVE),
+        );
+    }
+    std::env::remove_var("FRS_SCAN_OPEN_FANOUT");
+    std::env::remove_var("FRS_SCAN_COLD_PRIME");
 }
 
 fn run_engine_arm(smoke: bool, rtt: Duration) {
@@ -347,8 +461,10 @@ fn run_engine_arm(smoke: bool, rtt: Duration) {
         let mut off = Vec::new();
         let mut on = Vec::new();
         for _ in 0..reps {
-            off.push(ms(engine_first_row_wall(k, rtt, false)));
-            on.push(ms(engine_first_row_wall(k, rtt, true)));
+            // Cold-prime (cycle-2) models the data-block read RTT only (no open
+            // RTT), preserving the original arm's measurement.
+            off.push(ms(engine_scan_wall(k, Duration::ZERO, rtt, Arm::Off)));
+            on.push(ms(engine_scan_wall(k, Duration::ZERO, rtt, Arm::ColdPrime)));
         }
         let o = median(off);
         let n = median(on);
@@ -420,6 +536,13 @@ fn main() {
         capped.max(Duration::from_millis(2))
     };
     run_engine_arm(smoke, engine_rtt);
+
+    // FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3): the catalog-#1 gate — OFF vs
+    // open-fanout vs open-fanout+cold-prime over K cold remote SSTs, injecting
+    // RTT on OPEN separately from first READ. The OPEN RTT models the footer +
+    // sparse-index round-trip; use the same capped engine RTT for both axes so
+    // the OFF arm pays K×(open+read) serially.
+    run_open_fanout_arm(smoke, engine_rtt, engine_rtt);
 
     println!(
         "\nReading: the speedup is the cold-start latency removed from every fresh \n\

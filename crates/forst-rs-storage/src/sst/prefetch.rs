@@ -287,6 +287,55 @@ fn read_io_pool() -> &'static ReadIoPool {
     })
 }
 
+/// FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3, catalog item #1): submit `jobs` to
+/// the shared read-I/O pool concurrently and BLOCK until all of them complete
+/// (a barrier). This is the OPEN-side analogue of [`BlockPrefetcher`]'s
+/// per-window submit: the scan merge-build site uses it to fan the K cold
+/// remote SST-reader OPENs (footer + sparse-index fetch) across the pool
+/// instead of opening them one at a time, so the K open round-trips overlap
+/// (bounded by the pool width) before the per-source open loop consumes the
+/// now-cached readers. Mirrors ForSt's `prefetch_concurrent`
+/// (`MAX_CONCURRENT_FETCH=8`, cached_fs.rs) but reuses the existing read-I/O
+/// pool rather than spawning a fresh `thread::scope` wave.
+///
+/// Each job runs on a pool worker (panic-contained — a panicking open does not
+/// strand the barrier: the wrapper's `Signal` guard fires during the unwind, so
+/// the counter still advances). Empty input is a no-op (zero pool jobs — the
+/// "nothing to fan out" fast path).
+pub fn prime_opens_concurrent(jobs: Vec<Box<dyn FnOnce() + Send + 'static>>) {
+    if jobs.is_empty() {
+        return;
+    }
+    let total = jobs.len();
+    // Shared completion counter + condvar — the barrier the caller waits on.
+    let done: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
+    let pool = read_io_pool();
+    for job in jobs {
+        let d = Arc::clone(&done);
+        pool.submit(Box::new(move || {
+            // Whether the open returns or panics, the `Signal` guard's Drop
+            // increments the barrier counter so the wait below can never strand
+            // (the worker's `catch_unwind` contains the panic; this guard fires
+            // during the unwind before the worker re-arms for the next job).
+            struct Signal(Arc<(Mutex<usize>, Condvar)>);
+            impl Drop for Signal {
+                fn drop(&mut self) {
+                    let (m, cv) = &*self.0;
+                    *m.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                    cv.notify_all();
+                }
+            }
+            let _signal = Signal(d);
+            job();
+        }));
+    }
+    let (m, cv) = &*done;
+    let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
+    while *g < total {
+        g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+    }
+}
+
 /// L4 (2026-06-12 compaction windowed-readpath design §2.1): what
 /// [`fetch_window`] does with blocks it had to READ (cache misses).
 /// The cache-first check (window splitting around hits) is unconditional —
@@ -1755,5 +1804,55 @@ mod tests {
         assert!(pf.next_decoded().unwrap().is_some());
         pf.terminate();
         assert!(pf.next_decoded().unwrap().is_none());
+    }
+
+    /// FRS-SCAN-OPEN-FANOUT: `prime_opens_concurrent` runs EVERY submitted job
+    /// and the barrier waits for all of them (more jobs than pool workers ⇒ the
+    /// barrier still completes; all run exactly once).
+    #[test]
+    fn prime_opens_concurrent_runs_all_and_barriers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        // More jobs than the pool width (clamp(cores/2,2,6) ≤ 6) to prove the
+        // barrier handles a fanout wider than the pool.
+        let n = 20usize;
+        let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let c = Arc::clone(&counter);
+            jobs.push(Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        prime_opens_concurrent(jobs);
+        // Barrier returned ⇒ every job has completed exactly once.
+        assert_eq!(counter.load(Ordering::SeqCst), n);
+    }
+
+    /// FRS-SCAN-OPEN-FANOUT: an empty job list is a no-op (zero pool work) and
+    /// returns immediately — the "nothing to fan out" fast path.
+    #[test]
+    fn prime_opens_concurrent_empty_is_noop() {
+        let jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
+        prime_opens_concurrent(jobs); // must return without blocking
+    }
+
+    /// FRS-SCAN-OPEN-FANOUT: a PANICKING job does not strand the barrier — the
+    /// `Signal` guard fires during the unwind, so a sibling job's completion is
+    /// still observed and the barrier returns (no hang).
+    #[test]
+    fn prime_opens_concurrent_panicking_job_does_not_strand_barrier() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&counter);
+        let jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = vec![
+            Box::new(|| panic!("deliberate open-fanout test panic")),
+            Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            }),
+        ];
+        // Must NOT hang: both job slots signal completion (the panicking one via
+        // the guard's unwind drop).
+        prime_opens_concurrent(jobs);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }

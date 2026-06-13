@@ -192,6 +192,63 @@ fn cold_prime_enabled() -> bool {
     )
 }
 
+/// FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3, catalog item #1): gate for the
+/// concurrent SST-reader OPEN fan-out at the scan merge-build site. Default-OFF:
+/// when unset the overlapping SST readers are opened one at a time inside the
+/// Tier-3 loop (`get_or_open_sst_reader` per source — K serial footer+index
+/// round-trips on cold remote state). When `FRS_SCAN_OPEN_FANOUT=1`, the K cold
+/// remote reader-OPENs are submitted to the read-I/O pool concurrently with a
+/// barrier BEFORE the per-source loop consumes them, so the K open round-trips
+/// overlap (bounded by the pool width) instead of running serially.
+///
+/// Composes independently with `FRS_SCAN_COLD_PRIME`: open-fanout parallelizes
+/// reader CONSTRUCTION (footer/index); cold-prime then parallelizes the first
+/// DATA block of the now-open readers. Both flag-gated separately; both ON =
+/// reader opens AND first blocks fan out.
+///
+/// Timing-only and byte-identical when OFF or ON: the fanout merely warms the
+/// `sst_readers` cache earlier; the Tier-3 loop then hits the cache and builds
+/// the exact same sources in the exact same order. Read LIVE (not
+/// `OnceLock`-cached) so the regression tests can toggle it per-case; the check
+/// runs once per scan build (one `env::var` lookup), off the hot path.
+fn open_fanout_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(forced) = OPEN_FANOUT_FORCE.with(|c| c.get()) {
+            return forced;
+        }
+    }
+    matches!(
+        std::env::var("FRS_SCAN_OPEN_FANOUT").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+// FRS-SCAN-OPEN-FANOUT test override: forces the gate decision on the CURRENT
+// THREAD (the scan build runs synchronously on the test thread), bypassing the
+// process-global env var so the regression tests toggle OFF-vs-ON without an
+// env race against the parallel suite. `None` => the live env gate. Set/cleared
+// by `with_open_fanout_forced`.
+#[cfg(test)]
+thread_local! {
+    static OPEN_FANOUT_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// FRS-SCAN-OPEN-FANOUT test helper: run `f` with the open-fanout gate forced to
+/// `on` on this thread, restoring the prior force on return (RAII-safe even if
+/// `f` panics).
+#[cfg(test)]
+fn with_open_fanout_forced<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OPEN_FANOUT_FORCE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(OPEN_FANOUT_FORCE.with(|c| c.replace(Some(on))));
+    f()
+}
+
 /// FRS-GARBAGE-DRAIN (2026-06-10): tombstone entries flushed to L0 since the
 /// last forced deep (L1→L2) drain. The 2026-06-10 q9 discriminator showed the
 /// engine dir growing 2.4→28GB while live state plateaued — size-budget
@@ -9843,6 +9900,20 @@ impl DbImpl {
                 .filter(|s| l0.contains(&s.file_number))
                 .count() as u64;
         }
+        // FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3): fan the K cold remote reader-
+        // OPENs (footer + index) across the read-I/O pool concurrently BEFORE
+        // the per-source loop below opens them serially. Pass only the SSTs the
+        // loop will actually open (not resident-shadowed — those are served from
+        // RAM and never opened). No-op when OFF / local / warm / ≤1 cold.
+        let mut open_fanout_submitted = 0u32;
+        if open_fanout_enabled() {
+            let to_open: Vec<&forst_rs_storage::version::SstFileMeta> = overlapping_ssts
+                .iter()
+                .copied()
+                .filter(|s| !resident_shadowed.contains(&s.file_number))
+                .collect();
+            open_fanout_submitted = self.prime_cold_reader_opens_concurrent(&to_open);
+        }
         for sst in overlapping_ssts {
             // FRS-RESIDENT-FLUSHED: skip SSTs whose data is currently served
             // from Tier 2 by a resident memtable (same content, same seqs).
@@ -9994,7 +10065,9 @@ impl DbImpl {
         // value-carrying FFI) flows through `next` / `next_with_value`, and a
         // clipped-out head is dropped there. `None` (every non-clipped CF) =
         // byte-identical.
-        LazyPrefixIter::new_clipped(sources, pinned, cf_data.clip_range())
+        let mut iter = LazyPrefixIter::new_clipped(sources, pinned, cf_data.clip_range())?;
+        iter.open_fanout_submitted = open_fanout_submitted;
+        Ok(iter)
     }
 
     /// B-R7-NEW-H1: range counterpart of [`Self::build_lazy_prefix_key_stream`].
@@ -10084,6 +10157,12 @@ impl DbImpl {
         // byte ranges interleave in the shared level arrays.
         let mut overlapping_ssts: Vec<&forst_rs_storage::version::SstFileMeta> = Vec::new();
         version.overlapping_ssts_in_range_for_cf(cf.id(), lower, upper, &mut overlapping_ssts);
+        // FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3): concurrent reader-OPEN fanout
+        // before the serial per-source loop (range sister of the prefix site).
+        // No-op when OFF / local / warm / ≤1 cold.
+        if open_fanout_enabled() {
+            let _ = self.prime_cold_reader_opens_concurrent(&overlapping_ssts);
+        }
         for sst in overlapping_ssts {
             let reader = self.get_or_open_sst_reader(sst)?;
             // FRS-PREFIX-SEEK: seek to the first index block >= lower (see sister
@@ -12684,6 +12763,91 @@ impl DbImpl {
             ForstError::corruption("BlobRef row carries malformed value-pointer bytes")
         })?;
         self.get_or_open_vlog_reader(ptr.segment_id)?.get(&ptr)
+    }
+
+    /// FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3, catalog item #1): before the
+    /// Tier-3 SST loop opens its readers ONE AT A TIME (each
+    /// `get_or_open_sst_reader` a synchronous footer+sparse-index read — a
+    /// remote round-trip on cold disaggregated state), submit the K COLD remote
+    /// reader-OPENs to the read-I/O pool concurrently and barrier on them, so the
+    /// K open round-trips overlap (bounded by the pool width) instead of running
+    /// serially. The subsequent per-source loop then finds every reader already
+    /// in the `sst_readers` cache and returns it without I/O.
+    ///
+    /// Byte-identical timing-only: this warms the SAME readers the loop would
+    /// have opened, in the same cache; the loop's source construction, order,
+    /// and emitted bytes are unchanged whether the fanout ran or not. `get_or_
+    /// open_sst_reader` is idempotent (double-checked RCU insert), so a race
+    /// between a fanout job and the loop simply drops the loser's reader.
+    ///
+    /// No-op guards (each cheaply checked BEFORE scheduling any pool work — the
+    /// "zero pool jobs when warm/local" gate):
+    /// - flag-OFF (`FRS_SCAN_OPEN_FANOUT` unset) ⇒ return, the loop opens
+    ///   serially exactly as before;
+    /// - local regime (`self.fs.is_local()`) ⇒ opens are µs-class preads with no
+    ///   round-trip to overlap, skip;
+    /// - no `self_weak` (can't form the `'static` job) ⇒ skip (correctness-safe
+    ///   fallback to serial opens);
+    /// - every overlapping reader already cached, or ≤ 1 cold ⇒ nothing to
+    ///   overlap, skip (a fully-warm or single-cold scan submits ZERO jobs).
+    ///
+    /// Errors are intentionally swallowed here: a failed concurrent open is NOT
+    /// surfaced — the Tier-3 loop re-runs `get_or_open_sst_reader` for that meta
+    /// and surfaces the error there exactly as it would have without the fanout.
+    /// This keeps the fanout a pure timing optimization with identical error
+    /// semantics.
+    fn prime_cold_reader_opens_concurrent(&self, metas: &[&SstFileMeta]) -> u32 {
+        if !open_fanout_enabled() {
+            return 0;
+        }
+        // Local regime: opening is a µs-class pread, no RTT to overlap.
+        if self.fs.is_local() {
+            return 0;
+        }
+        // Need an Arc<Self> to form `'static + Send` pool jobs.
+        let Some(weak) = self.self_weak.get().cloned() else {
+            return 0;
+        };
+        // Filter to COLD opens only (not already cached) — warm readers cost no
+        // I/O, so fanning them out would schedule pointless pool jobs.
+        let cache = self.sst_readers.load();
+        let cold: Vec<SstFileMeta> = metas
+            .iter()
+            .filter(|m| cache.get(&m.file_number).is_none())
+            .map(|m| (*m).clone())
+            .collect();
+        drop(cache);
+        // ≤ 1 cold open ⇒ nothing to overlap (a single round-trip is the floor;
+        // the loop pays it anyway). Skip so K=1 submits zero jobs.
+        if cold.len() <= 1 {
+            return 0;
+        }
+        let n = cold.len() as u32;
+        let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::with_capacity(cold.len());
+        for meta in cold {
+            let weak = weak.clone();
+            jobs.push(Box::new(move || {
+                if let Some(db) = weak.upgrade() {
+                    // Warm the reader cache; ignore errors (the Tier-3 loop
+                    // re-opens this meta and surfaces any error there).
+                    let _ = db.get_or_open_sst_reader(&meta);
+                }
+            }));
+        }
+        forst_rs_storage::sst::prime_opens_concurrent(jobs);
+        n
+    }
+
+    /// FRS-SCAN-OPEN-FANOUT bench/diag hook: drop ALL cached SST readers so the
+    /// next scan re-opens them COLD (each `get_or_open_sst_reader` pays a fresh
+    /// footer + sparse-index read — a remote round-trip on a disaggregated
+    /// backend). Models a reader-cache-cold state (fresh instance / restore /
+    /// reader LRU pressure) without reopening the DB. Correctness-neutral: an
+    /// SST is immutable once version-visible, so a re-opened reader is identical;
+    /// concurrent opens double-check via the RCU insert. Intended for the
+    /// cold-start micro-bench (`scan_cold_start`) — production never needs it.
+    pub fn evict_all_sst_readers(&self) {
+        self.sst_readers.store(std::sync::Arc::new(HashMap::new()));
     }
 
     fn get_or_open_sst_reader(&self, meta: &SstFileMeta) -> ForstResult<Arc<SstReaderImpl>> {
@@ -15610,6 +15774,13 @@ pub struct LazyPrefixIter {
     /// the prime has not run yet — the "zero pool jobs when warm" gate reads
     /// this.
     cold_primed_sources: u32,
+    /// FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3): number of cold remote SST reader-
+    /// OPENs the build-site fanout submitted concurrently for THIS iterator (0
+    /// when the flag is OFF, the regime is local, ≤1 cold, or every reader was
+    /// already cached). Per-iterator (not a global) so the regression gate is
+    /// race-free under the parallel suite. The "zero pool jobs when warm/local"
+    /// gate reads this.
+    open_fanout_submitted: u32,
     /// FRS-SCAN-COLD-PRIME test override: forces the prime gate decision per
     /// iterator instead of the process-global `FRS_SCAN_COLD_PRIME` env var, so
     /// the regression tests toggle OFF-vs-ON without an env race against the
@@ -15833,6 +16004,7 @@ impl LazyPrefixIter {
             clip,
             cold_prime_done: false,
             cold_primed_sources: 0,
+            open_fanout_submitted: 0,
             #[cfg(test)]
             cold_prime_force: None,
         })
@@ -15906,6 +16078,15 @@ impl LazyPrefixIter {
     #[cfg(test)]
     pub(crate) fn set_cold_prime_force(&mut self, on: bool) {
         self.cold_prime_force = Some(on);
+    }
+
+    /// FRS-SCAN-OPEN-FANOUT test/diag hook: cold remote reader-OPENs the build
+    /// site fanned out concurrently for this iterator (0 when OFF / local / warm
+    /// / ≤1 cold). Captured at build time, so it is valid immediately after the
+    /// stream is constructed (no first-step required, unlike `cold_primed_sources`).
+    #[cfg(test)]
+    pub(crate) fn open_fanout_submitted(&self) -> u32 {
+        self.open_fanout_submitted
     }
 
     /// W3 diag counters: `(rows_emitted, merge_comparisons, mat_allocs)`.
@@ -27238,6 +27419,450 @@ mod tests {
             assert!(
                 std::time::Instant::now() < deadline,
                 "cold-prime leaked buffered bytes: before={before} now={now}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    // =======================================================================
+    // FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3, catalog item #1) — engine
+    // regression gates (concurrent SST-reader OPEN fan-out at scan build).
+    // =======================================================================
+
+    /// A `RandomAccessFile` reporting `is_local() == false` so the per-source
+    /// `BlockPrefetcher` takes the REMOTE regime (and cold-prime's `wants_priming`
+    /// returns true). Pure delegation; no latency (correctness gate).
+    struct RemoteFakeFile {
+        inner: Box<dyn forst_rs_io::RandomAccessFile>,
+    }
+    impl forst_rs_io::RandomAccessFile for RemoteFakeFile {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
+            self.inner.read_at(offset, buf)
+        }
+        fn file_size(&self) -> ForstResult<u64> {
+            self.inner.file_size()
+        }
+        fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    /// A `FileSystem` wrapping [`MemoryFileSystem`] that reports `is_local() ==
+    /// false` (FS level AND per opened file) so the engine takes the REMOTE
+    /// regime — both the open-fanout's local guard AND the cold-prime per-source
+    /// guard then engage (a local FS would no-op both). Pure delegation; no
+    /// latency injection (correctness gate, not timing).
+    struct RemoteFakeFs {
+        inner: MemoryFileSystem,
+    }
+    impl RemoteFakeFs {
+        fn new() -> Self {
+            Self {
+                inner: MemoryFileSystem::new(),
+            }
+        }
+    }
+    impl FileSystem for RemoteFakeFs {
+        fn open_sequential_file(
+            &self,
+            path: &Path,
+        ) -> ForstResult<Box<dyn forst_rs_io::SequentialFile>> {
+            self.inner.open_sequential_file(path)
+        }
+        fn open_random_access_file(
+            &self,
+            path: &Path,
+        ) -> ForstResult<Box<dyn forst_rs_io::RandomAccessFile>> {
+            let inner = self.inner.open_random_access_file(path)?;
+            Ok(Box::new(RemoteFakeFile { inner }))
+        }
+        fn open_writable_file(
+            &self,
+            path: &Path,
+            mode: WriteMode,
+        ) -> ForstResult<Box<dyn forst_rs_io::WritableFile>> {
+            self.inner.open_writable_file(path, mode)
+        }
+        fn file_exists(&self, path: &Path) -> ForstResult<bool> {
+            self.inner.file_exists(path)
+        }
+        fn get_file_metadata(&self, path: &Path) -> ForstResult<forst_rs_io::FileMetadata> {
+            self.inner.get_file_metadata(path)
+        }
+        fn list_dir(&self, dir: &Path) -> ForstResult<Vec<forst_rs_io::FileMetadata>> {
+            self.inner.list_dir(dir)
+        }
+        fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+            self.inner.create_dir_all(dir)
+        }
+        fn delete_file(&self, path: &Path) -> ForstResult<()> {
+            self.inner.delete_file(path)
+        }
+        fn delete_dir(&self, path: &Path, recursive: bool) -> ForstResult<()> {
+            self.inner.delete_dir(path, recursive)
+        }
+        fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+            self.inner.rename(src, dst)
+        }
+        fn name(&self) -> &str {
+            "RemoteFakeFs(open-fanout test)"
+        }
+        fn is_local(&self) -> bool {
+            false // force the remote regime so the open-fanout engages
+        }
+    }
+
+    /// Builds the same multi-tier shape as [`s2_multi_tier_fixture`] (overlapping
+    /// L1 + L0 SSTs + memtable, with merges/deletes/dups) on a REMOTE-reporting
+    /// FS so a scan over it has K > 1 cold SST sources and the open-fanout fires.
+    fn open_fanout_remote_fixture(kvsep: bool) -> (Arc<DbImpl>, ColumnFamilyHandle) {
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            write_buffer_size: 2_000_000_000,
+            max_write_buffer_number: 8,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(RemoteFakeFs::new());
+        let db = DbImpl::open_with_fs(opts, fs).expect("open remote-fake");
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("open-fanout-fixture")
+                    .with_merge_operator(Arc::new(ListAppendMergeOperator::with_comma())),
+            )
+            .unwrap();
+        // Larger values when kvsep so the value-log deref path is exercised.
+        let val = |tag: &str, i: u32| {
+            if kvsep {
+                format!("{tag}-{i}-{}", "v".repeat(2048)).into_bytes()
+            } else {
+                format!("{tag}-{i}").into_bytes()
+            }
+        };
+        let key = |b: u32, i: u32| format!("p:{b:02}:{i:04}").into_bytes();
+        // Three flushed waves spanning the same prefixes ⇒ overlapping L0 SSTs.
+        for wave in 0..3u32 {
+            for b in 0..4u32 {
+                for i in 0..40u32 {
+                    let k = key(b, i);
+                    match (i + wave) % 5 {
+                        0 => {
+                            db.merge(&cf, &k, val("m", i).as_slice()).unwrap();
+                        }
+                        1 => {
+                            db.delete(&cf, &k).unwrap();
+                        }
+                        _ => {
+                            db.put(&cf, &k, val("w", i).as_slice()).unwrap();
+                        }
+                    }
+                }
+            }
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        // Memtable rows on top (dups + fresh keys).
+        for b in 0..4u32 {
+            for i in (0..48u32).step_by(3) {
+                let k = key(b, i);
+                if i % 9 == 0 {
+                    db.delete(&cf, &k).unwrap();
+                } else {
+                    db.put(&cf, &k, val("mem", i).as_slice()).unwrap();
+                }
+            }
+        }
+        (db, cf)
+    }
+
+    /// Drains one prefix through `fill_into` with the open-fanout gate forced
+    /// ON/OFF (thread-local, no env race) AFTER evicting the reader cache so the
+    /// fanout sees COLD sources. Returns the emitted rows + the number of reader
+    /// OPENs the fanout actually submitted.
+    fn open_fanout_drain_prefix(
+        db: &Arc<DbImpl>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+        pinned: bool,
+        fanout_on: bool,
+    ) -> (Vec<(Vec<u8>, Vec<u8>)>, u32) {
+        db.evict_all_sst_readers();
+        with_open_fanout_forced(fanout_on, || {
+            let mut stream = db
+                .prefix_scan_stream_with_mode(cf, prefix, Arc::new(Mutex::new(None)), pinned)
+                .unwrap();
+            // Captured at build time — valid before the drain.
+            let submitted = stream.inner.open_fanout_submitted();
+            let mut sink = S2Collect(Vec::new());
+            assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+            (sink.0, submitted)
+        })
+    }
+
+    /// (a) OFF-vs-ON byte-identity — THE gate. Over a remote multi-tier fixture
+    /// (so the fanout actually FIRES), the emitted (key, value) sequence with the
+    /// open-fanout forced ON is byte-identical to OFF and to the `prefix_scan`
+    /// oracle, on BOTH pinned and legacy merge paths. The fanout is timing-only.
+    /// Also asserts the fanout submitted > 1 open on at least one bucket (proving
+    /// it actually engaged, not silently no-op'd).
+    #[test]
+    fn open_fanout_off_vs_on_byte_identical_non_kvsep() {
+        let (db, cf) = open_fanout_remote_fixture(false);
+        let mut any_fanned = false;
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            db.evict_all_sst_readers();
+            let reference = db.prefix_scan(&cf, &prefix).unwrap();
+            assert!(!reference.is_empty(), "fixture must yield rows for {b}");
+            for pinned in [false, true] {
+                let (off, off_n) = open_fanout_drain_prefix(&db, &cf, &prefix, pinned, false);
+                let (on, on_n) = open_fanout_drain_prefix(&db, &cf, &prefix, pinned, true);
+                assert_eq!(off_n, 0, "OFF must submit zero fanout opens");
+                assert_eq!(
+                    off, on,
+                    "bucket={b} pinned={pinned}: open-fanout ON changed the merge output"
+                );
+                assert_eq!(
+                    on, reference,
+                    "bucket={b} pinned={pinned}: open-fanout ON != prefix_scan oracle"
+                );
+                if on_n > 1 {
+                    any_fanned = true;
+                }
+            }
+        }
+        assert!(
+            any_fanned,
+            "open-fanout never engaged (no bucket fanned >1 cold open) — test is vacuous"
+        );
+    }
+
+    /// (a, KV-sep arm) OFF-vs-ON byte-identity with KV-separation ON: the pinned
+    /// path's BlobRef rows deref the value log identically whether the readers
+    /// were opened serially or fanned out. `#[ignore]` for the process-global
+    /// KV-sep override race (run explicitly in the cycle-3 gate).
+    #[test]
+    #[ignore = "toggles process-global KV-sep override; run explicitly in the cycle-3 gate"]
+    fn open_fanout_off_vs_on_byte_identical_kvsep() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        let (db, cf) = open_fanout_remote_fixture(true);
+        let mut any_fanned = false;
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            db.evict_all_sst_readers();
+            let reference = db.prefix_scan(&cf, &prefix).unwrap();
+            assert!(
+                !reference.is_empty(),
+                "KV-sep fixture must yield rows for {b}"
+            );
+            for pinned in [false, true] {
+                let (off, _) = open_fanout_drain_prefix(&db, &cf, &prefix, pinned, false);
+                let (on, on_n) = open_fanout_drain_prefix(&db, &cf, &prefix, pinned, true);
+                assert_eq!(
+                    off, on,
+                    "KV-sep bucket={b} pinned={pinned}: open-fanout changed output"
+                );
+                assert_eq!(
+                    on, reference,
+                    "KV-sep bucket={b} pinned={pinned}: open-fanout != oracle"
+                );
+                if on_n > 1 {
+                    any_fanned = true;
+                }
+            }
+        }
+        assert!(
+            any_fanned,
+            "KV-sep open-fanout never engaged — test is vacuous"
+        );
+        set_kv_separation_override(None);
+    }
+
+    /// (b) Compose with cold-prime: with BOTH flags ON, the output stays
+    /// byte-identical to the oracle AND both layers engage (reader opens fan out
+    /// AND first data blocks prime). The oracle comes from a SEPARATE identical
+    /// fixture so warming its block cache never masks the measured DB's
+    /// cold-prime (the block cache survives reader eviction, so a same-DB
+    /// reference scan would make every first block warm ⇒ cold-prime no-ops).
+    /// Proves independent composition (catalog directive item 2).
+    #[test]
+    fn open_fanout_composes_with_cold_prime() {
+        let (oracle_db, oracle_cf) = open_fanout_remote_fixture(false);
+        let (db, cf) = open_fanout_remote_fixture(false);
+        let mut both_engaged = false;
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            let reference = oracle_db.prefix_scan(&oracle_cf, &prefix).unwrap();
+            assert!(!reference.is_empty(), "fixture must yield rows for {b}");
+            for pinned in [false, true] {
+                // Fresh measured DB per case ⇒ cold BLOCK cache (so cold-prime
+                // engages). Evict the READER cache (warmed by the build's flush)
+                // so the open-fanout ALSO sees cold sources. The block cache
+                // survives reader eviction, so cold-prime still sees cold first
+                // blocks — both layers engage on the SAME scan.
+                let (db2, cf2) = open_fanout_remote_fixture(false);
+                db2.evict_all_sst_readers();
+                let _ = (&db, &cf); // keep the outer fixture alive for symmetry
+                let (rows, opens, primes) = with_open_fanout_forced(true, || {
+                    let mut stream = db2
+                        .prefix_scan_stream_with_mode(
+                            &cf2,
+                            &prefix,
+                            Arc::new(Mutex::new(None)),
+                            pinned,
+                        )
+                        .unwrap();
+                    stream.inner.set_cold_prime_force(true);
+                    let opens = stream.inner.open_fanout_submitted();
+                    let mut sink = S2Collect(Vec::new());
+                    assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+                    let primes = stream.inner.cold_primed_sources();
+                    (sink.0, opens, primes)
+                });
+                assert_eq!(
+                    rows, reference,
+                    "bucket={b} pinned={pinned}: both-ON output != oracle"
+                );
+                if opens > 1 && primes > 1 {
+                    both_engaged = true;
+                }
+            }
+        }
+        assert!(
+            both_engaged,
+            "open-fanout + cold-prime never BOTH engaged (>1 each) — composition unproven"
+        );
+    }
+
+    /// (c) Zero pool jobs on the LOCAL regime: the same fixture on a local FS
+    /// (`is_local()==true`) submits ZERO fanout opens even with the gate forced
+    /// ON — local opens are µs-class preads with no RTT to overlap.
+    #[test]
+    fn open_fanout_zero_jobs_on_local_regime() {
+        let (db, cf) = s2_multi_tier_fixture(); // local tempdir/memory FS
+        for b in 0..4u32 {
+            let prefix = format!("p:{b:02}:").into_bytes();
+            for pinned in [false, true] {
+                let (_, n) = open_fanout_drain_prefix(&db, &cf, &prefix, pinned, true);
+                assert_eq!(
+                    n, 0,
+                    "bucket={b} pinned={pinned}: local regime must submit zero fanout opens"
+                );
+            }
+        }
+    }
+
+    /// (c2) Zero pool jobs when WARM (readers already cached): on the remote
+    /// fixture, a scan WITHOUT evicting the reader cache finds every reader warm
+    /// ⇒ the fanout's cold-filter removes them all ⇒ zero opens submitted. Proves
+    /// the "zero pool jobs when warm" gate.
+    #[test]
+    fn open_fanout_zero_jobs_when_warm() {
+        let (db, cf) = open_fanout_remote_fixture(false);
+        let prefix = b"p:01:";
+        // Warm the reader cache by scanning once (no eviction afterwards).
+        let _ = db.prefix_scan(&cf, prefix).unwrap();
+        // Now scan again WITHOUT eviction — readers are cached.
+        let n = with_open_fanout_forced(true, || {
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, prefix, Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            let submitted = stream.inner.open_fanout_submitted();
+            let mut sink = S2Collect(Vec::new());
+            assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+            submitted
+        });
+        assert_eq!(n, 0, "warm reader cache must submit zero fanout opens");
+    }
+
+    /// (d) Flag-OFF and K<=1 skip-guards: flag OFF over the remote fixture
+    /// submits zero opens; a single-SST CF (one flushed wave, one prefix) has
+    /// <=1 cold source ⇒ zero opens even when forced ON.
+    #[test]
+    fn open_fanout_skip_guards_off_and_k1() {
+        // Flag OFF over the remote multi-source fixture.
+        let (db, cf) = open_fanout_remote_fixture(false);
+        let (_, n_off) = open_fanout_drain_prefix(&db, &cf, b"p:00:", true, false);
+        assert_eq!(n_off, 0, "flag OFF must submit zero fanout opens");
+
+        // K <= 1: single flushed SST, single prefix.
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            write_buffer_size: 2_000_000_000,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(RemoteFakeFs::new());
+        let db2 = DbImpl::open_with_fs(opts, fs).unwrap();
+        let cf2 = db2
+            .create_column_family(ColumnFamilyDescriptor::new("open-fanout-k1"))
+            .unwrap();
+        for i in 0..40u32 {
+            db2.put(&cf2, format!("k:{i:04}").as_bytes(), b"v").unwrap();
+        }
+        db2.switch_and_flush(&cf2).unwrap().unwrap();
+        let (_, n_k1) = open_fanout_drain_prefix(&db2, &cf2, b"k:", true, true);
+        assert_eq!(n_k1, 0, "K<=1 must submit zero fanout opens");
+    }
+
+    /// (e) No leaked / stranded jobs on a mid-scan drop: the open-fanout
+    /// BARRIERS before the merge consumes any source, so by the time the scan
+    /// starts emitting all fanout opens have completed (no in-flight open job
+    /// survives the iterator). Dropping the scan mid-drain leaves no stranded
+    /// pool job; the prefetch buffered-bytes charge (cold-prime windows, if any)
+    /// returns to baseline. Here the fanout-only arm adds NO prefetch charge.
+    #[test]
+    fn open_fanout_no_leaked_jobs_on_mid_scan_drop() {
+        use forst_rs_storage::sst::prefetch::prefetch_buffered_bytes;
+        let (db, cf) = open_fanout_remote_fixture(false);
+        db.evict_all_sst_readers();
+        let before = prefetch_buffered_bytes();
+        let opens = with_open_fanout_forced(true, || {
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, b"p:01:", Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            struct OneRow(bool);
+            impl RowSink for OneRow {
+                fn push(&mut self, _k: &[u8], _v: &[u8]) -> bool {
+                    let was = self.0;
+                    self.0 = true;
+                    !was
+                }
+            }
+            let n = stream.inner.open_fanout_submitted();
+            let mut sink = OneRow(false);
+            let _ = stream.fill_into(&mut sink).unwrap();
+            // stream dropped here mid-scan
+            n
+        });
+        assert!(
+            opens > 1,
+            "fanout must have engaged for this to be meaningful"
+        );
+        // The fanout barrier completed before emit; readers are now cached, so a
+        // follow-up scan re-finds them WITHOUT re-opening (zero new fanout jobs).
+        let n2 = with_open_fanout_forced(true, || {
+            let mut stream = db
+                .prefix_scan_stream_with_mode(&cf, b"p:01:", Arc::new(Mutex::new(None)), true)
+                .unwrap();
+            let submitted = stream.inner.open_fanout_submitted();
+            let mut sink = S2Collect(Vec::new());
+            assert_eq!(stream.fill_into(&mut sink).unwrap(), FillOutcome::Exhausted);
+            submitted
+        });
+        assert_eq!(
+            n2, 0,
+            "readers opened by the aborted scan's fanout stayed cached"
+        );
+        // No prefetch windows were charged by the fanout-only path.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let now = prefetch_buffered_bytes();
+            assert!(now < usize::MAX / 2, "counter wrapped");
+            if now <= before {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open-fanout leaked buffered bytes: before={before} now={now}"
             );
             std::thread::yield_now();
         }

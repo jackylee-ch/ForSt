@@ -769,6 +769,12 @@ impl FileSystem for ObjectStoreFileSystem {
     fn name(&self) -> &str {
         "ObjectStoreFileSystem"
     }
+
+    /// FRS-SCAN-OPEN-FANOUT: an object store always pays a remote round-trip on
+    /// open — report NOT-local so the scan open-fanout engages.
+    fn is_local(&self) -> bool {
+        false
+    }
 }
 
 // ===========================================================================

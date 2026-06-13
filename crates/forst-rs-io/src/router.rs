@@ -596,6 +596,13 @@ impl FileSystem for FileSystemRouter {
         // inspect local_fs().name() and remote_fs().map(|f| f.name()).
         "FileSystemRouter"
     }
+
+    /// FRS-SCAN-OPEN-FANOUT: a router is remote-capable iff it has a remote leg
+    /// — only then can an SST open pay a round-trip worth fanning out. A
+    /// local-only router (no `remote_fs`) is local, so the fanout is skipped.
+    fn is_local(&self) -> bool {
+        self.remote_fs.is_none()
+    }
 }
 
 // Override the default `name()` to include child filesystem names for

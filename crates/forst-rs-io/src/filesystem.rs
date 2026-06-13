@@ -257,6 +257,20 @@ pub trait FileSystem: Send + Sync {
     /// Returns a human-readable name for this filesystem implementation.
     fn name(&self) -> &str;
 
+    /// FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3): whether this filesystem serves
+    /// reads from local storage with no remote round-trip on `open` (footer +
+    /// index fetch). When `true`, opening an SST reader is a µs-class pread and
+    /// the concurrent open-fanout would add scheduling overhead for no latency
+    /// win, so the scan merge-build site SKIPS the fanout (the "local regime"
+    /// no-op guard, mirroring the per-source `RandomAccessFile::is_local` guard
+    /// the data-block cold-prime uses). Object-store / caching / latency-
+    /// injecting backends override this to `false` so the fanout engages.
+    ///
+    /// Default `true`: local / in-memory POSIX-style backends pay no open RTT.
+    fn is_local(&self) -> bool {
+        true
+    }
+
     /// Hint: ensure the file at `path` is locally available for fast reads.
     ///
     /// For caching filesystem implementations (e.g. `CachedFileSystem`),

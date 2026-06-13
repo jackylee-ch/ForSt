@@ -1426,6 +1426,12 @@ impl FileSystem for MappedFileSystem {
         self.inner.name()
     }
 
+    /// FRS-SCAN-OPEN-FANOUT: delegate the locality property to the wrapped FS
+    /// (a mapping layer adds no remoteness of its own).
+    fn is_local(&self) -> bool {
+        self.inner.is_local()
+    }
+
     fn ensure_cached(&self, path: &Path) -> ForstResult<()> {
         self.inner.ensure_cached(&self.resolve(path))
     }
