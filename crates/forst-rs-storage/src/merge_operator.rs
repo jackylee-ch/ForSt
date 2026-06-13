@@ -58,6 +58,26 @@ pub trait MergeOperator: Send + Sync {
         operands: &[&[u8]],
     ) -> ForstResult<Vec<u8>>;
 
+    /// Merge operands that are ordered newest to oldest.
+    ///
+    /// The engine naturally peels merge operands newest-first from memtables
+    /// and SSTs. Most operators keep the traditional oldest-first
+    /// [`Self::full_merge`] implementation and use this default adapter.
+    /// Operators whose merge is simple concatenation can override this method
+    /// to avoid an intermediate reversed slice vector on read hot paths.
+    fn full_merge_newest_first(
+        &self,
+        key: &[u8],
+        base_value: Option<&[u8]>,
+        operands_newest_first: &[Vec<u8>],
+    ) -> ForstResult<Vec<u8>> {
+        let mut ordered: Vec<&[u8]> = Vec::with_capacity(operands_newest_first.len());
+        for op in operands_newest_first.iter().rev() {
+            ordered.push(op.as_slice());
+        }
+        self.full_merge(key, base_value, &ordered)
+    }
+
     /// Combine two adjacent merge operands when no base value is available.
     ///
     /// Called during compaction at non-bottommost levels. If partial merge
@@ -194,6 +214,24 @@ impl MergeOperator for RawConcatMergeOperator {
             out.extend_from_slice(base);
         }
         for op in operands {
+            out.extend_from_slice(op);
+        }
+        Ok(out)
+    }
+
+    fn full_merge_newest_first(
+        &self,
+        _key: &[u8],
+        base_value: Option<&[u8]>,
+        operands_newest_first: &[Vec<u8>],
+    ) -> ForstResult<Vec<u8>> {
+        let total = base_value.map_or(0, |v| v.len())
+            + operands_newest_first.iter().map(|v| v.len()).sum::<usize>();
+        let mut out = Vec::with_capacity(total);
+        if let Some(base) = base_value {
+            out.extend_from_slice(base);
+        }
+        for op in operands_newest_first.iter().rev() {
             out.extend_from_slice(op);
         }
         Ok(out)
@@ -540,6 +578,16 @@ mod tests {
             .full_merge(b"key", Some(b"BASE"), &[b"\0A", b"B\0"])
             .unwrap();
         assert_eq!(result, b"BASE\0AB\0");
+    }
+
+    #[test]
+    fn test_raw_concat_full_merge_newest_first_matches_oldest_first_contract() {
+        let op = RawConcatMergeOperator::new();
+        let newest_first = vec![b"C".to_vec(), b"B".to_vec(), b"A".to_vec()];
+        let result = op
+            .full_merge_newest_first(b"key", Some(b"BASE"), &newest_first)
+            .unwrap();
+        assert_eq!(result, b"BASEABC");
     }
 
     #[test]

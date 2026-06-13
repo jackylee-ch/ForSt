@@ -9986,11 +9986,10 @@ impl DbImpl {
                 cf_data.handle().name()
             ))
         })?;
-        // `operands` was collected newest-first — the merge operator expects
-        // oldest-first so reverse before invoking.
-        let reversed: Vec<Vec<u8>> = operands.into_iter().rev().collect();
-        let slices: Vec<&[u8]> = reversed.iter().map(|v| v.as_slice()).collect();
-        op.full_merge(key, base.as_deref(), &slices)
+        // `operands` was collected newest-first. Use the newest-first adapter
+        // so simple operators such as RawConcat can avoid allocating a reversed
+        // operand vector on q19-style merge-chain reads.
+        op.full_merge_newest_first(key, base.as_deref(), &operands)
     }
 
     /// Collect additional merge operands older than the outer `first_seq`.

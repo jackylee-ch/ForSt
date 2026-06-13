@@ -226,6 +226,52 @@ Interpretation:
 - Same-key merge-chain reads improve materially after compaction, so future merge work should target merge-resolution/read-amplification and compaction policy, not append-write rewrite.
 - Distinct-key chain cost is mostly proportional to returned key count and is not fixed by merge compaction.
 
+### RawConcat newest-first merge read fast path
+
+Patch under test:
+
+- Add `MergeOperator::full_merge_newest_first(...)` as an engine-facing adapter for operands already collected newest-to-oldest.
+- Override it in `RawConcatMergeOperator` so q19-style merge-chain reads avoid allocating a reversed `Vec<Vec<u8>>` plus slice vector before concatenation.
+- Route `DbImpl::apply_merge_operator(...)` through the adapter.
+
+Validation:
+
+```bash
+cargo test -p forst-rs-storage test_raw_concat_full_merge_newest_first_matches_oldest_first_contract
+cargo test -p forst-rs-engine test_batch_get_vectorized_put_delete_merge_mix
+cargo test -p forst-rs-engine value_carrying_merge_fallback_resolves_merge_chain
+cargo test -p forst-rs-engine test_scan_resolves_merges
+cargo bench -p forst-rs-bench --bench ffi_vectorized q19_merge_chain_read_lifecycle_ffi -- --noplot --baseline q19-merge-before-rawconcat-fastpath
+```
+
+Key result versus `q19-merge-before-rawconcat-fastpath` baseline:
+
+| Cell | After | Change |
+|---|---:|---:|
+| distinct chain1 / memtable | 16.55 us | -15.66% |
+| distinct chain1 / flushed | 16.53 us | -16.27% |
+| distinct chain1 / compacted | 16.13 us | -4.78% |
+| same-key chain4 / memtable | 19.70 us | -16.96% |
+| distinct chain16 / memtable | 299.14 us | -13.20% |
+| distinct chain16 / flushed | 298.26 us | -15.20% |
+| same-key chain16 / memtable | 39.33 us | -20.07% |
+| same-key chain16 / flushed | 39.63 us | -20.53% |
+| same-key chain16 / compacted | 17.11 us | -4.46% |
+
+Two cells were noisy in the first full run and were repeated individually:
+
+| Re-run cell | After | Change |
+|---|---:|---:|
+| same-key chain1 / compacted | 16.76 us | -2.29% |
+| distinct chain4 / memtable | 72.51 us | -13.47% |
+
+Interpretation:
+
+- The patch is a focused q19 read-path win for merge-chain cases. It reduces read-side merge materialization overhead without changing merge append.
+- The benefit is strongest before compaction folds a same-key chain; after compaction, the remaining path is mostly batch get and result materialization.
+- The added `output_copy_only` cells separate result-buffer copy from engine lookup/merge work. In the filtered bench, output copy was roughly 150 ns for chain1 and roughly 2.3 us for distinct chain16, while full reads were roughly 16-17 us and 301-318 us respectively. That makes output buffer copy a small term for this q19 case; the next q19 bottleneck is lookup/merge-chain resolution.
+- This does not close q7/q19 by itself. The next bottlenecks are caller scratch reuse, serial/parallel adaptive prefix probing, and merge-chain compaction/read-amplification policy.
+
 Next production patch candidate:
 
 1. Flink/ForSt-RS iterator caller scratch reuse: reuse prefix offsets, handles, `FrsChunk` descriptors, and chunk buffers per vectorized executor or task thread.

@@ -784,6 +784,25 @@ fn run_merge_read_get(d: &FfiDb, fixture: &mut MergeReadFixture) -> usize {
     out_len
 }
 
+fn copy_expected_values_to_vec_get_buffers(
+    expected_values: &[Vec<u8>],
+    out_offsets: &mut [i32],
+    out_data: &mut [u8],
+    out_validity: &mut [u8],
+) -> usize {
+    out_offsets.fill(0);
+    out_validity.fill(0);
+    let mut pos = 0usize;
+    for (i, value) in expected_values.iter().enumerate() {
+        let end = pos + value.len();
+        out_data[pos..end].copy_from_slice(value);
+        out_validity[i] = 1;
+        out_offsets[i + 1] = end as i32;
+        pos = end;
+    }
+    pos
+}
+
 fn assert_merge_fixture_readable(d: &FfiDb, fixture: &MergeBatchFixture) {
     let mut read_fixture = build_merge_read_fixture(fixture);
     run_merge_read_get(d, &mut read_fixture);
@@ -1422,6 +1441,28 @@ fn bench_q19_merge_chain_read_lifecycle_ffi(c: &mut Criterion) {
                     |b, _| {
                         b.iter(|| {
                             let bytes = run_merge_read_get(&d, &mut read_fixture);
+                            std::hint::black_box(bytes);
+                        })
+                    },
+                );
+
+                let expected_values = read_fixture.expected_values.clone();
+                let expected_bytes: usize = expected_values.iter().map(|v| v.len()).sum();
+                let mut copy_offsets = vec![0i32; expected_values.len() + 1];
+                let mut copy_data = vec![0u8; expected_bytes + expected_values.len() * 8 + 1];
+                let mut copy_validity = vec![0u8; expected_values.len()];
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{}_output_copy_only", stage.label()), &label),
+                    &returned_keys,
+                    |b, _| {
+                        b.iter(|| {
+                            let bytes = copy_expected_values_to_vec_get_buffers(
+                                &expected_values,
+                                &mut copy_offsets,
+                                &mut copy_data,
+                                &mut copy_validity,
+                            );
+                            assert_eq!(bytes, expected_bytes);
                             std::hint::black_box(bytes);
                         })
                     },
