@@ -96,7 +96,7 @@ impl CompactionMergeExecutor for LocalCompactionExecutor {
 
 /// Locally-emulated REMOTE executor (paper pillar 6b, flag-gated default OFF).
 ///
-/// The job is moved to a dedicated background [`WorkerPool`] (so the merge CPU
+/// The job is moved to a dedicated background `WorkerPool` (so the merge CPU
 /// and the input/output I/O happen OFF the calling thread); the calling thread
 /// blocks on the result channel and then installs the returned edit exactly as
 /// the local path does. Because the moved `CompactionJob` carries its own

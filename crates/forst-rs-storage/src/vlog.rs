@@ -187,8 +187,9 @@ impl VlogWriter {
         let uncompressed_len = u32::try_from(value.len())
             .map_err(|_| ForstError::invalid_argument("vlog value exceeds u32::MAX bytes"))?;
         let stored: Vec<u8> = compress(value, self.compression)?;
-        let stored_len = u32::try_from(stored.len())
-            .map_err(|_| ForstError::invalid_argument("vlog stored value exceeds u32::MAX bytes"))?;
+        let stored_len = u32::try_from(stored.len()).map_err(|_| {
+            ForstError::invalid_argument("vlog stored value exceeds u32::MAX bytes")
+        })?;
         let ptr = ValuePointer {
             segment_id: self.segment_id,
             offset: self.offset,
@@ -400,13 +401,18 @@ mod tests {
             let mut w = VlogWriter::create_with_compression(&fs, dir, 10, codec).unwrap();
             // Low-entropy, NexMark-shaped values (repeated fields) compress well.
             let values: Vec<Vec<u8>> = (0..40u32)
-                .map(|i| format!("{{\"auction\":{},\"bidder\":{},\"price\":100}}", i % 7, i % 5)
+                .map(|i| {
+                    format!(
+                        "{{\"auction\":{},\"bidder\":{},\"price\":100}}",
+                        i % 7,
+                        i % 5
+                    )
                     .repeat(6)
-                    .into_bytes())
+                    .into_bytes()
+                })
                 .collect();
             let logical_total: usize = values.iter().map(|v| v.len()).sum();
-            let ptrs: Vec<ValuePointer> =
-                values.iter().map(|v| w.append(v).unwrap()).collect();
+            let ptrs: Vec<ValuePointer> = values.iter().map(|v| w.append(v).unwrap()).collect();
             w.sync().unwrap();
             // On-disk payload (excludes headers) must be smaller than logical.
             assert!(
@@ -450,17 +456,20 @@ mod tests {
         // One reader cannot mix codecs within a single writer (codec is
         // per-writer), but two segments written under different codecs both
         // decode via the per-record tag with the SAME reader logic.
-        let mut none_w = VlogWriter::create_with_compression(&fs, dir, 20, CompressionType::None)
-            .unwrap();
-        let mut lz4_w = VlogWriter::create_with_compression(&fs, dir, 21, CompressionType::Lz4)
-            .unwrap();
+        let mut none_w =
+            VlogWriter::create_with_compression(&fs, dir, 20, CompressionType::None).unwrap();
+        let mut lz4_w =
+            VlogWriter::create_with_compression(&fs, dir, 21, CompressionType::Lz4).unwrap();
         let payload = b"the quick brown fox the quick brown fox the quick brown fox".to_vec();
         let p_none = none_w.append(&payload).unwrap();
         let p_lz4 = lz4_w.append(&payload).unwrap();
         none_w.sync().unwrap();
         lz4_w.sync().unwrap();
         assert_eq!(
-            VlogReader::open(&fs, dir, 20).unwrap().get(&p_none).unwrap(),
+            VlogReader::open(&fs, dir, 20)
+                .unwrap()
+                .get(&p_none)
+                .unwrap(),
             payload
         );
         assert_eq!(
