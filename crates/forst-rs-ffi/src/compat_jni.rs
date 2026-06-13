@@ -11621,6 +11621,9 @@ mod tests {
             "Java_org_forstdb_FlinkCompactionFilter_createNewFlinkCompactionFilterConfigHolder",
             "Java_org_forstdb_FlinkCompactionFilter_disposeFlinkCompactionFilterConfigHolder",
             "Java_org_forstdb_FlinkCompactionFilter_configureFlinkCompactionFilter",
+            // Core FFM LINK-mode restore symbols eagerly bound by ForStRsLinker.
+            "frs_db_open_from_linked_checkpoint_instant_clipped",
+            "frs_db_open_from_linked_checkpoint_instant_clipped_remote",
         ];
         for sym in &required {
             assert!(

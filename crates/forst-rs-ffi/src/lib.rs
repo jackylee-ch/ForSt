@@ -4650,6 +4650,66 @@ pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant_remote(
     })
 }
 
+/// Local clipped instant restore from LINK-mode checkpoint.
+///
+/// Placeholder only: return NOT_SUPPORTED after validating required pointers.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant_clipped(
+    ckpt_dir: *const c_char,
+    target_dir: *const c_char,
+    clip_start: *const u8,
+    _clip_start_len: usize,
+    clip_end: *const u8,
+    _clip_end_len: usize,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if ckpt_dir.is_null()
+            || target_dir.is_null()
+            || clip_start.is_null()
+            || clip_end.is_null()
+            || out_handle.is_null()
+        {
+            return FRS_STATUS_NULL_ARG;
+        }
+        *out_handle = std::ptr::null_mut();
+        FRS_STATUS_NOT_SUPPORTED
+    })
+}
+
+/// Remote-primary clipped instant restore from LINK-mode checkpoint.
+///
+/// Placeholder only: return NOT_SUPPORTED after validating required pointers.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant_clipped_remote(
+    uri: *const c_char,
+    _opendal_config_json: *const c_char,
+    cache_dir: *const c_char,
+    _cache_capacity_bytes: u64,
+    ckpt_dir: *const c_char,
+    target_dir: *const c_char,
+    clip_start: *const u8,
+    _clip_start_len: usize,
+    clip_end: *const u8,
+    _clip_end_len: usize,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if uri.is_null()
+            || cache_dir.is_null()
+            || ckpt_dir.is_null()
+            || target_dir.is_null()
+            || clip_start.is_null()
+            || clip_end.is_null()
+            || out_handle.is_null()
+        {
+            return FRS_STATUS_NULL_ARG;
+        }
+        *out_handle = std::ptr::null_mut();
+        FRS_STATUS_NOT_SUPPORTED
+    })
+}
+
 /// Number of adopted foreign SST references still live in the DB.
 ///
 /// Without LINK-mode restore there can be no adopted residuals, so this
@@ -8992,6 +9052,39 @@ mod tests {
                     0,
                     ckpt_dir.as_ptr(),
                     target_dir.as_ptr(),
+                    &mut restored
+                ),
+                FRS_STATUS_NOT_SUPPORTED
+            );
+            assert!(restored.is_null());
+
+            let clip_start = [0u8, 1u8];
+            let clip_end = [0u8, 2u8];
+            assert_eq!(
+                frs_db_open_from_linked_checkpoint_instant_clipped(
+                    ckpt_dir.as_ptr(),
+                    target_dir.as_ptr(),
+                    clip_start.as_ptr(),
+                    clip_start.len(),
+                    clip_end.as_ptr(),
+                    clip_end.len(),
+                    &mut restored
+                ),
+                FRS_STATUS_NOT_SUPPORTED
+            );
+            assert!(restored.is_null());
+            assert_eq!(
+                frs_db_open_from_linked_checkpoint_instant_clipped_remote(
+                    uri.as_ptr(),
+                    ptr::null(),
+                    cache_dir.as_ptr(),
+                    0,
+                    ckpt_dir.as_ptr(),
+                    target_dir.as_ptr(),
+                    clip_start.as_ptr(),
+                    clip_start.len(),
+                    clip_end.as_ptr(),
+                    clip_end.len(),
                     &mut restored
                 ),
                 FRS_STATUS_NOT_SUPPORTED
