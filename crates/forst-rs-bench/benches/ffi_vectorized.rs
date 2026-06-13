@@ -51,6 +51,9 @@
 //!   comparing row-limited serial open-first with batch-open first-chunk
 //!   lower bounds for K={64,256,1024}, rows/limit={1,4,16}, S2 pinned
 //!   off/on
+//! - `q7_q19_prefix_build_fill_diag` — q7/q19 K=1024 lower-bound split:
+//!   engine stream build only, build+fill without chunk copy, build+fill with
+//!   chunk copy, and full `frs_vec_iter_prefix_open_limited`
 //! - `compat_jni_prefix_proxy` — Rust-level proxy for compat JNI
 //!   `prefixLookupNext` / `iteratorNext` row-at-a-time scans vs the chunked
 //!   prefix iterator lower bound
@@ -68,14 +71,15 @@
 use std::ffi::CString;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use criterion::{criterion_group, BatchSize, BenchmarkId, Criterion, Throughput};
 
 use forst_rs_common::EngineOptions;
 use forst_rs_engine::{
-    set_s2_pinned_override, ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, DEFAULT_CF_NAME,
+    set_s2_pinned_override, ColumnFamilyDescriptor, ColumnFamilyHandle, DbImpl, FillOutcome,
+    RowSink, DEFAULT_CF_NAME,
 };
 use forst_rs_ffi::{
     frs_batch_get, frs_bytes_free, frs_compact_cf, frs_db_create_cf_with_merge, frs_db_open,
@@ -105,6 +109,8 @@ const Q19_ALLOC_SPLIT_ROWS_PER_PREFIX: &[usize] = &[1, 16, 32];
 const Q7_Q19_OPEN_FIRST_K: &[usize] = &[64, 256, 1024];
 const Q7_Q19_OPEN_FIRST_ROWS_PER_PREFIX: &[usize] = &[1, 4, 16];
 const Q7_Q19_OPEN_FIRST_ROW_LIMITS: &[usize] = &[1, 4, 16];
+const Q7_Q19_BUILD_FILL_K: usize = 1024;
+const Q7_Q19_BUILD_FILL_FANOUTS: &[usize] = &[0, 1, 8];
 const Q19_MERGE_KEYS: usize = 64;
 const Q19_CHAIN_LENGTHS: &[usize] = &[1, 4, 16];
 const COMPAT_PROXY_PREFIX_COUNTS: &[usize] = &[64, 256];
@@ -299,6 +305,209 @@ fn populate_iter_fixture(
         expected.push(rows);
     }
     (prefixes, expected)
+}
+
+fn populate_iter_fanout_fixture(
+    d: &FfiDb,
+    ns: &str,
+    prefix_count: usize,
+    rows_per_prefix: usize,
+    fanout_sources: usize,
+) -> (Vec<Vec<u8>>, Vec<Vec<(Vec<u8>, Vec<u8>)>>) {
+    let eng = d.engine().clone();
+    let cfh = d.engine_cf();
+    let prefixes: Vec<Vec<u8>> = (0..prefix_count).map(|p| q_iter_prefix(ns, p)).collect();
+    let source_rounds = fanout_sources.max(1);
+    for source in 0..source_rounds {
+        for p in 0..prefix_count {
+            for r in 0..rows_per_prefix {
+                let key = q_iter_key(ns, p, r);
+                let value = format!("{ns}/v{p:05}/{r:04}/s{source:02}").into_bytes();
+                eng.put(&cfh, &key, &value).expect("fanout fixture put");
+            }
+        }
+        if fanout_sources > 0 {
+            eng.switch_and_flush(&cfh).expect("fanout fixture flush");
+        }
+    }
+
+    let latest_source = source_rounds - 1;
+    let expected = (0..prefix_count)
+        .map(|p| {
+            (0..rows_per_prefix)
+                .map(|r| {
+                    (
+                        q_iter_key(ns, p, r),
+                        format!("{ns}/v{p:05}/{r:04}/s{latest_source:02}").into_bytes(),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    (prefixes, expected)
+}
+
+struct CountLimitSink {
+    row_limit: u32,
+    rows: u32,
+    bytes: u64,
+}
+
+impl RowSink for CountLimitSink {
+    fn push(&mut self, key: &[u8], value: &[u8]) -> bool {
+        self.rows += 1;
+        self.bytes += (8 + key.len() + value.len()) as u64;
+        self.rows < self.row_limit
+    }
+}
+
+struct ChunkCopyLimitSink<'a> {
+    row_limit: u32,
+    rows: u32,
+    off: usize,
+    buf: &'a mut [u8],
+}
+
+impl RowSink for ChunkCopyLimitSink<'_> {
+    fn push(&mut self, key: &[u8], value: &[u8]) -> bool {
+        let row_size = 8 + key.len() + value.len();
+        assert!(
+            self.off + row_size <= self.buf.len(),
+            "diagnostic chunk buffer too small"
+        );
+        let klen = key.len() as u32;
+        let vlen = value.len() as u32;
+        self.buf[self.off..self.off + 4].copy_from_slice(&klen.to_le_bytes());
+        self.buf[self.off + 4..self.off + 8].copy_from_slice(&vlen.to_le_bytes());
+        self.off += 8;
+        self.buf[self.off..self.off + key.len()].copy_from_slice(key);
+        self.off += key.len();
+        self.buf[self.off..self.off + value.len()].copy_from_slice(value);
+        self.off += value.len();
+        self.rows += 1;
+        self.rows < self.row_limit
+    }
+}
+
+fn engine_prefix_build_only_count(d: &FfiDb, prefixes: &[Vec<u8>], pinned: bool) -> (u64, u64) {
+    let eng = d.engine().clone();
+    let cfh = d.engine_cf();
+    let mut source_count = 0u64;
+    for prefix in prefixes {
+        let stream = eng
+            .prefix_scan_stream_with_mode(&cfh, prefix, Arc::new(Mutex::new(None)), pinned)
+            .expect("prefix stream build");
+        source_count += stream.debug_source_count() as u64;
+        std::hint::black_box(stream);
+    }
+    (prefixes.len() as u64, source_count)
+}
+
+fn engine_prefix_fill_count_no_copy(
+    d: &FfiDb,
+    prefixes: &[Vec<u8>],
+    pinned: bool,
+    row_limit: usize,
+) -> (u64, u64, u64, u64, u64) {
+    let eng = d.engine().clone();
+    let cfh = d.engine_cf();
+    let mut rows = 0u64;
+    let mut bytes = 0u64;
+    let mut sources = 0u64;
+    let mut comps = 0u64;
+    let mut allocs = 0u64;
+    for prefix in prefixes {
+        let mut stream = eng
+            .prefix_scan_stream_with_mode(&cfh, prefix, Arc::new(Mutex::new(None)), pinned)
+            .expect("prefix stream build");
+        sources += stream.debug_source_count() as u64;
+        let mut sink = CountLimitSink {
+            row_limit: row_limit as u32,
+            rows: 0,
+            bytes: 0,
+        };
+        let outcome = stream.fill_into(&mut sink).expect("prefix stream fill");
+        assert!(
+            matches!(outcome, FillOutcome::Exhausted | FillOutcome::SinkFull),
+            "unexpected fill outcome"
+        );
+        let (diag_rows, diag_comps, diag_allocs) = stream.diag_counters();
+        rows += u64::from(sink.rows);
+        bytes += sink.bytes;
+        comps += diag_comps;
+        allocs += diag_allocs;
+        if pinned {
+            assert!(
+                diag_rows >= u64::from(sink.rows),
+                "pinned diag row counter must cover delivered rows"
+            );
+        }
+    }
+    (rows, bytes, sources, comps, allocs)
+}
+
+fn engine_prefix_fill_chunk_copy(
+    d: &FfiDb,
+    prefixes: &[Vec<u8>],
+    pinned: bool,
+    row_limit: usize,
+    buf: &mut [u8],
+) -> (u64, u64, u64, u64) {
+    let eng = d.engine().clone();
+    let cfh = d.engine_cf();
+    let mut rows = 0u64;
+    let mut bytes = 0u64;
+    let mut comps = 0u64;
+    let mut allocs = 0u64;
+    for prefix in prefixes {
+        let mut stream = eng
+            .prefix_scan_stream_with_mode(&cfh, prefix, Arc::new(Mutex::new(None)), pinned)
+            .expect("prefix stream build");
+        let mut sink = ChunkCopyLimitSink {
+            row_limit: row_limit as u32,
+            rows: 0,
+            off: 0,
+            buf,
+        };
+        let outcome = stream.fill_into(&mut sink).expect("prefix stream fill");
+        assert!(
+            matches!(outcome, FillOutcome::Exhausted | FillOutcome::SinkFull),
+            "unexpected fill outcome"
+        );
+        let (_, diag_comps, diag_allocs) = stream.diag_counters();
+        rows += u64::from(sink.rows);
+        bytes += sink.off as u64;
+        comps += diag_comps;
+        allocs += diag_allocs;
+        std::hint::black_box(&sink.buf[..sink.off]);
+    }
+    (rows, bytes, comps, allocs)
+}
+
+fn print_prefix_build_fill_diag_once(
+    d: &FfiDb,
+    label: &str,
+    prefix: &[u8],
+    pinned: bool,
+    row_limit: usize,
+) {
+    let eng = d.engine().clone();
+    let cfh = d.engine_cf();
+    let mut stream = eng
+        .prefix_scan_stream_with_mode(&cfh, prefix, Arc::new(Mutex::new(None)), pinned)
+        .expect("prefix stream build");
+    let sources = stream.debug_source_count();
+    let mut sink = CountLimitSink {
+        row_limit: row_limit as u32,
+        rows: 0,
+        bytes: 0,
+    };
+    let outcome = stream.fill_into(&mut sink).expect("prefix stream fill");
+    let (diag_rows, diag_comps, diag_allocs) = stream.diag_counters();
+    eprintln!(
+        "[q7_q19_prefix_build_fill_diag] {label}: sources={sources} rows={} bytes={} outcome={outcome:?} diag_rows={diag_rows} comps={diag_comps} allocs={diag_allocs}",
+        sink.rows, sink.bytes
+    );
 }
 
 fn decode_chunk_rows(buf: &[u8], bytes_used: u32, row_count: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1782,6 +1991,110 @@ fn bench_q7_q19_open_first_slice_ffi(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_q7_q19_prefix_build_fill_diag(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ffi_vectorized/q7_q19_prefix_build_fill_diag");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_millis(400));
+    group.warm_up_time(std::time::Duration::from_millis(100));
+
+    for &(s2_label, pinned) in &[("s2off", false), ("s2on", true)] {
+        set_s2_pinned_override(Some(pinned));
+        for &fanout in Q7_Q19_BUILD_FILL_FANOUTS {
+            for &rows_per_prefix in Q7_Q19_OPEN_FIRST_ROWS_PER_PREFIX {
+                for &row_limit in Q7_Q19_OPEN_FIRST_ROW_LIMITS {
+                    if row_limit > rows_per_prefix {
+                        continue;
+                    }
+                    let d = FfiDb::open();
+                    let ns = format!(
+                        "q7q19/buildfill/{s2_label}/f{fanout}/r{rows_per_prefix}/l{row_limit}"
+                    );
+                    let (prefixes, expected) = populate_iter_fanout_fixture(
+                        &d,
+                        &ns,
+                        Q7_Q19_BUILD_FILL_K,
+                        rows_per_prefix,
+                        fanout,
+                    );
+                    assert_iter_fixture_correct(&d, &prefixes, &expected);
+                    let expected_first_rows = (Q7_Q19_BUILD_FILL_K * row_limit) as u64;
+                    let compat_scratch_cap =
+                        (COMPAT_OPEN_FIRST_INITIAL_DATA_CAP * 2 + row_limit * 8) as u32;
+                    let mut ffi_buf = vec![0_u8; compat_scratch_cap as usize];
+                    let mut chunk_copy_buf = vec![0_u8; compat_scratch_cap as usize];
+                    let label =
+                        format!("{s2_label}_k1024_f{fanout}_r{rows_per_prefix}_limit{row_limit}");
+
+                    print_prefix_build_fill_diag_once(&d, &label, &prefixes[0], pinned, row_limit);
+
+                    group.throughput(Throughput::Elements(expected_first_rows));
+                    group.bench_with_input(
+                        BenchmarkId::new("engine_build_only", &label),
+                        &expected_first_rows,
+                        |b, _| {
+                            b.iter(|| {
+                                let (opens, sources) =
+                                    engine_prefix_build_only_count(&d, &prefixes, pinned);
+                                assert_eq!(opens, Q7_Q19_BUILD_FILL_K as u64);
+                                std::hint::black_box(sources);
+                            })
+                        },
+                    );
+                    group.bench_with_input(
+                        BenchmarkId::new("engine_build_fill_nocopy", &label),
+                        &expected_first_rows,
+                        |b, _| {
+                            b.iter(|| {
+                                let (rows, bytes, sources, comps, allocs) =
+                                    engine_prefix_fill_count_no_copy(
+                                        &d, &prefixes, pinned, row_limit,
+                                    );
+                                assert_eq!(rows, expected_first_rows);
+                                std::hint::black_box((bytes, sources, comps, allocs));
+                            })
+                        },
+                    );
+                    group.bench_with_input(
+                        BenchmarkId::new("engine_build_fill_chunkcopy", &label),
+                        &expected_first_rows,
+                        |b, _| {
+                            b.iter(|| {
+                                let (rows, bytes, comps, allocs) = engine_prefix_fill_chunk_copy(
+                                    &d,
+                                    &prefixes,
+                                    pinned,
+                                    row_limit,
+                                    &mut chunk_copy_buf,
+                                );
+                                assert_eq!(rows, expected_first_rows);
+                                std::hint::black_box((bytes, comps, allocs));
+                            })
+                        },
+                    );
+                    group.bench_with_input(
+                        BenchmarkId::new("ffi_open_limited_full", &label),
+                        &expected_first_rows,
+                        |b, _| {
+                            b.iter(|| {
+                                let rows = open_first_limited_prefixes_count(
+                                    &d,
+                                    &prefixes,
+                                    row_limit,
+                                    &mut ffi_buf,
+                                );
+                                assert_eq!(rows, expected_first_rows);
+                                std::hint::black_box(rows);
+                            })
+                        },
+                    );
+                }
+            }
+        }
+    }
+    set_s2_pinned_override(None);
+    group.finish();
+}
+
 fn drain_prefix_compat_row_by_row(d: &FfiDb, prefix: &[u8], copy_payloads: bool) -> u64 {
     let mut iter: FrsIterator = std::ptr::null_mut();
     let rc =
@@ -2396,6 +2709,7 @@ criterion_group!(
     bench_q7_iter_probe_ffi,
     bench_q19_iter_topn_ffi,
     bench_q7_q19_open_first_slice_ffi,
+    bench_q7_q19_prefix_build_fill_diag,
     bench_compat_jni_prefix_proxy,
     bench_q19_append_merge_chain_ffi,
     bench_q19_merge_chain_read_lifecycle_ffi,
