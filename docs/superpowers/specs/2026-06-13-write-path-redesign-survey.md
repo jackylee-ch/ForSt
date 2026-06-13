@@ -740,6 +740,195 @@ timer/seq-keyed-state shape; 3 × 90 s medians):
    OFF; zero FileMappingManager edits needed — levels are manifest
    metadata over a flat namespace).
 
+## 11. CYCLE 1 — combined-config write-amp floor + Q4/Q7/Q19 residual models (2026-06-13, PMC-1 standing Phase-1 write-amp owner)
+
+Tip `eccec55a1` (sorted-run default-ON; KV-sep `FRS_KV_SEPARATION`, trivial-move
+`FRS_TRIVIAL_MOVE`, lifecycle `FRS_LIFECYCLE_SEGMENTS`, vlog-GC all default-OFF).
+Suite: WA-V engine UTs 11/11 green; `cargo clippy -p forst-rs-engine -p forst-rs-bench
+--release` clean. Cells: churn_probe medians-of-3 × 90 s, same-session A/B per shape,
+Mac system-allocator, methodology identical to §2. Raw:
+`target/churn_results_cycle1/*.log`.
+
+### 11.1 Combined-config floor — do KV-sep + trivial-move compose or overlap?
+
+Two key shapes, each a clean same-session A/B of {baseline, kvsep-only, tmove-only,
+BOTH-on}. The combined cell holds `FRS_KV_SEPARATION` AND `FRS_TRIVIAL_MOVE` on together
+(the engine paths are orthogonal — trivial move re-levels file metadata regardless of
+whether the SST carries full values or 21-B BlobRef pointers; KV-sep diverts values at
+flush; vlog-GC accounting bounds the segment footprint).
+
+**q7-shaped cell** (default churn: random hash-bucket keys + TTL deletes — the q7/q9/q20
+interval-join shape):
+
+| Cell | write-amp | p50 late (µs) | p99 (µs) | last L0 | vlog MiB |
+|---|---|---|---|---|---|
+| q7-default (both OFF) | **7.22** | 978 | 2 109 | 1 | 0 |
+| q7-kvsep | **1.56** | 721 | 1 166 | 4 | 978 |
+| q7-tmove | **7.42** | 619 | 1 126 | 1 | 0 |
+| **q7-combined (BOTH ON)** | **1.56** | **667** | 952 | 3 | 940 |
+
+**seq-keys cell** (`--seq-keys --no-deletes`: globally monotone keys — the
+timer / changelog / seq-keyed-state shape, trivial-move-favorable):
+
+| Cell | write-amp | p50 late (µs) | p99 (µs) | last L0 | vlog MiB |
+|---|---|---|---|---|---|
+| seq-rewrite (both OFF) | **2.96** | 555 | 627 | 1 | 0 |
+| seq-kvsep | **1.09** | 637 | 747 | 1 | 3 560 † |
+| seq-tmove | **0.98** | 553 | 635 | 1 | 0 |
+| seq-combined (BOTH ON) | **1.03** | 635 | 803 | 1 | 3 560 † |
+
+† no-deletes ⇒ nothing dies ⇒ V2b GC never reclaims ⇒ vlog grows with the dataset
+(the `--no-deletes` accounting artifact, §8 cell-F class); under real TTL churn V2b
+bounds it to ≈1.04× live (§10.3). The write-amp/probe numbers are unaffected (vlog
+append is counted in physical bytes either way).
+
+### 11.2 Finding — the levers OVERLAP by shape, they do NOT compose
+
+**Headline combined write-amp floor: there is no stacking gain. The floor on each shape
+is set by whichever single lever fits the key geometry, and that floor is ~1×.**
+
+1. **q7-shaped: combined 1.56 = kvsep-only 1.56 exactly.** Trivial-move is *inert* on
+   random/hash keys (7.42 alone ≈ the 7.22 baseline — it fires on ~0 % of compactions
+   because random-bucket flushes overlap, so no compaction is non-overlapping). This is
+   the direct empirical confirmation of the sorted-run §M2 model ("trivial-movable
+   fraction at uniform keys ≈ 0") and of survey §10.4's own scoping. **KV-sep does 100 %
+   of the work** on the join shape: 7.22 → 1.56 = a **4.6× write-volume cut** (probe p50
+   *improves* 978 → 667 µs — the §3.1 prediction that 21-B pointers shrink the S2 merge
+   buffers vs 220-B values, measured here as a net read win, NOT the 1.17× regression the
+   §10.2 chunk-cell showed; that regression was a fan-out artifact of that cell's L0=4).
+2. **seq-keys: kvsep 1.09, tmove 0.98, combined 1.03 — both reach the flush floor by
+   DIFFERENT routes, redundantly.** Trivial-move makes the disjoint demotion
+   metadata-only (0.98 = pure flush floor); KV-sep diverts the 200-B values to the vlog so
+   the key-LSM that still rewrites carries only 21-B pointers (1.09). Running both gives
+   1.03 — marginally *worse* than tmove-alone, because KV-sep's vlog-append + pointer-SST
+   framing is slightly heavier than tmove's zero-byte metadata edit. They are
+   **substitutes, not complements**, on this shape.
+
+**Correctness guard for the combined config** (the configuration this section claims):
+engine UT `test_cycle1_kvsep_and_trivial_move_compose_metadata_only_and_exact` drives
+seq-disjoint big-value flushes with BOTH flags ON, asserts the rollup is a metadata-only
+move of the **pointer-bearing** SSTs (same file numbers, L0 drained) AND that every
+separated value derefs byte-exactly post-move across point / batch / scan / snapshot —
+i.e. trivial move correctly re-levels BlobRef SSTs without disturbing the vlog
+indirection. Green at tip.
+
+**Conclusion (the "write-amp solved" metric):** the q7-shaped (join) write-amp floor is
+**1.56×** (KV-sep), and the seq-keyed (timer/changelog) floor is **0.98×** (trivial move)
+— **both are ~1× and both are already shipped (flag-gated, default-OFF)**. KV-sep is the
+more *general* single lever (it also covers the seq shape at 1.09×); trivial-move is the
+cheaper lever where it applies (monotone keys), and it is free on S3 (zero upload). The
+write-amp paradigm question is answered at the engine level: **across both NexMark state
+geometries, physical write-amp drops from 3–7.5× to ≈1×, gated medians-of-3.** What is
+NOT yet closed is the *default-ON / Flink-adoption / remote-validation* leg (§11.4).
+
+### 11.3 Q4 / Q7 / Q19 residual cost models (levers ON)
+
+Re-derived from the recorded profiles (master-strategy §A.3, sorted-run §1.1/§8,
+q7-analysis §1–2, q19 design doc) re-read against the §11.1 measured floors. The question
+per query: with the write-amp levers ON, is the residual write-amp (more lever work),
+read/scan (gate `FRS_COMPACT_WINDOWED` / S2), or framework (out of engine scope)?
+
+**Q7 — was: write-volume-bound (the WORST goal-1 row, frs 2 376.4 s vs bar ~1 380 s).**
+Recorded root cause (q7-analysis §1, sorted-run §1.1): I/O volume = write-amp ×
+(1/compression) × read-amp; frs writes ~13 KB/event vs ForSt ~1.4 KB/event (~10×) at
+98–99 % disk util — *the disk is the binding resource*, CPU/FFM/probe-merge exonerated (S2
+falsifier +3.1 %). Decompose the ~10× event-byte gap against the measured levers:
+  - **write-amp share — NOW LEVERED.** 7.22 → 1.56 (KV-sep) = 4.6× of the ~10×. q7 state
+    is interval-join state on hash keys ⇒ the KV-sep shape exactly (Unbounded CF, no merge
+    op) ⇒ the §11.1 q7-cell IS the q7 model. **Residual write-amp after KV-sep ≈ 1.56×.**
+  - **compression share — STILL OPEN, multiplicative.** frs runs `FRS_SST_COMPRESSION=none`
+    while ForSt/RocksDB run Snappy (sorted-run W5) — a pure ÷2–3 disk-bytes term the levers
+    do not touch. This is the single largest UN-levered q7 byte source remaining (sorted-run
+    M5, "still owed").
+  - **read-amp share (L0 fan-out).** Levered partially by S2 (shipped) + `FRS_COMPACT_WINDOWED`
+    (L4, built, default-OFF) + sorted-run discipline; the §11.1 q7-cell shows KV-sep already
+    *cuts* probe p50 (978 → 667) by shrinking merge buffers.
+  **Residual model:** after KV-sep the q7 residual is **(a) compression (M5, ÷2–3, the
+  biggest remaining byte lever) and (b) read/scan (L4/S2)** — NOT more write-amp lever work.
+  Leave-saturation model (sorted-run §8): a 4.6× write-volume cut takes util well below
+  90 %, so the wall improvement is ~proportional once de-saturated → projects q7 toward the
+  ~1 380 s bar. **Next lever named: M5 SST compression parity (`FRS_SST_COMPRESSION` Snappy/LZ4
+  on the remote runner), then L4 `FRS_COMPACT_WINDOWED` gate.** Both engine-transparent; the
+  binding gate is the bridge-blocked remote q7 iostat A/B (V1 gate (c)) which must confirm
+  the ≥3× write-volume cut transfers off-Mac before the compression term is sized on the box.
+
+**Q19 — was: 1.70× (310 vs 528 / 308), FAIL both.** Recorded decomposition (q19 design doc
+§Evidence; master-strategy §A.3): wall = ~78 % write-path (92 M puts + compaction) + ~22 %
+MAP_ITER read-open. The *findRow O(n²)* hotspot (52 % on-CPU) is FIXED (flink 92a5d7c400b);
+the recorded host L0-cap A/B showed "shrinking L0 helps reads but **compaction eats the
+gain** ⇒ forst-rs compaction is more expensive per byte than RocksDB."
+  - **The dominant ~78 % write/compaction share is exactly what KV-sep attacks.** q19 state
+    is auction MapState — Put-dominated, value-bearing, Unbounded, no merge op ⇒ KV-sep
+    eligible ⇒ the §11.1 q7-cell floor (7.22 → 1.56) applies to its compaction byte volume.
+    "Compaction eats the read gain" *because* compaction was moving 220-B values; under
+    KV-sep it moves 21-B pointers ⇒ the L0-cap read win is no longer eaten. **This is the
+    named q19 write-side lever: KV-sep removes the compaction-byte tax that the L0-cap A/B
+    proved was capping the read prune.**
+  - **The ~22 % read-open residual** is partly engine (S2/L4, partial) and partly the Java
+    `frs_vec_iter_prefix_open_batch` handle alloc/register/close on ~6 M exhausted iters
+    (2026-06-07 q9/q19 skip-exhausted-iter design) — that leg is a Java-FFI change, **OUT OF
+    SCOPE** (operator/Java-layer, per the lifecycle decision). The diffuse serde residual
+    (RowDataSerializer copy + hashOf, no hotspot ≥10 %) is also framework, out of scope.
+  **Residual model:** q19's binding residual after KV-sep is **NOT write-amp** (levered 4.6×)
+  and **NOT a single engine read hotspot** — it is the Java iteration-layer overhead +
+  diffuse serde (framework, out of engine scope). Engine-side: **KV-sep is the q19 lever;
+  next engine read lever named = `FRS_COMPACT_WINDOWED` (L4) for the compaction-input read
+  share.** Gate: remote q19 A/B (bridge-blocked).
+
+**Q4 — was: BEATS ForSt by 669 s; RDB gap +70.3 s (1.23× M).** Recorded (2026-06-06
+campaign, master-strategy §A.3): the RDB gap is **diffuse per-record efficiency** — config
+exhausted, no single lever ≥ 2 %; WAL/memory/operator/zero-copy all tested and ruled out.
+  - **Q4 is NOT write-amp-bound in the KV-sep sense.** q4 is a windowed aggregation
+    (count/sum over auction windows) — its hot state is *accumulator* state under
+    Reducing/Aggregating semantics, which the engine stores as **merge operands**
+    (`RawConcatMergeOperator`). Per P12 (survey §1) merge-operand CFs are **KV-sep-exempt**
+    (pointers don't concat) ⇒ the §11.1 KV-sep floor does NOT apply to q4's hot CF.
+  - q4's key stream is auction-id-keyed (not globally monotone) ⇒ trivial-move's
+    applicable fraction is the random-key ≈ 0 case (§11.2 q7 finding), so trivial-move is
+    inert for q4 too.
+  **Residual model:** q4's +70.3 s residual is **neither KV-sep nor trivial-move
+  addressable** — it is the recorded diffuse per-record constant factor (FFM + engine vs
+  JNI + native), confirmed by the merge-operand exemption. The named next lever for q4 is
+  **NOT a write-amp lever**; it is the merge-chain / per-record reduce path
+  (OPT-N04-class ReducingState write-back, recorded as the q12/q8 canary population) —
+  which is a separate (largely Java-side) campaign, out of this Phase-1 write-amp scope.
+  **Q4 verdict: write-amp is already at parity-or-better for q4 (it beats ForSt); the RDB
+  residual is out of the write-amp lever family.**
+
+### 11.4 What remains for "write-amp fully resolved"
+
+Engine-level write-amp is **measured-solved** (≈1× on both shapes, gated). The unresolved
+legs are validation/adoption, not new engine levers:
+
+1. **Compression parity (M5) — the one un-levered q7 byte source.** frs `none` vs
+   ForSt/RocksDB Snappy is a ÷2–3 disk-bytes term orthogonal to (multiplicative with) the
+   write-amp cut. This is the highest-leverage REMAINING engine-transparent lever for the
+   q7 disk-saturation wall. Owed; sized by the remote A/B.
+2. **Remote q7/q19/q20 iostat A/B (V1 gate (c) / V2 gate (c))** — confirm the ≥3× (q7) /
+   4.6× (measured) write-volume cut transfers off-Mac and de-saturates the disk
+   (util < 90 %). **BRIDGE-BLOCKED** (user fingerprint) — out of this agent's scope; it
+   gates default-ON and validates P3 before any further write-amp spend.
+3. **Flink adoption (`wa-java/` + ADOPTION-GATES C1-C6)** — byte-exact q5/q8/q11 + the
+   default-ON disposition. Java-layer, out of engine scope.
+4. **No further engine write-amp lever is justified by CYCLE-1 evidence.** KV-sep covers
+   the join shape (1.56), trivial-move covers the seq shape (0.98), they do not stack, and
+   q4's residual is provably outside the lever family (merge-operand exemption). The next
+   engine spend is read/scan (L4 gate) and compression (M5), not more write-amp machinery.
+
+Raw cell medians (this session):
+```
+MEDIANS label=q7-default   write_amp=7.22 p50_late_us=978 p99_late_us=2109 last_l0=1 vlog_mib=0    (n=3)
+MEDIANS label=q7-kvsep      write_amp=1.56 p50_late_us=721 p99_late_us=1166 last_l0=4 vlog_mib=978  (n=3)
+MEDIANS label=q7-tmove      write_amp=7.42 p50_late_us=619 p99_late_us=1126 last_l0=1 vlog_mib=0    (n=3)
+MEDIANS label=q7-combined   write_amp=1.56 p50_late_us=667 p99_late_us=952  last_l0=3 vlog_mib=940  (n=3)
+MEDIANS label=seq-rewrite   write_amp=2.96 p50_late_us=555 p99_late_us=627  last_l0=1 vlog_mib=0    (n=3)
+MEDIANS label=seq-kvsep     write_amp=1.09 p50_late_us=637 p99_late_us=747  last_l0=1 vlog_mib=3560 (n=3)
+MEDIANS label=seq-tmove     write_amp=0.98 p50_late_us=553 p99_late_us=635  last_l0=1 vlog_mib=0    (n=3)
+MEDIANS label=seq-combined  write_amp=1.03 p50_late_us=635 p99_late_us=803  last_l0=1 vlog_mib=3560 (n=3)
+```
+
+---
+
 External references: WiscKey — Lu, Pillai, Gunawi, Arpaci-Dusseau, Arpaci-Dusseau,
 "WiscKey: Separating Keys from Values in SSD-conscious Storage", FAST '16.
 Dostoevsky — Dayan, Idreos, "Dostoevsky: Better Space-Time Trade-Offs for LSM-Tree

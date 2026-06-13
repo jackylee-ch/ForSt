@@ -16984,6 +16984,86 @@ mod tests {
         set_trivial_move_override(None);
     }
 
+    /// CYCLE-1 combined-config guard (survey §11): KV-separation AND
+    /// trivial-move ON TOGETHER on the seq-disjoint shape. The flushed L0
+    /// SSTs carry 21-B BlobRef pointers (values diverted to .vlog); the
+    /// disjoint rollup must still be satisfied by a METADATA-ONLY move
+    /// (the move re-levels the pointer-bearing SSTs without rewrite — no
+    /// new SST file number), and every separated value must deref
+    /// byte-exactly after the move. This is the exact configuration the
+    /// §11.1 combined-floor cell measures.
+    #[test]
+    fn test_cycle1_kvsep_and_trivial_move_compose_metadata_only_and_exact() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        set_trivial_move_override(Some(true));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("combo"))
+            .unwrap();
+
+        // Two key-disjoint flushes, each value ≥128 B ⇒ separated to vlog.
+        let mk = |seed: u8| -> Vec<u8> { (0..300u32).map(|i| (i as u8) ^ seed).collect() };
+        for i in 0..100u32 {
+            db.put(&cf, format!("a{i:04}").as_bytes(), &mk(0x11)).unwrap();
+        }
+        let m1 = db.switch_and_flush(&cf).unwrap().expect("flushed");
+        for i in 0..100u32 {
+            db.put(&cf, format!("b{i:04}").as_bytes(), &mk(0x22)).unwrap();
+        }
+        let m2 = db.switch_and_flush(&cf).unwrap().expect("flushed");
+
+        // Values were separated: a vlog segment per flush.
+        let v0 = db.version_set.current();
+        assert_eq!(
+            v0.vlog_segments.iter().filter(|s| s.cf_id == cf.id()).count(),
+            2,
+            "each big-value flush must separate to its own vlog segment"
+        );
+        let sst_moved: std::collections::HashSet<u64> =
+            [m1.file_number.value(), m2.file_number.value()].into();
+
+        // Disjoint L0 of pointer-bearing SSTs + empty dest ⇒ trivial move.
+        db.compact_all().unwrap();
+        let v = db.version_set.current();
+        let live_sst: std::collections::HashSet<u64> = v
+            .live_sst_files_iter()
+            .filter(|f| f.cf_id == cf.id())
+            .map(|f| f.file_number.value())
+            .collect();
+        assert_eq!(
+            live_sst, sst_moved,
+            "trivial move must re-level the SAME pointer-bearing SSTs (no rewrite) \
+             even with KV-separation on"
+        );
+        assert_eq!(
+            v.l0_files().iter().filter(|f| f.cf_id == cf.id()).count(),
+            0,
+            "L0 must drain via the move"
+        );
+
+        // Byte-exact derefs survive the metadata-only move (point, batch,
+        // scan, snapshot).
+        assert_eq!(db.get(&cf, b"a0000").unwrap().as_deref(), Some(&mk(0x11)[..]));
+        assert_eq!(db.get(&cf, b"b0099").unwrap().as_deref(), Some(&mk(0x22)[..]));
+        let got = db.batch_get(&cf, &[b"a0050", b"b0050", b"zmiss"]).unwrap();
+        assert_eq!(got[0].as_deref(), Some(&mk(0x11)[..]));
+        assert_eq!(got[1].as_deref(), Some(&mk(0x22)[..]));
+        assert_eq!(got[2], None);
+        let rows_a = db.prefix_scan(&cf, b"a").unwrap();
+        assert_eq!(rows_a.len(), 100);
+        assert!(rows_a.iter().all(|(_, rv)| rv == &mk(0x11)));
+        let snap = db.snapshot();
+        assert_eq!(
+            db.get_at_cf(&cf, &snap, b"b0001").unwrap().as_deref(),
+            Some(&mk(0x22)[..])
+        );
+        drop(snap);
+
+        set_kv_separation_override(None);
+        set_trivial_move_override(None);
+    }
+
     /// FRS-WA-V2a-2 checkpoint/restore with a LIVE vlog: the full
     /// checkpoint copies the segments, the manifest (blob v5) carries the
     /// table, restore re-adopts them, and every read path derefs
