@@ -21669,6 +21669,17 @@ mod tests {
 
     #[test]
     fn test_deletion_guard_protects_pinned_files_during_compaction() {
+        // This test exercises the REWRITE compaction path, which obsoletes the
+        // compacted-away input SST and queues it for deletion. The trivial-move
+        // (FRS-WA-V3) path instead RE-LEVELS the same file to L1 (it stays live,
+        // is never queued for deletion) — a fundamentally different lifecycle.
+        // `TRIVIAL_MOVE_OVERRIDE` is a PROCESS-GLOBAL atomic that the sibling
+        // `test_wa_v3_trivial_move_*` / `test_cycle1_kvsep_*` tests flip to
+        // `true` under `WA_V1_TEST_LOCK`. Take the SAME lock and pin the flag
+        // OFF for our duration so a concurrent run of those tests cannot make
+        // our single-file rollup take the move path (the parallel-suite flake).
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_trivial_move_override(Some(false));
         let db = open();
         let cf = db.default_cf();
         db.put(&cf, b"k", b"v").unwrap();
@@ -21683,14 +21694,26 @@ mod tests {
             "pinned file must survive"
         );
         drop(pin);
-        // Trigger a reap via another flush/compact cycle.
-        db.put(&cf, b"other", b"v2").unwrap();
-        db.switch_and_flush(&cf).unwrap().unwrap();
-        db.compact_l0(&cf).unwrap();
-        assert!(
-            !db.fs.file_exists(&path).unwrap(),
-            "file must be deleted after pin release"
-        );
+        // Releasing the pin makes the file reclaimable, but the queued deletion
+        // only reaps once the retiring version drops its last reader — which
+        // happens as engine activity (writes/flushes/compactions) churns
+        // ArcSwap's version load slots, NOT deterministically after exactly one
+        // flush+compact. Drive a few such cycles, polling for the reap (same
+        // pattern as `test_compaction_defers_delete_while_read_version_held`).
+        // Bounded so a true reap leak still fails.
+        let mut reaped = false;
+        for i in 0..16 {
+            db.put(&cf, format!("other{i}").as_bytes(), b"v2").unwrap();
+            db.switch_and_flush(&cf).unwrap().unwrap();
+            db.compact_l0(&cf).unwrap();
+            db.reap_pending_deletions();
+            if !db.fs.file_exists(&path).unwrap() {
+                reaped = true;
+                break;
+            }
+        }
+        assert!(reaped, "file must be deleted after pin release");
+        set_trivial_move_override(None);
     }
 
     /// 2026-05-30 OBSOLETE-FILE LIFETIME regression test: a compaction must NOT
