@@ -133,3 +133,11 @@ path = "src/bin/disagg_vs_forst.rs"
 [[bin]]
 name = "remote_compaction_offload"
 path = "src/bin/remote_compaction_offload.rs"
+
+# FRS-PHASE2 NEXMARK-shaped disagg validation: drives q5/q7/q9-q20/q4 query-
+# shaped state workloads through the full disaggregated path on fs-emulation,
+# disagg-ON vs disagg-OFF, with a correctness gate + S3 bandwidth projection.
+# Wall-clock loop (not criterion); takes --smoke for CI.
+[[bin]]
+name = "nexmark_disagg_s3"
+path = "src/bin/nexmark_disagg_s3.rs"
