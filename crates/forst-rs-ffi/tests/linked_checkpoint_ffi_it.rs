@@ -393,3 +393,142 @@ fn sweep_abandoned_checkpoints_reaps_journal_only_links() {
         assert_eq!(frs_db_close(db), FRS_STATUS_OK);
     }
 }
+
+unsafe fn put_raw(db: FrsDb, cf: FrsCfHandle, key: &[u8], val: &[u8]) {
+    assert_eq!(
+        frs_put(db, cf, key.as_ptr(), key.len(), val.as_ptr(), val.len()),
+        FRS_STATUS_OK
+    );
+}
+
+unsafe fn get_raw_present(db: FrsDb, cf: FrsCfHandle, key: &[u8]) -> bool {
+    let mut out = FrsBytes::default();
+    assert_eq!(
+        frs_get(db, cf, key.as_ptr(), key.len(), &mut out),
+        FRS_STATUS_OK
+    );
+    !out.data.is_null()
+}
+
+/// FRS-PHASE2-C2U3 (rescale-by-clip) FFI round trip: build a checkpoint
+/// spanning four 2-byte big-endian "key-group" prefixes, then restore only
+/// the `[0x0001, 0x0003)` sub-range. Keys in groups 1–2 survive; groups 0
+/// and 3 are clipped out (file-level + read-path). Mirrors the backend's
+/// composite-key encoding `[kg_be16][user-key]`.
+#[test]
+fn linked_checkpoint_instant_clipped_adopts_only_assigned_range() {
+    unsafe {
+        let dir = TempDir::new().unwrap();
+        let (db, cf) = open_local(&dir);
+        // Four groups, distinct big-endian prefixes; flush so they land in
+        // SSTs (the file-level clip operates on the restored Version).
+        for kg in 0u16..4 {
+            for i in 0..8u32 {
+                let mut key = kg.to_be_bytes().to_vec();
+                key.extend_from_slice(format!("-user{i:02}").as_bytes());
+                put_raw(db, cf, &key, format!("val-{kg}-{i}").as_bytes());
+            }
+        }
+        assert_eq!(frs_flush(db), FRS_STATUS_OK);
+
+        let (mut result, ckpt_dir) = linked_ckpt(db, 1, 0);
+
+        // Clip to assigned key-group sub-range [1, 3): start = 0x0001,
+        // end (exclusive) = 0x0003.
+        let clip_start = 1u16.to_be_bytes();
+        let clip_end = 3u16.to_be_bytes();
+
+        let target = TempDir::new().unwrap();
+        let target_str = target.path().join("restored-clip");
+        let ckpt_c = CString::new(ckpt_dir.to_str().unwrap()).unwrap();
+        let target_c = CString::new(target_str.to_str().unwrap()).unwrap();
+        let mut restored: FrsDb = ptr::null_mut();
+        assert_eq!(
+            frs_db_open_from_linked_checkpoint_instant_clipped(
+                ckpt_c.as_ptr(),
+                target_c.as_ptr(),
+                clip_start.as_ptr(),
+                clip_start.len(),
+                clip_end.as_ptr(),
+                clip_end.len(),
+                &mut restored
+            ),
+            FRS_STATUS_OK
+        );
+
+        let mut rcf: FrsCfHandle = ptr::null_mut();
+        assert_eq!(frs_db_default_cf(restored, &mut rcf), FRS_STATUS_OK);
+
+        // Groups 1 and 2 are present; groups 0 and 3 are clipped out.
+        for kg in 0u16..4 {
+            let in_range = kg == 1 || kg == 2;
+            for i in 0..8u32 {
+                let mut key = kg.to_be_bytes().to_vec();
+                key.extend_from_slice(format!("-user{i:02}").as_bytes());
+                assert_eq!(
+                    get_raw_present(restored, rcf, &key),
+                    in_range,
+                    "kg={kg} i={i} expected present={in_range}"
+                );
+            }
+        }
+
+        // Empty clip (start >= end) is rejected at the FFI boundary.
+        let mut bad: FrsDb = ptr::null_mut();
+        let empty_lo = 3u16.to_be_bytes();
+        let empty_hi = 1u16.to_be_bytes();
+        assert_eq!(
+            frs_db_open_from_linked_checkpoint_instant_clipped(
+                ckpt_c.as_ptr(),
+                target_c.as_ptr(),
+                empty_lo.as_ptr(),
+                empty_lo.len(),
+                empty_hi.as_ptr(),
+                empty_hi.len(),
+                &mut bad
+            ),
+            FRS_STATUS_INVALID_ARGUMENT
+        );
+
+        assert_eq!(
+            frs_db_linked_checkpoint_result_free(&mut result),
+            FRS_STATUS_OK
+        );
+        assert_eq!(frs_db_close(restored), FRS_STATUS_OK);
+        assert_eq!(frs_db_close(db), FRS_STATUS_OK);
+    }
+}
+
+/// `frs_set_env` plumbs a process env var the engine reads (the backend's
+/// feature-flag bridge). Null args and malformed names are rejected without
+/// aborting; a valid set is observable via `std::env::var`.
+#[test]
+fn set_env_plumbs_and_rejects_bad_input() {
+    unsafe {
+        // Use a test-private name to avoid perturbing the engine's cached
+        // feature OnceLocks in this shared test process.
+        let name = CString::new("FRS_FFI_SET_ENV_PROBE").unwrap();
+        let value = CString::new("hello").unwrap();
+        assert_eq!(frs_set_env(name.as_ptr(), value.as_ptr()), FRS_STATUS_OK);
+        assert_eq!(std::env::var("FRS_FFI_SET_ENV_PROBE").unwrap(), "hello");
+
+        // Null pointers.
+        assert_eq!(
+            frs_set_env(ptr::null(), value.as_ptr()),
+            FRS_STATUS_NULL_ARG
+        );
+        assert_eq!(frs_set_env(name.as_ptr(), ptr::null()), FRS_STATUS_NULL_ARG);
+
+        // Empty name and `=`-bearing name are rejected (would panic set_var).
+        let empty = CString::new("").unwrap();
+        assert_eq!(
+            frs_set_env(empty.as_ptr(), value.as_ptr()),
+            FRS_STATUS_INVALID_ARGUMENT
+        );
+        let eq_name = CString::new("BAD=NAME").unwrap();
+        assert_eq!(
+            frs_set_env(eq_name.as_ptr(), value.as_ptr()),
+            FRS_STATUS_INVALID_ARGUMENT
+        );
+    }
+}

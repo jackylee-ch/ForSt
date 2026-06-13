@@ -830,6 +830,9 @@ pub unsafe extern "C" fn frs_db_open_remote_with_options(
             builder = builder
                 .write_buffer_manager_capacity_bytes(cfg.write_buffer_manager_capacity_bytes);
         }
+        if let Some(codec) = sst_compression_from_discriminant(cfg.sst_compression) {
+            builder = builder.compression(codec);
+        }
         let mut engine_opts = match builder.try_build() {
             Ok(o) => o,
             Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
@@ -1043,6 +1046,31 @@ pub struct FrsEngineOptions {
     /// Cross-CF memtable budget in bytes (WriteBufferManager).
     /// `0` = engine default (512 MiB; spec §6d).
     pub write_buffer_manager_capacity_bytes: u64,
+    /// SST data-block compression codec (FRS-PHASE2 fairness fix — the
+    /// engine default is already LZ4, matching ForSt/RocksDB; this exposes
+    /// it as a backend config option). Append-only field (ABI-stable):
+    /// older consumers leave it `0`.
+    ///   - `0` = engine default (LZ4)
+    ///   - `1` = `none`
+    ///   - `2` = `lz4`
+    ///   - `3` = `zstd`
+    ///
+    /// The `FRS_SST_COMPRESSION` env var (when set) still takes precedence
+    /// on the remote open path, preserving the per-run tuning hook.
+    pub sst_compression: u32,
+}
+
+/// Maps the `FrsEngineOptions::sst_compression` discriminant to the engine
+/// codec. `0` (and any unknown value) ⇒ `None`, signalling "leave the
+/// builder default" to the caller (the default is LZ4).
+fn sst_compression_from_discriminant(v: u32) -> Option<forst_rs_common::CompressionType> {
+    use forst_rs_common::CompressionType;
+    match v {
+        1 => Some(CompressionType::None),
+        2 => Some(CompressionType::Lz4),
+        3 => Some(CompressionType::Zstd),
+        _ => None,
+    }
 }
 
 /// Opens a new engine using a structured options blob. Backwards-compatible
@@ -1100,6 +1128,9 @@ pub unsafe extern "C" fn frs_db_open_with_options(
             builder = builder
                 .write_buffer_manager_capacity_bytes(cfg.write_buffer_manager_capacity_bytes);
         }
+        if let Some(codec) = sst_compression_from_discriminant(cfg.sst_compression) {
+            builder = builder.compression(codec);
+        }
 
         let engine_opts = match builder.try_build() {
             Ok(o) => o,
@@ -1124,6 +1155,53 @@ pub unsafe extern "C" fn frs_db_open_with_options(
             }
             Err(e) => error_to_status(&e),
         }
+    })
+}
+
+/// FRS-PHASE2 backend feature-flag plumbing. Sets a process environment
+/// variable from the (in-process) Flink backend so the engine's env-gated
+/// feature flags — `FRS_KV_SEPARATION`, `FRS_KV_MIN_BLOB_SIZE`,
+/// `FRS_TRIVIAL_MOVE`, `FRS_REMOTE_COMPACTION`, `FRS_VLOG_COMPRESSION`,
+/// `FRS_SST_COMPRESSION`, … — observe the configured value.
+///
+/// **Why an FFI setter and not `System.setProperty`?** The engine reads
+/// these via `std::env::var(...)` (POSIX `getenv`), which the JVM's Java
+/// system-property table does NOT feed. Because the backend and the engine
+/// share ONE process (the dylib is loaded into the JVM), a single
+/// `std::env::set_var` here is visible to the engine. Each flag is cached
+/// in an engine-side `OnceLock` on FIRST observation (KV-sep at first
+/// flush, trivial-move at first compaction, remote-compaction / SST
+/// compression at `frs_db_open*`), so the backend MUST call this BEFORE the
+/// first `frs_db_open*` for the value to take effect — which is exactly the
+/// backend's open-time config-plumbing point.
+///
+/// Returns `FRS_STATUS_OK` on success, `FRS_STATUS_NULL_ARG` if either
+/// pointer is null, `FRS_STATUS_INVALID_ARGUMENT` if the name/value are not
+/// valid UTF-8 or the name is empty / contains `=` or NUL.
+///
+/// # SAFETY
+/// - `name` and `value` must be NUL-terminated UTF-8 for the call's duration.
+#[no_mangle]
+pub unsafe extern "C" fn frs_set_env(name: *const c_char, value: *const c_char) -> i32 {
+    guarded(|| {
+        if name.is_null() || value.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let name_str = match cstr_to_str(&name) {
+            Some(s) => s,
+            None => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        let value_str = match cstr_to_str(&value) {
+            Some(s) => s,
+            None => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        // `set_var` panics on an empty name or a name/value containing `=`
+        // or NUL — reject those up front so the FFI never aborts the JVM.
+        if name_str.is_empty() || name_str.contains('=') || name_str.contains('\0') {
+            return FRS_STATUS_INVALID_ARGUMENT;
+        }
+        std::env::set_var(name_str, value_str);
+        FRS_STATUS_OK
     })
 }
 
@@ -4896,6 +4974,185 @@ pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant_remote(
             Err(e) => error_to_status(&e),
         }
     })
+}
+
+/// FRS-PHASE2-C2U3 (rescale-by-clip, paper §5.2 / Fig. 10): INSTANT-LINK
+/// restore that ADOPTS ONLY the half-open key range `[clip_start, clip_end)`
+/// of the linked checkpoint — the rescale-aware companion to
+/// [`frs_db_open_from_linked_checkpoint_instant`]. On rescale, each new
+/// sub-task is assigned a key-group SUB-range of the source; passing that
+/// sub-range's key-prefix bounds lets the engine drop fully-disjoint SSTs
+/// from the restored Version (file-level clip) and install a read-path clip
+/// for boundary SSTs, so the sub-task sees only its own state without a
+/// download or a row-by-row copy.
+///
+/// The clip bounds are raw composite-key prefix bytes (the backend's
+/// key-group encoding): `clip_start` is the inclusive low bound (e.g. the
+/// 2-byte big-endian first assigned key group), `clip_end` the exclusive
+/// high bound (the 2-byte big-endian (last+1) key group). An empty range
+/// (`start >= end`) is rejected with `FRS_STATUS_INVALID_ARGUMENT`.
+///
+/// # SAFETY
+/// - `ckpt_dir` / `target_dir` NUL-terminated UTF-8; `out_handle` valid.
+/// - `clip_start` must point to `clip_start_len` bytes (or be null when 0);
+///   `clip_end` to `clip_end_len` bytes (or be null when 0).
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant_clipped(
+    ckpt_dir: *const c_char,
+    target_dir: *const c_char,
+    clip_start: *const u8,
+    clip_start_len: usize,
+    clip_end: *const u8,
+    clip_end_len: usize,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if out_handle.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let ckpt = match cstr_to_str(&ckpt_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let target = match cstr_to_str(&target_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let clip = match read_clip_range(clip_start, clip_start_len, clip_end, clip_end_len) {
+            Some(r) => r,
+            None => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        let fs: std::sync::Arc<dyn forst_rs_io::FileSystem> =
+            std::sync::Arc::new(forst_rs_io::LocalFileSystem::new());
+        match DbImpl::open_from_linked_checkpoint_instant_clipped_with_default_cf(
+            fs,
+            Path::new(&ckpt),
+            &target,
+            clip,
+            raw_concat_default_cf_descriptor(),
+        ) {
+            Ok(db) => {
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// REMOTE-primary variant of
+/// [`frs_db_open_from_linked_checkpoint_instant_clipped`] — the rescale-aware
+/// download-skip restore over an OpenDAL engine filesystem (same `uri` /
+/// `opendal_config_json` / cache parameters as
+/// [`frs_db_open_from_linked_checkpoint_instant_remote`]).
+///
+/// # SAFETY
+/// - String args NUL-terminated UTF-8 (`opendal_config_json` may be null);
+///   `out_handle` valid. Clip-byte pointers as in the local variant.
+#[no_mangle]
+pub unsafe extern "C" fn frs_db_open_from_linked_checkpoint_instant_clipped_remote(
+    uri: *const c_char,
+    opendal_config_json: *const c_char,
+    cache_dir: *const c_char,
+    cache_capacity_bytes: u64,
+    ckpt_dir: *const c_char,
+    target_dir: *const c_char,
+    clip_start: *const u8,
+    clip_start_len: usize,
+    clip_end: *const u8,
+    clip_end_len: usize,
+    out_handle: *mut FrsDb,
+) -> i32 {
+    guarded(|| {
+        if out_handle.is_null() {
+            return FRS_STATUS_NULL_ARG;
+        }
+        let uri_str = match cstr_to_str(&uri) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let cache_dir_str = match cstr_to_str(&cache_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let ckpt = match cstr_to_str(&ckpt_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let target = match cstr_to_str(&target_dir) {
+            Some(s) => s.to_string(),
+            None => return FRS_STATUS_NULL_ARG,
+        };
+        let json_str = if opendal_config_json.is_null() {
+            String::new()
+        } else {
+            match cstr_to_str(&opendal_config_json) {
+                Some(s) => s.to_string(),
+                None => return FRS_STATUS_NULL_ARG,
+            }
+        };
+        let config = match parse_flat_json_object(&json_str) {
+            Ok(m) => m,
+            Err(_) => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        let clip = match read_clip_range(clip_start, clip_start_len, clip_end, clip_end_len) {
+            Some(r) => r,
+            None => return FRS_STATUS_INVALID_ARGUMENT,
+        };
+        match DbImpl::open_from_linked_checkpoint_instant_clipped_remote(
+            &uri_str,
+            config,
+            Path::new(&cache_dir_str),
+            cache_capacity_bytes,
+            Path::new(&ckpt),
+            &target,
+            clip,
+            raw_concat_default_cf_descriptor(),
+        ) {
+            Ok(db) => {
+                let boxed = Box::new(db);
+                *out_handle = Box::into_raw(boxed) as *mut c_void;
+                FRS_STATUS_OK
+            }
+            Err(e) => error_to_status(&e),
+        }
+    })
+}
+
+/// Reads a `[clip_start, clip_end)` [`KeyRange`] from two raw byte slices.
+/// Returns `None` (⇒ `FRS_STATUS_INVALID_ARGUMENT`) when a non-zero length
+/// has a null pointer or when the resulting range is empty (`start >= end`);
+/// the engine also rejects empty ranges, but checking here keeps the error
+/// at the FFI boundary.
+///
+/// # SAFETY
+/// - `start` must point to `start_len` bytes (or be null when 0); `end` to
+///   `end_len` bytes (or be null when 0).
+unsafe fn read_clip_range(
+    start: *const u8,
+    start_len: usize,
+    end: *const u8,
+    end_len: usize,
+) -> Option<forst_rs_common::types::KeyRange> {
+    if (start_len > 0 && start.is_null()) || (end_len > 0 && end.is_null()) {
+        return None;
+    }
+    let start_bytes = if start_len == 0 {
+        Vec::new()
+    } else {
+        slice::from_raw_parts(start, start_len).to_vec()
+    };
+    let end_bytes = if end_len == 0 {
+        Vec::new()
+    } else {
+        slice::from_raw_parts(end, end_len).to_vec()
+    };
+    let range = forst_rs_common::types::KeyRange::new(start_bytes, end_bytes);
+    if range.is_empty() {
+        return None;
+    }
+    Some(range)
 }
 
 /// Number of LIVE SSTs still resolving to physical objects OUTSIDE this
