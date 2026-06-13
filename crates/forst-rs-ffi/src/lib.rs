@@ -7778,11 +7778,14 @@ mod tests {
         // *const c_char is 8B on 64-bit; padded out to alignment by the
         // following u64 fields. The total size is the sum of:
         //   8 (db_path ptr) + 8 (write_buffer_size u64) + 4 (u32) + 4 (u32)
-        // + 4 (u32) + 4 (pad) + 8 (u64) + 8 (u64) = 48 bytes.
+        // + 4 (u32) + 4 (pad) + 8 (u64) + 8 (u64) + 4 (sst_compression u32)
+        // + 4 (trailing pad) = 56 bytes.
         // (32-bit hosts will have a smaller pointer; the bridge is built
         // 64-bit only today, so we encode the 64-bit layout here.)
+        // Mirrors FRS_ENGINE_OPTIONS_LAYOUT in ForStRsLinker.java (sst_compression
+        // at +48, trailing paddingLayout(4)); keep both in lockstep.
         if size_of::<*const c_char>() == 8 {
-            assert_eq!(size_of::<FrsEngineOptions>(), 48);
+            assert_eq!(size_of::<FrsEngineOptions>(), 56);
         }
         assert!(align_of::<FrsEngineOptions>() >= 8);
     }
