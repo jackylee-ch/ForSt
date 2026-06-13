@@ -48,6 +48,9 @@ use crate::checkpoint::{
 use crate::column_family::{ColumnFamilyData, ColumnFamilyDescriptor, ColumnFamilyHandle};
 use crate::compaction::{compaction_output_path, CompactionJob};
 use crate::compaction_filter::CompactionFilter;
+use crate::compaction_policy::{
+    compensated_file_size, compute_base_level, dynamic_level_target, CompactionPolicy,
+};
 use crate::file_deletion_guard::FileDeletionGuard;
 use crate::flush::{
     sst_file_path, CompactionExecutor, FlushExecutor, FlushJob, SST_TMP_PREFIX, SST_TMP_SUFFIX,
@@ -5557,6 +5560,30 @@ impl DbImpl {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// FRS-COMPACTION-POLICY (2026-06-14 writeamp-fundamental-reusable-design
+    /// §2): build the read-only [`PolicyCtx`] the shared [`SortedRunPolicy`]
+    /// picks under. Pure metadata — the tombstone closure reads cached reader
+    /// footers (no I/O), so the policy holds no engine locks and runs the same
+    /// whether SSTs are local or remote. `compaction_filter_active` forbids the
+    /// metadata-only trivial-move arm (rows must be inspected).
+    fn policy_ctx<'a>(
+        &'a self,
+        readers: &'a std::sync::Arc<std::collections::HashMap<FileNumber, Arc<SstReaderImpl>>>,
+        compaction_filter_active: bool,
+        tombstones: &'a dyn Fn(FileNumber) -> u64,
+    ) -> crate::compaction_policy::PolicyCtx<'a> {
+        let _ = readers; // borrowed by the closure the caller supplies
+        crate::compaction_policy::PolicyCtx {
+            num_levels: self.options.num_levels,
+            max_bytes_for_level_base: self.options.max_bytes_for_level_base as u64,
+            max_bytes_for_level_multiplier: self.options.max_bytes_for_level_multiplier,
+            dynamic_levels: self.dynamic_levels_on(),
+            trivial_move: trivial_move_enabled(),
+            compaction_filter_active,
+            tombstones,
+        }
+    }
+
     /// Test hook: restore the legacy fixed-target layout (rollup→L1,
     /// shallowest-over-budget pick) for tests that construct multi-level
     /// layouts by hand.
@@ -5719,153 +5746,67 @@ impl DbImpl {
         // cf_id filter, an inter-level compaction could pull SSTs from other
         // CFs into this CF's output, silently merging key streams across CFs.
         let cf_id = cf_data.handle().id();
-        // FRS-LEVELED-COMPACTION (2026-06-04): bounded input picking. Pick a
-        // SINGLE source file from `level` (the smallest-key one — files are
-        // sorted by smallest_key) plus the next-level files its range
-        // overlaps, instead of rewriting the WHOLE level into the next on
-        // every compaction (the write-amp source that let compaction fall
-        // behind → L0 backup → read-amp + write-stall). The picked file is
-        // consumed (removed from `level`) by this compaction's VersionEdit, so
-        // successive invocations naturally rotate through the level's key
-        // space; the background worker re-triggers while the level stays
-        // over-target. Combined with the multi-file split output, each Ln→Ln+1
-        // compaction now touches O(1 src + its overlap) bytes, not O(level).
-        let all_src: Vec<SstFileMeta> = version.levels[level_idx]
-            .files
-            .iter()
-            .filter(|f| f.cf_id == cf_id)
-            .cloned()
-            .collect();
-        if all_src.is_empty() {
-            return Ok(None);
-        }
-        let next_level = level_idx + 1;
-        if next_level >= version.num_levels() {
-            // Can't go deeper — the engine is at max depth. Treat as no-op.
-            return Ok(None);
-        }
-        let dst_candidates: Vec<SstFileMeta> = version.levels[next_level]
-            .files
-            .iter()
-            .filter(|f| f.cf_id == cf_id)
-            .cloned()
-            .collect();
-        // Legacy mode: `apply_edit` keeps each level sorted by smallest_key,
-        // so `all_src[0]` is the lowest-key file for this CF — a
-        // deterministic, rotating pick (the picked file is consumed, so
-        // successive picks rotate through the key space).
-        //
-        // FRS-M4 (dynamic mode): RocksDB `kMinOverlappingRatio` parity (the
-        // default `compaction_pri` since 6.x) — pick the file with the
-        // SMALLEST next-level-overlap ÷ tombstone-COMPENSATED-size ratio.
-        // This is the descent write-amp lever: moving a byte down costs
-        // (src + overlap) rewritten bytes, so the cheapest-ratio file moves
-        // the most data per byte rewritten; the compensated denominator
-        // simultaneously prioritizes delete-laden files so TTL garbage
-        // descends toward annihilation instead of riding along. Measured
-        // need: with max-compensated-size picking alone, the q7-shape cell
-        // ended at write-amp ~8.2 — each descent of a wide file rewrote
-        // ~10× its size of bottom-level overlap. Progress is guaranteed —
-        // the picked file is consumed by the edit — and ties fall back to
-        // the lowest-key file (iteration order), preserving rotation.
-        let src_pick: SstFileMeta = if self.dynamic_levels_on() {
-            let readers = self.sst_readers.load();
-            let comp = |m: &SstFileMeta| -> u64 {
-                let t = readers
-                    .get(&m.file_number)
-                    .map(|r| r.footer().tombstone_count)
-                    .unwrap_or(0);
-                compensated_file_size(m.file_size, m.num_entries, t)
-            };
-            let overlap_bytes = |m: &SstFileMeta| -> u64 {
-                dst_candidates
-                    .iter()
-                    .filter(|d| d.largest_key >= m.smallest_key && d.smallest_key <= m.largest_key)
-                    .map(|d| d.file_size)
-                    .sum()
-            };
-            // min_by on the ratio overlap/comp, compared exactly via
-            // cross-multiplication in u128 (no float drift, no div-by-0).
-            all_src
-                .iter()
-                .min_by(|a, b| {
-                    let (oa, ca) = (overlap_bytes(a) as u128, comp(a).max(1) as u128);
-                    let (ob, cb) = (overlap_bytes(b) as u128, comp(b).max(1) as u128);
-                    // `min_by` keeps the FIRST minimal element on Equal, so
-                    // ties go to the lowest-key file automatically.
-                    (oa * cb).cmp(&(ob * ca))
-                })
-                .cloned()
-                .unwrap_or_else(|| all_src[0].clone())
-        } else {
-            all_src[0].clone()
+        // FRS-COMPACTION-POLICY (2026-06-14 writeamp-fundamental-reusable-design
+        // §2.3): delegate the Ln→Ln+1 PICK to the shared `SortedRunPolicy` — the
+        // SAME policy the L0 rollup and the remote-describe paths use. The policy
+        // owns the FRS-M4 kMinOverlapping-ratio / tombstone-compensated source
+        // pick, the overlap gather, the WA-V3 trivial-move eligibility, and the
+        // `is_bottommost` derivation (pure metadata over the Version). db.rs keeps
+        // reader-open / file-number alloc / snapshot / job build / execute /
+        // install. Bounded input picking is preserved: the policy returns ONE
+        // source file + its overlap, so each descent touches O(1 src + overlap)
+        // bytes (not O(level)); the consumed file rotates the key space.
+        let readers = self.sst_readers.load();
+        let tombstones = |fnum: FileNumber| -> u64 {
+            readers
+                .get(&fnum)
+                .map(|r| r.footer().tombstone_count)
+                .unwrap_or(0)
         };
-        let src_files: Vec<SstFileMeta> = vec![src_pick];
-
-        // Compute the key range spanned by src_files; pull any dst file
-        // whose range overlaps.
-        let (mut min_key, mut max_key) = (
-            src_files[0].smallest_key.clone(),
-            src_files[0].largest_key.clone(),
-        );
-        for f in &src_files {
-            if f.smallest_key < min_key {
-                min_key = f.smallest_key.clone();
-            }
-            if f.largest_key > max_key {
-                max_key = f.largest_key.clone();
-            }
-        }
-        let mut overlapping_dst: Vec<SstFileMeta> = Vec::new();
-        for f in &dst_candidates {
-            if f.largest_key < min_key {
-                continue;
-            }
-            if f.smallest_key > max_key {
-                continue;
-            }
-            overlapping_dst.push(f.clone());
-        }
-
-        // FRS-WA-V3 (link-compaction): no destination overlap + no filter ⇒
-        // demote the picked file by metadata alone (Ln files are per-CF
-        // non-overlapping, so the destination invariant holds trivially).
-        if trivial_move_enabled()
-            && cf_data.compaction_filter().is_none()
-            && overlapping_dst.is_empty()
+        let ctx = self.policy_ctx(&readers, cf_data.compaction_filter().is_some(), &tombstones);
+        let decision = match crate::compaction_policy::SortedRunPolicy
+            .pick_level_descent(&version, cf_id, level, &ctx)
         {
-            let src = src_files[0].clone();
-            let edit = VersionEdit {
-                deleted_files: vec![(level, src.file_number)],
-                new_files: vec![(next_level as u32, src.clone())],
-                ..Default::default()
-            };
-            self.version_set.apply(&edit)?;
-            tracing::debug!(
-                file = src.file_number.value(),
-                from = level,
-                to = next_level,
-                "FRS-WA-V3: level demotion satisfied by trivial move (no rewrite)"
-            );
-            return Ok(Some(src));
-        }
+            None => return Ok(None),
+            Some(d) => d,
+        };
+        let plan = match decision {
+            // FRS-WA-V3 (link-compaction): no destination overlap + no filter ⇒
+            // demote the picked file by metadata alone (Ln files are per-CF
+            // non-overlapping, so the destination invariant holds trivially).
+            crate::compaction_policy::CompactionDecision::TrivialMove {
+                files,
+                from_level,
+                to_level,
+            } => {
+                let src = files[0].clone();
+                let edit = VersionEdit {
+                    deleted_files: vec![(from_level, src.file_number)],
+                    new_files: vec![(to_level, src.clone())],
+                    ..Default::default()
+                };
+                self.version_set.apply(&edit)?;
+                tracing::debug!(
+                    file = src.file_number.value(),
+                    from = from_level,
+                    to = to_level,
+                    "FRS-WA-V3: level demotion satisfied by trivial move (no rewrite)"
+                );
+                return Ok(Some(src));
+            }
+            crate::compaction_policy::CompactionDecision::Merge(plan) => plan,
+        };
+        drop(readers);
 
-        // Build input list. Source files carry `level`; destination overlap
-        // carries `next_level`.
-        let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> = Vec::new();
-        for f in &src_files {
-            inputs.push((level, f.clone(), self.get_or_open_sst_reader(f)?));
+        // Build input list from the policy-chosen plan (source carries `level`,
+        // destination overlap carries `next_level` — order preserved).
+        let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> =
+            Vec::with_capacity(plan.inputs.len());
+        for (lvl, meta) in &plan.inputs {
+            inputs.push((*lvl, meta.clone(), self.get_or_open_sst_reader(meta)?));
         }
-        for f in &overlapping_dst {
-            inputs.push((
-                next_level as u32,
-                f.clone(),
-                self.get_or_open_sst_reader(f)?,
-            ));
-        }
-
-        let is_bottommost =
-            (next_level + 1..version.num_levels()).all(|lvl| version.levels[lvl].files.is_empty());
+        let next_level = plan.output_level as usize;
+        let is_bottommost = plan.is_bottommost;
         let output_file_number = self.version_set.allocate_file_number();
         let output_path = compaction_output_path(&self.db_path, output_file_number);
         let writer_options = SstWriterOptions {
@@ -5992,6 +5933,37 @@ impl DbImpl {
             self.delete_file_guarded(*file_number);
         }
         self.reap_pending_deletions();
+
+        // FRS-WAMP phase decomposition: attribute this descent's rewrite bytes to
+        // the Ln→Ln+1 phase (sister to the L0Rollup record in `compact_l0_for_cf`)
+        // so the cumulative write-amp can be split L0 vs Ln. Pure byte accounting
+        // (run_ms=0; the Ln path is not separately timed), gated by FRS_WAMP_FILE.
+        if wamp_file().is_some() {
+            let out_bytes: u64 = edit.new_files.iter().map(|(_, m)| m.file_size).sum();
+            let cur = self.version_set.current();
+            let (l1_files, l1_bytes) = cur
+                .levels
+                .get(1)
+                .map(|lm| {
+                    (
+                        lm.files.len(),
+                        lm.files.iter().map(|f| f.file_size).sum::<u64>(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            wamp_record_compaction(
+                WampPhase::LnDescent,
+                total_input_bytes,
+                out_bytes,
+                l1_files,
+                l1_bytes,
+                0,
+            );
+            let reloc: u64 = edit.new_vlog_segments.iter().map(|s| s.file_size).sum();
+            if reloc > 0 {
+                wamp_record_vlog_relocation(reloc);
+            }
+        }
 
         Ok(new_meta)
     }
@@ -8705,98 +8677,73 @@ impl DbImpl {
             return Ok(None);
         }
 
-        // R49-H1: only roll up this CF's L0 files (and overlap into this CF's
-        // output-level files). Without the filter, an L0 rollup could fold
-        // another CF's data into this CF's stream.
+        // FRS-COMPACTION-POLICY (2026-06-14 writeamp-fundamental-reusable-design
+        // §2.3): delegate the L0→base PICK to the shared `SortedRunPolicy` — the
+        // SAME policy object the Ln descent and the remote-describe paths use.
+        // The policy owns the M1 overlap-scoped clean cut, the WA-V3 trivial-move
+        // eligibility, and the `is_bottommost` derivation (all pure metadata over
+        // the Version); db.rs keeps reader-open / file-number alloc / snapshot /
+        // job build / execute / install. One policy, four call sites.
         let version = self.version_set.current();
-        let l0_files: Vec<SstFileMeta> = version
-            .l0_files()
-            .iter()
-            .filter(|f| f.cf_id == cf_id)
-            .cloned()
-            .collect();
-        if l0_files.is_empty() {
-            return Ok(None);
-        }
-        // FRS-M1-OVERLAP-SCOPED (2026-06-12 sorted-run-discipline §4 M1):
-        // pick only the output-level files whose key range overlaps the L0
-        // union range, expanded to a clean cut — NOT the CF's entire level.
-        // Pre-M1 every rollup rewrote the whole L1 (the measured 7.68×
-        // write-amp driver, design §2.3/W1). The level invariant is
-        // preserved: the output range equals the input union range, which
-        // is disjoint from the untouched remainder (any file overlapping
-        // the L0 union — or, transitively, the growing selected union — is
-        // pulled in by the clean-cut expansion below, so no key in the
-        // inputs can also live in an unselected file). That same
-        // disjointness keeps the `is_bottommost` tombstone-drop rule
-        // sound: a tombstone's key lies inside the input union range, so
-        // it cannot shadow (and dropping it cannot resurrect) anything in
-        // the unselected remainder.
-        let cf_out: Vec<SstFileMeta> = version.levels[output_level as usize]
-            .files
-            .iter()
-            .filter(|f| f.cf_id == cf_id)
-            .cloned()
-            .collect();
-        let out_overlap_files: Vec<SstFileMeta> = overlap_scoped_clean_cut(&l0_files, cf_out);
+        let readers = self.sst_readers.load();
+        let tombstones = |fnum: FileNumber| -> u64 {
+            readers
+                .get(&fnum)
+                .map(|r| r.footer().tombstone_count)
+                .unwrap_or(0)
+        };
+        let ctx = self.policy_ctx(&readers, cf_data.compaction_filter().is_some(), &tombstones);
+        let decision = match crate::compaction_policy::SortedRunPolicy.pick_l0_rollup(
+            &version,
+            cf_id,
+            output_level,
+            &ctx,
+        ) {
+            None => return Ok(None),
+            Some(d) => d,
+        };
+        let plan = match decision {
+            // FRS-WA-V3 (link-compaction): a mutually key-disjoint L0 set with
+            // no output-level overlap and no compaction filter is a
+            // METADATA-ONLY re-level — zero rewrite, zero upload. Death
+            // stamps/meta ride along verbatim; cached readers stay valid
+            // (keyed by file number).
+            crate::compaction_policy::CompactionDecision::TrivialMove {
+                files,
+                from_level,
+                to_level,
+            } => {
+                let edit = VersionEdit {
+                    deleted_files: files.iter().map(|f| (from_level, f.file_number)).collect(),
+                    new_files: files.iter().map(|f| (to_level, f.clone())).collect(),
+                    ..Default::default()
+                };
+                // Busy ⇒ a racing writer changed the version; nothing was
+                // created, so propagating lets the caller retry cleanly.
+                self.version_set.apply(&edit)?;
+                tracing::debug!(
+                    files = files.len(),
+                    bytes = files.iter().map(|f| f.file_size).sum::<u64>(),
+                    output_level = to_level,
+                    "FRS-WA-V3: L0 rollup satisfied by trivial move (no rewrite)"
+                );
+                drop(flush_guard);
+                self.write_controller
+                    .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
+                return Ok(files.last().cloned());
+            }
+            crate::compaction_policy::CompactionDecision::Merge(plan) => plan,
+        };
+        drop(readers);
 
-        // FRS-WA-V3 (link-compaction): when the rollup's L0 set is mutually
-        // key-disjoint AND nothing at the output level overlaps it AND no
-        // compaction filter must inspect rows, the rollup is a METADATA-ONLY
-        // re-level of the same files — zero rewrite, zero upload. Death
-        // stamps/meta ride along verbatim (lifecycle expiry scans every
-        // level); cached readers stay valid (keyed by file number).
-        if trivial_move_enabled()
-            && cf_data.compaction_filter().is_none()
-            && out_overlap_files.is_empty()
-            && sst_metas_mutually_disjoint(&l0_files)
-        {
-            let edit = VersionEdit {
-                deleted_files: l0_files.iter().map(|f| (0u32, f.file_number)).collect(),
-                new_files: l0_files.iter().map(|f| (output_level, f.clone())).collect(),
-                ..Default::default()
-            };
-            // Busy ⇒ a racing writer changed the version; nothing was
-            // created, so propagating lets the caller retry cleanly.
-            self.version_set.apply(&edit)?;
-            tracing::debug!(
-                files = l0_files.len(),
-                bytes = l0_files.iter().map(|f| f.file_size).sum::<u64>(),
-                output_level,
-                "FRS-WA-V3: L0 rollup satisfied by trivial move (no rewrite)"
-            );
-            drop(flush_guard);
-            self.write_controller
-                .set_l0_file_count(self.backpressure_l0_count(&self.version_set.current()));
-            return Ok(l0_files.last().cloned());
+        // Gather input readers for the policy-chosen plan inputs (L0 inputs
+        // first, then the output-level overlap — the policy preserves order).
+        let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> =
+            Vec::with_capacity(plan.inputs.len());
+        for (lvl, meta) in &plan.inputs {
+            inputs.push((*lvl, meta.clone(), self.get_or_open_sst_reader(meta)?));
         }
-
-        // Gather input readers.
-        let mut inputs: Vec<(u32, SstFileMeta, Arc<SstReaderImpl>)> = Vec::new();
-        for meta in &l0_files {
-            inputs.push((0, meta.clone(), self.get_or_open_sst_reader(meta)?));
-        }
-        for meta in &out_overlap_files {
-            inputs.push((
-                output_level,
-                meta.clone(),
-                self.get_or_open_sst_reader(meta)?,
-            ));
-        }
-
-        // Allocate the output file number and build the job. We mark the
-        // rollup as bottommost iff every level OTHER than the output level
-        // is empty, so delete tombstones can be eliminated:
-        // - levels DEEPER than the output must be empty (an older version
-        //   under a dropped tombstone would resurrect);
-        // - levels BETWEEN L0 and the output (FRS-M4: the output can be
-        //   deep) must be empty too — they hold data OLDER than L0 that a
-        //   dropped L0 tombstone may shadow;
-        // - the output level's own non-input remainder is range-disjoint
-        //   from the inputs (M1 clean cut), so it can never hold a key the
-        //   inputs cover.
-        let is_bottommost = (1..version.num_levels())
-            .all(|lvl| lvl == output_level as usize || version.levels[lvl].files.is_empty());
+        let is_bottommost = plan.is_bottommost;
 
         let output_file_number = self.version_set.allocate_file_number();
         let output_path = compaction_output_path(&self.db_path, output_file_number);
@@ -8972,12 +8919,20 @@ impl DbImpl {
                 })
                 .unwrap_or((0, 0));
             wamp_record_compaction(
+                WampPhase::L0Rollup,
                 total_input_bytes_diag,
                 out_bytes,
                 l1_files,
                 l1_bytes,
                 run_ms,
             );
+            // FRS-WAMP value-rewrite term: bytes the kv-sep relocation wrote into
+            // fresh vlog segments this compaction (the "value rewrite" the design
+            // wants attributed separately from the key-LSM rewrite).
+            let reloc: u64 = edit.new_vlog_segments.iter().map(|s| s.file_size).sum();
+            if reloc > 0 {
+                wamp_record_vlog_relocation(reloc);
+            }
         }
 
         // FRS-COMPACT-PHASE-DIAG: attribute the stall — merge+local-write (run_ms)
@@ -14037,72 +13992,6 @@ fn drain_l1_on() -> bool {
     })
 }
 
-/// FRS-M1-OVERLAP-SCOPED (2026-06-12 sorted-run-discipline §4 M1): from the
-/// next-level files of ONE column family (`level_files`, mutually
-/// non-overlapping by the level invariant), select the subset whose key range
-/// overlaps the union key range of `upper_files` (the compaction's
-/// upper-level inputs), expanded to a CLEAN CUT.
-///
-/// "Clean cut" (RocksDB `ExpandInputsToCleanCut` parity): the selection is
-/// grown to a fixpoint — any file overlapping the union range of the
-/// selection so far is pulled in, so no key in the selected union range can
-/// also live in an unselected file. forst-rs SSTs are key-boundary split
-/// (FRS-LEVELED-COMPACTION), so for a healthy level the overlap subset is
-/// already boundary-aligned and the expansion loop is a safety net, not a
-/// rewrite source.
-///
-/// Returns the selected files in their original (smallest_key) order.
-/// `upper_files` must be non-empty.
-fn overlap_scoped_clean_cut(
-    upper_files: &[SstFileMeta],
-    level_files: Vec<SstFileMeta>,
-) -> Vec<SstFileMeta> {
-    debug_assert!(!upper_files.is_empty());
-    let mut lo: &[u8] = &upper_files[0].smallest_key;
-    let mut hi: &[u8] = &upper_files[0].largest_key;
-    for f in upper_files {
-        if f.smallest_key.as_slice() < lo {
-            lo = &f.smallest_key;
-        }
-        if f.largest_key.as_slice() > hi {
-            hi = &f.largest_key;
-        }
-    }
-    let mut selected = vec![false; level_files.len()];
-    // Fixpoint expansion: ranges only ever GROW, so each pass either selects
-    // at least one new file or terminates — O(n²) worst case over a level's
-    // file count (dozens), trivially cheap on the compaction worker.
-    loop {
-        let mut grew = false;
-        for (i, f) in level_files.iter().enumerate() {
-            if selected[i] {
-                continue;
-            }
-            // Inclusive-range overlap test (same predicate as the Ln→Ln+1
-            // picker in `compact_level_for_cf`).
-            if f.largest_key.as_slice() >= lo && f.smallest_key.as_slice() <= hi {
-                selected[i] = true;
-                if f.smallest_key.as_slice() < lo {
-                    lo = &f.smallest_key;
-                }
-                if f.largest_key.as_slice() > hi {
-                    hi = &f.largest_key;
-                }
-                grew = true;
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-    level_files
-        .iter()
-        .zip(&selected)
-        .filter(|(_, &s)| s)
-        .map(|(f, _)| f.clone())
-        .collect()
-}
-
 /// FRS-M4-DYNAMIC-LEVELS: env resolution for the per-DbImpl flag. Default ON;
 /// `FRS_DYNAMIC_LEVELS=0|false` restores the legacy fixed
 /// `base × mult^(L-1)` targets + shallowest-over-budget picking + rollup→L1
@@ -14114,51 +14003,11 @@ fn dynamic_levels_from_env() -> bool {
     )
 }
 
-/// FRS-M4-DYNAMIC-LEVELS: the CF's BASE level — where L0 rollups output —
-/// derived RocksDB-style (`VersionStorageInfo::CalculateBaseBytes` parity,
-/// `advanced_options.h:691` default-true since 8.x): anchor at the BOTTOM
-/// level's actual CF size and walk upward dividing by `mult` until the
-/// derived target fits under `max_bytes_for_level_base`. An empty bottom
-/// anchors the whole CF at the bottom (first rollup takes ONE hop to its
-/// resting level). Pure function — unit-tested directly.
-fn compute_base_level(s_bottom: u64, bottom: u32, base_bytes: u64, mult: f64) -> u32 {
-    if bottom <= 1 || s_bottom == 0 {
-        return bottom.max(1);
-    }
-    let mult = mult.max(1.0 + f64::EPSILON);
-    let mut cur = s_bottom as f64;
-    let mut bl = bottom;
-    while bl > 1 && cur > base_bytes as f64 {
-        cur /= mult;
-        bl -= 1;
-    }
-    bl
-}
-
-/// FRS-M4-DYNAMIC-LEVELS: dynamic size target for `level` ∈
-/// [base_level, bottom): `target(Ln) = size(bottom) / mult^(bottom - Ln)` —
-/// the design's "anchor at the last level's actual size and derive upward".
-/// Floored at 1 so the score division is well-defined.
-fn dynamic_level_target(s_bottom: u64, bottom: u32, level: u32, mult: f64) -> u64 {
-    let mult = mult.max(1.0 + f64::EPSILON);
-    let t = s_bottom as f64 / mult.powi((bottom.saturating_sub(level)) as i32);
-    (t as u64).max(1)
-}
-
-/// FRS-M4 tombstone compensation (RocksDB compensated_file_size parity,
-/// `compaction_picker_level.cc:130-185`): weight delete tombstones by twice
-/// the file's average entry size, so tombstone-laden files/levels sort first
-/// in the score pick and TTL garbage is compacted toward annihilation
-/// instead of riding to the bottom repeatedly. `tombstone_count` comes from
-/// the footer-v4 field (pre-v4 SSTs decode 0 → no compensation —
-/// conservative). Pure function — unit-tested directly.
-fn compensated_file_size(file_size: u64, num_entries: u64, tombstone_count: u64) -> u64 {
-    if num_entries == 0 || tombstone_count == 0 {
-        return file_size;
-    }
-    let avg = file_size / num_entries.max(1);
-    file_size.saturating_add(tombstone_count.saturating_mul(avg.saturating_mul(2)))
-}
+// FRS-COMPACTION-POLICY (2026-06-14): the M4 dynamic-level pure functions
+// (`compute_base_level`, `dynamic_level_target`, `compensated_file_size`) now
+// live in `compaction_policy` (the single picking module) and are re-used here
+// by `pick_compaction_level_for_cf` / `rollup_output_level` — one definition,
+// shared by the score-picker and the policy. Imported at the top of db.rs.
 
 // ---------------------------------------------------------------------
 // FRS-WAMP (2026-06-05): write-amplification confirmation tooling. Gated by
@@ -14174,6 +14023,34 @@ static WAMP_CUM_COMPACT_OUT: AtomicU64 = AtomicU64::new(0);
 static WAMP_CUM_FLUSH_OUT: AtomicU64 = AtomicU64::new(0);
 static WAMP_CUM_RUN_MS: AtomicU64 = AtomicU64::new(0);
 static WAMP_N: AtomicU64 = AtomicU64::new(0);
+// FRS-WAMP PHASE DECOMPOSITION (2026-06-14): attribute the cumulative compaction
+// rewrite bytes to the PHASE that wrote them, so the 7.68× write-amp can be split
+// into "flush floor + L0→base rollup + Ln→Ln+1 descent + value rewrites". Each
+// phase carries its own input (= bytes-read-and-rewritten) accumulator; the
+// denominator is the same cumulative flushed (ingested) bytes. Byte ratios are
+// CPU-contention-independent so this is safe to sample under concurrent load.
+static WAMP_L0_IN: AtomicU64 = AtomicU64::new(0); // L0→base rollup input bytes
+static WAMP_L0_OUT: AtomicU64 = AtomicU64::new(0);
+static WAMP_LN_IN: AtomicU64 = AtomicU64::new(0); // Ln→Ln+1 descent input bytes
+static WAMP_LN_OUT: AtomicU64 = AtomicU64::new(0);
+static WAMP_VLOG_RELOC_OUT: AtomicU64 = AtomicU64::new(0); // kv-sep value-rewrite bytes
+
+/// Which compaction phase a `wamp_record_compaction` call attributes its bytes to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WampPhase {
+    /// L0→base rollup (`compact_l0_for_cf`).
+    L0Rollup,
+    /// Ln→Ln+1 leveled descent (`compact_level_for_cf`).
+    LnDescent,
+}
+
+/// Record value-log relocation (KV-separation) bytes for the phase split — the
+/// "value rewrite" term distinct from the key-LSM rewrite. No-op when WAMP off.
+fn wamp_record_vlog_relocation(out_bytes: u64) {
+    if wamp_file().is_some() {
+        WAMP_VLOG_RELOC_OUT.fetch_add(out_bytes, Ordering::Relaxed);
+    }
+}
 
 fn wamp_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
     use std::sync::OnceLock;
@@ -14201,6 +14078,7 @@ fn wamp_record_flush(out_bytes: u64) {
 
 /// Record one compaction and append the cumulative write-amp + ns/byte line.
 fn wamp_record_compaction(
+    phase: WampPhase,
     in_bytes: u64,
     out_bytes: u64,
     l1_files: usize,
@@ -14210,9 +14088,31 @@ fn wamp_record_compaction(
     let Some(m) = wamp_file() else { return };
     let ci = WAMP_CUM_COMPACT_IN.fetch_add(in_bytes, Ordering::Relaxed) + in_bytes;
     let co = WAMP_CUM_COMPACT_OUT.fetch_add(out_bytes, Ordering::Relaxed) + out_bytes;
+    // Phase-attributed accumulators (the decomposition).
+    let (p0_in, pn_in) = match phase {
+        WampPhase::L0Rollup => {
+            WAMP_L0_OUT.fetch_add(out_bytes, Ordering::Relaxed);
+            (
+                WAMP_L0_IN.fetch_add(in_bytes, Ordering::Relaxed) + in_bytes,
+                WAMP_LN_IN.load(Ordering::Relaxed),
+            )
+        }
+        WampPhase::LnDescent => {
+            WAMP_LN_OUT.fetch_add(out_bytes, Ordering::Relaxed);
+            (
+                WAMP_L0_IN.load(Ordering::Relaxed),
+                WAMP_LN_IN.fetch_add(in_bytes, Ordering::Relaxed) + in_bytes,
+            )
+        }
+    };
     let n = WAMP_N.fetch_add(1, Ordering::Relaxed) + 1;
     let cum_run_ms = WAMP_CUM_RUN_MS.fetch_add(run_ms as u64, Ordering::Relaxed) + run_ms as u64;
     let fo = WAMP_CUM_FLUSH_OUT.load(Ordering::Relaxed).max(1);
+    let vlog_reloc = WAMP_VLOG_RELOC_OUT.load(Ordering::Relaxed);
+    let phase_tag = match phase {
+        WampPhase::L0Rollup => "L0",
+        WampPhase::LnDescent => "Ln",
+    };
     let ns_per_byte = if in_bytes > 0 {
         (run_ms as f64 * 1.0e6) / in_bytes as f64
     } else {
@@ -14230,13 +14130,22 @@ fn wamp_record_compaction(
     if let Ok(mut f) = m.lock() {
         let _ = writeln!(
             f,
-            "n={n} in_mb={:.1} out_mb={:.1} l1_files={l1_files} l1_mb={:.1} cum_flush_mb={:.0} wamp_in={:.2} wamp_total={:.2} run_ms={run_ms} ns_per_byte={ns_per_byte:.1} cum_run_ms={cum_run_ms} cum_gather_ms={cum_gather_ms} cum_sort_ms={cum_sort_ms} cum_emit_ms={cum_emit_ms}",
+            "n={n} phase={phase_tag} in_mb={:.1} out_mb={:.1} l1_files={l1_files} l1_mb={:.1} cum_flush_mb={:.0} wamp_in={:.2} wamp_total={:.2} \
+             wamp_l0={:.2} wamp_ln={:.2} wamp_vlog={:.2} l0_in_mb={:.0} ln_in_mb={:.0} vlog_reloc_mb={:.0} \
+             run_ms={run_ms} ns_per_byte={ns_per_byte:.1} cum_run_ms={cum_run_ms} cum_gather_ms={cum_gather_ms} cum_sort_ms={cum_sort_ms} cum_emit_ms={cum_emit_ms}",
             in_bytes as f64 / 1_048_576.0,
             out_bytes as f64 / 1_048_576.0,
             l1_bytes as f64 / 1_048_576.0,
             fo as f64 / 1_048_576.0,
             ci as f64 / fo as f64,
             (fo + co) as f64 / fo as f64,
+            // Per-phase write-amp contribution = phase-input-bytes ÷ flushed bytes.
+            p0_in as f64 / fo as f64,
+            pn_in as f64 / fo as f64,
+            vlog_reloc as f64 / fo as f64,
+            p0_in as f64 / 1_048_576.0,
+            pn_in as f64 / 1_048_576.0,
+            vlog_reloc as f64 / 1_048_576.0,
         );
     }
 }
@@ -14796,16 +14705,6 @@ fn default_compaction_executor_from_env(
     } else {
         Arc::new(crate::compaction_executor::LocalCompactionExecutor)
     }
-}
-
-/// FRS-WA-V3: strict mutual key-disjointness over a set of SST metas (the
-/// destination-level invariant a multi-file move must preserve).
-fn sst_metas_mutually_disjoint(files: &[SstFileMeta]) -> bool {
-    let mut sorted: Vec<&SstFileMeta> = files.iter().collect();
-    sorted.sort_by(|a, b| a.smallest_key.cmp(&b.smallest_key));
-    sorted
-        .windows(2)
-        .all(|w| w[0].largest_key < w[1].smallest_key)
 }
 
 /// FRS-WA-V2a-2 separation threshold (`FRS_KV_MIN_BLOB_SIZE`, bytes,
@@ -17767,6 +17666,78 @@ mod tests {
         );
         assert_eq!(db2.get(&cf2, b"a0000").unwrap().as_deref(), Some(&b"v"[..]));
         set_trivial_move_override(None);
+    }
+
+    /// FRS-COMPACTION-POLICY (2026-06-14 writeamp-fundamental-reusable-design
+    /// §5.3 T2/T3): the shared `SortedRunPolicy` refactor + the paradigm levers
+    /// DEFAULT-OFF must emit byte-identical DATA to the legacy path. We drive an
+    /// overlap-heavy, delete-laden workload (the q7 shape: two key streams,
+    /// rewrite-dominated descents) through the FULL local compaction policy
+    /// (L0 rollup + Ln descent) with trivial-move OFF and kv-sep OFF, then assert
+    /// the read-back over EVERY key matches an in-memory oracle exactly. Because
+    /// the levers are OFF the policy takes only the Merge arm — the same picks
+    /// the inlined code made — so identical reads prove the extraction changed no
+    /// emitted byte. (Trivial-move/kv-sep ON correctness is covered by the
+    /// dedicated WA-V3 / cycle-1 tests above; this is the OFF-path contract.)
+    #[test]
+    fn test_compaction_policy_off_path_byte_identical_data() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Levers OFF (the default-OFF contract): policy must behave exactly as
+        // the legacy inline picking.
+        set_trivial_move_override(Some(false));
+        set_kv_separation_override(Some(false));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("policy-off"))
+            .unwrap();
+
+        // Oracle of the latest visible value per key. Overlapping ranges across
+        // flushes force REWRITE descents (no trivial move), and deletes exercise
+        // the tombstone-compensated picking + bottommost drop.
+        let mut oracle: std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        for round in 0..6u32 {
+            for i in 0..400u32 {
+                // Interleave two streams over the SAME 0..400 key space each
+                // round so successive flushes overlap (rewrite, not move).
+                let key = format!("k{:04}", i).into_bytes();
+                let val = format!("r{round}-v{i}").into_bytes();
+                db.put(&cf, &key, &val).unwrap();
+                oracle.insert(key, Some(val));
+            }
+            // Delete a rotating slice → tombstones descend.
+            for i in (round * 20..round * 20 + 20).map(|x| x % 400) {
+                let key = format!("k{:04}", i).into_bytes();
+                db.delete(&cf, &key).unwrap();
+                oracle.insert(key, None);
+            }
+            db.switch_and_flush(&cf).unwrap();
+        }
+        // Force the full leveled cascade through the policy (L0 rollup + Ln
+        // descents).
+        db.compact_all().unwrap();
+        db.compact_all().unwrap();
+
+        // Byte-exact read-back over every key in the oracle.
+        for (key, want) in &oracle {
+            let got = db.get(&cf, key).unwrap();
+            assert_eq!(
+                got.as_deref(),
+                want.as_deref(),
+                "policy OFF path must read back byte-identical data for key {:?}",
+                String::from_utf8_lossy(key)
+            );
+        }
+        // Live keys via prefix scan match the oracle's live set exactly.
+        let live_oracle = oracle.values().filter(|v| v.is_some()).count();
+        let scanned = db.prefix_scan(&cf, b"k").unwrap();
+        assert_eq!(
+            scanned.len(),
+            live_oracle,
+            "prefix scan live count must equal oracle live count after policy compaction"
+        );
+        set_trivial_move_override(None);
+        set_kv_separation_override(None);
     }
 
     /// CYCLE-1 combined-config guard (survey §11): KV-separation AND
@@ -20761,7 +20732,7 @@ mod tests {
             meta_for_range(3, b"o", b"q"), // overlaps [m,p]
             meta_for_range(4, b"r", b"z"),
         ];
-        let picked = overlap_scoped_clean_cut(&l0, l1);
+        let picked = crate::compaction_policy::overlap_scoped_clean_cut(&l0, l1);
         let nums: Vec<u64> = picked.iter().map(|f| f.file_number.value()).collect();
         assert_eq!(nums, vec![2, 3]);
     }
@@ -20770,7 +20741,7 @@ mod tests {
     fn overlap_scoped_clean_cut_disjoint_selects_none() {
         let l0 = vec![meta_for_range(10, b"x", b"z")];
         let l1 = vec![meta_for_range(1, b"a", b"c"), meta_for_range(2, b"d", b"f")];
-        assert!(overlap_scoped_clean_cut(&l0, l1).is_empty());
+        assert!(crate::compaction_policy::overlap_scoped_clean_cut(&l0, l1).is_empty());
     }
 
     #[test]
@@ -20786,7 +20757,7 @@ mod tests {
             meta_for_range(3, b"e", b"g"), // overlaps file 2 only — transitive
             meta_for_range(4, b"h", b"i"), // disjoint from the selected union
         ];
-        let picked = overlap_scoped_clean_cut(&l0, l1);
+        let picked = crate::compaction_policy::overlap_scoped_clean_cut(&l0, l1);
         let nums: Vec<u64> = picked.iter().map(|f| f.file_number.value()).collect();
         assert_eq!(nums, vec![1, 2, 3]);
     }

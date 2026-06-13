@@ -92,6 +92,7 @@ pub mod column_family;
 pub mod compaction;
 pub mod compaction_executor;
 pub mod compaction_filter;
+pub mod compaction_policy;
 pub mod db;
 pub mod file_deletion_guard;
 pub mod flush;
