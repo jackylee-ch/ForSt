@@ -75,6 +75,11 @@ case "$cmd" in
       # FRS_SST_COMPRESSION=none for the zero-copy read-path A/B. See survey §12.
       -e FRS_BLOCK_SIZE_KB=8 -e FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}" \
       -e FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}" \
+      # FRS write-amp / disagg lever stack (2026-06-13 PMC-1 V10 local validation):
+      # forwarded so the engine inside the TM/JM containers can read them.
+      -e FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-}" -e FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-}" \
+      -e FRS_TRIVIAL_MOVE="${FRS_TRIVIAL_MOVE:-}" -e FRS_REMOTE_COMPACTION="${FRS_REMOTE_COMPACTION:-}" \
+      -e FRS_RS_S2_PINNED="${FRS_RS_S2_PINNED:-}" \
       -e FRS_BG_COMPACT_THREADS="${FRS_BG_COMPACT_THREADS:-}" -e FRS_BG_FLUSH_THREADS="${FRS_BG_FLUSH_THREADS:-}" \
       -e FRS_L0_STOP_TRIGGER="${FRS_L0_STOP_TRIGGER:-}" -e FRS_L0_COMPACTION_TRIGGER="${FRS_L0_COMPACTION_TRIGGER:-}" \
       -e FRS_DECAY_DIAG="${FRS_DECAY_DIAG:-}" -e FRS_BULK_SAMPLE="${FRS_BULK_SAMPLE:-}" -e FRS_ITER_DIAG="${FRS_ITER_DIAG:-}" \
