@@ -1573,3 +1573,109 @@ exact pre-change branch). FFI/Java wiring is a later cross-repo unit.
   later reads prune — bounded, correct, and reclaimed on the next compaction;
   an eager compaction-side drop is a future optimization, not a correctness
   requirement).
+
+---
+
+## Cycle — Disagg WRITE-PATH backpressure collapse (USER DIRECTIVE 2026-06-15)
+
+**Charter (PMC-2):** the disagg REMOTE WRITE path collapses — the q4 hot
+MapState front-end flush BLOCKS native batchPut; a slow remote (BOS-class)
+write + background compaction AMPLIFY the backpressure → throughput drops to
+ZERO + the checkpoint cannot complete in time (ckpt-timeout cascade). Fix it +
+related remote write problems. Flag-gated, default-OFF, byte-identical when off.
+
+### ForSt-technique → forst-rs gap map (write/upload/flush/cache/ckpt)
+
+| ForSt / paper technique | forst-rs status (file:line) | this cycle |
+|---|---|---|
+| Async flush↔upload decoupling (front-end never blocks on upload) | **PARTIAL** — flush runs on `bg_flush_pool` (db.rs:15054), front-end `put` only checks counters (`may_throttle`, write_controller.rs:201); the SST write-back upload is async (opendal_backend.rs:934, `MAX_INFLIGHT_UPLOADS=8`); BUT the **non-link checkpoint** force-drains the whole flush backlog through the throttle (`flush_all` db.rs:5459 → `wait_for_pending_flushes`) → ckpt blocks for the full drain | WAL-DELTA link ckpt skips the force-flush (already exists, db.rs:7370); validated as the ckpt-timeout fix |
+| Write-buffer / water-level mgmt | **YES** — `WriteController` L0 slowdown/stop + imm cap (write_controller.rs), WBM `allow_stall` (db.rs:3765 `wait_for_wbm_headroom`) | unchanged (an imm water-level experiment was tried + REVERTED: it added latency without touching the channel-saturation root cause — recorded below) |
+| Upload rate-limiting / QoS (compaction must not starve ckpt/flush) | **MISSING** — one `RateLimiter` for the whole remote leg (throttle.rs); compaction + flush + ckpt all share it; `await_all_uploads` scope already fixed (the q7 freeze, db.rs:7412) | **NEW: QoS upload RATE SPLIT** — compaction-class writes pace against a reduced sub-rate bucket; flush/ckpt keep the full rate |
+| Multi-tier local cache (keep hot/recent state local) | **YES** — `CachedFileSystem` write-through + `LocalCache` LRU + history-based admission (cached_fs.rs, local_cache.rs, requester.rs); ForSt §2.1 adoption landed in prior cycles | unchanged |
+| `await_all_uploads` scope (ckpt must not drain unrelated compaction uploads) | **YES (fixed)** — ckpt awaits ONLY its pinned live set (db.rs:7482); no-`await_all_uploads` invariant test | preserved; the rate-split + WAL-DELTA build on it |
+
+### Reproduced backpressure signature (mock-S3, fs-emulation)
+
+`forst-rs-bench --release --bin disagg_write_backpressure` (q4-hot MapState put
+churn through a 16 MiB/s `FRS_REMOTE_BW_MBPS` throttle, small write buffer →
+frequent flush + compaction; ONE checkpoint fired mid-ingest against a 5 s
+deadline; per-window ingest-rate sampling; dev Mac 2026-06-15):
+
+```
+-- repro (legacy non-link ckpt; single shared remote channel) --
+  ingest: 54.4 s for 117.2 MiB → mean 2.15 MiB/s
+  windows: 40 total, 8 COLLAPSED (<5% bw), trough 0.17 MiB/s   ← throughput→0
+  rate/window: █▂▃▃▆▂▃▃▃▆▂▃▃▆▂▃▃▃▆▁▂▂▁▆▁▁▁▁▁▁▆▁▁▁▆▆▆▆▆▇
+  checkpoint: 61253 ms (MISSED; deadline 5000 ms)             ← ckpt-timeout cascade
+```
+
+Root cause (code-grounded): mean useful ingest = `channel_bw / write_amp` (the
+flush + compaction rewrites saturate the slow channel). The zero-throughput
+troughs coincide with the checkpoint, whose `flush_all()` force-drains the
+enqueued flush backlog through the same throttle and monopolizes it for ~50 s.
+
+### What was implemented (flag-gated, default-OFF, byte-identical when off)
+
+1. **QoS upload RATE SPLIT** (`FRS_UPLOAD_RATE_SPLIT=1`, share via
+   `FRS_UPLOAD_COMPACTION_SHARE`, default 0.5):
+   - per-thread requester CLASS moved to a single source of truth in
+     `crates/forst-rs-io/src/requester_class.rs` (io layer, so the throttle can
+     read it; `forst-rs-storage::requester` now delegates). New `Compaction`
+     sub-class (`mark_thread_compaction`/`is_compaction_thread`).
+   - compaction pool marked compaction-class (`WorkerPool::new_compaction`,
+     `bg_pool.rs`; wired at `db.rs::bg_compact_pool` + `compaction_executor.rs`).
+   - `ThrottledFileSystem` gains a second compaction-rate bucket
+     (`new_split`/`from_env`, `throttle.rs`): compaction-class writes pace
+     against `bw × share`; flush + foreground (ckpt `await_upload`) keep the
+     full rate → compaction can never consume the whole channel and starve the
+     flush/checkpoint critical path. Default OFF = one bucket, byte-identical.
+2. **WAL-DELTA link checkpoint** (the ckpt-timeout fix — relied on the EXISTING
+   db.rs:7370 mode boundary: a WAL attached ⇒ the linked checkpoint syncs the
+   local WAL tail + links already-streamed SSTs instead of force-flushing the
+   memtable + backlog through the slow channel). This cycle validates it as the
+   write-path-backpressure relief and gates it in the bench/IT.
+
+### Relief result (same bench, relief arm = rate split + WAL-DELTA link ckpt)
+
+```
+-- relief --
+  ingest: 24.0 s for 117.2 MiB → mean 4.89 MiB/s            (2.3× the repro mean)
+  windows: 35 total, 0 COLLAPSED, trough 1.09 MiB/s         (8→0 collapsed windows)
+  checkpoint: 2379 ms (MET; deadline 5000 ms)               (61253→2379 ms, 26×)
+  oracle: rows=2048 checksum=… == repro                     (byte-identical result)
+
+VERDICT: RELIEF EFFECTIVE — ckpt 61253→2379 ms (now MET); collapsed 8→0;
+         mean 2.15→4.89 MiB/s.
+```
+
+Gates green (2026-06-15): io throttle UTs (no-split-default, split-paces-
+compaction-only, from_env gating) + requester_class UTs; storage requester
+delegation UTs; engine `bg_pool` class-marking UT (background vs compaction vs
+foreground); engine IT `disagg_write_backpressure_it` (mid-ingest WAL-DELTA
+link ckpt under an 8 MiB/s throttle = ~0.47 s, full keyspace byte-exact);
+`remote_bw_throttle_it` + `remote_compaction_it` still green; `cargo fmt --all
+--check` + `clippy --all-targets` clean on io/storage/engine/bench.
+
+### Recorded dead-ends (save-the-next-session)
+
+- **imm-count water-level** (graduated Slowdown at `max-1` imm) and
+  **flush-side upload await** (bound the in-flight backlog to ~1) were both
+  implemented, benchmarked, and REVERTED: neither reduces the TOTAL bytes the
+  slow channel must move, so under channel-saturation they did not raise the
+  floor — the water-level actively HURT (added per-op latency, more collapsed
+  windows). The binding constraint on a slow channel is `bw / write_amp`; the
+  only effective levers are the ones that cut bytes-through-the-channel
+  (WAL-DELTA ckpt = no force-flush; KV-sep / trivial-move / link-mode for the
+  steady stream — already landed) or that protect the critical path's share of
+  the channel (the rate split).
+
+### Residue (next cycle)
+
+- Rate-split value is MASKED in the q4-overwrite shape (compaction is cheap
+  there); a compaction-dominant shape (q9/q20 join, leveled compaction) would
+  show its isolation win at scale — its correctness is unit-proven, its e2e win
+  needs the compaction-heavy soak.
+- WAL-DELTA's per-checkpoint cost is still O(unflushed tail) through the engine
+  FS (`wal_capture_to`); the Phase-5 sealed-segment rotation (flat capture +
+  WAL GC) remains the flat-in-tail-size finish (recorded in the Stage-4 residue).
+- Java/FFI surface for the rate-split env + WAL-DELTA link mode (cross-repo).

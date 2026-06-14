@@ -30,26 +30,38 @@
 //! byte-identical behavior unless its own policy flag opts in (see
 //! `LocalCache` `CachePolicy::background_exempt`, default OFF).
 
-use std::cell::Cell;
-
-thread_local! {
-    /// `true` when the current thread performs background work (flush /
-    /// compaction). Foreground (operator / state-executor / FFI) threads
-    /// never set this.
-    static BACKGROUND: Cell<bool> = const { Cell::new(false) };
-}
+// FRS-PHASE2 UPLOAD-RATE-SPLIT: the per-thread requester CLASS is a single
+// source of truth living in `forst-rs-io` (`requester_class`) so the io-layer
+// remote throttle and this storage-layer cache policy read the SAME flags.
+// (`forst-rs-storage` depends on `forst-rs-io`, never the reverse.) These are
+// thin delegations; the public API is unchanged.
 
 /// Marks the CURRENT thread as a background requester for its remaining
 /// lifetime (sticky). Call once at worker-thread startup (engine `bg_pool`).
 pub fn mark_thread_background() {
-    BACKGROUND.with(|b| b.set(true));
+    forst_rs_io::requester_class::mark_thread_background();
+}
+
+/// Marks the CURRENT thread as a COMPACTION worker for its remaining lifetime
+/// (sticky). Compaction is also background. Call once at compaction-pool
+/// worker startup. Compaction is distinguished from flush because the QoS
+/// remote throttle paces compaction-class writes against a reduced sub-rate so
+/// they can never starve the flush / checkpoint critical path.
+pub fn mark_thread_compaction() {
+    forst_rs_io::requester_class::mark_thread_compaction();
+}
+
+/// Returns `true` if the current thread was marked as a compaction worker.
+/// Advisory; consulted by the QoS-aware remote throttle (default OFF).
+pub fn is_compaction_thread() -> bool {
+    forst_rs_io::requester_class::is_compaction_thread()
 }
 
 /// Returns `true` if the current thread was marked as a background requester
 /// (either sticky via [`mark_thread_background`] or scoped via
 /// [`BackgroundScope`]).
 pub fn is_background_thread() -> bool {
-    BACKGROUND.with(|b| b.get())
+    forst_rs_io::requester_class::is_background_thread()
 }
 
 /// RAII guard that marks the current thread background for the guard's
@@ -62,15 +74,14 @@ pub struct BackgroundScope {
 impl BackgroundScope {
     /// Enters background class on the current thread.
     pub fn enter() -> Self {
-        let prev = BACKGROUND.with(|b| b.replace(true));
+        let prev = forst_rs_io::requester_class::replace_background(true);
         Self { prev }
     }
 }
 
 impl Drop for BackgroundScope {
     fn drop(&mut self) {
-        let prev = self.prev;
-        BACKGROUND.with(|b| b.set(prev));
+        forst_rs_io::requester_class::replace_background(self.prev);
     }
 }
 

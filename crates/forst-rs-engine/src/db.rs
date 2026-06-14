@@ -15109,8 +15109,12 @@ fn bg_compact_pool() -> &'static crate::bg_pool::WorkerPool {
         // FRS-CACHE-BG-EXEMPT: compaction workers are background cache
         // requesters — their input-SST scans must not be able to evict the
         // operator hot set from requester-aware caches (ForSt §2.1.4).
-        // Advisory mark; inert unless the cache policy opts in (default OFF).
-        crate::bg_pool::WorkerPool::new_background(n, "forst-rs-compact")
+        // FRS-PHASE2 UPLOAD-RATE-SPLIT: marked COMPACTION-class so the QoS
+        // remote throttle paces their large continuous SST-rewrite uploads
+        // against the reduced sub-rate, never starving flush / checkpoint
+        // (FRS_UPLOAD_RATE_SPLIT, default OFF). Advisory; inert unless a
+        // policy/throttle flag opts in (default OFF).
+        crate::bg_pool::WorkerPool::new_compaction(n, "forst-rs-compact")
     })
 }
 

@@ -126,7 +126,7 @@ impl RemoteEmulatedCompactionExecutor {
 
     pub fn with_workers(n: usize) -> Self {
         Self {
-            pool: Arc::new(WorkerPool::new_background(n, "forst-rs-remote-compact")),
+            pool: Arc::new(WorkerPool::new_compaction(n, "forst-rs-remote-compact")),
             serialize_round_trip: serialize_round_trip_env(),
         }
     }

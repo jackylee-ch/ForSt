@@ -127,6 +127,14 @@ path = "src/bin/compaction_throughput.rs"
 name = "disagg_vs_forst"
 path = "src/bin/disagg_vs_forst.rs"
 
+# FRS-PHASE2 disagg write-path backpressure: reproduce the q4-hot MapState
+# flush→remote-write→stall collapse under a mock-S3 throttle, then show the
+# relief levers hold the throughput floor + complete the in-flight checkpoint.
+# Wall-clock loop; takes --smoke.
+[[bin]]
+name = "disagg_write_backpressure"
+path = "src/bin/disagg_write_backpressure.rs"
+
 # FRS-PHASE2 pillar 6b: TM-side CPU during a compaction with the Local vs
 # Remote-emulated CompactionMergeExecutor — the offload should show the
 # calling (TM) thread doing ~0 compaction CPU. Wall-clock loop; takes --smoke.

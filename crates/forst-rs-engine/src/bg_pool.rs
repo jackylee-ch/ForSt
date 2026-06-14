@@ -39,27 +39,49 @@ pub(crate) struct WorkerPool {
     workers: Vec<JoinHandle<()>>,
 }
 
+/// Requester class assigned to every worker in a pool (sticky thread-local).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PoolClass {
+    /// Foreground — promotes cache, full remote rate (the read pool).
+    Foreground,
+    /// Background-flush — exempt from cache promotion; flush-priority for the
+    /// upload split (a checkpoint awaits these L0 SSTs).
+    Flush,
+    /// Compaction — exempt from cache promotion AND paced against the reduced
+    /// sub-rate by the QoS remote throttle (FRS_UPLOAD_RATE_SPLIT).
+    Compaction,
+}
+
 impl WorkerPool {
     /// Spawn a pool with `n_workers` threads (clamped to ≥1), each named with
     /// `name` for visibility in `sample`/profilers.
     pub(crate) fn new(n_workers: usize, name: &str) -> Self {
-        Self::with_class(n_workers, name, false)
+        Self::with_class(n_workers, name, PoolClass::Foreground)
     }
 
     /// [`new`](Self::new), but every worker thread is marked as a BACKGROUND
-    /// cache requester (`forst_rs_storage::requester`). Used by the flush and
-    /// compaction pools so their SST reads cannot evict/promote the operator
-    /// hot set in requester-aware caches (FRS-CACHE-BG-EXEMPT, ForSt §2.1.4 —
-    /// only state-executor threads affect LRU order). The mark is advisory
-    /// and inert unless a cache policy flag opts in (default OFF).
+    /// cache requester (`forst_rs_storage::requester`). Used by the flush pool
+    /// so its SST reads cannot evict/promote the operator hot set in
+    /// requester-aware caches (FRS-CACHE-BG-EXEMPT, ForSt §2.1.4 — only
+    /// state-executor threads affect LRU order). The mark is advisory and
+    /// inert unless a cache policy flag opts in (default OFF).
     ///
     /// NOT used for `bg_read_pool`: its workers execute FOREGROUND operator
     /// reads (parallel batch iterator opens) that must keep promoting.
     pub(crate) fn new_background(n_workers: usize, name: &str) -> Self {
-        Self::with_class(n_workers, name, true)
+        Self::with_class(n_workers, name, PoolClass::Flush)
     }
 
-    fn with_class(n_workers: usize, name: &str, background: bool) -> Self {
+    /// [`new_background`](Self::new_background), but every worker is also marked
+    /// as a COMPACTION requester so the QoS remote throttle paces its large
+    /// continuous SST-rewrite uploads against the reduced sub-rate — flush /
+    /// checkpoint critical-path writes are never starved by compaction
+    /// (FRS_UPLOAD_RATE_SPLIT, default OFF). Use for the compaction pool.
+    pub(crate) fn new_compaction(n_workers: usize, name: &str) -> Self {
+        Self::with_class(n_workers, name, PoolClass::Compaction)
+    }
+
+    fn with_class(n_workers: usize, name: &str, class: PoolClass) -> Self {
         let n = n_workers.max(1);
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::new()),
@@ -71,8 +93,14 @@ impl WorkerPool {
             let handle = std::thread::Builder::new()
                 .name(name.to_string())
                 .spawn(move || {
-                    if background {
-                        forst_rs_storage::requester::mark_thread_background();
+                    match class {
+                        PoolClass::Foreground => {}
+                        PoolClass::Flush => {
+                            forst_rs_storage::requester::mark_thread_background();
+                        }
+                        PoolClass::Compaction => {
+                            forst_rs_storage::requester::mark_thread_compaction();
+                        }
                     }
                     worker_loop(sh)
                 })
@@ -210,31 +238,42 @@ mod tests {
         assert_eq!(max_seen.load(Ordering::SeqCst), CAP);
     }
 
-    /// FRS-CACHE-BG-EXEMPT: `new_background` workers carry the background
-    /// requester mark; plain `new` workers stay foreground. The mark is what
-    /// lets requester-aware caches exempt flush/compaction reads from LRU
-    /// promotion without affecting the read pool.
+    /// FRS-CACHE-BG-EXEMPT + FRS-PHASE2 UPLOAD-RATE-SPLIT: `new_background`
+    /// (flush) workers carry the background mark but are NOT compaction-class;
+    /// `new_compaction` workers carry BOTH (background + compaction); plain
+    /// `new` workers stay foreground. The background mark exempts flush/
+    /// compaction reads from LRU promotion; the compaction mark additionally
+    /// routes their remote writes onto the QoS sub-rate bucket.
     #[test]
     fn background_pool_marks_workers_plain_pool_does_not() {
-        use forst_rs_storage::requester::is_background_thread;
-        let check = |pool: &WorkerPool, expect_bg: bool, what: &'static str| {
-            let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        use forst_rs_storage::requester::{is_background_thread, is_compaction_thread};
+        let check = |pool: &WorkerPool, expect_bg: bool, expect_comp: bool, what: &'static str| {
+            let (tx, rx) = std::sync::mpsc::channel::<(bool, bool)>();
             pool.submit(Box::new(move || {
-                let _ = tx.send(is_background_thread());
+                let _ = tx.send((is_background_thread(), is_compaction_thread()));
             }));
-            let got = rx
+            let (bg, comp) = rx
                 .recv_timeout(Duration::from_secs(10))
                 .expect("job did not run");
-            assert_eq!(got, expect_bg, "{what}");
+            assert_eq!(bg, expect_bg, "{what}: background");
+            assert_eq!(comp, expect_comp, "{what}: compaction");
         };
         let bg = WorkerPool::new_background(1, "test-bg-marked");
         check(
             &bg,
             true,
-            "new_background workers must be marked background",
+            false,
+            "new_background workers must be background, NOT compaction",
+        );
+        let comp = WorkerPool::new_compaction(1, "test-comp-marked");
+        check(
+            &comp,
+            true,
+            true,
+            "new_compaction workers must be background AND compaction",
         );
         let fg = WorkerPool::new(1, "test-fg-unmarked");
-        check(&fg, false, "plain new workers must stay foreground");
+        check(&fg, false, false, "plain new workers must stay foreground");
     }
 
     /// H1: a panicking job (i) does not kill its worker — subsequent jobs on

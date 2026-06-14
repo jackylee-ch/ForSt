@@ -34,6 +34,7 @@ pub mod memory_fs;
 pub mod object_store;
 pub mod opendal_backend;
 pub mod ownership;
+pub mod requester_class;
 pub mod router;
 pub mod throttle;
 
@@ -54,5 +55,8 @@ pub use object_store::{
 };
 pub use opendal_backend::OpendalFileSystem;
 pub use ownership::{FileOwnership, FileOwnershipTracker, OwnedFile};
+pub use requester_class::{
+    is_background_thread, is_compaction_thread, mark_thread_background, mark_thread_compaction,
+};
 pub use router::{file_locality, FileLocality, FileSystemRouter};
 pub use throttle::{RateLimiter, ThrottledFileSystem, REMOTE_BW_MBPS_ENV};

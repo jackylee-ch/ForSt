@@ -55,7 +55,45 @@ use crate::filesystem::{
 /// 50 Gb/s. See the module docs.
 pub const REMOTE_BW_MBPS_ENV: &str = "FRS_REMOTE_BW_MBPS";
 
+/// FRS-PHASE2 UPLOAD-RATE-SPLIT (USER DIRECTIVE 2026-06-15, "RATE-LIMIT
+/// uploads"): when set to `1`/`true`, the throttle becomes QoS-aware — writes
+/// issued by COMPACTION-class threads
+/// ([`crate::requester_class::is_compaction_thread`]) are paced against a
+/// SEPARATE, reduced sub-rate bucket, while foreground (operator / checkpoint
+/// `await_upload`) and flush-class writes keep the full remote rate. This
+/// guarantees that a compaction burst can never consume the whole slow remote
+/// write channel and starve the flush → checkpoint critical path (the
+/// backpressure-amplification + ckpt-timeout collapse). Default OFF =
+/// byte-identical single-bucket behavior.
+pub const UPLOAD_RATE_SPLIT_ENV: &str = "FRS_UPLOAD_RATE_SPLIT";
+
+/// FRS-PHASE2 UPLOAD-RATE-SPLIT: fraction of the remote bandwidth compaction
+/// uploads are capped to when the split is enabled. The remaining
+/// `1 - share` is reserved headroom that compaction can never steal from
+/// flush / checkpoint. Override with `FRS_UPLOAD_COMPACTION_SHARE` (a float in
+/// (0, 1)); default `0.5`.
+pub const UPLOAD_COMPACTION_SHARE_ENV: &str = "FRS_UPLOAD_COMPACTION_SHARE";
+
+const DEFAULT_COMPACTION_SHARE: f64 = 0.5;
+
 const MIB: f64 = 1024.0 * 1024.0;
+
+/// Reads [`UPLOAD_RATE_SPLIT_ENV`]; default OFF.
+fn upload_rate_split_enabled() -> bool {
+    std::env::var(UPLOAD_RATE_SPLIT_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Reads [`UPLOAD_COMPACTION_SHARE_ENV`]; clamped to (0.05, 0.95); default 0.5.
+fn compaction_share() -> f64 {
+    std::env::var(UPLOAD_COMPACTION_SHARE_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|f| f.is_finite())
+        .map(|f| f.clamp(0.05, 0.95))
+        .unwrap_or(DEFAULT_COMPACTION_SHARE)
+}
 
 /// A lock-free-ish token-bucket rate limiter measured in **bytes per second**.
 ///
@@ -188,9 +226,17 @@ impl RateLimiter {
 pub struct ThrottledFileSystem {
     inner: Arc<dyn FileSystem>,
     limiter: Arc<RateLimiter>,
+    /// FRS-PHASE2 UPLOAD-RATE-SPLIT: when present, COMPACTION-class writes are
+    /// paced against this reduced sub-rate bucket INSTEAD of the full-rate
+    /// `limiter`. `None` ⇒ split disabled (every class shares `limiter`,
+    /// byte-identical to the legacy single-bucket throttle).
+    compaction_limiter: Option<Arc<RateLimiter>>,
     /// Cumulative bytes charged through this decorator (diagnostics / smoke
     /// verification — proves the throttle is on the remote leg).
     bytes_charged: Arc<AtomicU64>,
+    /// Cumulative bytes paced through the compaction sub-rate bucket (split
+    /// mode only) — proves the QoS isolation is engaged.
+    compaction_bytes_charged: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for ThrottledFileSystem {
@@ -204,21 +250,52 @@ impl std::fmt::Debug for ThrottledFileSystem {
 }
 
 impl ThrottledFileSystem {
-    /// Wraps `inner`, throttling its byte traffic with `limiter`.
+    /// Wraps `inner`, throttling its byte traffic with `limiter`. No QoS split
+    /// (every requester class shares `limiter`).
     pub fn new(inner: Arc<dyn FileSystem>, limiter: Arc<RateLimiter>) -> Self {
         Self {
             inner,
             limiter,
+            compaction_limiter: None,
             bytes_charged: Arc::new(AtomicU64::new(0)),
+            compaction_bytes_charged: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Wraps `inner` with separate full-rate and compaction sub-rate limiters
+    /// (FRS-PHASE2 UPLOAD-RATE-SPLIT). Compaction-class writes pace against
+    /// `compaction_limiter`; all other classes pace against `limiter`.
+    pub fn new_split(
+        inner: Arc<dyn FileSystem>,
+        limiter: Arc<RateLimiter>,
+        compaction_limiter: Arc<RateLimiter>,
+    ) -> Self {
+        Self {
+            inner,
+            limiter,
+            compaction_limiter: Some(compaction_limiter),
+            bytes_charged: Arc::new(AtomicU64::new(0)),
+            compaction_bytes_charged: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Wraps `inner` with a limiter built from [`REMOTE_BW_MBPS_ENV`].
     ///
     /// When the env knob is unset / `0`, the returned decorator is a
-    /// byte-identical pass-through (the limiter never sleeps).
+    /// byte-identical pass-through (the limiter never sleeps). When
+    /// [`UPLOAD_RATE_SPLIT_ENV`] is set AND a cap is active, a compaction
+    /// sub-rate bucket at `bw * (1 - compaction_share)` is installed so
+    /// compaction uploads cannot starve the flush / checkpoint critical path.
     pub fn from_env(inner: Arc<dyn FileSystem>) -> Self {
-        Self::new(inner, Arc::new(RateLimiter::from_env()))
+        let limiter = Arc::new(RateLimiter::from_env());
+        if limiter.is_unlimited() || !upload_rate_split_enabled() {
+            return Self::new(inner, limiter);
+        }
+        // Compaction gets a hard sub-rate cap; the remaining headroom is
+        // reserved for foreground + flush (which use the full-rate bucket).
+        let share = compaction_share();
+        let compaction_bps = ((limiter.bytes_per_sec() as f64) * share).max(1.0) as u64;
+        Self::new_split(inner, limiter, Arc::new(RateLimiter::new(compaction_bps)))
     }
 
     /// Returns `true` when the wrapped limiter imposes no cap.
@@ -237,6 +314,61 @@ impl ThrottledFileSystem {
     pub fn bytes_charged(&self) -> u64 {
         self.bytes_charged.load(Ordering::Relaxed)
     }
+
+    /// Bytes paced through the compaction sub-rate bucket (split mode only).
+    pub fn compaction_bytes_charged(&self) -> u64 {
+        self.compaction_bytes_charged.load(Ordering::Relaxed)
+    }
+
+    /// `true` when a compaction sub-rate split is installed.
+    pub fn has_rate_split(&self) -> bool {
+        self.compaction_limiter.is_some()
+    }
+
+    /// Snapshot the shared throttle state for a freshly opened handle.
+    fn shared(&self) -> ThrottleShared {
+        ThrottleShared {
+            limiter: Arc::clone(&self.limiter),
+            compaction_limiter: self.compaction_limiter.clone(),
+            bytes_charged: Arc::clone(&self.bytes_charged),
+            compaction_bytes_charged: Arc::clone(&self.compaction_bytes_charged),
+        }
+    }
+}
+
+/// FRS-PHASE2 UPLOAD-RATE-SPLIT: shared per-handle throttle state. Carries the
+/// full-rate limiter, the optional compaction sub-rate limiter, and the two
+/// byte counters. A handle charges against the compaction bucket iff the
+/// CALLING thread is compaction-class AND a split is installed; otherwise the
+/// full-rate bucket (legacy single-bucket behavior).
+#[derive(Clone)]
+struct ThrottleShared {
+    limiter: Arc<RateLimiter>,
+    compaction_limiter: Option<Arc<RateLimiter>>,
+    bytes_charged: Arc<AtomicU64>,
+    compaction_bytes_charged: Arc<AtomicU64>,
+}
+
+impl ThrottleShared {
+    /// Charges `n` bytes against the bucket selected by the calling thread's
+    /// requester class, and accounts it.
+    fn charge(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        match self.compaction_limiter.as_ref() {
+            Some(comp) if crate::requester_class::is_compaction_thread() => {
+                self.compaction_bytes_charged
+                    .fetch_add(n as u64, Ordering::Relaxed);
+                self.bytes_charged.fetch_add(n as u64, Ordering::Relaxed);
+                comp.throttle(n);
+            }
+            _ => {
+                self.bytes_charged.fetch_add(n as u64, Ordering::Relaxed);
+                self.limiter.throttle(n);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,17 +377,13 @@ impl ThrottledFileSystem {
 
 struct ThrottledSequential {
     inner: Box<dyn SequentialFile>,
-    limiter: Arc<RateLimiter>,
-    bytes_charged: Arc<AtomicU64>,
+    shared: ThrottleShared,
 }
 
 impl SequentialFile for ThrottledSequential {
     fn read(&mut self, buf: &mut [u8]) -> ForstResult<usize> {
         let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.bytes_charged.fetch_add(n as u64, Ordering::Relaxed);
-            self.limiter.throttle(n);
-        }
+        self.shared.charge(n);
         Ok(n)
     }
 
@@ -267,31 +395,23 @@ impl SequentialFile for ThrottledSequential {
 
 struct ThrottledRandom {
     inner: Box<dyn RandomAccessFile>,
-    limiter: Arc<RateLimiter>,
-    bytes_charged: Arc<AtomicU64>,
+    shared: ThrottleShared,
 }
 
 impl RandomAccessFile for ThrottledRandom {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
         let n = self.inner.read_at(offset, buf)?;
-        if n > 0 {
-            self.bytes_charged.fetch_add(n as u64, Ordering::Relaxed);
-            self.limiter.throttle(n);
-        }
+        self.shared.charge(n);
         Ok(n)
     }
 
     fn read_ranges(&self, ranges: &[(u64, usize)]) -> ForstResult<Vec<Vec<u8>>> {
         let out = self.inner.read_ranges(ranges)?;
         let total: usize = out.iter().map(|v| v.len()).sum();
-        if total > 0 {
-            self.bytes_charged
-                .fetch_add(total as u64, Ordering::Relaxed);
-            // One charge for the whole concurrent batch: the backend issued the
-            // ranges in parallel, so the wall cost is the aggregate bytes over
-            // the link, not the serial sum of per-range sleeps.
-            self.limiter.throttle(total);
-        }
+        // One charge for the whole concurrent batch: the backend issued the
+        // ranges in parallel, so the wall cost is the aggregate bytes over the
+        // link, not the serial sum of per-range sleeps.
+        self.shared.charge(total);
         Ok(out)
     }
 
@@ -314,18 +434,13 @@ impl RandomAccessFile for ThrottledRandom {
 
 struct ThrottledWritable {
     inner: Box<dyn WritableFile>,
-    limiter: Arc<RateLimiter>,
-    bytes_charged: Arc<AtomicU64>,
+    shared: ThrottleShared,
 }
 
 impl WritableFile for ThrottledWritable {
     fn append(&mut self, data: &[u8]) -> ForstResult<()> {
         self.inner.append(data)?;
-        let n = data.len();
-        if n > 0 {
-            self.bytes_charged.fetch_add(n as u64, Ordering::Relaxed);
-            self.limiter.throttle(n);
-        }
+        self.shared.charge(data.len());
         Ok(())
     }
 
@@ -354,8 +469,7 @@ impl FileSystem for ThrottledFileSystem {
         }
         Ok(Box::new(ThrottledSequential {
             inner,
-            limiter: Arc::clone(&self.limiter),
-            bytes_charged: Arc::clone(&self.bytes_charged),
+            shared: self.shared(),
         }))
     }
 
@@ -366,8 +480,7 @@ impl FileSystem for ThrottledFileSystem {
         }
         Ok(Box::new(ThrottledRandom {
             inner,
-            limiter: Arc::clone(&self.limiter),
-            bytes_charged: Arc::clone(&self.bytes_charged),
+            shared: self.shared(),
         }))
     }
 
@@ -382,8 +495,7 @@ impl FileSystem for ThrottledFileSystem {
         }
         Ok(Box::new(ThrottledWritable {
             inner,
-            limiter: Arc::clone(&self.limiter),
-            bytes_charged: Arc::clone(&self.bytes_charged),
+            shared: self.shared(),
         }))
     }
 
@@ -556,5 +668,117 @@ mod tests {
         assert_eq!(fs.get_file_metadata(Path::new("/d/a.sst")).unwrap().size, 3);
         assert_eq!(fs.list_dir(Path::new("/d")).unwrap().len(), 1);
         assert_eq!(fs.name(), "ThrottledFileSystem");
+    }
+
+    // ---- FRS-PHASE2 UPLOAD-RATE-SPLIT ----
+
+    /// Without a split, the decorator has no compaction bucket and EVERY class
+    /// charges the single full-rate limiter — byte-identical to legacy.
+    #[test]
+    fn no_split_by_default() {
+        let inner = Arc::new(MemoryFileSystem::new());
+        let fs = ThrottledFileSystem::new(
+            Arc::clone(&inner) as Arc<dyn FileSystem>,
+            Arc::new(RateLimiter::from_mibps(100_000)),
+        );
+        assert!(!fs.has_rate_split());
+        assert_eq!(fs.compaction_bytes_charged(), 0);
+    }
+
+    /// With a split installed, a COMPACTION-class write is paced against the
+    /// reduced sub-rate bucket (and accounted separately), while a
+    /// FOREGROUND-class write of the same size is NOT — proving the QoS
+    /// isolation that keeps compaction from starving flush / checkpoint.
+    #[test]
+    fn split_paces_compaction_against_subrate_only() {
+        let inner = Arc::new(MemoryFileSystem::new());
+        inner.create_dir_all(Path::new("/d")).unwrap();
+        // Full rate 1000 MiB/s (effectively free at this size); compaction
+        // sub-rate 1 MiB/s (clearly paced).
+        let fs = ThrottledFileSystem::new_split(
+            Arc::clone(&inner) as Arc<dyn FileSystem>,
+            Arc::new(RateLimiter::from_mibps(1000)),
+            Arc::new(RateLimiter::from_mibps(1)),
+        );
+        assert!(fs.has_rate_split());
+
+        // FOREGROUND: write 4 MiB. At 1000 MiB/s this is effectively free and
+        // charges ONLY the full-rate counter.
+        {
+            let mut w = fs
+                .open_writable_file(Path::new("/d/fg.sst"), WriteMode::CreateNew)
+                .unwrap();
+            let start = Instant::now();
+            w.append(&vec![0u8; 4 * 1024 * 1024]).unwrap();
+            let fg_secs = start.elapsed().as_secs_f64();
+            drop(w);
+            assert!(
+                fg_secs < 0.3,
+                "foreground write must not be sub-rate paced, took {fg_secs:.3}s"
+            );
+        }
+        assert_eq!(fs.compaction_bytes_charged(), 0, "fg must not charge comp");
+
+        // COMPACTION: same 4 MiB on a compaction-marked thread. At the 1 MiB/s
+        // sub-rate with a 1 MiB burst, ~3 MiB must pace ⇒ ≥~2s, and it charges
+        // the compaction counter.
+        let comp_fs = ThrottledFileSystem::new_split(
+            Arc::clone(&inner) as Arc<dyn FileSystem>,
+            Arc::new(RateLimiter::from_mibps(1000)),
+            Arc::new(RateLimiter::from_mibps(1)),
+        );
+        let comp_fs = Arc::new(comp_fs);
+        let comp_fs2 = Arc::clone(&comp_fs);
+        let handle = std::thread::spawn(move || {
+            crate::requester_class::mark_thread_compaction();
+            let mut w = comp_fs2
+                .open_writable_file(Path::new("/d/comp.sst"), WriteMode::CreateNew)
+                .unwrap();
+            let start = Instant::now();
+            w.append(&vec![0u8; 4 * 1024 * 1024]).unwrap();
+            start.elapsed().as_secs_f64()
+        });
+        let comp_secs = handle.join().unwrap();
+        assert!(
+            comp_secs >= 1.5,
+            "compaction write must be sub-rate paced (≥1.5s at 1 MiB/s), got {comp_secs:.3}s"
+        );
+        assert_eq!(
+            comp_fs.compaction_bytes_charged(),
+            4 * 1024 * 1024,
+            "compaction bytes must be accounted to the compaction counter"
+        );
+    }
+
+    /// `from_env` installs a split iff both the cap and the split flag are on;
+    /// the compaction sub-rate is `bw * compaction_share`.
+    #[test]
+    fn from_env_split_gating() {
+        // Process-global env — serialize against any sibling env-mutating test.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Cap on, split off ⇒ no split.
+        std::env::set_var(REMOTE_BW_MBPS_ENV, "100");
+        std::env::remove_var(UPLOAD_RATE_SPLIT_ENV);
+        let fs = ThrottledFileSystem::from_env(Arc::new(MemoryFileSystem::new()));
+        assert!(!fs.has_rate_split(), "no split unless explicitly enabled");
+
+        // Cap on, split on ⇒ split at default 0.5 share.
+        std::env::set_var(UPLOAD_RATE_SPLIT_ENV, "1");
+        std::env::remove_var(UPLOAD_COMPACTION_SHARE_ENV);
+        let fs = ThrottledFileSystem::from_env(Arc::new(MemoryFileSystem::new()));
+        assert!(fs.has_rate_split());
+        assert_eq!(
+            fs.compaction_limiter.as_ref().unwrap().bytes_per_sec(),
+            (100.0 * MIB * 0.5) as u64
+        );
+
+        // Cap OFF ⇒ no split regardless of the flag (unlimited pass-through).
+        std::env::remove_var(REMOTE_BW_MBPS_ENV);
+        let fs = ThrottledFileSystem::from_env(Arc::new(MemoryFileSystem::new()));
+        assert!(!fs.has_rate_split());
+        assert!(fs.is_unlimited());
+
+        std::env::remove_var(UPLOAD_RATE_SPLIT_ENV);
     }
 }
