@@ -285,6 +285,62 @@ fn vlog_gc_adaptive_cutoff_percent() -> u32 {
     })
 }
 
+/// FRS-VLOG-COALESCE master flag for the coalesced batched value-log deref
+/// (`FRS_VLOG_COALESCE_DEREF=1`, **DEFAULT OFF**). When OFF, `batch_get_vectorized`
+/// derefs each winning `BlobRef` row inline, per-key, exactly as before
+/// (byte-identical). When ON, the batch DEFERS its `BlobRef` derefs into a side
+/// list, then resolves them in ONE coalesced pass: pointers are grouped by
+/// `segment_id` and sorted by `offset`, so a `VlogReader`'s single 64 KiB chunk
+/// cache HITS along contiguous offsets instead of thrashing one-value-per-chunk
+/// on scattered access. On the disagg/remote path the same group+sort collapses
+/// N scattered ranged GETs into ~1 ranged GET per segment. Results are scattered
+/// back to their key slots — values are independent, so reorder is byte-identical
+/// OUTPUT. Inline (`OpType::Put`) values are untouched; only the SEPARATED
+/// (`OpType::BlobRef`) deref path changes. A uniform engine capability, not
+/// per-query.
+pub fn vlog_coalesce_deref_enabled() -> bool {
+    let ov = VLOG_COALESCE_DEREF_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_VLOG_COALESCE_DEREF").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-VLOG-COALESCE: decode a `BlobRef` row's stored value-pointer bytes into a
+/// [`ValuePointer`] for the deferred-coalesce list. Mirrors `vlog_deref`'s decode
+/// + corruption contract (a BlobRef row's payload is ALWAYS a `ValuePointer`).
+fn decode_blob_ptr(ptr_bytes: &[u8]) -> ForstResult<forst_rs_storage::vlog::ValuePointer> {
+    forst_rs_storage::vlog::ValuePointer::decode(ptr_bytes)
+        .ok_or_else(|| ForstError::corruption("BlobRef row carries malformed value-pointer bytes"))
+}
+
+/// FRS-VLOG-COALESCE test override for [`vlog_coalesce_deref_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static VLOG_COALESCE_DEREF_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-VLOG-COALESCE: forces the coalesced batched deref on/off for tests/benches
+/// (`None` = defer to `FRS_VLOG_COALESCE_DEREF`).
+pub fn set_vlog_coalesce_deref_override(v: Option<bool>) {
+    VLOG_COALESCE_DEREF_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// FRS-SST-COMPRESSION env override (perf experiment, 2026-06-02): force the
 /// SST block compression via `FRS_SST_COMPRESSION=none|lz4|zstd`. A differential
 /// q7 profile showed LZ4 `decompress` is ~43% of the heavy-join prefix-iter CPU
@@ -11890,6 +11946,16 @@ impl DbImpl {
         // outer None = missing/tombstoned.
         let mut resolved: Vec<Option<Option<Vec<u8>>>> = vec![None; n];
 
+        // FRS-VLOG-COALESCE: when ON, the SST-tier deref sites DEFER each
+        // winning `BlobRef` row's pointer into `deferred` (and mark the slot
+        // resolved with a placeholder) instead of dereffing per-key inline; the
+        // deferred pointers are then resolved in ONE coalesced (group-by-segment,
+        // sort-by-offset) pass at every return site via `finish_batch`. OFF
+        // (default) keeps the per-key inline deref — byte-identical. Captured
+        // once so the per-key hot loop reads a local bool, not the flag function.
+        let coalesce = vlog_coalesce_deref_enabled();
+        let mut deferred: Vec<(usize, forst_rs_storage::vlog::ValuePointer)> = Vec::new();
+
         // FRS-PHASE2-C2U3 (rescale-by-clip, design §10 DR1 layer 2): the
         // vectorized phases resolve memtable/SST hits INLINE (only Merge
         // falls back to `get_internal`'s clip gate), so an out-of-range key
@@ -11938,7 +12004,7 @@ impl DbImpl {
             r.iter().any(|x| x.is_none())
         }
         if !any_pending(&resolved) {
-            return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+            return self.finish_batch(resolved, std::mem::take(&mut deferred));
         }
         self.prefetch_sst_files_for_batch(&cf_data, keys);
 
@@ -11976,7 +12042,7 @@ impl DbImpl {
                     }
                 }
                 if !any_pending(&resolved) {
-                    return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+                    return self.finish_batch(resolved, std::mem::take(&mut deferred));
                 }
             }
         }
@@ -12021,7 +12087,7 @@ impl DbImpl {
                     }
                 }
                 if !any_pending(&resolved) {
-                    return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+                    return self.finish_batch(resolved, std::mem::take(&mut deferred));
                 }
             }
         }
@@ -12137,7 +12203,13 @@ impl DbImpl {
                                         "batch_get_vectorized: L0 BlobRef missing pointer payload",
                                     )
                                 })?;
-                                resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                                if coalesce {
+                                    let ptr = decode_blob_ptr(&ptr_bytes)?;
+                                    deferred.push((i, ptr));
+                                    resolved[i] = Some(Some(Vec::new()));
+                                } else {
+                                    resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                                }
                                 break 'l0_files;
                             }
                             OpType::Merge => {
@@ -12153,7 +12225,7 @@ impl DbImpl {
                 }
             }
             if !any_pending(&resolved) {
-                return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+                return self.finish_batch(resolved, std::mem::take(&mut deferred));
             }
         } else if !l0_files.is_empty() {
             // For each L0 file, collect hits keyed by slot index. Then merge
@@ -12235,7 +12307,13 @@ impl DbImpl {
                                     "batch_get_vectorized: L0 BlobRef missing pointer payload",
                                 )
                             })?;
-                            resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                            if coalesce {
+                                let ptr = decode_blob_ptr(&ptr_bytes)?;
+                                deferred.push((i, ptr));
+                                resolved[i] = Some(Some(Vec::new()));
+                            } else {
+                                resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                            }
                             break;
                         }
                         OpType::Merge => {
@@ -12253,7 +12331,7 @@ impl DbImpl {
                 }
             }
             if !any_pending(&resolved) {
-                return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+                return self.finish_batch(resolved, std::mem::take(&mut deferred));
             }
         }
 
@@ -12333,7 +12411,13 @@ impl DbImpl {
                                         "batch_get_vectorized: L1+ BlobRef missing pointer payload",
                                     )
                                 })?;
-                                resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                                if coalesce {
+                                    let ptr = decode_blob_ptr(&ptr_bytes)?;
+                                    deferred.push((i, ptr));
+                                    resolved[i] = Some(Some(Vec::new()));
+                                } else {
+                                    resolved[i] = Some(Some(self.vlog_deref(&ptr_bytes)?));
+                                }
                                 decided = true;
                                 break;
                             }
@@ -12349,12 +12433,13 @@ impl DbImpl {
                 }
             }
             if !any_pending(&resolved) {
-                return Ok(resolved.into_iter().map(|r| r.unwrap()).collect());
+                return self.finish_batch(resolved, std::mem::take(&mut deferred));
             }
         }
 
-        // Any keys still pending after every level are genuine misses.
-        Ok(resolved.into_iter().map(|r| r.unwrap_or(None)).collect())
+        // Any keys still pending after every level are genuine misses. The
+        // deferred (coalesce-ON) BlobRef derefs are resolved here in one pass.
+        self.finish_batch(resolved, deferred)
     }
 
     /// Batch point-lookup returning results as an Arrow RecordBatch.
@@ -13331,6 +13416,71 @@ impl DbImpl {
             ForstError::corruption("BlobRef row carries malformed value-pointer bytes")
         })?;
         self.get_or_open_vlog_reader(ptr.segment_id)?.get(&ptr)
+    }
+
+    /// FRS-VLOG-COALESCE: resolve a batch's DEFERRED `BlobRef` derefs in ONE
+    /// coalesced pass and SCATTER the values back to their key slots in
+    /// `resolved`. Each `deferred` entry is `(slot, ValuePointer)` — the slot the
+    /// value belongs to and the decoded pointer (decoded once at the deref site,
+    /// no re-decode here). The pass:
+    ///   1. groups the pointers by `segment_id`,
+    ///   2. sorts each segment's group by `offset`,
+    ///   3. opens each segment's reader ONCE and derefs its group with
+    ///      [`VlogReader::get_coalesced`] (one sequential / ranged read per
+    ///      segment instead of one chunk-thrash per key), then
+    ///   4. writes each value into `resolved[slot] = Some(Some(value))`.
+    /// Values are independent, so the (segment, offset) reorder produces
+    /// byte-identical OUTPUT to the per-key inline path. Empty `deferred` is a
+    /// no-op. Used only when [`vlog_coalesce_deref_enabled`] is ON.
+    fn coalesced_vlog_deref_into(
+        &self,
+        deferred: Vec<(usize, forst_rs_storage::vlog::ValuePointer)>,
+        resolved: &mut [Option<Option<Vec<u8>>>],
+    ) -> ForstResult<()> {
+        if deferred.is_empty() {
+            return Ok(());
+        }
+        // Group slots by segment (preserving each pointer alongside its slot).
+        let mut by_segment: std::collections::HashMap<
+            u64,
+            Vec<(usize, forst_rs_storage::vlog::ValuePointer)>,
+        > = std::collections::HashMap::new();
+        for (slot, ptr) in deferred {
+            by_segment
+                .entry(ptr.segment_id)
+                .or_default()
+                .push((slot, ptr));
+        }
+        for (segment_id, mut group) in by_segment {
+            // Sort by physical offset — the coalesce (chunk-cache HIT / one
+            // ranged read per segment).
+            group.sort_by_key(|(_, p)| p.offset);
+            let reader = self.get_or_open_vlog_reader(segment_id)?;
+            let ptr_refs: Vec<&forst_rs_storage::vlog::ValuePointer> =
+                group.iter().map(|(_, p)| p).collect();
+            let values = reader.get_coalesced(&ptr_refs)?;
+            debug_assert_eq!(values.len(), group.len());
+            for ((slot, _), value) in group.into_iter().zip(values) {
+                resolved[slot] = Some(Some(value));
+            }
+        }
+        Ok(())
+    }
+
+    /// FRS-VLOG-COALESCE: finalize a `batch_get_vectorized` result vector at a
+    /// return site. Runs the coalesced deferred-deref pass (no-op when `deferred`
+    /// is empty — the OFF path and the pre-SST phases), then collapses `resolved`
+    /// into the public `Vec<Option<Vec<u8>>>`. Every still-`None` slot is a
+    /// genuine miss (`None`). With the deferred pass run first, no `Vec::new()`
+    /// placeholder ever escapes — each deferred slot is overwritten by its real
+    /// value before collapse.
+    fn finish_batch(
+        &self,
+        mut resolved: Vec<Option<Option<Vec<u8>>>>,
+        deferred: Vec<(usize, forst_rs_storage::vlog::ValuePointer)>,
+    ) -> ForstResult<Vec<Option<Vec<u8>>>> {
+        self.coalesced_vlog_deref_into(deferred, &mut resolved)?;
+        Ok(resolved.into_iter().map(|r| r.unwrap_or(None)).collect())
     }
 
     /// FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3, catalog item #1): before the
@@ -18419,6 +18569,142 @@ mod tests {
         assert_eq!(db.get(&cf, b"k256").unwrap().as_deref(), Some(&v256[..]));
         assert_eq!(db.get(&cf, b"k128").unwrap().as_deref(), Some(&v128[..]));
         assert_eq!(db.get(&cf, b"k80").unwrap().as_deref(), Some(&v80[..]));
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-COALESCE (2026-06-14): the coalesced batched value-log deref
+    /// (`FRS_VLOG_COALESCE_DEREF`) produces BYTE-IDENTICAL output to the per-key
+    /// inline deref on the q9-probe shape — many separated values read in
+    /// SCATTERED (random) order through `batch_get_vectorized`, from the SST
+    /// tier (post-flush + post-compaction, so both the L0 and L1+ deref sites are
+    /// exercised). The coalesce groups by segment + sorts by offset + scatters
+    /// back, so the reorder is invisible in the result. Default OFF must equal
+    /// the pre-flag path; ON must equal OFF, value-for-value, including misses
+    /// interleaved with separated hits.
+    #[test]
+    fn test_vlog_coalesce_deref_byte_identical_scattered_kvsep() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+
+        // Incompressible payloads so EVERY value is ≥256 B → separates (lz4 must
+        // not shrink one below the threshold and silently keep it inline).
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 240;
+        // Two flushes (two vlog segments) so the coalesce must group by segment;
+        // a mid-run overwrite + compaction pushes rows to L1 (the L1+ deref site)
+        // while the second flush's rows stay shallow (the L0 site).
+        let build = || -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<(Vec<u8>, Vec<u8>)>) {
+            let db = open();
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("coalesce"))
+                .unwrap();
+            let mut kv: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N);
+            for i in 0..N as u32 {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x1000 + i as u64, 256 + (i as usize % 64));
+                db.put(&cf, &k, &v).unwrap();
+                kv.push((k, v));
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed");
+            db.compact_all().unwrap(); // first cohort → L1 (L1+ deref site)
+                                       // Second cohort: overwrite half the keys with new large values,
+                                       // flush WITHOUT compacting → these BlobRef rows live in L0.
+            for i in (0..N as u32).step_by(2) {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x9000 + i as u64, 256 + (i as usize % 48));
+                db.put(&cf, &k, &v).unwrap();
+                kv[i as usize].1 = v;
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed");
+            assert!(
+                !db.version_set.current().vlog_segments.is_empty(),
+                "values must have separated"
+            );
+            (db, cf, kv)
+        };
+
+        // Scattered (deterministic-shuffle) read order = the join-probe shape.
+        // Interleave misses so the slot-scatter is exercised with gaps.
+        let scattered_keys = |kv: &[(Vec<u8>, Vec<u8>)]| -> Vec<Vec<u8>> {
+            let mut order: Vec<usize> = (0..kv.len()).collect();
+            let mut s: u64 = 0x9E3779B97F4A7C15;
+            for i in (1..order.len()).rev() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let j = (s as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            let mut out = Vec::with_capacity(order.len() + order.len() / 8);
+            for (n, &i) in order.iter().enumerate() {
+                if n % 8 == 3 {
+                    out.push(format!("absent{n:05}").into_bytes()); // genuine miss
+                }
+                out.push(kv[i].0.clone());
+            }
+            out
+        };
+
+        // Arm 1: flag OFF (the pre-flag per-key inline deref) = the baseline.
+        set_vlog_coalesce_deref_override(Some(false));
+        let (db_off, cf_off, kv) = build();
+        let keys = scattered_keys(&kv);
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let read_seq = u64::MAX; // latest view
+        let off = db_off
+            .batch_get_vectorized(&cf_off, &key_refs, read_seq)
+            .unwrap();
+
+        // Arm 2: flag ON (the coalesced deref) on a FRESH db (same build).
+        set_vlog_coalesce_deref_override(Some(true));
+        let (db_on, cf_on, kv2) = build();
+        assert_eq!(kv, kv2, "build must be deterministic across arms");
+        let keys2 = scattered_keys(&kv2);
+        assert_eq!(keys, keys2);
+        let key_refs2: Vec<&[u8]> = keys2.iter().map(|k| k.as_slice()).collect();
+        let read_seq2 = u64::MAX; // latest view
+        let on = db_on
+            .batch_get_vectorized(&cf_on, &key_refs2, read_seq2)
+            .unwrap();
+
+        // (a) ON == OFF, value-for-value (the byte-identity gate).
+        assert_eq!(on.len(), off.len());
+        assert_eq!(on, off, "coalesced deref must be byte-identical to per-key");
+
+        // (b) Each present key returned its CORRECT value; misses are None.
+        let want: std::collections::HashMap<Vec<u8>, Vec<u8>> = kv.iter().cloned().collect();
+        for (k, got) in keys.iter().zip(on.iter()) {
+            match want.get(k) {
+                Some(v) => assert_eq!(got.as_deref(), Some(v.as_slice()), "wrong value for a key"),
+                None => assert_eq!(got, &None, "absent key must miss"),
+            }
+        }
+
+        // (c) Empty and single-key batches: the coalesce path must no-op.
+        let empty: Vec<&[u8]> = Vec::new();
+        assert!(db_on
+            .batch_get_vectorized(&cf_on, &empty, read_seq2)
+            .unwrap()
+            .is_empty());
+        let single = vec![kv[0].0.as_slice()];
+        let one = db_on
+            .batch_get_vectorized(&cf_on, &single, read_seq2)
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].as_deref(), Some(kv[0].1.as_slice()));
+
+        set_vlog_coalesce_deref_override(None);
         set_kv_separation_override(None);
     }
 

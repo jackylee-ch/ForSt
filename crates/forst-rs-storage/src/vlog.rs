@@ -233,6 +233,14 @@ impl VlogWriter {
 /// page-cache-warm 64 KiB read + memcpy per miss.
 const VLOG_READ_CHUNK: usize = 64 * 1024;
 
+/// FRS-VLOG-COALESCE: max spanning byte range a single coalesced batched read
+/// ([`VlogReader::get_coalesced`]) will buffer. A flush segment's values are
+/// packed contiguously in append (= offset) order, so a scattered batch's
+/// offset-sorted group spans ≈ the sum of its record sizes; this cap only trips
+/// for pathologically sparse pointer sets, which fall back to per-record reads.
+/// 16 MiB bounds the transient coalesce buffer well under a typical segment.
+const VLOG_COALESCE_MAX_SPAN: usize = 16 * 1024 * 1024;
+
 /// Random-access reader for a value-log segment (the post-visibility
 /// dereference of the V2 read path).
 pub struct VlogReader {
@@ -280,6 +288,71 @@ impl VlogReader {
         let out = Self::parse_record(&buf[..total], ptr);
         *guard = Some((ptr.offset, buf));
         out
+    }
+
+    /// FRS-VLOG-COALESCE: coalesced batched deref of MANY pointers into THIS
+    /// segment in ONE pass. `ptrs` must all target this segment and be SORTED by
+    /// `offset` (the caller groups by `segment_id` + sorts). The reader computes
+    /// the spanning byte range `[first.offset, last.offset + last_total)` and
+    /// issues a SINGLE positioned read for it, then slices + CRC-verifies +
+    /// decompresses each value out of the in-memory span. On local FS this turns
+    /// N scattered chunk reads into one sequential read; on the disagg/remote
+    /// path it collapses N scattered ranged GETs into ~1 ranged GET per segment
+    /// (the disagg-critical win). Returns one value per input pointer, IN INPUT
+    /// (offset) ORDER — the caller scatters them back to key slots.
+    ///
+    /// Records that individually exceed the span budget are read with the
+    /// per-record `get` path (one direct pread each) so a single huge value can
+    /// never force an unbounded coalesce buffer. An empty `ptrs` is a no-op.
+    pub fn get_coalesced(&self, ptrs: &[&ValuePointer]) -> ForstResult<Vec<Vec<u8>>> {
+        if ptrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ptrs.len() == 1 {
+            return Ok(vec![self.get(ptrs[0])?]);
+        }
+        // The spanning range across the (offset-sorted) group.
+        let first_off = ptrs[0].offset;
+        let last = ptrs[ptrs.len() - 1];
+        let last_total = VLOG_RECORD_HEADER + last.len as usize;
+        let span_end = last.offset + last_total as u64;
+        let span_len = (span_end - first_off) as usize;
+
+        // Guard: if the offset-sorted group spans more than VLOG_COALESCE_MAX_SPAN
+        // (sparse pointers far apart in a large segment), fall back to per-record
+        // reads so the coalesce buffer stays bounded. The hot case — a flush
+        // segment dereffed by a scattered batch — has values packed contiguously,
+        // so the span ~= sum of record sizes and this guard does not trip.
+        if span_len > VLOG_COALESCE_MAX_SPAN {
+            return ptrs.iter().map(|p| self.get(p)).collect();
+        }
+
+        let mut span = vec![0u8; span_len];
+        let mut filled = 0usize;
+        while filled < span_len {
+            let n = self
+                .file
+                .read_at(first_off + filled as u64, &mut span[filled..])?;
+            if n == 0 {
+                return Err(ForstError::corruption(
+                    "vlog coalesced span short read (EOF before span end)",
+                ));
+            }
+            filled += n;
+        }
+        let mut out = Vec::with_capacity(ptrs.len());
+        for p in ptrs {
+            let total = VLOG_RECORD_HEADER + p.len as usize;
+            let lo = (p.offset - first_off) as usize;
+            let hi = lo + total;
+            if hi > span.len() {
+                return Err(ForstError::corruption(
+                    "vlog coalesced record extends past span",
+                ));
+            }
+            out.push(Self::parse_record(&span[lo..hi], p)?);
+        }
+        Ok(out)
     }
 
     /// Validates one framed record (`record` spans exactly header + stored
@@ -572,6 +645,54 @@ mod tests {
         let r = VlogReader::open(&fs, dir, 1).unwrap();
         for (v, p) in values.iter().zip(&ptrs) {
             assert_eq!(&r.get(p).unwrap(), v, "value at {:?}", p);
+        }
+    }
+
+    /// FRS-VLOG-COALESCE: `get_coalesced` returns each pointer's value
+    /// byte-identically to per-`get`, IN INPUT ORDER, for an offset-sorted group
+    /// — incl. compressed segments. Empty = []; single = one value. The caller
+    /// (engine) groups by segment + sorts by offset before calling, so this test
+    /// feeds the offset-sorted run a real batch would produce.
+    #[test]
+    fn test_vlog_get_coalesced_byte_identical_and_in_order() {
+        for codec in [CompressionType::None, CompressionType::Lz4] {
+            let fs = MemoryFileSystem::new();
+            let dir = Path::new("/db");
+            fs.create_dir_all(dir).unwrap();
+            let mut w = VlogWriter::create_with_compression(&fs, dir, 9, codec).unwrap();
+            // Mixed sizes; semi-compressible so lz4 has work but framing varies.
+            let values: Vec<Vec<u8>> = (0..64u32)
+                .map(|i| {
+                    let n = (i as usize % 11) * 40 + 1;
+                    (0..n).map(|j| ((i as usize + j) % 251) as u8).collect()
+                })
+                .collect();
+            let ptrs: Vec<ValuePointer> = values.iter().map(|v| w.append(v).unwrap()).collect();
+            w.sync().unwrap();
+            let r = VlogReader::open(&fs, dir, 9).unwrap();
+
+            // Empty + single no-op.
+            assert!(r.get_coalesced(&[]).unwrap().is_empty());
+            assert_eq!(
+                r.get_coalesced(&[&ptrs[7]]).unwrap(),
+                vec![values[7].clone()]
+            );
+
+            // Full offset-sorted group (== append order) — one ranged read.
+            let refs: Vec<&ValuePointer> = ptrs.iter().collect();
+            let got = r.get_coalesced(&refs).unwrap();
+            assert_eq!(got, values, "coalesced group must match per-get values");
+
+            // A scattered SUBSET, then sorted by offset (what the engine does):
+            // result is in the (sorted) input order and equals per-get.
+            let mut subset: Vec<usize> = vec![40, 3, 17, 0, 63, 28, 9];
+            subset.sort_by_key(|&i| ptrs[i].offset);
+            let sub_refs: Vec<&ValuePointer> = subset.iter().map(|&i| &ptrs[i]).collect();
+            let sub_got = r.get_coalesced(&sub_refs).unwrap();
+            for (slot, &i) in sub_got.iter().zip(&subset) {
+                assert_eq!(slot, &values[i]);
+                assert_eq!(slot, &r.get(&ptrs[i]).unwrap());
+            }
         }
     }
 
