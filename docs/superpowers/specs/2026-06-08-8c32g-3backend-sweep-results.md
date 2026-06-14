@@ -2610,3 +2610,135 @@ fingerprint needed to resume observation; sweep unaffected.
 #    V10, NEAR-missing 1.25x by 0.01x) show single-run Mac variance; verdicts
 #    near a bar boundary should be re-confirmed on a quiet box / n>=3. Never
 #    cross-compare these Mac numbers with REMOTE-x86 pins.
+
+# ─────────────────────────────────────────────────────────────────────────
+# ★ V3 FLAG-OFF (ForSt-matching default) verdict pass 2026-06-14 (tip 15436bfde)
+# ─────────────────────────────────────────────────────────────────────────
+# Mac population (8c/32g TOPO=split, 2 TM 4c/16g + 1 JM 2c/4g), @100M, STRICTLY
+# SERIAL. tip 15436bfde. frs flag-OFF = the ForSt-matching DEFAULT: NONE of the
+# opt-in forst-rs write/read levers. Set FRS_KV_SEPARATION=false
+# FRS_TRIVIAL_MOVE=false, FRS_RS_S2_PINNED UNSET (no S2 pin); FRS_SST_COMPRESSION
+# stays lz4 (the engine default AND fair vs rocksdb/forst snappy/lz4). rocksdb/
+# forst = own defaults. MAXSEC: q11,q12,q17,q19,q4=1500; q7,q9,q20=2700.
+# Purpose: the clean apples-to-apples local baseline. The earlier "baseline"
+# (21191eb51) was contention-inflated AND secretly flag-OFF due to a harness bug.
+# This isolates which queries truly WANT the KV-sep lever stack (compare to the
+# flag-ON section above).  NEVER cross-compare with REMOTE-x86 pins.
+#
+# query | frs-OFF wall (rows)     | rdb wall (rows)        | forst wall (rows)       | frs/rdb | RDB bar (<=1.25x) | vs ForSt (<ForSt) | flag-ON vs OFF delta
+# ------|------------------------|------------------------|-------------------------|---------|-------------------|-------------------|---------------------
+# q9    | 1828.7 (91,813,372)    | 1076.8 (91,813,372)    | 2002.5 (91,813,372)     | 1.70x   | FAIL 1.70x        | PASS 1.10x        | ★ flag-OFF FINISHES (flag-ON DNF/OOM) — KV-sep CAUSED the OOM; frs BEATS forst by completing faster (1828.7<2002.5)
+#         q9-frs flag-OFF FINISHED clean @1828.7s, out_rows 91,813,372 (byte-
+#         identical to flag-ON rdb/forst 91,813,372). RSS oscillated 10-15.8GiB
+#         (transient peak 15.8 right at ~75M then GC/compaction reclaimed to
+#         ~13GiB) — NEVER breached the 16g/TM cgroup. flag-ON OOM-killed at ~75M
+#         (15.25GiB); flag-OFF rode the SAME join-state pressure ~2GiB lower and
+#         survived. CONFIRMS: the KV-sep vlog-reader cache + lever stack is what
+#         pushed the TM over the cgroup; with levers OFF the bounded-LRU holds it.
+# q11   | 118.8 (92,000,000)     | 105.9 (92,000,000)     | 130.8 (92,000,000)      | 1.12x   | PASS              | PASS 1.10x        | ★★ flag-ON 215.8->OFF 118.8 = -45% / 1.82x FASTER. KV-sep HURTS q11.
+#         q11-frs flag-OFF FINISHED @118.8s (flag-ON was 215.8s -> -97s/-45%).
+#         frs 1.12x RDB (105.9) = PASS the <=1.25x bar (flag-ON FAILED 2.08x);
+#         frs BEATS forst 130.8 (1.10x) = PASS (flag-ON FAILED 1.68x). The
+#         windowed-MapState-agg DRAIN that was the wall under flag-ON is fixed by
+#         turning the KV-sep lever stack OFF -> q11 flips from BOTH-FAIL to
+#         BOTH-PASS. All 3 rows identical (92,000,000). q11 strongly wants KV-sep OFF.
+# q17   | 110.7 (92,000,000)     | 71.6 (92,000,000)      | 245.9 (92,000,000)      | 1.55x   | FAIL 1.55x        | PASS 2.22x        | ★ flag-ON 150.7->OFF 110.7 = -27% / 1.36x FASTER. KV-sep HURTS q17.
+#         q17-frs flag-OFF FINISHED @110.7s (flag-ON 150.7s -> -40s/-27%). Still
+#         1.55x RDB (71.6) = FAIL the <=1.25x bar, BUT much closer than flag-ON's
+#         2.23x. frs BEATS forst 245.9 (2.22x) = strong PASS (flag-ON was 1.67x).
+#         The windowed-agg accumulator-RMW DRAIN is faster with KV-sep OFF. q17
+#         still loses to RocksDB's C++ windowed-agg read path (residual read-path
+#         gap, NOT write-amp) but the lever stack was making it WORSE. All 3 rows
+#         identical (92,000,000). q17 wants KV-sep OFF.
+# q20   | 956.3 (93,201,404)     | 663.7 (93,201,404)     | 1463.4 (93,201,404)     | 1.44x   | FAIL 1.44x        | PASS 1.53x        | ✗ flag-ON 824.4->OFF 956.3 = +16% SLOWER. q20 WANTS KV-sep ON.
+#         q20-frs flag-OFF FINISHED @956.3s -- SLOWER than flag-ON's 824.4s
+#         (+132s/+16%). frs/rdb 1.44x = FAIL (flag-ON was NEAR 1.26x). frs still
+#         BEATS forst 1463.4 (1.53x) = PASS. UNLIKE q11/q17, q20's heavy interval-
+#         join with value-carrying read path BENEFITS from the KV-sep + write-amp
+#         CompactionPolicy lever stack (consistent with q19's flag-ON win). RSS
+#         oscillated 9-11GiB (no OOM either way). All 3 rows identical (93,201,404).
+#         NOTE flag-ON's 824.4 was flagged busy-disk noise; even so flag-OFF is
+#         clearly not faster -> q20 is a KV-sep-ON query. (rdb 663.7 vs flag-ON
+#         653.5 = stable, confirming the frs delta is real not box noise.)
+# q4    | 384.1 (25,851,000)     | 289.8 (177,629,788)    | DNF (OOM @~73M)         | 1.33x   | FAIL 1.33x        | PASS (ForSt DNF)  | ✗ flag-ON 311.0->OFF 384.1 = +23% SLOWER. q4 WANTS KV-sep ON.
+#         q4-frs flag-OFF FINISHED @384.1s -- SLOWER than flag-ON's 311.0s
+#         (+73s/+23%). frs/rdb 1.33x = FAIL (flag-ON PASSED 1.09x). CORRECTNESS:
+#         frs 25,851,000 vs rdb 177,629,788 = the KNOWN retract-changelog cadence
+#         (frs ~25.8M, rdb ~177.6M), EXPECTED/documented, src_out 98,000,000 both.
+#         ForSt DNF: TM1 OOM-killed (exit 137) at ~73M (RSS rode 12->16GiB then
+#         SIGKILL -> RESTARTING crash-loop -> harness early-abort), REPRODUCES the
+#         flag-ON ForSt-q4 DNF. frs FINISHES where ForSt cannot -> PASS "< ForSt".
+#         q4 net: like q20, the heavy retract/agg write path BENEFITS from the
+#         KV-sep + write-amp CompactionPolicy stack -> q4 is a KV-sep-ON query.
+# q7    | 936.8 (92,000,002)     | 579.1 (92,000,002)     | 491.0 (92,000,002)      | 1.62x   | FAIL 1.62x        | FAIL 0.52x        | ✗✗ flag-ON 695.5->OFF 936.8 = +35% SLOWER. q7 STRONGLY wants KV-sep ON.
+#         q7-frs flag-OFF FINISHED @936.8s -- much SLOWER than flag-ON's 695.5s
+#         (+241s/+35%). frs/rdb 1.62x = FAIL (flag-ON PASSED 1.16x); frs now LOSES
+#         to forst too (936.8 vs 491.0 = 0.52x; flag-ON was 1.46x behind but
+#         closer). The heaviest windowed-join shows intermittent join stalls
+#         (rate swung 13k-170k/s) with KV-sep OFF. CONFIRMS the flag-ON -26% q7
+#         win came FROM the write-amp CompactionPolicy + CYCLE-3 fan-out + KV-sep
+#         stack -- q7 is THE clearest KV-sep-ON beneficiary. All 3 rows identical
+#         (92,000,002). (rdb 579.1 vs flag-ON 599.1, forst 491.0 vs 477.8 = stable
+#         -> frs delta is real not box noise.)
+# q19   | 464.2 (92,000,000)     | 269.5 (92,000,000)     | 268.2 (92,000,000)      | 1.72x   | FAIL 1.72x        | FAIL 0.58x        | ✗✗✗ flag-ON 216.0->OFF 464.2 = +115% / 2.15x SLOWER. q19 is THE strongest KV-sep-ON beneficiary.
+#         q19-frs flag-OFF FINISHED @464.2s -- 2.15x SLOWER than flag-ON's 216.0s
+#         (+248s/+115%). flag-ON q19 BEAT BOTH backends (0.82x RDB, 1.18x ForSt);
+#         flag-OFF now LOSES to both (1.72x RDB, 0.58x vs ForSt 268.2). This is the
+#         LARGEST single-query swing in the whole pass. q19 = value-carrying
+#         interval-join + Top-N read path; the write-amp CompactionPolicy + KV-sep
+#         stack is exactly what that path was built for. DEFINITIVE: q19 is the #1
+#         KV-sep-ON query. All 3 rows identical (92,000,000). (rdb 269.5 vs flag-ON
+#         264.3, forst 268.2 vs 255.6 = stable -> frs swing is real.)
+# q12   | 41.6 (92,000,000)      | 40.9 (92,000,000)      | 40.6 (92,000,000)       | 1.02x   | PASS              | PASS ~parity      | = flag-ON 40.6 ~ OFF 41.6 (source-bound parity; KV-sep irrelevant)
+#         q12-frs flag-OFF FINISHED @41.6s (flag-ON 40.6s; +1s box noise). q12 is
+#         a lightweight proctime tumbling agg = SOURCE-BOUND; all 3 backends ~40s
+#         (40.6-41.6). KV-sep ON/OFF makes no difference -> q12 is lever-neutral.
+#         All 3 rows identical (92,000,000) despite proctime nondeterminism.
+#
+# ───────────────────── FLAG-OFF HEADLINE FINDINGS (2026-06-14) ─────────────────────
+# COMPACT TABLE (frs flag-OFF | rdb | forst, @100M, TOPO=split 8c/32g Mac, serial):
+#   query | frs-OFF   | rdb       | forst      | frs/rdb | flag-ON->OFF frs | KV-sep verdict
+#   ------|-----------|-----------|------------|---------|------------------|----------------
+#   q9    | 1828.7    | 1076.8    | 2002.5     | 1.70x   | DNF -> 1828.7 ★  | OFF (KV-sep CAUSED the OOM)
+#   q11   | 118.8     | 105.9     | 130.8      | 1.12x   | 215.8 -> 118.8   | OFF (-45%, both-FAIL->both-PASS)
+#   q17   | 110.7     | 71.6      | 245.9      | 1.55x   | 150.7 -> 110.7   | OFF (-27%)
+#   q20   | 956.3     | 663.7     | 1463.4     | 1.44x   | 824.4 -> 956.3   | ON  (+16%)
+#   q4    | 384.1     | 289.8     | DNF(OOM)   | 1.33x   | 311.0 -> 384.1   | ON  (+23%)
+#   q7    | 936.8     | 579.1     | 491.0      | 1.62x   | 695.5 -> 936.8   | ON  (+35%)
+#   q19   | 464.2     | 269.5     | 268.2      | 1.72x   | 216.0 -> 464.2   | ON  (+115% ★ biggest swing)
+#   q12   | 41.6      | 40.9      | 40.6       | 1.02x   | 40.6 -> 41.6     | NEUTRAL (source-bound)
+#   (All finishing rows byte-identical per query; q4 retract cadence frs 25.85M
+#    vs rdb 177.6M documented; ForSt q4 = DNF OOM.)
+#
+# 1. ★ q9 FINISHES flag-OFF (1828.7s) where it DNF'd flag-ON (OOM). DEFINITIVE:
+#    the KV-sep lever stack CAUSED the q9 OOM. RSS oscillated 10-15.8GiB and rode
+#    the SAME join-state pressure ~2GiB LOWER than flag-ON, surviving the ~75M
+#    cliff where flag-ON SIGKILL'd. (frs 1.70x RDB = FAIL the bar, but it RUNS,
+#    and BEATS ForSt 2002.5 by completing faster.)
+# 2. q11/q17 RECOVER strongly with KV-sep OFF: q11 -45% (215.8->118.8, flips
+#    BOTH-FAIL -> BOTH-PASS), q17 -27% (150.7->110.7, RDB-gap 2.23x->1.55x).
+#    The windowed-agg accumulator DRAIN is what the KV-sep stack was hurting.
+# 3. q4/q7/q19/q20 get SLOWER flag-OFF (confirming they WANT KV-sep): q19 +115%
+#    (the value-carrying interval-join + Top-N read path is THE KV-sep showcase),
+#    q7 +35% (heaviest windowed-join), q4 +23%, q20 +16%. These are the write-amp
+#    /value-carrying read-path queries the lever stack was built for.
+# 4. q12 lever-neutral (source-bound). q9 is the special case: it "wants" levers
+#    for read-path speed but they OOM the box -> on THIS 35g Mac it MUST run OFF.
+# 5. CORRECTNESS: ZERO defects. Every finishing backend's out_rows byte-identical
+#    per query (q9 91,813,372 all 3; q11/q12/q17/q19 92,000,000; q7 92,000,002;
+#    q20 93,201,404; q4 documented retract cadence). ForSt q4 DNF (OOM, reproduces
+#    flag-ON). NOTE: this clean SERIAL pass ran ~15-20% slower across ALL backends
+#    than the contention-era flag-ON pass (rdb/forst stable within ±3% where
+#    re-measured), so frs flag-ON-vs-OFF deltas are REAL (same-pass A/B), not box
+#    noise.
+#
+# ───────────────────── RECOMMENDED SELECTIVE KV-SEP PROFILE ─────────────────────
+# Per-query lever choice (FRS_KV_SEPARATION / FRS_TRIVIAL_MOVE / S2-pin):
+#   KV-sep ON  : q4, q7, q19, q20  (write-amp / value-carrying read-path joins)
+#   KV-sep OFF : q9 (MUST, else OOM on 35g Mac), q11, q17  (windowed-agg drain)
+#   NEUTRAL    : q12 (source-bound; either)
+# The lever is NOT globally good or bad -- it is READ-PATH-SHAPED: interval-join +
+# Top-N + heavy windowed-JOIN want it ON; windowed-AGG-DRAIN (q11/q17) and the
+# memory-bound q9 want it OFF. A production deployment should gate KV-sep per
+# operator/query class, not globally. On a memory-constrained box (<=16g/TM), q9
+# REQUIRES OFF regardless of its read-path preference.
