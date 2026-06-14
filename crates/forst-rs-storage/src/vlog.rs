@@ -331,7 +331,7 @@ pub const DEFAULT_VLOG_READER_CACHE_CAP: usize = 2048;
 /// FRS-AKV-B1 (adaptive KV-sep, 2026-06-14): the charged RESIDENT byte cost
 /// attributed to one open [`VlogReader`] for the byte-budget bound. A reader
 /// holds an OS file handle plus a lazily-filled chunk buffer of at most
-/// [`VLOG_READ_CHUNK`] (64 KiB) bytes; we charge the full chunk granule (the
+/// `VLOG_READ_CHUNK` (64 KiB) bytes; we charge the full chunk granule (the
 /// dominant, worst-case term) plus a small fixed overhead for the handle +
 /// `Arc`/map bookkeeping. The charge is intentionally a fixed UPPER bound per
 /// reader so `resident_bytes == len() * CHARGE` is exact and the budget can

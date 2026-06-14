@@ -188,7 +188,7 @@ pub fn set_vlog_resident_budget_mb_override(v: Option<u64>) {
 /// (`FRS_KV_ADAPTIVE_PRESSURE=1`, **DEFAULT OFF**). When OFF, separation is
 /// decided purely by size (Layer A) + the static eligibility gates — i.e.
 /// today's `FRS_KV_SEPARATION` behaviour, byte-identical. When ON,
-/// [`DbImpl::should_separate_now`] additionally backs off (writes inline) for
+/// `DbImpl::should_separate_now` additionally backs off (writes inline) for
 /// a CF that is at/over the resident byte budget AND not reclaiming (the q9
 /// scattered-death signature) — the adaptive never-OOM decision.
 pub fn kv_adaptive_pressure_enabled() -> bool {
@@ -15390,7 +15390,7 @@ fn default_compaction_executor_from_env(
 /// up to 256). 256 also matches the bench join-payload fixture. This is the
 /// FIRST (eligibility) gate of the adaptive mechanism — necessary but not
 /// sufficient (q9 stores large values yet must back off under memory pressure;
-/// see [`DbImpl::should_separate_now`]).
+/// see `DbImpl::should_separate_now`).
 pub fn kv_min_blob_size() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
