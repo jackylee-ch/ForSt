@@ -506,6 +506,17 @@ fn test_flush_all_drains_after_async_path() {
     let opts = EngineOptions {
         db_path: "/db".to_string(),
         write_buffer_size: 1024,
+        // De-flake: this test asserts `flush_all` drains every CF through the
+        // async path — it is NOT a write-stall test (that is covered by
+        // `test_max_write_buffer_number_backpressure`). With the default
+        // `max_write_buffer_number: 3`, 400 tiny puts into a 1 KiB buffer pile
+        // up imms faster than the flush worker drains them, hitting the stall
+        // path; under the slow llvm-cov instrumented CI build the drain cannot
+        // clear within the 45 s stall_timeout and the put fails spuriously
+        // (run 27485409277). Raise the imm ceiling so the drain-correctness
+        // assertion is not gated by the stall timeout while still exercising
+        // many async flushes via the tiny buffer.
+        max_write_buffer_number: 64,
         ..EngineOptions::default()
     };
     let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
