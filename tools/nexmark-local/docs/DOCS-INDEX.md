@@ -6,6 +6,11 @@ of truth). Paths are relative to the repo root.
 
 ## Procedure / config (read before running)
 
+- **`tools/nexmark-local/configs/best-config.tsv`** + **`scripts/run-best.sh`**
+  Per-query EMPIRICALLY-BEST config (best-performance reproduction; per-query
+  config is intentional). Distinct from the uniform-config research mode.
+  Synthesized from the V3 flag-ON vs flag-OFF passes in
+  `docs/superpowers/specs/2026-06-08-8c32g-3backend-sweep-results.md`.
 - **`docs/superpowers/specs/2026-06-14-remote-nexmark-config-v3.md`**
   Canonical UNIFORM config + flag values, deploy + concurrency etiquette.
   Maps config → harness (`run-8c32g.sh`) → templates. *The* config authority.
