@@ -157,6 +157,13 @@ path = "src/bin/nexmark_disagg_s3.rs"
 name = "vlog_reader_cache_footprint"
 path = "src/bin/vlog_reader_cache_footprint.rs"
 
+# KVSEP-OPTIMAL investigation (2026-06-14): per-deref read-side latency probe —
+# cold-seq (scan locality) vs random (point-get) vs hot-hit (cache-hit floor),
+# uncompressed vs lz4. Quantifies the deref cost the read-side fix must remove.
+[[bin]]
+name = "vlog_deref_latency"
+path = "src/bin/vlog_deref_latency.rs"
+
 # FRS-PHASE2 catalog #4: checkpoint multi-file upload — serial copy loop vs
 # parallel multi-file PUT (FRS_CKPT_PARALLEL_UPLOAD). Models per-object PUT-RTT
 # on a remote checkpoint dir; quantifies the checkpoint-barrier upload term.
