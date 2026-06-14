@@ -302,6 +302,46 @@ recurs back-to-back, the q11 pattern), bounded (per-key, LRU-capped like the exi
   perf/iostat capture (`/ssd2/.../q7prof-*`) to rank H1 vs H2 vs H4 (write-amp share). All are
   remote 100M and must wait for the bridge/Mac to free — **needs profiling run.**
 
+## 5b. IMPLEMENTATION STATUS (2026-06-14, read-side levers R1/R2a/R3)
+
+- **R1 (adaptive fan-out-gated S2)** — SHIPPED, engine repo `forst-rs` @ `d0c6e74f3`
+  (`crates/forst-rs-engine/src/db.rs`). Per-scan `n_overlap` gate, `FRS_S2_FANOUT_MIN`
+  default `u32::MAX` (= OFF, byte-identical). Done by the prior agent; not revisited.
+
+- **R2a (content-adaptive executor depth, SAFE realization)** — SHIPPED, **Flink backend repo**
+  (`flink-statebackend-forst-rs`), new mode `FRS_RS_EXECUTOR=routing-adaptive`. The executor and
+  MapState code live in the Flink backend, NOT this engine repo — R1 was the engine-side lever of
+  the campaign; R2a/R3 are its Java-side levers. Files:
+  - `exec/RoutingStateExecutor.java` — `routingAdaptive` mode + the `runIterBatchOnWorkers` /
+    iter-free-inline split + the inline/worker dispatch counters (R2a gate);
+  - `keyed/ForStRsAsyncKeyedStateBackend.java` — `case "routing-adaptive"` wiring;
+  - tests `exec/RoutingAdaptiveR2aTest.java` (5 falsifiers) + `exec/RoutingAdaptiveR2aMicroBench.java`.
+  Every batch stays **kg-affine** (one cache per key-group — the proven windowed-join read-your-writes
+  invariant; NEVER the mailbox-vs-worker cross-cache split that was the q8-flaky ingredient). Per
+  batch: ITER batches fan out to the kg-affine worker threads (overlap, the q11 318.9→135.7s lever);
+  ITER-FREE batches run inline on the mailbox via their kg workers' executors with **zero
+  worker-thread handoff** (the q17 carve-out — keeps the 76.7s point-RMW path that beats ForSt 3.3×).
+  Byte-identical OUTPUT to `routing` (same caches, synchronous completion). Default stays `inline`.
+
+- **R3 (per-key MergingWindowSet cache)** — SCOPED BACKEND-REPO FOLLOW-UP, **not implemented**
+  (deliberately, to avoid over-reaching). Findings that re-scoped it:
+  1. The re-drain caller `MergingWindowSet.initializeCache` is **flink-table-runtime code**
+     (`flink-table/.../groupwindow/internal/MergingWindowSet.java:91`), which the directive says to
+     keep untouched.
+  2. That runtime ALREADY caches per key: `cachedSortedWindows.get(key)` — it only calls
+     `mapping.iterator()` (→ `ForStRsMapState.forEachEntry`) on a **cache miss**. So the per-record
+     O(N) re-drain the spec modelled is bounded by the runtime's own per-key cache; the residual is
+     only on runtime-cache eviction.
+  3. R3 has **NO engine (Rust) component** — the engine already exposes the vectorized prefix-iter
+     drain `forEachEntry` uses; nothing to add engine-side.
+  → R3 is therefore a **pure Java backend cache** layered inside `ForStRsMapState.forEachEntry`
+  (keyed on the map prefix, invalidated on put/remove/clear across the statebuf + writeCache +
+  readCache + off-heap mutation paths). The multi-path invalidation is correctness-fragile and its
+  marginal benefit (runtime already caches) is unquantified, so it is shipped as R2a alone and R3
+  recorded here as a scoped follow-up rather than rushed. If pursued: add the per-prefix snapshot in
+  `ForStRsMapState`, gate `FRS_RS_WINSET_CACHE` default-OFF, and prove byte-identical merged-window
+  sets ON vs OFF with a forEachEntry microbench — all within the Flink backend repo.
+
 ## 6. Net
 The dynamic mechanism the user wants **already half-exists** (one `FRS_RS_EXECUTOR` switch with
 kg-affine routing; one S2 flag). The missing pieces are: (1) make S2 **per-scan fan-out-adaptive**
