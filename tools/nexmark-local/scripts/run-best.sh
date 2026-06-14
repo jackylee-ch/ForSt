@@ -13,6 +13,9 @@
 #   KV-sep OFF (read-bound / OOM-prone):     q9 (MUST, else OOM) q11 q17
 #   NEUTRAL    (source-bound):               q12
 #   q17 best wall (83.7s) also needs FRS_RS_EXECUTOR=routing-adaptive (R2a).
+#   Approach A (coalesced vlog deref, FRS_VLOG_COALESCE_DEREF=1) is part of the
+#   best config for the KV-sep queries (q4 q7 q19 q20). It is set uniformly in
+#   the TSV; it is a no-op when KV-sep is OFF (q9/q11/q12/q17).
 #
 # USAGE
 #   run-best.sh <query>            # run ONE query at its best config (forst-rs arm)
@@ -76,12 +79,12 @@ lookup_row() {
 # Echoes a human-readable summary. Sets the FRS_* env for run-8c32g.sh.
 apply_row() {
   local row="$1"
-  local query kvsep kvmin trivial s2pin s2fan exec_ comp wall status note
-  IFS=$'\t' read -r query kvsep kvmin trivial s2pin s2fan exec_ comp wall status note <<<"$row"
+  local query kvsep kvmin trivial s2pin s2fan exec_ comp coalesce wall status note
+  IFS=$'\t' read -r query kvsep kvmin trivial s2pin s2fan exec_ comp coalesce wall status note <<<"$row"
 
   # Clear all per-query knobs first (so a previous query's setting never leaks).
   unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE \
-        FRS_RS_S2_PINNED FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR 2>/dev/null || true
+        FRS_RS_S2_PINNED FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF 2>/dev/null || true
 
   setk() { [ "$2" != "-" ] && export "$1=$2" || true; }
   setk FRS_KV_SEPARATION   "$kvsep"
@@ -90,6 +93,10 @@ apply_row() {
   setk FRS_RS_S2_PINNED    "$s2pin"
   setk FRS_S2_FANOUT_MIN   "$s2fan"
   setk FRS_RS_EXECUTOR     "$exec_"
+  # Coalesced batched value-log deref (Approach A): KV-sep pure-win read path,
+  # part of the best config for the KV-sep queries (q4/q7/q19/q20). No-op when
+  # KV-sep is OFF, so harmless to set uniformly.
+  setk FRS_VLOG_COALESCE_DEREF "$coalesce"
   # SST compression: lz4 is the engine default AND the fair match; always set it
   # explicitly so the run is reproducible regardless of any inherited env.
   export FRS_SST_COMPRESSION="${comp:-lz4}"
@@ -98,7 +105,7 @@ apply_row() {
   echo "  query=$query  expected_wall=${wall}s  status=$status"
   echo "  FRS_KV_SEPARATION=${FRS_KV_SEPARATION:-<unset>}  FRS_KV_MIN_BLOB_SIZE=${FRS_KV_MIN_BLOB_SIZE:-<unset>}  FRS_TRIVIAL_MOVE=${FRS_TRIVIAL_MOVE:-<unset>}"
   echo "  FRS_RS_S2_PINNED=${FRS_RS_S2_PINNED:-<unset>}  FRS_S2_FANOUT_MIN=${FRS_S2_FANOUT_MIN:-<unset>}  FRS_RS_EXECUTOR=${FRS_RS_EXECUTOR:-<unset>}"
-  echo "  FRS_SST_COMPRESSION=$FRS_SST_COMPRESSION"
+  echo "  FRS_SST_COMPRESSION=$FRS_SST_COMPRESSION  FRS_VLOG_COALESCE_DEREF=${FRS_VLOG_COALESCE_DEREF:-<unset>}"
   [ "$status" = "NEEDS-CONFIRM" ] && echo "  *** NEEDS-CONFIRM: this exact knob combo's wall is UNMEASURED — treat $wall s as an estimate; a confirming run is required. ***"
   echo "  note: $note"
 }

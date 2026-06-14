@@ -2742,3 +2742,85 @@ fingerprint needed to resume observation; sweep unaffected.
 # memory-bound q9 want it OFF. A production deployment should gate KV-sep per
 # operator/query class, not globally. On a memory-constrained box (<=16g/TM), q9
 # REQUIRES OFF regardless of its read-path preference.
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ★ Approach-A coalesce-deref confirm 2026-06-14 (tip 317c5e00f, FRS_VLOG_COALESCE_DEREF=1)
+# ═════════════════════════════════════════════════════════════════════════════
+# GOAL: confirm whether Approach A (coalesced batched value-log deref, the
+# read-side KV-sep pure-win the kvsep investigation §1.3 proved at the ENGINE
+# layer) translates to an END-TO-END NexMark query win. Engine mini-bench
+# (vlog_deref_latency, §1.3 of 2026-06-14-kvsep-optimal-all-queries-investigation.md)
+# showed scattered-deref COALESCED vs random: 64B 2361->22ns (105x), 512B
+# 2983->90ns (33x), 4096B 3334->401ns (8x) -- i.e. coalescing lands scattered
+# point-get derefs at the scan-locality floor (the ~2.9x-class engine read win
+# cited for the q9-probe shape).
+#
+# METHOD: tip 317c5e00f, fresh Linux arm64 .so (q1@1M smoke PASS out_rows=
+# 1,000,000). Each KV-sep query's BEST config (KV-sep ON + lz4 + trivial-move +
+# S2-pinned) PLUS FRS_VLOG_COALESCE_DEREF=1, @100M, TOPO=split (2 TM 4c/16g +
+# 1 JM 2c/4g), STRICTLY SERIAL, docker empty + scratch cleaned between each.
+# q9 run with KV-sep ON (to test if coalesce lets it finish/get-further) even
+# though its best config is KV-sep OFF. MAXSEC q4/q19=1500, q7/q9/q20=2700.
+# Baseline = the "V3 FULL 8-QUERY flag-ON" pass above (tip 1cda0e724, SAME box
+# family, SAME lever stack minus coalesce) -> the per-query delta isolates the
+# coalesce flag.
+#
+# query | prior best (flag-ON) | coalesce-ON wall | delta        | rows (vs prior)            | verdict
+# ------|----------------------|------------------|--------------|----------------------------|--------
+# q9    | DNF (OOM ~75-83M)    | DNF (OOM ~59.7M) | still DNF    | n/a (DNF)                  | NO HELP -- still OOM, earlier
+# q4    | 311.0                | 374.1            | +63.1 (+20%) | 25,833,798 (~25.8M cadence)| box noise (slower)
+# q7    | 695.5                | 686.6            | -8.9 (-1.3%) | 92,000,002 (EXACT)         | tiny win (probe-side deref)
+# q19   | 216.0                | 227.2            | +11.2 (+5%)  | 92,000,000 (EXACT)         | flat (box noise)
+# q20   | 824.4                | 836.3            | +11.9 (+1.4%)| 93,201,404 (EXACT)         | flat (box noise)
+#
+# q9 detail: KV-sep ON + coalesce STILL OOMs (TaskManager-no-longer-reachable /
+# exit-137 crash-loop). Peak src_out 59,665,818 (~59.7M) before the freeze at
+# 561s -> job-time ~622s when it stopped progressing -> harness aborted at
+# 762.6s. This is LOWER than the prior flag-ON OOM point (~75-83M, att3 ~75M).
+# So coalesce did NOT get q9 further -- the deref-tax/run-length drop is NOT the
+# binding constraint; the dominant final-phase pressure is the FLINK-SIDE
+# join+rank state heap on the 36g(2x16+4) > 35g Mac (consistent with the
+# bounded-LRU finding: vlog read-side levers are necessary-but-NOT-sufficient
+# for q9 on this box). q9's BEST config STAYS KV-sep OFF @1828.7s (finishes).
+# (The ~59.7M vs prior ~75-83M is within busy-disk single-run crash-point noise,
+# but the headline is unchanged: q9 = Mac-population RESOURCE DNF, coalesce or not.)
+#
+# CORRECTNESS: every finishing query's out_rows is byte-identical to the prior
+# flag-ON pass (q7 92,000,002; q19 92,000,000; q20 93,201,404; q4 the documented
+# ~25.8M retract cadence 25,833,798 ~ prior 25,830,678). FRS_VLOG_COALESCE_DEREF
+# is BYTE-IDENTICAL by construction (db.rs:18576) -- confirmed empirically.
+#
+# ───────────────────────── VERDICT (Approach A end-to-end) ─────────────────────────
+# The 105x/33x/8x ENGINE mini-bench deref win does NOT translate into a
+# comparable END-TO-END query win on these NexMark queries. Net per-query
+# deltas: q7 -1.3%, q19 +5%, q20 +1.4%, q4 +20% -- all WITHIN this 35g Mac's
+# documented single-run busy-disk variance (the prior pass already noted q20
+# ran +18% and q4 +12% on busy-disk passes). No query shows a coalesce win
+# remotely near the engine micro-bench's multiple-x.
+#
+# WHY the engine win doesn't show end-to-end (code-grounded, kvsep §1.2):
+#   - The value-carrying SCAN/DRAIN path (q4/q7/q9/q20 next_with_value ->
+#     ValueDecision::Blob) reads consecutive key-order values that ALREADY HIT
+#     the single-slot 64KiB chunk cache -> it was at the scan-locality floor
+#     BEFORE coalesce. Coalesce only helps SCATTERED point-get derefs
+#     (batch_get_vectorized per-key), which are a SMALL fraction of these
+#     queries' total wall (dominated by ingest + windowed-join/agg state RMW +
+#     compaction, NOT scattered vlog derefs).
+#   - q9 is the one query whose PROBE side issues scattered point-gets (the
+#     micro-bench's target shape) -- but q9 is MEMORY-bound (OOM) before the
+#     deref-CPU saving can matter, so the win is masked by the resource DNF.
+#   - q7 (-1.3%) is the only query with a directionally-correct (if tiny) move,
+#     consistent with its heavy windowed-JOIN having some probe-side scattered
+#     derefs; still box-noise-sized.
+#
+# DISPOSITION: coalesce is CORRECTNESS-SAFE (byte-identical) and a genuine
+# ENGINE-LAYER read win (mini-bench proven), so it is RETAINED in the best
+# config for the KV-sep queries (q4/q7/q19/q20) in tools/nexmark-local/
+# configs/best-config.tsv -- it is the disagg-correct deref form and a no-op
+# when KV-sep is OFF. But on THIS local box it is NOT an end-to-end mover: the
+# scattered-deref tax it removes is not on these queries' critical path (their
+# value-carrying drains already hit the chunk-cache floor). Its expected payoff
+# is on the DISAGG/remote path (vlog segment remote, opendal; §2.3) where each
+# scattered deref is a network round-trip -- THERE coalescing collapses N RTTs
+# to ~1 and should show end-to-end. Local-FS confirm = NO REGRESSION, no win.
+# RE-RUN on the REMOTE x86/NVMe + disagg vlog to capture the network-RTT win.

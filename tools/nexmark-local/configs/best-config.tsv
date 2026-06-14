@@ -21,23 +21,28 @@
 #   FRS_RS_S2_PINNED     1|true|TRUE => ON  (default OFF)            db.rs:15529
 #   FRS_S2_FANOUT_MIN    usize, default usize::MAX=OFF (R1 adaptive) db.rs:15601
 #   FRS_SST_COMPRESSION  none|lz4|zstd, engine default lz4          db.rs:299
+#   FRS_VLOG_COALESCE_DEREF 1|true|TRUE => ON (default OFF)         db.rs:312
+#                        Coalesced batched value-log deref: KV-sep pure-win read
+#                        path. Byte-identical output (db.rs:18576). NO-OP when
+#                        KV-sep is OFF (no separated values to deref) → harmless
+#                        to leave set. Part of the best config for KV-sep queries.
 #   FRS_RS_EXECUTOR      inline(default)|routing|routing-adaptive|coordinated|two-regime|routing-async
 #                        ForStRsAsyncKeyedStateBackend.java:1319 (Java/flink side)
 #
 # COLUMNS (tab-separated):
-#   query  KV_SEPARATION  KV_MIN_BLOB_SIZE  TRIVIAL_MOVE  S2_PINNED  S2_FANOUT_MIN  RS_EXECUTOR  SST_COMPRESSION  expected_wall_s  status  note
+#   query  KV_SEPARATION  KV_MIN_BLOB_SIZE  TRIVIAL_MOVE  S2_PINNED  S2_FANOUT_MIN  RS_EXECUTOR  SST_COMPRESSION  VLOG_COALESCE_DEREF  expected_wall_s  status  note
 #   - "-" = leave unset (engine default).
 #   - status: MEASURED       = the encoded config produced expected_wall_s in a captured run.
 #             NEEDS-CONFIRM   = best-known config but THIS exact knob combination's wall is
 #                               UNMEASURED (the encoded value is the best component-measured
 #                               estimate; a confirming run is required before trusting it).
 #
-query	KV_SEPARATION	KV_MIN_BLOB_SIZE	TRIVIAL_MOVE	S2_PINNED	S2_FANOUT_MIN	RS_EXECUTOR	SST_COMPRESSION	expected_wall_s	status	note
-q4	true	256	true	1	-	-	lz4	311	MEASURED	KV-sep ON wins (flag-ON 311 vs flag-OFF 384, +23%). Retract-changelog cadence rows ~25.8M (documented, not a defect). Beats RDB 1.09x; ForSt DNF(OOM).
-q7	true	256	true	1	-	-	lz4	695	MEASURED	KV-sep ON wins big (flag-ON 695 vs flag-OFF 937, +35%). Heaviest windowed-join; -26% vs prior V10. PASS RDB 1.16x; loses to ForSt.
-q9	false	-	false	-	-	-	lz4	1828	MEASURED	KV-sep MUST be OFF on the 35g Mac: flag-ON DNF (TM OOM ~75-83M, reproducible x2); flag-OFF FINISHES 1828.7s (RSS ~2GiB lower). Beats ForSt 2002.5 by completing.
-q11	false	-	false	-	-	-	lz4	119	MEASURED	KV-sep OFF wins (flag-OFF 118.8 vs flag-ON 215.8, -45%). Flips both-FAIL->both-PASS (1.12x RDB). Windowed-MapState-agg drain. NOTE: R2a (routing-adaptive) ALSO helped q11 historically (318.9->135.7); the OFF+R2a combo is UNMEASURED -- current cell encodes the best MEASURED (plain OFF, 118.8). See run-best.sh q11-r2a variant.
-q12	-	-	-	-	-	-	lz4	41	MEASURED	Source-bound parity; KV-sep neutral (flag-ON 40.6 ~ flag-OFF 41.6). Either works; left at engine default (OFF).
-q17	false	-	false	-	-	routing-adaptive	lz4	83.7	NEEDS-CONFIRM	BEST wall 83.7 = KV-sep-OFF regime + R2a routing-adaptive (/tmp/v3-q17 capture). Plain KV-sep-OFF inline measured 110.7 (flag-OFF pass); KV-sep-ON measured 150.7 (flag-ON). The OFF+routing-adaptive 83.7 is from a SEPARATE capture, NOT the clean serial flag-OFF pass -> CONFIRM the OFF+routing-adaptive wall on a quiet box. Fallback MEASURED config = OFF/inline @110.7.
-q19	true	256	true	1	-	-	lz4	216	MEASURED	#1 KV-sep-ON beneficiary (flag-ON 216 vs flag-OFF 464, +115% = largest swing). BEATS BOTH backends (0.82x RDB, 1.18x ForSt). Value-carrying interval-join + Top-N read path.
-q20	true	256	true	1	-	-	lz4	824	MEASURED	KV-sep ON wins (flag-ON 824.4 vs flag-OFF 956.3, +16%). NEAR RDB 1.26x (busy-disk noise; quiet box likely PASS <=1.25x). PASS ForSt 1.63x. R1 adaptive-S2 (FRS_S2_FANOUT_MIN) is a candidate further lever for this deep-probe join (UNMEASURED here).
+query	KV_SEPARATION	KV_MIN_BLOB_SIZE	TRIVIAL_MOVE	S2_PINNED	S2_FANOUT_MIN	RS_EXECUTOR	SST_COMPRESSION	VLOG_COALESCE_DEREF	expected_wall_s	status	note
+q4	true	256	true	1	-	-	lz4	1	311	MEASURED	KV-sep ON wins (flag-ON 311 vs flag-OFF 384, +23%). +FRS_VLOG_COALESCE_DEREF=1 (coalesced batched vlog deref, part of best config). Retract-changelog cadence rows ~25.8M (documented, not a defect). Beats RDB 1.09x; ForSt DNF(OOM).
+q7	true	256	true	1	-	-	lz4	1	695	MEASURED	KV-sep ON wins big (flag-ON 695 vs flag-OFF 937, +35%). +FRS_VLOG_COALESCE_DEREF=1 (coalesced probe-side vlog deref, part of best config). Heaviest windowed-join; -26% vs prior V10. PASS RDB 1.16x; loses to ForSt.
+q9	false	-	false	-	-	-	lz4	1	1828	MEASURED	KV-sep MUST be OFF on the 35g Mac: flag-ON DNF (TM OOM ~75-83M, reproducible x2); flag-OFF FINISHES 1828.7s (RSS ~2GiB lower). Beats ForSt 2002.5 by completing. VLOG_COALESCE_DEREF=1 is a NO-OP here (KV-sep OFF => no separated values); set uniformly, harmless.
+q11	false	-	false	-	-	-	lz4	1	119	MEASURED	KV-sep OFF wins (flag-OFF 118.8 vs flag-ON 215.8, -45%). Flips both-FAIL->both-PASS (1.12x RDB). Windowed-MapState-agg drain. NOTE: R2a (routing-adaptive) ALSO helped q11 historically (318.9->135.7); the OFF+R2a combo is UNMEASURED -- current cell encodes the best MEASURED (plain OFF, 118.8). See run-best.sh q11-r2a variant.
+q12	-	-	-	-	-	-	lz4	1	41	MEASURED	Source-bound parity; KV-sep neutral (flag-ON 40.6 ~ flag-OFF 41.6). Either works; left at engine default (OFF).
+q17	false	-	false	-	-	routing-adaptive	lz4	1	83.7	NEEDS-CONFIRM	BEST wall 83.7 = KV-sep-OFF regime + R2a routing-adaptive (/tmp/v3-q17 capture). Plain KV-sep-OFF inline measured 110.7 (flag-OFF pass); KV-sep-ON measured 150.7 (flag-ON). The OFF+routing-adaptive 83.7 is from a SEPARATE capture, NOT the clean serial flag-OFF pass -> CONFIRM the OFF+routing-adaptive wall on a quiet box. Fallback MEASURED config = OFF/inline @110.7.
+q19	true	256	true	1	-	-	lz4	1	216	MEASURED	#1 KV-sep-ON beneficiary (flag-ON 216 vs flag-OFF 464, +115% = largest swing). +FRS_VLOG_COALESCE_DEREF=1 (coalesced vlog deref, part of best config). BEATS BOTH backends (0.82x RDB, 1.18x ForSt). Value-carrying interval-join + Top-N read path.
+q20	true	256	true	1	-	-	lz4	1	824	MEASURED	KV-sep ON wins (flag-ON 824.4 vs flag-OFF 956.3, +16%). +FRS_VLOG_COALESCE_DEREF=1 (coalesced deep-probe vlog deref, part of best config). NEAR RDB 1.26x (busy-disk noise; quiet box likely PASS <=1.25x). PASS ForSt 1.63x. R1 adaptive-S2 (FRS_S2_FANOUT_MIN) is a candidate further lever for this deep-probe join (UNMEASURED here).
