@@ -976,10 +976,31 @@ impl FileMappingManager {
     }
 
     /// Crash-GC sweep (design §2.4): lists `dir` on the backing FS and reaps
-    /// every `.sst` object that no live mapping (refs > 0) references —
-    /// orphans from a crash between journal append and physical delete, and
-    /// drained tombstones. HARD-STOP guarantee: an object with refs > 0 is
-    /// never deleted.
+    /// every disaggregation-managed object (`.sst` AND `.vlog`) that no live
+    /// mapping (refs > 0) references — orphans from a crash between journal
+    /// append and physical delete, and drained tombstones. HARD-STOP
+    /// guarantee: an object with refs > 0 is never deleted.
+    ///
+    /// FRS-PHASE2-P1 (vlog reclaim parity, 2026-06-14): the KV-separation
+    /// `.vlog` segment is the SECOND disaggregation artifact class — registered,
+    /// linked, unlinked, adopted and tombstoned through the exact same physical
+    /// map as `.sst` (link site `db.rs` `create_incremental_checkpoint_linked`,
+    /// adopt site `adopt_linked_vlog_segments`). It was wired into the *adopt*
+    /// side but was MISSING from the *reclaim* side: this sweep filtered
+    /// `extension == "sst"` only, so a vlog orphan (crash between journal append
+    /// and physical write) or a JM-tombstoned vlog segment was never reaped —
+    /// a monotonic remote-space leak (hazard H1). The reap path itself is
+    /// extension-agnostic (it keys on the physical map's refcount / tombstone
+    /// state), so extending the filter to `.vlog` completes the durability
+    /// ordering guarantee for the second artifact class with the SAME
+    /// refcount/HARD-STOP discipline.
+    ///
+    /// H4 (TOCTOU): the `list_dir` runs OUTSIDE the lock (a file created after
+    /// the listing is simply absent from the stale listing — safe), and the
+    /// delete decision runs UNDER the lock against the live physical map (a
+    /// concurrent `link`/`adopt` blocks on the same mutex and would have set
+    /// refs > 0 before release if it ran first — the HARD-STOP holds). This
+    /// invariant is class-agnostic and so holds for `.vlog` unchanged.
     pub fn gc_sweep(&self, dir: &Path) -> ForstResult<GcReport> {
         let listing = self.fs.list_dir(dir)?;
         let mut report = GcReport::default();
@@ -988,8 +1009,19 @@ impl FileMappingManager {
             if meta.is_dir {
                 continue;
             }
-            let is_sst = meta.path.extension().map(|e| e == "sst").unwrap_or(false);
-            if !is_sst {
+            // Both disaggregation artifact classes are swept with identical
+            // refcount/tombstone discipline: SST (key-LSM) and vlog (KV-sep
+            // value segments). UUID-keyed minting always uses a `.sst`-suffixed
+            // physical (`mint_physical_key`), so a UUID-mode vlog physical is
+            // already covered by the `.sst` arm; the `.vlog` arm covers the
+            // identity-mapped (non-UUID) physicals whose key keeps the segment
+            // suffix.
+            let is_managed = meta
+                .path
+                .extension()
+                .map(|e| e == "sst" || e == "vlog")
+                .unwrap_or(false);
+            if !is_managed {
                 continue;
             }
             let key = match meta.path.to_str() {
@@ -2042,6 +2074,173 @@ mod tests {
         assert!(!fs.file_exists(Path::new("/db/000031.sst")).unwrap());
         // Non-SST files are never touched.
         assert!(fs.file_exists(Path::new("/db/MANIFEST")).unwrap());
+    }
+
+    // --- FRS-PHASE2-P1: vlog reclaim parity (the gc_sweep / tombstone class) ----
+
+    /// H1 guard: an orphaned `.vlog` segment (registered+unlinked to refs==0,
+    /// physical bytes left on disk — the crash-between-journal-and-delete shape)
+    /// IS reaped by `gc_sweep`, exactly like the SST analog
+    /// (`test_gc_sweep_reaps_orphans_never_live_refs`). Pre-P1 the `.sst`-only
+    /// filter skipped it → monotonic remote-space leak.
+    #[test]
+    fn test_gc_sweep_reaps_orphan_vlog_segments() {
+        let fs = fs_with_file("/db/000050.vlog", b"live-segment");
+        write_file(fs.as_ref(), "/db/000051.vlog", b"orphan-segment");
+        write_file(fs.as_ref(), "/db/000052.sst", b"live-sst");
+        write_file(fs.as_ref(), "/db/CURRENT", b"not-managed");
+        let m = mgr(&fs);
+        // A live (referenced) vlog segment + a live SST stay.
+        m.register(Path::new("/db/000050.vlog"), "/db/000050.vlog", 12)
+            .unwrap();
+        m.register(Path::new("/db/000052.sst"), "/db/000052.sst", 8)
+            .unwrap();
+        // 000051: register then unlink → refs==0 in metadata, but emulate a
+        // crash that lost the physical delete by re-creating the bytes.
+        m.register(Path::new("/db/000051.vlog"), "/db/000051.vlog", 14)
+            .unwrap();
+        m.unlink(Path::new("/db/000051.vlog")).unwrap();
+        write_file(fs.as_ref(), "/db/000051.vlog", b"resurrected-orphan");
+
+        let report = m.gc_sweep(Path::new("/db")).unwrap();
+        // The live vlog + live SST are kept; only the orphan vlog is reaped.
+        assert_eq!(report.kept_live, 2, "live vlog + live sst kept");
+        assert_eq!(report.reaped, vec!["/db/000051.vlog".to_string()]);
+        assert!(fs.file_exists(Path::new("/db/000050.vlog")).unwrap());
+        assert!(!fs.file_exists(Path::new("/db/000051.vlog")).unwrap());
+        assert!(fs.file_exists(Path::new("/db/000052.sst")).unwrap());
+        // Non-managed files (CURRENT) are still never touched.
+        assert!(fs.file_exists(Path::new("/db/CURRENT")).unwrap());
+    }
+
+    /// H1 guard: a JM-discard tombstone on a `.vlog` segment DEFERS while refs
+    /// are held, then reaps when the last unlink drains — the vlog analog of
+    /// `test_tombstone_defers_delete_until_refs_drain`. Tombstone/unlink are
+    /// extension-agnostic; this confirms the full vlog tombstone lifecycle.
+    #[test]
+    fn test_tombstone_defers_then_reaps_vlog() {
+        let fs = fs_with_file("/db/000060.vlog", b"seg");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000060.vlog"), "/db/000060.vlog", 3)
+            .unwrap();
+        m.link(
+            Path::new("/db/000060.vlog"),
+            Path::new("/ckpt/chk-3/000060.vlog"),
+        )
+        .unwrap();
+
+        // Tombstone while a checkpoint link holds a ref: bytes survive.
+        assert!(
+            !m.tombstone("/db/000060.vlog").unwrap(),
+            "refs held → deferred"
+        );
+        assert!(fs.file_exists(Path::new("/db/000060.vlog")).unwrap());
+
+        // Drain the refs; the last unlink consumes the tombstone → delete.
+        m.unlink(Path::new("/db/000060.vlog")).unwrap();
+        let out = m.unlink(Path::new("/ckpt/chk-3/000060.vlog")).unwrap();
+        assert_eq!(out, UnlinkOutcome::PhysicalDeleted);
+        assert!(!fs.file_exists(Path::new("/db/000060.vlog")).unwrap());
+
+        // A second, no-refs vlog tombstone reaps immediately (the
+        // already-drained path), and a sweep is a clean no-op afterwards.
+        write_file(fs.as_ref(), "/db/000061.vlog", b"orphan");
+        assert!(m.tombstone("/db/000061.vlog").unwrap());
+        assert!(!fs.file_exists(Path::new("/db/000061.vlog")).unwrap());
+    }
+
+    /// H1 guard: a refcount-SHARED `.vlog` (a checkpoint link holds a second
+    /// reference) is NEVER reaped by `gc_sweep` while referenced — the HARD-STOP
+    /// `refs > 0` invariant holds for the vlog class identically to SST.
+    #[test]
+    fn test_gc_sweep_keeps_refcount_shared_vlog() {
+        let fs = fs_with_file("/db/000070.vlog", b"shared-seg");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000070.vlog"), "/db/000070.vlog", 10)
+            .unwrap();
+        // Link into a checkpoint namespace → refs == 2.
+        m.link(
+            Path::new("/db/000070.vlog"),
+            Path::new("/db/checkpoints/00000000000000000007/000070.vlog"),
+        )
+        .unwrap();
+        assert_eq!(m.refs("/db/000070.vlog"), 2);
+
+        let report = m.gc_sweep(Path::new("/db")).unwrap();
+        assert_eq!(report.kept_live, 1, "shared vlog kept");
+        assert!(report.reaped.is_empty());
+        assert!(fs.file_exists(Path::new("/db/000070.vlog")).unwrap());
+
+        // Drop the working ref: still referenced by the checkpoint link.
+        m.unlink(Path::new("/db/000070.vlog")).unwrap();
+        assert_eq!(m.refs("/db/000070.vlog"), 1);
+        let report = m.gc_sweep(Path::new("/db")).unwrap();
+        assert_eq!(report.kept_live, 1, "still checkpoint-referenced");
+        assert!(report.reaped.is_empty());
+        assert!(fs.file_exists(Path::new("/db/000070.vlog")).unwrap());
+    }
+
+    /// H1 guard: with NO vlog present (KV-separation OFF), the sweep behaves
+    /// EXACTLY as before — only `.sst` orphans reaped, every other extension
+    /// untouched. Pins that the `.vlog` arm is purely additive / no-op when the
+    /// KV-sep path is inactive.
+    #[test]
+    fn test_gc_sweep_sst_only_behavior_unchanged_when_no_vlog() {
+        let fs = fs_with_file("/db/000080.sst", b"live");
+        write_file(fs.as_ref(), "/db/000081.sst", b"orphan");
+        write_file(fs.as_ref(), "/db/MANIFEST-000001", b"manifest");
+        write_file(fs.as_ref(), "/db/CURRENT", b"current");
+        let m = mgr(&fs);
+        m.register(Path::new("/db/000080.sst"), "/db/000080.sst", 4)
+            .unwrap();
+
+        let report = m.gc_sweep(Path::new("/db")).unwrap();
+        assert_eq!(report.kept_live, 1);
+        assert_eq!(report.reaped, vec!["/db/000081.sst".to_string()]);
+        assert!(fs.file_exists(Path::new("/db/000080.sst")).unwrap());
+        assert!(!fs.file_exists(Path::new("/db/000081.sst")).unwrap());
+        assert!(fs.file_exists(Path::new("/db/MANIFEST-000001")).unwrap());
+        assert!(fs.file_exists(Path::new("/db/CURRENT")).unwrap());
+    }
+
+    /// H4 guard (lands with P1): a `link` that races a `gc_sweep` never causes a
+    /// live physical to be reaped. Both serialize on the single `inner` mutex,
+    /// so once the link applied (refs == 2) the sweep's under-lock decision sees
+    /// refs > 0 and HARD-STOPs. Covers the vlog class (`.vlog` physical).
+    #[test]
+    fn test_gc_sweep_concurrent_link_does_not_reap_live_vlog() {
+        use std::sync::Barrier;
+        let fs = fs_with_file("/db/000090.vlog", b"raced-seg");
+        let m = Arc::new(mgr(&fs));
+        m.register(Path::new("/db/000090.vlog"), "/db/000090.vlog", 9)
+            .unwrap();
+
+        // Run many rounds: in each, a link and a sweep race. The link is what
+        // makes refs > 0 (register already did), so the invariant under test is
+        // that an in-flight link never loses to a concurrent sweep.
+        for round in 0..64u32 {
+            let dst = format!("/ckpt/chk-{round}/000090.vlog");
+            let barrier = Arc::new(Barrier::new(2));
+            let m_link = m.clone();
+            let b_link = barrier.clone();
+            let dst_link = dst.clone();
+            let h = std::thread::spawn(move || {
+                b_link.wait();
+                m_link
+                    .link(Path::new("/db/000090.vlog"), Path::new(&dst_link))
+                    .unwrap();
+            });
+            barrier.wait();
+            let report = m.gc_sweep(Path::new("/db")).unwrap();
+            h.join().unwrap();
+            // The working ref is always live → never reaped, regardless of
+            // which op won the race.
+            assert!(report.reaped.is_empty(), "live vlog reaped in race");
+            assert!(fs.file_exists(Path::new("/db/000090.vlog")).unwrap());
+            // Clean up the link so refs don't grow unboundedly across rounds.
+            m.unlink(Path::new(&dst)).unwrap();
+        }
+        assert_eq!(m.refs("/db/000090.vlog"), 1, "back to working ref only");
     }
 
     // --- misc -------------------------------------------------------------------

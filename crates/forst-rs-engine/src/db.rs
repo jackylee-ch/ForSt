@@ -8231,10 +8231,28 @@ impl DbImpl {
         // the restored Version so the engine never tries to open an unadopted
         // file. Boundary SSTs (partial overlap) are kept. Inclusive-SST vs
         // half-open clip overlap: `smallest_key < clip.end && clip.start <=
-        // largest_key`. vlog segments stay (KV-sep pointers; their values are
-        // gated by the same read-path clip).
+        // largest_key`.
+        //
+        // FRS-PHASE2-P2 (vlog reclaim parity): `clip_version_to_range` ALSO
+        // drops `.vlog` segments whose CF lost every SST to the clip — those
+        // segments are provably unreachable in the downscaled keyspace, so the
+        // restored instance must NOT adopt/link them (that is the H2 leak: a
+        // whole-segment adopt regardless of clip re-derives the q9 OOM regime
+        // through unbounded resident segments). The adopt loop below iterates
+        // the PRUNED `snap.version.vlog_segments`, so it links only the
+        // reachable segments → the restored vlog footprint scales with the clip,
+        // not the full state.
+        let pre_clip_segment_count = snap.version.vlog_segments.len();
         let clipped_version = Self::clip_version_to_range(&snap.version, &clip);
         snap.version = Arc::new(clipped_version);
+        let reclaimed_vlog_count = pre_clip_segment_count - snap.version.vlog_segments.len();
+        if reclaimed_vlog_count > 0 && frs_iter_diag_enabled() {
+            eprintln!(
+                "FRS-CLIP-DIAG clipped restore reclaimed {reclaimed_vlog_count} vlog segment(s) \
+                 outside clip {clip} (adopting {} of {pre_clip_segment_count})",
+                snap.version.vlog_segments.len(),
+            );
+        }
         let clipped_base = serialize_snapshot(&snap)?;
 
         // Same source-journal tombstone/paranoia consultation as the
@@ -8296,10 +8314,13 @@ impl DbImpl {
             mgr.adopt(&canonical, physical)?;
             fs.pre_seed_admission(Path::new(physical));
         }
-        // FRS-WA-V2a-2 × disagg: adopt the KV-separated `.vlog` segments too
-        // (the clip carries the segment table through unchanged — the read-path
-        // clip prunes out-of-range pointers, but the segments themselves must
-        // still be mapped for any in-range separated value to deref).
+        // FRS-WA-V2a-2 × disagg: adopt the KV-separated `.vlog` segments that
+        // SURVIVED the clip. P2: `snap.version.vlog_segments` was pruned by
+        // `clip_version_to_range` to the segments whose CF still owns at least
+        // one in-range SST, so a downscale that dropped a CF entirely no longer
+        // adopts/links its segments — the read-path clip still prunes
+        // out-of-range pointers within a surviving CF, and every adopted segment
+        // is mapped so any in-range separated value can deref.
         Self::adopt_linked_vlog_segments(
             &snap,
             ckpt_dir,
@@ -8335,9 +8356,27 @@ impl DbImpl {
     /// FRS-PHASE2-C2U3: returns a copy of `version` with every SST whose
     /// inclusive `[smallest_key, largest_key]` is FULLY DISJOINT from the
     /// half-open `clip` removed from its level. An SST overlaps `clip` iff
-    /// `smallest_key < clip.end && clip.start <= largest_key`. vlog segments
-    /// are carried through unchanged (their live pointers are clipped by the
-    /// read path). Used by the clipped restore (design §10 DR1 layer 1).
+    /// `smallest_key < clip.end && clip.start <= largest_key`.
+    ///
+    /// FRS-PHASE2-P2 (vlog reclaim parity, 2026-06-14): a KV-separation `.vlog`
+    /// segment is reachable ONLY through pointer rows that live in SSTs of the
+    /// segment's own CF (KV separation is per-CF; `VlogSegmentMeta::cf_id` names
+    /// the producing CF and a segment never mixes CFs). When the clip removes
+    /// EVERY SST of a CF, that CF retains zero pointer rows, so its segments are
+    /// PROVABLY unreachable and are dropped from the clipped Version — the
+    /// downscale-rescale analog of the SST clip. This bounds resident vlog
+    /// SEGMENT residency under repeated downscale (hazard H2: the q9 reader cap
+    /// bounds handles, not segments). The clipped-restore caller tombstones the
+    /// SOURCE physical of every dropped segment so source-side `gc_sweep` (P1)
+    /// reclaims the bytes.
+    ///
+    /// SAFETY (no premature deletion): a segment is dropped ONLY when its CF has
+    /// zero surviving SSTs — never on partial overlap. A CF with even one
+    /// boundary SST keeps ALL its segments (the surviving pointers may deref any
+    /// segment; per-segment key ranges are not tracked because each segment is
+    /// keyspace-wide). This is the conservative side: over-retention delays
+    /// reclaim, it never deletes a still-referenced segment. Used by the clipped
+    /// restore (design §10 DR1 layer 1).
     fn clip_version_to_range(
         version: &forst_rs_storage::version::Version,
         clip: &forst_rs_common::types::KeyRange,
@@ -8363,10 +8402,21 @@ impl DbImpl {
                 }
             })
             .collect();
-        forst_rs_storage::version::Version::from_levels_and_vlogs(
-            new_levels,
-            version.vlog_segments.clone(),
-        )
+        // P2: CFs that still own at least one surviving SST after the clip. A
+        // segment whose `cf_id` is NOT in this set is unreachable (its CF lost
+        // every pointer row) → dropped from the clipped Version (and reclaimed
+        // at source by the caller's tombstone).
+        let surviving_cfs: std::collections::HashSet<ColumnFamilyId> = new_levels
+            .iter()
+            .flat_map(|lvl| lvl.files.iter().map(|f| f.cf_id))
+            .collect();
+        let kept_vlogs: Vec<_> = version
+            .vlog_segments
+            .iter()
+            .filter(|seg| surviving_cfs.contains(&seg.cf_id))
+            .cloned()
+            .collect();
+        forst_rs_storage::version::Version::from_levels_and_vlogs(new_levels, kept_vlogs)
     }
 
     /// FRS-PHASE2-FFI: INSTANT-LINK restore over a REMOTE (OpenDAL) engine
@@ -8669,6 +8719,16 @@ impl DbImpl {
             }
         }
         residual
+    }
+
+    /// FRS-PHASE2-P2: number of KV-separation `.vlog` segments the current
+    /// Version references — the RESIDENT segment set the disagg lifecycle must
+    /// keep mapped/open. Under a downscale clipped restore this is the bound
+    /// that the rescale lock arm (M4) asserts scales with the clip, not the full
+    /// state (the reader cache bounds open handles; this bounds the segment set
+    /// itself — hazard H2). Read-only; zero when KV separation is inactive.
+    pub fn live_vlog_segment_count(&self) -> usize {
+        self.version_set.current().vlog_segments.len()
     }
 
     /// FRS-LEVELED-COMPACTION (2026-06-04): pre-allocate the ADDITIONAL output
@@ -23615,6 +23675,196 @@ mod tests {
                 "unclipped restore missing {k}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2-P2 (vlog reclaim parity, 2026-06-14): clip-reclaim of
+    // KV-separation `.vlog` segments on downscale rescale (hazard H2).
+    // ------------------------------------------------------------------
+
+    /// P2 unit gate: `clip_version_to_range` drops the `.vlog` segments of any
+    /// CF whose SSTs were ALL clipped out (provably unreachable), and keeps the
+    /// segments of every CF that still owns an in-range (or boundary) SST. This
+    /// is the metadata-only reclaim that bounds vlog SEGMENT residency under
+    /// downscale rescale (the reader cap bounds handles, not segments — H2).
+    #[test]
+    fn test_phase2_c2u3_clip_version_drops_unreachable_cf_vlog_segments() {
+        use forst_rs_storage::version::{LevelMeta, SstFileMeta, VlogSegmentMeta};
+        let cf_a = ColumnFamilyId(0); // in-range CF
+        let cf_b = ColumnFamilyId(1); // fully-clipped-out CF
+        let cf_c = ColumnFamilyId(2); // boundary CF (one straddling SST)
+        let sst = |n: u64, cf: ColumnFamilyId, lo: &[u8], hi: &[u8]| SstFileMeta {
+            file_number: FileNumber(n),
+            cf_id: cf,
+            file_size: 1024,
+            smallest_key: lo.to_vec(),
+            largest_key: hi.to_vec(),
+            min_sequence: forst_rs_common::SequenceNumber(1),
+            max_sequence: forst_rs_common::SequenceNumber(2),
+            num_entries: 10,
+            max_death: 0,
+        };
+        let seg = |id: u64, cf: ColumnFamilyId| VlogSegmentMeta {
+            segment_id: id,
+            cf_id: cf,
+            file_size: 4096,
+            live_bytes: 4096,
+        };
+        // Level 0 holds SSTs from three CFs (multi-CF layout). Clip [m, t):
+        //   cf_a: [m, p]      → in range            (kept)
+        //   cf_b: [a, c]      → fully below clip     (DROPPED → its segs go)
+        //   cf_c: [r, z]      → straddles t          (kept boundary → segs stay)
+        let level0 = LevelMeta {
+            level: 0,
+            files: vec![
+                sst(10, cf_a, b"m", b"p"),
+                sst(11, cf_b, b"a", b"c"),
+                sst(12, cf_c, b"r", b"z"),
+            ],
+        };
+        let version = forst_rs_storage::version::Version::from_levels_and_vlogs(
+            vec![level0],
+            vec![
+                seg(100, cf_a),
+                seg(101, cf_b), // reachable ONLY through cf_b → must be dropped
+                seg(102, cf_c),
+                seg(103, cf_b), // second cf_b segment → also dropped
+            ],
+        );
+
+        let clip = KeyRange::new(b"m".to_vec(), b"t".to_vec());
+        let clipped = DbImpl::clip_version_to_range(&version, &clip);
+
+        // cf_b's SSTs are all clipped out → cf_b is not a surviving CF.
+        let surviving_cfs: std::collections::HashSet<ColumnFamilyId> = clipped
+            .levels
+            .iter()
+            .flat_map(|l| l.files.iter().map(|f| f.cf_id))
+            .collect();
+        assert!(surviving_cfs.contains(&cf_a));
+        assert!(surviving_cfs.contains(&cf_c), "boundary CF survives");
+        assert!(!surviving_cfs.contains(&cf_b), "cf_b fully clipped out");
+
+        // The vlog segment set scales with the clip: only cf_a + cf_c segments
+        // remain; both cf_b segments are reclaimed (not carried into the
+        // restored Version, so never adopted/linked → not resident).
+        let kept: Vec<u64> = clipped.vlog_segments.iter().map(|s| s.segment_id).collect();
+        assert_eq!(
+            kept,
+            vec![100, 102],
+            "only reachable-CF segments kept; cf_b (101,103) reclaimed"
+        );
+    }
+
+    /// P2 unit gate (SAFETY): a CF with even ONE surviving boundary SST keeps
+    /// ALL its segments — never a premature drop. Single-CF (the common rescale)
+    /// keeps every segment as long as any SST survives.
+    #[test]
+    fn test_phase2_c2u3_clip_version_keeps_segments_for_surviving_cf() {
+        use forst_rs_storage::version::{LevelMeta, SstFileMeta, VlogSegmentMeta};
+        let cf = DEFAULT_CF_ID;
+        let sst = |n: u64, lo: &[u8], hi: &[u8]| SstFileMeta {
+            file_number: FileNumber(n),
+            cf_id: cf,
+            file_size: 1024,
+            smallest_key: lo.to_vec(),
+            largest_key: hi.to_vec(),
+            min_sequence: forst_rs_common::SequenceNumber(1),
+            max_sequence: forst_rs_common::SequenceNumber(2),
+            num_entries: 10,
+            max_death: 0,
+        };
+        let seg = |id: u64| VlogSegmentMeta {
+            segment_id: id,
+            cf_id: cf,
+            file_size: 4096,
+            live_bytes: 4096,
+        };
+        // Two SSTs; clip [d, f) drops the disjoint [a,c] but keeps [d,g].
+        let level0 = LevelMeta {
+            level: 0,
+            files: vec![sst(1, b"a", b"c"), sst(2, b"d", b"g")],
+        };
+        let version = forst_rs_storage::version::Version::from_levels_and_vlogs(
+            vec![level0],
+            vec![seg(50), seg(51)],
+        );
+        let clip = KeyRange::new(b"d".to_vec(), b"f".to_vec());
+        let clipped = DbImpl::clip_version_to_range(&version, &clip);
+        // One SST survives → the default CF survives → ALL its segments stay
+        // (each segment is keyspace-wide; a surviving pointer may deref any).
+        assert_eq!(clipped.levels[0].files.len(), 1);
+        let kept: Vec<u64> = clipped.vlog_segments.iter().map(|s| s.segment_id).collect();
+        assert_eq!(kept, vec![50, 51], "surviving CF keeps every segment");
+    }
+
+    /// P2 integration gate: a single-default-CF KV-separated checkpoint clipped
+    /// to a sub-range still derefs every IN-RANGE separated value byte-exactly
+    /// (no-regression: the default CF survives, so its segments are kept and
+    /// the read-path clip prunes out-of-range pointers). Mirrors the
+    /// vlog-adoption byte-identity harness under the CLIPPED restore.
+    #[test]
+    fn test_phase2_c2u3_clipped_restore_kvsep_in_range_byte_exact() {
+        use forst_rs_io::MemoryFileSystem;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = open_in_shared_fs("/db", fs.clone());
+        let cf = db.default_cf();
+        // Large (separated) values across the keyspace so several vlog segments
+        // are produced; the clip will keep them (single default CF).
+        let big = |i: u32| -> Vec<u8> { (0..2048u32).map(|j| ((i + j) % 251) as u8).collect() };
+        for i in 0..100u32 {
+            let k = format!("k{:04}", i);
+            db.put(&cf, k.as_bytes(), &big(i)).unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flush A");
+        for i in 100..200u32 {
+            let k = format!("k{:04}", i);
+            db.put(&cf, k.as_bytes(), &big(i)).unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flush B");
+        assert!(
+            db.version_set.current().vlog_segments.len() >= 2,
+            "expected multiple KV-separated vlog segments"
+        );
+
+        let snap = db.snapshot();
+        let r = db
+            .create_incremental_checkpoint_linked(&snap, 21, 0)
+            .unwrap();
+        assert!(r.link_mode);
+        db.release_snapshot(snap);
+        let chk_dir = PathBuf::from("/db/checkpoints/00000000000000000021");
+
+        // Clip to the upper half [k0100, k0200).
+        let clip = KeyRange::new(b"k0100".to_vec(), b"k0200".to_vec());
+        let restored = DbImpl::open_from_linked_checkpoint_instant_clipped(
+            fs.clone(),
+            &chk_dir,
+            "/restore",
+            clip.clone(),
+        )
+        .unwrap();
+        let rcf = restored.default_cf();
+        assert_eq!(restored.cf_clip_range(&rcf).unwrap(), Some(clip));
+
+        // Every in-range separated value derefs byte-exactly; every
+        // out-of-range key is absent (the read-path clip hides them).
+        for i in 0..200u32 {
+            let k = format!("k{:04}", i);
+            let got = restored.get(&rcf, k.as_bytes()).unwrap();
+            if (100..200).contains(&i) {
+                assert_eq!(
+                    got.as_deref(),
+                    Some(&big(i)[..]),
+                    "in-range KV-sep deref not byte-exact at {k}"
+                );
+            } else {
+                assert_eq!(got, None, "OUT-OF-RANGE KV-sep leak at {k}");
+            }
+        }
+        set_kv_separation_override(None);
     }
 
     // ------------------------------------------------------------------
