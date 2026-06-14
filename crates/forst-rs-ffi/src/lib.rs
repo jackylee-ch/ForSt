@@ -391,11 +391,61 @@ fn guarded<F: FnOnce() -> i32>(f: F) -> i32 {
 /// drain). Zero cost when unset.
 fn probe_diag_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FRS_PROBE_DIAG")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    *ENABLED.get_or_init(|| parse_probe_diag_enabled(std::env::var("FRS_PROBE_DIAG").ok()))
+}
+
+fn parse_probe_diag_enabled(v: Option<String>) -> bool {
+    v.map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Minimum per-probe latency to log when [`probe_diag_enabled`] is true.
+/// Defaults to the original 5ms slow-probe filter; set
+/// `FRS_PROBE_DIAG_MIN_US=0` to sample every prefix open during a short QA run.
+fn probe_diag_min_us() -> u128 {
+    static MIN_US: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *MIN_US.get_or_init(|| parse_probe_diag_min_us(std::env::var("FRS_PROBE_DIAG_MIN_US").ok()))
+}
+
+fn parse_probe_diag_min_us(v: Option<String>) -> u128 {
+    v.and_then(|v| v.parse::<u128>().ok()).unwrap_or(5_000)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProbeDiagSnapshot {
+    path: &'static str,
+    s2_pinned: bool,
+    source_count: isize,
+    rows_emitted: u64,
+    merge_comparisons: u64,
+    materialization_allocs: u64,
+}
+
+fn format_probe_diag_line(
+    op: &str,
+    total_us: u128,
+    build_us: u128,
+    rows: u32,
+    bytes: u32,
+    prefix_len: u32,
+    max_rows: Option<u32>,
+    eof: Option<bool>,
+    snapshot: ProbeDiagSnapshot,
+) -> String {
+    let fill_us = total_us.saturating_sub(build_us);
+    format!(
+        "FRS-PROBE-DIAG {op}: total_us={total_us} build_us={build_us} fill_us={fill_us} rows={rows} bytes={bytes} prefix_len={prefix_len} max_rows={} eof={} s2_pinned={} path={} source_count={} diag_rows={} merge_comparisons={} materialization_allocs={}",
+        max_rows
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        eof.map(|v| if v { "1" } else { "0" }).unwrap_or("-"),
+        if snapshot.s2_pinned { "1" } else { "0" },
+        snapshot.path,
+        snapshot.source_count,
+        snapshot.rows_emitted,
+        snapshot.merge_comparisons,
+        snapshot.materialization_allocs,
+    )
 }
 
 /// Like [`guarded`] but for the vectorized batch FFI functions. On panic,
@@ -5490,6 +5540,35 @@ impl IterHandle {
         self.aborted.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    fn probe_diag_snapshot(&self, s2_pinned: bool) -> ProbeDiagSnapshot {
+        match &self.inner {
+            IterBackend::Pinned(p) => {
+                let (rows_emitted, merge_comparisons, materialization_allocs) =
+                    p.stream.diag_counters();
+                ProbeDiagSnapshot {
+                    path: if s2_pinned {
+                        "s2_stream"
+                    } else {
+                        "legacy_stream_diag"
+                    },
+                    s2_pinned,
+                    source_count: p.stream.debug_source_count() as isize,
+                    rows_emitted,
+                    merge_comparisons,
+                    materialization_allocs,
+                }
+            }
+            IterBackend::Boxed(_) => ProbeDiagSnapshot {
+                path: "legacy_boxed",
+                s2_pinned,
+                source_count: -1,
+                rows_emitted: 0,
+                merge_comparisons: 0,
+                materialization_allocs: 0,
+            },
+        }
+    }
+
     /// FRS-ITER-EAGER-FREE (2026-06-04): the iterator is EXHAUSTED — drop its
     /// heavy backing state NOW (the `LazyPrefixIter` tier cursors, any buffered
     /// SST/Arrow `RecordBatch`es, and the captured `Arc<DbImpl>`) by replacing
@@ -5836,6 +5915,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         } else {
             slice::from_raw_parts(prefix_ptr, prefix_len as usize)
         };
+        let s2_pinned = forst_rs_engine::s2_pinned_enabled();
 
         // PR-C6-H1 + B10-H3 + B11-H3 + R17-M1: route through the
         // zero-copy-{key,value} streaming `prefix_scan_iter_owned_arc_with_error_slot`.
@@ -5871,7 +5951,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         // drive `fill_into` straight into the chunk buffer — the raw sink
         // path (zero per-row allocations on SST-Put rows; no Arc traffic).
         // Flag OFF keeps the legacy Arc-pair pull iterator byte-for-byte.
-        let mut handle_state = if forst_rs_engine::s2_pinned_enabled() {
+        let mut handle_state = if s2_pinned {
             match db_ref.prefix_scan_stream_with_error_slot(
                 cf_ref_,
                 prefix,
@@ -5928,19 +6008,35 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         // Fill the first chunk lazily into the caller's buffer.
         let (bytes_used, row_count, iter_exhausted) =
             fill_chunk_from_iter(&mut handle_state, chunk_buf_ptr, chunk_buf_cap as usize);
+        let probe_snapshot = if probe_diag {
+            Some(handle_state.probe_diag_snapshot(s2_pinned))
+        } else {
+            None
+        };
         if iter_exhausted {
             // FRS-ITER-EAGER-FREE: first chunk drained the whole result — free the
             // heavy backing state now (don't pin it until the lagging Java close()).
             handle_state.drop_inner();
         }
 
-        if let (Some(t0), Some(build_us)) = (probe_t0, probe_build_us) {
+        if let (Some(t0), Some(build_us), Some(snapshot)) =
+            (probe_t0, probe_build_us, probe_snapshot)
+        {
             let total_us = t0.elapsed().as_micros();
-            if total_us > 5000 {
-                let fill_us = total_us.saturating_sub(build_us);
+            if total_us >= probe_diag_min_us() {
                 eprintln!(
-                    "FRS-PROBE-DIAG slow open: total_us={} build_us={} fill_us={} rows={} prefix_len={}",
-                    total_us, build_us, fill_us, row_count, prefix_len
+                    "{}",
+                    format_probe_diag_line(
+                        "open",
+                        total_us,
+                        build_us,
+                        row_count,
+                        bytes_used,
+                        prefix_len,
+                        None,
+                        Some(iter_exhausted),
+                        snapshot,
+                    )
                 );
             }
         }
@@ -6041,14 +6137,22 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_limited(
         } else {
             slice::from_raw_parts(prefix_ptr, prefix_len as usize)
         };
+        let probe_diag = probe_diag_enabled();
+        let probe_t0 = if probe_diag {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        let s2_pinned = forst_rs_engine::s2_pinned_enabled();
 
         let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
             Arc::new(Mutex::new(None));
-        let mut handle_state = if forst_rs_engine::s2_pinned_enabled() {
-            match db_ref.prefix_scan_stream_with_error_slot(
+        let mut handle_state = if s2_pinned || probe_diag {
+            match db_ref.prefix_scan_stream_with_mode(
                 cf_ref_,
                 prefix,
                 Arc::clone(&error_slot),
+                s2_pinned,
             ) {
                 Ok(stream) => IterHandle::new_pinned_with_error_slot(stream, error_slot),
                 Err(_) => return FrsErrorCode::EngineIo as i32,
@@ -6076,6 +6180,7 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_limited(
                 }));
             IterHandle::new_with_error_slot(inner, error_slot)
         };
+        let probe_build_us = probe_t0.map(|t| t.elapsed().as_micros());
 
         let (bytes_used, row_count, iter_exhausted) = fill_chunk_from_iter_limited(
             &mut handle_state,
@@ -6083,6 +6188,32 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_limited(
             chunk_buf_cap as usize,
             max_rows,
         );
+        let probe_snapshot = if probe_diag {
+            Some(handle_state.probe_diag_snapshot(s2_pinned))
+        } else {
+            None
+        };
+        if let (Some(t0), Some(build_us), Some(snapshot)) =
+            (probe_t0, probe_build_us, probe_snapshot)
+        {
+            let total_us = t0.elapsed().as_micros();
+            if total_us >= probe_diag_min_us() {
+                eprintln!(
+                    "{}",
+                    format_probe_diag_line(
+                        "open_limited",
+                        total_us,
+                        build_us,
+                        row_count,
+                        bytes_used,
+                        prefix_len,
+                        Some(max_rows),
+                        Some(iter_exhausted),
+                        snapshot,
+                    )
+                );
+            }
+        }
         if row_count == 0 && !iter_exhausted {
             handle_state.drop_inner();
             *out_handle = 0;
@@ -7605,6 +7736,47 @@ mod tests {
             assert_eq!(size_of::<FrsEngineOptions>(), 48);
         }
         assert!(align_of::<FrsEngineOptions>() >= 8);
+    }
+
+    #[test]
+    fn test_probe_diag_env_parsing_and_line_format() {
+        assert!(!parse_probe_diag_enabled(None));
+        assert!(!parse_probe_diag_enabled(Some("0".to_string())));
+        assert!(parse_probe_diag_enabled(Some("1".to_string())));
+        assert!(parse_probe_diag_enabled(Some("TRUE".to_string())));
+
+        assert_eq!(parse_probe_diag_min_us(None), 5_000);
+        assert_eq!(parse_probe_diag_min_us(Some("0".to_string())), 0);
+        assert_eq!(parse_probe_diag_min_us(Some("250".to_string())), 250);
+        assert_eq!(parse_probe_diag_min_us(Some("bad".to_string())), 5_000);
+
+        let line = format_probe_diag_line(
+            "open_limited",
+            123,
+            45,
+            4,
+            256,
+            12,
+            Some(4),
+            Some(true),
+            ProbeDiagSnapshot {
+                path: "s2_stream",
+                s2_pinned: true,
+                source_count: 8,
+                rows_emitted: 4,
+                merge_comparisons: 148,
+                materialization_allocs: 0,
+            },
+        );
+        assert!(line.contains("FRS-PROBE-DIAG open_limited"));
+        assert!(line.contains("fill_us=78"));
+        assert!(line.contains("max_rows=4"));
+        assert!(line.contains("eof=1"));
+        assert!(line.contains("s2_pinned=1"));
+        assert!(line.contains("path=s2_stream"));
+        assert!(line.contains("source_count=8"));
+        assert!(line.contains("merge_comparisons=148"));
+        assert!(line.contains("materialization_allocs=0"));
     }
 
     #[test]
