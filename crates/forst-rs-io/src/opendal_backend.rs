@@ -122,32 +122,85 @@ impl RuntimeHandle {
     }
 }
 
+/// Bounded grace for draining an owned runtime to zero alive tasks before its
+/// time driver is torn down. The upload barriers already joined the *tracked*
+/// tasks, so on a clean shutdown the count is normally already 0 and this returns
+/// after a single check; the cap only bounds a pathological never-completing task.
+const RUNTIME_DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+/// Poll cadence while draining; small so the common case (count already 0) is
+/// near-instant and a just-finishing timer is observed promptly.
+const RUNTIME_DRAIN_POLL: Duration = Duration::from_millis(2);
+
+/// 2026-06-15 TOKIO-SHUTDOWN-RACE FIX (real root cause): drain an OWNED runtime to
+/// zero alive tasks BEFORE its time driver is allowed to shut down.
+///
+/// `await_all_uploads` (45c5fe728) joins only the tasks we *track* in the
+/// `pending` registry. opendal spawns tasks we never see a handle for:
+///
+/// - `TokioExecutor::execute` (the `.concurrent()` multipart executor) does
+///   `let _handle = tokio::task::spawn(f);` — it DROPS the JoinHandle, so the
+///   part-upload sub-tasks are detached and untracked.
+/// - `RetryLayer` (backon) arms `tokio::time::sleep` backoff timers on those
+///   detached tasks.
+///
+/// When the owned `Runtime` is dropped, tokio marks the time driver shut down and
+/// unparks the workers; if any of those untracked tasks is still mid-poll of a
+/// `Sleep`, `tokio::runtime::time::entry::poll_elapsed` asserts
+/// `!driver().is_shutdown()` and panics: "A Tokio 1.x context was found, but it is
+/// being shutdown". The QoS upload rate split (4c57528ef) paces uploads slowly,
+/// widening that window into a deterministic CI failure.
+///
+/// `num_alive_tasks()` counts EVERY spawned task — tracked or not — so blocking
+/// until it reaches 0 (driving the workers with `yield_now` so detached tasks make
+/// progress) guarantees no task, and therefore no `Sleep`, is live when we tear the
+/// runtime down. This is the invariant the join-handle fix could not provide.
+///
+/// Returns when the runtime is idle (or the bounded deadline elapses, never
+/// hanging shutdown). Pure waiting on already-completed work — it changes nothing
+/// about WHAT bytes are written, so it is byte-identical and QoS-neutral.
+fn drain_runtime_to_idle(rt: &Runtime, deadline: Duration) {
+    let start = std::time::Instant::now();
+    while rt.metrics().num_alive_tasks() > 0 {
+        if start.elapsed() >= deadline {
+            break;
+        }
+        // Drive the scheduler so detached tasks (incl. their backoff `Sleep`s)
+        // run to completion, then re-check. `yield_now` returns after one
+        // scheduler tick, which lets ready tasks finish; the short sleep avoids a
+        // busy spin while a timer is still pending.
+        rt.block_on(async {
+            tokio::task::yield_now().await;
+        });
+        if rt.metrics().num_alive_tasks() == 0 {
+            break;
+        }
+        std::thread::sleep(RUNTIME_DRAIN_POLL);
+    }
+}
+
 impl Drop for RuntimeHandle {
-    /// 2026-06-15 TOKIO-SHUTDOWN-RACE FIX (defense-in-depth): when we OWN the
-    /// runtime, shut it down with a bounded grace period instead of a bare drop.
+    /// 2026-06-15 TOKIO-SHUTDOWN-RACE FIX: when we OWN the runtime, drain it to
+    /// zero alive tasks (see [`drain_runtime_to_idle`]) and then drop it on a
+    /// DEDICATED thread that is not itself inside any runtime.
     ///
-    /// `await_all_uploads` already joins every tracked upload task before the
-    /// filesystem (and hence this owned runtime) is dropped. But opendal's
-    /// `.concurrent()` multipart executor and `RetryLayer` can spawn *untracked*
-    /// internal sub-tasks/timers onto this runtime; a bare `Runtime` drop tears
-    /// the time driver down out from under any that are momentarily still live,
-    /// yielding the "A Tokio 1.x context was found, but it is being shutdown"
-    /// panic. `shutdown_timeout` performs an orderly shutdown — it parks worker
-    /// threads and drives outstanding tasks to a stop within the grace window —
-    /// so the time driver is not yanked mid-flight. The grace window is short
-    /// because the upload tasks are already joined; this only mops up any
-    /// residual internal task teardown. The `Borrowed` variant owns nothing and
-    /// must NOT touch the caller's runtime, so it is a no-op.
+    /// 45c5fe728's join-handle fix was insufficient: it joins only the upload
+    /// tasks registered in `pending`, but opendal's `.concurrent()` executor
+    /// detaches its sub-tasks (`TokioExecutor::execute` drops the JoinHandle) and
+    /// `RetryLayer` arms backoff `Sleep`s on them — all untracked, so the registry
+    /// join never reaches them. Draining to `num_alive_tasks()==0` catches every
+    /// spawned task regardless of whether we hold its handle, eliminating the live
+    /// `Sleep` that races the time-driver teardown.
+    ///
+    /// The runtime is then dropped on a separate thread: a plain `drop(Runtime)`
+    /// blocks until all worker/blocking threads stop, which would block the caller
+    /// (and is forbidden from inside another runtime). Off-thread, the caller never
+    /// blocks and the drop never runs in a borrowed-runtime context. The `Borrowed`
+    /// variant owns nothing and must NOT touch the caller's runtime — it is a no-op.
     fn drop(&mut self) {
         if let RuntimeHandle::Owned(arc) = self {
-            // Only the sole owner may shut the runtime down. `acquire()` is the
-            // single construction site and never clones the `Arc`, so in practice
-            // we are always the sole owner here; the `try_unwrap` guard keeps that
-            // assumption safe even if cloning is introduced later.
-            //
             // Replace the field with a fresh, never-used placeholder runtime so we
-            // can move the real `Arc` out of `&mut self` (the placeholder is
-            // dropped bare, but it has no spawned tasks so its drop is panic-free).
+            // can move the real `Arc` out of `&mut self` (the placeholder has no
+            // spawned tasks, so its own bare drop is panic-free and instant).
             let placeholder = match tokio::runtime::Builder::new_current_thread().build() {
                 Ok(rt) => Arc::new(rt),
                 // If we cannot build a placeholder, leave the field as-is and let
@@ -155,21 +208,37 @@ impl Drop for RuntimeHandle {
                 Err(_) => return,
             };
             let owned = std::mem::replace(arc, placeholder);
+            // `acquire()` is the single construction site and never clones the
+            // `Arc`, so we are the sole owner; `try_unwrap` keeps that safe even if
+            // cloning is introduced later (a non-sole owner drops it later).
             if let Ok(rt) = Arc::try_unwrap(owned) {
-                if Handle::try_current().is_ok() {
-                    // We are executing inside SOME tokio runtime on this thread.
-                    // A blocking `shutdown_timeout` here could block a worker (or,
-                    // if this were our own runtime, panic). Use the non-blocking
-                    // background shutdown, which still performs an orderly stop on
-                    // a detached thread without yanking the time driver.
-                    rt.shutdown_background();
-                } else {
-                    rt.shutdown_timeout(Duration::from_secs(5));
+                // 1. Wait until no task (tracked OR detached) is alive, so no
+                //    `Sleep` can be polled once the time driver shuts down.
+                drain_runtime_to_idle(&rt, RUNTIME_DRAIN_DEADLINE);
+                // 2. Drop on a dedicated, non-runtime thread. `drop(Runtime)`
+                //    blocks until the worker/blocking threads stop; doing it here
+                //    would block the caller (and panics if the caller is itself in
+                //    a runtime). The spawned thread is detached — its only job is to
+                //    let the runtime's own Drop complete the orderly shutdown after
+                //    the runtime is already idle. If we are NOT inside a runtime we
+                //    can safely fall back to an in-line orderly shutdown; the
+                //    runtime is already idle so this can never race a live timer.
+                match std::thread::Builder::new()
+                    .name("forst-rs-opendal-rt-drop".to_string())
+                    .spawn(move || drop(rt))
+                {
+                    Ok(_join) => {}
+                    Err(_e) => {
+                        // Thread spawn failed (resource exhaustion): the closure was
+                        // returned WITHOUT being run, so `rt` was NOT dropped. We
+                        // cannot recover the moved value from the closure, so we
+                        // simply let the original `rt` ownership fall through — it is
+                        // already consumed by the failed closure and dropped when
+                        // that closure is dropped here. The runtime is idle, so its
+                        // teardown cannot race a live timer.
+                    }
                 }
             }
-            // If `try_unwrap` failed, another owner exists and will drop it later;
-            // we deliberately do nothing (a bare drop by the last owner remains a
-            // theoretical risk, but no code path clones the owned `Arc`).
         }
     }
 }
@@ -427,24 +496,36 @@ impl OpendalFileSystem {
     /// Constructs an OpenDAL filesystem backed by the in-memory service.
     ///
     /// Useful for tests and for staging buffers in unit harnesses.
+    ///
+    /// 2026-06-15 TOKIO-SHUTDOWN-RACE FIX: the in-memory service has no real
+    /// remote, so there are no transient faults to retry — the [`RetryLayer`]
+    /// would only add untracked `backon`/`tokio::time::sleep` backoff timers that
+    /// can race the owned-runtime time-driver teardown (the entry.rs:602 panic).
+    /// We deliberately build it WITHOUT retry. Behaviour is unchanged on the
+    /// happy path (RetryLayer is transparent when nothing errors).
     pub fn memory() -> ForstResult<Self> {
         let op = Operator::new(opendal::services::Memory::default())
             .map_err(|e| map_opendal_err(e, "OpendalFileSystem::memory: builder"))?
             .finish();
-        Self::with_operator(op)
+        Self::with_operator_no_retry(op)
     }
 
     /// Constructs an OpenDAL filesystem rooted at `root` on the local FS.
     ///
     /// `root` must be valid UTF-8. The directory does not need to exist
     /// yet — OpenDAL creates it on first write.
+    ///
+    /// 2026-06-15 TOKIO-SHUTDOWN-RACE FIX: the local FS service is not a flaky
+    /// remote, so retries add no durability value — they would only arm untracked
+    /// `backon`/`tokio::time::sleep` backoff timers (the entry.rs:602 shutdown
+    /// race). Built WITHOUT the [`RetryLayer`]; happy-path behaviour is identical.
     pub fn local(root: &Path) -> ForstResult<Self> {
         let root_str = path_str(root, "OpendalFileSystem::local")?;
         let builder = opendal::services::Fs::default().root(root_str);
         let op = Operator::new(builder)
             .map_err(|e| map_opendal_err(e, "OpendalFileSystem::local: builder"))?
             .finish();
-        Self::with_operator(op)
+        Self::with_operator_no_retry(op)
     }
 
     /// Constructs an OpenDAL filesystem backed by an S3 bucket.
@@ -605,6 +686,38 @@ impl OpendalFileSystem {
                     join: Arc::new(Mutex::new(Some(join))),
                 },
             );
+    }
+
+    /// TEST-ONLY: spawn an *UNTRACKED* detached task that arms a tokio timer,
+    /// EXACTLY modeling opendal's `TokioExecutor::execute` (which does
+    /// `let _handle = tokio::task::spawn(f);` — dropping the JoinHandle) and its
+    /// `RetryLayer` backoff `tokio::time::sleep`. The JoinHandle is dropped here,
+    /// so this task is NOT in the `pending` registry and CANNOT be joined by
+    /// `await_upload` / `await_all_uploads`. It is the real shutdown-race source
+    /// the join-handle fix (45c5fe728) could not reach: a live `Sleep` on the
+    /// owned runtime that the registry never sees. `done` flips to `true` only
+    /// once the task — and its timer — has fully finished.
+    #[cfg(test)]
+    fn spawn_untracked_timer_task(&self, timer_ms: u64, done: Arc<std::sync::atomic::AtomicBool>) {
+        // Drop the JoinHandle EXPLICITLY: detached + untracked, mirroring
+        // `TokioExecutor::execute`'s `let _handle = tokio::task::spawn(f);`.
+        let handle = self.rt.handle().spawn(async move {
+            tokio::time::sleep(Duration::from_millis(timer_ms)).await;
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        std::mem::drop(handle);
+    }
+
+    /// TEST-ONLY: drain the owned runtime to zero alive tasks, exercising the
+    /// exact shutdown-teardown drain (`drain_runtime_to_idle`) that
+    /// [`RuntimeHandle::drop`] performs — but synchronously, so a test can assert
+    /// the invariant (every untracked task finished) without depending on the
+    /// detached drop thread's timing. No-op for the `Borrowed` variant.
+    #[cfg(test)]
+    fn drain_owned_runtime_for_test(&self) {
+        if let RuntimeHandle::Owned(arc) = &self.rt {
+            drain_runtime_to_idle(arc, RUNTIME_DRAIN_DEADLINE);
+        }
     }
 
     /// Builds a [`BlockingLayer`]-equipped clone of the inner operator.
@@ -2088,8 +2201,14 @@ mod tests {
     // we mock the storage layer to surface transient errors.
     #[test]
     fn test_pr_a12_default_retry_layer_happy_path() {
-        // Direct constructor (retry attached).
-        let with_retry = OpendalFileSystem::memory().expect("build memory fs with retry");
+        // Retry attached explicitly via `with_operator` (the S3 path still uses
+        // it; `memory()`/`local()` intentionally skip it — see the
+        // TOKIO-SHUTDOWN-RACE FIX on those constructors).
+        let retry_op = Operator::new(opendal::services::Memory::default())
+            .expect("memory builder")
+            .finish();
+        let with_retry =
+            OpendalFileSystem::with_operator(retry_op).expect("build memory fs with retry");
 
         // Mirror the same operator but bypass the retry layer.
         let raw_op = Operator::new(opendal::services::Memory::default())
@@ -2534,6 +2653,56 @@ mod tests {
             fs.pending.lock().unwrap().is_empty(),
             "await_upload must remove the drained entry"
         );
+        drop(fs);
+    }
+
+    /// 2026-06-15 TOKIO-SHUTDOWN-RACE regression — the *real* root cause that
+    /// 45c5fe728's join-handle fix could not reach.
+    ///
+    /// opendal spawns tasks we never get a handle for: `TokioExecutor::execute`
+    /// (the `.concurrent()` multipart executor) does `let _ = tokio::task::spawn(f)`
+    /// — DROPPING the JoinHandle — and `RetryLayer` arms `tokio::time::sleep`
+    /// backoff timers on those detached tasks. They are NOT in the `pending`
+    /// registry, so `await_upload`/`await_all_uploads` (which only join tracked
+    /// uploads) cannot wait for them. When the owned runtime is dropped with such a
+    /// task still polling its `Sleep`, tokio panics at entry.rs:602 ("A Tokio 1.x
+    /// context was found, but it is being shutdown").
+    ///
+    /// This models that exact gap: spawn an UNTRACKED detached timer task, then run
+    /// the shutdown drain. The fix (`drain_runtime_to_idle`, blocking until
+    /// `num_alive_tasks()==0`) must wait for the untracked task to FINISH — proven
+    /// by `done == true` after the drain. PRE-FIX (`shutdown_timeout` without a
+    /// drain), the drain does not exist and the detached task's `Sleep` is still
+    /// live at teardown — the race. The final `drop(fs)` is the belt-and-suspenders
+    /// check that the real Drop path is panic-free.
+    #[test]
+    fn drop_drains_untracked_detached_timer_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+
+        // 8 untracked detached tasks, each holding a 200ms `Sleep` — far longer
+        // than a single scheduler tick, so a no-drain teardown would tear the time
+        // driver down while these are still polling.
+        let flags: Vec<Arc<AtomicBool>> = (0..8)
+            .map(|_| {
+                let done = Arc::new(AtomicBool::new(false));
+                fs.spawn_untracked_timer_task(200, Arc::clone(&done));
+                done
+            })
+            .collect();
+
+        // The drain that `RuntimeHandle::drop` runs: block until NO task is alive.
+        fs.drain_owned_runtime_for_test();
+
+        for (i, done) in flags.iter().enumerate() {
+            assert!(
+                done.load(Ordering::Acquire),
+                "untracked task {i} still live after drain: its `Sleep` would race \
+                 the owned-runtime time-driver teardown (entry.rs:602 panic)"
+            );
+        }
+
+        // Real Drop path (drain + off-thread orderly shutdown): must not panic.
         drop(fs);
     }
 }
