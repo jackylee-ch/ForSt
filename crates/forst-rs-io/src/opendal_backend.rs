@@ -122,6 +122,58 @@ impl RuntimeHandle {
     }
 }
 
+impl Drop for RuntimeHandle {
+    /// 2026-06-15 TOKIO-SHUTDOWN-RACE FIX (defense-in-depth): when we OWN the
+    /// runtime, shut it down with a bounded grace period instead of a bare drop.
+    ///
+    /// `await_all_uploads` already joins every tracked upload task before the
+    /// filesystem (and hence this owned runtime) is dropped. But opendal's
+    /// `.concurrent()` multipart executor and `RetryLayer` can spawn *untracked*
+    /// internal sub-tasks/timers onto this runtime; a bare `Runtime` drop tears
+    /// the time driver down out from under any that are momentarily still live,
+    /// yielding the "A Tokio 1.x context was found, but it is being shutdown"
+    /// panic. `shutdown_timeout` performs an orderly shutdown — it parks worker
+    /// threads and drives outstanding tasks to a stop within the grace window —
+    /// so the time driver is not yanked mid-flight. The grace window is short
+    /// because the upload tasks are already joined; this only mops up any
+    /// residual internal task teardown. The `Borrowed` variant owns nothing and
+    /// must NOT touch the caller's runtime, so it is a no-op.
+    fn drop(&mut self) {
+        if let RuntimeHandle::Owned(arc) = self {
+            // Only the sole owner may shut the runtime down. `acquire()` is the
+            // single construction site and never clones the `Arc`, so in practice
+            // we are always the sole owner here; the `try_unwrap` guard keeps that
+            // assumption safe even if cloning is introduced later.
+            //
+            // Replace the field with a fresh, never-used placeholder runtime so we
+            // can move the real `Arc` out of `&mut self` (the placeholder is
+            // dropped bare, but it has no spawned tasks so its drop is panic-free).
+            let placeholder = match tokio::runtime::Builder::new_current_thread().build() {
+                Ok(rt) => Arc::new(rt),
+                // If we cannot build a placeholder, leave the field as-is and let
+                // the bare drop proceed (best-effort; never panic in Drop).
+                Err(_) => return,
+            };
+            let owned = std::mem::replace(arc, placeholder);
+            if let Ok(rt) = Arc::try_unwrap(owned) {
+                if Handle::try_current().is_ok() {
+                    // We are executing inside SOME tokio runtime on this thread.
+                    // A blocking `shutdown_timeout` here could block a worker (or,
+                    // if this were our own runtime, panic). Use the non-blocking
+                    // background shutdown, which still performs an orderly stop on
+                    // a detached thread without yanking the time driver.
+                    rt.shutdown_background();
+                } else {
+                    rt.shutdown_timeout(Duration::from_secs(5));
+                }
+            }
+            // If `try_unwrap` failed, another owner exists and will drop it later;
+            // we deliberately do nothing (a bare drop by the last owner remains a
+            // theoretical risk, but no code path clones the owned `Arc`).
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error mapping
 // ---------------------------------------------------------------------------
@@ -183,8 +235,35 @@ type UploadOutcome = Result<(), String>;
 /// `watch::Receiver` whose value transitions `None → Some(outcome)` when the
 /// spawned upload task completes; EVERY awaiter clones the receiver and blocks
 /// until the outcome is published, so no awaiter can race ahead of the upload.
-type PendingUploads =
-    Arc<Mutex<HashMap<String, tokio::sync::watch::Receiver<Option<UploadOutcome>>>>>;
+///
+/// 2026-06-15 TOKIO-SHUTDOWN-RACE FIX: the watch outcome is published by the
+/// spawned task as its final `await` (`tx.send(...)`), but the watch resolving
+/// does NOT mean the spawned task's *future* has been fully polled to completion
+/// and dropped — the task object (and the tokio timers its inner opendal upload
+/// future / `RetryLayer` / `.concurrent()` executor armed) can still be live for
+/// a brief window after `tx.send`. When that window overlaps the drop of an
+/// OWNED multi-thread `Runtime` (refcount → 0 after `await_all_uploads` returns
+/// on shutdown), tokio panics: "A Tokio 1.x context was found, but it is being
+/// shutdown" (time driver entry teardown). The QoS upload rate-split (slow-paced
+/// compaction uploads) made this previously-rare race deterministic on CI. The
+/// fix bundles the spawned task's [`JoinHandle`] next to the watch receiver so
+/// every drain point can also *join* the task (await the JoinHandle), guaranteeing
+/// the task — and all timers it owns — is fully finished before the runtime can be
+/// dropped. The handle is shared (`Arc<Mutex<Option<_>>>`) so the entry stays
+/// cloneable for the multi-awaiter watch path; whichever drainer joins first takes
+/// the handle, the rest see `None` (already joined) and no-op.
+type SharedJoinHandle = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+#[derive(Clone)]
+struct PendingUpload {
+    /// Broadcast of the upload outcome; awaiters block until it is `Some`.
+    rx: tokio::sync::watch::Receiver<Option<UploadOutcome>>,
+    /// Joinable handle to the spawned upload task. `take()`n and awaited by the
+    /// first drainer so the task is fully dropped before runtime teardown.
+    join: SharedJoinHandle,
+}
+
+type PendingUploads = Arc<Mutex<HashMap<String, PendingUpload>>>;
 
 /// 2026-05-29 WRITE-BACK FLUSH: cap on concurrent in-flight buffered uploads.
 /// Each spawned upload acquires one permit before touching S3 and releases it
@@ -483,6 +562,49 @@ impl OpendalFileSystem {
         // `block_on` panics if called from inside an async task on the same
         // runtime. We document this constraint at the type level.
         handle.block_on(fut)
+    }
+
+    /// TEST-ONLY: registers a synthetic in-flight "upload" task that reproduces
+    /// the tokio-shutdown lifecycle window: the spawned task publishes the watch
+    /// outcome FIRST (so any awaiter that blocks only on the watch unblocks) and
+    /// THEN keeps a tokio timer live for `timer_ms`, setting `done` to `true` only
+    /// once the task has fully finished. This models opendal's upload future,
+    /// whose `RetryLayer` / `.concurrent()` sub-tasks are still churning timers
+    /// after the byte-result is available.
+    ///
+    /// The gap this exposes: the watch resolving does NOT mean the task is done.
+    /// A drainer that waits only on the watch returns with `done == false` and a
+    /// live timer on the runtime; if the OWNED runtime is then dropped, a worker
+    /// thread polling that `Sleep` asserts `!driver().is_shutdown()` (tokio
+    /// entry.rs:602) → "A Tokio 1.x context was found, but it is being shutdown".
+    /// The join added to the barrier waits for the task, so on return `done` is
+    /// `true` (no live timer) and the runtime drop is safe.
+    #[cfg(test)]
+    fn register_synthetic_inflight_upload(
+        &self,
+        key: &str,
+        timer_ms: u64,
+        done: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let (tx, rx) = tokio::sync::watch::channel::<Option<UploadOutcome>>(None);
+        let join = self.rt.handle().spawn(async move {
+            // Publish the outcome FIRST: a watch-only awaiter unblocks here, while
+            // the task itself keeps a live timer below.
+            let _ = tx.send(Some(Ok(())));
+            tokio::time::sleep(Duration::from_millis(timer_ms)).await;
+            // Only NOW is the task — and its timer — actually finished.
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+        self.pending
+            .lock()
+            .expect("upload registry poisoned")
+            .insert(
+                key.to_string(),
+                PendingUpload {
+                    rx,
+                    join: Arc::new(Mutex::new(Some(join))),
+                },
+            );
     }
 
     /// Builds a [`BlockingLayer`]-equipped clone of the inner operator.
@@ -963,7 +1085,7 @@ impl OpendalWritableFile {
                             // receiver is registered for awaiters.
                             let (tx, rx) =
                                 tokio::sync::watch::channel::<Option<UploadOutcome>>(None);
-                            self.handle.spawn(async move {
+                            let join = self.handle.spawn(async move {
                                 let outcome: UploadOutcome = async {
                                     // Backpressure: hold a permit for the whole upload so
                                     // at most MAX_INFLIGHT_UPLOADS SSTs are resident at
@@ -1014,23 +1136,37 @@ impl OpendalWritableFile {
                                 // left — the FS was dropped — which is benign on shutdown).
                                 let _ = tx.send(Some(outcome));
                             });
-                            // Register the receiver so a later await can block on it. If a
+                            // Register the receiver + joinable handle so a later await can
+                            // block on it AND join the task (see `PendingUpload`). If a
                             // prior upload to the SAME path is still pending (path reuse),
                             // await it first to preserve last-writer-wins ordering.
+                            let entry = PendingUpload {
+                                rx,
+                                join: Arc::new(Mutex::new(Some(join))),
+                            };
                             let prior = pending
                                 .lock()
                                 .expect("upload registry poisoned")
-                                .insert(p.clone(), rx);
-                            if let Some(mut prior_rx) = prior {
+                                .insert(p.clone(), entry);
+                            if let Some(prior) = prior {
                                 // Drain the superseded upload so its outcome is observed
-                                // before we return (the new write supersedes it on S3).
+                                // AND its task is fully joined before we return (the new
+                                // write supersedes it on S3).
+                                let mut prior_rx = prior.rx;
+                                let prior_join = prior.join.lock().expect("join poisoned").take();
                                 let prior_outcome = self.handle.block_on(async move {
-                                    match prior_rx.wait_for(|v| v.is_some()).await {
+                                    let outcome = match prior_rx.wait_for(|v| v.is_some()).await {
                                         Ok(g) => g.clone().unwrap_or(Ok(())),
                                         // Sender dropped without publishing (task aborted on
                                         // shutdown) — treat as benign for a superseded write.
                                         Err(_) => Ok(()),
+                                    };
+                                    // Join the task so its timers are dropped before we
+                                    // proceed (the watch resolving precedes task teardown).
+                                    if let Some(jh) = prior_join {
+                                        let _ = jh.await;
                                     }
+                                    outcome
                                 });
                                 if let Err(msg) = prior_outcome {
                                     return Err(ForstError::Io(std::io::Error::other(format!(
@@ -1515,17 +1651,23 @@ impl FileSystem for OpendalFileSystem {
         // awaiters all block on the SAME upload completion instead of one of them
         // racing ahead with no handle. The receiver stays registered until the
         // outcome is observed below, then is removed to bound the map.
-        let rx = {
+        let entry = {
             let pending = self.pending.lock().expect("upload registry poisoned");
             pending.get(p).cloned()
         };
-        let Some(mut rx) = rx else {
+        let Some(entry) = entry else {
             // No pending entry: written synchronously, already completed + removed,
             // or never async. The object is durable.
             return Ok(());
         };
+        let mut rx = entry.rx;
+        // Take the joinable handle so we can await full task teardown after the
+        // outcome resolves (the watch resolving precedes the spawned task — and
+        // its tokio timers — being dropped; joining closes that window so a later
+        // owned-runtime drop cannot race a live timer → "context being shutdown").
+        let join = entry.join.lock().expect("join poisoned").take();
         let outcome = self.block_on(async move {
-            match rx.wait_for(|v| v.is_some()).await {
+            let outcome = match rx.wait_for(|v| v.is_some()).await {
                 Ok(g) => g.clone().unwrap_or(Ok(())),
                 // Sender dropped without publishing — only happens if the upload
                 // task was aborted (FS drop / shutdown). Surface as an error so a
@@ -1533,7 +1675,11 @@ impl FileSystem for OpendalFileSystem {
                 Err(_) => Err(format!(
                     "await_upload {p}: upload task dropped before completion"
                 )),
+            };
+            if let Some(jh) = join {
+                let _ = jh.await;
             }
+            outcome
         });
         // Completed: drop the entry so the map does not grow unbounded. A late
         // awaiter that missed it returns Ok (object is durable by now).
@@ -1557,17 +1703,30 @@ impl FileSystem for OpendalFileSystem {
         // here because this is the barrier — no concurrent reader should be
         // mid-`await_upload` for the same path at a checkpoint/shutdown boundary,
         // and even if one is, it holds its own cloned receiver.
-        let receivers: Vec<tokio::sync::watch::Receiver<Option<UploadOutcome>>> = {
+        let entries: Vec<PendingUpload> = {
             let mut pending = self.pending.lock().expect("upload registry poisoned");
-            pending.drain().map(|(_, rx)| rx).collect()
+            pending.drain().map(|(_, e)| e).collect()
         };
         let mut first_err: Option<ForstError> = None;
-        for mut rx in receivers {
+        for entry in entries {
+            let mut rx = entry.rx;
+            // 2026-06-15 TOKIO-SHUTDOWN-RACE FIX: take + await the spawned task's
+            // JoinHandle after its outcome resolves. This is the shutdown barrier
+            // (engine `DbImpl::drop` calls it before dropping the FS / owned
+            // runtime), so the task — and every tokio timer its opendal upload
+            // future armed — MUST be fully finished here, or dropping the owned
+            // `Runtime` next can race a live timer and panic with "A Tokio 1.x
+            // context was found, but it is being shutdown".
+            let join = entry.join.lock().expect("join poisoned").take();
             let outcome = self.block_on(async move {
-                match rx.wait_for(|v| v.is_some()).await {
+                let outcome = match rx.wait_for(|v| v.is_some()).await {
                     Ok(g) => g.clone().unwrap_or(Ok(())),
                     Err(_) => Ok(()),
+                };
+                if let Some(jh) = join {
+                    let _ = jh.await;
                 }
+                outcome
             });
             if let Err(msg) = outcome {
                 if first_err.is_none() {
@@ -2299,5 +2458,82 @@ mod tests {
         // Idempotent: nothing left pending.
         fs.await_all_uploads()
             .expect("await_all_uploads idempotent");
+    }
+
+    /// 2026-06-15 TOKIO-SHUTDOWN-RACE regression (`await_all_uploads`).
+    ///
+    /// The shutdown panic ("A Tokio 1.x context was found, but it is being
+    /// shutdown", tokio entry.rs:602) is a *timing* race: it fires on a tokio
+    /// worker thread polling a `Sleep` at the instant the OWNED runtime is being
+    /// dropped, after the barrier returned while a spawned upload task still held
+    /// a live timer. The watch resolving precedes the task — and its timers —
+    /// being dropped, so a watch-only barrier opened that window. The fix JOINS
+    /// the spawned task inside the barrier, closing the window.
+    ///
+    /// Rather than chase the flaky panic, this asserts the DETERMINISTIC invariant
+    /// the fix provides and whose absence IS the bug: when `await_all_uploads`
+    /// returns, every spawned upload task has FULLY finished (its `done` flag is
+    /// set, i.e. its timer is gone) — not merely that the watch outcome was
+    /// published. With a watch-only barrier (pre-fix) these flags would still be
+    /// `false` on return (the 300ms timers have not elapsed). The clean
+    /// owned-runtime drop at the end is the belt-and-suspenders check.
+    #[test]
+    fn await_all_uploads_joins_inflight_tasks_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+        let flags: Vec<Arc<AtomicBool>> = (0..8)
+            .map(|n| {
+                let done = Arc::new(AtomicBool::new(false));
+                // 300ms timer: far longer than the watch publish, so a watch-only
+                // barrier would return with done==false (the bug).
+                fs.register_synthetic_inflight_upload(
+                    &format!("sst/{n:06}.sst"),
+                    300,
+                    Arc::clone(&done),
+                );
+                done
+            })
+            .collect();
+
+        fs.await_all_uploads().expect("await_all_uploads");
+
+        // The barrier JOINED each task: every task ran to completion (timer gone),
+        // so no live timer can race the runtime drop below.
+        for (i, done) in flags.iter().enumerate() {
+            assert!(
+                done.load(Ordering::Acquire),
+                "task {i} not joined: await_all_uploads returned before its timer finished"
+            );
+        }
+        assert!(
+            fs.pending.lock().unwrap().is_empty(),
+            "barrier must drain the registry"
+        );
+        // Owned-runtime teardown: no live timer left → no shutdown-race panic.
+        drop(fs);
+    }
+
+    /// Same invariant for the per-path read barrier `await_upload`: it must also
+    /// JOIN the spawned task (not just observe the watch) so a later owned-runtime
+    /// drop cannot race the task's still-live timer.
+    #[test]
+    fn await_upload_joins_inflight_task_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+        let done = Arc::new(AtomicBool::new(false));
+        fs.register_synthetic_inflight_upload("sst/aa.sst", 300, Arc::clone(&done));
+
+        fs.await_upload(Path::new("sst/aa.sst"))
+            .expect("await_upload");
+
+        assert!(
+            done.load(Ordering::Acquire),
+            "await_upload returned before the spawned task finished (watch-only, not joined)"
+        );
+        assert!(
+            fs.pending.lock().unwrap().is_empty(),
+            "await_upload must remove the drained entry"
+        );
+        drop(fs);
     }
 }
