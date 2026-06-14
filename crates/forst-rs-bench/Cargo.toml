@@ -164,3 +164,12 @@ path = "src/bin/vlog_reader_cache_footprint.rs"
 [[bin]]
 name = "checkpoint_upload"
 path = "src/bin/checkpoint_upload.rs"
+
+# FRS-PHASE2 catalog #2.3 verify-before-build: cache-admission decay policy —
+# FIFO stand-in vs ForSt epoch-decayed cold-list counts. Synthetic Zipf
+# access-trace hit-rate simulation (working set >> cache); sweeps skew x
+# cache-ratio and prints a MATERIAL/MARGINAL/NEGLIGIBLE verdict. Pure CPU, no
+# I/O, no NexMark. Takes --smoke for CI.
+[[bin]]
+name = "cache_admission_epoch"
+path = "src/bin/cache_admission_epoch.rs"

@@ -75,6 +75,23 @@ pub struct AdmissionParams {
     /// for ForSt's epoch-decayed cold-list counts; old keys fall out of the
     /// tracker, which both bounds memory and decays stale counts).
     pub tracker_cap: usize,
+    /// FRS-CACHE-ADMISSION-EPOCH (catalog #2.3): when `Some(n)`, the per-key
+    /// eviction-count thrash signal is **epoch-decayed** — every `n` global
+    /// evictions, every key's eviction count is halved (a cheap sliding-window
+    /// decay modelling ForSt's `secondAccessEpoch` position-drift reset,
+    /// `FileBasedCache.java:377-387`). `None` (default) keeps the FIFO-only
+    /// stand-in, where an eviction record decays only when `tracker_cap`
+    /// distinct keys push it out of the deque.
+    ///
+    /// Why it matters (verified by `cache_admission_epoch` micro-bench): under
+    /// state ≫ cache with low-to-moderate skew, a medium-hot key that briefly
+    /// thrashed early crosses `promote_limit` and is then **permanently** blocked
+    /// from re-admission under FIFO — it can never be re-cached even after it
+    /// becomes genuinely hot again. Epoch decay sheds that stale credit so the
+    /// key is re-admitted, recovering up to ~10 pp hit-rate in the paper's
+    /// 1 GB-cache regime. (Negligible when cache ≥ hot set, i.e. high skew /
+    /// high cache-ratio — so it is default-OFF and byte-identical when OFF.)
+    pub epoch_evicts: Option<u64>,
 }
 
 impl Default for AdmissionParams {
@@ -83,6 +100,7 @@ impl Default for AdmissionParams {
             access_before_promote: 2,
             promote_limit: 3,
             tracker_cap: 65_536,
+            epoch_evicts: None,
         }
     }
 }
@@ -123,11 +141,19 @@ impl CachePolicy {
         }
         let admission = if flag("FRS_CACHE_ADMISSION") {
             let d = AdmissionParams::default();
+            // FRS_CACHE_ADMISSION_EPOCH: 0 / unset = OFF (FIFO-only stand-in,
+            // byte-identical legacy). A positive value n enables epoch decay,
+            // halving every key's eviction count every n global evictions.
+            let epoch_evicts = match num::<u64>("FRS_CACHE_ADMISSION_EPOCH", 0) {
+                0 => None,
+                n => Some(n),
+            };
             Some(AdmissionParams {
                 access_before_promote: num("FRS_CACHE_ADMISSION_PROMOTE", d.access_before_promote)
                     .max(1),
                 promote_limit: num("FRS_CACHE_ADMISSION_EVICT_LIMIT", d.promote_limit).max(1),
                 tracker_cap: num("FRS_CACHE_ADMISSION_TRACKER_CAP", d.tracker_cap).max(16),
+                epoch_evicts,
             })
         } else {
             None
@@ -151,6 +177,10 @@ struct AdmissionTracker {
     counts_order: VecDeque<String>,
     evictions: HashMap<String, u32>,
     evictions_order: VecDeque<String>,
+    /// FRS-CACHE-ADMISSION-EPOCH: count of global evictions since the last
+    /// epoch-decay tick. Only advanced/consulted when `epoch_evicts` is set;
+    /// stays 0 in the legacy (FIFO-only) path → byte-identical when OFF.
+    evicts_since_decay: u64,
 }
 
 impl AdmissionTracker {
@@ -219,6 +249,33 @@ impl AdmissionTracker {
                 );
             }
         }
+        // FRS-CACHE-ADMISSION-EPOCH: when enabled, halve every key's eviction
+        // count every `period` global evictions so stale thrash credit fades
+        // and a re-hot key can be re-admitted. OFF (`None`) leaves the legacy
+        // FIFO-only behavior byte-identical (the counter never advances).
+        if let Some(period) = p.epoch_evicts {
+            if period > 0 {
+                self.evicts_since_decay += 1;
+                if self.evicts_since_decay >= period {
+                    self.evicts_since_decay = 0;
+                    self.decay_evictions();
+                }
+            }
+        }
+    }
+
+    /// Halves every tracked key's eviction count and drops keys whose count
+    /// reaches 0 (also reclaiming their `evictions_order` ref). O(tracked
+    /// keys), amortized over `period` evictions → O(1) per eviction.
+    fn decay_evictions(&mut self) {
+        for v in self.evictions.values_mut() {
+            *v >>= 1;
+        }
+        self.evictions.retain(|_, v| *v > 0);
+        // Reclaim stale order refs for keys just dropped (mirrors `trim`'s
+        // amortized retain so the deque cannot grow unbounded).
+        self.evictions_order
+            .retain(|k| self.evictions.contains_key(k));
     }
 }
 
@@ -1847,6 +1904,7 @@ mod tests {
                 access_before_promote: 2,
                 promote_limit: 3,
                 tracker_cap: 1024,
+                ..AdmissionParams::default()
             }),
         }
     }
@@ -2104,6 +2162,7 @@ mod tests {
                 access_before_promote: 2,
                 promote_limit: 100, // never block: pure admit traffic
                 tracker_cap: cap,
+                ..AdmissionParams::default()
             }),
         };
         let (_tmp, cache) = policy_cache(1 << 20, policy);
@@ -2132,6 +2191,7 @@ mod tests {
                 access_before_promote: 3, // touches stay below promote → counts retained
                 promote_limit: 2,
                 tracker_cap: 64,
+                ..AdmissionParams::default()
             }),
         };
         let (_tmp, cache) = policy_cache(1 << 20, policy);
@@ -2143,6 +2203,101 @@ mod tests {
             tracker.counts.len() <= 64,
             "cold-count tracker exceeded cap: {}",
             tracker.counts.len()
+        );
+    }
+
+    #[test]
+    fn admission_epoch_off_never_decays_evictions() {
+        // FRS-CACHE-ADMISSION-EPOCH default-OFF: record_eviction must leave the
+        // eviction count strictly monotonic (the FIFO-only stand-in) — a key
+        // that crosses promote_limit stays blocked forever. This is the
+        // byte-identical-OFF guarantee for the epoch feature.
+        let p = AdmissionParams {
+            access_before_promote: 2,
+            promote_limit: 3,
+            tracker_cap: 1024,
+            epoch_evicts: None, // OFF
+        };
+        let mut t = AdmissionTracker::default();
+        for _ in 0..50 {
+            t.record_eviction("/db/hot.sst", &p);
+        }
+        assert_eq!(
+            t.evictions.get("/db/hot.sst").copied(),
+            Some(50),
+            "OFF: eviction count must be exactly the number of evictions (no decay)"
+        );
+        // Blocked and never resurrected.
+        assert!(
+            !t.touch_and_should_admit("/db/hot.sst", &p),
+            "OFF: key past promote_limit must stay blocked"
+        );
+        assert_eq!(
+            t.evicts_since_decay, 0,
+            "OFF: decay counter must never advance"
+        );
+    }
+
+    #[test]
+    fn admission_epoch_on_decays_and_unblocks() {
+        // FRS-CACHE-ADMISSION-EPOCH ON: after `period` global evictions, every
+        // key's eviction count halves. A previously-blocked key (count >=
+        // promote_limit) sheds credit and becomes re-admittable.
+        let period = 10u64;
+        let p = AdmissionParams {
+            access_before_promote: 1, // first touch admits once not blocked
+            promote_limit: 3,
+            tracker_cap: 1024,
+            epoch_evicts: Some(period),
+        };
+        let mut t = AdmissionTracker::default();
+        // Drive "/db/k.sst" to a blocked state (4 >= promote_limit 3).
+        for _ in 0..4 {
+            t.record_eviction("/db/k.sst", &p);
+        }
+        assert_eq!(t.evictions.get("/db/k.sst").copied(), Some(4));
+        assert!(
+            !t.touch_and_should_admit("/db/k.sst", &p),
+            "key should be blocked at count 4"
+        );
+        // Issue evictions on OTHER keys to reach the epoch boundary (period=10);
+        // 4 already recorded above, so 6 more triggers the first decay tick.
+        for i in 0..6 {
+            t.record_eviction(&format!("/db/other{i}.sst"), &p);
+        }
+        // Decay halved 4 -> 2, which is below promote_limit (3): unblocked.
+        assert_eq!(
+            t.evictions.get("/db/k.sst").copied(),
+            Some(2),
+            "epoch decay must halve the eviction count at the period boundary"
+        );
+        assert!(
+            t.touch_and_should_admit("/db/k.sst", &p),
+            "after decay below promote_limit the key must be re-admittable"
+        );
+    }
+
+    #[test]
+    fn admission_epoch_drops_zeroed_keys() {
+        // A key whose count decays to 0 must be removed from BOTH the map and
+        // the order deque so the tracker cannot grow unbounded under epoch decay.
+        let period = 2u64;
+        let p = AdmissionParams {
+            access_before_promote: 2,
+            promote_limit: 5,
+            tracker_cap: 1024,
+            epoch_evicts: Some(period),
+        };
+        let mut t = AdmissionTracker::default();
+        t.record_eviction("/db/a.sst", &p); // a=1, tick? evicts_since=1
+        t.record_eviction("/db/b.sst", &p); // b=1, evicts_since=2 -> decay: a=0,b=0 dropped
+        assert!(
+            t.evictions.is_empty(),
+            "keys at count 1 must drop to 0 and be removed on decay"
+        );
+        assert!(
+            t.evictions_order.is_empty(),
+            "order deque must be reclaimed when keys are dropped"
         );
     }
 

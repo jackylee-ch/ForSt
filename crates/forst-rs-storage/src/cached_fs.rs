@@ -1770,6 +1770,7 @@ mod tests {
                 access_before_promote: 2,
                 promote_limit: 3,
                 tracker_cap: 1024,
+                ..AdmissionParams::default()
             }),
         }
     }
