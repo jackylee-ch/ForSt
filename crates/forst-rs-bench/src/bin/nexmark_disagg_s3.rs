@@ -304,7 +304,7 @@ fn run_q5(db: &Arc<DbImpl>, sc: Scale, rng: &mut Rng) -> ((u64, u64), u64) {
 fn run_q7(db: &Arc<DbImpl>, sc: Scale, rng: &mut Rng) -> ((u64, u64), u64) {
     let cf = db.default_cf();
     let mut logical = 0u64;
-    let mut value = [0u8; 256]; // join payload — past kv_min_blob_size (128)
+    let mut value = [0u8; 256]; // join payload — at kv_min_blob_size (256, FRS-AKV Layer A)
     for p in 0..sc.q7_prefixes {
         for b in 0..sc.q7_bids {
             let key = format!("q7|p{p:08}|b{b:06}");

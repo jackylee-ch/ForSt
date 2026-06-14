@@ -60,6 +60,7 @@ use std::sync::Arc;
 use forst_rs_io::{FileSystem, MemoryFileSystem};
 use forst_rs_storage::vlog::{
     ValuePointer, VlogReader, VlogReaderCache, VlogWriter, DEFAULT_VLOG_READER_CACHE_CAP,
+    VLOG_READER_CHARGE_BYTES,
 };
 
 const CHUNK_BYTES: usize = 64 * 1024; // VlogReader's read-ahead granule.
@@ -152,21 +153,24 @@ fn write_segments(fs: &dyn FileSystem, dir: &Path, n: u64) -> Vec<(u64, ValuePoi
 struct ArmResult {
     label: &'static str,
     cap: usize,
+    byte_budget: usize,
     resident_readers: usize,
     resident_chunk_bytes: usize,
     rss_delta: usize,
 }
 
 /// Touches every segment once through the cache (the q9 wide-live-set deref
-/// pattern), materialising each resident reader's chunk buffer.
+/// pattern), materialising each resident reader's chunk buffer. Bounded by a
+/// count `cap` (0 = uncapped) AND a charged `byte_budget` (usize::MAX = none).
 fn run_arm(
     label: &'static str,
     cap: usize,
+    byte_budget: usize,
     fs: &dyn FileSystem,
     dir: &Path,
     segments: &[(u64, ValuePointer)],
 ) -> ArmResult {
-    let cache = VlogReaderCache::with_capacity(cap);
+    let cache = VlogReaderCache::with_capacity_and_budget(cap, byte_budget);
     let rss_before = rss_bytes();
     for (seg, ptr) in segments {
         let s = *seg;
@@ -181,6 +185,7 @@ fn run_arm(
     ArmResult {
         label,
         cap,
+        byte_budget,
         resident_readers,
         resident_chunk_bytes: resident_readers.saturating_mul(CHUNK_BYTES),
         rss_delta: rss_after.saturating_sub(rss_before),
@@ -220,19 +225,34 @@ fn main() {
     fs.create_dir_all(dir).expect("mkdir");
     let segs = write_segments(&fs, dir, segments);
 
+    // FRS-AKV-B1: a byte-budget arm (default 64 MiB) — the never-OOM bound the
+    // count cap alone could not give. Sweepable via `--budget-mb`.
+    let budget_mb = arg_value(&args, "--budget-mb")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(if smoke { 4 } else { 64 });
+    let byte_budget = budget_mb.saturating_mul(1024 * 1024);
+
     // Uncapped arm (cap = 0): the pre-fix behaviour — keeps every reader.
-    let unbounded = run_arm("uncapped (pre-fix)", 0, &fs, dir, &segs);
-    // Bounded arm: O(cap) resident readers.
-    let bounded = run_arm("bounded   (fixed)  ", cap, &fs, dir, &segs);
+    let unbounded = run_arm("uncapped  (pre-fix)", 0, usize::MAX, &fs, dir, &segs);
+    // Count-bounded arm: O(cap) resident readers (the shipped V2a-2-LRU).
+    let bounded = run_arm("count-cap (V2a-2)  ", cap, usize::MAX, &fs, dir, &segs);
+    // FRS-AKV-B1 byte-budgeted arm: O(budget) resident bytes (count uncapped
+    // so the BYTE bound is what holds — the q9 never-OOM mechanism).
+    let budgeted = run_arm("byte-budget (AKV)  ", 0, byte_budget, &fs, dir, &segs);
 
     let report = |r: &ArmResult| {
         println!(
-            "  {}: cap={:<6} resident_readers={:<7} chunk_bytes={:<10} rss_delta={}",
+            "  {}: cap={:<6} budget={:<9} resident_readers={:<7} chunk_bytes={:<10} rss_delta={}",
             r.label,
             if r.cap == 0 {
                 "∞".to_string()
             } else {
                 r.cap.to_string()
+            },
+            if r.byte_budget == usize::MAX {
+                "∞".to_string()
+            } else {
+                human(r.byte_budget)
             },
             r.resident_readers,
             human(r.resident_chunk_bytes),
@@ -242,6 +262,7 @@ fn main() {
     println!("--- results ({segments} segments dereferenced) ---");
     report(&unbounded);
     report(&bounded);
+    report(&budgeted);
 
     let ratio = if bounded.resident_chunk_bytes == 0 {
         f64::INFINITY
@@ -254,6 +275,17 @@ fn main() {
         human(unbounded.resident_chunk_bytes),
         human(bounded.resident_chunk_bytes),
         ratio
+    );
+
+    // FRS-AKV-B1 byte-budget verdict.
+    let budgeted_resident_bytes = budgeted.resident_readers * VLOG_READER_CHARGE_BYTES;
+    println!(
+        "--- AKV-B1 byte-budget: resident readers plateau at {} (charge {}), \
+         charged resident {} <= budget {} (O(budget), not O(segments)) ---",
+        budgeted.resident_readers,
+        human(VLOG_READER_CHARGE_BYTES),
+        human(budgeted_resident_bytes),
+        human(byte_budget),
     );
 
     // Hard assertions so the bin doubles as a CI gate under --smoke.
@@ -271,5 +303,17 @@ fn main() {
         bounded.resident_chunk_bytes < unbounded.resident_chunk_bytes,
         "bounded footprint must be strictly smaller than uncapped"
     );
-    println!("OK: bound holds (resident readers <= cap, footprint O(cap)).");
+    // FRS-AKV-B1: the byte budget bounds CHARGED resident bytes regardless of
+    // segment count — the q9 never-OOM property.
+    assert!(
+        budgeted_resident_bytes <= byte_budget,
+        "byte-budget arm charged resident {} must not exceed budget {}",
+        budgeted_resident_bytes,
+        byte_budget
+    );
+    assert!(
+        budgeted.resident_readers < segments as usize,
+        "byte budget must cap resident below O(segments) when segments exceed budget/charge"
+    );
+    println!("OK: bounds hold (count cap O(cap); AKV byte budget O(budget) — q9 never-OOM).");
 }

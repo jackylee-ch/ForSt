@@ -215,6 +215,16 @@ struct Args {
     /// `FRS_VLOG_COMPRESSION={inherit|none|lz4|zstd}` (vlog under --kvsep)
     /// this measures write-amp + bytes-to-disk for the codec × KV-sep matrix.
     compressible: bool,
+    /// FRS-AKV (adaptive KV-sep, 2026-06-14): run the 3-SHAPE adaptive
+    /// mini-bench (the V3-confirm gate, NOT NexMark) under ONE uniform config
+    /// (threshold 256 + resident budget + adaptive pressure/GC). Reports, per
+    /// shape: did it separate, write-amp, resident vlog bytes, live segments.
+    ///   - q7/q19-shape FIFO  → FULL separation, resident bounded, write-amp low
+    ///   - q9-shape scattered → backs off under pressure, resident ≤ budget
+    ///   - q11/q17-shape small → stays INLINE (no vlog writes)
+    akv_shapes: bool,
+    /// FRS-AKV: resident vlog byte budget for `--akv-shapes` (MiB).
+    akv_budget_mib: u64,
 }
 
 impl Args {
@@ -240,6 +250,8 @@ impl Args {
             seq_keys: false,
             trivial_move: false,
             compressible: false,
+            akv_shapes: false,
+            akv_budget_mib: 2,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -271,6 +283,8 @@ impl Args {
                 "--seq-keys" => a.seq_keys = true,
                 "--trivial-move" => a.trivial_move = true,
                 "--compressible" => a.compressible = true,
+                "--akv-shapes" => a.akv_shapes = true,
+                "--akv-budget-mib" => a.akv_budget_mib = take(&mut i).parse().unwrap(),
                 other => panic!("unknown arg {other}"),
             }
             i += 1;
@@ -1004,8 +1018,261 @@ fn one_run_rocksdb(_args: &Args, _run_idx: usize, _workroot: &Path) -> RunSummar
     panic!("--engine rocksdb requires --features rocksdb-baseline");
 }
 
+/// FRS-AKV (adaptive KV-sep, 2026-06-14): the 3-SHAPE adaptive mini-bench —
+/// the V3-confirm gate (contention-robust, NOT NexMark). Drives THREE
+/// workload shapes through a real engine under ONE uniform config and reports
+/// whether the adaptive mechanism (Layer A size gate + B1 pressure back-off +
+/// B2 GC) produces the per-shape behaviour the design predicts:
+///
+/// - q7/q19 FIFO      → FULL separation, resident bounded, write-amp low
+/// - q9     scattered → backs off under pressure, resident ≤ budget (no OOM)
+/// - q11/17 small     → stays INLINE (no vlog writes)
+///
+/// All under the SAME config — the per-shape difference is the engine sensing
+/// value size / reclaim rate / resident pressure at runtime (no per-query flag).
+fn run_akv_shapes(args: &Args) {
+    use forst_rs_engine::{ColumnFamilyDescriptor, DbImpl};
+
+    let budget_mib = args.akv_budget_mib;
+    // ONE uniform config for all three shapes (the deliverable contract).
+    // Default threshold is already 256 (FRS-AKV Layer A). Force the adaptive
+    // flags ON via the test-safe overrides (default-OFF everywhere else).
+    std::env::set_var("FRS_KV_MIN_BLOB_SIZE", "256");
+    forst_rs_engine::set_kv_separation_override(Some(true));
+    forst_rs_engine::set_vlog_resident_budget_mb_override(Some(budget_mib));
+    forst_rs_engine::set_kv_adaptive_pressure_override(Some(true));
+    forst_rs_engine::set_vlog_gc_adaptive_override(Some(true));
+
+    let charge = forst_rs_storage::vlog::VLOG_READER_CHARGE_BYTES as u64;
+    let budget_bytes = budget_mib * 1024 * 1024;
+    // Size each shape so it OPENS far more segments than budget/charge — i.e.
+    // it would blow O(segments) resident if the byte bound did not hold.
+    let target_segments = (budget_bytes / charge) * 4 + 40;
+
+    println!("=== FRS-AKV 3-shape adaptive mini-bench (ONE uniform config) ===");
+    println!(
+        "config: FRS_KV_MIN_BLOB_SIZE=256 FRS_VLOG_RESIDENT_BUDGET_MB={budget_mib} \
+         FRS_KV_ADAPTIVE_PRESSURE=1 FRS_VLOG_GC_ADAPTIVE=1  (charge/reader={} KiB, \
+         budget/charge={} readers, target_segments/shape={})",
+        charge / 1024,
+        budget_bytes / charge,
+        target_segments,
+    );
+
+    #[derive(Debug)]
+    struct ShapeResult {
+        shape: &'static str,
+        value_bytes: usize,
+        logical_bytes: u64,
+        phys_bytes: u64,
+        separated_segments_seen: u64,
+        inline_flushes: u64,
+        resident_bytes_peak: usize,
+        live_segments_peak: usize,
+    }
+
+    // Run one shape in its own engine (CountingFs measures physical bytes).
+    let run_shape = |shape: &'static str, value_bytes: usize, scattered: bool| -> ShapeResult {
+        let workroot = std::path::PathBuf::from("target").join(format!(
+            "akv_shapes_{}_{}",
+            shape,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&workroot);
+        std::fs::create_dir_all(&workroot).expect("mkdir");
+        let written = Arc::new(AtomicU64::new(0));
+        let fs: Arc<dyn FileSystem> = Arc::new(CountingFs {
+            inner: LocalFileSystem,
+            written: Arc::clone(&written),
+        });
+        let opts = EngineOptions {
+            db_path: workroot.to_string_lossy().into_owned(),
+            // Config MATCHES ForSt: noflush=false, wbuf 1 GiB (the uniform
+            // production config). Small here so flushes actually fire in the
+            // mini-bench timeframe while staying append-shaped.
+            write_buffer_size: 4 * 1024 * 1024,
+            ..EngineOptions::default()
+        };
+        let db = DbImpl::open_with_fs(opts, fs).expect("open");
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new(shape))
+            .expect("cf");
+
+        let mut value = vec![0u8; value_bytes];
+        let mut logical = 0u64;
+        let mut separated_seen = 0u64;
+        let mut inline_flushes = 0u64;
+        let mut resident_peak = 0usize;
+        let mut segments_peak = 0usize;
+        let mut prev_segments = 0usize;
+
+        // Key universe: FIFO = monotone fresh keys (each flush a disjoint
+        // range, segments die in arrival order). Scattered = small recycled
+        // key space overwritten in a NON-arrival order so segments accumulate
+        // mixed-lifetime pointers and never reach live_bytes==0 (the q9
+        // signature) → resident climbs → budget → back-off.
+        let scattered_universe: u64 = 4096;
+        let flushes = target_segments + 20;
+        for f in 0..flushes {
+            // ~256 KiB of rows per flush (fills the 4 MiB wbuf in ~16 flushes;
+            // we drive many flushes so resident would blow without the bound).
+            let rows_per_flush = (256 * 1024 / value_bytes.max(1)).max(1);
+            for r in 0..rows_per_flush {
+                let seq = f * rows_per_flush as u64 + r as u64;
+                let key = if scattered {
+                    // Scattered overwrite: hash the seq into a small recycled
+                    // space so deaths do NOT follow arrival order.
+                    let h = (seq.wrapping_mul(0x9E3779B97F4A7C15)) % scattered_universe;
+                    format!("k{h:06}")
+                } else {
+                    // FIFO: globally monotone (disjoint per-flush ranges).
+                    format!("k{seq:012}")
+                };
+                value[0] = seq as u8;
+                if value_bytes > 1 {
+                    value[value_bytes - 1] = (seq >> 8) as u8;
+                }
+                db.put(&cf, key.as_bytes(), &value).expect("put");
+                logical += (key.len() + value_bytes) as u64;
+            }
+            let segs_before = db.vlog_live_segment_count();
+            db.switch_and_flush(&cf).expect("flush");
+            let segs_after = db.vlog_live_segment_count();
+            if segs_after > segs_before {
+                separated_seen += 1;
+            } else if value_bytes >= 256 {
+                // An eligible-by-size flush that produced NO new segment = a
+                // back-off (inline) flush (Layer B1) OR all-shadowed reclaim.
+                inline_flushes += 1;
+            }
+            // Deref to materialise vlog readers (resident charge). FIFO: one
+            // recent key (narrow working set → low resident). Scattered (q9):
+            // probe a WIDE set of keys spread across the recycled universe so
+            // their pointers hit MANY distinct live segments at once — the q9
+            // wide-live-segment-set read pattern that drives resident up to
+            // the budget and triggers the adaptive back-off.
+            if scattered {
+                for p in 0..512u64 {
+                    let h = (p.wrapping_mul(0x9E3779B1)) % scattered_universe;
+                    let _ = db.get(&cf, format!("k{h:06}").as_bytes());
+                }
+            } else {
+                let probe_key = format!("k{:012}", f * rows_per_flush as u64);
+                let _ = db.get(&cf, probe_key.as_bytes());
+            }
+            // FIFO: expire the OLDEST flush's range so segments die whole
+            // (the q7 TTL/whole-segment drop → reclaim → full separation).
+            if !scattered && f >= 16 {
+                let old_base = (f - 16) * rows_per_flush as u64;
+                for r in 0..rows_per_flush {
+                    let old_key = format!("k{:012}", old_base + r as u64);
+                    db.delete(&cf, old_key.as_bytes()).expect("delete");
+                }
+                if f % 4 == 0 {
+                    db.compact_all().expect("compact"); // drive reclaim
+                }
+            }
+            resident_peak = resident_peak.max(db.vlog_resident_bytes());
+            segments_peak = segments_peak.max(db.vlog_live_segment_count());
+            prev_segments = segs_after;
+        }
+        let _ = prev_segments;
+        let phys = written.load(Ordering::Relaxed);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&workroot);
+        ShapeResult {
+            shape,
+            value_bytes,
+            logical_bytes: logical,
+            phys_bytes: phys,
+            separated_segments_seen: separated_seen,
+            inline_flushes,
+            resident_bytes_peak: resident_peak,
+            live_segments_peak: segments_peak,
+        }
+    };
+
+    let fifo = run_shape("q7q19-FIFO ", 512, false);
+    let scattered = run_shape("q9-scatter ", 512, true);
+    let small = run_shape("q11q17-tiny", 64, false);
+
+    let human = |b: u64| -> String {
+        if b >= 1 << 20 {
+            format!("{:.1} MiB", b as f64 / (1u64 << 20) as f64)
+        } else {
+            format!("{:.1} KiB", b as f64 / 1024.0)
+        }
+    };
+    let report = |r: &ShapeResult| {
+        let wa = r.phys_bytes as f64 / r.logical_bytes.max(1) as f64;
+        println!(
+            "  {:<11} val={:>4}B  write_amp={:>5.2}x  separated_flushes={:>4}  \
+             inline/backoff_flushes={:>4}  resident_peak={:>9}  segments_peak={:>4}  (budget={})",
+            r.shape,
+            r.value_bytes,
+            wa,
+            r.separated_segments_seen,
+            r.inline_flushes,
+            human(r.resident_bytes_peak as u64),
+            r.live_segments_peak,
+            human(budget_bytes),
+        );
+    };
+    println!("--- results (ONE config; behaviour differs by RUNTIME sensing) ---");
+    report(&fifo);
+    report(&scattered);
+    report(&small);
+
+    // VERDICTS (the gate). Restore overrides first so a panic does not leak.
+    forst_rs_engine::set_kv_separation_override(None);
+    forst_rs_engine::set_vlog_resident_budget_mb_override(None);
+    forst_rs_engine::set_kv_adaptive_pressure_override(None);
+    forst_rs_engine::set_vlog_gc_adaptive_override(None);
+
+    // (1) FIFO fully separates AND resident stays bounded by the budget.
+    assert!(
+        fifo.separated_segments_seen > 0,
+        "FIFO shape must SEPARATE (large values, full separation)"
+    );
+    assert!(
+        fifo.resident_bytes_peak as u64 <= budget_bytes,
+        "FIFO resident_peak {} must stay <= budget {}",
+        fifo.resident_bytes_peak,
+        budget_bytes
+    );
+    // (2) Scattered-death backs off: resident ≤ budget (the OOM regime closed)
+    //     AND it produced inline/back-off flushes (did NOT separate forever).
+    assert!(
+        scattered.resident_bytes_peak as u64 <= budget_bytes,
+        "SCATTERED resident_peak {} must stay <= budget {} (q9 never-OOM)",
+        scattered.resident_bytes_peak,
+        budget_bytes
+    );
+    assert!(
+        scattered.inline_flushes > 0,
+        "SCATTERED shape must BACK OFF (some flushes inline) under pressure"
+    );
+    // (3) Small values stay inline → NO vlog segments ever.
+    assert_eq!(
+        small.separated_segments_seen, 0,
+        "SMALL (q11/q17) values must stay INLINE (no vlog writes)"
+    );
+    assert_eq!(
+        small.live_segments_peak, 0,
+        "SMALL shape must never create a vlog segment"
+    );
+    println!(
+        "VERDICT OK: FIFO fully-separates+bounded; scattered-death backs-off (resident <= budget, \
+         no unbounded growth); small-value stays inline — ALL under ONE config."
+    );
+}
+
 fn main() {
     let args = Args::parse();
+    if args.akv_shapes {
+        run_akv_shapes(&args);
+        return;
+    }
     eprintln!(
         "churn_probe: {:?} env: FRS_L0_COMPACTION_TRIGGER={:?} FRS_L0_SLOWDOWN_TRIGGER={:?} \
          FRS_L0_STOP_TRIGGER={:?} FRS_BULK_SAMPLE={:?}",

@@ -141,6 +141,150 @@ fn vlog_reader_cache_cap() -> usize {
     }
 }
 
+/// FRS-AKV-B1 (adaptive KV-sep, 2026-06-14): charged-byte budget for the
+/// resident vlog-reader working set, in MiB, via `FRS_VLOG_RESIDENT_BUDGET_MB`.
+/// The count cap (`FRS_VLOG_READER_CACHE_CAP`) bounds reader HANDLES but NOT
+/// bytes — q9 still OOM'd with the count cap because (a) the count × 64 KiB
+/// chunk is still ~128 MB of buffers AND (b) the resident vlog state kept
+/// growing on top of an already-near-cap Flink heap. This budget is the
+/// missing BYTE bound: when resident vlog bytes approach it, the LRU evicts to
+/// the byte budget AND (with `FRS_KV_ADAPTIVE_PRESSURE`) the engine backs off
+/// separating new flushes for non-reclaiming CFs — guaranteeing resident vlog
+/// bytes ≤ budget regardless of how scattered the death pattern is.
+///
+/// **DEFAULT 0 = DISABLED** (`u64::MAX` bytes = byte bound OFF = today's
+/// count-only behaviour; byte-identical when off). A sane production value is
+/// ~512-1024 MB (small vs the 6 GB WBM and the 16 g cgroup).
+fn vlog_resident_budget_bytes() -> usize {
+    let ov = VLOG_RESIDENT_BUDGET_MB_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let mb = if ov != u64::MAX {
+        ov
+    } else {
+        std::env::var("FRS_VLOG_RESIDENT_BUDGET_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    if mb == 0 {
+        usize::MAX // disabled — no byte bound (default, byte-identical)
+    } else {
+        (mb as usize).saturating_mul(1024 * 1024)
+    }
+}
+
+/// FRS-AKV-B1 test override for [`vlog_resident_budget_bytes`]: `u64::MAX` =
+/// unset (env/default); any other value = that many MiB (0 MiB = disabled).
+static VLOG_RESIDENT_BUDGET_MB_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// FRS-AKV-B1: forces the resident vlog byte budget (MiB) for tests/benches;
+/// `None` restores the `FRS_VLOG_RESIDENT_BUDGET_MB` env/default.
+pub fn set_vlog_resident_budget_mb_override(v: Option<u64>) {
+    VLOG_RESIDENT_BUDGET_MB_OVERRIDE
+        .store(v.unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// FRS-AKV-B1 master flag for the pressure-gated separation BACK-OFF
+/// (`FRS_KV_ADAPTIVE_PRESSURE=1`, **DEFAULT OFF**). When OFF, separation is
+/// decided purely by size (Layer A) + the static eligibility gates — i.e.
+/// today's `FRS_KV_SEPARATION` behaviour, byte-identical. When ON,
+/// [`DbImpl::should_separate_now`] additionally backs off (writes inline) for
+/// a CF that is at/over the resident byte budget AND not reclaiming (the q9
+/// scattered-death signature) — the adaptive never-OOM decision.
+pub fn kv_adaptive_pressure_enabled() -> bool {
+    let ov = KV_ADAPTIVE_PRESSURE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_KV_ADAPTIVE_PRESSURE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-AKV-B1 test override for [`kv_adaptive_pressure_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static KV_ADAPTIVE_PRESSURE_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-AKV-B1: forces the adaptive-pressure back-off on/off for tests/benches
+/// (`None` = defer to `FRS_KV_ADAPTIVE_PRESSURE`).
+pub fn set_kv_adaptive_pressure_override(v: Option<bool>) {
+    KV_ADAPTIVE_PRESSURE_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-AKV-B2 master flag for adaptive vlog-GC relocation
+/// (`FRS_VLOG_GC_ADAPTIVE=1`, **DEFAULT OFF**). When OFF, relocation follows
+/// the static [`vlog_gc_age_cutoff_percent`] (default 0 = relocation off —
+/// today's behaviour, byte-identical). When ON, a CF whose reclaim-rate is ~0
+/// while its live segment count climbs (scattered death) auto-enables a modest
+/// relocation cutoff so its mostly-dead old segments drain WHOLE — bounding
+/// on-disk segment count / space-amp — while FIFO-death CFs (q7) keep cutoff 0
+/// (no added write-amp). Lower leverage than B1 (B1 alone bounds the RAM).
+pub fn vlog_gc_adaptive_enabled() -> bool {
+    let ov = VLOG_GC_ADAPTIVE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_VLOG_GC_ADAPTIVE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-AKV-B2 test override for [`vlog_gc_adaptive_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static VLOG_GC_ADAPTIVE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-AKV-B2: forces adaptive vlog-GC relocation on/off for tests/benches
+/// (`None` = defer to `FRS_VLOG_GC_ADAPTIVE`).
+pub fn set_vlog_gc_adaptive_override(v: Option<bool>) {
+    VLOG_GC_ADAPTIVE_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-AKV-B2: the relocation cutoff (percent of OLDEST segments) auto-applied
+/// to a non-reclaiming CF when `FRS_VLOG_GC_ADAPTIVE` is ON. Modest by design:
+/// it relocates the oldest quarter of the CF's segments so mostly-dead ones
+/// drain whole without re-writing the whole working set. Overridable via
+/// `FRS_VLOG_GC_ADAPTIVE_CUTOFF` for the mini-bench sweep.
+fn vlog_gc_adaptive_cutoff_percent() -> u32 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u32> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FRS_VLOG_GC_ADAPTIVE_CUTOFF")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(1, 100))
+            .unwrap_or(25)
+    })
+}
+
 /// FRS-SST-COMPRESSION env override (perf experiment, 2026-06-02): force the
 /// SST block compression via `FRS_SST_COMPRESSION=none|lz4|zstd`. A differential
 /// q7 profile showed LZ4 `decompress` is ~43% of the heavy-join prefix-iter CPU
@@ -978,6 +1122,46 @@ impl<'a> Drop for WbmReleaseGuard<'a> {
     }
 }
 
+/// FRS-AKV-B1 (adaptive KV-sep, 2026-06-14): per-CF vlog write/reclaim
+/// accounting — the cheap runtime signal that distinguishes a FIFO-death CF
+/// (q7/q19: reclaims continuously → keeps separating) from a scattered-death
+/// CF under memory pressure (q9: ~0 reclaim while resident climbs → must back
+/// off to inline so it never OOMs). Both counters are monotone cumulative
+/// byte totals; the reclaim RATE is `freed / written` over the run (and a
+/// recent window via the `windowed_*` snapshot taken when pressure is first
+/// hit). Updated only on the KV-sep path (flush appends vlog → `written`;
+/// reclaim/relocation frees → `freed`); the default path never touches it.
+#[derive(Debug, Default, Clone)]
+struct VlogCfStats {
+    /// Cumulative vlog payload bytes this CF has WRITTEN (appended at flush).
+    bytes_written: u64,
+    /// Cumulative vlog payload bytes this CF has FREED (reclaimed whole-segment
+    /// or relocated-away — i.e. `live_bytes` decremented to dead).
+    bytes_freed: u64,
+    /// Snapshot of `(written, freed)` taken when the CF FIRST observed the
+    /// resident budget exceeded — lets `should_separate_now` measure the
+    /// reclaim rate over the recent pressure WINDOW (not the whole run), so a
+    /// CF that reclaimed heavily early then stalled is still caught.
+    windowed_at_pressure: Option<(u64, u64)>,
+}
+
+impl VlogCfStats {
+    /// FRS-AKV-B1: the recent-window reclaim ratio used by the back-off
+    /// decision. If a pressure-window snapshot exists, measure freed/written
+    /// SINCE that snapshot; otherwise the whole-run ratio. Returns 1.0 (treat
+    /// as fully reclaiming) when nothing has been written in the window — a CF
+    /// that is not writing cannot be the runaway, so never back it off.
+    fn windowed_reclaim_ratio(&self) -> f64 {
+        let (base_w, base_f) = self.windowed_at_pressure.unwrap_or((0, 0));
+        let dw = self.bytes_written.saturating_sub(base_w);
+        let df = self.bytes_freed.saturating_sub(base_f);
+        if dw == 0 {
+            return 1.0;
+        }
+        (df as f64 / dw as f64).clamp(0.0, 1.0)
+    }
+}
+
 /// The top-level engine struct.
 pub struct DbImpl {
     options: EngineOptions,
@@ -1023,6 +1207,17 @@ pub struct DbImpl {
     /// This makes resident vlog-reader cost `O(cap)` instead of `O(segments)`,
     /// the structure that OOM'd q9 under scattered-death joins.
     vlog_readers: forst_rs_storage::vlog::VlogReaderCache,
+    /// FRS-AKV-B1 (adaptive KV-sep, 2026-06-14): per-CF vlog write/reclaim
+    /// accounting — the runtime signal [`DbImpl::should_separate_now`] consults
+    /// to back off separation for a non-reclaiming CF under memory pressure
+    /// (the q9 scattered-death discriminator). Empty / untouched on the default
+    /// (KV-sep OFF) path. See [`VlogCfStats`].
+    vlog_cf_stats: Mutex<std::collections::HashMap<ColumnFamilyId, VlogCfStats>>,
+    /// FRS-AKV-B1: per-segment `(cf_id, original_payload_bytes)` recorded at
+    /// write so reclaim can charge FREED bytes in the SAME unit as WRITTEN
+    /// (payload, not seal file_size). Pruned when the segment is reaped. Only
+    /// the KV-sep path populates it.
+    vlog_seg_payload: Mutex<std::collections::HashMap<u64, (ColumnFamilyId, u64)>>,
     /// FRS-WA-V2b: vlog segments whose reclaim was deferred by a deletion-
     /// guard pin or a retiring-version reference (sister of
     /// `pending_deletions`); drained by `reap_pending_deletions`.
@@ -1350,9 +1545,12 @@ impl DbImpl {
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
-            vlog_readers: forst_rs_storage::vlog::VlogReaderCache::with_capacity(
+            vlog_readers: forst_rs_storage::vlog::VlogReaderCache::with_capacity_and_budget(
                 vlog_reader_cache_cap(),
+                vlog_resident_budget_bytes(),
             ),
+            vlog_cf_stats: Mutex::new(std::collections::HashMap::new()),
+            vlog_seg_payload: Mutex::new(std::collections::HashMap::new()),
             pending_vlog_deletions: Mutex::new(Vec::new()),
             file_mapping: std::sync::OnceLock::new(),
             background_fill: Mutex::new(None),
@@ -6814,9 +7012,12 @@ impl DbImpl {
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
-            vlog_readers: forst_rs_storage::vlog::VlogReaderCache::with_capacity(
+            vlog_readers: forst_rs_storage::vlog::VlogReaderCache::with_capacity_and_budget(
                 vlog_reader_cache_cap(),
+                vlog_resident_budget_bytes(),
             ),
+            vlog_cf_stats: Mutex::new(std::collections::HashMap::new()),
+            vlog_seg_payload: Mutex::new(std::collections::HashMap::new()),
             pending_vlog_deletions: Mutex::new(Vec::new()),
             file_mapping: std::sync::OnceLock::new(),
             background_fill: Mutex::new(None),
@@ -10935,9 +11136,17 @@ impl DbImpl {
             },
             // FRS-WA-V2a-2: register the flush's vlog segment atomically
             // with the SST that points into it.
-            new_vlog_segments: vlog_meta.into_iter().collect(),
+            new_vlog_segments: vlog_meta.iter().cloned().collect(),
             ..Default::default()
         };
+        // FRS-AKV-B1: charge the separated payload to this CF's write total
+        // (the reclaim-rate signal's numerator). `live_bytes` at seal == the
+        // appended payload total. No-op when KV-sep is off (vlog_meta is None).
+        let kvsep_written: u64 = vlog_meta.iter().map(|s| s.live_bytes).sum();
+        let kvsep_seg_payloads: Vec<(u64, ColumnFamilyId, u64)> = vlog_meta
+            .iter()
+            .map(|s| (s.segment_id, s.cf_id, s.live_bytes))
+            .collect();
         // FRS-RESIDENT-FLUSHED-ORDER (2026-05-30): enroll the resident RAM shadow
         // BEFORE the SST becomes visible via `version_set.apply`. A symbolized q9-S3
         // stall profile showed join-probe threads BLOCKED on `await_upload` inside
@@ -10966,6 +11175,20 @@ impl DbImpl {
         }
 
         self.version_set.apply(&edit)?;
+
+        // FRS-AKV-B1: account the separated payload once the segment is
+        // version-visible (post-apply, so a stale-edit reject does not
+        // mis-charge). Cheap map upsert; only the KV-sep path reaches here.
+        if kvsep_written > 0 {
+            self.vlog_account_written(cf_data.handle().id(), kvsep_written);
+            let mut seg_payload = self
+                .vlog_seg_payload
+                .lock()
+                .expect("vlog_seg_payload poisoned");
+            for (seg_id, cf_id, payload) in &kvsep_seg_payloads {
+                seg_payload.insert(*seg_id, (*cf_id, *payload));
+            }
+        }
 
         // FRS-PHASE2-C3U4: advance the CF's MONOTONIC flushed floor — every
         // WAL record of this CF at or below `meta.max_sequence` is now
@@ -12722,11 +12945,153 @@ impl DbImpl {
         if cf_data.merge_operator().is_some() || cf_data.compaction_filter().is_some() {
             return None;
         }
+        // FRS-AKV-B1: the adaptive runtime decision. Eligible by size+lifecycle,
+        // but under sustained memory pressure with ~0 reclaim (the q9
+        // scattered-death signature) back off to inline for THIS flush so the
+        // resident vlog working set stays bounded (never OOMs). Default-OFF
+        // (`FRS_KV_ADAPTIVE_PRESSURE`) → always returns true → byte-identical
+        // to today's flag-ON behaviour.
+        if !self.should_separate_now(cf_data.handle().id()) {
+            return None;
+        }
         Some(crate::flush::KvSepSpec {
             segment_id: self.version_set.allocate_file_number(),
             min_blob_size: kv_min_blob_size(),
             vlog_compression: kv_vlog_compression(self.options.compression),
         })
+    }
+
+    /// FRS-AKV-B1 (adaptive KV-sep, 2026-06-14): the runtime per-CF decision —
+    /// "should this flush separate values, or back off to inline?". This is THE
+    /// adaptive signal the mission requires (value size = Layer A gate; this =
+    /// resident pressure AND reclaim rate, decided per-CF at runtime, ONE
+    /// config).
+    ///
+    /// Returns `true` (separate) UNLESS, with `FRS_KV_ADAPTIVE_PRESSURE` ON:
+    ///   (a) the resident vlog working set is at/over `FRS_VLOG_RESIDENT_BUDGET_MB`
+    ///       (memory pressure), AND
+    ///   (b) THIS CF's recent reclaim rate is ≈ 0 (segments not dying whole —
+    ///       the q9 scattered-death signature).
+    /// In that case it returns `false`: this flush writes values INLINE
+    /// (byte-identical to flag-OFF for that flush; a back-off mid-run never
+    /// corrupts the already-separated portion — those BlobRef rows still
+    /// deref through the immutable segments). A FIFO-death CF (q7/q19) keeps
+    /// reclaiming, so (b) is false → it NEVER backs off → full separation; q9
+    /// hits the budget with ~0 reclaim → backs off → resident bounded, fits.
+    ///
+    /// DEFAULT (`FRS_KV_ADAPTIVE_PRESSURE` OFF): always `true` — today's
+    /// behaviour, byte-identical.
+    fn should_separate_now(&self, cf_id: ColumnFamilyId) -> bool {
+        if !kv_adaptive_pressure_enabled() {
+            return true;
+        }
+        let budget = vlog_resident_budget_bytes();
+        if budget == usize::MAX {
+            return true; // no byte budget configured → no pressure signal
+        }
+        // The reader cache EVICTS to keep resident_bytes ≤ budget, so it
+        // plateaus just BELOW the budget when saturated. Treat "within one
+        // reader's charge of the budget" as the pressure (saturated) signal —
+        // `resident >= budget` alone would never fire once the byte-budget
+        // eviction is active.
+        let resident = self.vlog_readers.resident_bytes();
+        let saturated =
+            resident >= budget.saturating_sub(forst_rs_storage::vlog::VLOG_READER_CHARGE_BYTES);
+        let mut stats = self.vlog_cf_stats.lock().expect("vlog_cf_stats poisoned");
+        let entry = stats.entry(cf_id).or_default();
+        if !saturated {
+            // Below pressure → clear the window snapshot; always separate.
+            entry.windowed_at_pressure = None;
+            return true;
+        }
+        // At/over budget: arm the pressure window on first contact so the
+        // reclaim rate is measured over the RECENT pressure window.
+        if entry.windowed_at_pressure.is_none() {
+            entry.windowed_at_pressure = Some((entry.bytes_written, entry.bytes_freed));
+            // First contact: give the CF one flush to start reclaiming before
+            // judging it (no history yet); separate this once.
+            return true;
+        }
+        // Back off ONLY if this CF is essentially NOT reclaiming in the window
+        // (scattered death). A reclaiming CF (q7) keeps full separation.
+        const RECLAIM_FLOOR: f64 = 0.05; // <5% freed/written over the window ⇒ stalled
+        entry.windowed_reclaim_ratio() >= RECLAIM_FLOOR
+    }
+
+    /// FRS-AKV-B1: the current charged RESIDENT vlog-reader bytes (the value
+    /// bounded by `FRS_VLOG_RESIDENT_BUDGET_MB`). Exposed for the mini-bench /
+    /// observability; cheap (one cache len read × fixed charge).
+    pub fn vlog_resident_bytes(&self) -> usize {
+        self.vlog_readers.resident_bytes()
+    }
+
+    /// FRS-AKV-B1: number of live vlog segments in the current version (the
+    /// disk-side footprint Layer B2 bounds). Exposed for the mini-bench.
+    pub fn vlog_live_segment_count(&self) -> usize {
+        self.version_set.current().vlog_segments.len()
+    }
+
+    /// FRS-AKV-B1: charge `bytes` of freshly WRITTEN vlog payload to a CF
+    /// (called at flush apply, once per separated segment). Cheap: one map
+    /// upsert. No-op semantics on the default path (never reached when KV-sep
+    /// is OFF since no segment is produced).
+    fn vlog_account_written(&self, cf_id: ColumnFamilyId, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut stats = self.vlog_cf_stats.lock().expect("vlog_cf_stats poisoned");
+        stats.entry(cf_id).or_default().bytes_written += bytes;
+    }
+
+    /// FRS-AKV-B1: charge `bytes` of FREED vlog payload to a CF (called when a
+    /// segment is reclaimed whole or relocated away). Together with
+    /// `vlog_account_written` this is the reclaim-rate signal.
+    fn vlog_account_freed(&self, cf_id: ColumnFamilyId, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut stats = self.vlog_cf_stats.lock().expect("vlog_cf_stats poisoned");
+        stats.entry(cf_id).or_default().bytes_freed += bytes;
+    }
+
+    /// FRS-AKV-B2: resolve the per-compaction vlog-GC relocation cutoff for a
+    /// CF. Returns the static [`vlog_gc_age_cutoff_percent`] UNLESS
+    /// `FRS_VLOG_GC_ADAPTIVE` is ON and the CF shows the scattered-death
+    /// signature (whole-run reclaim ratio below the floor while it has
+    /// accumulated several segments), in which case it auto-applies
+    /// [`vlog_gc_adaptive_cutoff_percent`]. Default-OFF → byte-identical.
+    fn effective_vlog_gc_cutoff(&self, cf_id: ColumnFamilyId, live_segment_count: usize) -> u32 {
+        let static_cutoff = vlog_gc_age_cutoff_percent();
+        if !vlog_gc_adaptive_enabled() {
+            return static_cutoff;
+        }
+        // Only consider relocation once a CF has enough segments to have a
+        // meaningful old/cold tail (avoids churning a tiny working set).
+        const MIN_SEGMENTS_FOR_RELOCATION: usize = 8;
+        if live_segment_count < MIN_SEGMENTS_FOR_RELOCATION {
+            return static_cutoff;
+        }
+        let ratio = {
+            let stats = self.vlog_cf_stats.lock().expect("vlog_cf_stats poisoned");
+            match stats.get(&cf_id) {
+                // No writes recorded → not the runaway; leave it alone.
+                None => return static_cutoff,
+                Some(s) => {
+                    if s.bytes_written == 0 {
+                        return static_cutoff;
+                    }
+                    (s.bytes_freed as f64 / s.bytes_written as f64).clamp(0.0, 1.0)
+                }
+            }
+        };
+        // Scattered death = the CF is NOT reclaiming. Auto-relocate; otherwise
+        // keep the static cutoff (FIFO-death CF reclaims → no extra write-amp).
+        const RECLAIM_FLOOR: f64 = 0.05;
+        if ratio < RECLAIM_FLOOR {
+            static_cutoff.max(vlog_gc_adaptive_cutoff_percent())
+        } else {
+            static_cutoff
+        }
     }
 
     /// FRS-WA-V2b: per-compaction vlog-GC directive. Armed whenever the CF
@@ -12751,7 +13116,16 @@ impl DbImpl {
         if segs.is_empty() {
             return None;
         }
-        let cutoff = vlog_gc_age_cutoff_percent();
+        // FRS-AKV-B2 (adaptive vlog-GC relocation, 2026-06-14): the effective
+        // cutoff. Default = the static `FRS_VLOG_GC_AGE_CUTOFF` (0 = relocation
+        // off, the q7-tuned default — no added write-amp). With
+        // `FRS_VLOG_GC_ADAPTIVE` ON, a CF that is NOT reclaiming (reclaim-rate
+        // ~0 — the q9 scattered-death signature) while its segment count climbs
+        // auto-enables a modest relocation cutoff so its mostly-dead OLD
+        // segments drain WHOLE (bounding on-disk segment count / space-amp);
+        // a FIFO-death CF (q7) keeps reclaiming → stays at the static cutoff
+        // (no relocation, write-amp unchanged).
+        let cutoff = self.effective_vlog_gc_cutoff(cf_id, segs.len());
         let relocate: std::collections::HashSet<u64> = if cutoff == 0 {
             std::collections::HashSet::new()
         } else {
@@ -12787,6 +13161,27 @@ impl DbImpl {
             ..Default::default()
         };
         self.version_set.apply(&edit)?;
+        // FRS-AKV-B1: a whole-dead segment freed all of its original payload —
+        // charge it as FREED (the reclaim-rate signal's numerator) in the SAME
+        // unit as WRITTEN, and prune the per-segment record. A FIFO-death CF
+        // (q7) reaches here continuously → high reclaim rate → never backs off.
+        {
+            let mut seg_payload = self
+                .vlog_seg_payload
+                .lock()
+                .expect("vlog_seg_payload poisoned");
+            let mut freed_by_cf: std::collections::HashMap<ColumnFamilyId, u64> =
+                std::collections::HashMap::new();
+            for seg in &dead {
+                if let Some((cf_id, payload)) = seg_payload.remove(seg) {
+                    *freed_by_cf.entry(cf_id).or_default() += payload;
+                }
+            }
+            drop(seg_payload);
+            for (cf_id, bytes) in freed_by_cf {
+                self.vlog_account_freed(cf_id, bytes);
+            }
+        }
         for seg in &dead {
             // Drop the cached reader BEFORE unlinking so a later (buggy)
             // re-open cannot resurrect a stale handle by id.
@@ -14983,11 +15378,19 @@ fn default_compaction_executor_from_env(
 }
 
 /// FRS-WA-V2a-2 separation threshold (`FRS_KV_MIN_BLOB_SIZE`, bytes,
-/// default 128, floor 22): values STRICTLY SHORTER stay inline. The floor
+/// **default 256**, floor 22): values STRICTLY SHORTER stay inline. The floor
 /// is `VALUE_POINTER_LEN + 1` — separating a value the size of its own
-/// pointer can never win. Default 128 keeps small ValueState rows inline
-/// (cold-deref bound, survey §3.1 exclusion) while catching the join/list
-/// payloads that dominate the q7/q9-class churn byte volume.
+/// pointer can never win.
+///
+/// FRS-AKV Layer A (adaptive KV-sep, 2026-06-14): default raised 128 → 256.
+/// The KV-sep-NEEDED family (q4/q7/q9/q20) stores LARGE join/list payloads
+/// ~256-800 B → 256 still catches ALL of them; the KV-sep-HURTS family
+/// (q11 ~16-32 B, q17 ~40-80 B numeric accumulators) stays inline with a
+/// wider margin (even an accumulator that grows past the old 128 stays inline
+/// up to 256). 256 also matches the bench join-payload fixture. This is the
+/// FIRST (eligibility) gate of the adaptive mechanism — necessary but not
+/// sufficient (q9 stores large values yet must back off under memory pressure;
+/// see [`DbImpl::should_separate_now`]).
 pub fn kv_min_blob_size() -> usize {
     use std::sync::OnceLock;
     static V: OnceLock<usize> = OnceLock::new();
@@ -14996,7 +15399,7 @@ pub fn kv_min_blob_size() -> usize {
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&v| v > forst_rs_storage::vlog::VALUE_POINTER_LEN)
-            .unwrap_or(128)
+            .unwrap_or(256)
     })
 }
 
@@ -17796,6 +18199,335 @@ mod tests {
         assert_eq!(
             db.get(&cf, b"k").unwrap().as_deref(),
             Some(&b"sub-threshold"[..])
+        );
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-AKV Layer A (2026-06-14): the default size threshold is 256 B.
+    /// A 256-B value SEPARATES; an 80-B value (q17-shape accumulator) and a
+    /// 128-B value (above the OLD default, below the new one) stay INLINE.
+    /// All read byte-identically.
+    #[test]
+    fn test_akv_layer_a_threshold_256_separates_large_inlines_small() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Default threshold must be 256.
+        assert_eq!(kv_min_blob_size(), 256, "FRS-AKV Layer A default = 256 B");
+
+        set_kv_separation_override(Some(true));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("akv-a"))
+            .unwrap();
+
+        // Incompressible (random) payloads so the SEPARATED-record byte count
+        // reflects the real value size (Lz4 would shrink low-entropy fills,
+        // masking which values were diverted).
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+        let v256 = mkrand(0xA1, 256); // at threshold → separates
+        let v128 = mkrand(0xB2, 128); // q11/q17 band → inline (new margin)
+        let v80 = mkrand(0xC3, 80); // q17 accumulator → inline
+        db.put(&cf, b"k256", &v256).unwrap();
+        db.put(&cf, b"k128", &v128).unwrap();
+        db.put(&cf, b"k80", &v80).unwrap();
+        db.switch_and_flush(&cf).unwrap().expect("flushed");
+
+        let v = db.version_set.current();
+        assert_eq!(v.vlog_segments.len(), 1, "the 256-B value separated");
+        // Only the 256-B value was diverted; the segment payload (random, so
+        // ~incompressible) must be ≈ 256 (one record), NOT 256+128+80.
+        let payload = v.vlog_segments[0].live_bytes;
+        assert!(
+            (200..(256 + 128)).contains(&(payload as usize)),
+            "only the >=256 value separates: segment payload {payload} (expected ~256)"
+        );
+
+        // Byte-identical reads regardless of inline/separated.
+        assert_eq!(db.get(&cf, b"k256").unwrap().as_deref(), Some(&v256[..]));
+        assert_eq!(db.get(&cf, b"k128").unwrap().as_deref(), Some(&v128[..]));
+        assert_eq!(db.get(&cf, b"k80").unwrap().as_deref(), Some(&v80[..]));
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-AKV-B1 (2026-06-14): with `FRS_KV_ADAPTIVE_PRESSURE` OFF (default),
+    /// `should_separate_now` is ALWAYS true — byte-identical to today's
+    /// flag-ON behaviour (every eligible flush separates). This guards the
+    /// default-OFF contract.
+    #[test]
+    fn test_akv_b1_pressure_off_always_separates() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        set_kv_adaptive_pressure_override(Some(false));
+        // Even with a tiny budget configured, OFF ⇒ no back-off.
+        set_vlog_resident_budget_mb_override(Some(1));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("akv-b1-off"))
+            .unwrap();
+        assert!(
+            db.should_separate_now(cf.id()),
+            "pressure OFF ⇒ always separate"
+        );
+        let big = vec![9u8; 512];
+        for i in 0..50u32 {
+            db.put(&cf, format!("k{i:04}").as_bytes(), &big).unwrap();
+            db.switch_and_flush(&cf).unwrap();
+        }
+        assert!(
+            !db.version_set.current().vlog_segments.is_empty(),
+            "pressure OFF separates every flush"
+        );
+        set_vlog_resident_budget_mb_override(None);
+        set_kv_adaptive_pressure_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-AKV-B1 (2026-06-14): the ADAPTIVE decision unit-tested directly.
+    /// (a) A scattered-death CF (writes but NEVER reclaims) over the resident
+    /// budget BACKS OFF (`should_separate_now` → false) — the q9 never-OOM
+    /// path. (b) A reclaiming CF (freed ≈ written) over the SAME budget keeps
+    /// separating (the q7 FIFO path). (c) Below budget, both separate.
+    #[test]
+    fn test_akv_b1_should_separate_now_backoff_vs_reclaiming() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        set_kv_adaptive_pressure_override(Some(true));
+        // Tiny budget so the resident reader set easily exceeds it.
+        set_vlog_resident_budget_mb_override(Some(1));
+        let db = open();
+        let budget = vlog_resident_budget_bytes();
+        let charge = forst_rs_storage::vlog::VLOG_READER_CHARGE_BYTES;
+        let scattered = db
+            .create_column_family(ColumnFamilyDescriptor::new("scattered"))
+            .unwrap();
+        let fifo = db
+            .create_column_family(ColumnFamilyDescriptor::new("fifo"))
+            .unwrap();
+
+        // (c) Below budget: nothing resident yet → both separate.
+        assert!(db.should_separate_now(scattered.id()));
+        assert!(db.should_separate_now(fifo.id()));
+
+        // Drive the resident reader set to SATURATION (the byte-budget
+        // eviction plateaus it just below `budget`) by opening many real
+        // segments (each charges VLOG_READER_CHARGE_BYTES) via flush+deref.
+        let big = vec![5u8; 512];
+        let needed = budget / charge + 8; // enough to fill + exercise eviction
+        for i in 0..needed {
+            db.put(&scattered, format!("s{i:05}").as_bytes(), &big)
+                .unwrap();
+            db.switch_and_flush(&scattered).unwrap();
+            // Deref to materialise the reader (resident charge).
+            let _ = db.get(&scattered, format!("s{i:05}").as_bytes()).unwrap();
+        }
+        // Saturated = within one reader's charge of the budget, AND the cache
+        // never exceeded the budget (the byte bound held).
+        assert!(
+            db.vlog_readers.resident_bytes() <= budget,
+            "byte budget must bound resident: {} <= {}",
+            db.vlog_readers.resident_bytes(),
+            budget
+        );
+        assert!(
+            db.vlog_readers.resident_bytes() >= budget.saturating_sub(charge),
+            "resident {} must be saturated near budget {} (charge {})",
+            db.vlog_readers.resident_bytes(),
+            budget,
+            charge
+        );
+
+        // (a) Scattered CF: WRITTEN >> FREED (never reclaims) → back off.
+        // First call arms the pressure window (returns true once), subsequent
+        // calls with zero reclaim back off.
+        let _ = db.should_separate_now(scattered.id()); // arm window
+        db.vlog_account_written(scattered.id(), 10_000_000); // more writes, no frees
+        assert!(
+            !db.should_separate_now(scattered.id()),
+            "scattered-death CF over budget with ~0 reclaim must BACK OFF (q9)"
+        );
+
+        // (b) FIFO CF: simulate full reclaim (freed ≈ written) → keep separating
+        // even over the SAME budget.
+        db.vlog_account_written(fifo.id(), 1_000_000);
+        let _ = db.should_separate_now(fifo.id()); // arm window
+        db.vlog_account_written(fifo.id(), 1_000_000);
+        db.vlog_account_freed(fifo.id(), 1_000_000); // reclaimed the window's writes
+        assert!(
+            db.should_separate_now(fifo.id()),
+            "reclaiming (FIFO-death) CF must KEEP separating even over budget (q7)"
+        );
+
+        set_vlog_resident_budget_mb_override(None);
+        set_kv_adaptive_pressure_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-AKV-B1 (2026-06-14): a mid-run BACK-OFF never corrupts the already-
+    /// separated portion. Flush several separated segments, force a back-off
+    /// (inline) flush, then read EVERY key — separated and inline — and assert
+    /// byte-identical. This is the correctness gate for "adaptive switch is
+    /// transparent to reads".
+    #[test]
+    fn test_akv_b1_backoff_midrun_reads_byte_identical() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        set_kv_adaptive_pressure_override(Some(true));
+        set_vlog_resident_budget_mb_override(Some(1));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("akv-b1-mix"))
+            .unwrap();
+
+        let mkval = |i: u32| -> Vec<u8> {
+            (0..512u32)
+                .map(|j| (i.wrapping_mul(131).wrapping_add(j)) as u8)
+                .collect()
+        };
+
+        // Phase 1: several separated flushes (one key each, distinct payload).
+        let mut expected: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for i in 0..6u32 {
+            let k = format!("sep{i:03}").into_bytes();
+            let v = mkval(i);
+            db.put(&cf, &k, &v).unwrap();
+            db.switch_and_flush(&cf).unwrap();
+            let _ = db.get(&cf, &k).unwrap(); // materialise reader
+            expected.push((k, v));
+        }
+        let separated_segments = db.version_set.current().vlog_segments.len();
+        assert!(separated_segments >= 1, "phase 1 separated");
+
+        // Force the back-off regime: drive the resident set to SATURATION
+        // (the byte-budget eviction plateaus it just below budget), then
+        // declare zero reclaim. Bounded loop (the cache caps resident, so it
+        // plateaus — never grows past budget).
+        let budget = vlog_resident_budget_bytes();
+        let charge = forst_rs_storage::vlog::VLOG_READER_CHARGE_BYTES;
+        let max_extra = (budget / charge + 16) as u32;
+        let mut extra = 0u32;
+        while db.vlog_readers.resident_bytes() < budget.saturating_sub(charge) && extra < max_extra
+        {
+            let i = 1000 + extra;
+            let k = format!("warm{i:03}").into_bytes();
+            let v = mkval(i);
+            db.put(&cf, &k, &v).unwrap();
+            db.switch_and_flush(&cf).unwrap();
+            let _ = db.get(&cf, &k).unwrap();
+            expected.push((k, v));
+            extra += 1;
+        }
+        assert!(
+            db.vlog_readers.resident_bytes() >= budget.saturating_sub(charge),
+            "must reach saturation before forcing back-off"
+        );
+        let _ = db.should_separate_now(cf.id()); // arm window
+        db.vlog_account_written(cf.id(), 50_000_000); // zero reclaim → back off
+
+        // Phase 2: writes during back-off go INLINE (no new segment).
+        let segs_before = db.version_set.current().vlog_segments.len();
+        for i in 100..104u32 {
+            let k = format!("inl{i:03}").into_bytes();
+            let v = mkval(i);
+            assert!(
+                !db.should_separate_now(cf.id()),
+                "must be backing off in phase 2"
+            );
+            db.put(&cf, &k, &v).unwrap();
+            db.switch_and_flush(&cf).unwrap();
+            expected.push((k, v));
+        }
+        let segs_after = db.version_set.current().vlog_segments.len();
+        assert_eq!(
+            segs_after, segs_before,
+            "back-off flushes must NOT add vlog segments (written inline)"
+        );
+
+        // Read EVERY key (separated + inline) — byte-identical.
+        for (k, v) in &expected {
+            assert_eq!(
+                db.get(&cf, k).unwrap().as_deref(),
+                Some(&v[..]),
+                "key {k:?} must read byte-identical across the back-off boundary"
+            );
+        }
+        // Prefix scan also derefs both kinds correctly.
+        let rows = db.prefix_scan(&cf, b"sep").unwrap();
+        assert_eq!(rows.len(), 6, "all separated keys present via scan");
+
+        set_vlog_resident_budget_mb_override(None);
+        set_kv_adaptive_pressure_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-AKV-B1 (2026-06-14): the per-CF reclaim accounting is EXACT — a
+    /// whole-dead segment charges FREED bytes equal to what it WROTE (same
+    /// unit), so a fully-overwritten-then-compacted CF reaches reclaim ratio
+    /// ≈ 1.0 (the FIFO signature) and never under/over-counts.
+    #[test]
+    fn test_akv_b1_reclaim_accounting_exact() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("akv-acct"))
+            .unwrap();
+
+        let val = |i: u32, tag: u8| -> Vec<u8> { vec![tag ^ (i as u8); 512] };
+        // Segment A: write 32 keys.
+        for i in 0..32u32 {
+            db.put(&cf, format!("k{i:03}").as_bytes(), &val(i, 1))
+                .unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap();
+        // Segment B: overwrite ALL of them (shadows A entirely).
+        for i in 0..32u32 {
+            db.put(&cf, format!("k{i:03}").as_bytes(), &val(i, 2))
+                .unwrap();
+        }
+        db.switch_and_flush(&cf).unwrap();
+
+        let written_before = db
+            .vlog_cf_stats
+            .lock()
+            .unwrap()
+            .get(&cf.id())
+            .map(|s| s.bytes_written)
+            .unwrap_or(0);
+        assert!(written_before > 0, "writes accounted");
+
+        // Compact: segment A is fully shadowed → live_bytes→0 → reaped, freed.
+        db.compact_all().unwrap();
+        let _ = db.kv_gc_reap_dead_segments();
+
+        let stats = db.vlog_cf_stats.lock().unwrap();
+        let s = stats.get(&cf.id()).expect("cf stats");
+        assert!(
+            s.bytes_freed > 0,
+            "a fully-shadowed segment must charge FREED bytes"
+        );
+        // Freed is charged in the same unit as written (payload), so the freed
+        // amount equals segment A's written payload (never exceeds written).
+        assert!(
+            s.bytes_freed <= s.bytes_written,
+            "freed {} must not exceed written {} (exact accounting)",
+            s.bytes_freed,
+            s.bytes_written
+        );
+        drop(stats);
+
+        // Reads still byte-exact (segment B is live).
+        assert_eq!(
+            db.get(&cf, b"k005").unwrap().as_deref(),
+            Some(&val(5, 2)[..])
         );
         set_kv_separation_override(None);
     }

@@ -328,6 +328,17 @@ impl VlogReader {
 /// segment is immutable once any pointer to it is version-visible.
 pub const DEFAULT_VLOG_READER_CACHE_CAP: usize = 2048;
 
+/// FRS-AKV-B1 (adaptive KV-sep, 2026-06-14): the charged RESIDENT byte cost
+/// attributed to one open [`VlogReader`] for the byte-budget bound. A reader
+/// holds an OS file handle plus a lazily-filled chunk buffer of at most
+/// [`VLOG_READ_CHUNK`] (64 KiB) bytes; we charge the full chunk granule (the
+/// dominant, worst-case term) plus a small fixed overhead for the handle +
+/// `Arc`/map bookkeeping. The charge is intentionally a fixed UPPER bound per
+/// reader so `resident_bytes == len() * CHARGE` is exact and the budget can
+/// never be under-counted (a deref that has not yet filled its chunk simply
+/// uses less than its charge — conservative, never OOMs).
+pub const VLOG_READER_CHARGE_BYTES: usize = VLOG_READ_CHUNK + 4096;
+
 /// Bounded LRU cache of open [`VlogReader`] handles, keyed by segment id.
 ///
 /// **Correctness:** byte-identical to an unbounded cache for every read — a
@@ -348,6 +359,13 @@ pub const DEFAULT_VLOG_READER_CACHE_CAP: usize = 2048;
 pub struct VlogReaderCache {
     inner: std::sync::Mutex<VlogReaderCacheInner>,
     cap: usize,
+    /// FRS-AKV-B1: charged-byte budget for resident readers (the q9 never-OOM
+    /// bound the count cap alone could not provide). `usize::MAX` = no byte
+    /// bound (default / pre-AKV behaviour — only the count `cap` applies).
+    /// When set, eviction also trims to `byte_budget`, so resident vlog cost
+    /// is `min(cap, byte_budget / VLOG_READER_CHARGE_BYTES)` readers,
+    /// independent of how many segments the run ever touches.
+    byte_budget: usize,
 }
 
 struct VlogReaderCacheInner {
@@ -360,20 +378,43 @@ struct VlogReaderCacheInner {
 
 impl VlogReaderCache {
     /// Builds a cache bounded to `cap` resident readers. `cap == 0` means
-    /// UNCAPPED (used only by the mini-bench / pre-fix A-B arm).
+    /// UNCAPPED (used only by the mini-bench / pre-fix A-B arm). No byte
+    /// budget (byte bound disabled) — see [`Self::with_capacity_and_budget`].
     pub fn with_capacity(cap: usize) -> Self {
+        Self::with_capacity_and_budget(cap, usize::MAX)
+    }
+
+    /// FRS-AKV-B1: builds a cache bounded by BOTH a resident-reader `cap`
+    /// (count) AND a charged `byte_budget` (bytes). `byte_budget == usize::MAX`
+    /// disables the byte bound (count-only, the pre-AKV behaviour, default).
+    /// `cap == 0` is uncapped on count; the two bounds compose (eviction trims
+    /// to whichever is tighter).
+    pub fn with_capacity_and_budget(cap: usize, byte_budget: usize) -> Self {
         Self {
             inner: std::sync::Mutex::new(VlogReaderCacheInner {
                 readers: std::collections::HashMap::new(),
                 lru: std::collections::VecDeque::new(),
             }),
             cap,
+            byte_budget,
         }
     }
 
     /// The configured capacity (0 == uncapped).
     pub fn capacity(&self) -> usize {
         self.cap
+    }
+
+    /// FRS-AKV-B1: the configured charged-byte budget (`usize::MAX` = none).
+    pub fn byte_budget(&self) -> usize {
+        self.byte_budget
+    }
+
+    /// FRS-AKV-B1: the charged RESIDENT bytes for the current reader set
+    /// (`len() * VLOG_READER_CHARGE_BYTES`). This is the value bounded by
+    /// `byte_budget`. Exact (each reader charges a fixed upper bound).
+    pub fn resident_bytes(&self) -> usize {
+        self.len().saturating_mul(VLOG_READER_CHARGE_BYTES)
     }
 
     /// Number of resident readers. Never exceeds `cap` when `cap > 0`.
@@ -422,7 +463,7 @@ impl VlogReaderCache {
         }
         g.readers.insert(segment_id, opened.clone());
         g.lru.push_back(segment_id);
-        Self::evict_to_cap(&mut g, self.cap);
+        Self::evict_to_cap(&mut g, self.cap, self.byte_budget);
         Ok(opened)
     }
 
@@ -434,15 +475,31 @@ impl VlogReaderCache {
         // The stale `lru` entry (if any) is pruned lazily at eviction time.
     }
 
-    /// Lazy-LRU eviction: while over `cap`, pop the front of the recency
-    /// deque and evict it IFF it is still the live entry AND not a stale
-    /// duplicate (a later access re-pushed it to the back). Bounded work per
-    /// call: each pop either evicts (reduces `readers`) or skips a stale id.
-    fn evict_to_cap(g: &mut VlogReaderCacheInner, cap: usize) {
-        if cap == 0 {
-            return; // uncapped (mini-bench / pre-fix arm)
+    /// Lazy-LRU eviction: while over the EFFECTIVE max resident count, pop the
+    /// front of the recency deque and evict it IFF it is still the live entry
+    /// AND not a stale duplicate (a later access re-pushed it to the back).
+    /// Bounded work per call: each pop either evicts (reduces `readers`) or
+    /// skips a stale id.
+    ///
+    /// FRS-AKV-B1: the effective max is `min(cap, byte_budget / charge)` — the
+    /// byte budget is translated to a reader count via the fixed per-reader
+    /// charge so resident bytes (`len * charge`) never exceed `byte_budget`.
+    /// `cap == 0` (uncapped count) with a finite budget enforces ONLY the byte
+    /// bound; both `MAX`/`0` (no bounds) is the pre-fix uncapped behaviour.
+    fn evict_to_cap(g: &mut VlogReaderCacheInner, cap: usize, byte_budget: usize) {
+        // Translate the byte budget to a max resident-reader count.
+        let budget_count = if byte_budget == usize::MAX {
+            usize::MAX
+        } else {
+            // floor div: keep resident_bytes = count*charge <= byte_budget.
+            byte_budget / VLOG_READER_CHARGE_BYTES
+        };
+        let count_cap = if cap == 0 { usize::MAX } else { cap };
+        let effective = count_cap.min(budget_count);
+        if effective == usize::MAX {
+            return; // no bound active (mini-bench / pre-fix arm)
         }
-        while g.readers.len() > cap {
+        while g.readers.len() > effective {
             let Some(victim) = g.lru.pop_front() else {
                 break; // recency deque drained; nothing more to evict
             };
@@ -834,5 +891,124 @@ mod tests {
         assert!(cache.get(2).is_none(), "seg 2 was the true LRU victim");
         assert_eq!(cache.len(), cap);
         let _ = &segs; // segments exist on disk for the re-opens above
+    }
+
+    /// FRS-AKV-B1: the BYTE budget bounds resident readers independent of the
+    /// count cap — resident_bytes plateaus at the budget, NOT O(segments).
+    /// Budget = 4 readers' worth of charge; count cap is generous (uncapped),
+    /// so the byte bound is what holds.
+    #[test]
+    fn test_vlog_reader_cache_byte_budget_bounds_resident() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 64);
+
+        // Budget for exactly 4 resident readers; count cap = 0 (uncapped) so
+        // ONLY the byte bound is active.
+        let budget_readers = 4usize;
+        let budget = budget_readers * VLOG_READER_CHARGE_BYTES;
+        let cache = VlogReaderCache::with_capacity_and_budget(0, budget);
+        for (seg, _p, _v) in &segs {
+            let s = *seg;
+            cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+            assert!(
+                cache.resident_bytes() <= budget,
+                "resident_bytes {} exceeded byte budget {}",
+                cache.resident_bytes(),
+                budget
+            );
+        }
+        assert_eq!(
+            cache.len(),
+            budget_readers,
+            "byte-budgeted cache plateaus at budget/charge readers (O(budget), not O(segments))"
+        );
+    }
+
+    /// FRS-AKV-B1: a read AFTER a byte-budget eviction is byte-identical — the
+    /// budget bound carries the same re-open-on-miss correctness as the count
+    /// cap (a vlog segment is immutable once published).
+    #[test]
+    fn test_vlog_reader_cache_byte_budget_evict_then_read_byte_identical() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 32);
+
+        let budget = 4 * VLOG_READER_CHARGE_BYTES;
+        let cache = VlogReaderCache::with_capacity_and_budget(0, budget);
+        // Warm-touch all → only the last few stay resident (byte-budgeted).
+        for (seg, _p, _v) in &segs {
+            let s = *seg;
+            cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+        }
+        // Re-read EVERY segment; evicted ones re-open and must match exactly.
+        for (seg, p, expected) in &segs {
+            let s = *seg;
+            let r = cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+            assert_eq!(
+                &r.get(p).unwrap(),
+                expected,
+                "segment {s} bytes after byte-budget evict"
+            );
+            assert!(
+                cache.resident_bytes() <= budget,
+                "byte budget still held during re-read"
+            );
+        }
+    }
+
+    /// FRS-AKV-B1: count cap and byte budget COMPOSE — the tighter bound wins.
+    /// Count cap = 10, byte budget = 3 readers → resident plateaus at 3.
+    #[test]
+    fn test_vlog_reader_cache_count_and_byte_budget_compose() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 40);
+
+        let cache = VlogReaderCache::with_capacity_and_budget(10, 3 * VLOG_READER_CHARGE_BYTES);
+        for (seg, _p, _v) in &segs {
+            let s = *seg;
+            cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+        }
+        assert_eq!(
+            cache.len(),
+            3,
+            "tighter (byte) bound wins over the count cap"
+        );
+    }
+
+    /// FRS-AKV-B1: `usize::MAX` budget = byte bound DISABLED → only the count
+    /// cap applies (byte-identical to the pre-AKV `with_capacity` path).
+    #[test]
+    fn test_vlog_reader_cache_max_budget_is_count_only() {
+        let fs = MemoryFileSystem::new();
+        let dir = Path::new("/db");
+        fs.create_dir_all(dir).unwrap();
+        let segs = write_kvsep_segments(&fs, dir, 20);
+
+        let cap = 5;
+        let cache = VlogReaderCache::with_capacity_and_budget(cap, usize::MAX);
+        for (seg, _p, _v) in &segs {
+            let s = *seg;
+            cache
+                .get_or_open(s, || VlogReader::open(&fs, dir, s))
+                .unwrap();
+        }
+        assert_eq!(
+            cache.len(),
+            cap,
+            "MAX budget defers entirely to the count cap"
+        );
     }
 }
