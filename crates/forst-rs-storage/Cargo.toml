@@ -48,6 +48,15 @@ rustc-hash = "2.1"
 # the NexMark join keys (~36 B); larger keys spill to heap.
 smallvec = "1"
 
+# FRS-CACHE-SPACE-LIMIT (catalog #5b): a SAFE statvfs wrapper for the
+# free-disk-headroom probe behind the space-based cache limit. This crate is
+# #![forbid(unsafe_code)], so the raw libc::statvfs unsafe block is off-limits;
+# `nix` exposes a safe `sys::statvfs::statvfs` (the exact same reason
+# forst-rs-io already depends on `nix` for posix_fadvise). Unix-only — the
+# probe degrades to "unknown" (no extra eviction) on non-unix targets.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.27", features = ["fs"] }
+
 [dev-dependencies]
 forst-rs-test-utils = { workspace = true }
 tempfile = { workspace = true }

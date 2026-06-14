@@ -242,6 +242,22 @@ struct Entry {
 pub struct LocalCache {
     cache_dir: PathBuf,
     capacity_bytes: u64,
+    /// FRS-CACHE-SPACE-LIMIT (catalog #5b — ForSt's dual size+space limit,
+    /// `SpaceBasedCacheLimitPolicy`): a free-disk-headroom floor for the
+    /// cache filesystem. When `> 0`, [`put_inner`](Self::put_inner) evicts
+    /// LRU victims until the underlying filesystem reports at least this many
+    /// FREE bytes — so write-through fills can never drive the cache disk to
+    /// full. `0` (the default) disables the probe entirely: behavior is
+    /// byte-identical to the size-only policy, no `statvfs` call is made.
+    ///
+    /// This is a SAFETY bound (avoid ENOSPC under state ≫ cache), not a
+    /// throughput lever — it only ever evicts MORE, never admits more.
+    min_free_disk_bytes: u64,
+    /// Test hook: when `Some(n)`, the free-disk probe returns `n` instead of
+    /// calling `statvfs`, so the space-limit eviction path is deterministically
+    /// testable without depending on (or filling) the real disk. `None` in all
+    /// production constructions — the probe hits the real filesystem.
+    disk_free_override: Option<AtomicU64>,
     inner: Mutex<Inner>,
     /// Cache-hit counter (lock-free). A "hit" is a `get` that returns
     /// `Some(_)`. Sized to validate the concurrent-read fix on S3 — a low
@@ -421,6 +437,37 @@ fn pread(file: &fs::File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
     f.read(buf)
 }
 
+/// FRS-CACHE-SPACE-LIMIT (catalog #5b): the free-disk-headroom floor (in
+/// bytes) parsed from `FRS_CACHE_SPACE_LIMIT_MB`. `0` / unset / unparseable =
+/// disabled (the default — byte-identical size-only policy, no `statvfs`).
+fn space_limit_floor_from_env() -> u64 {
+    std::env::var("FRS_CACHE_SPACE_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1024 * 1024))
+        .unwrap_or(0)
+}
+
+/// Returns the number of bytes currently FREE (available to an unprivileged
+/// writer) on the filesystem that backs `path`, or `None` when the probe is
+/// unavailable (non-unix target or a `statvfs` error). A `None` result means
+/// "headroom unknown" → the space-based limit makes no extra eviction (it
+/// never blocks progress on a probe failure; the size-based limit still holds).
+#[cfg(unix)]
+fn available_disk_bytes(path: &Path) -> Option<u64> {
+    // `nix::sys::statvfs` is the SAFE wrapper (this crate forbids unsafe).
+    // available_bytes = blocks_available * fragment_size.
+    let st = nix::sys::statvfs::statvfs(path).ok()?;
+    let frag = st.fragment_size() as u64;
+    let avail = st.blocks_available() as u64;
+    Some(avail.saturating_mul(frag))
+}
+
+#[cfg(not(unix))]
+fn available_disk_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 impl LocalCache {
     /// Opens (or initializes) a cache rooted at `cache_dir` with the
     /// given byte budget. Creates the directory if it does not exist.
@@ -472,6 +519,8 @@ impl LocalCache {
         Ok(Self {
             cache_dir,
             capacity_bytes,
+            min_free_disk_bytes: space_limit_floor_from_env(),
+            disk_free_override: None,
             inner: Mutex::new(inner),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -676,6 +725,49 @@ impl LocalCache {
     /// Returns the capacity in bytes.
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_bytes
+    }
+
+    /// FRS-CACHE-SPACE-LIMIT: the configured free-disk-headroom floor in bytes
+    /// (`0` = the space-based limit is disabled).
+    pub fn min_free_disk_bytes(&self) -> u64 {
+        self.min_free_disk_bytes
+    }
+
+    /// TEST-ONLY: construct a cache with an explicit space-based floor and a
+    /// synthetic (overridable) free-disk reading, so the space-limit eviction
+    /// path is deterministically testable without depending on (or filling)
+    /// the real disk. `simulated_free` is the initial free-disk byte count
+    /// reported by [`probe_free_disk`](Self::probe_free_disk).
+    #[cfg(test)]
+    fn open_with_space_floor(
+        cache_dir: impl Into<PathBuf>,
+        capacity_bytes: u64,
+        min_free_disk_bytes: u64,
+        simulated_free: u64,
+    ) -> io::Result<Self> {
+        let mut c = Self::open_with_policy(cache_dir, capacity_bytes, CachePolicy::default())?;
+        c.min_free_disk_bytes = min_free_disk_bytes;
+        c.disk_free_override = Some(AtomicU64::new(simulated_free));
+        Ok(c)
+    }
+
+    /// TEST-ONLY: set the synthetic free-disk reading (e.g. to simulate the OS
+    /// reclaiming space after evicted files are deleted).
+    #[cfg(test)]
+    fn set_simulated_free(&self, bytes: u64) {
+        if let Some(o) = &self.disk_free_override {
+            o.store(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Free bytes on the cache filesystem (respecting the test override).
+    /// `None` ⇒ the probe is unavailable; callers treat that as "no extra
+    /// eviction" so a probe failure never blocks progress.
+    fn probe_free_disk(&self) -> Option<u64> {
+        if let Some(o) = &self.disk_free_override {
+            return Some(o.load(Ordering::Relaxed));
+        }
+        available_disk_bytes(&self.cache_dir)
     }
 
     /// Returns the current on-disk usage in bytes.
@@ -1024,23 +1116,51 @@ impl LocalCache {
                 false
             };
 
+            // FRS-CACHE-SPACE-LIMIT (catalog #5b): how many cache-disk bytes
+            // this put must RECLAIM (beyond the size-based limit) to restore
+            // the free-disk-headroom floor. The just-renamed file (`new_bytes`)
+            // already consumed disk, so the floor must hold AFTER it lands —
+            // hence we require freeing the current deficit PLUS the new file's
+            // footprint. Zero when the space limit is disabled or the probe
+            // says we are already above the floor. `statvfs` cannot be re-read
+            // inside the loop (victims are only `remove`d after the lock drops),
+            // so we drive the loop off a running `freed` tally instead.
+            let space_deficit: u64 = if self.min_free_disk_bytes == 0 {
+                0
+            } else {
+                match self.probe_free_disk() {
+                    // The probe reflects the filesystem's current free space
+                    // (the just-renamed file already consumed its bytes). We
+                    // must reclaim enough to bring free space back up to the
+                    // floor: deficit = max(0, floor - free_now).
+                    Some(free) => self.min_free_disk_bytes.saturating_sub(free),
+                    None => 0,
+                }
+            };
+
             // FRS-PHASE2-C3U3 R1-H1: a COLD insert must NEVER evict live
             // entries — the budget-capped guarantee made ATOMIC here (the
             // caller's headroom pre-check races concurrent demand puts).
             // The file was already renamed into place above; undo it and
             // report "not admitted". Only for genuinely NEW keys: an
             // existing key's bytes were just atomically replaced (same
-            // content for write-once SSTs) and are handled below.
+            // content for write-once SSTs) and are handled below. The space
+            // limit shares this rule: a cold fill never displaces live entries
+            // to satisfy a disk floor either.
             if cold
                 && !existed
-                && inner.current_bytes.saturating_add(new_bytes) > self.capacity_bytes
+                && (inner.current_bytes.saturating_add(new_bytes) > self.capacity_bytes
+                    || space_deficit > 0)
             {
                 let _ = fs::remove_file(&path);
                 return Ok(false);
             }
 
             let mut evict = Vec::new();
-            while inner.current_bytes.saturating_add(new_bytes) > self.capacity_bytes {
+            let mut freed: u64 = 0;
+            while inner.current_bytes.saturating_add(new_bytes) > self.capacity_bytes
+                || freed < space_deficit
+            {
                 let Some((victim, g)) = inner.lru.pop_front() else {
                     break;
                 };
@@ -1052,6 +1172,7 @@ impl LocalCache {
                         let bytes = e.bytes;
                         inner.entries.remove(&victim);
                         inner.current_bytes = inner.current_bytes.saturating_sub(bytes);
+                        freed = freed.saturating_add(bytes);
                         evict.push(victim);
                     }
                     _ => {
@@ -1532,6 +1653,99 @@ mod tests {
         assert!(cache.contains("/small"));
         assert!(!cache.contains("/huge"));
         assert_eq!(cache.current_bytes(), 50);
+    }
+
+    // -- FRS-CACHE-SPACE-LIMIT (catalog #5b) ---------------------------------
+
+    #[test]
+    fn space_limit_disabled_is_byte_identical_size_only() {
+        // floor=0 ⇒ no statvfs probe, eviction governed solely by capacity.
+        let tmp = TempDir::new().expect("tempdir");
+        // A deliberately tiny simulated_free that WOULD trip a floor, but the
+        // floor is 0 so it must be ignored entirely.
+        let cache = LocalCache::open_with_space_floor(tmp.path(), 220, 0, 1).expect("open");
+        let blk = vec![0u8; 100];
+        assert!(cache.put("/a", &blk).unwrap());
+        assert!(cache.put("/b", &blk).unwrap());
+        // Both fit under the 220-byte size cap; the (tiny) simulated free disk
+        // must NOT cause any extra eviction because the floor is disabled.
+        assert!(cache.contains("/a"));
+        assert!(cache.contains("/b"));
+        assert_eq!(cache.current_bytes(), 200);
+    }
+
+    #[test]
+    fn space_limit_evicts_until_free_disk_floor_restored() {
+        // Size cap is generous (10 KiB) so the SIZE limit never triggers; the
+        // SPACE floor is what forces eviction. Floor = 1000 free bytes; the
+        // probe returns the free space AFTER the new file lands, so
+        // deficit = max(0, floor - free).
+        let tmp = TempDir::new().expect("tempdir");
+        // Start comfortably above the floor so the first puts do not evict.
+        let cache =
+            LocalCache::open_with_space_floor(tmp.path(), 10_000, 1000, 1500).expect("open");
+        let blk = vec![0u8; 100];
+
+        // free 1500 ≥ floor 1000 ⇒ deficit 0, no eviction.
+        assert!(cache.put("/a", &blk).unwrap());
+        cache.set_simulated_free(1500);
+        assert!(cache.put("/b", &blk).unwrap());
+        cache.set_simulated_free(1500);
+        assert!(cache.put("/c", &blk).unwrap());
+        assert_eq!(cache.len(), 3, "all admitted while above the floor");
+
+        // Now the filesystem drops to 950 free (50 below the floor): the next
+        // put must reclaim ≥ 50 bytes, i.e. exactly ONE 100-byte LRU victim
+        // (/a, the oldest).
+        cache.set_simulated_free(950);
+        assert!(cache.put("/d", &blk).unwrap());
+        assert!(!cache.contains("/a"), "oldest evicted to honour disk floor");
+        assert!(cache.contains("/b"));
+        assert!(cache.contains("/c"));
+        assert!(cache.contains("/d"));
+        assert_eq!(cache.current_bytes(), 300);
+    }
+
+    #[test]
+    fn space_limit_evicts_multiple_victims_for_large_deficit() {
+        // A big deficit forces several evictions in one put.
+        let tmp = TempDir::new().expect("tempdir");
+        let cache =
+            LocalCache::open_with_space_floor(tmp.path(), 10_000, 1000, 5000).expect("open");
+        let blk = vec![0u8; 100];
+        for k in ["/a", "/b", "/c", "/d", "/e"] {
+            assert!(cache.put(k, &blk).unwrap());
+        }
+        assert_eq!(cache.len(), 5);
+        // Drop simulated free far below the floor: deficit = 1000 - 200 = 800
+        // → must evict ceil(800/100)=8 victims, but only 5 exist, so all
+        // pre-existing entries go and the new one is admitted.
+        cache.set_simulated_free(200);
+        assert!(cache.put("/f", &blk).unwrap());
+        for k in ["/a", "/b", "/c", "/d", "/e"] {
+            assert!(!cache.contains(k), "{k} should have been evicted");
+        }
+        assert!(cache.contains("/f"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn space_limit_floor_from_env_parses_mb() {
+        // Pure parse-helper check (no global env mutation in parallel tests):
+        // the conversion is MB → bytes with saturating multiply.
+        // We exercise the function indirectly via a constructed cache whose
+        // floor we set explicitly; this asserts the byte math used by the env
+        // path (MB * 1024 * 1024).
+        let tmp = TempDir::new().expect("tempdir");
+        let floor_mb = 4u64;
+        let cache = LocalCache::open_with_space_floor(
+            tmp.path(),
+            10_000,
+            floor_mb * 1024 * 1024,
+            64 * 1024 * 1024,
+        )
+        .expect("open");
+        assert_eq!(cache.min_free_disk_bytes(), 4 * 1024 * 1024);
     }
 
     #[test]

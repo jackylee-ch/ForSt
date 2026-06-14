@@ -1189,6 +1189,7 @@ dependencies = [
  "forst-rs-io-uring",
  "forst-rs-test-utils",
  "lz4_flex",
+ "nix",
  "rustc-hash 2.1.2",
  "smallvec",
  "tempfile",
