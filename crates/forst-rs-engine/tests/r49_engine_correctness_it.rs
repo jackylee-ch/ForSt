@@ -280,3 +280,78 @@ fn r49_m1_checkpoint_copies_ssts_before_blob() {
         );
     }
 }
+
+/// FRS-PHASE2 catalog #4: a checkpoint taken with `FRS_CKPT_PARALLEL_UPLOAD`
+/// ON must produce a checkpoint that restores to the SAME data as the serial
+/// path (the parallel copy is byte-identical; only the issue order differs).
+/// End-to-end: build a multi-SST engine, checkpoint with the flag ON, restore,
+/// and read every key back.
+///
+/// NOTE: the flag is process-global env; this test sets+restores it. It is the
+/// only test in this file that touches `FRS_CKPT_PARALLEL_UPLOAD`, so there is
+/// no intra-file env race.
+#[test]
+fn ckpt_parallel_upload_round_trip_reads_all_keys() {
+    let src_dir = tempfile::tempdir().expect("src tempdir");
+    let ckpt_dir = tempfile::tempdir().expect("ckpt tempdir");
+    let db = open_local(&src_dir.path().to_string_lossy());
+
+    let cf = db
+        .create_column_family(ColumnFamilyDescriptor::new("data"))
+        .expect("create data");
+
+    // Several flush waves => several L0 SSTs => the parallel copy actually fans
+    // out (> 1 file). Each wave writes a disjoint key band.
+    const WAVES: u32 = 6;
+    const PER_WAVE: u32 = 500;
+    for wave in 0..WAVES {
+        for i in 0..PER_WAVE {
+            let k = format!("w{wave}-k{i:05}");
+            let v = format!("w{wave}-v{i:05}");
+            db.put(&cf, k.as_bytes(), v.as_bytes()).expect("put");
+        }
+        db.switch_and_flush(&cf).expect("flush wave");
+    }
+
+    let prev = std::env::var("FRS_CKPT_PARALLEL_UPLOAD").ok();
+    std::env::set_var("FRS_CKPT_PARALLEL_UPLOAD", "8");
+    let manifest = db
+        .create_checkpoint(ckpt_dir.path())
+        .expect("create_checkpoint (parallel upload)");
+    match prev {
+        Some(v) => std::env::set_var("FRS_CKPT_PARALLEL_UPLOAD", v),
+        None => std::env::remove_var("FRS_CKPT_PARALLEL_UPLOAD"),
+    }
+
+    assert!(
+        manifest.sst_files.len() >= 2,
+        "expected multiple SSTs to exercise the parallel fan-out, got {}",
+        manifest.sst_files.len()
+    );
+    for p in &manifest.sst_files {
+        assert!(p.is_file(), "manifest SST {:?} missing on disk", p);
+    }
+
+    drop(db);
+
+    // Restore and verify EVERY key is readable with the original value.
+    let restored_opts = EngineOptions {
+        db_path: ckpt_dir.path().to_string_lossy().into_owned(),
+        ..EngineOptions::default()
+    };
+    let fs: Arc<dyn FileSystem> = Arc::new(LocalFileSystem::new());
+    let restored = DbImpl::open_from_checkpoint(restored_opts, fs).expect("open_from_checkpoint");
+    let rcf = restored.column_family("data").expect("data cf restored");
+    for wave in 0..WAVES {
+        for i in 0..PER_WAVE {
+            let k = format!("w{wave}-k{i:05}");
+            let want = format!("w{wave}-v{i:05}");
+            let got = restored.get(&rcf, k.as_bytes()).expect("get");
+            assert_eq!(
+                got.as_deref(),
+                Some(want.as_bytes()),
+                "parallel-upload checkpoint lost key {k}"
+            );
+        }
+    }
+}

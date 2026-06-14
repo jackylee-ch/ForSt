@@ -156,3 +156,11 @@ path = "src/bin/nexmark_disagg_s3.rs"
 [[bin]]
 name = "vlog_reader_cache_footprint"
 path = "src/bin/vlog_reader_cache_footprint.rs"
+
+# FRS-PHASE2 catalog #4: checkpoint multi-file upload — serial copy loop vs
+# parallel multi-file PUT (FRS_CKPT_PARALLEL_UPLOAD). Models per-object PUT-RTT
+# on a remote checkpoint dir; quantifies the checkpoint-barrier upload term.
+# Wall-clock bin; takes --smoke for CI (caps RTT, asserts byte-identity).
+[[bin]]
+name = "checkpoint_upload"
+path = "src/bin/checkpoint_upload.rs"

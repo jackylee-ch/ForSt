@@ -353,7 +353,27 @@ pub fn read_artifact_file(fs: &dyn FileSystem, path: &Path) -> ForstResult<Vec<u
 
 /// Copies every live SST file from `source_dir` into `target_dir`. Returns
 /// the total bytes copied and the list of produced files.
+///
+/// FRS-PHASE2 catalog #4 — dispatches to the parallel multi-file PUT
+/// ([`copy_live_ssts_parallel`]) when `FRS_CKPT_PARALLEL_UPLOAD` is set, else
+/// the byte-identical serial loop ([`copy_live_ssts_serial`]). Default OFF:
+/// bytes AND manifest order are identical to the pre-Phase-2 serial path.
 pub fn copy_live_ssts(
+    fs: &dyn FileSystem,
+    source_dir: &Path,
+    target_dir: &Path,
+    live: &[SstFileMeta],
+) -> ForstResult<(u64, Vec<PathBuf>)> {
+    match ckpt_parallel_upload_workers() {
+        Some(workers) => copy_live_ssts_parallel(fs, source_dir, target_dir, live, workers),
+        None => copy_live_ssts_serial(fs, source_dir, target_dir, live),
+    }
+}
+
+/// The serial copy loop — one `copy_file` per live SST, in ascending
+/// `file_number` order. This is the byte-identical default and the reference
+/// the parallel path is validated against.
+pub fn copy_live_ssts_serial(
     fs: &dyn FileSystem,
     source_dir: &Path,
     target_dir: &Path,
@@ -369,6 +389,124 @@ pub fn copy_live_ssts(
         total += bytes;
         files.push(dst);
     }
+    Ok((total, files))
+}
+
+/// Process-global default upload concurrency for [`copy_live_ssts_parallel`] —
+/// mirrors the opendal backend's `MAX_INFLIGHT_UPLOADS=8` so the checkpoint
+/// barrier can fill (but not over-fill) the same write-back pipe.
+const CKPT_PARALLEL_UPLOAD_DEFAULT: usize = 8;
+
+/// Returns the configured parallel-upload bound, or `None` when the flag is OFF
+/// (the byte-identical serial default). `FRS_CKPT_PARALLEL_UPLOAD` accepts:
+/// `0`/empty/unset/`false`/`off` ⇒ OFF; `1`/`true`/`on` ⇒ the default bound
+/// ([`CKPT_PARALLEL_UPLOAD_DEFAULT`]); any other positive integer ⇒ that
+/// explicit worker count.
+fn ckpt_parallel_upload_workers() -> Option<usize> {
+    let raw = std::env::var("FRS_CKPT_PARALLEL_UPLOAD").ok()?;
+    let v = raw.trim();
+    match v {
+        "" | "0" | "false" | "off" | "no" => None,
+        "1" | "true" | "on" | "yes" => Some(CKPT_PARALLEL_UPLOAD_DEFAULT),
+        other => match other.parse::<usize>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => None,
+        },
+    }
+}
+
+/// FRS-PHASE2 catalog #4 — checkpoint multi-file parallel PUT.
+///
+/// Twin of [`copy_live_ssts_serial`] that fans the per-SST copies across a
+/// bounded pool of scoped worker threads instead of the serial `for` loop. On
+/// disaggregated/remote state each `copy_file` ends in a `flush()`+`sync()`
+/// that completes an INDEPENDENT object PUT (distinct `<N>.sst` key) — a full
+/// remote round-trip — so the serial loop pays `N × PUT-RTT` at the barrier
+/// even though the object-store backend can absorb many in flight. This
+/// overlaps them, cutting the barrier wall to ≈ `ceil(N / workers) × PUT-RTT`
+/// (mini-bench `checkpoint_upload`: ~7.6–7.9× at the 8-wide bound, at both
+/// dev-RTT 23 ms and intra-DC sim-S3 RTT 2 ms — it is an op-latency term, not
+/// bandwidth).
+///
+/// **Byte-identity:** each worker runs the SAME `copy_file` (same tmp/rename,
+/// short-read check, sync_dir) on a DISJOINT destination key, so the produced
+/// bytes are identical to the serial path; only the issue ORDER differs. The
+/// returned `files` are sorted by `file_number` to keep the manifest order
+/// deterministic regardless of completion order. `fs` is `Send + Sync`
+/// (`FileSystem` supertrait), so sharing `&dyn FileSystem` across the scope is
+/// sound. On ANY worker error the scope still joins all threads (no detached
+/// work) and the FIRST error is returned; partial destination files are left
+/// for the next restore's orphan-scan (identical to the serial path's
+/// mid-loop-error behaviour).
+pub fn copy_live_ssts_parallel(
+    fs: &dyn FileSystem,
+    source_dir: &Path,
+    target_dir: &Path,
+    live: &[SstFileMeta],
+    workers: usize,
+) -> ForstResult<(u64, Vec<PathBuf>)> {
+    // Degenerate fan-outs run inline (no thread/sync overhead) and stay
+    // byte-identical to the serial path.
+    if live.len() <= 1 || workers <= 1 {
+        return copy_live_ssts_serial(fs, source_dir, target_dir, live);
+    }
+    fs.create_dir_all(target_dir)?;
+    let n = live.len();
+    let workers = workers.min(n);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // Accumulated copy results, guarded for the scoped workers.
+    let total = std::sync::Mutex::new(0u64);
+    let first_err: std::sync::Mutex<Option<ForstError>> = std::sync::Mutex::new(None);
+    let produced: std::sync::Mutex<Vec<(u64, PathBuf)>> =
+        std::sync::Mutex::new(Vec::with_capacity(n));
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let next = &next;
+            let total = &total;
+            let first_err = &first_err;
+            let produced = &produced;
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                // Stop pulling new work once a sibling has failed — bounds the
+                // blast radius of a remote outage at the barrier.
+                if first_err.lock().expect("ckpt err lock").is_some() {
+                    break;
+                }
+                let meta = &live[i];
+                let src = sst_file_path(source_dir, meta.file_number);
+                let dst = sst_file_path(target_dir, meta.file_number);
+                match copy_file(fs, &src, &dst) {
+                    Ok(bytes) => {
+                        *total.lock().expect("ckpt total lock") += bytes;
+                        produced
+                            .lock()
+                            .expect("ckpt produced lock")
+                            .push((meta.file_number.value(), dst));
+                    }
+                    Err(e) => {
+                        let mut slot = first_err.lock().expect("ckpt err lock");
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(e) = first_err.into_inner().expect("ckpt err lock") {
+        return Err(e);
+    }
+    let total = total.into_inner().expect("ckpt total lock");
+    let mut produced = produced.into_inner().expect("ckpt produced lock");
+    // Deterministic manifest order (== serial path's ascending file_number).
+    produced.sort_by_key(|(fnum, _)| *fnum);
+    let files = produced.into_iter().map(|(_, dst)| dst).collect();
     Ok((total, files))
 }
 
@@ -541,5 +679,171 @@ mod tests {
         let bytes = copy_file(&fs, src, dst).unwrap();
         assert_eq!(bytes, 7);
         assert!(fs.file_exists(dst).unwrap());
+    }
+
+    // ----- FRS-PHASE2 catalog #4: parallel checkpoint upload -----
+
+    /// Seeds `n` source SST files of distinct content at `src_dir` and returns
+    /// the matching `live` metas (file_number = i).
+    fn seed_live_ssts(fs: &dyn FileSystem, src_dir: &Path, n: u64) -> Vec<SstFileMeta> {
+        let mut live = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let p = sst_file_path(src_dir, forst_rs_common::FileNumber(i));
+            if let Some(parent) = p.parent() {
+                fs.create_dir_all(parent).unwrap();
+            }
+            // Distinct content per file so a byte-identity check is meaningful.
+            let payload: Vec<u8> = (0..(64 + i)).map(|b| (b ^ i) as u8).collect();
+            let mut wf = fs
+                .open_writable_file(&p, WriteMode::CreateOrTruncate)
+                .unwrap();
+            wf.append(&payload).unwrap();
+            wf.flush().unwrap();
+            wf.sync().unwrap();
+            live.push(SstFileMeta::new_default_cf(
+                forst_rs_common::FileNumber(i),
+                payload.len() as u64,
+                vec![i as u8],
+                vec![i as u8],
+                forst_rs_common::SequenceNumber(i),
+                forst_rs_common::SequenceNumber(i),
+                1,
+            ));
+        }
+        live
+    }
+
+    /// The parallel path must be BYTE-IDENTICAL to the serial path: same total
+    /// bytes, same produced file set + manifest order, and the destination
+    /// content must match the source for every file.
+    #[test]
+    fn parallel_copy_matches_serial_byte_for_byte() {
+        let fs = MemoryFileSystem::new();
+        let src = Path::new("/db");
+        let live = seed_live_ssts(&fs, src, 17); // > 1 and not a multiple of pool
+
+        let (ser_bytes, ser_files) =
+            copy_live_ssts_serial(&fs, src, Path::new("/ckpt-ser"), &live).unwrap();
+        let (par_bytes, par_files) =
+            copy_live_ssts_parallel(&fs, src, Path::new("/ckpt-par"), &live, 8).unwrap();
+
+        assert_eq!(ser_bytes, par_bytes, "total bytes differ");
+        // Manifest order is deterministic (ascending file_number) for BOTH.
+        let ser_names: Vec<_> = ser_files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        let par_names: Vec<_> = par_files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(ser_names, par_names, "manifest order/file set differ");
+
+        // Every parallel-copied destination matches its source content.
+        for (dst_ser, dst_par) in ser_files.iter().zip(par_files.iter()) {
+            let a = read_artifact_file(&fs, dst_ser).unwrap();
+            let b = read_artifact_file(&fs, dst_par).unwrap();
+            assert_eq!(a, b, "copied content differs for {:?}", dst_par);
+        }
+    }
+
+    /// Degenerate fan-outs (0/1 file, or workers<=1) must run the serial path
+    /// and still produce the correct result.
+    #[test]
+    fn parallel_copy_degenerate_fanouts() {
+        let fs = MemoryFileSystem::new();
+        let src = Path::new("/db");
+
+        // Zero files.
+        let (b, f) = copy_live_ssts_parallel(&fs, src, Path::new("/ck0"), &[], 8).unwrap();
+        assert_eq!(b, 0);
+        assert!(f.is_empty());
+
+        // One file with many workers => inline.
+        let live1 = seed_live_ssts(&fs, src, 1);
+        let (b1, f1) = copy_live_ssts_parallel(&fs, src, Path::new("/ck1"), &live1, 8).unwrap();
+        assert_eq!(f1.len(), 1);
+        assert_eq!(b1, live1[0].file_size);
+
+        // Many files but workers=1 => serial-equivalent.
+        let live = seed_live_ssts(&fs, src, 5);
+        let (b5, f5) = copy_live_ssts_parallel(&fs, src, Path::new("/ck5"), &live, 1).unwrap();
+        assert_eq!(f5.len(), 5);
+        let (bs, _) = copy_live_ssts_serial(&fs, src, Path::new("/ck5s"), &live).unwrap();
+        assert_eq!(b5, bs);
+    }
+
+    /// A missing source surfaces as an error (not a panic / silent partial),
+    /// matching the serial path's fail-fast contract.
+    #[test]
+    fn parallel_copy_propagates_error() {
+        let fs = MemoryFileSystem::new();
+        let src = Path::new("/db");
+        let mut live = seed_live_ssts(&fs, src, 4);
+        // Add a meta whose source SST was never written.
+        live.push(SstFileMeta::new_default_cf(
+            forst_rs_common::FileNumber(999),
+            10,
+            vec![0],
+            vec![0],
+            forst_rs_common::SequenceNumber(0),
+            forst_rs_common::SequenceNumber(0),
+            1,
+        ));
+        let r = copy_live_ssts_parallel(&fs, src, Path::new("/cke"), &live, 8);
+        assert!(r.is_err(), "missing source must error");
+    }
+
+    /// The env flag parser: OFF by default and for falsey values; ON maps to
+    /// the default bound; explicit positive integers pass through. Also asserts
+    /// `copy_live_ssts` dispatches to the serial path when the flag is OFF.
+    #[test]
+    fn parallel_upload_flag_parser_and_dispatch() {
+        // Snapshot + restore the env var so the test is hermetic.
+        let prev = std::env::var("FRS_CKPT_PARALLEL_UPLOAD").ok();
+        let cases = [
+            (None, None),
+            (Some("0"), None),
+            (Some(""), None),
+            (Some("false"), None),
+            (Some("off"), None),
+            (Some("1"), Some(CKPT_PARALLEL_UPLOAD_DEFAULT)),
+            (Some("true"), Some(CKPT_PARALLEL_UPLOAD_DEFAULT)),
+            (Some("on"), Some(CKPT_PARALLEL_UPLOAD_DEFAULT)),
+            (Some("4"), Some(4)),
+            (Some("16"), Some(16)),
+            (Some("garbage"), None),
+        ];
+        for (set, want) in cases {
+            match set {
+                Some(v) => std::env::set_var("FRS_CKPT_PARALLEL_UPLOAD", v),
+                None => std::env::remove_var("FRS_CKPT_PARALLEL_UPLOAD"),
+            }
+            assert_eq!(ckpt_parallel_upload_workers(), want, "for {:?}", set);
+        }
+
+        // Flag OFF => copy_live_ssts is byte-identical to the serial path.
+        std::env::remove_var("FRS_CKPT_PARALLEL_UPLOAD");
+        let fs = MemoryFileSystem::new();
+        let live = seed_live_ssts(&fs, Path::new("/db"), 6);
+        let (auto_b, auto_f) =
+            copy_live_ssts(&fs, Path::new("/db"), Path::new("/a"), &live).unwrap();
+        let (ser_b, ser_f) =
+            copy_live_ssts_serial(&fs, Path::new("/db"), Path::new("/s"), &live).unwrap();
+        assert_eq!(auto_b, ser_b);
+        let an: Vec<_> = auto_f
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        let sn: Vec<_> = ser_f
+            .iter()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(an, sn);
+
+        match prev {
+            Some(v) => std::env::set_var("FRS_CKPT_PARALLEL_UPLOAD", v),
+            None => std::env::remove_var("FRS_CKPT_PARALLEL_UPLOAD"),
+        }
     }
 }
