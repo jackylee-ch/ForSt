@@ -6244,7 +6244,14 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open(
         // drive `fill_into` straight into the chunk buffer — the raw sink
         // path (zero per-row allocations on SST-Put rows; no Arc traffic).
         // Flag OFF keeps the legacy Arc-pair pull iterator byte-for-byte.
-        let mut handle_state = if forst_rs_engine::s2_pinned_enabled() {
+        // R1: take the push-style stream path when S2 is statically ON *or*
+        // when per-scan fan-out-adaptive selection is active (`FRS_S2_FANOUT_MIN`
+        // set). The stream picks pinned/loser-tree per-scan by overlap depth;
+        // shallow scans drive the byte-identical legacy decision procedure.
+        // With both unset this is false => today's exact owned-arc path.
+        let mut handle_state = if forst_rs_engine::s2_pinned_enabled()
+            || forst_rs_engine::s2_adaptive_active()
+        {
             match db_ref.prefix_scan_stream_with_error_slot(
                 cf_ref_,
                 prefix,
@@ -7044,7 +7051,9 @@ pub unsafe extern "C" fn frs_vec_iter_prefix_open_batch_parallel(
         // S2 (flag ON): build push-style streams on the pool and drive
         // `fill_into` straight into each probe's buffer — the raw sink path
         // for the batch-open probe shape too (no Arc-pair adapter tax).
-        let fills = if forst_rs_engine::s2_pinned_enabled() {
+        // R1: stream path when statically ON or per-scan adaptive is active.
+        let fills = if forst_rs_engine::s2_pinned_enabled() || forst_rs_engine::s2_adaptive_active()
+        {
             db_ref.batch_open_prefix_streams_parallel_map(
                 cf_ref_,
                 &valid_prefixes,
@@ -7241,8 +7250,10 @@ pub unsafe extern "C" fn frs_vec_iter_range_open(
         let error_slot: Arc<Mutex<Option<forst_rs_common::ForstError>>> =
             Arc::new(Mutex::new(None));
         // S2 (flag ON): push-style range stream — see the prefix-open sister
-        // comment.
-        let mut handle_state = if forst_rs_engine::s2_pinned_enabled() {
+        // comment. R1: also take it when per-scan adaptive selection is active.
+        let mut handle_state = if forst_rs_engine::s2_pinned_enabled()
+            || forst_rs_engine::s2_adaptive_active()
+        {
             match db_ref.range_scan_stream_with_error_slot(
                 cf_ref_,
                 lo,

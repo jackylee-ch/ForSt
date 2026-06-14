@@ -9937,7 +9937,10 @@ impl DbImpl {
         cf: &ColumnFamilyHandle,
         prefix: &[u8],
     ) -> ForstResult<LazyPrefixIter> {
-        self.build_lazy_prefix_key_stream_mode(cf, prefix, s2_pinned_enabled())
+        // R1: default callers select per-scan (fan-out-adaptive). With
+        // `FRS_S2_FANOUT_MIN` unset this is `Force(s2_pinned_enabled())` —
+        // byte-identical to the pre-R1 behaviour.
+        self.build_lazy_prefix_key_stream_sel(cf, prefix, s2_select())
     }
 
     /// S2: explicit-mode variant of [`Self::build_lazy_prefix_key_stream`] —
@@ -9950,6 +9953,21 @@ impl DbImpl {
         cf: &ColumnFamilyHandle,
         prefix: &[u8],
         pinned: bool,
+    ) -> ForstResult<LazyPrefixIter> {
+        self.build_lazy_prefix_key_stream_sel(cf, prefix, S2Sel::Force(pinned))
+    }
+
+    /// R1: selection-driven prefix-stream builder. `sel` is resolved to a
+    /// concrete pinned flag AFTER the overlapping-SST set is located, so the
+    /// `Adaptive` arm can key the loser-tree choice on the actual per-scan
+    /// fan-out depth. `Force(_)` ignores the fan-out (byte-identical to the
+    /// old `_mode` path). Output is byte-identical for either resolution —
+    /// only the merge mechanism / per-source replenish differs.
+    fn build_lazy_prefix_key_stream_sel(
+        &self,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+        sel: S2Sel,
     ) -> ForstResult<LazyPrefixIter> {
         // FRS-ITER-DIAG: gated timing of the prefix-stream build. Set
         // FRS_ITER_DIAG=1 to log slow builds (>1ms) with tier + result-size
@@ -10206,6 +10224,12 @@ impl DbImpl {
             upper_slice,
             &mut overlapping_ssts,
         );
+        // R1: resolve the per-scan S2 pinned/loser-tree choice now that the
+        // overlap fan-out is known. `Force(_)` returns the caller's flag
+        // (byte-identical to pre-R1); `Adaptive` engages the pinned merge only
+        // when `overlapping_ssts.len() >= FRS_S2_FANOUT_MIN` — deep probes win
+        // the loser tree, shallow probes keep the legacy path.
+        let pinned = sel.resolve(overlapping_ssts.len());
         if let Some(t) = locate_t {
             bulk_locate_ns = t.elapsed().as_nanos() as u64;
             bulk_n_overlap = overlapping_ssts.len() as u64;
@@ -10401,7 +10425,8 @@ impl DbImpl {
         lower: &[u8],
         upper: Option<&[u8]>,
     ) -> ForstResult<LazyRangeIter> {
-        self.build_lazy_range_key_stream_mode(cf, lower, upper, s2_pinned_enabled())
+        // R1: per-scan fan-out-adaptive selection (prefix-path sister).
+        self.build_lazy_range_key_stream_sel(cf, lower, upper, s2_select())
     }
 
     /// S2: explicit-mode variant of [`Self::build_lazy_range_key_stream`]
@@ -10412,6 +10437,18 @@ impl DbImpl {
         lower: &[u8],
         upper: Option<&[u8]>,
         pinned: bool,
+    ) -> ForstResult<LazyRangeIter> {
+        self.build_lazy_range_key_stream_sel(cf, lower, upper, S2Sel::Force(pinned))
+    }
+
+    /// R1: selection-driven range-stream builder (prefix-path sister). `sel`
+    /// resolves to a concrete pinned flag after the overlap set is located.
+    fn build_lazy_range_key_stream_sel(
+        &self,
+        cf: &ColumnFamilyHandle,
+        lower: &[u8],
+        upper: Option<&[u8]>,
+        sel: S2Sel,
     ) -> ForstResult<LazyRangeIter> {
         let cf_data = self.lookup_cf_by_id(cf.id())?;
 
@@ -10436,8 +10473,10 @@ impl DbImpl {
                 _ => clip.end.as_slice(),
             };
             if eff_lower >= eff_upper {
-                // Disjoint — no in-range keys exist for this query.
-                return LazyRangeIter::new(Vec::new(), pinned);
+                // Disjoint — no in-range keys exist for this query. The merge
+                // mode is irrelevant on an empty source set; resolve `sel` at
+                // fan-out 0 (legacy under any setting).
+                return LazyRangeIter::new(Vec::new(), sel.resolve(0));
             }
             (eff_lower.to_vec(), Some(eff_upper.to_vec()))
         } else {
@@ -10474,6 +10513,9 @@ impl DbImpl {
         // byte ranges interleave in the shared level arrays.
         let mut overlapping_ssts: Vec<&forst_rs_storage::version::SstFileMeta> = Vec::new();
         version.overlapping_ssts_in_range_for_cf(cf.id(), lower, upper, &mut overlapping_ssts);
+        // R1: resolve the per-scan S2 pinned choice on the located fan-out
+        // (prefix-path sister). `Force(_)` = byte-identical to pre-R1.
+        let pinned = sel.resolve(overlapping_ssts.len());
         // FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3): concurrent reader-OPEN fanout
         // before the serial per-source loop (range sister of the prefix site).
         // No-op when OFF / local / warm / ≤1 cold.
@@ -10628,7 +10670,19 @@ impl DbImpl {
         prefix: &[u8],
         error_slot: Arc<Mutex<Option<ForstError>>>,
     ) -> ForstResult<PrefixScanStream> {
-        self.prefix_scan_stream_with_mode(cf, prefix, error_slot, s2_pinned_enabled())
+        // R1: per-scan fan-out-adaptive pinned selection. With the static flag
+        // forced (`FRS_RS_S2_PINNED=1`) this is `Force(true)` for every scan
+        // (unchanged); with `FRS_S2_FANOUT_MIN` set, deep probes pick the
+        // pinned loser tree while shallow probes drive the byte-identical
+        // legacy decision procedure through `fill_into`.
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let mut inner = self.build_lazy_prefix_key_stream_sel(cf, prefix, s2_select())?;
+        inner.set_shared_error_slot(error_slot);
+        Ok(PrefixScanStream {
+            db: Arc::clone(self),
+            cf_data,
+            inner,
+        })
     }
 
     /// S2: explicit-mode variant of
@@ -10660,7 +10714,15 @@ impl DbImpl {
         upper: Option<&[u8]>,
         error_slot: Arc<Mutex<Option<ForstError>>>,
     ) -> ForstResult<PrefixScanStream> {
-        self.range_scan_stream_with_mode(cf, lower, upper, error_slot, s2_pinned_enabled())
+        // R1: per-scan fan-out-adaptive pinned selection (prefix-path sister).
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let mut inner = self.build_lazy_range_key_stream_sel(cf, lower, upper, s2_select())?;
+        inner.set_shared_error_slot(error_slot);
+        Ok(PrefixScanStream {
+            db: Arc::clone(self),
+            cf_data,
+            inner,
+        })
     }
 
     /// S2: explicit-mode variant of
@@ -15468,6 +15530,108 @@ pub fn s2_pinned_enabled() -> bool {
             Some("1") | Some("true") | Some("TRUE")
         )
     })
+}
+
+// ---------------------------------------------------------------
+// R1 (2026-06-14, repair design §3-R1): per-scan fan-out-ADAPTIVE S2
+// selection — one uniform config, runtime-adaptive on the overlap depth
+// the open already computes. Today S2 is a STATIC process flag applied to
+// EVERY scan (shallow/churn scans pay the +18%/+20% pinned tax; deep probes
+// win 8-18×). R1 makes the pinned/loser-tree choice per-scan, keyed on
+// `n_overlap`: deep probes (q7/q9/q20 interval-join) get the loser tree,
+// shallow/point probes (q3/q4/q17) keep the legacy path BYTE-IDENTICAL.
+// ---------------------------------------------------------------
+
+/// R1: per-scan S2 selection. `Force(b)` = a caller-pinned choice (the
+/// explicit-mode A/B fixtures + the static-flag forced ON/OFF) — byte-identical
+/// to passing `pinned: b`. `Adaptive` = decide per-scan by the `n_overlap` the
+/// open computes (`>= FRS_S2_FANOUT_MIN`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum S2Sel {
+    Force(bool),
+    Adaptive,
+}
+
+impl S2Sel {
+    /// Resolve the effective pinned flag for a scan whose overlapping-SST
+    /// fan-out is `n_overlap`. `Force` ignores the fan-out (proven-equal
+    /// per-source path is chosen up front); `Adaptive` engages the pinned
+    /// loser-tree merge only at/above the uniform threshold.
+    #[inline]
+    pub(crate) fn resolve(self, n_overlap: usize) -> bool {
+        match self {
+            S2Sel::Force(b) => b,
+            S2Sel::Adaptive => n_overlap >= s2_adaptive_fanout_min(),
+        }
+    }
+}
+
+/// R1: programmatic override for [`s2_adaptive_fanout_min`] (test/bench A/B
+/// fixtures). `u64::MAX` = unset (read the env, cached). Any other value forces
+/// that threshold for scans built AFTER the call — so in-process fixtures can
+/// flip the adaptive arm without racing the env `OnceLock`.
+static S2_FANOUT_MIN_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// R1: force the adaptive fan-out threshold (`Some(n)`) or restore the env-flag
+/// behaviour (`None`). Affects scans built AFTER the call.
+pub fn set_s2_adaptive_fanout_min_override(v: Option<usize>) {
+    S2_FANOUT_MIN_OVERRIDE.store(
+        match v {
+            None => u64::MAX,
+            Some(n) => n as u64,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// R1 knob (`FRS_S2_FANOUT_MIN`, uniform for ALL queries): a scan whose
+/// overlapping-SST fan-out is `>= this` uses the pinned loser-tree merge;
+/// shallower scans keep the legacy path. Default `usize::MAX` = OFF = no scan
+/// ever crosses it = byte-identical to today. Cached once (env); the
+/// programmatic override takes precedence for in-process fixtures.
+pub(crate) fn s2_adaptive_fanout_min() -> usize {
+    use std::sync::OnceLock;
+    let ov = S2_FANOUT_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != u64::MAX {
+        return ov as usize;
+    }
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("FRS_S2_FANOUT_MIN")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(usize::MAX)
+    })
+}
+
+/// R1: the per-scan selection the DEFAULT (non-fixture) build callers use.
+/// Honours the static force first (so `FRS_RS_S2_PINNED=1/0` and the
+/// programmatic override keep forcing ON/OFF for every scan, unchanged), then
+/// falls through to fan-out-adaptive. With `FRS_S2_FANOUT_MIN` unset (default
+/// `usize::MAX`) the adaptive arm never fires, so this is byte-identical to
+/// `Force(s2_pinned_enabled())` = today's behaviour.
+pub(crate) fn s2_select() -> S2Sel {
+    match S2_PINNED_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return S2Sel::Force(false),
+        2 => return S2Sel::Force(true),
+        _ => {}
+    }
+    // Static env force still wins (uniform A/B kill switch).
+    if s2_pinned_enabled() {
+        return S2Sel::Force(true);
+    }
+    S2Sel::Adaptive
+}
+
+/// R1: is the per-scan adaptive arm able to ever pick pinned? True only when
+/// the selection is `Adaptive` AND the threshold is reachable (`< usize::MAX`).
+/// The FFI uses this to decide whether to drive the `fill_into` stream (which
+/// can engage the loser tree per-scan) vs the legacy owned-arc iterator. False
+/// (the default, `FRS_S2_FANOUT_MIN` unset) => the FFI keeps today's exact path.
+pub fn s2_adaptive_active() -> bool {
+    matches!(s2_select(), S2Sel::Adaptive) && s2_adaptive_fanout_min() != usize::MAX
 }
 
 /// FRS-RESIDENT-BYPASS toggle (`FRS_RESIDENT_BYPASS=1`, off by default), cached.

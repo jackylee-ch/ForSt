@@ -166,5 +166,136 @@ fn bench_join_probe_fill_into(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_join_probe_open, bench_join_probe_fill_into);
+/// R1 (2026-06-14, repair design §3-R1): per-scan fan-out-ADAPTIVE S2 gate.
+///
+/// The `build_db` fixture above lets background compaction collapse the L0
+/// fan-out down to ~1 SST during criterion's steady-state window, so it cannot
+/// exercise a SUSTAINED deep probe (the q7/q9/q20 long-running-join regime
+/// where forst-rs holds L0 at 40-64). This group raises
+/// `FRS_L0_COMPACTION_TRIGGER`/`FRS_L0_STOP_TRIGGER` so the overlapping SSTs
+/// PERSIST at scan time, then measures THREE arms on the IDENTICAL fixture:
+///   * `legacy`   — forced OFF (today's path);
+///   * `pinned`   — forced ON (the full S2 loser-tree win, the ceiling);
+///   * `adaptive` — the R1 selector (threshold 8) — should match `pinned` on
+///     the deep cells (n_overlap >= 8 → loser tree) and `legacy` on the shallow
+///     cell (n_overlap == 1 < 8 → no pinned tax). One config, no shallow tax,
+///     full deep win.
+fn bench_join_probe_adaptive(c: &mut Criterion) {
+    use forst_rs_engine::{
+        set_s2_adaptive_fanout_min_override, set_s2_pinned_override, FillOutcome, RowSink,
+    };
+
+    struct CountBytes(u64);
+    impl RowSink for CountBytes {
+        fn push(&mut self, key: &[u8], value: &[u8]) -> bool {
+            self.0 += (key.len() + value.len()) as u64;
+            true
+        }
+    }
+
+    // Sustain the L0 fan-out for the lifetime of this group: keep auto-compaction
+    // from collapsing the per-round SSTs so a deep probe actually sees them.
+    // SAFETY: single-threaded bench setup; read fresh per DB open (env_u32).
+    std::env::set_var("FRS_L0_COMPACTION_TRIGGER", "100000");
+    std::env::set_var("FRS_L0_STOP_TRIGGER", "100000");
+    std::env::set_var("FRS_L0_SLOWDOWN_TRIGGER", "100000");
+
+    let drain = |db: &Arc<forst_rs_engine::DbImpl>, prefix: &[u8]| {
+        let cf = db.default_cf();
+        let mut stream = db
+            .prefix_scan_stream_with_error_slot(&cf, prefix, Arc::new(Mutex::new(None)))
+            .expect("open prefix stream");
+        let mut sink = CountBytes(0);
+        let outcome = stream.fill_into(&mut sink).expect("fill_into");
+        assert_eq!(outcome, FillOutcome::Exhausted);
+        sink.0
+    };
+
+    // Deep-fan-out fixture: TINY write buffer so every round flushes a real
+    // SST, with the high trigger above so they are NOT compacted away — a
+    // 4-byte (join-key-only) prefix probe then overlaps ~rounds SSTs (the
+    // sustained long-running-join regime). (Diagnosed: 64 MiB buffer → 1
+    // source; 4 KiB buffer + trigger 100000 → sources≈rounds.)
+    let deep_keys = 64u32;
+    let build_deep = |rounds: u32| -> Arc<forst_rs_engine::DbImpl> {
+        let db = open_in_memory(4096);
+        let cf = db.default_cf();
+        for round in 0..rounds {
+            for jk in 0..deep_keys {
+                let mut k = [0u8; 8];
+                k[..4].copy_from_slice(&jk.to_be_bytes());
+                k[4..].copy_from_slice(&round.to_be_bytes());
+                let v = vec![0xCDu8; 64];
+                db.put(&cf, &k, &v).expect("put");
+            }
+            db.flush_cf(&cf).expect("flush");
+        }
+        db
+    };
+    let prefix4 = |jk: u32| -> [u8; 4] { jk.to_be_bytes() };
+
+    let mut group = c.benchmark_group("join_probe_open_adaptive");
+    for &rounds in &[1u32, 8, 32, 64, 128] {
+        let db = build_deep(rounds);
+
+        // legacy (forced OFF)
+        set_s2_pinned_override(Some(false));
+        set_s2_adaptive_fanout_min_override(None);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("legacy_ssts_{}", rounds)),
+            &rounds,
+            |b, &_n| {
+                let mut jk = 0u32;
+                b.iter(|| {
+                    black_box(drain(&db, &prefix4(jk % deep_keys)));
+                    jk = jk.wrapping_add(1);
+                });
+            },
+        );
+
+        // pinned (forced ON — the ceiling)
+        set_s2_pinned_override(Some(true));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("pinned_ssts_{}", rounds)),
+            &rounds,
+            |b, &_n| {
+                let mut jk = 0u32;
+                b.iter(|| {
+                    black_box(drain(&db, &prefix4(jk % deep_keys)));
+                    jk = jk.wrapping_add(1);
+                });
+            },
+        );
+
+        // adaptive (R1 selector, threshold 8)
+        set_s2_pinned_override(None);
+        set_s2_adaptive_fanout_min_override(Some(8));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("adaptive_ssts_{}", rounds)),
+            &rounds,
+            |b, &_n| {
+                let mut jk = 0u32;
+                b.iter(|| {
+                    black_box(drain(&db, &prefix4(jk % deep_keys)));
+                    jk = jk.wrapping_add(1);
+                });
+            },
+        );
+    }
+    group.finish();
+
+    // Restore default global state for any later bench in the same process.
+    set_s2_pinned_override(None);
+    set_s2_adaptive_fanout_min_override(None);
+    std::env::remove_var("FRS_L0_COMPACTION_TRIGGER");
+    std::env::remove_var("FRS_L0_STOP_TRIGGER");
+    std::env::remove_var("FRS_L0_SLOWDOWN_TRIGGER");
+}
+
+criterion_group!(
+    benches,
+    bench_join_probe_open,
+    bench_join_probe_fill_into,
+    bench_join_probe_adaptive
+);
 criterion_main!(benches);

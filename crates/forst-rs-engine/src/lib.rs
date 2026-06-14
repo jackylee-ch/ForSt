@@ -116,9 +116,10 @@ pub use compaction_filter::{
 };
 pub use db::{
     kv_adaptive_pressure_enabled, kv_min_blob_size, kv_separation_enabled,
-    lifecycle_segments_enabled, s2_pinned_enabled, set_kv_adaptive_pressure_override,
-    set_kv_separation_override, set_lifecycle_segments_override, set_s2_pinned_override,
-    set_trivial_move_override, set_vlog_gc_adaptive_override, set_vlog_gc_age_cutoff_override,
+    lifecycle_segments_enabled, s2_adaptive_active, s2_pinned_enabled,
+    set_kv_adaptive_pressure_override, set_kv_separation_override, set_lifecycle_segments_override,
+    set_s2_adaptive_fanout_min_override, set_s2_pinned_override, set_trivial_move_override,
+    set_vlog_gc_adaptive_override, set_vlog_gc_age_cutoff_override,
     set_vlog_resident_budget_mb_override, trivial_move_enabled, vlog_gc_adaptive_enabled,
     vlog_gc_age_cutoff_percent, DbImpl, FillOutcome, IncrementalCheckpointResult,
     LinkedCheckpointDiscard, LiveFileInfo, PrefixScanStream, RowSink, DEFAULT_CF_NAME,
