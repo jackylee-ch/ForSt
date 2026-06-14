@@ -35,6 +35,7 @@ pub mod object_store;
 pub mod opendal_backend;
 pub mod ownership;
 pub mod router;
+pub mod throttle;
 
 pub use async_io::{AsyncRandomReader, AsyncSequentialReader, AsyncWriter, BoxFuture};
 pub use block_io::{check_vectored_args, BlockIo, PreadBlockIo};
@@ -54,3 +55,4 @@ pub use object_store::{
 pub use opendal_backend::OpendalFileSystem;
 pub use ownership::{FileOwnership, FileOwnershipTracker, OwnedFile};
 pub use router::{file_locality, FileLocality, FileSystemRouter};
+pub use throttle::{RateLimiter, ThrottledFileSystem, REMOTE_BW_MBPS_ENV};

@@ -920,6 +920,26 @@ fn wrap_nonsst_local(remote_primary: Arc<dyn FileSystem>) -> Arc<dyn FileSystem>
     ))
 }
 
+/// LOCAL S3 SIMULATION (default OFF): wraps the *remote* leg of a
+/// disaggregated open in a bandwidth throttle driven by the
+/// `FRS_REMOTE_BW_MBPS` env knob. The throttle sits BENEATH the local SST
+/// cache (`CachedFileSystem`), so only true remote/object-store round-trips
+/// pay the bandwidth cap — local cache hits and the local store (`db_path`,
+/// WAL, MANIFEST, …) stay at native speed, exactly as in a real
+/// disaggregated deployment.
+///
+/// When the env knob is unset / `0` (the default), [`ThrottledFileSystem`]
+/// returns its inner handles unwrapped — byte-identical, no sleep. Set
+/// `FRS_REMOTE_BW_MBPS=6250` for the 50 Gb/s S3-sim regime.
+fn wrap_remote_bw_throttle(remote_fs: Arc<dyn FileSystem>) -> Arc<dyn FileSystem> {
+    let throttled = forst_rs_io::ThrottledFileSystem::from_env(remote_fs);
+    if throttled.is_unlimited() {
+        // Unwrap to keep the stack byte-identical when the knob is OFF.
+        return Arc::clone(throttled.inner_arc());
+    }
+    Arc::new(throttled)
+}
+
 /// RAII guard that releases a previously-reserved chunk back to the cross-CF
 /// [`WriteBufferManager`] when dropped, unless [`Self::commit`] is called.
 ///
@@ -1504,6 +1524,10 @@ impl DbImpl {
         default_desc: ColumnFamilyDescriptor,
     ) -> ForstResult<Arc<Self>> {
         let remote_fs = build_opendal_fs_from_uri(uri, &opendal_config)?;
+        // LOCAL S3 SIMULATION (default OFF): cap the remote leg's bandwidth
+        // beneath the local cache so only true object-store round-trips pay
+        // the `FRS_REMOTE_BW_MBPS` rate.
+        let remote_fs = wrap_remote_bw_throttle(remote_fs);
         let cache = LocalCache::open(cache_dir, cache_capacity_bytes).map_err(|e| {
             ForstError::Io(std::io::Error::other(format!(
                 "open_remote: failed to open local cache at {:?}: {e}",
@@ -8437,6 +8461,8 @@ impl DbImpl {
         default_desc: ColumnFamilyDescriptor,
     ) -> ForstResult<Arc<Self>> {
         let remote_fs = build_opendal_fs_from_uri(uri, &opendal_config)?;
+        // LOCAL S3 SIMULATION (default OFF): see `wrap_remote_bw_throttle`.
+        let remote_fs = wrap_remote_bw_throttle(remote_fs);
         let cache = LocalCache::open(cache_dir, cache_capacity_bytes).map_err(|e| {
             ForstError::Io(std::io::Error::other(format!(
                 "open_from_linked_checkpoint_instant_remote: failed to open \
@@ -8485,6 +8511,8 @@ impl DbImpl {
         default_desc: ColumnFamilyDescriptor,
     ) -> ForstResult<Arc<Self>> {
         let remote_fs = build_opendal_fs_from_uri(uri, &opendal_config)?;
+        // LOCAL S3 SIMULATION (default OFF): see `wrap_remote_bw_throttle`.
+        let remote_fs = wrap_remote_bw_throttle(remote_fs);
         let cache = LocalCache::open(cache_dir, cache_capacity_bytes).map_err(|e| {
             ForstError::Io(std::io::Error::other(format!(
                 "open_from_linked_checkpoint_instant_clipped_remote: failed to open \
