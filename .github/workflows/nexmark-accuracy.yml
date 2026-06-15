@@ -286,6 +286,13 @@ jobs:
       - name: Pin NEXMARK_HOME
         run: echo "NEXMARK_HOME=$RUNTIME/nexmark-flink" >> "$GITHUB_ENV"
 
+      # The packaged dist intentionally omits the (stale) log/ dir to stay small.
+      # flink-daemon.sh writes its .out to $FLINK_HOME/log and aborts the daemon
+      # if the dir is missing ("No such file or directory") — which silently
+      # prevented the JM/TM/gateway from ever starting. Recreate it.
+      - name: Create Flink log dir (required by flink-daemon.sh)
+        run: mkdir -p "$RUNTIME/flink-2.2.1/log"
+
       - name: Deploy forst-rs .so into FFM libpath + Flink lib
         run: sudo mkdir -p /usr/local/lib
       - name: Copy .so to /usr/local/lib (FFM libpath)
@@ -315,21 +322,6 @@ jobs:
           echo "== lib sql jars =="; ls -la "$FLINK_HOME/lib" | grep -iE 'sql-client|sql-gateway' || true
           echo "== find regex (as in sql-client.sh.orig) =="; find "$FLINK_HOME/opt" -regex ".*flink-sql-client.*.jar" || true
           echo "== SqlClient class in jar? =="; unzip -l "$FLINK_HOME"/lib/flink-sql-client-*.jar | grep -E 'table/client/SqlClient\.class' || echo "MISSING SqlClient.class"
-
-      - name: Cluster smoke (start standalone cluster with VISIBLE output)
-        run: |
-          set -x
-          export FLINK_HOME JAVA_HOME="$JDK17"
-          cp "$TEMPLATES/config-rocksdb.yaml" "$FLINK_HOME/conf/config.yaml"
-          echo "--- start-cluster (not suppressed) ---"
-          "$FLINK_HOME/bin/start-cluster.sh" || echo "start-cluster returned $?"
-          sleep 12
-          echo "--- log dir after start ---"; ls -la "$FLINK_HOME/log" || true
-          echo "--- REST overview ---"; curl -s --max-time 8 http://localhost:8081/overview || echo "(no REST)"
-          echo "--- standalonesession log ---"; tail -n 120 "$FLINK_HOME"/log/*standalonesession*.log 2>/dev/null || echo "(no JM log)"
-          echo "--- taskexecutor log ---"; tail -n 120 "$FLINK_HOME"/log/*taskexecutor*.log 2>/dev/null || echo "(no TM log)"
-          echo "--- taskexecutor .out ---"; tail -n 60 "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null || echo "(no TM out)"
-          "$FLINK_HOME/bin/stop-cluster.sh" || true
 
       - name: Generate fixed CSV (deterministic, JDK17 datagen)
         run: JDK17="$JDK17" bash scripts/accuracy-gate/gen-fixed-csv.sh 2>&1 | tee /tmp/gen.log
