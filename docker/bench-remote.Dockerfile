@@ -39,5 +39,4 @@ RUN sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g; s|http://se
     ln -s /usr/lib/*-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc-preload.so
 
 WORKDIR /work
-USER flink
 CMD ["bash"]
