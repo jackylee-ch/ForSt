@@ -22,6 +22,18 @@
 # | q8 | 46.7 | 3,064,481 ✓ | 44.3 | 3,064,413 | 41.2 | 3,064,421 | PASS RDB (1.05×); GAP ForSt (+5.5s, 1.13×); rows in-band (sink jitter, src≈3.064M) |
 # | q9 | 1285.5 | 91,813,372 ✓ | 1057.4 | 91,813,372 ✓ | 1982.0 | 91,813,372 ✓ | PASS (vs RDB 1.22× ≤1.25 bar; BEATS ForSt 1.54×; rows EXACT all 3) |
 # | q12 | 43.6 | 92,000,000 ✓ | 39.6 | 92,000,000 ✓ | 43.9 | 92,000,000 ✓ | PASS both (RDB 1.10×; BEATS ForSt by 0.3s); rows EXACT |
+# | q17 | 333.7 | 92,000,000 ✓ | 73.9 | 92,000,000 ✓ | (running) | — | ⚠ FAIL RDB (4.52×!) — routing-adaptive lever PATHOLOGICAL for q17 here (see negative below) |
+#
+# ⚠⚠ q17 HONEST NEGATIVE: forst-rs under the validate full-stack-ON profile
+#   (FRS_RS_EXECUTOR=routing-adaptive) ran 333.7s — 4.52× SLOWER than RocksDB
+#   (73.9s) and 4.3× slower than the prior Mac forst-rs 77.7s (which used the
+#   DEFAULT executor). The OVER-window build phase grinds at ~45-80K/s under
+#   routing-adaptive before the stream catches up. This is NOT the process.size
+#   change (q17 is KV-sep OFF, tiny engine-native footprint); it is the
+#   routing-adaptive EXECUTOR lever mis-serving q17's unbounded group-agg at this
+#   scale. The validate profile's q17 claim ("STRUCTURAL vs RDB, beats ForSt 3.3×")
+#   does NOT hold under the uniform full-stack-ON here. ACTION: q17 should drop
+#   routing-adaptive (run default executor) — that recovers ~77s. Flagged loud.
 #
 # ★ q9 headline: in the uniform split it FINISHES on all 3 backends with byte-
 #   identical out_rows (91,813,372), BEATS ForSt (1285.5 < 1982.0), and is within
