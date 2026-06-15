@@ -1,7 +1,8 @@
 # Stage-0 — q8 cache-corruption race: DETERMINISTIC repro + root cause + residual assessment
 
-**Date:** 2026-06-15 · **Status:** cache-race repro SHIPPED (prior cycle); **residual op-mix race
-DETERMINISTICALLY REPRODUCED + root-caused this cycle** (seam + test on `readside-r2a`)
+**Date:** 2026-06-15 · **Status:** cache-race repro SHIPPED (prior cycle); residual op-mix race
+DETERMINISTICALLY REPRODUCED + root-caused; **FIX SHIPPED this cycle — option A landed, repro now
+GREEN (593/0), Approach-3 unblocked** (seam + test + fix on `readside-r2a`). See §6.4b / §6.5b.
 **Repo:** flink-statebackend-forst-rs (test-only, JDK 25 module)
 **Context:** Stage-0 of the two-regime executor design
 (`2026-06-11-two-regime-executor-design.md` §4) is the BLOCKING gate for Approach-3
@@ -161,6 +162,46 @@ The single-worker FIFO (`RoutingStateExecutor` kg-affine routing) DOES order sam
 the race only manifests for fire-path effects that take a **non-FIFO / mailbox-direct route** — which
 is exactly why it is timing-dependent and rare at workers=1 (the ledger's `✓ / ✓ / −77%`), and why
 the staging-buffer env-gates reduced but never eliminated it.
+
+### 6.4b The fix — SHIPPED + repro now GREEN (2026-06-15 cycle)
+
+Option A is implemented. **File:line + flag:**
+`RoutingStateExecutor.executeRequestSync` (`flink-statebackend-forst-rs/.../exec/RoutingStateExecutor.java:734`):
+the `FRS_RS_SYNC_DIRECT` mailbox-direct bypass (the dedicated `syncDirectWorker` that shares the
+engine's backing store but NOT the kg worker FIFO) is **retired under the non-blocking executor**.
+Its construction is removed (`:330` was `nonBlocking && FRS_RS_SYNC_DIRECT=1` → now always null) and
+the bypass branch (`:750`) is guarded `syncDirectWorker != null && !nonBlocking` — dead by
+construction. Every fire-path sync/overdraft read therefore funnels onto its key-group worker's FIFO
+TAIL (`workerThreads[floorMod(kg,N)].submit(...).get()`, `:758-761`), behind any queued LIST_ADD, so
+read-your-writes holds by FIFO construction — exactly the property the proven blocking `routing` mode
+already has. **Flag-gated:** the change only alters the `nonBlocking` (routing-async / Approach-3)
+path; blocking/inline modes are byte-identical (they never constructed `syncDirectWorker` either, and
+their batches complete synchronously so there is never a queued write to overtake).
+
+**The deterministic repro now proves the fix.** `Q8OpMixBoundaryRaceTest` is 3 tests, 5/5
+deterministic, full module suite 593/0:
+- `blockingRoutingOrdersWriteBeforeRead_control` (CONTROL) — still passes.
+- `routingAsyncFirePathReadMissesQueuedWrite_repro` (the BUG, on the mailbox-direct bypass route via
+  `workers[0].executeRequestSync` directly) — still reproduces the EMPTY read, documenting the hazard.
+- `routingAsyncFirePathThroughExecutorFifoSeesQueuedWrite_fix` (the FIX, new this cycle) — the SAME
+  fire-path GET routed through `RoutingStateExecutor.executeRequestSync` funnels onto the parked
+  worker's FIFO behind the queued LIST_ADD and **observes the write byte-exact**. The contrast
+  (bypass route → race; FIFO route → no race) IS the proof option A closes the residual −77%.
+
+Gate run: `JAVA_HOME=<jdk25> ./mvnw -pl flink-state-backends/flink-statebackend-forst-rs
+-Pforst-rs-jdk25 test -Dforstrs.native.tests.skip=false
+-Dforstrs.native.libpath=<...>/libforst_rs_ffi.dylib -o` → 593/0 (was 592; +1 = the new fix test).
+spotless:check clean.
+
+### 6.5b Approach-3 unblock status — now SHIPPED-READY (one canary owed)
+
+With the fix, the coordination-free / non-blocking executor (routing-async) produces correct q8
+read-your-writes deterministically (the repro gate proves it). The residual op-mix race — the last
+OPEN q8 blocker — is **closed in code**, not merely root-caused. Approach-3 is therefore
+shippable; the only remaining step is the post-sweep NexMark canary confirmation (q8 exactness +
+q17/q11/q9 no-regress) under one uniform config — NOT run this cycle (the uniform sweep owns the box).
+The executor-mode selectability already exists (`FRS_RS_EXECUTOR=routing-async`); enabling it as a
+default is the canary's call, not a code gap.
 
 ### 6.4 The fix — DESIGNED (next cycle), not shipped (timeboxed honestly)
 
