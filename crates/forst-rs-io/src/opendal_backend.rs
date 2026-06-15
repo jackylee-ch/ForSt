@@ -341,7 +341,73 @@ type PendingUploads = Arc<Mutex<HashMap<String, PendingUpload>>>;
 /// upload holds its whole buffered SST plus ~`S3_WRITE_CONCURRENCY *
 /// S3_WRITE_CHUNK_BYTES` of multipart parts). 8 concurrent SST uploads bounds
 /// resident upload memory at roughly `8 * (SST_size + 128 MiB)`.
+///
+/// CAVEAT (the default, permit-INSIDE-task path): the permit is acquired
+/// *inside* the spawned upload task, AFTER the SST buffer has already been
+/// moved into the future. So a fast flush loop over a slow remote can spawn an
+/// unbounded number of upload tasks that each hold their full SST buffer in RAM
+/// while queued on the semaphore — the cap bounds concurrent *network
+/// transfers* but NOT resident *buffers*. [`ASYNC_FLUSH_UPLOAD_ENV`] flips the
+/// permit acquisition to the FLUSH THREAD (before spawn), making the bound real
+/// (`MAX_INFLIGHT_UPLOADS * SST_size` resident) at the cost of brief flush-loop
+/// backpressure when the queue is full. See `async_flush_upload_backpressure`.
 const MAX_INFLIGHT_UPLOADS: usize = 8;
+
+/// FRS-ASYNC-FLUSH-UPLOAD env knob (default OFF): when `1`/`true`, the buffered
+/// object-store upload path acquires its in-flight permit SYNCHRONOUSLY on the
+/// flush thread (in `close_writer`) BEFORE spawning the upload task, rather than
+/// inside the spawned task. This turns the soft, buffer-unbounded
+/// `MAX_INFLIGHT_UPLOADS` cap into a TRUE bounded in-flight upload queue:
+/// when `MAX_INFLIGHT_UPLOADS` uploads are already pending, the next
+/// `close_writer` blocks (briefly) on the permit instead of spawning a
+/// buffer-holding task — bounding resident upload memory at
+/// `MAX_INFLIGHT_UPLOADS * SST_size` even under a throttled remote.
+///
+/// The overlap (flush N+1 proceeds while N uploads) is UNCHANGED — uploads
+/// still run on the bridged runtime off the flush critical path; only the
+/// admission point moves. Durability/await semantics are identical (the
+/// `pending` registry + watch + join are registered the same way), so a
+/// checkpoint still observes every required upload via `await_upload` /
+/// `await_all_uploads`. OFF is byte-identical to the prior behaviour.
+pub const ASYNC_FLUSH_UPLOAD_ENV: &str = "FRS_ASYNC_FLUSH_UPLOAD";
+
+/// Test/bench override for `async_flush_upload_backpressure`:
+/// `0` = env/default, `1` = forced OFF, `2` = forced ON. The env is resolved
+/// only once per process (`OnceLock`), so this override is the supported way to
+/// exercise both modes within one test binary.
+static ASYNC_FLUSH_UPLOAD_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Forces `async_flush_upload_backpressure` on/off for tests/benches
+/// (`None` = defer to [`ASYNC_FLUSH_UPLOAD_ENV`]).
+pub fn set_async_flush_upload_override(v: Option<bool>) {
+    ASYNC_FLUSH_UPLOAD_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Reads [`ASYNC_FLUSH_UPLOAD_ENV`] (env resolved once per process), unless a
+/// test override is set via [`set_async_flush_upload_override`].
+fn async_flush_upload_backpressure() -> bool {
+    match ASYNC_FLUSH_UPLOAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var(ASYNC_FLUSH_UPLOAD_ENV).ok().as_deref(),
+            Some("1") | Some("true")
+        )
+    })
+}
 
 pub struct OpendalFileSystem {
     op: Operator,
@@ -1184,6 +1250,31 @@ impl OpendalWritableFile {
                             let op = op.clone();
                             let sem = sem.clone();
                             let path_for_task = p.clone();
+                            // FRS-ASYNC-FLUSH-UPLOAD (flag-gated, default OFF): acquire the
+                            // in-flight permit SYNCHRONOUSLY on this (flush) thread BEFORE
+                            // spawning, so a full in-flight queue blocks the flush loop here
+                            // instead of letting it spawn an unbounded number of
+                            // buffer-holding tasks (each `buf` is the full SST). The owned
+                            // permit is moved into the task and dropped when the upload
+                            // finishes. OFF => `None`, and the task acquires the permit
+                            // itself (byte-identical to the prior behaviour). `block_on` is
+                            // safe: `close_writer` runs on the synchronous flush thread, not
+                            // inside an async task (same context as the `_ =>` fallback).
+                            let prefetched_permit: Option<tokio::sync::OwnedSemaphorePermit> =
+                                if async_flush_upload_backpressure() {
+                                    match self.handle.block_on(sem.clone().acquire_owned()) {
+                                        Ok(permit) => Some(permit),
+                                        Err(e) => {
+                                            return Err(ForstError::Io(std::io::Error::other(
+                                                format!(
+                                                    "OpenDAL upload semaphore closed: {p}: {e}"
+                                                ),
+                                            )));
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                             // 2026-05-29 FRS-S3-FLUSH-CONCURRENT: `write_with` provides
                             // the WHOLE buffer up front (no streaming `.chunk()` "final
                             // part dropped on close" truncation bug), with
@@ -1203,11 +1294,22 @@ impl OpendalWritableFile {
                                     // Backpressure: hold a permit for the whole upload so
                                     // at most MAX_INFLIGHT_UPLOADS SSTs are resident at
                                     // once under a slow S3 endpoint.
-                                    let _permit = sem.acquire().await.map_err(|e| {
-                                        format!(
-                                            "OpenDAL upload semaphore closed: {path_for_task}: {e}"
-                                        )
-                                    })?;
+                                    //
+                                    // FRS-ASYNC-FLUSH-UPLOAD: when the flag is ON,
+                                    // `prefetched_permit` is `Some` (already acquired on the
+                                    // flush thread before spawn — TRUE buffer backpressure),
+                                    // so we keep it alive for the whole upload and SKIP the
+                                    // in-task acquire. When OFF it is `None` and we acquire
+                                    // here exactly as before (byte-identical).
+                                    let _permit = match prefetched_permit {
+                                        Some(p) => p,
+                                        None => sem.acquire_owned().await.map_err(|e| {
+                                            format!(
+                                                "OpenDAL upload semaphore closed: \
+                                                 {path_for_task}: {e}"
+                                            )
+                                        })?,
+                                    };
                                     op.write_with(&path_for_task, buf)
                                         // `executors-tokio`-backed Executor: required for
                                         // `.concurrent()` or opendal's default `()` executor
@@ -2704,5 +2806,157 @@ mod tests {
 
         // Real Drop path (drain + off-thread orderly shutdown): must not panic.
         drop(fs);
+    }
+
+    // -----------------------------------------------------------------------
+    // FRS-ASYNC-FLUSH-UPLOAD: bounded in-flight upload queue (default OFF).
+    // -----------------------------------------------------------------------
+
+    /// Serialize the override-toggling tests: the flag is process-global, so two
+    /// of these running concurrently would clobber each other's override.
+    static ASYNC_FLUSH_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores the override to "defer to env" on drop, so a
+    /// panicking test never leaks a forced flag into the rest of the binary.
+    struct OverrideGuard;
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            set_async_flush_upload_override(None);
+        }
+    }
+
+    /// Drive the buffered object-store upload path with the flag in `mode` and
+    /// assert every object lands byte-exact and the durability barriers behave —
+    /// the OFF case is the byte-identity gate; the ON case is correctness under
+    /// the moved admission point (no lost / duplicated / truncated SST).
+    fn assert_uploads_durable_in_mode(mode: bool) {
+        set_async_flush_upload_override(Some(mode));
+        // Write more SSTs than MAX_INFLIGHT so ON mode actually exercises the
+        // flush-thread backpressure (the 9th..Nth close must wait for a permit).
+        let fs = OpendalFileSystem::memory().expect("build memory fs");
+        let mut payloads = Vec::new();
+        for n in 0..(MAX_INFLIGHT_UPLOADS as u32 + 4) {
+            let path = PathBuf::from(format!("sst/{n:06}.sst"));
+            // Distinct, non-trivial payloads so a swap / dup / truncation shows.
+            let payload: Vec<u8> = (0..40_000u32)
+                .map(|i| ((i.wrapping_mul(n + 1)) % 251) as u8)
+                .collect();
+            let mut w = fs
+                .open_writable_file(&path, WriteMode::CreateOrTruncate)
+                .expect("open writable");
+            w.append(&payload).expect("append");
+            // `sync()` calls `close_writer()` — this is what publishes / spawns
+            // the upload (and, with the flag ON, acquires the permit on this
+            // thread before spawning).
+            w.sync().expect("sync");
+            drop(w);
+            payloads.push((path, payload));
+        }
+        fs.await_all_uploads().expect("await_all_uploads");
+        for (path, payload) in &payloads {
+            assert!(
+                fs.file_exists(path).expect("file_exists"),
+                "{} missing",
+                path.display()
+            );
+            let rar = fs.open_random_access_file(path).expect("open random");
+            assert_eq!(
+                rar.file_size().unwrap(),
+                payload.len() as u64,
+                "{} wrong size (truncation?)",
+                path.display()
+            );
+            let mut got = vec![0u8; payload.len()];
+            let n = rar.read_at(0, &mut got).expect("read_at");
+            got.truncate(n);
+            assert_eq!(&got, payload, "{} bytes differ (swap/dup?)", path.display());
+        }
+        fs.await_all_uploads().expect("idempotent barrier");
+        drop(fs);
+    }
+
+    /// OFF (default) must be byte-identical: every SST uploads + reads back exact.
+    #[test]
+    fn async_flush_upload_off_is_durable_and_byte_identical() {
+        let _g = ASYNC_FLUSH_TEST_LOCK.lock().unwrap();
+        let _r = OverrideGuard;
+        assert_uploads_durable_in_mode(false);
+    }
+
+    /// ON must preserve durability: no lost / duplicated / truncated SST even
+    /// with the permit acquired on the flush thread before spawn.
+    #[test]
+    fn async_flush_upload_on_is_durable() {
+        let _g = ASYNC_FLUSH_TEST_LOCK.lock().unwrap();
+        let _r = OverrideGuard;
+        assert_uploads_durable_in_mode(true);
+    }
+
+    /// THE BACKPRESSURE INVARIANT. With the flag ON, when `MAX_INFLIGHT_UPLOADS`
+    /// permits are all held, the next `close_writer` MUST BLOCK on the flush
+    /// thread (acquiring the permit before spawn) — it does not return until a
+    /// permit frees. With the flag OFF the same `close_writer` returns
+    /// immediately (the queued task waits inside the runtime, holding its buffer).
+    /// This is exactly the soft-vs-true backpressure difference.
+    #[test]
+    fn async_flush_upload_on_blocks_flush_when_queue_full() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _g = ASYNC_FLUSH_TEST_LOCK.lock().unwrap();
+        let _r = OverrideGuard;
+
+        for (mode, expect_block) in [(true, true), (false, false)] {
+            set_async_flush_upload_override(Some(mode));
+            let fs = Arc::new(OpendalFileSystem::memory().expect("build memory fs"));
+
+            // Exhaust the in-flight semaphore: hold ALL permits for the duration.
+            let held = fs
+                .rt
+                .handle()
+                .block_on(
+                    fs.upload_sem
+                        .clone()
+                        .acquire_many_owned(MAX_INFLIGHT_UPLOADS as u32),
+                )
+                .expect("acquire all permits");
+            assert_eq!(fs.upload_sem.available_permits(), 0);
+
+            let returned = Arc::new(AtomicBool::new(false));
+            let fs2 = Arc::clone(&fs);
+            let returned2 = Arc::clone(&returned);
+            let writer = std::thread::spawn(move || {
+                let path = PathBuf::from("sst/blocked.sst");
+                let mut w = fs2
+                    .open_writable_file(&path, WriteMode::CreateOrTruncate)
+                    .expect("open writable");
+                w.append(&[7u8; 4096]).expect("append");
+                // `sync()` -> `close_writer()`: publishes/spawns the upload. With
+                // the flag ON and the queue full, this BLOCKS here until a permit
+                // frees; with it OFF it returns immediately.
+                w.sync().expect("sync");
+                returned2.store(true, Ordering::Release);
+            });
+
+            // Give the writer time to reach (and, if ON, block at) close_writer.
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                returned.load(Ordering::Acquire),
+                !expect_block,
+                "mode ON={mode}: close_writer should {} when the in-flight queue is full",
+                if expect_block { "BLOCK" } else { "NOT block" }
+            );
+
+            // Release the permits so the (possibly blocked) close can proceed.
+            drop(held);
+            writer.join().expect("writer thread");
+            assert!(
+                returned.load(Ordering::Acquire),
+                "close_writer never returned"
+            );
+
+            // Durability still holds in both modes.
+            fs.await_all_uploads().expect("await_all_uploads");
+            assert!(fs.file_exists(Path::new("sst/blocked.sst")).unwrap());
+            drop(fs);
+        }
     }
 }

@@ -1162,7 +1162,8 @@ pub unsafe extern "C" fn frs_db_open_with_options(
 /// variable from the (in-process) Flink backend so the engine's env-gated
 /// feature flags — `FRS_KV_SEPARATION`, `FRS_KV_MIN_BLOB_SIZE`,
 /// `FRS_TRIVIAL_MOVE`, `FRS_REMOTE_COMPACTION`, `FRS_VLOG_COMPRESSION`,
-/// `FRS_SST_COMPRESSION`, … — observe the configured value.
+/// `FRS_SST_COMPRESSION`, `FRS_ASYNC_FLUSH_UPLOAD`, … — observe the configured
+/// value.
 ///
 /// **Why an FFI setter and not `System.setProperty`?** The engine reads
 /// these via `std::env::var(...)` (POSIX `getenv`), which the JVM's Java
