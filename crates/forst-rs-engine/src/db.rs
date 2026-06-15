@@ -315,6 +315,65 @@ pub fn vlog_coalesce_deref_enabled() -> bool {
     })
 }
 
+/// FRS-MULTIGET-COALESCE master flag for the coalesced SST data-block read on
+/// the L1+ batch point-lookup path (`FRS_MULTIGET_COALESCE=1`, **DEFAULT OFF**).
+///
+/// Mirrors ForSt/RocksDB `BlockBasedTable::RetrieveMultipleBlocks`
+/// (`table/block_based/block_based_table_reader_sync_and_async.h`), which reads
+/// the data blocks for a MultiGet's keys via ONE `Env::MultiRead()` vectored
+/// call. forst-rs's `batch_get_vectorized` already groups pending keys by file
+/// (one reader open per file), but then resolves each key with an INDEPENDENT
+/// `reader.get_versions(k)` — so N keys landing in N distinct (cold) blocks of
+/// one SST pay N separate block reads.
+///
+/// When ON, before the per-key loop for a file the engine calls
+/// [`SstReaderImpl::prefetch_blocks_for_keys`], which warms the decoded-block
+/// cache for every block those keys would read using ONE vectored
+/// `read_block_regions` over the physically-contiguous cache-missing blocks
+/// (io_uring single submission on Linux, serial preads on the portable
+/// fallback). The subsequent `get_versions` calls then hit warm cache.
+///
+/// BYTE-IDENTICAL to OFF: the prefetch only populates the block cache at the
+/// SAME `Low` priority `read_decoded_block` uses, over EXACTLY the blocks the
+/// per-key path would read (same bloom / range / sparse-index predicate), so
+/// the resolved values, merge handling, and sequence ordering are untouched.
+/// The win is purely fewer, larger reads on the disaggregated/remote tier
+/// (M cold per-block reads → 1 vectored read); warm batches do zero extra I/O.
+pub fn multiget_coalesce_enabled() -> bool {
+    let ov = MULTIGET_COALESCE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_MULTIGET_COALESCE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-MULTIGET-COALESCE test override for [`multiget_coalesce_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static MULTIGET_COALESCE_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-MULTIGET-COALESCE: forces the coalesced multi-key block read on/off for
+/// tests/benches (`None` = defer to `FRS_MULTIGET_COALESCE`).
+pub fn set_multiget_coalesce_override(v: Option<bool>) {
+    MULTIGET_COALESCE_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// FRS-VLOG-COALESCE: decode a `BlobRef` row's stored value-pointer bytes into a
 /// [`ValuePointer`] for the deferred-coalesce list. Mirrors `vlog_deref`'s decode
 /// + corruption contract (a BlobRef row's payload is ALWAYS a `ValuePointer`).
@@ -12957,6 +13016,9 @@ impl DbImpl {
         // (default) keeps the per-key inline deref — byte-identical. Captured
         // once so the per-key hot loop reads a local bool, not the flag function.
         let coalesce = vlog_coalesce_deref_enabled();
+        // FRS-MULTIGET-COALESCE: read once for the L1+ per-file hot loop (a local
+        // bool, not the flag function). OFF (default) ⇒ no prefetch, byte-identical.
+        let multiget_coalesce = multiget_coalesce_enabled();
         let mut deferred: Vec<(usize, forst_rs_storage::vlog::ValuePointer)> = Vec::new();
 
         // FRS-PHASE2-C2U3 (rescale-by-clip, design §10 DR1 layer 2): the
@@ -13355,6 +13417,20 @@ impl DbImpl {
                 let sst = &version.levels[level].files[file_idx];
                 // Open reader ONCE per file — reused for every grouped key.
                 let reader = self.get_or_open_sst_reader(sst)?;
+                // FRS-MULTIGET-COALESCE: when ON and >1 key landed in this file,
+                // warm the block cache for ALL their candidate blocks with ONE
+                // vectored read (RetrieveMultipleBlocks). The per-key loop below
+                // then serves from warm cache — byte-identical, fewer reads.
+                if multiget_coalesce && slot_ixs.len() > 1 {
+                    let file_keys: Vec<&[u8]> = slot_ixs
+                        .iter()
+                        .filter(|&&i| resolved[i].is_none())
+                        .map(|&i| keys[i])
+                        .collect();
+                    if file_keys.len() > 1 {
+                        reader.prefetch_blocks_for_keys(&file_keys);
+                    }
+                }
                 for i in slot_ixs {
                     if resolved[i].is_some() {
                         continue;
@@ -20773,6 +20849,134 @@ mod tests {
 
         set_vlog_coalesce_deref_override(None);
         set_kv_separation_override(None);
+    }
+
+    /// FRS-MULTIGET-COALESCE: the coalesced SST multi-key block read
+    /// (`FRS_MULTIGET_COALESCE`) produces BYTE-IDENTICAL `batch_get_vectorized`
+    /// output to the per-key path, over a batch whose keys land in MANY distinct
+    /// data blocks of ONE compacted L1 SST (the disagg MultiRead shape). A small
+    /// `block_size` forces a few rows per block, so a scattered multi-key batch
+    /// touches several blocks of the same file — exactly what the coalesced
+    /// vectored read collapses. The prefetch is a pure cache-warm, so ON must
+    /// equal OFF must equal N independent `get()` calls, including interleaved
+    /// genuine misses. Default OFF must equal the pre-flag path.
+    #[test]
+    fn test_multiget_coalesce_byte_identical_l1_multiblock() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        const N: usize = 300;
+        // Small block_size => ~2-3 rows per block => keys span many blocks of one
+        // L1 SST after compaction. 256 MiB block cache (default) so the warm is
+        // observable. KV-sep OFF: this lever is about the SST DATA-BLOCK reads,
+        // independent of the vlog deref coalesce (which has its own test).
+        let build = || -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<(Vec<u8>, Vec<u8>)>) {
+            let opts = EngineOptions {
+                db_path: "/db".to_string(),
+                block_size: 512,
+                ..EngineOptions::default()
+            };
+            let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+            let db = DbImpl::open_with_fs(opts, fs).expect("open");
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("mg"))
+                .unwrap();
+            let mut kv: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N);
+            for i in 0..N as u32 {
+                let k = format!("key{i:05}").into_bytes();
+                let v = format!("value-for-key-{i:05}-{}", "p".repeat(120)).into_bytes();
+                db.put(&cf, &k, &v).unwrap();
+                kv.push((k, v));
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed");
+            db.compact_all().unwrap(); // push the cohort to L1 (the L1+ batch path)
+            (db, cf, kv)
+        };
+
+        // Scattered read order with interleaved misses (the join-probe shape).
+        let scattered_keys = |kv: &[(Vec<u8>, Vec<u8>)]| -> Vec<Vec<u8>> {
+            let mut order: Vec<usize> = (0..kv.len()).collect();
+            let mut s: u64 = 0xD1B54A32D192ED03;
+            for i in (1..order.len()).rev() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let j = (s as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            let mut out = Vec::with_capacity(order.len() + order.len() / 8);
+            for (n, &i) in order.iter().enumerate() {
+                if n % 7 == 2 {
+                    out.push(format!("absent{n:05}").into_bytes());
+                }
+                out.push(kv[i].0.clone());
+            }
+            out
+        };
+
+        // Arm OFF (the per-key path) = baseline.
+        set_multiget_coalesce_override(Some(false));
+        let (db_off, cf_off, kv) = build();
+        let keys = scattered_keys(&kv);
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let off = db_off
+            .batch_get_vectorized(&cf_off, &key_refs, u64::MAX)
+            .unwrap();
+
+        // Arm ON (the coalesced multi-key block read) on a FRESH db.
+        set_multiget_coalesce_override(Some(true));
+        let (db_on, cf_on, kv2) = build();
+        assert_eq!(kv, kv2, "build must be deterministic across arms");
+        let keys2 = scattered_keys(&kv2);
+        assert_eq!(keys, keys2);
+        let key_refs2: Vec<&[u8]> = keys2.iter().map(|k| k.as_slice()).collect();
+        let on = db_on
+            .batch_get_vectorized(&cf_on, &key_refs2, u64::MAX)
+            .unwrap();
+
+        // (a) ON == OFF, value-for-value (byte-identity gate).
+        assert_eq!(on.len(), off.len());
+        assert_eq!(
+            on, off,
+            "coalesced multi-key block read must be byte-identical"
+        );
+
+        // (b) Each present key returned its CORRECT value; misses are None;
+        //     and ON matches an independent per-key get() oracle.
+        let want: std::collections::HashMap<Vec<u8>, Vec<u8>> = kv.iter().cloned().collect();
+        for (k, got) in keys.iter().zip(on.iter()) {
+            let oracle = db_on.get(&cf_on, k).unwrap();
+            assert_eq!(got, &oracle, "batch != per-key get for a key");
+            match want.get(k) {
+                Some(v) => assert_eq!(got.as_deref(), Some(v.as_slice()), "wrong value"),
+                None => assert_eq!(got, &None, "absent key must miss"),
+            }
+        }
+
+        // (c) Empty + single-key batches no-op cleanly under the flag.
+        let empty: Vec<&[u8]> = Vec::new();
+        assert!(db_on
+            .batch_get_vectorized(&cf_on, &empty, u64::MAX)
+            .unwrap()
+            .is_empty());
+        let single = vec![kv[0].0.as_slice()];
+        let one = db_on
+            .batch_get_vectorized(&cf_on, &single, u64::MAX)
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].as_deref(), Some(kv[0].1.as_slice()));
+
+        set_multiget_coalesce_override(None);
+    }
+
+    /// FRS-MULTIGET-COALESCE flag default-off + override semantics.
+    #[test]
+    fn test_multiget_coalesce_flag_default_off_and_override() {
+        std::env::remove_var("FRS_MULTIGET_COALESCE");
+        set_multiget_coalesce_override(Some(false));
+        assert!(!multiget_coalesce_enabled(), "forced-off must read false");
+        set_multiget_coalesce_override(Some(true));
+        assert!(multiget_coalesce_enabled(), "forced-on must read true");
+        set_multiget_coalesce_override(None);
     }
 
     /// FRS-VLOG-DEREF-FANOUT (2026-06-15): the per-segment deref fan-out must be

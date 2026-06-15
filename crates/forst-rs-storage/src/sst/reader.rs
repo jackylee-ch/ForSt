@@ -807,6 +807,127 @@ impl SstReaderImpl {
         Ok(out)
     }
 
+    /// FRS-MULTIGET-COALESCE (Phase-2 disagg, ForSt mechanism
+    /// `BlockBasedTable::RetrieveMultipleBlocks`): warm the decoded-block cache
+    /// with EVERY data block the per-key [`Self::get_versions`] loop would read
+    /// for `keys`, using ONE vectored `read_block_regions` over the
+    /// physically-contiguous cache-missing blocks instead of N separate
+    /// per-block reads.
+    ///
+    /// This is a PURE PREFETCH: it only populates the cache (at the SAME `Low`
+    /// priority `read_decoded_block` uses), so a subsequent `get_versions` for
+    /// any of `keys` is byte-identical to the un-prefetched path — it simply
+    /// finds its block already cache-resident. Therefore the engine's per-key
+    /// resolution logic (merge chains, sequence ordering, op-type handling) is
+    /// untouched and the result is bit-identical with or without this call.
+    ///
+    /// No-op (and a cheap return) when there is no block cache (nowhere to warm
+    /// → the per-key path would read each block anyway, identical), or when no
+    /// missing blocks remain after the cache-first / bloom / range filters. The
+    /// block set is computed with the EXACT same predicate `get_versions` uses
+    /// (footer range, full bloom, sparse-index seek, then the forward walk over
+    /// blocks whose per-block `[min_key,max_key]` still contains the key), so it
+    /// never reads a block the per-key path would not have read — coalescing
+    /// only changes HOW the blocks reach the cache, never WHICH ones.
+    ///
+    /// In the disaggregated regime a batch point-lookup whose keys land in M
+    /// distinct blocks of one SST collapses M cold reads (M local-cache preads,
+    /// or M remote GETs on a local-cache miss) into ONE vectored read — the
+    /// MultiRead win. Warm batches (all blocks cache-resident) do zero I/O.
+    pub fn prefetch_blocks_for_keys(&self, keys: &[&[u8]]) {
+        // Without a block cache there is nowhere to deposit warmed blocks; the
+        // per-key path reads each block directly and this would be wasted work.
+        if self.block_cache.is_none() || keys.is_empty() {
+            return;
+        }
+        // Collect the candidate data-block indices for all keys (same predicate
+        // as `get_versions`), deduped and ordered.
+        let mut want: Vec<usize> = Vec::new();
+        for &key in keys {
+            if key < self.footer.min_key.as_slice() || key > self.footer.max_key.as_slice() {
+                continue;
+            }
+            if !self.bloom_filter.check(key) {
+                continue;
+            }
+            let Some(start_idx) = search_index(&self.index_entries, key) else {
+                continue;
+            };
+            for block_idx in start_idx..self.index_entries.len() {
+                let stats = &self.index_stats[block_idx];
+                if key < stats.min_key.as_slice() {
+                    break;
+                }
+                if key > stats.max_key.as_slice() {
+                    continue;
+                }
+                want.push(block_idx);
+            }
+        }
+        if want.is_empty() {
+            return;
+        }
+        want.sort_unstable();
+        want.dedup();
+        // Keep only blocks NOT already decoded-cache-resident (cache-first
+        // window splitting — exactly what `fetch_window` does).
+        want.retain(|&bi| {
+            self.index_entries
+                .get(bi)
+                .is_some_and(|e| self.cache_get_decoded(e.block_offset).is_none())
+        });
+        if want.is_empty() {
+            return;
+        }
+        // Group the missing blocks into runs of PHYSICALLY contiguous file
+        // ranges (the writer lays blocks back-to-back) → one I/O region per run,
+        // packed back-to-back into a single buffer.
+        let mut io_regions: Vec<(u64, usize)> = Vec::new();
+        let mut runs: Vec<Vec<usize>> = Vec::new();
+        let mut i = 0usize;
+        while i < want.len() {
+            let run_start = i;
+            let mut run_bytes = self.index_entries[want[i]].block_size as usize;
+            let mut prev = want[i];
+            i += 1;
+            while i < want.len() {
+                let cur = want[i];
+                let prev_entry = &self.index_entries[prev];
+                let cur_entry = &self.index_entries[cur];
+                if cur_entry.block_offset != prev_entry.block_offset + prev_entry.block_size as u64
+                {
+                    break;
+                }
+                run_bytes += cur_entry.block_size as usize;
+                prev = cur;
+                i += 1;
+            }
+            io_regions.push((self.index_entries[want[run_start]].block_offset, run_bytes));
+            runs.push(want[run_start..i].to_vec());
+        }
+        let total: usize = io_regions.iter().map(|&(_, l)| l).sum();
+        let mut buf = vec![0u8; total];
+        // Best-effort: a failed coalesced read leaves the cache cold and the
+        // per-key path reads (and surfaces any genuine error) normally.
+        if self.read_block_regions(&io_regions, &mut buf).is_err() {
+            return;
+        }
+        // Decode each block from its slice and insert at `Low` — identical to
+        // the per-key `read_decoded_block` cache fill.
+        let mut cursor = 0usize;
+        for run in &runs {
+            for &bi in run {
+                let entry = &self.index_entries[bi];
+                let sz = entry.block_size as usize;
+                let slice = &buf[cursor..cursor + sz];
+                cursor += sz;
+                if let Ok(decoded) = self.decode_block_from_slice(slice) {
+                    self.cache_insert_decoded(entry.block_offset, &decoded, CachePriority::Low);
+                }
+            }
+        }
+    }
+
     /// Returns the number of index entries (one per data block).
     /// Used by streaming callers (e.g. compaction) to iterate blocks via
     /// [`Self::read_block_at`].
@@ -1739,6 +1860,101 @@ mod tests {
             reader.cache_get_decoded(off0).is_some(),
             "second prime must leave block 0 cache-resident (idempotent)"
         );
+    }
+
+    /// FRS-MULTIGET-COALESCE: `prefetch_blocks_for_keys` (the
+    /// `RetrieveMultipleBlocks` analogue) warms the decoded-block cache for every
+    /// candidate block of a multi-key batch with ONE coalesced vectored read, so
+    /// the per-key `get_versions` loop that follows issues ZERO additional file
+    /// reads — proving the I/O collapse. A counting `RandomAccessFile` measures it.
+    #[test]
+    fn prefetch_blocks_for_keys_coalesces_io_then_get_versions_is_free() {
+        use crate::cache::clock::ShardedClockCache;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingFile {
+            data: Arc<Vec<u8>>,
+            reads: Arc<AtomicU64>,
+        }
+        impl RandomAccessFile for CountingFile {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                let start = offset as usize;
+                if start >= self.data.len() {
+                    return Ok(0);
+                }
+                let end = std::cmp::min(start + buf.len(), self.data.len());
+                buf[..end - start].copy_from_slice(&self.data[start..end]);
+                Ok(end - start)
+            }
+            fn file_size(&self) -> ForstResult<u64> {
+                Ok(self.data.len() as u64)
+            }
+        }
+
+        // Small block_size → many blocks; pick keys spanning several blocks.
+        let data = write_test_sst(2000);
+        let reads = Arc::new(AtomicU64::new(0));
+        let file = Box::new(CountingFile {
+            data: Arc::clone(&data),
+            reads: Arc::clone(&reads),
+        });
+        let cache: Arc<dyn BlockCache> = Arc::new(ShardedClockCache::new(64 * 1024 * 1024, 4));
+        let reader = SstReaderImpl::open(file)
+            .unwrap()
+            .with_block_cache(cache, 1, 7);
+        assert!(
+            reader.index_entry_count() >= 4,
+            "need several blocks to exercise coalescing (got {})",
+            reader.index_entry_count()
+        );
+
+        // Keys scattered across the keyspace (so they hit distinct blocks).
+        let owned: Vec<Vec<u8>> = (0..2000)
+            .step_by(137)
+            .map(|i| format!("key_{:05}", i).into_bytes())
+            .collect();
+        let keys: Vec<&[u8]> = owned.iter().map(|k| k.as_slice()).collect();
+
+        // Coalesced prefetch: the reads it issues should be FAR fewer than the
+        // number of distinct blocks (contiguous runs collapse into one read),
+        // and crucially <= the number of keys.
+        let before = reads.load(Ordering::SeqCst);
+        reader.prefetch_blocks_for_keys(&keys);
+        let prefetch_reads = reads.load(Ordering::SeqCst) - before;
+        assert!(
+            prefetch_reads >= 1,
+            "a cold multi-block batch must issue at least one read"
+        );
+        assert!(
+            prefetch_reads <= keys.len() as u64,
+            "coalesced reads ({prefetch_reads}) must not exceed key count ({})",
+            keys.len()
+        );
+
+        // After the warm, every key's get_versions serves from cache → 0 reads.
+        let before_get = reads.load(Ordering::SeqCst);
+        let mut found = 0;
+        for &k in &keys {
+            let v = reader.get_versions(k).unwrap();
+            if !v.is_empty() {
+                found += 1;
+            }
+        }
+        let get_reads = reads.load(Ordering::SeqCst) - before_get;
+        assert_eq!(found, keys.len(), "every probed key must resolve");
+        assert_eq!(
+            get_reads, 0,
+            "get_versions after prefetch must hit warm cache (0 file reads), got {get_reads}"
+        );
+
+        // No-cache reader: prefetch is a clean no-op (no panic, nothing warmed).
+        let file2 = Box::new(CountingFile {
+            data: Arc::clone(&data),
+            reads: Arc::new(AtomicU64::new(0)),
+        });
+        let reader2 = SstReaderImpl::open(file2).unwrap();
+        reader2.prefetch_blocks_for_keys(&keys); // must not panic / must no-op
     }
 
     /// FRS-WA-V2a-1 (KV separation groundwork): a `BlobRef` entry (op 17 =

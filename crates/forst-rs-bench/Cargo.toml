@@ -117,6 +117,13 @@ harness = false
 name = "probe_open_bloom_prune"
 harness = false
 
+# FRS-MULTIGET-COALESCE (Phase-2 disagg): coalesced SST multi-key block read on
+# the L1+ batch point-lookup path (RetrieveMultipleBlocks) — off vs on under a
+# RTT-bearing sim-S3 FS.
+[[bench]]
+name = "multiget_coalesce"
+harness = false
+
 # APPROACH-1 (2026-06-15 omnipotent rethink §4.1): persistent seekable probe
 # iterator — read-amp (q7 win) + memory-additive (q9 fix) mini-bench.
 [[bench]]
