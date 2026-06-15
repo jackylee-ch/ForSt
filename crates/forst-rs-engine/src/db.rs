@@ -679,6 +679,86 @@ fn probe_bloom_prune_enabled() -> bool {
     )
 }
 
+/// FRS-RS-LEVELED-HOT-CF (Approach 1, `2026-06-15-q7-approach1-leveled-hot-cf-design.md`):
+/// gate for the leveled-bottom-level discipline on hot interval-join probe CFs.
+/// Default-OFF: when unset the L0 rollup fires at the normal
+/// `l0_compaction_trigger` (today's path; byte- AND behavior-identical). When
+/// `FRS_RS_LEVELED_HOT_CF=1`, a CF whose runtime probe fan-out has crossed
+/// [`leveled_hot_cf_fanout_min`] (the data-driven "this is a long-running
+/// interval join" signal — same `n_overlap` the R1 S2 selector samples) is
+/// ARMED: its effective L0 rollup trigger drops to [`leveled_hot_cf_l0_trigger`]
+/// so its overlapping L0 tail is folded promptly into the leveled, non-overlapping
+/// bottom level (the dynamic-level picker + the output split already produce a
+/// non-overlapping Ln). A probe on an armed CF then locates `≈ small-L0 + #levels`
+/// sources instead of `rounds` — bounding the per-probe source COUNT at the
+/// layout level (the §4.1 read-amp root, mini-bench-confirmed 13.3× at fan-out
+/// 128). The emitted (key,value,seq) stream is IDENTICAL — compaction never
+/// changes the visible rows, only how many SSTs they live across — so this is a
+/// pure layout/scheduling lever, not a content change. Composes with MR-1 (fewer
+/// residual cold opens) and KV-sep (the LSM carries 36-B pointers, so leveling is
+/// cheap). A shallow/point CF (q8/q12/q17) never crosses the fan-out threshold and
+/// is left on the cheap tiered path (no shallow regression). Read LIVE (not
+/// `OnceLock`-cached) so the regression tests toggle it per-case; the check runs
+/// once per auto-compact decision, off the per-row hot path.
+fn leveled_hot_cf_enabled() -> bool {
+    // Programmatic override wins (test/bench A/B fixtures, no env race): 0 = unset
+    // (read env), 1 = forced OFF, 2 = forced ON. Mirrors `S2_PINNED_OVERRIDE`.
+    match LEVELED_HOT_CF_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    matches!(
+        std::env::var("FRS_RS_LEVELED_HOT_CF").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// FRS-RS-LEVELED-HOT-CF: programmatic override for [`leveled_hot_cf_enabled`]
+/// (test/bench A/B fixtures). `0` = unset (read env), `1` = forced OFF, `2` =
+/// forced ON. Mirrors `S2_PINNED_OVERRIDE` so in-process fixtures flip the gate
+/// without racing the env across the parallel suite.
+static LEVELED_HOT_CF_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-RS-LEVELED-HOT-CF: force the leveled-hot-CF gate ON (`Some(true)`) / OFF
+/// (`Some(false)`) or restore the env-flag behaviour (`None`). Affects
+/// auto-compact decisions made AFTER the call.
+pub fn set_leveled_hot_cf_override(v: Option<bool>) {
+    LEVELED_HOT_CF_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-RS-LEVELED-HOT-CF: the per-probe overlap fan-out at which a CF earns the
+/// leveled-bottom policy. Override with `FRS_RS_LEVELED_HOT_CF_FANOUT_MIN`
+/// (default 8 — matches the R1 S2 deep/shallow split, so the same probes that win
+/// the loser tree arm the leveled layout). A CF whose probes never reach this
+/// fan-out stays tiered.
+fn leveled_hot_cf_fanout_min() -> u64 {
+    std::env::var("FRS_RS_LEVELED_HOT_CF_FANOUT_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(8)
+}
+
+/// FRS-RS-LEVELED-HOT-CF: the effective L0→Ln rollup trigger for an ARMED CF.
+/// Override with `FRS_RS_LEVELED_HOT_CF_L0_TRIGGER` (default 4 — keep L0 shallow
+/// so the probe's L0 tail is bounded; the bottom level absorbs the rest into a
+/// non-overlapping run). Only consulted for armed CFs when the flag is ON.
+fn leveled_hot_cf_l0_trigger() -> u32 {
+    std::env::var("FRS_RS_LEVELED_HOT_CF_L0_TRIGGER")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4)
+}
+
 /// FRS-SCAN-COLD-PRIME (Phase-2 cycle 2): gate for the concurrent k-way scan
 /// cold-start prime (design `2026-06-13-concurrent-scan-cold-start-prime`).
 /// Default-OFF: when unset the merge cold-starts exactly as before
@@ -4559,6 +4639,48 @@ impl DbImpl {
         self.sequence_number.store(seq, Ordering::Release);
     }
 
+    /// FRS-RS-LEVELED-HOT-CF (Approach 1): the effective L0 rollup trigger for
+    /// `cf_data`. The base trigger is the write-controller's
+    /// `l0_compaction_trigger` (today's value — returned verbatim whenever the
+    /// leveled-hot-CF flag is OFF, so the build is byte/behavior-identical). When
+    /// the flag is ON and this CF has been ARMED by its runtime probe fan-out
+    /// (`peak_probe_fanout >= leveled_hot_cf_fanout_min`), the trigger drops to
+    /// the (lower) [`leveled_hot_cf_l0_trigger`] so the CF's overlapping L0 tail
+    /// is folded promptly into the leveled, non-overlapping bottom level — bounding
+    /// the per-probe source COUNT. A CF that never fans out deep keeps the base
+    /// trigger (no shallow regression). The min keeps the armed trigger from ever
+    /// being LARGER than the base (arming only tightens, never loosens).
+    fn effective_l0_trigger_for_cf(&self, cf_data: &Arc<ColumnFamilyData>) -> u32 {
+        let base = self.write_controller.config().l0_compaction_trigger;
+        if leveled_hot_cf_enabled() && cf_data.peak_probe_fanout() >= leveled_hot_cf_fanout_min() {
+            base.min(leveled_hot_cf_l0_trigger())
+        } else {
+            base
+        }
+    }
+
+    /// FRS-RS-LEVELED-HOT-CF (Approach 1) test/diagnostic hook: reports whether
+    /// the CF named `cf_name` is currently ARMED for the leveled-bottom policy —
+    /// i.e. the leveled-hot-CF gate is ON AND the CF's effective L0 rollup trigger
+    /// has been tightened below the base trigger by its observed probe fan-out.
+    /// Returns `false` when the flag is OFF, the CF is unknown, or the CF has not
+    /// fanned out deep enough to arm. Used by the byte-identity falsifier to prove
+    /// the fixture actually exercises the armed arm (so byte-equality is not
+    /// vacuous).
+    pub fn leveled_hot_cf_armed_by_name(&self, cf_name: &str) -> bool {
+        let cf_data = {
+            let cfs = self.cfs.read().expect("cfs lock poisoned");
+            match cfs.values().find(|cf| cf.handle().name() == cf_name) {
+                Some(cf) => cf.clone(),
+                None => return false,
+            }
+        };
+        let base = self.write_controller.config().l0_compaction_trigger;
+        leveled_hot_cf_enabled()
+            && cf_data.peak_probe_fanout() >= leveled_hot_cf_fanout_min()
+            && self.effective_l0_trigger_for_cf(&cf_data) < base
+    }
+
     /// If the current L0 file count is at or above the slowdown trigger,
     /// run an L0→L1 compaction. Returns `Ok(())` either way.
     fn maybe_auto_compact(&self, cf_data: &Arc<ColumnFamilyData>) -> ForstResult<()> {
@@ -4578,7 +4700,11 @@ impl DbImpl {
         // [historical: "2026-05-30: tried a low L0 compaction trigger (4)…it
         //  stalled EARLIER from frequent INLINE compaction on the flush worker"
         //  — that inline coupling is exactly what FRS-COMPACT-BG removed.]
-        let trigger = self.write_controller.config().l0_compaction_trigger;
+        // FRS-RS-LEVELED-HOT-CF (Approach 1): armed hot-probe CFs roll up at a
+        // lower effective trigger so their bottom level stays a non-overlapping
+        // leveled run (bounded per-probe source count). Flag-OFF/unarmed ⇒ the
+        // base trigger, byte/behavior-identical.
+        let trigger = self.effective_l0_trigger_for_cf(cf_data);
         if l0_count >= trigger {
             // R46-L3: surface which CF triggered the auto-compaction and
             // how many engine-global L0 files are about to be absorbed.
@@ -4639,7 +4765,6 @@ impl DbImpl {
     /// and avoid introducing new deeper-level compaction work that could add
     /// background SST uploads to the checkpoint drain on the S3 path.
     fn cfs_due_for_compaction(&self) -> Vec<Arc<ColumnFamilyData>> {
-        let trigger = self.write_controller.config().l0_compaction_trigger;
         let version = self.version_set.current();
         let cfs: Vec<Arc<ColumnFamilyData>> = {
             let guard = self.cfs.read().expect("lock poisoned");
@@ -4663,7 +4788,10 @@ impl DbImpl {
                     .iter()
                     .filter(|f| f.cf_id == cf_id && !(lifecycle_on && f.max_death != 0))
                     .count() as u32;
-                l0_count >= trigger
+                // FRS-RS-LEVELED-HOT-CF (Approach 1): per-CF effective trigger —
+                // armed hot-probe CFs roll up sooner; flag-OFF/unarmed CFs use the
+                // base trigger (identical to the prior single-value behavior).
+                l0_count >= self.effective_l0_trigger_for_cf(cf_data)
             })
             .collect()
     }
@@ -10604,6 +10732,18 @@ impl DbImpl {
             upper_slice,
             &mut overlapping_ssts,
         );
+        // FRS-RS-LEVELED-HOT-CF (Approach 1): arm this CF for the leveled-bottom
+        // policy when its per-probe overlap fan-out crosses the threshold. Gated
+        // by the flag so the OFF path pays NOTHING beyond one env read (no CF
+        // lookup, no atomic): a build with the flag OFF is byte/behavior-identical.
+        // `note_probe_fanout` is monotone `fetch_max`, so the background
+        // compaction's `effective_l0_trigger_for_cf` then rolls this CF up sooner.
+        if leveled_hot_cf_enabled() && overlapping_ssts.len() as u64 >= leveled_hot_cf_fanout_min()
+        {
+            if let Ok(cf_data) = self.lookup_cf_by_id(cf.id()) {
+                cf_data.note_probe_fanout(overlapping_ssts.len() as u64);
+            }
+        }
         // R1: resolve the per-scan S2 pinned/loser-tree choice now that the
         // overlap fan-out is known. `Force(_)` returns the caller's flag
         // (byte-identical to pre-R1); `Adaptive` engages the pinned merge only

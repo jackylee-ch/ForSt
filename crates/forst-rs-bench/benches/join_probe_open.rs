@@ -388,11 +388,89 @@ fn bench_join_probe_leveled_vs_tiered(c: &mut Criterion) {
     std::env::remove_var("FRS_L0_SLOWDOWN_TRIGGER");
 }
 
+/// APPROACH 1 (shipped, `FRS_RS_LEVELED_HOT_CF`): the per-probe located-SOURCE-
+/// COUNT collapse, measured through the REAL stream API (`debug_source_count`).
+///
+/// The `bench_join_probe_leveled_vs_tiered` group above measures per-probe TIME;
+/// this group quantifies the underlying lever directly: the number of tier
+/// sources a probe's k-way merge fans out over. `tiered` = today's deep L0 (a
+/// probe locates ~`rounds` overlapping SSTs); `leveled` = after the bottom level
+/// is collapsed to one non-overlapping run (`compact_range`, the steady state an
+/// ARMED hot CF converges to once its tightened L0 trigger rolls the tail down) =
+/// a probe locates ≈#levels sources regardless of join duration. This is the
+/// "source count leveled vs tiered" number the design's read-amp argument rests
+/// on (it should match the KV-sep 69→6 file-count collapse the omnipotent-rethink
+/// §1.A measured). Printed once per `rounds`, then a no-op timed body so the group
+/// also records that locating ≤few sources is ~flat in `rounds`.
+fn bench_join_probe_leveled_source_count(c: &mut Criterion) {
+    use std::sync::Mutex;
+
+    std::env::set_var("FRS_L0_COMPACTION_TRIGGER", "100000");
+    std::env::set_var("FRS_L0_STOP_TRIGGER", "100000");
+    std::env::set_var("FRS_L0_SLOWDOWN_TRIGGER", "100000");
+
+    let deep_keys = 64u32;
+    let build_deep = |rounds: u32| -> Arc<DbImpl> {
+        let db = open_in_memory(4096);
+        let cf = db.default_cf();
+        for round in 0..rounds {
+            for jk in 0..deep_keys {
+                let mut k = [0u8; 8];
+                k[..4].copy_from_slice(&jk.to_be_bytes());
+                k[4..].copy_from_slice(&round.to_be_bytes());
+                db.put(&cf, &k, &[0xCDu8; 64]).expect("put");
+            }
+            db.switch_and_flush(&cf).expect("switch+flush");
+        }
+        db
+    };
+    let prefix4 = |jk: u32| -> [u8; 4] { jk.to_be_bytes() };
+    let source_count = |db: &Arc<DbImpl>, prefix: &[u8]| -> usize {
+        let cf = db.default_cf();
+        let s = db
+            .prefix_scan_stream_with_error_slot(&cf, prefix, Arc::new(Mutex::new(None)))
+            .expect("open stream");
+        s.debug_source_count()
+    };
+
+    let mut group = c.benchmark_group("join_probe_leveled_source_count");
+    for &rounds in &[8u32, 32, 64, 128] {
+        let db_tiered = build_deep(rounds);
+        let tiered_n = source_count(&db_tiered, &prefix4(7));
+
+        let db_leveled = build_deep(rounds);
+        let _ = db_leveled
+            .compact_range(&db_leveled.default_cf())
+            .expect("compact_range");
+        let leveled_n = source_count(&db_leveled, &prefix4(7));
+
+        eprintln!(
+            "APPROACH-1 source-count rounds={rounds:3}: tiered={tiered_n:3} leveled={leveled_n:3} \
+             collapse={:.1}x",
+            tiered_n as f64 / leveled_n.max(1) as f64
+        );
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("leveled_locate_{rounds}")),
+            &rounds,
+            |b, &_n| {
+                b.iter(|| black_box(source_count(&db_leveled, &prefix4(7))));
+            },
+        );
+    }
+    group.finish();
+
+    std::env::remove_var("FRS_L0_COMPACTION_TRIGGER");
+    std::env::remove_var("FRS_L0_STOP_TRIGGER");
+    std::env::remove_var("FRS_L0_SLOWDOWN_TRIGGER");
+}
+
 criterion_group!(
     benches,
     bench_join_probe_open,
     bench_join_probe_fill_into,
     bench_join_probe_adaptive,
-    bench_join_probe_leveled_vs_tiered
+    bench_join_probe_leveled_vs_tiered,
+    bench_join_probe_leveled_source_count
 );
 criterion_main!(benches);

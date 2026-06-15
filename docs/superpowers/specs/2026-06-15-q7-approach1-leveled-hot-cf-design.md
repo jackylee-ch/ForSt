@@ -220,6 +220,51 @@ probes. No new design here — 1b is the already-shipped half; this doc is 1a.
 
 ---
 
+## 6.1 BUILD STATUS — SHIPPED (2026-06-15, this cycle)
+
+Approach 1 (1a) is implemented behind `FRS_RS_LEVELED_HOT_CF` (default-OFF),
+per-CF data-driven arming, byte-identical when OFF:
+
+- **Per-CF arming signal** — `ColumnFamilyData::{peak_probe_fanout,
+  note_probe_fanout}` (`column_family.rs`): a monotone `fetch_max` of the
+  per-probe overlap fan-out, fed from the SAME `overlapping_ssts.len()` the R1 S2
+  selector computes (`db.rs` `build_lazy_prefix_key_stream_sel`, gated so the OFF
+  path does ZERO extra work — no CF lookup, no atomic).
+- **Effective trigger** — `DbImpl::effective_l0_trigger_for_cf` (`db.rs`): an
+  armed CF (`peak_probe_fanout >= FRS_RS_LEVELED_HOT_CF_FANOUT_MIN`, default 8)
+  rolls up at the tightened `FRS_RS_LEVELED_HOT_CF_L0_TRIGGER` (default 4) so its
+  overlapping L0 tail folds promptly into the leveled, non-overlapping bottom
+  level the dynamic-level picker + output-split already produce. Wired into BOTH
+  `maybe_auto_compact` and the maintenance ticker's `cfs_due_for_compaction`.
+  `.min(base)` guarantees arming only ever TIGHTENS the trigger (never loosens).
+- **Flag + override** — `leveled_hot_cf_enabled` + `set_leveled_hot_cf_override`
+  (`db.rs`, exported), mirroring the `S2_PINNED_OVERRIDE` convention.
+- **Composition unchanged** — content is byte-identical (compaction never alters
+  the visible row stream); only WHICH/HOW-MANY SSTs the rows live across changes.
+
+**Read-side evidence, this worktree (criterion + the SHIPPED stream API):**
+
+| rounds | tiered probe | leveled probe | located sources tiered→leveled |
+|---:|---:|---:|---:|
+| 8   | 6.28 µs  | 5.80 µs | **8 → 1** |
+| 32  | 28.76 µs | 10.10 µs | **32 → 1** |
+| 64  | 72.51 µs | 12.04 µs | **64 → 1** |
+| 128 | (linear) | ~15 µs (flat) | (128 → 1) |
+
+`bench_join_probe_leveled_source_count` (new) reads `debug_source_count()` off the
+real `prefix_scan_stream` and prints the collapse: the tiered probe locates
+`rounds` overlapping SSTs; the leveled (collapsed-bottom) probe locates exactly
+**1** — the per-probe source COUNT is bounded at the layout level, independent of
+join duration. This matches the KV-sep 69→6 file-count collapse class
+(omnipotent-rethink §1.A) and is the direct measurement the read-amp argument
+rests on.
+
+**Correctness gates met:** C0 (engine lib 425/0, storage lib 481/0), C1
+byte-identity OFF-vs-ON (deep + shallow, `tests/leveled_hot_cf_it.rs`), C4
+no-shallow-regression (a 1-source CF never arms), plus the remote_compaction_it
+byte-identity falsifier (4/4) and r1_adaptive_s2 (the sibling fan-out lever)
+still green. fmt + clippy --all-targets + `RUSTDOCFLAGS=-D warnings` doc clean.
+
 ## 7. Next cycle candidate (stated for continuity)
 
 After Approach 1 micro-gates: if the leveled-vs-tiered arm PASSES, build §5.3 (the

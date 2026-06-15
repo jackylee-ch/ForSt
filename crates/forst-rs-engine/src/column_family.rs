@@ -515,6 +515,17 @@ pub struct ColumnFamilyData {
     /// swappable like `lifecycle`/`compaction_filter`; reclamation of the
     /// out-of-range remainder is left to normal compaction (design §10 DR4).
     clip_range: ArcSwapOption<KeyRange>,
+    /// FRS-RS-LEVELED-HOT-CF (Approach 1, `2026-06-15-q7-approach1-leveled-hot-cf-design.md`):
+    /// runtime peak per-probe overlap fan-out observed on this CF's interval-join
+    /// probe path (`note_probe_fanout`, `fetch_max`). `0` = no probe sampled yet.
+    /// This is the data-driven arming signal: a CF whose probes fan out deep
+    /// (a long-running interval join: q7/q9/q20) earns the leveled-bottom policy;
+    /// a shallow/point CF (q8/q12/q17) never crosses the threshold and stays on
+    /// the cheap tiered path. Sampled from the SAME `n_overlap` the R1 S2 selector
+    /// already computes per scan — no extra probe-path work. Inert unless the
+    /// `FRS_RS_LEVELED_HOT_CF` flag is ON (the engine reads it only then), so a
+    /// build with the flag OFF is byte- and behavior-identical.
+    peak_probe_fanout: AtomicU64,
 }
 
 /// FRS-RESIDENT-FLUSHED entry: a flushed memtable retained in RAM, tagged with
@@ -607,7 +618,28 @@ impl ColumnFamilyData {
             watermark: AtomicU64::new(0),
             max_event_time: AtomicU64::new(0),
             clip_range: ArcSwapOption::empty(),
+            peak_probe_fanout: AtomicU64::new(0),
         }
+    }
+
+    /// FRS-RS-LEVELED-HOT-CF (Approach 1): the peak per-probe overlap fan-out
+    /// observed on this CF (`0` = none sampled yet). Read by the leveled-hot-CF
+    /// arming decision; cheap relaxed load.
+    #[inline]
+    pub fn peak_probe_fanout(&self) -> u64 {
+        self.peak_probe_fanout.load(Ordering::Relaxed)
+    }
+
+    /// FRS-RS-LEVELED-HOT-CF (Approach 1): records a per-probe overlap fan-out
+    /// observation, keeping the running maximum (`fetch_max`). Called from the
+    /// interval-join probe build with the located overlapping-SST count — the
+    /// SAME `n_overlap` the R1 S2 selector already computes — so it adds only one
+    /// relaxed atomic per scan and no I/O. Monotonic: a single shallow probe can
+    /// never disarm a CF that has fanned out deep.
+    #[inline]
+    pub fn note_probe_fanout(&self, n_overlap: u64) {
+        self.peak_probe_fanout
+            .fetch_max(n_overlap, Ordering::Relaxed);
     }
 
     /// FRS-PHASE2-C2U3 (rescale-by-clip, design §10): returns the CF's
