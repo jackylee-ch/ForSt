@@ -229,6 +229,80 @@ Each lever is orthogonal and default-OFF; the uniform-best config stacks them.
 2. **Negative-cache for absent segments** — a scan/batch that repeatedly probes
    keys whose segment was GC'd pays a remote miss each time; a small negative
    cache (segment_id → absent) short-circuits.
-3. **Multi-window depth ≥ 2 readahead** — generalize the one-window look-ahead to
-   a configurable depth when consume ≫ rtt (deeper pipeline), bounded by a
-   resident-bytes budget.
+3. ~~**Multi-window depth ≥ 2 readahead**~~ — **DONE this cycle (cycle 7), see §7.**
+
+---
+
+## 7. Cycle-7 addendum — configurable look-ahead DEPTH (the read-bound fix)
+
+**Flag:** `FRS_VLOG_SCAN_READAHEAD_DEPTH` (default `1` ⇒ byte-AND-timing-identical
+to the cycle-6 one-window-deep path); clamped `[1, 64]`; test/bench hook
+`set_vlog_scan_readahead_depth_override`.
+
+### 7.1 Why depth-1 was insufficient on the remote tier
+
+The cycle-6 look-ahead keeps **exactly one** window in flight. It hides at most
+`min(rtt, consume)` of the per-window remote read: while the consumer drains window
+`k` (cost `consume`), window `k+1`'s read (cost `rtt`) overlaps — but only for
+`consume` of it. When **`rtt > consume`** (the disagg-typical regime: a coalesced
+remote GET dominates a light downstream operator drain), the consumer still stalls
+`rtt − consume` per window. Mini-bench (RTT=23 ms, consume=rtt/4, Wn=32): depth-1
+= **1067 ms ≈ 1.01× over serial** — the look-ahead is nearly inert because one
+in-flight window can't cover a read 4× longer than a drain.
+
+### 7.2 Design — a depth-`D` in-flight FIFO
+
+`ScanCoalesceIter` now holds `prefetch: VecDeque<WindowPrefetch>` (was
+`Option<WindowPrefetch>`) and a `depth` resolved once at construction. `next`:
+
+```
+ready empties:
+    refill: while !inner_done && prefetch.len() < depth: assemble+launch a window
+    join the FRONT (oldest) window → ready
+    (loop refills again next time ready empties)
+```
+
+`D` windows resolve **concurrently** on the read-I/O pool, so a resolved window is
+ready the moment the consumer finishes the previous drain, as long as
+`D · consume >= rtt`. Steady state becomes `consume`-bound — the iterator-side
+analogue of ForSt's multiple parallel read threads. Effective concurrency is
+`min(D, pool_width)` (`pool_width = clamp(cores/2, 2, 6)`). **Order is preserved**:
+`assemble_window` (the only phase that advances the inner cursor) still runs on the
+consumer thread in window order; only the FIFO of resolves grows. Windows resolve
+out of order on the pool but are JOINED front-first, restoring emit order. Extra
+buffered rows bounded to `(D + 1) · W`. Depth `1` ⇒ the FIFO holds ≤ 1 entry =
+the cycle-6 path exactly.
+
+### 7.3 Byte-identity TDD
+
+* `test_vlog_scan_readahead_depth_byte_identical_kvsep_remote` — remote KV-sep
+  scan, depths {1, 2, 4, 8} each reproduce the readahead-OFF baseline EXACTLY
+  (rows + order) and each engages (launches ≥ 2 windows).
+* `test_vlog_scan_readahead_depth_default_and_override` — default `1`, override
+  clamps to `[1, 64]`, clearing restores default.
+* Engine lib suite: **428/0** (4 ignored); fmt / clippy / rustdoc-strict clean.
+
+### 7.4 Mini-bench — depth-D latency hiding (sim-S3, RTT=23 ms, 50 Gb/s throttle)
+
+`vlog_scan_readahead.rs` extended to a depth-`D` FIFO model (`readahead_scan_depth`)
+sweeping depth × windows × consume/rtt. Read-bound regime (consume = rtt/4), Wn=32:
+
+| depth | wall (ms) | vs serial | vs depth-1 |
+|------:|----------:|----------:|-----------:|
+| 1     | 1067      | 1.01×     | 1.00×      |
+| 2     |  549      | 1.97×     | 1.94×      |
+| 4     |  295      | 3.66×     | 3.61×      |
+| 8     |  250      | 4.32×     | **4.26×**  |
+
+Honest negatives: when `consume >= rtt` (drain-bound) depth-1 already saturates and
+deeper adds ~nothing (depth-2 ≈ depth-8); and depth-1 can trail serial by ~2-6% on
+small scans (the pool-hop is pure overhead when the read can't be hidden) — depth-2+
+always recovers. So **depth is the lever specifically for the read-bound disagg
+regime** (`rtt > consume`), which is exactly the disaggregated-S3 case the goal
+targets. `--smoke` asserts deep-over-depth-1 > 1.3× in the read-bound regime.
+
+### 7.5 Next-cycle candidate
+
+* **Resident-bytes budget on look-ahead depth** — auto-tune `D` from the observed
+  rtt/consume ratio and a buffered-bytes cap, so the pipeline self-sizes to the
+  measured remote latency instead of a static env knob.

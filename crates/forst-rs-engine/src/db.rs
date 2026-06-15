@@ -455,6 +455,59 @@ fn vlog_scan_readahead_window_override() -> Option<usize> {
         .map(|v| v.clamp(1, 65536))
 }
 
+/// FRS-VLOG-SCAN-READAHEAD: look-ahead DEPTH — how many windows the iterator keeps
+/// in flight on the read-I/O pool ahead of the one being consumed
+/// (`FRS_VLOG_SCAN_READAHEAD_DEPTH`, **DEFAULT 1**). Depth `1` is the cycle-6
+/// one-window-deep look-ahead (byte-AND-timing-identical to that path); depth `D`
+/// keeps `D` windows resolving concurrently so that when the consumer drains
+/// window `k` and joins window `k+1`, windows `k+2..k+1+D` are ALREADY in flight.
+///
+/// # Why depth matters (the cross-window latency model)
+///
+/// Depth-1 look-ahead hides at most `min(rtt, consume)` per window — when the
+/// modeled remote read `rtt` EXCEEDS the per-window `consume` time it cannot be
+/// fully hidden by a single in-flight window (the consumer drains window `k` in
+/// `consume`, then still waits `rtt - consume` for window `k+1`). With depth `D`,
+/// `D` windows resolve in parallel on the read-I/O pool, so as long as
+/// `D · consume >= rtt` the consumer NEVER stalls on a window read — the steady
+/// state becomes `consume`-bound, mirroring ForSt's multiple parallel read
+/// threads. The depth is the pipeline's stage count; the read-I/O pool width
+/// (`clamp(cores/2, 2, 6)`) bounds the achievable parallelism, so the effective
+/// concurrency is `min(D, pool_width)`.
+///
+/// Clamped to `[1, 64]`. Read LIVE (test/bench-toggleable). When the
+/// [`vlog_scan_readahead_depth_override`] test hook is set it takes precedence.
+fn vlog_scan_readahead_depth() -> usize {
+    let ov = VLOG_SCAN_READAHEAD_DEPTH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if ov != 0 {
+        return (ov as usize).clamp(1, 64);
+    }
+    std::env::var("FRS_VLOG_SCAN_READAHEAD_DEPTH")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(1, 64))
+        .unwrap_or(1)
+}
+
+/// FRS-VLOG-SCAN-READAHEAD test/bench override for [`vlog_scan_readahead_depth`]:
+/// `0` = env/default, `1..=64` = forced depth. Stored as a `u8` (depth never
+/// exceeds 64).
+static VLOG_SCAN_READAHEAD_DEPTH_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-VLOG-SCAN-READAHEAD: forces the look-ahead depth for tests/benches
+/// (`None` = defer to `FRS_VLOG_SCAN_READAHEAD_DEPTH`; `Some(d)` clamps to
+/// `[1, 64]`).
+pub fn set_vlog_scan_readahead_depth_override(v: Option<usize>) {
+    VLOG_SCAN_READAHEAD_DEPTH_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(d) => d.clamp(1, 64) as u8,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// FRS-VLOG-SCAN-READAHEAD test override for [`vlog_scan_readahead_enabled`]:
 /// 0 = env/default, 1 = forced off, 2 = forced on.
 static VLOG_SCAN_READAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
@@ -18565,11 +18618,20 @@ struct ScanCoalesceIter {
     /// `None` ⇒ the legacy blocking `fill_window` (flag OFF / local FS / no
     /// `self_weak`). Set once at construction.
     readahead: Option<Weak<DbImpl>>,
-    /// FRS-VLOG-SCAN-READAHEAD: the NEXT window's in-flight resolution (at most
-    /// one window deep). `recv` yields the resolved rows (in slot order) or the
-    /// in-band deref error; on early drop the channel disconnects and the pool
-    /// job's send becomes a no-op (clean cancellation, nothing strands).
-    prefetch: Option<WindowPrefetch>,
+    /// FRS-VLOG-SCAN-READAHEAD: the in-flight window resolutions, in launch (==
+    /// emit) order — a FIFO of at most [`Self::depth`] windows resolving
+    /// concurrently on the read-I/O pool ahead of the one being consumed. The
+    /// front is the next window to JOIN; each `recv` yields the resolved rows (in
+    /// slot order) or the in-band deref error. On early drop every channel
+    /// disconnects and each pool job's send becomes a no-op (clean cancellation,
+    /// nothing strands). Depth `1` ⇒ this holds at most one entry, exactly the
+    /// cycle-6 one-window-deep look-ahead.
+    prefetch: std::collections::VecDeque<WindowPrefetch>,
+    /// FRS-VLOG-SCAN-READAHEAD: how many windows to keep in flight ahead of the
+    /// consumed one ([`vlog_scan_readahead_depth`], `>= 1`). Resolved once at
+    /// construction. Bounds the extra buffered rows to `(depth + 1) · W` and the
+    /// in-flight reads to `depth` windows' segments.
+    depth: usize,
 }
 
 /// FRS-VLOG-SCAN-READAHEAD: a single window's in-flight resolution, owned by the
@@ -18620,6 +18682,9 @@ impl ScanCoalesceIter {
         } else {
             None
         };
+        // Resolve the look-ahead depth once. Only meaningful when readahead is
+        // engaged; otherwise the legacy `fill_window` path ignores it.
+        let depth = vlog_scan_readahead_depth();
         Self {
             db,
             cf_data,
@@ -18628,7 +18693,8 @@ impl ScanCoalesceIter {
             ready: std::collections::VecDeque::new(),
             inner_done: false,
             readahead,
-            prefetch: None,
+            prefetch: std::collections::VecDeque::new(),
+            depth,
         }
     }
 
@@ -18800,36 +18866,45 @@ impl Iterator for ScanCoalesceIter {
             // the pool; join it here (the read has overlapped the drain), promote
             // its rows to `ready`, and immediately launch the window after it.
             if let Some(weak) = self.readahead.clone() {
-                // Ensure a window is in flight (the very first call has none — it
-                // launches, then immediately joins, so cold-start = one un-hidden
-                // RTT, exactly as the inline path's first window).
-                if self.prefetch.is_none() && !self.inner_done {
-                    self.prefetch = self.launch_prefetch(weak.clone());
-                    if self.prefetch.is_none() {
-                        // Nothing left to assemble.
-                        self.inner_done = true;
+                // Refill the in-flight FIFO up to `depth` windows so that as the
+                // consumer drains the joined window, the next `depth` windows are
+                // ALREADY resolving in parallel on the read-I/O pool. With depth 1
+                // this launches exactly one window then joins it (the cycle-6
+                // one-window-deep path, byte-AND-timing-identical). With depth `D`
+                // and `D · consume >= rtt`, the consumer never stalls on a read.
+                //
+                // `assemble_window` (inside `launch_prefetch`) ADVANCES the inner
+                // cursor — and it ALWAYS runs here on the consumer thread, in
+                // window order, exactly as the legacy path. Only WHEN each window's
+                // blob reads happen moves to the pool; the emitted row sequence is
+                // unchanged.
+                while !self.inner_done && self.prefetch.len() < self.depth {
+                    match self.launch_prefetch(weak.clone()) {
+                        Some(pf) => {
+                            let done_after = pf.inner_done_after;
+                            self.prefetch.push_back(pf);
+                            if done_after {
+                                // This window consumed the rest of the cursor; stop
+                                // launching but keep the queued windows to drain.
+                                self.inner_done = true;
+                            }
+                        }
+                        None => {
+                            // Cursor exhausted with nothing left to assemble.
+                            self.inner_done = true;
+                        }
                     }
                 }
                 // No window in flight and nothing left to assemble ⇒ the scan is
                 // exhausted (`?` returns `None` from `next`).
-                let pf = self.prefetch.take()?;
-                // Join the in-flight window. A channel disconnect (pool job
-                // panicked / DB torn down) yields an empty window — the scan ends
-                // cleanly rather than stranding.
+                let pf = self.prefetch.pop_front()?;
+                // Join the FRONT (oldest) in-flight window. A channel disconnect
+                // (pool job panicked / DB torn down) yields an empty window — the
+                // scan ends cleanly rather than stranding.
                 let rows = pf.rx.recv().unwrap_or_default();
                 self.ready.extend(rows);
-                if pf.inner_done_after {
-                    self.inner_done = true;
-                } else {
-                    // Look one window ahead: launch window k+1 so it overlaps the
-                    // drain of the window we just promoted.
-                    self.prefetch = self.launch_prefetch(weak);
-                    if self.prefetch.is_none() {
-                        self.inner_done = true;
-                    }
-                }
                 // A window can resolve to ZERO ready rows (all `Skip`) yet leave
-                // more inner rows; loop to join/launch again rather than return a
+                // more inner rows; loop to refill/join again rather than return a
                 // spurious None.
                 continue;
             }
@@ -20826,6 +20901,141 @@ mod tests {
         set_vlog_scan_readahead_override(None);
         set_vlog_scan_coalesce_override(None);
         set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD-DEPTH: deep look-ahead (`depth >= 2`) is byte-AND-
+    /// order-identical to the depth-1 path AND to the readahead-OFF baseline, on a
+    /// remote KV-separated scan. Proves the multi-window-in-flight FIFO never
+    /// reorders or drops rows regardless of how many windows resolve concurrently
+    /// on the read-I/O pool (the resolves complete out of order; the FIFO join
+    /// restores emit order). Also asserts each depth still ENGAGES the pipeline
+    /// (launches multiple windows). The depth is a pure timing knob.
+    #[test]
+    fn test_vlog_scan_readahead_depth_byte_identical_kvsep_remote() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        set_vlog_scan_coalesce_override(Some(true));
+        // Tiny window ⇒ many boundaries ⇒ a deep pipeline actually fills.
+        std::env::set_var("FRS_VLOG_SCAN_READAHEAD_WINDOW", "4");
+
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 200;
+        let build = || -> (Arc<DbImpl>, ColumnFamilyHandle) {
+            let opts = EngineOptions {
+                db_path: "/db".to_string(),
+                write_buffer_size: 2_000_000_000,
+                max_write_buffer_number: 8,
+                ..EngineOptions::default()
+            };
+            let fs: Arc<dyn FileSystem> = Arc::new(RemoteFakeFs::new());
+            let db = DbImpl::open_with_fs(opts, fs).expect("open remote-fake");
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("scan-ra-depth"))
+                .unwrap();
+            for i in 0..N as u32 {
+                let k = format!("row{i:05}").into_bytes();
+                let v = mkrand(0x1000 + i as u64, 256 + (i as usize % 64));
+                db.put(&cf, &k, &v).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 0");
+            for i in (0..N as u32).step_by(2) {
+                let k = format!("row{i:05}").into_bytes();
+                let v = mkrand(0x5000 + i as u64, 256 + (i as usize % 48));
+                db.put(&cf, &k, &v).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 1");
+            for i in (0..N as u32).step_by(17) {
+                let k = format!("row{i:05}").into_bytes();
+                db.delete(&cf, &k).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 2");
+            (db, cf)
+        };
+
+        let collect_scan = |db: &Arc<DbImpl>, cf: &ColumnFamilyHandle| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let slot: Arc<Mutex<Option<ForstError>>> = Arc::new(Mutex::new(None));
+            let it = db
+                .scan_iter_owned_arc_with_error_slot(cf, b"", None, Arc::clone(&slot))
+                .unwrap();
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = it
+                .map(|r| {
+                    let (k, v) = r.unwrap();
+                    (k.to_vec(), v.to_vec())
+                })
+                .collect();
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "no tier-peek error expected"
+            );
+            rows
+        };
+
+        // Baseline: readahead OFF.
+        set_vlog_scan_readahead_override(Some(false));
+        let (db_off, cf_off) = build();
+        let baseline = collect_scan(&db_off, &cf_off);
+        assert!(!baseline.is_empty(), "baseline scan produced rows");
+
+        // Readahead ON; sweep look-ahead depth. Every depth must reproduce the
+        // baseline EXACTLY (rows + order) and engage the pipeline.
+        set_vlog_scan_readahead_override(Some(true));
+        for depth in [1usize, 2, 4, 8] {
+            set_vlog_scan_readahead_depth_override(Some(depth));
+            assert_eq!(
+                vlog_scan_readahead_depth(),
+                depth,
+                "depth override must take effect"
+            );
+            let (db_on, cf_on) = build();
+            let launched_before = vlog_scan_readahead_launched();
+            let rows = collect_scan(&db_on, &cf_on);
+            let launched = vlog_scan_readahead_launched() - launched_before;
+            assert!(
+                launched >= 2,
+                "depth={depth}: readahead must launch multiple windows (launched={launched})"
+            );
+            assert_eq!(
+                rows, baseline,
+                "depth={depth}: deep readahead must be byte-AND-order-identical to OFF"
+            );
+        }
+
+        std::env::remove_var("FRS_VLOG_SCAN_READAHEAD_WINDOW");
+        set_vlog_scan_readahead_depth_override(None);
+        set_vlog_scan_readahead_override(None);
+        set_vlog_scan_coalesce_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD-DEPTH: the depth flag defaults to 1 and the override
+    /// clamps + flips deterministically.
+    #[test]
+    fn test_vlog_scan_readahead_depth_default_and_override() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_vlog_scan_readahead_depth_override(None);
+        std::env::remove_var("FRS_VLOG_SCAN_READAHEAD_DEPTH");
+        assert_eq!(vlog_scan_readahead_depth(), 1, "default depth is 1");
+        set_vlog_scan_readahead_depth_override(Some(5));
+        assert_eq!(vlog_scan_readahead_depth(), 5, "override sets depth");
+        set_vlog_scan_readahead_depth_override(Some(1000));
+        assert_eq!(vlog_scan_readahead_depth(), 64, "override clamps to 64");
+        set_vlog_scan_readahead_depth_override(None);
+        assert_eq!(
+            vlog_scan_readahead_depth(),
+            1,
+            "clearing override restores default"
+        );
     }
 
     /// FRS-VLOG-SCAN-READAHEAD: a mid-scan overwrite+flush yields the SAME rows as

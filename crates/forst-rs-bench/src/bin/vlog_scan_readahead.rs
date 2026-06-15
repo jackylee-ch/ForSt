@@ -122,36 +122,57 @@ impl Pool {
     }
 }
 
-/// READAHEAD (this cycle): launch window 0's read, then for each window join its
-/// in-flight read (overlapped with the PRIOR window's consume) and immediately
-/// launch the next window's read on the pool BEFORE consuming. Wall ≈
-/// `rtt + Wn·max(rtt, consume)` (the first read is un-hidden; thereafter each
-/// window costs the larger of its read or its consume). Mirrors
-/// `ScanCoalesceIter::next`'s join-then-launch-then-drain loop.
-fn readahead_scan(pool: &Pool, windows: usize, rtt: Duration, consume: Duration) -> Duration {
+/// A window's "resolution" = one modeled coalesced remote read, run on the pool,
+/// signalling completion over a oneshot channel (the consumer's join).
+fn launch_window(pool: &Pool, rtt: Duration) -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+    pool.submit(Box::new(move || {
+        std::thread::sleep(rtt); // window's coalesced remote read, overlapped
+        let _ = tx.send(());
+    }));
+    rx
+}
+
+/// READAHEAD depth-`D` (this cycle): keep up to `D` windows' reads in flight on the
+/// pool ahead of the one being consumed (a FIFO of receivers), join the FRONT
+/// (oldest) before each consume, and refill the FIFO back up to `D`. Mirrors
+/// `ScanCoalesceIter::next`'s refill-to-depth → join-front → drain loop.
+///
+/// * `D == 1` reproduces the cycle-6 one-window-deep look-ahead exactly:
+///   `rtt + Wn·max(rtt, consume)` — depth-1 can only hide one `consume` worth of
+///   the read, so when `rtt > consume` the consumer still stalls `rtt - consume`
+///   per window.
+/// * `D >= ceil(rtt / consume)` (and `D <= pool width`) fully hides the read:
+///   `D` windows resolve in parallel, so a resolved window is always ready when
+///   the consumer finishes the previous drain ⇒ steady state ≈ `Wn·consume`
+///   (`consume`-bound), mirroring ForSt's parallel read threads. Effective
+///   concurrency is `min(D, pool_width)`.
+fn readahead_scan_depth(
+    pool: &Pool,
+    windows: usize,
+    rtt: Duration,
+    consume: Duration,
+    depth: usize,
+) -> Duration {
+    let depth = depth.max(1);
     let t0 = Instant::now();
-    // A window's "resolution" = one modeled coalesced remote read, run on the
-    // pool, signalling completion over a oneshot channel (the consumer's join).
-    let launch = |pool: &Pool| -> mpsc::Receiver<()> {
-        let (tx, rx) = mpsc::channel();
-        pool.submit(Box::new(move || {
-            std::thread::sleep(rtt); // window's coalesced remote read, overlapped
-            let _ = tx.send(());
-        }));
-        rx
-    };
-    let mut prefetch = Some(launch(pool)); // window 0 in flight
+    let mut inflight: std::collections::VecDeque<mpsc::Receiver<()>> =
+        std::collections::VecDeque::with_capacity(depth);
+    let mut launched = 0usize;
     for k in 0..windows {
-        // Join the in-flight window (its read overlapped window k-1's consume).
-        if let Some(rx) = prefetch.take() {
+        // Refill the in-flight FIFO up to `depth` windows (bounded by what is left
+        // to scan) — these reads run concurrently on the pool.
+        while inflight.len() < depth && launched < windows {
+            inflight.push_back(launch_window(pool, rtt));
+            launched += 1;
+        }
+        // Join the FRONT (oldest) in-flight window — its read overlapped the prior
+        // windows' consumes (and the deeper windows' reads).
+        if let Some(rx) = inflight.pop_front() {
             let _ = rx.recv();
         }
-        // Look one window ahead: launch window k+1's read BEFORE consuming k, so
-        // it overlaps k's consume.
-        if k + 1 < windows {
-            prefetch = Some(launch(pool));
-        }
-        std::thread::sleep(consume); // consumer drains window k's rows
+        let _ = k;
+        std::thread::sleep(consume); // consumer drains this window's rows
     }
     t0.elapsed()
 }
@@ -173,63 +194,90 @@ fn main() {
         )
     };
 
+    let depths: Vec<usize> = if smoke {
+        vec![1, 2, 4]
+    } else {
+        std::env::var("FRS_VLOG_SCAN_READAHEAD_DEPTH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|d| vec![d])
+            .unwrap_or_else(|| vec![1, 2, 4, 8])
+    };
+
     println!(
-        "== vlog-scan READAHEAD latency-hiding cost model ==\n\
+        "== vlog-scan READAHEAD depth-D latency-hiding cost model ==\n\
          pool width = {pool_n} (clamp(cores/2,2,6); FRS_RS_PREFETCH_THREADS)\n\
          modeled per-window read RTT = {:.1} ms (FRS_MODEL_RTT_MS)\n\
-         serial    = Wn·(rtt + consume)\n\
-         readahead = rtt + Wn·max(rtt, consume)  (window k+1 read hides behind k's consume)\n",
+         serial      = Wn·(rtt + consume)\n\
+         depth-1     = rtt + Wn·max(rtt, consume)         (cycle-6: hides 1 consume)\n\
+         depth-D     ≈ rtt + Wn·max(rtt/min(D,pool), consume)  (D reads in parallel)\n\
+         depth-OPT fully hides the read once D >= ceil(rtt/consume) (& D <= pool)\n",
         ms(rtt)
-    );
-    println!(
-        "{:>9} {:>11} {:>13} {:>16} {:>9}",
-        "windows", "consume(ms)", "serial(ms)", "readahead(ms)", "speedup"
     );
 
     let pool = Pool::new(pool_n);
-    // Sweep windows × consume/rtt ratio. The win is largest when consume ≈ rtt
-    // (each window fully hides one RTT); it shrinks as consume ≫ rtt (consume
-    // dominates) or consume ≪ rtt (little to overlap), but never regresses.
-    let window_counts: Vec<usize> = if smoke {
-        vec![8, 16]
-    } else {
-        vec![4, 8, 16, 32]
-    };
+    // Sweep consume/rtt ratio × windows × depth. Depth pays off most when
+    // rtt > consume (a single in-flight window can't hide the whole read); when
+    // consume >= rtt depth-1 already saturates and deeper adds nothing (never
+    // regresses). Track the best deep-vs-depth1 win in the rtt-bound regime.
+    let window_counts: Vec<usize> = if smoke { vec![16] } else { vec![8, 32] };
+    // Include a read-bound ratio (consume = rtt/4) where depth is the lever.
     let consume_ratios: Vec<f64> = if smoke {
-        vec![1.0]
+        vec![0.25]
     } else {
-        vec![0.5, 1.0, 2.0]
+        vec![0.25, 1.0, 2.0]
     };
 
-    let mut min_speedup_at_parity = f64::INFINITY;
+    let mut best_deep_over_d1_readbound = 1.0f64;
     for &cr in &consume_ratios {
         let consume = consume_base.mul_f64(cr);
+        println!(
+            "\n-- consume/rtt = {cr} (consume = {:.1} ms) --",
+            ms(consume)
+        );
+        println!(
+            "{:>9} {:>13} {:>11} {:>13} {:>10} {:>13}",
+            "windows", "serial(ms)", "depth", "depth-D(ms)", "vs serial", "vs depth-1"
+        );
         for &wn in &window_counts {
             let s = serial_scan(wn, rtt, consume);
-            let r = readahead_scan(&pool, wn, rtt, consume);
-            let sp = ms(s) / ms(r).max(1e-9);
-            if (cr - 1.0).abs() < 1e-9 {
-                min_speedup_at_parity = min_speedup_at_parity.min(sp);
+            let mut d1 = f64::NAN;
+            for &d in &depths {
+                let r = readahead_scan_depth(&pool, wn, rtt, consume, d);
+                let vs_serial = ms(s) / ms(r).max(1e-9);
+                if d == 1 {
+                    d1 = ms(r);
+                }
+                let vs_d1 = d1 / ms(r).max(1e-9);
+                // Only deep (D>1) in the read-bound regime (consume < rtt) is the
+                // claim under test — depth must hide more of the read there.
+                if d > 1 && cr < 1.0 {
+                    best_deep_over_d1_readbound = best_deep_over_d1_readbound.max(vs_d1);
+                }
+                println!(
+                    "{wn:>9} {:>13.1} {d:>11} {:>13.1} {:>9.2}× {:>12.2}×",
+                    ms(s),
+                    ms(r),
+                    vs_serial,
+                    vs_d1
+                );
             }
-            println!(
-                "{wn:>9} {:>11.1} {:>13.1} {:>16.1} {:>8.2}×",
-                ms(consume),
-                ms(s),
-                ms(r),
-                sp
-            );
         }
     }
     pool.shutdown();
 
     if smoke {
-        // At consume ≈ rtt the readahead should hide ≈ one RTT per window ⇒
-        // approaching 2× as Wn grows; require a clear win (a collapse to serial
-        // means the pipeline join/launch interleave broke).
+        // In the read-bound regime (consume = rtt/4) a single in-flight window
+        // hides only ~1 consume of the 4-consume read; depth >= 2 must hide more,
+        // so deep readahead must beat depth-1 by a clear margin. A collapse to
+        // depth-1 means the multi-window FIFO refill broke.
         assert!(
-            min_speedup_at_parity > 1.3,
-            "readahead smoke: speedup at consume≈rtt collapsed ({min_speedup_at_parity:.2}× <= 1.3×)"
+            best_deep_over_d1_readbound > 1.3,
+            "depth smoke: deep readahead didn't beat depth-1 in the read-bound regime \
+             ({best_deep_over_d1_readbound:.2}× <= 1.3×)"
         );
-        println!("\nSMOKE OK: consume≈rtt speedup {min_speedup_at_parity:.2}× (> 1.3×).");
+        println!(
+            "\nSMOKE OK: deep-over-depth1 (read-bound) {best_deep_over_d1_readbound:.2}× (> 1.3×)."
+        );
     }
 }
