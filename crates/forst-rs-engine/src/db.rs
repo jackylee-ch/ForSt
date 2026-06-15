@@ -534,6 +534,23 @@ pub fn set_vlog_deref_fanout_override(v: Option<bool>) {
     );
 }
 
+/// FRS-VLOG-DEREF-LOCALITY (2026-06-15): process-global count of vlog SEGMENTS
+/// dispatched to the read-I/O pool by [`DbImpl::coalesced_vlog_deref_fanout`].
+/// Diagnostic only — lets a test PROVE the locality gate works: warm-local
+/// segments must NOT be counted here (they take the cheap direct serial path),
+/// while genuinely cold/remote segments must be (they still fan out). Never read
+/// on the hot path.
+static VLOG_DEREF_SEGMENTS_FANNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// FRS-VLOG-DEREF-LOCALITY diag: total segments dispatched to the pool by the
+/// deref fan-out (see [`VLOG_DEREF_SEGMENTS_FANNED`]). Test-only — proves the
+/// locality gate routes warm-local derefs to the direct path.
+#[cfg(test)]
+fn vlog_deref_segments_fanned() -> u64 {
+    VLOG_DEREF_SEGMENTS_FANNED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// FRS-ACCUM-MERGE (Approach 2, 2026-06-15): the in-engine windowed-agg
 /// accumulator-merge capability gate (`FRS_ACCUM_MERGE=1`, **DEFAULT OFF**).
 ///
@@ -14274,13 +14291,55 @@ impl DbImpl {
             group.sort_by_key(|(_, p)| p.offset);
         }
 
-        // FRS-VLOG-DEREF-FANOUT: when ON + remote + M>=2 segments, fan the
-        // per-segment coalesced reads across the read-I/O pool so the M segment
-        // GETs overlap instead of running serially. Byte-identical OUTPUT (each
-        // disjoint slot still receives its own pointer's value); timing-only.
-        if vlog_deref_fanout_enabled() && !self.fs.is_local() && by_segment.len() >= 2 {
+        // FRS-VLOG-DEREF-FANOUT + FRS-VLOG-DEREF-LOCALITY: when ON + >=2 segments,
+        // fan the per-segment coalesced reads across the read-I/O pool so the
+        // segment GETs overlap instead of running serially. A fan-out only buys
+        // anything when the read is a genuine remote round-trip — for a WARM,
+        // cache-resident-LOCAL segment the bytes are already local (µs preads),
+        // so pool dispatch is pure overhead. So the gate is LOCALITY-AWARE: each
+        // segment is classified by its reader's PER-SEGMENT `is_local()` (the
+        // real cache-residency signal, not the FS-level `is_local()` which a
+        // caching FS reports `false` unconditionally). Only the genuinely-remote
+        // (cache-miss) segments fan out; warm-local segments take the cheap direct
+        // serial path. Byte-identical OUTPUT regardless of which path a segment
+        // takes (each disjoint slot still receives its own pointer's value).
+        if vlog_deref_fanout_enabled() && by_segment.len() >= 2 {
             if let Some(weak) = self.self_weak.get().cloned() {
-                return self.coalesced_vlog_deref_fanout(by_segment, resolved, weak);
+                // Classify each segment by CURRENT cache-locality. Opening the
+                // reader here is cheap+idempotent (the cached LRU open the serial
+                // loop / fan-out job would do anyway); a reader we fail to open is
+                // treated as remote so its error surfaces on the normal path.
+                let mut remote: std::collections::HashMap<
+                    u64,
+                    Vec<(usize, forst_rs_storage::vlog::ValuePointer)>,
+                > = std::collections::HashMap::with_capacity(by_segment.len());
+                let mut local: Vec<(u64, Vec<(usize, forst_rs_storage::vlog::ValuePointer)>)> =
+                    Vec::new();
+                for (segment_id, group) in by_segment {
+                    let is_local = self
+                        .get_or_open_vlog_reader(segment_id)
+                        .map(|r| r.is_local())
+                        .unwrap_or(false);
+                    if is_local {
+                        local.push((segment_id, group));
+                    } else {
+                        remote.insert(segment_id, group);
+                    }
+                }
+                // Warm-local segments take the direct serial path (no pool
+                // dispatch) — the locality win this gate exists for.
+                for (segment_id, group) in local {
+                    self.deref_one_segment_into(segment_id, group, resolved)?;
+                }
+                // The cache-miss / remote segments still fan out (the remote win),
+                // but only when there are >=2 to actually overlap.
+                if remote.len() >= 2 {
+                    return self.coalesced_vlog_deref_fanout(remote, resolved, weak);
+                }
+                for (segment_id, group) in remote {
+                    self.deref_one_segment_into(segment_id, group, resolved)?;
+                }
+                return Ok(());
             }
             // No self_weak (can't form 'static jobs) => fall through to serial.
         }
@@ -14361,6 +14420,11 @@ impl DbImpl {
         }
         // Drop our extra sender so the channel closes once all jobs finish.
         drop(tx);
+        // FRS-VLOG-DEREF-LOCALITY diag: count the segments we actually dispatch
+        // to the pool (the genuinely-remote group). Warm-local segments never
+        // reach here — they took the direct serial path — so a test can assert
+        // "warm = 0 fanned, cold = M fanned" against this counter.
+        VLOG_DEREF_SEGMENTS_FANNED.fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
         // Barrier: prime_opens_concurrent submits + joins all jobs (panic-safe).
         forst_rs_storage::sst::prime_opens_concurrent(jobs);
         // Scatter results; first error wins (serial-path `?` parity).
@@ -20198,6 +20262,280 @@ mod tests {
                 Some(v) => {
                     assert_eq!(got.as_deref(), Some(v.as_slice()), "wrong value for a key");
                     let oracle = db_on.get(&cf_on, k).unwrap();
+                    assert_eq!(oracle.as_deref(), Some(v.as_slice()), "get oracle mismatch");
+                }
+                None => assert_eq!(got, &None, "absent key must miss"),
+            }
+        }
+
+        set_vlog_deref_fanout_override(None);
+        set_vlog_coalesce_deref_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-DEREF-LOCALITY (2026-06-15): a `RandomAccessFile` whose
+    /// PER-FILE `is_local()` is decided by membership of its path in a shared set
+    /// (so a test can mark specific vlog segments warm-local vs cold-remote). Pure
+    /// delegation for the bytes; the locality answer is the only behavior change.
+    struct LocalityFakeFile {
+        inner: Box<dyn forst_rs_io::RandomAccessFile>,
+        path: std::path::PathBuf,
+        local_set: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    }
+    impl forst_rs_io::RandomAccessFile for LocalityFakeFile {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> ForstResult<usize> {
+            self.inner.read_at(offset, buf)
+        }
+        fn file_size(&self) -> ForstResult<u64> {
+            self.inner.file_size()
+        }
+        fn is_local(&self) -> bool {
+            self.local_set
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&self.path)
+        }
+    }
+
+    /// FRS-VLOG-DEREF-LOCALITY: a `FileSystem` whose FS-level `is_local()` is
+    /// always `false` (it models a caching/remote FS — exactly the case the
+    /// production `CachedFileSystem` reports), but whose OPENED files answer
+    /// `is_local()` PER PATH from a shared set. This is the fixture that proves
+    /// the deref gate is locality-AWARE: marking a segment's path local must route
+    /// its deref to the direct serial path (no pool dispatch), while an unmarked
+    /// (cold) segment must still fan out.
+    struct LocalityFakeFs {
+        inner: MemoryFileSystem,
+        local_set: Arc<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
+    }
+    impl LocalityFakeFs {
+        fn new() -> Self {
+            Self {
+                inner: MemoryFileSystem::new(),
+                local_set: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            }
+        }
+    }
+    impl FileSystem for LocalityFakeFs {
+        fn open_sequential_file(
+            &self,
+            path: &Path,
+        ) -> ForstResult<Box<dyn forst_rs_io::SequentialFile>> {
+            self.inner.open_sequential_file(path)
+        }
+        fn open_random_access_file(
+            &self,
+            path: &Path,
+        ) -> ForstResult<Box<dyn forst_rs_io::RandomAccessFile>> {
+            let inner = self.inner.open_random_access_file(path)?;
+            Ok(Box::new(LocalityFakeFile {
+                inner,
+                path: path.to_path_buf(),
+                local_set: Arc::clone(&self.local_set),
+            }))
+        }
+        fn open_writable_file(
+            &self,
+            path: &Path,
+            mode: WriteMode,
+        ) -> ForstResult<Box<dyn forst_rs_io::WritableFile>> {
+            self.inner.open_writable_file(path, mode)
+        }
+        fn file_exists(&self, path: &Path) -> ForstResult<bool> {
+            self.inner.file_exists(path)
+        }
+        fn get_file_metadata(&self, path: &Path) -> ForstResult<forst_rs_io::FileMetadata> {
+            self.inner.get_file_metadata(path)
+        }
+        fn list_dir(&self, dir: &Path) -> ForstResult<Vec<forst_rs_io::FileMetadata>> {
+            self.inner.list_dir(dir)
+        }
+        fn create_dir_all(&self, dir: &Path) -> ForstResult<()> {
+            self.inner.create_dir_all(dir)
+        }
+        fn delete_file(&self, path: &Path) -> ForstResult<()> {
+            self.inner.delete_file(path)
+        }
+        fn delete_dir(&self, path: &Path, recursive: bool) -> ForstResult<()> {
+            self.inner.delete_dir(path, recursive)
+        }
+        fn rename(&self, src: &Path, dst: &Path) -> ForstResult<()> {
+            self.inner.rename(src, dst)
+        }
+        fn name(&self) -> &str {
+            "LocalityFakeFs(deref-locality test)"
+        }
+        fn is_local(&self) -> bool {
+            false // FS-level always-remote, like the production CachedFileSystem
+        }
+    }
+
+    /// FRS-VLOG-DEREF-LOCALITY (2026-06-15): the deref fan-out gate must be
+    /// LOCALITY-AWARE. On a caching/remote FS (FS-level `is_local()==false`)
+    /// whose individual vlog segments can be warm-local or cold-remote:
+    ///   - when EVERY segment is warm-cache-local, the deref takes the direct
+    ///     serial path and dispatches ZERO segments to the read-I/O pool
+    ///     (the warm-overhead-removed property), and
+    ///   - when the segments are cold/remote, the deref still fans out (the
+    ///     remote win is preserved — >= 2 segments dispatched), and
+    ///   - the emitted values are BYTE-IDENTICAL across both regimes and to the
+    ///     per-key `get` oracle.
+    /// This is the regression gate for the locality fix: before it, the gate used
+    /// the FS-level `is_local()` (always false) and warm-local derefs wastefully
+    /// fanned out.
+    #[test]
+    fn test_vlog_deref_locality_warm_direct_cold_fanout() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        set_vlog_coalesce_deref_override(Some(true));
+        set_vlog_deref_fanout_override(Some(true)); // gate ON for both regimes
+
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 200;
+        // THREE flushes ⇒ >= 2 vlog segments so the deref groups span multiple
+        // segments and the fan-out CAN fire. Returns the FS handle too so the test
+        // can flip per-segment locality.
+        let build = || -> (
+            Arc<LocalityFakeFs>,
+            Arc<DbImpl>,
+            ColumnFamilyHandle,
+            Vec<(Vec<u8>, Vec<u8>)>,
+        ) {
+            let opts = EngineOptions {
+                db_path: "/db".to_string(),
+                write_buffer_size: 2_000_000_000,
+                max_write_buffer_number: 8,
+                ..EngineOptions::default()
+            };
+            let fs = Arc::new(LocalityFakeFs::new());
+            let fs_dyn: Arc<dyn FileSystem> = fs.clone();
+            let db = DbImpl::open_with_fs(opts, fs_dyn).expect("open locality-fake");
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("deref-locality"))
+                .unwrap();
+            let mut kv: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N);
+            for i in 0..N as u32 {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x1000 + i as u64, 256 + (i as usize % 64));
+                db.put(&cf, &k, &v).unwrap();
+                kv.push((k, v));
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 0");
+            for i in (0..N as u32).step_by(2) {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x5000 + i as u64, 256 + (i as usize % 48));
+                db.put(&cf, &k, &v).unwrap();
+                kv[i as usize].1 = v;
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 1");
+            for i in (0..N as u32).step_by(3) {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x9000 + i as u64, 256 + (i as usize % 32));
+                db.put(&cf, &k, &v).unwrap();
+                kv[i as usize].1 = v;
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 2");
+            let nseg = db.version_set.current().vlog_segments.len();
+            assert!(nseg >= 2, "need >= 2 vlog segments (got {nseg})");
+            (fs, db, cf, kv)
+        };
+
+        let scattered_keys = |kv: &[(Vec<u8>, Vec<u8>)]| -> Vec<Vec<u8>> {
+            let mut order: Vec<usize> = (0..kv.len()).collect();
+            let mut s: u64 = 0xD1B54A32D192ED03;
+            for i in (1..order.len()).rev() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let j = (s as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            let mut out = Vec::with_capacity(order.len() + order.len() / 8);
+            for (n, &i) in order.iter().enumerate() {
+                if n % 7 == 2 {
+                    out.push(format!("absent{n:05}").into_bytes());
+                }
+                out.push(kv[i].0.clone());
+            }
+            out
+        };
+
+        // The set of vlog segment paths for the built db (mark these "warm-local").
+        let segment_paths = |db: &Arc<DbImpl>| -> Vec<std::path::PathBuf> {
+            db.version_set
+                .current()
+                .vlog_segments
+                .iter()
+                .map(|seg| {
+                    forst_rs_storage::vlog::vlog_segment_path(
+                        Path::new(&db.db_path),
+                        seg.segment_id,
+                    )
+                })
+                .collect()
+        };
+
+        // ---- Regime COLD: no segment marked local ⇒ derefs fan out. ----
+        let before_cold = vlog_deref_segments_fanned();
+        let (_fs_cold, db_cold, cf_cold, kv) = build();
+        let keys = scattered_keys(&kv);
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let cold = db_cold
+            .batch_get_vectorized(&cf_cold, &key_refs, u64::MAX)
+            .unwrap();
+        let cold_fanned = vlog_deref_segments_fanned() - before_cold;
+        assert!(
+            cold_fanned >= 2,
+            "cold/remote regime must still fan out >= 2 segments (got {cold_fanned}) — \
+             the remote win must be preserved"
+        );
+
+        // ---- Regime WARM: mark EVERY segment local BEFORE the reads ⇒ direct. ----
+        let before_warm = vlog_deref_segments_fanned();
+        let (fs_warm, db_warm, cf_warm, kv2) = build();
+        assert_eq!(kv, kv2, "build must be deterministic across regimes");
+        {
+            let mut set = fs_warm.local_set.lock().unwrap();
+            for p in segment_paths(&db_warm) {
+                set.insert(p);
+            }
+        }
+        // Drop any vlog readers opened during the build so the next open re-reads
+        // the (now-marked-local) locality — readers cache the file, and is_local()
+        // is answered live by the file, so this is belt-and-suspenders.
+        let keys2 = scattered_keys(&kv2);
+        let key_refs2: Vec<&[u8]> = keys2.iter().map(|k| k.as_slice()).collect();
+        let warm = db_warm
+            .batch_get_vectorized(&cf_warm, &key_refs2, u64::MAX)
+            .unwrap();
+        let warm_fanned = vlog_deref_segments_fanned() - before_warm;
+        assert_eq!(
+            warm_fanned, 0,
+            "warm-local regime must dispatch ZERO segments to the pool (direct path)"
+        );
+
+        // ---- Byte-identity across regimes + the per-key get oracle. ----
+        assert_eq!(
+            warm, cold,
+            "locality gate must be byte-identical: warm-direct == cold-fanout"
+        );
+        let want: std::collections::HashMap<Vec<u8>, Vec<u8>> = kv.iter().cloned().collect();
+        for (k, got) in keys.iter().zip(warm.iter()) {
+            match want.get(k) {
+                Some(v) => {
+                    assert_eq!(got.as_deref(), Some(v.as_slice()), "wrong value for a key");
+                    let oracle = db_warm.get(&cf_warm, k).unwrap();
                     assert_eq!(oracle.as_deref(), Some(v.as_slice()), "get oracle mismatch");
                 }
                 None => assert_eq!(got, &None, "absent key must miss"),

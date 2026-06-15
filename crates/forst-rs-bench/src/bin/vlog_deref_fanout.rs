@@ -110,6 +110,54 @@ impl Pool {
     }
 }
 
+/// FRS-VLOG-DEREF-LOCALITY: WARM-local segments. Each segment's bytes are
+/// already cache-resident, so a deref is served inline (no remote RTT) and —
+/// with the locality gate — on the DIRECT path with NO pool involvement. This
+/// models the per-segment COORDINATION cost only (the byte work is identical on
+/// both paths): the direct path is a plain function call per segment, ~0 µs.
+/// Repeated `reps` times so the µs-scale signal is measurable above timer noise.
+fn warm_local_direct_deref(m: usize, reps: usize) -> Duration {
+    let t0 = Instant::now();
+    for _ in 0..reps {
+        for _ in 0..m {
+            // Direct path: the serial loop calls deref_one_segment_into — no
+            // channel, no pool submit, no barrier. Model the dispatch cost as a
+            // trivial inline op (std::hint::black_box keeps it from being elided).
+            std::hint::black_box(0u64);
+        }
+    }
+    t0.elapsed()
+}
+
+/// FRS-VLOG-DEREF-LOCALITY: what the OLD (locality-BLIND) gate did to WARM
+/// segments — it fanned them out anyway (FS-level `is_local()` was always
+/// `false`), paying the read-I/O-pool COORDINATION per batch (mpsc channel
+/// alloc + M `tx.clone()` + M boxed-job submits + M condvar wakeups + the
+/// receiver barrier) for bytes that were already local. This models exactly that
+/// coordination — each job does NO byte work (warm), so the wall is pure
+/// dispatch overhead the direct path never pays. `reps` batches.
+fn warm_local_fanned_deref(pool: &Pool, m: usize, reps: usize) -> Duration {
+    let t0 = Instant::now();
+    for _ in 0..reps {
+        let done = Arc::new((Mutex::new(0usize), Condvar::new()));
+        for _ in 0..m {
+            let d = Arc::clone(&done);
+            pool.submit(Box::new(move || {
+                std::hint::black_box(0u64); // warm: byte work is inline, ~0
+                let (mu, cv) = &*d;
+                *mu.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                cv.notify_all();
+            }));
+        }
+        let (mu, cv) = &*done;
+        let mut g = mu.lock().unwrap_or_else(|p| p.into_inner());
+        while *g < m {
+            g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+        }
+    }
+    t0.elapsed()
+}
+
 /// PROPOSED: submit all M segment derefs to the bounded pool and barrier. Wall ≈
 /// ceil(M / pool) × RTT — exactly what `coalesced_vlog_deref_fanout` does via
 /// `prime_opens_concurrent`.
@@ -181,15 +229,61 @@ fn main() {
         }
         println!("{m:>10} {:>14.1} {:>16.1} {:>9.2}×", ms(s), ms(c), sp);
     }
-    pool.shutdown();
+
+    // -------------------------------------------------------------------------
+    // FRS-VLOG-DEREF-LOCALITY: warm-cache regime. For segments whose bytes are
+    // already cache-resident-local, the locality-aware gate takes the DIRECT
+    // path (no pool dispatch). The OLD locality-blind gate fanned them out
+    // anyway, paying pool submit/wakeup/barrier overhead on top of a µs pread.
+    // -------------------------------------------------------------------------
+    println!(
+        "\n== WARM-LOCAL regime (cache-resident segments — coordination cost) ==\n\
+         old gate (locality-BLIND) fanned warm derefs to the pool;\n\
+         new gate (locality-AWARE) takes the direct path (no pool dispatch).\n\
+         Byte work is identical (already local); this isolates DISPATCH cost.\n"
+    );
+    let warm_reps = if smoke { 2_000 } else { 20_000 };
+    println!(
+        "{:>10} {:>20} {:>20} {:>12}",
+        "segments M", "old: fanned (µs/b)", "new: direct (µs/b)", "overhead×"
+    );
+    let pool2 = Pool::new(pool_n);
+    let mut max_warm_overhead = 0.0f64;
+    for &m in &cases {
+        let old = warm_local_fanned_deref(&pool2, m, warm_reps);
+        let new = warm_local_direct_deref(m, warm_reps);
+        let old_us = old.as_secs_f64() * 1e6 / warm_reps as f64;
+        let new_us = new.as_secs_f64() * 1e6 / warm_reps as f64;
+        let ovh = old_us / new_us.max(1e-9);
+        if m >= 4 {
+            max_warm_overhead = max_warm_overhead.max(ovh);
+        }
+        println!("{m:>10} {old_us:>20.3} {new_us:>20.3} {ovh:>11.1}×");
+    }
+    pool2.shutdown();
+    println!(
+        "\nWARM: the direct path removes the per-batch pool COORDINATION the old\n\
+         gate paid on cache-resident segments (overhead {max_warm_overhead:.0}× at M>=4);\n\
+         COLD/remote still fans out (speedup {min_speedup_at_4:.2}× above)."
+    );
 
     if smoke {
-        // The win must be > 1.5× at M ≥ 4 (bounded at min(M, pool)); a regression
-        // here means the pool barrier collapsed to serial.
+        // The COLD/remote win must hold (> 1.5× at M ≥ 4) — a regression here
+        // means the pool barrier collapsed to serial.
         assert!(
             min_speedup_at_4 > 1.5,
             "fan-out smoke: speedup at M>=4 collapsed ({min_speedup_at_4:.2}× <= 1.5×)"
         );
-        println!("\nSMOKE OK: M>=4 speedup {min_speedup_at_4:.2}× (> 1.5×).");
+        // The WARM direct path must be CHEAPER than fanning out (the locality win
+        // this cycle adds) — pool COORDINATION is genuine overhead when local.
+        assert!(
+            max_warm_overhead > 2.0,
+            "locality smoke: warm direct path not meaningfully cheaper than fanout \
+             ({max_warm_overhead:.1}× <= 2×) — locality gate gives no win"
+        );
+        println!(
+            "\nSMOKE OK: cold speedup {min_speedup_at_4:.2}× (> 1.5×); \
+             warm direct cheaper by {max_warm_overhead:.0}× (> 2×)."
+        );
     }
 }

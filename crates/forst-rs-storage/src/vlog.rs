@@ -258,6 +258,18 @@ impl VlogReader {
         })
     }
 
+    /// FRS-VLOG-DEREF-LOCALITY (2026-06-15): whether THIS segment's reads are
+    /// CURRENTLY served from local storage (a warm cache copy / page cache) as
+    /// opposed to a remote object-store round-trip. Delegates to the underlying
+    /// [`RandomAccessFile::is_local`], which answers per CURRENT serving tier
+    /// (e.g. a local-first cache file reports `true` only while its bytes are
+    /// cache-resident). The deref fan-out uses this to skip the read-I/O-pool
+    /// dispatch for warm-local segments — a fan-out only overlaps remote RTTs, so
+    /// a warm-local deref is pure overhead on the pool. A hint, not an invariant.
+    pub fn is_local(&self) -> bool {
+        self.file.is_local()
+    }
+
     /// Reads + CRC-verifies the value `ptr` points at. `ptr.segment_id` must
     /// match the opened segment (caller routes by id).
     pub fn get(&self, ptr: &ValuePointer) -> ForstResult<Vec<u8>> {

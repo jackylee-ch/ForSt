@@ -277,3 +277,75 @@ segment (reusing `coalesced_vlog_deref_into` + this cycle's fan-out), and emit
 the window — the scan-path analogue of the batch coalesce. Larger surface (the
 iterator must defer + re-order value resolution while preserving emit order), so
 it is sequenced after this cycle's lower-risk batch fan-out.
+
+---
+
+## 7. Locality-aware deref-fanout gating (2026-06-15, follow-up cycle)
+
+### 7.1 Finding (from the combined-stack validation, 41ab15e22)
+
+The original gate (section 3) engaged the fan-out on
+`vlog_deref_fanout_enabled() && !self.fs.is_local() && by_segment.len() >= 2`.
+The middle predicate is the **FS-level** `CachedFileSystem::is_local()`, which
+returns `false` **unconditionally** (`cached_fs.rs:760`) — a caching FS over a
+remote backend *can* pay a round-trip on any open, so it reports not-local for
+the whole filesystem. But locality is a **per-segment, per-instant** property:
+once a vlog segment's bytes are write-through/page-cache resident, its deref is a
+µs-class local pread with **no remote RTT to overlap**. Fanning such a warm
+segment out is pure overhead — it consumes a read-I/O-pool slot and pays the
+per-batch coordination (mpsc channel + `tx.clone()` ×M + boxed-job submits +
+condvar wakeups + the receiver barrier) for bytes that were already local. It is
+net-positive remotely (the cold case the fan-out exists for) but wasted work on
+a warm-cache scan.
+
+### 7.2 Fix — per-segment locality classification at the engage site
+
+`RandomAccessFile::is_local()` already answers per **current serving tier**:
+`LocalFirstSstFile::is_local()` (`cached_fs.rs:909`) returns
+`self.cache.contains(&self.key)`, and a whole-file-fetched `InMemoryRandom`
+inherits the default `true`. So the genuine signal is per-file, not per-FS.
+
+- `VlogReader::is_local()` (`vlog.rs`) — new; delegates to `self.file.is_local()`,
+  surfacing the segment's current cache-residency.
+- `DbImpl::coalesced_vlog_deref_into` (`db.rs:~14294`) — the gate is now
+  **locality-aware**. With the flag ON and `>= 2` segments, each segment is
+  classified by its reader's `is_local()`:
+  - **warm-local** segments take the **direct serial path**
+    (`deref_one_segment_into`) — NO pool dispatch;
+  - the **genuinely-remote** (cache-miss) group still fans out via
+    `coalesced_vlog_deref_fanout`, but only when `>= 2` remote segments remain to
+    actually overlap (otherwise a single remote segment also goes direct).
+  The FS-level `is_local()` is no longer consulted at this site. Opening the
+  reader to classify is cheap + idempotent (the cached LRU open the loop/job would
+  do anyway); a reader that fails to open is treated as remote so its error
+  surfaces on the normal path.
+- `VLOG_DEREF_SEGMENTS_FANNED` (`db.rs`) — new test-only diagnostic counter,
+  incremented by the segments actually dispatched to the pool, so a test can
+  prove "warm = 0 fanned, cold = M fanned".
+
+Byte-identity is unchanged: a segment produces the same `resolved[slot]` values
+whether resolved on the direct or the fanned path (slots are disjoint across
+segments), so routing a subset of segments to each path cannot change output.
+
+### 7.3 TDD + evidence
+
+- **`test_vlog_deref_locality_warm_direct_cold_fanout`** (engine lib) — a new
+  `LocalityFakeFs` reports FS-level `is_local()==false` (like `CachedFileSystem`)
+  but answers per-file `is_local()` from a shared path-set, so the test can mark
+  vlog segments warm-local. Asserts: (a) COLD regime (no segment marked) still
+  fans out `>= 2` segments (`VLOG_DEREF_SEGMENTS_FANNED` delta) — the remote win
+  is preserved; (b) WARM regime (every segment marked local) dispatches **ZERO**
+  segments to the pool — the direct path; (c) the emitted values are
+  **byte-identical** across both regimes and to the per-key `get` oracle. This is
+  the regression gate: before the fix the warm arm would have fanned out `>= 2`
+  and `warm_fanned == 0` would fail.
+- All 3 `vlog_deref` tests + all 15 `vlog` engine tests + the full engine
+  (426 pass/4 ignored) and storage (481 pass/3 ignored) suites green.
+- **Mini-bench** (`vlog_deref_fanout --smoke`): the COLD/remote arm keeps the
+  3.75-4.27x fan-out win at M>=4; a new WARM-local arm isolates the per-batch
+  pool **coordination** cost (byte work identical on both paths) and shows the
+  direct path removes ~12-21 µs/batch — a >12000x reduction in dispatch overhead
+  on cache-resident segments. Smoke asserts both (cold > 1.5x, warm direct > 2x
+  cheaper).
+- `cargo fmt`, `clippy --all-targets`, `RUSTDOCFLAGS=-D warnings cargo doc` clean
+  on the three changed crates. Default OFF + byte-identical.
