@@ -396,6 +396,18 @@ impl SstReaderImpl {
         }
     }
 
+    /// MR-1 (`2026-06-15-q7-probe-open-prune-design.md` §3.4): borrow this SST's
+    /// decoded prefix bloom (the v3 footer section) so a caller can hoist it into
+    /// a process-side metadata cache and prune bloom-negative SSTs WITHOUT opening
+    /// the reader on a later cold probe. `None` for pre-v3 SSTs and v3 SSTs whose
+    /// keys never reached [`PREFIX_BLOOM_LEN`] — those callers fall through to the
+    /// open-then-check path (byte-identical). The filter is the SAME bytes
+    /// [`Self::may_contain_prefix`] consults, so a metadata-side prune built from
+    /// it returns the identical answer.
+    pub fn prefix_bloom(&self) -> Option<&Sbbf> {
+        self.prefix_bloom.as_ref()
+    }
+
     /// 2026-05-30 DECODED-BLOCK CACHE: attach the process-shared decoded-block
     /// cache and the file's `db_id`-qualified identity (for the cache key).
     /// Returns `self` for chaining at the `get_or_open_sst_reader` call site.

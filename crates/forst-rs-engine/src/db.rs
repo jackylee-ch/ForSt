@@ -37,7 +37,7 @@ use forst_rs_storage::cache::clock::ShardedClockCache;
 use forst_rs_storage::cached_fs::CachedFileSystem;
 use forst_rs_storage::local_cache::LocalCache;
 use forst_rs_storage::merge_operator::merge_operator_by_name;
-use forst_rs_storage::sst::{SstReaderImpl, SstWriterOptions};
+use forst_rs_storage::sst::{Sbbf, SstReaderImpl, SstWriterOptions, PREFIX_BLOOM_LEN};
 use forst_rs_storage::version::{
     SstFileMeta, Version, VersionEdit, VersionSetImpl, VersionSetSnapshot,
 };
@@ -575,6 +575,27 @@ fn prefix_bloom_enabled() -> bool {
             Some("1") | Some("true")
         )
     })
+}
+
+/// MR-1 (`2026-06-15-q7-probe-open-prune-design.md`): gate for the
+/// metadata-resident prefix-bloom prune on the interval-join probe path.
+/// Default-OFF: when unset (`0`/absent) the per-SST loop opens every
+/// range-overlapping SST and prunes bloom-negative ones AFTER the cold open
+/// (today's path; byte-identical). When `FRS_RS_PROBE_BLOOM_PRUNE=1`, a
+/// process-side `prefix_bloom_meta_cache` of each previously-opened SST's
+/// ~256-byte prefix bloom is consulted BEFORE `get_or_open_sst_reader`, so a
+/// bloom-negative SST is skipped with NO cold footer/index/bloom open — the
+/// `db.rs:10484` "26% cold" read-amp the q7 iostat capture binds on. The prune
+/// is a strict subset of the reader-side `may_contain_prefix` (the cache holds
+/// the SAME footer bytes), so emitted (key,value,seq) rows are identical ON vs
+/// OFF — only which SSTs get opened changes. Read LIVE (not `OnceLock`-cached)
+/// so the byte-identity regression tests can toggle it per-case; the check runs
+/// once per scan build, off the per-block hot path.
+fn probe_bloom_prune_enabled() -> bool {
+    matches!(
+        std::env::var("FRS_RS_PROBE_BLOOM_PRUNE").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
 }
 
 /// FRS-SCAN-COLD-PRIME (Phase-2 cycle 2): gate for the concurrent k-way scan
@@ -1418,6 +1439,17 @@ pub struct DbImpl {
     // via `.rcu()` (clone-on-write; inserts/removes are rare — once per SST
     // open / compaction-retire). Removes the RwLock read on every block read.
     sst_readers: arc_swap::ArcSwap<HashMap<FileNumber, Arc<SstReaderImpl>>>,
+    /// MR-1 (`2026-06-15-q7-probe-open-prune-design.md` §3.4): process-side cache
+    /// of each opened SST's ~256-byte prefix bloom, keyed by file number. Lets the
+    /// interval-join probe path prune a bloom-negative SST WITHOUT opening its
+    /// reader (no cold footer/index/bloom I/O), the q7 read-amp lever. Populated
+    /// alongside `sst_readers` whenever a reader is opened (flush/compaction/restore/
+    /// lazy), so it SURVIVES `sst_readers` eviction (the cold-probe regime). `None`
+    /// value = the SST has no v3 prefix bloom (pre-v3 / short keys) → the probe
+    /// falls through to the open-then-check path (byte-identical). Lock-free RCU
+    /// like `sst_readers`; gated by `FRS_RS_PROBE_BLOOM_PRUNE` (default-OFF), so
+    /// when the flag is off the cache is never consulted.
+    prefix_bloom_meta_cache: arc_swap::ArcSwap<HashMap<FileNumber, Option<Arc<Sbbf>>>>,
     /// Tracks SST files pinned by active checkpoints so concurrent
     /// compactions do not delete them prematurely.
     deletion_guard: Arc<FileDeletionGuard>,
@@ -1780,6 +1812,7 @@ impl DbImpl {
             cf_name_to_id: RwLock::new(HashMap::new()),
             version_set: Arc::new(VersionSetImpl::new()),
             sst_readers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
+            prefix_bloom_meta_cache: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
@@ -7247,6 +7280,7 @@ impl DbImpl {
             cf_name_to_id: RwLock::new(HashMap::new()),
             version_set,
             sst_readers: arc_swap::ArcSwap::from_pointee(HashMap::new()),
+            prefix_bloom_meta_cache: arc_swap::ArcSwap::from_pointee(HashMap::new()),
             deletion_guard: Arc::new(FileDeletionGuard::new()),
             pending_deletions: Mutex::new(Vec::new()),
             lifecycle_merged: Mutex::new(std::collections::HashSet::new()),
@@ -10512,12 +10546,20 @@ impl DbImpl {
         // the per-source loop below opens them serially. Pass only the SSTs the
         // loop will actually open (not resident-shadowed — those are served from
         // RAM and never opened). No-op when OFF / local / warm / ≤1 cold.
+        // MR-1 (§3.5): when the probe-bloom prune is ON, read the flag once for
+        // this build (off the per-SST hot path). The loop below + the open-fanout
+        // both skip metadata-proven bloom-negative SSTs so neither pays the cold
+        // open. OFF => `mr1_prune` stays false and every branch is byte-identical.
+        let mr1_prune = probe_bloom_prune_enabled();
         let mut open_fanout_submitted = 0u32;
         if open_fanout_enabled() {
             let to_open: Vec<&forst_rs_storage::version::SstFileMeta> = overlapping_ssts
                 .iter()
                 .copied()
                 .filter(|s| !resident_shadowed.contains(&s.file_number))
+                // MR-1: do NOT cold-open a bloom-negative SST in the fanout either
+                // — it would defeat the prune by paying the open the loop skips.
+                .filter(|s| !(mr1_prune && self.probe_bloom_meta_negative(s.file_number, prefix)))
                 .collect();
             open_fanout_submitted = self.prime_cold_reader_opens_concurrent(&to_open);
         }
@@ -10525,6 +10567,16 @@ impl DbImpl {
             // FRS-RESIDENT-FLUSHED: skip SSTs whose data is currently served
             // from Tier 2 by a resident memtable (same content, same seqs).
             if resident_shadowed.contains(&sst.file_number) {
+                continue;
+            }
+            // MR-1 (§3.3): decode-free, OPEN-free prune from the process-side
+            // prefix-bloom meta cache. When the cache proves this SST holds no key
+            // for `prefix`, skip the cold `get_or_open_sst_reader` below entirely —
+            // the q7 read-amp lever (avoids the footer/index/bloom pread that the
+            // reader-side `may_contain_prefix` only rejects AFTER paying it). The
+            // reader-side check below stays as defence in depth (same answer); a
+            // not-yet-cached or bloom-less SST falls through (byte-identical).
+            if mr1_prune && self.probe_bloom_meta_negative(sst.file_number, prefix) {
                 continue;
             }
             if diag {
@@ -14206,6 +14258,14 @@ impl DbImpl {
         {
             let cache = self.sst_readers.load();
             if let Some(r) = cache.get(&meta.file_number) {
+                // MR-1 (§3.4): a reader cache HIT still seeds the prefix-bloom meta
+                // cache the FIRST time we see this file, so that a LATER cold probe
+                // (after this reader is evicted) can prune it without re-opening.
+                // `cache_prefix_bloom_meta` short-circuits if already recorded, so
+                // this is one `load()`+`contains_key` on the hot warm path.
+                if probe_bloom_prune_enabled() {
+                    self.cache_prefix_bloom_meta(meta.file_number, r);
+                }
                 return Ok(r.clone());
             }
         }
@@ -14290,7 +14350,67 @@ impl DbImpl {
                 std::sync::Arc::new(next)
             }
         });
+        // MR-1 (§3.4): hoist this SST's prefix bloom into the process-side meta
+        // cache so a later COLD probe (after this reader is evicted) prunes a
+        // bloom-negative SST with no reader open. Only when the flag is ON — when
+        // OFF the cache stays empty and the prune is never consulted (byte- and
+        // behaviour-identical to before). `resolved` is the winning reader (ours
+        // or a concurrent inserter's); its bloom is the same footer bytes either
+        // way, so caching from it is correct under the open race.
+        if probe_bloom_prune_enabled() {
+            self.cache_prefix_bloom_meta(meta.file_number, &resolved);
+        }
         Ok(resolved)
+    }
+
+    /// MR-1 (`2026-06-15-q7-probe-open-prune-design.md` §3.4): record `reader`'s
+    /// prefix bloom in the process-side `prefix_bloom_meta_cache` under
+    /// `file_number`, so the interval-join probe path can prune a bloom-negative
+    /// SST without re-opening the reader on a later cold probe. Idempotent: an SST
+    /// is immutable once version-visible, so re-caching is a no-op insert. Stores
+    /// `None` for SSTs with no v3 prefix bloom so the probe distinguishes "cached,
+    /// no filter → fall through to open" from "not yet opened → fall through to
+    /// open" (both fall through; the distinction is documentary). Lock-free RCU.
+    fn cache_prefix_bloom_meta(&self, file_number: FileNumber, reader: &SstReaderImpl) {
+        // Fast path: already cached (the common steady-state — readers re-open
+        // after eviction but the bloom is sticky), so skip the RCU clone.
+        if self
+            .prefix_bloom_meta_cache
+            .load()
+            .contains_key(&file_number)
+        {
+            return;
+        }
+        let bloom = reader.prefix_bloom().cloned().map(Arc::new);
+        self.prefix_bloom_meta_cache.rcu(|cur| {
+            if cur.contains_key(&file_number) {
+                std::sync::Arc::clone(cur)
+            } else {
+                let mut next = (**cur).clone();
+                next.insert(file_number, bloom.clone());
+                std::sync::Arc::new(next)
+            }
+        });
+    }
+
+    /// MR-1 (`2026-06-15-q7-probe-open-prune-design.md` §3.3): returns `true` only
+    /// when the process-side meta cache PROVES `file_number`'s SST holds no key
+    /// whose first [`PREFIX_BLOOM_LEN`] bytes equal `prefix` — i.e. the SST can be
+    /// skipped with NO reader open. Returns `false` (open it) when the flag is
+    /// off, the probe prefix is shorter than the filter, the SST is not yet cached,
+    /// or it has no v3 prefix bloom — so the caller falls through to today's
+    /// open-then-check path (byte-identical). The predicate is the SAME one
+    /// [`SstReaderImpl::may_contain_prefix`] applies (same footer bytes), so a
+    /// false NEGATIVE is impossible: the reader-side check stays as defence in
+    /// depth and always agrees.
+    fn probe_bloom_meta_negative(&self, file_number: FileNumber, prefix: &[u8]) -> bool {
+        if prefix.len() < PREFIX_BLOOM_LEN {
+            return false;
+        }
+        match self.prefix_bloom_meta_cache.load().get(&file_number) {
+            Some(Some(pb)) => !pb.check_hash(Sbbf::hash_key(&prefix[..PREFIX_BLOOM_LEN])),
+            _ => false,
+        }
     }
 
     fn apply_merge_operator(
@@ -30955,5 +31075,247 @@ mod tests {
             0,
             "resident shadow is default-OFF; persistent iter must hold zero clones"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // MR-1 (`2026-06-15-q7-probe-open-prune-design.md`): metadata-resident
+    // prefix-bloom prune — skip COLD reader opens of bloom-negative SSTs on the
+    // interval-join probe path. TDD gates C0-C3 (byte-identity OFF vs ON;
+    // bloom-negative SSTs not re-opened; bloom-positive + overlapping still
+    // opened so no rows are missed; short-prefix safety).
+    //
+    // These tests SET/REMOVE the live env flag `FRS_RS_PROBE_BLOOM_PRUNE`, so
+    // they MUST run serially with respect to each other (and any test that reads
+    // the scan path). A single combined `#[test]` runs the sub-cases in sequence
+    // under one process so the env toggles never interleave.
+    // ---------------------------------------------------------------------
+
+    /// 16-byte state key `[join-key BE u64][entry BE u64]`. The probe uses the
+    /// 16-byte join-key... no — the join key is the first 8 bytes; we pad the
+    /// probe prefix to `PREFIX_BLOOM_LEN`(=16) so the prefix bloom engages (the
+    /// reader-side `may_contain_prefix` requires `prefix.len() >= 16`). To get a
+    /// 16-byte prefix that still selects ONE logical join key, the key layout is
+    /// `[jk BE u64][round BE u64]` and the probe prefix is the FULL 16 bytes
+    /// `[jk][round]` — each (jk,round) is its own scan target with a handful of
+    /// entries appended as a 17th..N suffix byte run.
+    fn mr1_key(jk: u64, round: u64, entry: u8) -> [u8; 17] {
+        let mut k = [0u8; 17];
+        k[..8].copy_from_slice(&jk.to_be_bytes());
+        k[8..16].copy_from_slice(&round.to_be_bytes());
+        k[16] = entry;
+        k
+    }
+    /// The 16-byte probe prefix selecting all entries of one (jk, round).
+    fn mr1_prefix(jk: u64, round: u64) -> [u8; 16] {
+        let mut p = [0u8; 16];
+        p[..8].copy_from_slice(&jk.to_be_bytes());
+        p[8..].copy_from_slice(&round.to_be_bytes());
+        p
+    }
+
+    /// Build a deep multi-SST fixture: `rounds` flushed L0 SSTs. EVERY SST writes
+    /// the range-endpoint keys (jk=0 and jk=MAX) so the coarse smallest/largest
+    /// range-skip cannot prune any of them — they all range-overlap a probe for
+    /// the target. Only the FIRST `present` SSTs additionally write the target
+    /// (jk=`target_jk`, round=that-SST's-round). So a probe for one target round
+    /// range-overlaps all `rounds` SSTs but is bloom-POSITIVE in exactly one and
+    /// bloom-NEGATIVE in the rest — the MR-1 prune target.
+    /// CALLER MUST set the three `FRS_L0_*_TRIGGER` env vars high BEFORE calling
+    /// (so the per-round SSTs are NOT compacted away mid-test) and remove them at
+    /// the end. The triggers are captured at `open_with_fs` time, so they must be
+    /// set across the DB's whole lifetime, not just `build` — hence the caller
+    /// (not this helper) owns them. See `mr1_with_deep_l0`.
+    fn mr1_build(rounds: u64, present: u64, target_jk: u64) -> Arc<DbImpl> {
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            write_buffer_size: 4096,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = DbImpl::open_with_fs(opts, fs).expect("open");
+        let cf = db.default_cf();
+        let val = vec![0xCDu8; 48];
+        for round in 0..rounds {
+            // Range endpoints in every SST (force range overlap, defeat the
+            // coarse smallest/largest_key prune).
+            for e in 0..2u8 {
+                db.put(&cf, &mr1_key(0, round, e), &val).expect("put lo");
+                db.put(&cf, &mr1_key(u64::MAX, round, e), &val)
+                    .expect("put hi");
+            }
+            // Target key present only in the first `present` SSTs; the probe will
+            // target round=0 (which lives only in SST round=0) ... see note: we
+            // probe (target_jk, round=0). To make `present` SSTs bloom-positive
+            // for that one probe, write (target_jk, round=0) into the first
+            // `present` SSTs.
+            if round < present {
+                for e in 0..3u8 {
+                    db.put(&cf, &mr1_key(target_jk, 0, e), &val)
+                        .expect("put target");
+                }
+            }
+            // switch_and_flush (not flush_cf): force EACH round into its own SST
+            // regardless of the tiny write buffer, so the version really carries
+            // `rounds` overlapping L0 SSTs (a bare `flush_cf` only drains the imm
+            // queue and would let the small rounds accumulate in one memtable →
+            // a handful of SSTs that wouldn't exercise the deep-fan-out prune).
+            db.switch_and_flush(&cf).expect("switch+flush");
+        }
+        db
+    }
+
+    /// Serializes the MR-1 tests against each other: both toggle the LIVE-read
+    /// `FRS_RS_PROBE_BLOOM_PRUNE` flag + the `FRS_L0_*` triggers in the global
+    /// process env, so running them concurrently lets one's teardown clear the
+    /// other's flag mid-probe (observed: `opened=16` when the prune silently went
+    /// OFF). The lock makes the whole set/body/remove sequence atomic per test.
+    static MR1_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set the deep-L0 triggers, run `body`, then ALWAYS remove them — keeps the
+    /// per-round SSTs uncompacted for the DB's whole lifetime (the sustained
+    /// long-running-join fan-out the MR-1 prune targets). Holds [`MR1_TEST_LOCK`]
+    /// for the whole body so the env toggles never interleave with the other
+    /// MR-1 test.
+    fn mr1_with_deep_l0<R>(body: impl FnOnce() -> R) -> R {
+        let _guard = MR1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("FRS_L0_COMPACTION_TRIGGER", "100000");
+        std::env::set_var("FRS_L0_STOP_TRIGGER", "100000");
+        std::env::set_var("FRS_L0_SLOWDOWN_TRIGGER", "100000");
+        let r = body();
+        std::env::remove_var("FRS_L0_COMPACTION_TRIGGER");
+        std::env::remove_var("FRS_L0_STOP_TRIGGER");
+        std::env::remove_var("FRS_L0_SLOWDOWN_TRIGGER");
+        r
+    }
+
+    /// Drain a prefix scan to an owned, sorted `(key, value)` vec.
+    fn mr1_drain(
+        db: &Arc<DbImpl>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let it = db
+            .prefix_scan_iter_owned_arc(cf, prefix)
+            .expect("scan open");
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = it
+            .map(|r| {
+                let (k, v) = r.expect("row");
+                (k.as_ref().to_vec(), v.as_ref().to_vec())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn test_mr1_probe_bloom_prune_byte_identical_and_skips_cold_opens() {
+        mr1_with_deep_l0(test_mr1_byte_identical_body);
+    }
+    fn test_mr1_byte_identical_body() {
+        let rounds = 16u64;
+        let present = 2u64;
+        let target_jk = 7u64;
+        let target_round = 0u64;
+        let prefix = mr1_prefix(target_jk, target_round);
+
+        // --- Gate C1: byte-identity OFF vs ON on the same fixture/probe. ---
+        let db = mr1_build(rounds, present, target_jk);
+        let cf = db.default_cf();
+
+        std::env::remove_var("FRS_RS_PROBE_BLOOM_PRUNE"); // OFF
+        db.evict_all_sst_readers();
+        let off = mr1_drain(&db, &cf, &prefix);
+        // Sanity: the fixture actually produced a bloom-positive multi-entry probe.
+        assert_eq!(
+            off.len(),
+            3,
+            "target (jk,round) should have 3 entries (present in {present} SSTs but same key+seq dedups to newest)"
+        );
+
+        std::env::set_var("FRS_RS_PROBE_BLOOM_PRUNE", "1"); // ON
+                                                            // Re-build a fresh DB so the meta cache starts empty, then prime it once
+                                                            // (a cold probe opens every overlapping SST, caching every bloom), then
+                                                            // evict the readers (the q7 spilled-state regime: blooms sticky, readers
+                                                            // gone) and probe again — now the prune must fire.
+        let db_on = mr1_build(rounds, present, target_jk);
+        let cf_on = db_on.default_cf();
+        // Prime: first probe opens + caches all blooms (no prune yet, cache empty).
+        let _ = mr1_drain(&db_on, &cf_on, &prefix);
+        // Now evict readers but KEEP the bloom meta cache → cold-probe regime.
+        db_on.evict_all_sst_readers();
+        let on = mr1_drain(&db_on, &cf_on, &prefix);
+
+        assert_eq!(off, on, "MR-1 ON must be byte-identical to OFF");
+
+        // --- Gate C0/skip-proof: after the pruned cold probe, ONLY the
+        // bloom-positive SSTs were (re-)opened; the bloom-negative ones were
+        // skipped without a reader open. ---
+        let opened = db_on.sst_readers.load();
+        // Exactly the `present` bloom-positive SSTs hold the target; only those
+        // should have been re-opened by the post-evict probe. (Endpoint-only SSTs
+        // are bloom-negative for this prefix → pruned, not opened.)
+        assert_eq!(
+            opened.len() as u64,
+            present,
+            "MR-1 must re-open ONLY the {present} bloom-positive SSTs; opened={}",
+            opened.len()
+        );
+
+        // --- Gate C3: short-prefix safety. A prefix shorter than
+        // PREFIX_BLOOM_LEN must NOT prune (falls through to open-then-check),
+        // byte-identical to OFF and seeing the endpoint rows too. ---
+        let short_prefix = &target_jk.to_be_bytes()[..]; // 8 bytes < 16
+        std::env::remove_var("FRS_RS_PROBE_BLOOM_PRUNE");
+        db.evict_all_sst_readers();
+        let short_off = mr1_drain(&db, &cf, short_prefix);
+        std::env::set_var("FRS_RS_PROBE_BLOOM_PRUNE", "1");
+        db.evict_all_sst_readers();
+        let short_on = mr1_drain(&db, &cf, short_prefix);
+        assert_eq!(
+            short_off, short_on,
+            "short prefix (< PREFIX_BLOOM_LEN) must not be pruned — identical to OFF"
+        );
+
+        std::env::remove_var("FRS_RS_PROBE_BLOOM_PRUNE");
+    }
+
+    /// Gate C2 (no false negative): the metadata-bloom prune NEVER skips an SST
+    /// that the reader-side `may_contain_prefix` would accept. We prove this by
+    /// the strongest observable property: with the prune ON over the FULL key
+    /// space, every probe returns exactly the rows the OFF path returns (a
+    /// dropped bloom-positive SST would lose rows). Run across many distinct
+    /// targets so a single false-negative would surface as a row mismatch.
+    #[test]
+    fn test_mr1_probe_bloom_prune_no_false_negative_full_keyspace() {
+        mr1_with_deep_l0(test_mr1_no_false_negative_body);
+    }
+    fn test_mr1_no_false_negative_body() {
+        let rounds = 12u64;
+        let db = mr1_build(rounds, /*present*/ 3, /*target_jk*/ 5);
+        let cf = db.default_cf();
+
+        // Probe a spread of (jk, round) targets — most are bloom-NEGATIVE in
+        // every SST (no rows), the planted one (jk=5, round=0) is positive.
+        let targets: Vec<[u8; 16]> = (0..8u64)
+            .flat_map(|jk| (0..3u64).map(move |r| mr1_prefix(jk, r)))
+            .collect();
+
+        for prefix in &targets {
+            std::env::remove_var("FRS_RS_PROBE_BLOOM_PRUNE");
+            db.evict_all_sst_readers();
+            let off = mr1_drain(&db, &cf, prefix);
+
+            std::env::set_var("FRS_RS_PROBE_BLOOM_PRUNE", "1");
+            // Prime the bloom cache (one full open), evict readers, then probe ON.
+            let _ = mr1_drain(&db, &cf, prefix);
+            db.evict_all_sst_readers();
+            let on = mr1_drain(&db, &cf, prefix);
+
+            assert_eq!(
+                off, on,
+                "false negative: ON dropped rows OFF returned for prefix {prefix:?}"
+            );
+        }
+        std::env::remove_var("FRS_RS_PROBE_BLOOM_PRUNE");
     }
 }

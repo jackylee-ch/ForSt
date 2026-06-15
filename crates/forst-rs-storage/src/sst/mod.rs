@@ -44,7 +44,7 @@ pub use reader::{
 };
 pub use schema::{
     sst_schema, BLOCK_HEADER_SIZE, BLOCK_TYPE_DATA, BLOCK_TYPE_DATA_KV, FILE_HEADER_SIZE,
-    SST_FORMAT_VERSION, SST_MAGIC,
+    PREFIX_BLOOM_LEN, SST_FORMAT_VERSION, SST_MAGIC,
 };
 pub use sparse_index::{decode_index, encode_index, search_index, BlockStats, SparseIndexEntry};
 pub use writer::{SstFileInfo, SstWriterImpl, SstWriterOptions};

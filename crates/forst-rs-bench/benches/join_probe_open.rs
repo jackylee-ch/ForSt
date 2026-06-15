@@ -292,10 +292,107 @@ fn bench_join_probe_adaptive(c: &mut Criterion) {
     std::env::remove_var("FRS_L0_SLOWDOWN_TRIGGER");
 }
 
+/// APPROACH 1 (2026-06-15 omnipotent-rethink §4.1 + the q7 probe-open prune
+/// next-cycle candidate): **leveled vs tiered** per-probe source count.
+///
+/// The size-tiered L0 layout is the read-amp root: a long-running join holds
+/// `rounds` overlapping SSTs, each spanning the full join-key range, so EVERY
+/// probe fans out over all `rounds` sources (the `tiered` arm — identical fixture
+/// to `bench_join_probe_adaptive`). A true LEVELED bottom level holds ONE
+/// non-overlapping run, so a probe locates ≤1 source regardless of `rounds`. We
+/// approximate the leveled bottom level with `compact_range` (a full-range
+/// compaction that collapses the overlapping L0 SSTs into a single sorted run),
+/// then measure the SAME probe.
+///
+/// PASS (the gate for building leveled-on-hot-CFs): the `leveled` arm's per-probe
+/// time is ~FLAT in `rounds` (source count bounded to ≈#levels) while `tiered`
+/// rises ~linearly — i.e. "leveled-N ≈ tiered-1". This complements MR-1: MR-1
+/// cuts the WASTED cold opens of bloom-negative sources; leveled cuts the source
+/// COUNT itself. Run BEFORE any leveled-compaction build (NOT NexMark).
+fn bench_join_probe_leveled_vs_tiered(c: &mut Criterion) {
+    // Sustain the L0 fan-out so the `tiered` arm actually sees `rounds` sources.
+    std::env::set_var("FRS_L0_COMPACTION_TRIGGER", "100000");
+    std::env::set_var("FRS_L0_STOP_TRIGGER", "100000");
+    std::env::set_var("FRS_L0_SLOWDOWN_TRIGGER", "100000");
+
+    let deep_keys = 64u32;
+    let build_deep = |rounds: u32| -> Arc<DbImpl> {
+        let db = open_in_memory(4096);
+        let cf = db.default_cf();
+        for round in 0..rounds {
+            for jk in 0..deep_keys {
+                let mut k = [0u8; 8];
+                k[..4].copy_from_slice(&jk.to_be_bytes());
+                k[4..].copy_from_slice(&round.to_be_bytes());
+                db.put(&cf, &k, &[0xCDu8; 64]).expect("put");
+            }
+            // switch_and_flush forces one SST per round (tiered fan-out fixture).
+            db.switch_and_flush(&cf).expect("switch+flush");
+        }
+        db
+    };
+    let prefix4 = |jk: u32| -> [u8; 4] { jk.to_be_bytes() };
+    let drain = |db: &Arc<DbImpl>, prefix: &[u8]| {
+        let cf = db.default_cf();
+        let it = db
+            .prefix_scan_iter_owned_arc(&cf, prefix)
+            .expect("open prefix iter");
+        let mut n = 0usize;
+        for item in it {
+            let _ = item.expect("row");
+            n += 1;
+        }
+        n
+    };
+
+    let mut group = c.benchmark_group("join_probe_leveled_vs_tiered");
+    for &rounds in &[8u32, 32, 64, 128] {
+        // tiered: `rounds` overlapping L0 SSTs (today's layout).
+        let db_tiered = build_deep(rounds);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("tiered_ssts_{rounds}")),
+            &rounds,
+            |b, &_n| {
+                let mut jk = 0u32;
+                b.iter(|| {
+                    black_box(drain(&db_tiered, &prefix4(jk % deep_keys)));
+                    jk = jk.wrapping_add(1);
+                });
+            },
+        );
+
+        // leveled: collapse the overlapping L0 into ONE non-overlapping run via a
+        // full-range compaction (the leveled-bottom-level approximation). A probe
+        // now locates ≤1 source regardless of `rounds`.
+        let db_leveled = build_deep(rounds);
+        let cf = db_leveled.default_cf();
+        // Collapse repeatedly until the run is non-overlapping (one full-range
+        // pass merges all current inputs into a single sorted output).
+        let _ = db_leveled.compact_range(&cf).expect("compact_range");
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("leveled_ssts_{rounds}")),
+            &rounds,
+            |b, &_n| {
+                let mut jk = 0u32;
+                b.iter(|| {
+                    black_box(drain(&db_leveled, &prefix4(jk % deep_keys)));
+                    jk = jk.wrapping_add(1);
+                });
+            },
+        );
+    }
+    group.finish();
+
+    std::env::remove_var("FRS_L0_COMPACTION_TRIGGER");
+    std::env::remove_var("FRS_L0_STOP_TRIGGER");
+    std::env::remove_var("FRS_L0_SLOWDOWN_TRIGGER");
+}
+
 criterion_group!(
     benches,
     bench_join_probe_open,
     bench_join_probe_fill_into,
-    bench_join_probe_adaptive
+    bench_join_probe_adaptive,
+    bench_join_probe_leveled_vs_tiered
 );
 criterion_main!(benches);

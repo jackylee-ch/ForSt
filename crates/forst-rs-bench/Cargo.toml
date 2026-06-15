@@ -106,6 +106,13 @@ harness = false
 name = "join_probe_open"
 harness = false
 
+# MR-1 (2026-06-15 q7 probe-open prune): COLD reader-open cost of bloom-negative
+# SSTs on the interval-join probe path + the realized win of the
+# metadata-resident prefix-bloom prune (cold_all vs cold_hit vs mr1_on vs warm).
+[[bench]]
+name = "probe_open_bloom_prune"
+harness = false
+
 # APPROACH-1 (2026-06-15 omnipotent rethink §4.1): persistent seekable probe
 # iterator — read-amp (q7 win) + memory-additive (q9 fix) mini-bench.
 [[bench]]
