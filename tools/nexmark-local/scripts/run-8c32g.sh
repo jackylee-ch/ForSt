@@ -168,6 +168,7 @@ case "$cmd" in
       -e FRS_BLOCK_SIZE_KB=8 -e FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}" \
       -e FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}" \
       -e FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-}" \
+      -e FRS_VLOG_POINT_DEREF="${FRS_VLOG_POINT_DEREF:-}" \
       # KV-sep per-TM MEMORY BOUNDS (q9 KV-sep OOM fix, 2026-06-15 PMC-1).
       # These are the engine knobs that bound resident vlog state so KV-sep
       # fits the per-TM cgroup. Previously NOT forwarded → the bounded LRU /
