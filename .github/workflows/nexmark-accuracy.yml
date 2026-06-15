@@ -58,6 +58,23 @@
 name: nexmark-accuracy-fullstack
 
 on:
+  # HOSTED job (nexmark-accuracy-hosted) runs on every push / PR to forst-rs so
+  # GHA actually GUARANTEES real-NEXMark SQL accuracy in the cloud. The
+  # self-hosted full-stack job below is the on-demand confirmation at 1M scale.
+  push:
+    branches: [forst-rs, main]
+    paths:
+      - 'crates/**'
+      - 'scripts/accuracy-gate/**'
+      - 'scripts/templates-hosted/**'
+      - '.github/workflows/nexmark-accuracy.yml'
+  pull_request:
+    branches: [forst-rs, main]
+    paths:
+      - 'crates/**'
+      - 'scripts/accuracy-gate/**'
+      - 'scripts/templates-hosted/**'
+      - '.github/workflows/nexmark-accuracy.yml'
   workflow_dispatch:
     inputs:
       events:
@@ -79,6 +96,10 @@ permissions: read-all
 jobs:
   fullstack-nexmark-accuracy:
     name: "full-stack NEXMark accuracy (real Flink, forst-rs vs rocksdb)"
+    # Self-hosted Tier-2 (1M-scale confirmation) is on-demand ONLY: it would
+    # otherwise queue forever on every push when no `nexmark` runner is online.
+    # The every-push cloud guarantee is the nexmark-accuracy-hosted job below.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, nexmark]
     timeout-minutes: 180
     env:
@@ -161,5 +182,175 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: nexmark-accuracy-fullstack
+          path: /tmp/acc-rows
+          retention-days: 7
+
+  # ==========================================================================
+  # HOSTED real-NEXMark accuracy gate — runs on EVERY push / PR (ubuntu-latest).
+  #
+  # This is the genuinely faithful E2E accuracy guarantee in the CLOUD: it runs
+  # the ACTUAL NEXMark q3/q5/q8/q11/q12 SQL through a REAL Flink 2.2.1 standalone
+  # cluster on BOTH the forst-rs backend (JDK25, FFM) AND the rocksdb backend
+  # (JDK17), replaying a byte-identical 100K-event fixed CSV, then sha256
+  # multiset-compares the print-sink changelog rows. Any DIFF / missing query /
+  # absent verdict FAILS the job.
+  #
+  # Why this works on a hosted runner where the prior agent said it couldn't:
+  #   The 12 GB was only the Flink SOURCE build. We do NOT build Flink here. We
+  #   DOWNLOAD a prebuilt lean Flink 2.2.1 dist (released as
+  #   `nexmark-runtime-flink-2.2.1`) which already bundles:
+  #     * flink-dist (with librocksdbjni-linux64.so + libforstjni-linux64.so
+  #       self-extracted at runtime — so the rocksdb reference needs NO extra
+  #       native lib on Linux),
+  #     * the forst-rs / rocksdb statebackend jars and the nexmark-flink jar,
+  #     * the nexmark q*.sql + ddl files.
+  #   The ONLY thing rebuilt per-commit is the forst-rs FFM .so (a cheap ~5 min
+  #   Linux Rust build, cached), which the forst-rs jar loads via FFM
+  #   (-Dforstrs.native.libpath). A single small TaskManager (accuracy, not the
+  #   8c/32g perf split) fits the runner; 100K events is tiny.
+  # ==========================================================================
+  nexmark-accuracy-hosted:
+    name: "hosted real-NEXMark accuracy (real Flink SQL, forst-rs vs rocksdb, 100K)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # CI portability: .cargo/config.toml uses target-cpu=native; hosted runners
+      # are CPU-heterogeneous, so pin a universal baseline (SIGILL guard).
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+      RUNTIME_TAG: nexmark-runtime-flink-2.2.1
+      RUNTIME: ${{ github.workspace }}/.nexmark-runtime
+      EVENTS_NUM: ${{ github.event.inputs.events || '100000' }}
+      QUERIES: ${{ github.event.inputs.queries || 'q3 q5 q8 q11 q12' }}
+      TEMPLATES: ${{ github.workspace }}/scripts/templates-hosted
+      CSV_DIR: /tmp/nexmark-fixed-csv-acc
+      MAXSEC: "600"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (rocksdb backend + datagen)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Pin JDK17 path
+        run: echo "JDK17=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Set up JDK 25 (forst-rs backend)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Pin JDK25 path
+        run: echo "JDK25=$JAVA_HOME" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-nexacc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-nexacc-
+
+      - name: Cache forst-rs .so build (target dir for forst-rs-ffi)
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-nexacc-${{ hashFiles('Cargo.lock', 'crates/forst-rs-ffi/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-target-nexacc-
+
+      - name: Build forst-rs FFM .so (Linux release)
+        run: cargo build --release -p forst-rs-ffi
+
+      - name: Verify .so built
+        run: test -f target/release/libforst_rs_ffi.so
+
+      - name: Download prebuilt Flink runtime (dist + backends + nexmark queries)
+        run: gh release download "$RUNTIME_TAG" --repo "${{ github.repository }}" --pattern 'nexmark-runtime-flink-2.2.1.tar.gz' --dir /tmp
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Extract runtime
+        run: mkdir -p "$RUNTIME"
+      - name: Untar runtime
+        run: tar -C "$RUNTIME" -xzf /tmp/nexmark-runtime-flink-2.2.1.tar.gz
+
+      - name: Pin FLINK_HOME / NEXMARK_HOME
+        run: echo "FLINK_HOME=$RUNTIME/flink-2.2.1" >> "$GITHUB_ENV"
+      - name: Pin NEXMARK_HOME
+        run: echo "NEXMARK_HOME=$RUNTIME/nexmark-flink" >> "$GITHUB_ENV"
+
+      - name: Deploy forst-rs .so into FFM libpath + Flink lib
+        run: sudo mkdir -p /usr/local/lib
+      - name: Copy .so to /usr/local/lib (FFM libpath)
+        run: sudo cp target/release/libforst_rs_ffi.so /usr/local/lib/libforst_rs_ffi.so
+      - name: Copy .so to Flink lib
+        run: cp target/release/libforst_rs_ffi.so "$RUNTIME/flink-2.2.1/lib/libforst_rs_ffi.so"
+
+      - name: Sanity — Flink dist + nexmark queries present
+        run: test -x "$FLINK_HOME/bin/start-cluster.sh"
+      - name: Sanity — nexmark queries present
+        run: ls "$NEXMARK_HOME/queries"/q*.sql | head
+
+      - name: Sanity — rocksdb + forst JNI Linux native libs bundled in flink-dist
+        run: unzip -l "$FLINK_HOME/lib/flink-dist-2.2.1.jar" | grep -E 'librocksdbjni-linux64\.so'
+
+      - name: Generate fixed CSV (deterministic, JDK17 datagen)
+        run: JDK17="$JDK17" bash scripts/accuracy-gate/gen-fixed-csv.sh 2>&1 | tee /tmp/gen.log
+      - name: Verify CSV generated
+        run: grep -q "GEN OK" /tmp/gen.log
+
+      - name: Run each query on BOTH backends through real Flink SQL
+        run: |
+          set -u
+          mkdir -p /tmp/acc-rows
+          for q in $QUERIES; do
+            for cfg in forst-rs-ffm-local rocksdb; do
+              echo "== RUN $q [$cfg] =="
+              OUT_FILE="/tmp/acc-rows/$q-$cfg.rows" QUERY="$q" CONFIG="$cfg" \
+              JDK17="$JDK17" JDK25="$JDK25" TEMPLATES="$TEMPLATES" \
+              FLINK_HOME="$FLINK_HOME" NEXMARK_HOME="$NEXMARK_HOME" CSV_DIR="$CSV_DIR" MAXSEC="$MAXSEC" \
+                bash scripts/accuracy-gate/measure-print.sh \
+                2>&1 | tee "/tmp/acc-rows/$q-$cfg.log" || true
+            done
+          done
+
+      - name: Compare forst-rs vs rocksdb (sha256, FAIL on ANY mismatch)
+        run: |
+          set -u
+          fail=0
+          for q in $QUERIES; do
+            for cfg in forst-rs-ffm-local rocksdb; do
+              if ! grep -q "VERDICT_TSV	$q	$cfg	" "/tmp/acc-rows/$q-$cfg.log"; then
+                echo "::error::$q/$cfg produced no VERDICT_TSV"; fail=1
+              fi
+            done
+          done
+          EB=$(( EVENTS_NUM * 46 / 50 ))   # q12 invariant: bid count = BP/50 of events
+          for q in $QUERIES; do
+            frs="/tmp/acc-rows/$q-forst-rs-ffm-local.rows"
+            rdb="/tmp/acc-rows/$q-rocksdb.rows"
+            if [ ! -s "$frs" ] || [ ! -s "$rdb" ]; then
+              echo "::error::$q missing capture (frs=$([ -s "$frs" ] && echo ok || echo MISSING) rdb=$([ -s "$rdb" ] && echo ok || echo MISSING))"
+              fail=1; continue
+            fi
+            if ! python3 scripts/accuracy-gate/compare-print.py "$q" "$frs" "$rdb" "$EB"; then
+              echo "::error::$q ACCURACY MISMATCH (forst-rs vs rocksdb)"; fail=1
+            fi
+          done
+          [ "$fail" = "0" ] || { echo "HOSTED NEXMark real-SQL accuracy gate FAILED"; exit 1; }
+          echo "HOSTED NEXMark real-SQL accuracy gate: ALL PASS ($QUERIES)"
+
+      - name: Upload captures + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexmark-accuracy-hosted
           path: /tmp/acc-rows
           retention-days: 7
