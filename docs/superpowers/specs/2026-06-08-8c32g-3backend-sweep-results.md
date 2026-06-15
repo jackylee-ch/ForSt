@@ -19,9 +19,15 @@
 #
 # | query | forst-rs (M2) wall_s | out_rows | rocksdb wall_s | out_rows | forst wall_s | out_rows | beat-both verdict |
 # |---|---|---|---|---|---|---|---|
-# | q9 | 1285.5 | 91,813,372 ✓ | (running) | — | (running) | — | (pending baselines) |
+# | q9 | 1285.5 | 91,813,372 ✓ | 1057.4 | 91,813,372 ✓ | 1982.0 | 91,813,372 ✓ | PASS (vs RDB 1.22× ≤1.25 bar; BEATS ForSt 1.54×; rows EXACT all 3) |
 #
-# (table filled incrementally below as the sweep records each RESULT)
+# ★ q9 headline: in the uniform split it FINISHES on all 3 backends with byte-
+#   identical out_rows (91,813,372), BEATS ForSt (1285.5 < 1982.0), and is within
+#   the RocksDB ≤1.25× bar (1.22×). On Mac legacy ForSt q9 was DNF — at the uniform
+#   split it completes. q9 is no longer a fit/OOM problem; it PASSES.
+#
+# (priority sweep recording incrementally: order q8 q12 q17 q11 q18 q19 q4 q7 q20,
+#  then the light forst-rs-only queries; rows appended as each RESULT lands)
 #
 # ── process.size=10240m REGRESSION CHECK (vs prior 12288m, same machine) ──
 # q9: 10240m is REQUIRED for the fit (12288m OOM'd the split). For non-q9 queries

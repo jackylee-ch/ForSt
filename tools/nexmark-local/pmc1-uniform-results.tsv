@@ -1,2 +1,4 @@
 query	arm	state	wall_ms	wall_s	src_out	out_rows	tag	ts
 q9	forst-rs-ffm-local	FINISHED	1285487	1285.5	98000000	91813372	pmc1u-q9-forst-rs-ffm-local	20260615T180703
+q9	rocksdb	FINISHED	1057380	1057.4	98000000	91813372	pmc1u-q9-rocksdb	20260615T182526
+q9	forst-local	FINISHED	1981991	1982.0	98000000	91813372	pmc1u-q9-forst-local	20260615T185853
