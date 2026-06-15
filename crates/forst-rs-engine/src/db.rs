@@ -307,12 +307,17 @@ pub fn vlog_coalesce_deref_enabled() -> bool {
     }
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let base = *ON.get_or_init(|| {
         matches!(
             std::env::var("FRS_VLOG_COALESCE_DEREF").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE")
         )
-    })
+    });
+    // FRS-DYN-SHED: under memory pressure (Elevated+) shed the coalesced deref —
+    // its deferred-deref side lists + grouped per-segment chunk buffers are freed
+    // by falling back to inline per-key deref (byte-identical output). No-op when
+    // the master flag is OFF.
+    base && !crate::mem_pressure::should_shed(crate::mem_pressure::ShedPriority::CoalesceBuffers)
 }
 
 /// FRS-MULTIGET-COALESCE master flag for the coalesced SST data-block read on
@@ -998,10 +1003,15 @@ fn leveled_hot_cf_enabled() -> bool {
         2 => return true,
         _ => {}
     }
-    matches!(
+    let base = matches!(
         std::env::var("FRS_RS_LEVELED_HOT_CF").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
-    )
+    );
+    // FRS-DYN-SHED: under memory pressure (High+) shed the leveled-hot-CF
+    // residency boost — fall back to the base L0 rollup trigger so the hot CF
+    // holds fewer resident index/filter blocks. No-op when the master flag is
+    // OFF (byte-identical).
+    base && !crate::mem_pressure::should_shed(crate::mem_pressure::ShedPriority::LeveledHotCf)
 }
 
 /// FRS-RS-LEVELED-HOT-CF: programmatic override for [`leveled_hot_cf_enabled`]
@@ -2230,6 +2240,7 @@ impl DbImpl {
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
         maybe_start_mem_diag(); // FRS_MEM_DIAG: pinpoint engine resident native (join-OOM 16GB)
+        crate::mem_pressure::maybe_start_sampler(); // FRS-DYN-SHED: cgroup pressure watermark (no-op unless armed)
         let block_cache = shared_block_cache(cache_bytes); // FRS-ROCKSDB-PARITY C3: slot-shared
                                                            // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
                                                            // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
@@ -7755,6 +7766,7 @@ impl DbImpl {
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
         maybe_start_mem_diag(); // FRS_MEM_DIAG: pinpoint engine resident native (join-OOM 16GB)
+        crate::mem_pressure::maybe_start_sampler(); // FRS-DYN-SHED: cgroup pressure watermark (no-op unless armed)
         let block_cache = shared_block_cache(cache_bytes); // FRS-ROCKSDB-PARITY C3: slot-shared
                                                            // FRS-GLOBAL-WBM-BUDGET: enroll in the process-global memtable budget so the
                                                            // TOTAL memtable RAM across all keyed-state DB instances is bounded (RocksDB's
@@ -14252,6 +14264,17 @@ impl DbImpl {
     /// DEFAULT (`FRS_KV_ADAPTIVE_PRESSURE` OFF): always `true` — today's
     /// behaviour, byte-identical.
     fn should_separate_now(&self, cf_id: ColumnFamilyId) -> bool {
+        // FRS-DYN-SHED: the VlogResident tier is shed LAST (Critical pressure
+        // only). When shed, back off separation for THIS flush unconditionally —
+        // the strongest RAM-bounding action available (new values go inline so
+        // the vlog reader working set stops growing), independent of the per-CF
+        // reclaim heuristic below. Byte-identical to flag-OFF for the already-
+        // separated portion (those BlobRef rows still deref through the immutable
+        // segments); only this flush's NEW values stay inline. No-op when the
+        // master flag is OFF.
+        if crate::mem_pressure::should_shed(crate::mem_pressure::ShedPriority::VlogResident) {
+            return false;
+        }
         if !kv_adaptive_pressure_enabled() {
             return true;
         }
@@ -17236,12 +17259,16 @@ pub fn s2_pinned_enabled() -> bool {
         _ => {}
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let base = *ON.get_or_init(|| {
         matches!(
             std::env::var("FRS_RS_S2_PINNED").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE")
         )
-    })
+    });
+    // FRS-DYN-SHED: under memory pressure (High+) shed S2 pinned blocks — the
+    // legacy streaming path re-reads on demand instead of pinning blocks across
+    // the scan. No-op when the master flag is OFF (byte-identical).
+    base && !crate::mem_pressure::should_shed(crate::mem_pressure::ShedPriority::S2Pinned)
 }
 
 // ---------------------------------------------------------------
@@ -17421,12 +17448,20 @@ fn resident_bloom_skip() -> bool {
 fn persistent_probe_iter_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let base = *ON.get_or_init(|| {
         matches!(
             std::env::var("FRS_PERSISTENT_PROBE_ITER").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE")
         )
-    })
+    });
+    // FRS-DYN-SHED: persistent probe iterators pin an `Arc<Version>` + the
+    // overlapping SST readers for the whole probe window — the heaviest resident
+    // lever, shed FIRST (Elevated+). When shed, the engine falls back to the
+    // per-probe rebuild path (byte-identical, only rebuilds the source set per
+    // probe). No-op when the master flag is OFF.
+    base && !crate::mem_pressure::should_shed(
+        crate::mem_pressure::ShedPriority::PersistentProbeIter,
+    )
 }
 
 /// Drains pending flushes and joins the worker thread on shutdown so no
@@ -22538,6 +22573,68 @@ mod tests {
             !db.version_set.current().vlog_segments.is_empty(),
             "pressure OFF separates every flush"
         );
+        set_vlog_resident_budget_mb_override(None);
+        set_kv_adaptive_pressure_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-DYN-SHED (2026-06-16): the dynamic-shedding VlogResident tier wired
+    /// through the REAL `should_separate_now`. Proves the engine-level gate
+    /// (not just the `mem_pressure` unit) flips with pressure:
+    ///   (a) master flag ON + Critical pressure ⇒ back off (write inline) even
+    ///       though KV-adaptive-pressure is OFF and there is no byte budget —
+    ///       the never-OOM safety valve;
+    ///   (b) master flag ON + Ample pressure ⇒ separate (lever kept when ample);
+    ///   (c) master flag OFF (default) ⇒ separate regardless of pressure
+    ///       (byte-identical to today).
+    #[test]
+    fn test_dyn_shed_vlog_resident_forces_inline_at_critical() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        // KV-adaptive-pressure OFF + no byte budget ⇒ the legacy decision is
+        // ALWAYS "separate"; the only thing that can flip it is the shed.
+        set_kv_adaptive_pressure_override(Some(false));
+        set_vlog_resident_budget_mb_override(None);
+        let db = open();
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("dyn-shed-vlog"))
+            .unwrap();
+
+        // (c) master flag OFF (default): pressure is ignored, always separate.
+        crate::mem_pressure::set_dynamic_shed_override(Some(false));
+        crate::mem_pressure::set_pressure_override(Some(
+            crate::mem_pressure::PressureLevel::Critical,
+        ));
+        assert!(
+            db.should_separate_now(cf.id()),
+            "shed OFF ⇒ separate even at Critical (byte-identical to today)"
+        );
+
+        // (b) master flag ON but Ample: keep the lever (separate).
+        crate::mem_pressure::set_dynamic_shed_override(Some(true));
+        crate::mem_pressure::set_pressure_override(Some(crate::mem_pressure::PressureLevel::Ample));
+        assert!(
+            db.should_separate_now(cf.id()),
+            "shed ON + Ample ⇒ keep separating (lever kept when memory ample)"
+        );
+        // High is NOT enough to shed the VlogResident tier (it sheds LAST).
+        crate::mem_pressure::set_pressure_override(Some(crate::mem_pressure::PressureLevel::High));
+        assert!(
+            db.should_separate_now(cf.id()),
+            "shed ON + High ⇒ VlogResident tier not yet shed (sheds at Critical)"
+        );
+
+        // (a) master flag ON + Critical: back off → write inline (never-OOM).
+        crate::mem_pressure::set_pressure_override(Some(
+            crate::mem_pressure::PressureLevel::Critical,
+        ));
+        assert!(
+            !db.should_separate_now(cf.id()),
+            "shed ON + Critical ⇒ back off to inline (never-OOM safety valve)"
+        );
+
+        crate::mem_pressure::set_pressure_override(None);
+        crate::mem_pressure::set_dynamic_shed_override(None);
         set_vlog_resident_budget_mb_override(None);
         set_kv_adaptive_pressure_override(None);
         set_kv_separation_override(None);

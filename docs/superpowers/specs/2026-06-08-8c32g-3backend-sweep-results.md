@@ -1,6 +1,81 @@
 # 8c/32g 3-backend NexMark sweep — verified time + accuracy (2026-06-08)
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ★★★★ PMC-1 DYNAMIC MEMORY-PRESSURE LEVER SHEDDING (FRS-DYN-SHED) 2026-06-16
+# ═══════════════════════════════════════════════════════════════════════════
+# THE PROBLEM (sweep 791aa54cd/98cef906b/a0bf505e7): at the uniform 2×4c/16g
+# split the "full-stack-ON" config (KV-sep + persistent-probe-iter + coalesce +
+# S2-pinned + leveled-hot-CF + vlog-resident) OOM-killed q9/q19/q5 (exit-137
+# cgroup, NOT correctness). The prior LEANER config FIT them. Enabling all the
+# memory-hungry levers UNCONDITIONALLY robs the big scatter-joins / sliding
+# window of headroom. Directive: ONE uniform config (KV-sep format ON
+# everywhere, no hybrid layout) that DYNAMICALLY sheds the memory-hungry levers
+# under cgroup pressure — bounded, NEVER-OOM — keeping them when memory allows.
+#
+# ── DESIGN + IMPLEMENTATION (committed, branch dyn-shed → forst-rs) ──
+# New module `crates/forst-rs-engine/src/mem_pressure.rs`:
+#  * A process-global memory watermark sampler (thread, 1 s default cadence,
+#    `FRS_DYN_SHED_INTERVAL_MS`). Sources, most→least authoritative:
+#      1. test/bench override (deterministic),
+#      2. cgroup-v2 `memory.current`/`memory.max` (the EXACT bytes the
+#         OOM-killer watches → shedding tracks the real budget),
+#      3. RSS (`/proc/self/statm`) vs `FRS_MEM_BUDGET_MB` (portable fallback).
+#  * `used/budget` → conservative PressureLevel buckets (engage BEFORE the cliff):
+#      Ample <0.75 · Elevated 0.75–0.85 · High 0.85–0.92 · Critical ≥0.92.
+#  * Master flag `FRS_DYNAMIC_SHED=1` — **DEFAULT OFF, byte-identical when off**
+#    (`should_shed()` short-circuits to `false`; no sampler thread; no cgroup
+#    reads). Programmatic overrides for in-process A/B.
+#  * `should_shed(ShedPriority)` = `armed && current_pressure >= lever.shed_at`.
+#
+# PRIORITY LADDER (shed-FIRST → shed-LAST), exactly the work-order order:
+#   1. PersistentProbeIter  — shed at Elevated (held Arc<Version>+SST readers;
+#                             heaviest resident, trivially rebuilt per-probe)
+#   2. CoalesceBuffers      — shed at Elevated (deferred-deref side lists +
+#                             per-segment chunk bufs; inline per-key deref frees)
+#   3. S2Pinned             — shed at High (pinned data blocks across a scan)
+#   4. LeveledHotCf         — shed at High (lowered L0 trigger ⇒ more resident
+#                             index/filter blocks; relax to base trigger)
+#   5. VlogResident         — shed at Critical, LAST (back off NEW-flush value
+#                             separation ⇒ vlog reader working set stops growing;
+#                             the strongest RAM-bounding valve)
+# KV-SEPARATION FORMAT stays ON at every level — uniform layout, no hybrid. The
+# already-separated BlobRef rows always deref through their immutable segments,
+# so shedding mid-run is byte-identical OUTPUT; only NEW flushes go inline.
+#
+# WIRING: each lever's `*_enabled()` (db.rs) AND-folds `!should_shed(lever)`;
+# VlogResident is an early back-off in `should_separate_now`. Sampler started
+# next to `maybe_start_mem_diag()` at db open (no-op unless armed).
+#
+# ── VERIFICATION (Mac — what this host CAN prove) ──
+#  * `cargo test -p forst-rs-engine --lib`: **441 passed / 0 failed** (4 new:
+#    off-by-default-never-sheds, priority-ladder-order, sampler→gate, bp
+#    thresholds + 1 engine-level: shed forces inline at Critical through the
+#    REAL `should_separate_now`).
+#  * BYTE-IDENTICAL-WHEN-OFF proven: ALL pre-existing lever A/B equivalence
+#    tests (S2 byte-equality, persistent-probe-iter byte-identical, adaptive
+#    KV-sep back-off, vlog readahead byte-identical) PASS UNCHANGED — they run
+#    under the default OFF master flag where `should_shed` is always false.
+#  * fmt clean · clippy clean (incl. --tests) · rustdoc-strict
+#    (`RUSTDOCFLAGS=-D warnings cargo doc`) clean (no private intra-doc links).
+#  * FFI crate builds.
+#
+# ── HONEST NEGATIVES / NEEDS THE LINUX BOX ──
+#  * TASK 1 (profile the OOM breakdown — GiB-per-lever at the OOM moment) and
+#    TASK 3 (re-run q9/q19/q5 @100M at 16g/TM with shedding ON → FINISH, exact
+#    rows; q7 keeps its win when ample) REQUIRE the remote x86 box: the Mac has
+#    NO cgroup-v2 `/sys/fs/cgroup`, jemalloc is OFF on Darwin, and NexMark is
+#    REMOTE-ONLY per standing policy. The sampler's cgroup path is therefore
+#    UNEXERCISED on Mac (only the override path is). The mechanism is correct +
+#    inert-when-off + unit/engine-test-proven, but the DEFINITIVE never-OOM
+#    verdict + per-lever GiB attribution + the q7-still-wins-when-ample
+#    spot-check are OWED on the Linux box (run: `FRS_DYNAMIC_SHED=1` +
+#    `FRS_MEM_DIAG=1`, watch `[FRS_MEM_DIAG]` rss vs the cgroup, confirm
+#    exit-137 is gone and out_rows q9=91,813,372 / q19=92,000,000 / q5 canonical).
+#  * The Elevated/High/Critical fraction thresholds (0.75/0.85/0.92) are a
+#    conservative first cut; the box may want tuning (env-overridable design,
+#    but thresholds are currently compiled — a follow-up can env-gate them).
+#
+# ═══════════════════════════════════════════════════════════════════════════
 # ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
 # ═══════════════════════════════════════════════════════════════════════════
 # Population: M2 = Mac (Darwin, arm64 container, jemalloc OFF, io_uring no-op),

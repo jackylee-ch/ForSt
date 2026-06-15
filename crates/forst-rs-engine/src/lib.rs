@@ -97,6 +97,7 @@ pub mod db;
 pub mod file_deletion_guard;
 pub mod flush;
 pub mod list_merge;
+pub mod mem_pressure;
 pub mod mvcc;
 pub mod runtime_tuning;
 pub mod snapshot_view;
@@ -131,6 +132,10 @@ pub use db::{
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};
 pub use list_merge::ListMergeCombiner;
+pub use mem_pressure::{
+    current_pressure, dynamic_shed_enabled, maybe_start_sampler, set_dynamic_shed_override,
+    set_pressure_override, should_shed, PressureLevel, ShedPriority,
+};
 pub use mvcc::{DbId, Snapshot, SnapshotRegistry};
 pub use runtime_tuning::WriteBufferManager;
 pub use snapshot_view::SnapshotView;
