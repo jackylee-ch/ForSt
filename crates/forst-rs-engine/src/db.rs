@@ -508,6 +508,95 @@ pub fn set_vlog_scan_readahead_depth_override(v: Option<usize>) {
     );
 }
 
+/// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE (cycle 8): when ON, the look-ahead depth
+/// SELF-SIZES at runtime from the measured remote-read-latency / downstream-drain
+/// ratio (an EWMA controller) plus a buffered-bytes budget, instead of holding the
+/// static [`vlog_scan_readahead_depth`] knob (`FRS_VLOG_SCAN_READAHEAD_ADAPTIVE=1`,
+/// **DEFAULT OFF**). When OFF the iterator holds the static depth for its whole
+/// life — byte-AND-timing-identical to the cycle-7 path.
+///
+/// The pipeline adapts to MEASURED remote latency: each joined window reports the
+/// time its coalesced remote read actually took (`rtt`, timed inside the pool job)
+/// and the consumer measures the time it spends draining the window downstream
+/// (`consume`). The controller keeps EWMAs of both and steers the depth toward
+/// `ceil(rtt / consume)` — the stage count at which `D·consume >= rtt`, the point
+/// the consumer stops stalling on a read (the cycle-7 model's break-even). So a
+/// read-bound regime (rtt >> consume) grows the depth; a drain-bound regime
+/// (consume >= rtt) shrinks it to 1 — WITHOUT a per-regime knob.
+///
+/// Bounded three ways, all hard ceilings: the read-I/O pool width (a depth above
+/// it cannot raise real concurrency), the buffered-bytes budget
+/// ([`vlog_scan_readahead_budget_bytes`], so wide rows never blow memory), and the
+/// static [`vlog_scan_readahead_depth`] env (kept as an explicit override
+/// CEILING — set it to pin a maximum). The depth only ever moves between `1` and
+/// that min; correctness is independent of the value (a pure timing knob — the
+/// FIFO join restores emit order at any depth).
+fn vlog_scan_readahead_adaptive_enabled() -> bool {
+    let ov = VLOG_SCAN_READAHEAD_ADAPTIVE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    matches!(
+        std::env::var("FRS_VLOG_SCAN_READAHEAD_ADAPTIVE")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE test override for
+/// [`vlog_scan_readahead_adaptive_enabled`]: 0 = env/default, 1 = forced off,
+/// 2 = forced on.
+static VLOG_SCAN_READAHEAD_ADAPTIVE_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: forces adaptive depth on/off for
+/// tests/benches (`None` = defer to `FRS_VLOG_SCAN_READAHEAD_ADAPTIVE`).
+pub fn set_vlog_scan_readahead_adaptive_override(v: Option<bool>) {
+    VLOG_SCAN_READAHEAD_ADAPTIVE_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: the buffered-bytes budget that caps the
+/// adaptive depth (`FRS_VLOG_SCAN_READAHEAD_BUDGET_MIB`, default **16 MiB**). The
+/// controller raises the depth only while the projected buffered bytes
+/// `(depth + 1) · window · avg_row_bytes` stay within this budget — so a scan over
+/// wide vlog values self-limits its in-flight footprint instead of letting a deep
+/// read-bound pipeline pin many large windows of resolved rows. Clamped to
+/// `[1 MiB, 4096 MiB]`; read once per iterator at construction.
+fn vlog_scan_readahead_budget_bytes() -> u64 {
+    let ov = VLOG_SCAN_READAHEAD_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let mib = if ov != 0 {
+        ov as u64
+    } else {
+        std::env::var("FRS_VLOG_SCAN_READAHEAD_BUDGET_MIB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(16)
+    };
+    mib.clamp(1, 4096) * 1024 * 1024
+}
+
+/// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE test override (MiB) for
+/// [`vlog_scan_readahead_budget_bytes`]: `0` = env/default. Stored as a `u32`.
+static VLOG_SCAN_READAHEAD_BUDGET_OVERRIDE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: forces the buffered-bytes budget (in MiB)
+/// for tests/benches (`None` = defer to `FRS_VLOG_SCAN_READAHEAD_BUDGET_MIB`).
+pub fn set_vlog_scan_readahead_budget_override(mib: Option<u32>) {
+    VLOG_SCAN_READAHEAD_BUDGET_OVERRIDE
+        .store(mib.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// FRS-VLOG-SCAN-READAHEAD test override for [`vlog_scan_readahead_enabled`]:
 /// 0 = env/default, 1 = forced off, 2 = forced on.
 static VLOG_SCAN_READAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
@@ -18559,6 +18648,156 @@ enum ValueDecision {
     Fallback,
 }
 
+/// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE (cycle 8): the EWMA controller that self-sizes
+/// the scan-readahead look-ahead depth from measured remote latency. Lives in the
+/// [`ScanCoalesceIter`] when `FRS_VLOG_SCAN_READAHEAD_ADAPTIVE` is ON; absent (and
+/// the static depth is used) when OFF.
+///
+/// # The signal
+///
+/// Each joined window reports two measured times: `rtt` — how long its coalesced
+/// remote read actually took (timed inside the pool job, so it is the TRUE read
+/// latency even after the join no longer blocks because the read was hidden); and
+/// `consume` — how long the consumer spent draining the PREVIOUS window's rows
+/// downstream (measured on the consumer thread between joins). Both feed an EWMA
+/// (`alpha = 1/4`) so the controller tracks the running regime, not one noisy
+/// sample.
+///
+/// # The control law
+///
+/// Target depth = `ceil(rtt_ewma / consume_ewma)` — the cycle-7 break-even: the
+/// stage count at which `D·consume >= rtt`, i.e. a resolved window is always ready
+/// when the consumer finishes the previous drain (steady state becomes
+/// `consume`-bound). Read-bound (rtt >> consume) ⇒ grows; drain-bound
+/// (consume >= rtt) ⇒ collapses to `1`. The raw target is then clamped to the
+/// minimum of three hard ceilings, resolved once at construction:
+///   * `pool_width` — concurrency above the read-I/O pool width is unrealisable;
+///   * `byte_cap` — the largest depth whose projected buffered bytes
+///     `(D + 1) · window · avg_row_bytes` fit the budget (recomputed from the
+///     EWMA row size, so wide vlog values shrink the cap);
+///   * `static_ceiling` — the static `FRS_VLOG_SCAN_READAHEAD_DEPTH` env, kept as
+///     an explicit maximum override.
+/// Depth never drops below `1`. The controller only ever changes WHEN reads are
+/// issued, never which rows or their order, so it is correctness-neutral at any
+/// value.
+struct AdaptiveDepthCtl {
+    /// EWMA of the measured per-window remote-read latency, in seconds. `None`
+    /// until the first window reports (the first refill uses depth `1`).
+    rtt_ewma: Option<f64>,
+    /// EWMA of the measured per-window downstream drain time, in seconds. `None`
+    /// until the first inter-join interval is measured.
+    consume_ewma: Option<f64>,
+    /// EWMA of the average resolved row size in bytes (key + value), for the
+    /// buffered-bytes budget. `None` until the first window resolves.
+    row_bytes_ewma: Option<f64>,
+    /// Hard ceiling: the read-I/O pool width — depth above it cannot raise real
+    /// concurrency. Resolved once at construction.
+    pool_width: usize,
+    /// Hard ceiling: the static `FRS_VLOG_SCAN_READAHEAD_DEPTH` env, an explicit
+    /// maximum-depth override. Resolved once at construction.
+    static_ceiling: usize,
+    /// The buffered-bytes budget that caps the depth via the projected footprint
+    /// `(D + 1) · window · avg_row_bytes`. Resolved once at construction.
+    budget_bytes: u64,
+    /// The coalesce window size (rows per window) — the per-window row multiplier
+    /// in the buffered-bytes projection. Resolved once at construction.
+    window: usize,
+}
+
+impl AdaptiveDepthCtl {
+    /// EWMA smoothing factor — weights the newest sample 1/4, the running average
+    /// 3/4. Responsive enough to follow a regime shift within a handful of windows
+    /// yet immune to single-window noise.
+    const ALPHA: f64 = 0.25;
+
+    fn new(pool_width: usize, static_ceiling: usize, budget_bytes: u64, window: usize) -> Self {
+        Self {
+            rtt_ewma: None,
+            consume_ewma: None,
+            row_bytes_ewma: None,
+            pool_width: pool_width.max(1),
+            static_ceiling: static_ceiling.max(1),
+            budget_bytes,
+            window: window.max(1),
+        }
+    }
+
+    fn ewma_push(slot: &mut Option<f64>, sample: f64) {
+        *slot = Some(match *slot {
+            None => sample,
+            Some(prev) => prev + Self::ALPHA * (sample - prev),
+        });
+    }
+
+    /// Fold one joined window's measurements into the EWMAs. `rtt` and `consume`
+    /// are durations; `row_bytes` is this window's total resolved (key+value) bytes
+    /// and `rows` its resolved row count (skipped to avoid a divide-by-zero).
+    fn observe(
+        &mut self,
+        rtt: std::time::Duration,
+        consume: std::time::Duration,
+        row_bytes: u64,
+        rows: usize,
+    ) {
+        Self::ewma_push(&mut self.rtt_ewma, rtt.as_secs_f64());
+        Self::ewma_push(&mut self.consume_ewma, consume.as_secs_f64());
+        if rows > 0 {
+            Self::ewma_push(&mut self.row_bytes_ewma, row_bytes as f64 / rows as f64);
+        }
+    }
+
+    /// The largest depth whose projected buffered bytes fit the budget:
+    /// `(D + 1) · window · avg_row_bytes <= budget`. With no row-size sample yet
+    /// (or a degenerate zero) the byte cap is inert (returns the pool width).
+    fn byte_cap(&self) -> usize {
+        let avg = self.row_bytes_ewma.unwrap_or(0.0);
+        if avg <= 0.0 {
+            return self.pool_width;
+        }
+        let per_window = self.window as f64 * avg;
+        if per_window <= 0.0 {
+            return self.pool_width;
+        }
+        // (D + 1) · per_window <= budget  ⇒  D <= budget/per_window - 1
+        let max_plus_one = (self.budget_bytes as f64 / per_window).floor();
+        let cap = (max_plus_one - 1.0).max(1.0);
+        cap as usize
+    }
+
+    /// Current target depth: `ceil(rtt/consume) + 1` (the break-even stage count)
+    /// clamped to `min(pool_width, byte_cap, static_ceiling)` and floored at `1`.
+    ///
+    /// # The `+1`
+    ///
+    /// In the FIFO pipeline the window being JOINED was launched `D-1` consumes
+    /// ago (the consumer popped one slot, leaving `D-1` reads resolving while it
+    /// drains the joined window). So the join stops blocking — the read is fully
+    /// hidden — once `(D-1)·consume >= rtt`, i.e. `D >= rtt/consume + 1`. Hence
+    /// `D = ceil(rtt/consume) + 1`: there must always be at least ONE extra slot
+    /// beyond the one being consumed for ANY overlap, so even a deeply drain-bound
+    /// regime (rtt << consume) targets `2` (one read hidden behind one drain), not
+    /// `1` (which never overlaps — it joins the read it just launched).
+    ///
+    /// Before the first measurements land it returns `1` (the cycle-6 path), so a
+    /// cold scan starts conservative and grows only once a regime is observed.
+    fn target_depth(&self) -> usize {
+        let raw = match (self.rtt_ewma, self.consume_ewma) {
+            (Some(rtt), Some(consume)) if consume > 0.0 => (rtt / consume).ceil() as usize + 1,
+            // Read latency known but consume unmeasured/zero ⇒ drive toward the
+            // pool width (a read with no measurable drain is fully read-bound).
+            (Some(_), _) => self.pool_width,
+            // No read latency sample yet ⇒ stay at 1.
+            _ => 1,
+        };
+        let ceiling = self
+            .pool_width
+            .min(self.byte_cap())
+            .min(self.static_ceiling)
+            .max(1);
+        raw.clamp(1, ceiling)
+    }
+}
+
 /// FRS-VLOG-SCAN-COALESCE (Phase-2 cycle 5): a value-resolving wrapper over a
 /// [`LazyPrefixIter`] that BATCHES the `BlobRef` value-log derefs of a scan into
 /// coalesced windows while emitting rows in the EXACT key order the inner merge
@@ -18630,8 +18869,20 @@ struct ScanCoalesceIter {
     /// FRS-VLOG-SCAN-READAHEAD: how many windows to keep in flight ahead of the
     /// consumed one ([`vlog_scan_readahead_depth`], `>= 1`). Resolved once at
     /// construction. Bounds the extra buffered rows to `(depth + 1) · W` and the
-    /// in-flight reads to `depth` windows' segments.
+    /// in-flight reads to `depth` windows' segments. With `adaptive` engaged this
+    /// is the STATIC ceiling; the live target is `adaptive.target_depth()`.
     depth: usize,
+    /// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: when `Some`, the refill target is the
+    /// controller's live `target_depth()` (self-sized from measured rtt/consume +
+    /// the byte budget) instead of the static `depth`. `None` ⇒ static depth (flag
+    /// OFF) — byte-AND-timing-identical to the cycle-7 path. Only meaningful when
+    /// `readahead` is `Some`. Set once at construction.
+    adaptive: Option<AdaptiveDepthCtl>,
+    /// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: timestamp marking when the consumer last
+    /// finished joining a window (so the wall time until the NEXT join is that
+    /// window's downstream drain time, the `consume` sample). `None` until the
+    /// first join. Unused when `adaptive` is `None`.
+    last_join_at: Option<std::time::Instant>,
 }
 
 /// FRS-VLOG-SCAN-READAHEAD: a single window's in-flight resolution, owned by the
@@ -18640,12 +18891,30 @@ struct ScanCoalesceIter {
 /// `ready` rows back; the consumer JOINS by blocking on `rx.recv()` — but only
 /// after it has drained the previous window, so the read overlapped consumption.
 struct WindowPrefetch {
-    /// The resolved, slot-ordered rows of this window (or a disconnect on
-    /// cancellation / DB teardown — surfaced as a benign empty window).
-    rx: std::sync::mpsc::Receiver<std::collections::VecDeque<ForstResult<(Arc<[u8]>, Arc<[u8]>)>>>,
+    /// The resolved, slot-ordered rows of this window plus the measured read
+    /// latency (or a disconnect on cancellation / DB teardown — surfaced as a
+    /// benign empty window).
+    rx: std::sync::mpsc::Receiver<WindowResolved>,
     /// Whether the assemble that produced this prefetch hit the inner cursor's
     /// end (so after joining it, no further window should be launched).
     inner_done_after: bool,
+}
+
+/// FRS-VLOG-SCAN-READAHEAD: a resolved window sent from the pool job to the
+/// consumer. Carries the slot-ordered rows AND (for the adaptive controller) the
+/// time the coalesced remote read actually took plus the resolved byte count.
+/// The timing/byte fields are pure diagnostics on the static path (ignored when
+/// `adaptive` is `None`), so the static path is unaffected.
+struct WindowResolved {
+    /// The resolved, slot-ordered rows of this window.
+    rows: std::collections::VecDeque<ForstResult<(Arc<[u8]>, Arc<[u8]>)>>,
+    /// How long [`ScanCoalesceIter::resolve_window_slots`] took on the pool — the
+    /// TRUE per-window remote-read latency, measured even when the join no longer
+    /// blocks (the read was hidden). Zero on the DB-teardown empty window.
+    read_latency: std::time::Duration,
+    /// Total resolved (key + value) bytes in this window — the buffered-bytes
+    /// budget's row-size signal. Zero on the empty window.
+    row_bytes: u64,
 }
 
 /// One slot's resolved state while a window is being assembled. The slot order
@@ -18685,6 +18954,20 @@ impl ScanCoalesceIter {
         // Resolve the look-ahead depth once. Only meaningful when readahead is
         // engaged; otherwise the legacy `fill_window` path ignores it.
         let depth = vlog_scan_readahead_depth();
+        // FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: build the EWMA controller only when the
+        // adaptive flag is ON AND readahead is engaged (no pipeline to size
+        // otherwise). The static `depth` becomes the controller's CEILING (so the
+        // env still pins a maximum). OFF ⇒ `None` ⇒ the static depth, unchanged.
+        let adaptive = if readahead.is_some() && vlog_scan_readahead_adaptive_enabled() {
+            Some(AdaptiveDepthCtl::new(
+                forst_rs_storage::sst::read_io_pool_width(),
+                depth,
+                vlog_scan_readahead_budget_bytes(),
+                window.max(1),
+            ))
+        } else {
+            None
+        };
         Self {
             db,
             cf_data,
@@ -18695,6 +18978,8 @@ impl ScanCoalesceIter {
             readahead,
             prefetch: std::collections::VecDeque::new(),
             depth,
+            adaptive,
+            last_join_at: None,
         }
     }
 
@@ -18834,6 +19119,12 @@ impl ScanCoalesceIter {
         let (tx, rx) = std::sync::mpsc::channel();
         VLOG_SCAN_READAHEAD_LAUNCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         forst_rs_storage::sst::submit_read_job(Box::new(move || {
+            // FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: time the coalesced remote read
+            // (the resolve pass) HERE on the pool — this is the TRUE per-window
+            // read latency even after the join no longer blocks (the read was
+            // hidden by a deep pipeline). On the static path these fields are
+            // ignored, so the timing is a near-free `Instant::now` pair.
+            let t0 = std::time::Instant::now();
             let rows = match weak.upgrade() {
                 Some(db) => Self::resolve_window_slots(&db, slots, deferred),
                 // DB dropped mid-flight: emit an empty window. The receiver, if
@@ -18842,9 +19133,20 @@ impl ScanCoalesceIter {
                 // below is a harmless no-op.
                 None => std::collections::VecDeque::new(),
             };
+            let read_latency = t0.elapsed();
+            // Total resolved (key + value) bytes — the byte-budget row-size signal.
+            let row_bytes: u64 = rows
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .map(|(k, v)| (k.len() + v.len()) as u64)
+                .sum();
             // Best-effort send: a dropped receiver (early iterator drop) makes
             // this a no-op — the resolved rows are dropped, nothing leaks.
-            let _ = tx.send(rows);
+            let _ = tx.send(WindowResolved {
+                rows,
+                read_latency,
+                row_bytes,
+            });
         }));
         Some(WindowPrefetch {
             rx,
@@ -18878,7 +19180,19 @@ impl Iterator for ScanCoalesceIter {
                 // window order, exactly as the legacy path. Only WHEN each window's
                 // blob reads happen moves to the pool; the emitted row sequence is
                 // unchanged.
-                while !self.inner_done && self.prefetch.len() < self.depth {
+                // FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: the refill target is the
+                // controller's live `target_depth()` (self-sized from measured
+                // rtt/consume + the byte budget) when adaptive is engaged, else the
+                // static `depth` (byte-AND-timing-identical to the cycle-7 path).
+                // Floored at 1 so the pipeline always keeps at least one window in
+                // flight (the cycle-6 look-ahead).
+                let target = self
+                    .adaptive
+                    .as_ref()
+                    .map(|c| c.target_depth())
+                    .unwrap_or(self.depth)
+                    .max(1);
+                while !self.inner_done && self.prefetch.len() < target {
                     match self.launch_prefetch(weak.clone()) {
                         Some(pf) => {
                             let done_after = pf.inner_done_after;
@@ -18898,11 +19212,42 @@ impl Iterator for ScanCoalesceIter {
                 // No window in flight and nothing left to assemble ⇒ the scan is
                 // exhausted (`?` returns `None` from `next`).
                 let pf = self.prefetch.pop_front()?;
+                // FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: the `consume` sample is the PURE
+                // downstream drain — the wall from when the PREVIOUS window's join
+                // completed to NOW (this join's start). It deliberately EXCLUDES the
+                // `recv()` block below: the block IS the unhidden read, which the
+                // controller already sees via `read_latency`, so folding it into
+                // `consume` would conflate the two and make the depth under-grow in
+                // the read-bound regime (the very case depth is for). Captured
+                // before the blocking recv.
+                let consume = self.adaptive.as_ref().and_then(|_| {
+                    self.last_join_at
+                        .map(|t| std::time::Instant::now().duration_since(t))
+                });
                 // Join the FRONT (oldest) in-flight window. A channel disconnect
                 // (pool job panicked / DB torn down) yields an empty window — the
                 // scan ends cleanly rather than stranding.
-                let rows = pf.rx.recv().unwrap_or_default();
-                self.ready.extend(rows);
+                let resolved = pf.rx.recv().unwrap_or(WindowResolved {
+                    rows: std::collections::VecDeque::new(),
+                    read_latency: std::time::Duration::ZERO,
+                    row_bytes: 0,
+                });
+                // Fold this window's measured TRUE read latency (timed on the pool)
+                // and the pure drain interval into the EWMA controller, then mark the
+                // new join-completion point. Only on the adaptive path; the static
+                // path skips this entirely (timing-identical to cycle-7).
+                if let Some(ctl) = self.adaptive.as_mut() {
+                    if let Some(consume) = consume {
+                        ctl.observe(
+                            resolved.read_latency,
+                            consume,
+                            resolved.row_bytes,
+                            resolved.rows.len(),
+                        );
+                    }
+                    self.last_join_at = Some(std::time::Instant::now());
+                }
+                self.ready.extend(resolved.rows);
                 // A window can resolve to ZERO ready rows (all `Skip`) yet leave
                 // more inner rows; loop to refill/join again rather than return a
                 // spurious None.
@@ -21036,6 +21381,228 @@ mod tests {
             1,
             "clearing override restores default"
         );
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: the EWMA controller's control law in
+    /// isolation — read-bound grows toward `ceil(rtt/consume)`, drain-bound
+    /// collapses to 1, and each ceiling (pool width, byte budget, static) bites.
+    #[test]
+    fn test_adaptive_depth_ctl_control_law() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+
+        // Cold: no samples ⇒ stay at 1 (the cycle-6 look-ahead).
+        let cold = AdaptiveDepthCtl::new(8, 64, 1 << 30, 4);
+        assert_eq!(cold.target_depth(), 1, "cold start = depth 1");
+
+        // Read-bound rtt=20ms, consume=5ms ⇒ ceil(4)+1 = 5 (under all ceilings).
+        let mut rb = AdaptiveDepthCtl::new(8, 64, 1 << 30, 4);
+        for _ in 0..20 {
+            rb.observe(ms(20), ms(5), 4 * 100, 4);
+        }
+        assert_eq!(
+            rb.target_depth(),
+            5,
+            "read-bound rtt/consume=4 ⇒ depth ceil(4)+1=5 (got {})",
+            rb.target_depth()
+        );
+
+        // Drain-bound consume >= rtt ⇒ ceil(<=1)+1 = 2 (minimal overlapping depth).
+        let mut db_ = AdaptiveDepthCtl::new(8, 64, 1 << 30, 4);
+        for _ in 0..20 {
+            db_.observe(ms(5), ms(20), 4 * 100, 4);
+        }
+        assert_eq!(
+            db_.target_depth(),
+            2,
+            "drain-bound ⇒ depth 2 (one read hidden)"
+        );
+
+        // Pool-width ceiling: deeply read-bound (rtt/consume=10 ⇒ raw 11) but pool
+        // width 3.
+        let mut pw = AdaptiveDepthCtl::new(3, 64, 1 << 30, 4);
+        for _ in 0..20 {
+            pw.observe(ms(50), ms(5), 4 * 100, 4);
+        }
+        assert_eq!(pw.target_depth(), 3, "pool width caps the depth");
+
+        // Static-ceiling: same regime, pool wide, but static env pins max=2.
+        let mut sc = AdaptiveDepthCtl::new(8, 2, 1 << 30, 4);
+        for _ in 0..20 {
+            sc.observe(ms(50), ms(5), 4 * 100, 4);
+        }
+        assert_eq!(sc.target_depth(), 2, "static ceiling caps the depth");
+
+        // Byte-budget: read-bound (raw 11), pool wide, but a tight budget.
+        // window=10 rows, avg row = 1000 B ⇒ per_window = 10_000 B. budget = 30_000
+        // ⇒ (D+1)·10_000 <= 30_000 ⇒ D <= 2.
+        let mut bb = AdaptiveDepthCtl::new(16, 64, 30_000, 10);
+        for _ in 0..20 {
+            bb.observe(ms(50), ms(5), 10 * 1000, 10);
+        }
+        assert_eq!(
+            bb.target_depth(),
+            2,
+            "byte budget caps the depth (got {})",
+            bb.target_depth()
+        );
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: a full remote-FS scan with adaptive depth
+    /// ON produces EXACTLY the OFF baseline (rows + order) — the controller only
+    /// changes WHEN reads issue, never the emitted sequence. Correctness-neutral
+    /// proof (the timing-knob contract) across the engaged adaptive path.
+    #[test]
+    fn test_vlog_scan_readahead_adaptive_byte_identical_kvsep_remote() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        set_vlog_scan_coalesce_override(Some(true));
+        std::env::set_var("FRS_VLOG_SCAN_READAHEAD_WINDOW", "4");
+
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 200;
+        let build = || -> (Arc<DbImpl>, ColumnFamilyHandle) {
+            let opts = EngineOptions {
+                db_path: "/db".to_string(),
+                write_buffer_size: 2_000_000_000,
+                max_write_buffer_number: 8,
+                ..EngineOptions::default()
+            };
+            let fs: Arc<dyn FileSystem> = Arc::new(RemoteFakeFs::new());
+            let db = DbImpl::open_with_fs(opts, fs).expect("open remote-fake");
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("scan-ra-adaptive"))
+                .unwrap();
+            for i in 0..N as u32 {
+                let k = format!("row{i:05}").into_bytes();
+                let v = mkrand(0x1000 + i as u64, 256 + (i as usize % 64));
+                db.put(&cf, &k, &v).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 0");
+            for i in (0..N as u32).step_by(2) {
+                let k = format!("row{i:05}").into_bytes();
+                let v = mkrand(0x5000 + i as u64, 256 + (i as usize % 48));
+                db.put(&cf, &k, &v).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 1");
+            for i in (0..N as u32).step_by(17) {
+                let k = format!("row{i:05}").into_bytes();
+                db.delete(&cf, &k).unwrap();
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 2");
+            (db, cf)
+        };
+
+        let collect_scan = |db: &Arc<DbImpl>, cf: &ColumnFamilyHandle| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let slot: Arc<Mutex<Option<ForstError>>> = Arc::new(Mutex::new(None));
+            let it = db
+                .scan_iter_owned_arc_with_error_slot(cf, b"", None, Arc::clone(&slot))
+                .unwrap();
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = it
+                .map(|r| {
+                    let (k, v) = r.unwrap();
+                    (k.to_vec(), v.to_vec())
+                })
+                .collect();
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "no tier-peek error expected"
+            );
+            rows
+        };
+
+        // Baseline: readahead OFF.
+        set_vlog_scan_readahead_override(Some(false));
+        set_vlog_scan_readahead_adaptive_override(Some(false));
+        let (db_off, cf_off) = build();
+        let baseline = collect_scan(&db_off, &cf_off);
+        assert!(!baseline.is_empty(), "baseline scan produced rows");
+
+        // Adaptive ON: readahead engaged + the controller self-sizes the depth.
+        // A small byte budget exercises the cap path too; the static ceiling stays
+        // at the default (1) UNLESS we lift it, so set a generous explicit ceiling
+        // so the adaptive depth can actually grow above 1 and prove the deep path
+        // is still byte-identical.
+        set_vlog_scan_readahead_override(Some(true));
+        set_vlog_scan_readahead_adaptive_override(Some(true));
+        set_vlog_scan_readahead_depth_override(Some(16)); // static = adaptive CEILING
+        set_vlog_scan_readahead_budget_override(Some(64)); // 64 MiB budget
+        let launched_before = vlog_scan_readahead_launched();
+        let (db_on, cf_on) = build();
+        let rows = collect_scan(&db_on, &cf_on);
+        let launched = vlog_scan_readahead_launched() - launched_before;
+        assert!(
+            launched >= 2,
+            "adaptive readahead must launch multiple windows (launched={launched})"
+        );
+        assert_eq!(
+            rows, baseline,
+            "adaptive readahead must be byte-AND-order-identical to OFF"
+        );
+
+        std::env::remove_var("FRS_VLOG_SCAN_READAHEAD_WINDOW");
+        set_vlog_scan_readahead_depth_override(None);
+        set_vlog_scan_readahead_budget_override(None);
+        set_vlog_scan_readahead_adaptive_override(None);
+        set_vlog_scan_readahead_override(None);
+        set_vlog_scan_coalesce_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD-ADAPTIVE: the flag + budget env helpers default OFF
+    /// / 16 MiB and the overrides flip deterministically.
+    #[test]
+    fn test_vlog_scan_readahead_adaptive_flag_and_budget() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_vlog_scan_readahead_adaptive_override(None);
+        std::env::remove_var("FRS_VLOG_SCAN_READAHEAD_ADAPTIVE");
+        assert!(
+            !vlog_scan_readahead_adaptive_enabled(),
+            "adaptive defaults OFF"
+        );
+        set_vlog_scan_readahead_adaptive_override(Some(true));
+        assert!(
+            vlog_scan_readahead_adaptive_enabled(),
+            "forced-on reads true"
+        );
+        set_vlog_scan_readahead_adaptive_override(Some(false));
+        assert!(
+            !vlog_scan_readahead_adaptive_enabled(),
+            "forced-off reads false"
+        );
+        set_vlog_scan_readahead_adaptive_override(None);
+
+        set_vlog_scan_readahead_budget_override(None);
+        std::env::remove_var("FRS_VLOG_SCAN_READAHEAD_BUDGET_MIB");
+        assert_eq!(
+            vlog_scan_readahead_budget_bytes(),
+            16 * 1024 * 1024,
+            "budget defaults to 16 MiB"
+        );
+        set_vlog_scan_readahead_budget_override(Some(32));
+        assert_eq!(
+            vlog_scan_readahead_budget_bytes(),
+            32 * 1024 * 1024,
+            "override sets the budget"
+        );
+        set_vlog_scan_readahead_budget_override(Some(99999));
+        assert_eq!(
+            vlog_scan_readahead_budget_bytes(),
+            4096 * 1024 * 1024,
+            "budget clamps to 4096 MiB"
+        );
+        set_vlog_scan_readahead_budget_override(None);
     }
 
     /// FRS-VLOG-SCAN-READAHEAD: a mid-scan overwrite+flush yields the SAME rows as

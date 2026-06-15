@@ -273,18 +273,27 @@ impl ReadIoPool {
 
 fn read_io_pool() -> &'static ReadIoPool {
     static POOL: OnceLock<ReadIoPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let n = std::env::var("FRS_RS_PREFETCH_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(|| {
-                let cores = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4);
-                (cores / 2).clamp(2, 6)
-            });
-        ReadIoPool::new(n)
-    })
+    POOL.get_or_init(|| ReadIoPool::new(read_io_pool_width()))
+}
+
+/// The configured width (worker count) of the shared read-I/O pool —
+/// `FRS_RS_PREFETCH_THREADS` or `clamp(cores/2, 2, 6)`. This is the ceiling on
+/// how many of a scan's per-window reads can resolve CONCURRENTLY, so the
+/// adaptive scan-readahead depth controller clamps its target depth to this
+/// (a depth above the pool width cannot increase real concurrency). Computed
+/// from the same inputs the pool is built from, so it matches the live pool
+/// regardless of whether the pool has been initialised yet.
+pub fn read_io_pool_width() -> usize {
+    std::env::var("FRS_RS_PREFETCH_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            (cores / 2).clamp(2, 6)
+        })
+        .max(1)
 }
 
 /// FRS-SCAN-OPEN-FANOUT (Phase-2 cycle 3, catalog item #1): submit `jobs` to

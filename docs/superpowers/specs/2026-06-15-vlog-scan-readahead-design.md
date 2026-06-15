@@ -305,4 +305,130 @@ targets. `--smoke` asserts deep-over-depth-1 > 1.3× in the read-bound regime.
 
 * **Resident-bytes budget on look-ahead depth** — auto-tune `D` from the observed
   rtt/consume ratio and a buffered-bytes cap, so the pipeline self-sizes to the
-  measured remote latency instead of a static env knob.
+  measured remote latency instead of a static env knob. **DONE — §8 (cycle 8).**
+
+---
+
+## 8. Cycle 8 — ADAPTIVE depth (self-sizing from measured rtt/consume + a byte budget)
+
+**Flag:** `FRS_VLOG_SCAN_READAHEAD_ADAPTIVE` (default-OFF; byte-AND-timing-identical
+when OFF — the iterator holds the static cycle-7 depth for its whole life).
+**Budget:** `FRS_VLOG_SCAN_READAHEAD_BUDGET_MIB` (default 16 MiB).
+**Composes with:** the cycle-7 depth pipeline (it self-sizes the very `depth` the
+cycle-7 refill loop consumes; the static `FRS_VLOG_SCAN_READAHEAD_DEPTH` env becomes
+the controller's CEILING).
+
+### 8.1 The finding (why static D is not enough)
+
+Cycle 7 made `D` a static env knob. But the right `D` depends on the *measured*
+remote latency vs the downstream drain — a single per-job-cluster value cannot be
+right for both a read-bound regime (rtt ≫ consume, wants a deep pipeline) and a
+drain-bound one (consume ≥ rtt, wants the minimal depth). Picking one static D per
+query is exactly the per-query-knob the project forbids. The pipeline should
+**self-size** from what it observes.
+
+### 8.2 The signal (measured, not modeled)
+
+Two times are measured per joined window:
+
+* **`rtt`** — how long the coalesced remote read actually took, timed *inside the
+  pool job* (`launch_prefetch`'s `Instant::now()` around `resolve_window_slots`).
+  This is the TRUE read latency even after the join stops blocking because the read
+  was hidden — the only place the real cost is still visible.
+* **`consume`** — the PURE downstream drain: the wall from the previous join's
+  completion to this join's *start*, captured **before** the blocking `recv()`. It
+  deliberately EXCLUDES the recv block (the unhidden read) — folding the block into
+  `consume` would conflate it with `rtt` and make the depth under-grow in the very
+  read-bound regime depth is for. (This subtlety cost one mini-bench iteration: the
+  naive "wall between joins" measure inflated `consume` and the controller settled
+  at 2 instead of the optimal depth — see 8.5.)
+
+Both feed an EWMA (`alpha = 1/4`): responsive within a handful of windows, immune to
+single-window noise. Average row bytes (key+value) is also EWMA'd for the budget.
+
+### 8.3 The control law
+
+```
+target = ceil(rtt_ewma / consume_ewma) + 1
+clamped to min(pool_width, byte_cap, static_ceiling), floored at 1
+```
+
+**The `+1` is load-bearing.** In the FIFO pipeline the window being JOINED was
+launched `D-1` consumes ago (the consumer popped one slot and is draining it while
+the rest resolve). The join stops blocking once `(D-1)·consume >= rtt`, i.e.
+`D >= rtt/consume + 1`. So `D = ceil(rtt/consume) + 1`: there must always be at
+least one slot BEYOND the one being consumed for ANY overlap. A deeply drain-bound
+regime therefore targets `2` (one read hidden behind one drain), never `1` (which
+joins the read it just launched — zero overlap). This corrects the cycle-7 model's
+implicit `D = ceil(rtt/consume)` and is why cycle-7's depth-1 ≈ serial in the table.
+
+Three hard ceilings, resolved once at construction:
+
+* `pool_width` (`clamp(cores/2, 2, 6)`, via `read_io_pool_width()`) — concurrency
+  above the read-I/O pool is unrealisable.
+* `byte_cap` = largest `D` with `(D+1)·window·avg_row_bytes <= budget` — recomputed
+  from the EWMA row size, so WIDE vlog values shrink the cap (memory safety).
+* `static_ceiling` = `FRS_VLOG_SCAN_READAHEAD_DEPTH` — kept as an explicit max
+  override.
+
+The controller only changes WHEN reads issue, never which rows or their order →
+correctness-neutral at any value (the FIFO join restores emit order).
+
+### 8.4 Byte-identity TDD
+
+* `test_vlog_scan_readahead_adaptive_byte_identical_kvsep_remote` — remote KV-sep
+  scan, adaptive ON (ceiling 16, budget 64 MiB) reproduces the readahead-OFF
+  baseline EXACTLY (rows + order) and engages (≥ 2 windows launched).
+* `test_adaptive_depth_ctl_control_law` — the controller in isolation: cold ⇒ 1;
+  read-bound rtt/consume=4 ⇒ `ceil(4)+1 = 5`; drain-bound ⇒ 2; pool-width,
+  static-ceiling, and byte-budget caps each bite at the expected value.
+* `test_vlog_scan_readahead_adaptive_flag_and_budget` — flag defaults OFF, budget
+  defaults 16 MiB, overrides + clamps deterministic.
+* Engine lib suite: **431/0** (4 ignored); fmt / clippy / rustdoc-strict clean.
+
+### 8.5 Mini-bench — adaptive vs BEST static, across regimes (no per-regime knob)
+
+`vlog_scan_readahead.rs` extended with `AdaptiveCtl` (mirrors `AdaptiveDepthCtl`)
+and `adaptive_scan` (the cycle-7 FIFO loop with the refill target = live
+`target_depth()`). For each regime it computes the best static depth (min over
+{1,2,3,4,6,8}, 3-run mean) and the adaptive run, asserting the controller CONVERGES
+to the minimal-optimal depth (read-bound) and SETTLES at the minimal overlapping
+depth 2 (drain-bound) — WITHOUT a per-regime knob.
+
+Full run (RTT=12 ms, 50 Gb/s throttle, Wn=256, pool 6):
+
+| consume/rtt | best static | adaptive (ms) | settled-D | adpt/best | adpt/serial |
+|------------:|------------:|--------------:|----------:|----------:|------------:|
+| 0.125 (very read-bound) | 8 | 741 | **6** (= pool cap) | 1.21× | 5.50× |
+| 0.25 | 8 | 1002 | **5** (= ceil(4)+1) | 1.05× | 4.56× |
+| 0.5  | 8 | 1923 | **3** (= ceil(2)+1) | 1.04× | 2.82× |
+| 1.0  | 6 | 3757 | **2** (= ceil(1)+1) | 1.04× | 1.92× |
+| 2.0 (drain-bound) | 6 | 6959 | **2** | **1.01×** | 1.52× |
+
+The controller CONVERGES to the analytic optimum `min(ceil(rtt/consume)+1, pool=6)`
+— {6, 5, 3, 2, 2} — in every regime and stays within **1.01×–1.21×** of the best
+static depth's wall, with NO per-regime knob, never regressing the drain-bound case
+(1.01×). The 1.21× at the extreme read-bound end is the depth-1→6 warmup ramp (a
+fixed cost) plus that the bench's static sweep may exceed the pool width (the
+controller correctly caps at the realisable pool). Convergence (settled-D = the
+analytic optimum) is the load-bearing claim; the wall ratio is a loose sanity guard
+(≤ 2.5× in `--smoke`) since real-sleep jitter on a shared CI box makes a tight bound
+unreliable.
+
+**Honest negatives.** (1) The adaptive run carries a fixed warmup ramp (depth grows
+1→target over ~target windows) — on a SHORT scan the ramp is a larger fraction, so
+the static optimum, if known, is marginally faster; the adaptive win is that NO
+per-regime knob is needed and it never over-buffers. (2) When best-static is in a
+consume-bound tie (every depth ≥ 2 ties), the printed `best static` column picks an
+arbitrary deep depth — the controller deliberately picks the SMALLEST optimum (least
+buffering), which the bench rewards via the drain-bound settle-at-2 assertion, not
+the noisy argmin. (3) The `consume` measurement excluding the recv block is essential
+(see 8.2) — the naive measure regressed convergence.
+
+### 8.6 Next-cycle candidate
+
+* **Write-side QoS: a flush-priority lane in the upload in-flight budget** — the
+  shared `upload_sem` is class-blind, so a burst of large compaction-output uploads
+  can occupy the whole in-flight budget and STARVE flush uploads, whose completion
+  unblocks memtable rotation → ingest (write stall). Reserve a fraction of the
+  budget for flush-class uploads. (Item B this cycle — see its own design note.)
