@@ -106,6 +106,13 @@ harness = false
 name = "join_probe_open"
 harness = false
 
+# MR-1 (2026-06-15 q7 probe-open prune design): COLD per-probe reader-open cost
+# for prefix-bloom-NEGATIVE SSTs — the wasted footer/index I/O an metadata-resident
+# bloom prune reclaims. Confirms the projected win BEFORE the lever ships.
+[[bench]]
+name = "probe_open_bloom_prune"
+harness = false
+
 # APPROACH-1 (2026-06-15 omnipotent rethink §4.1): persistent seekable probe
 # iterator — read-amp (q7 win) + memory-additive (q9 fix) mini-bench.
 [[bench]]
