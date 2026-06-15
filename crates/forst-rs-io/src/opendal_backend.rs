@@ -409,6 +409,87 @@ fn async_flush_upload_backpressure() -> bool {
     })
 }
 
+/// FRS-PHASE2 UPLOAD-BYTE-BUDGET (2026-06-15): replaces the fixed COUNT cap
+/// (`MAX_INFLIGHT_UPLOADS`) with a **byte budget** for in-flight buffered
+/// uploads. When this env var is a positive integer (MiB), the `upload_sem`
+/// semaphore is sized to that many 1-MiB permits and each upload reserves
+/// `ceil(sst_bytes / 1 MiB)` of them, so MANY small SSTs can be in flight
+/// concurrently while a handful of LARGE ones cannot all be resident at once —
+/// bounding the *sum* of resident upload bytes rather than the *count*. This is
+/// the regime large compaction outputs need (one 256-MiB SST + a fixed count of
+/// 8 would otherwise pin `8 * 256 MiB`).
+///
+/// Unset / empty / `0` / non-numeric → the count cap is used and behaviour is
+/// **byte-identical** to the pre-2026-06-15 code path (each upload reserves 1
+/// permit out of `MAX_INFLIGHT_UPLOADS`). Recommended value: ~25–50% of the
+/// `WriteBufferManager` budget so upload-resident memory tracks the write memory
+/// the engine is already sized for. Only meaningful together with
+/// [`ASYNC_FLUSH_UPLOAD_ENV`] (the TRUE-bound path that holds the permit on the
+/// flush thread); with async-flush OFF the permit is held only for the network
+/// transfer, but the byte sizing/acquire is still applied for consistency.
+pub const UPLOAD_BYTE_BUDGET_MIB_ENV: &str = "FRS_UPLOAD_BYTE_BUDGET_MIB";
+
+/// One permit in the byte-budget semaphore represents this many bytes. A 1-MiB
+/// unit keeps the permit count small (a 1-GiB budget = 1024 permits, well under
+/// [`Semaphore::MAX_PERMITS`]) and matches SST granularity
+/// (`target_file_size_base` is MiB-scale).
+const UPLOAD_BUDGET_UNIT_BYTES: u64 = 1024 * 1024;
+
+/// Reads [`UPLOAD_BYTE_BUDGET_MIB_ENV`] once per process; `Some(mib)` only for a
+/// positive, parseable value (default OFF → `None`). Resolved via `OnceLock` so
+/// the byte regime is stable for the lifetime of the process (the semaphore is
+/// sized from it at construction).
+fn upload_byte_budget_mib() -> Option<u64> {
+    use std::sync::OnceLock;
+    static V: OnceLock<Option<u64>> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var(UPLOAD_BYTE_BUDGET_MIB_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&m| m > 0)
+    })
+}
+
+/// Total budget permits implied by `budget_mib` (1 permit == 1 MiB), clamped to
+/// [`Semaphore::MAX_PERMITS`]. Pure helper so the sizing math is unit-testable
+/// without touching the process-global env.
+fn byte_budget_total_permits(budget_mib: u64) -> usize {
+    (budget_mib as usize).min(Semaphore::MAX_PERMITS)
+}
+
+/// Permits an upload of `nbytes` reserves against a byte budget of
+/// `budget_mib` MiB: `ceil(nbytes / 1 MiB)`, at least `1` (a tiny SST still
+/// occupies a slot) and at most the whole budget (so an SST larger than the
+/// budget runs ALONE rather than deadlocking on a permit count it can never
+/// satisfy). Pure helper — unit-testable without env.
+fn byte_budget_permits_for(nbytes: u64, budget_mib: u64) -> u32 {
+    let budget = byte_budget_total_permits(budget_mib) as u64;
+    let units = nbytes.div_ceil(UPLOAD_BUDGET_UNIT_BYTES).max(1);
+    units.min(budget) as u32
+}
+
+/// Number of [`Semaphore`] permits the `upload_sem` should be constructed with.
+///
+/// Byte regime → [`byte_budget_total_permits`]. Count regime (default) →
+/// [`MAX_INFLIGHT_UPLOADS`] (byte-identical to the prior behaviour).
+fn upload_sem_total_permits() -> usize {
+    match upload_byte_budget_mib() {
+        Some(mib) => byte_budget_total_permits(mib),
+        None => MAX_INFLIGHT_UPLOADS,
+    }
+}
+
+/// Permits one upload of `nbytes` must reserve from `upload_sem`.
+///
+/// Count regime (default) → always `1` (byte-identical). Byte regime →
+/// [`byte_budget_permits_for`].
+fn upload_permits_for(nbytes: u64) -> u32 {
+    match upload_byte_budget_mib() {
+        None => 1,
+        Some(mib) => byte_budget_permits_for(nbytes, mib),
+    }
+}
+
 pub struct OpendalFileSystem {
     op: Operator,
     rt: RuntimeHandle,
@@ -536,7 +617,7 @@ impl OpendalFileSystem {
             rt,
             name,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
+            upload_sem: Arc::new(Semaphore::new(upload_sem_total_permits())),
         })
     }
 
@@ -555,7 +636,7 @@ impl OpendalFileSystem {
             rt,
             name,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            upload_sem: Arc::new(Semaphore::new(MAX_INFLIGHT_UPLOADS)),
+            upload_sem: Arc::new(Semaphore::new(upload_sem_total_permits())),
         })
     }
 
@@ -1260,9 +1341,18 @@ impl OpendalWritableFile {
                             // itself (byte-identical to the prior behaviour). `block_on` is
                             // safe: `close_writer` runs on the synchronous flush thread, not
                             // inside an async task (same context as the `_ =>` fallback).
+                            //
+                            // FRS-PHASE2 UPLOAD-BYTE-BUDGET: reserve `upload_permits_for`
+                            // permits — `1` in the count regime (default, byte-identical) or
+                            // `ceil(bytes / 1 MiB)` in the byte regime so large SSTs reserve
+                            // proportionally more of the shared budget than small ones.
+                            let permits = upload_permits_for(expected);
                             let prefetched_permit: Option<tokio::sync::OwnedSemaphorePermit> =
                                 if async_flush_upload_backpressure() {
-                                    match self.handle.block_on(sem.clone().acquire_owned()) {
+                                    match self
+                                        .handle
+                                        .block_on(sem.clone().acquire_many_owned(permits))
+                                    {
                                         Ok(permit) => Some(permit),
                                         Err(e) => {
                                             return Err(ForstError::Io(std::io::Error::other(
@@ -1303,12 +1393,17 @@ impl OpendalWritableFile {
                                     // here exactly as before (byte-identical).
                                     let _permit = match prefetched_permit {
                                         Some(p) => p,
-                                        None => sem.acquire_owned().await.map_err(|e| {
-                                            format!(
-                                                "OpenDAL upload semaphore closed: \
-                                                 {path_for_task}: {e}"
-                                            )
-                                        })?,
+                                        // FRS-PHASE2 UPLOAD-BYTE-BUDGET: reserve the same
+                                        // `permits` (1 in the count regime, byte-scaled in
+                                        // the byte regime) when acquiring in-task.
+                                        None => {
+                                            sem.acquire_many_owned(permits).await.map_err(|e| {
+                                                format!(
+                                                    "OpenDAL upload semaphore closed: \
+                                                     {path_for_task}: {e}"
+                                                )
+                                            })?
+                                        }
                                     };
                                     op.write_with(&path_for_task, buf)
                                         // `executors-tokio`-backed Executor: required for
@@ -2957,6 +3052,111 @@ mod tests {
             fs.await_all_uploads().expect("await_all_uploads");
             assert!(fs.file_exists(Path::new("sst/blocked.sst")).unwrap());
             drop(fs);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // FRS-PHASE2 UPLOAD-BYTE-BUDGET: byte-aware in-flight upload admission.
+    // -----------------------------------------------------------------------
+
+    /// 1 MiB == 1 permit; sub-MiB rounds UP to 1 (a tiny SST still occupies a
+    /// slot); exact multiples don't over-charge.
+    #[test]
+    fn byte_budget_permits_round_up_to_whole_mib() {
+        let budget = 1024; // 1 GiB budget → plenty of headroom for these.
+        assert_eq!(byte_budget_permits_for(0, budget), 1, "zero-byte → 1 slot");
+        assert_eq!(byte_budget_permits_for(1, budget), 1, "1 byte → 1 MiB slot");
+        assert_eq!(
+            byte_budget_permits_for(UPLOAD_BUDGET_UNIT_BYTES, budget),
+            1,
+            "exactly 1 MiB → 1 permit"
+        );
+        assert_eq!(
+            byte_budget_permits_for(UPLOAD_BUDGET_UNIT_BYTES + 1, budget),
+            2,
+            "1 MiB + 1 byte → 2 permits"
+        );
+        assert_eq!(
+            byte_budget_permits_for(64 * UPLOAD_BUDGET_UNIT_BYTES, budget),
+            64,
+            "64 MiB SST → 64 permits"
+        );
+    }
+
+    /// An SST larger than the WHOLE budget must clamp to the budget (run ALONE),
+    /// never request a permit count the semaphore can never grant (deadlock).
+    #[test]
+    fn byte_budget_oversized_sst_clamps_to_budget_runs_alone() {
+        let budget_mib = 8; // tiny 8 MiB budget.
+        let total = byte_budget_total_permits(budget_mib) as u32;
+        // A 256 MiB SST would want 256 permits — must clamp to 8 (the budget).
+        let permits = byte_budget_permits_for(256 * UPLOAD_BUDGET_UNIT_BYTES, budget_mib);
+        assert_eq!(permits, total, "oversized SST clamps to full budget");
+        assert!(permits <= total, "never exceeds the budget");
+    }
+
+    /// MIXED sizes: the budget admits MANY small SSTs concurrently but only a
+    /// FEW large ones — this is the whole point of the byte regime vs the count
+    /// cap. Drives the real `acquire_many` against a sized semaphore.
+    #[test]
+    fn byte_budget_admits_many_small_few_large() {
+        // 64 MiB budget == 64 permits.
+        let budget_mib: u64 = 64;
+        let sem = Semaphore::new(byte_budget_total_permits(budget_mib));
+
+        // 32 small (1 MiB) SSTs each take 1 permit → all 32 fit at once (32/64).
+        // Hold the RAII guards so the permits stay reserved (dropping the Vec
+        // releases them — no manual `add_permits` bookkeeping).
+        let mut small_permits = Vec::new();
+        for _ in 0..32 {
+            let p = byte_budget_permits_for(UPLOAD_BUDGET_UNIT_BYTES, budget_mib);
+            small_permits.push(
+                sem.try_acquire_many(p)
+                    .expect("small SST should be admitted"),
+            );
+        }
+        assert_eq!(
+            sem.available_permits(),
+            32,
+            "32 of 64 permits used by smalls"
+        );
+
+        // One 32 MiB SST takes 32 permits → exactly fills the rest.
+        let big = byte_budget_permits_for(32 * UPLOAD_BUDGET_UNIT_BYTES, budget_mib);
+        assert_eq!(big, 32);
+        let big_guard = sem
+            .try_acquire_many(big)
+            .expect("one big SST fills remaining budget");
+        assert_eq!(sem.available_permits(), 0, "budget now exhausted");
+
+        // A SECOND big SST cannot be admitted — byte budget is full (the count
+        // cap of 8 would have happily admitted 8 big ones = 8x the bytes).
+        let big2 = byte_budget_permits_for(32 * UPLOAD_BUDGET_UNIT_BYTES, budget_mib);
+        assert!(
+            sem.try_acquire_many(big2).is_err(),
+            "second large SST must wait — byte budget exhausted"
+        );
+
+        // Release the smalls; now the second big fits (their bytes freed).
+        drop(small_permits);
+        assert!(
+            sem.try_acquire_many(big2).is_ok(),
+            "second large fits once smalls free their bytes"
+        );
+        drop(big_guard);
+    }
+
+    /// The count-regime default (`upload_permits_for` with the env unset) must
+    /// be exactly `1` per upload and the semaphore sized to `MAX_INFLIGHT_UPLOADS`
+    /// — i.e. byte-identical to the pre-byte-budget behaviour. (Env is unset in
+    /// the test binary unless a sibling sets it; assert the default mapping.)
+    #[test]
+    fn count_regime_default_is_byte_identical() {
+        // With no FRS_UPLOAD_BYTE_BUDGET_MIB set, the byte budget is None.
+        if upload_byte_budget_mib().is_none() {
+            assert_eq!(upload_permits_for(0), 1);
+            assert_eq!(upload_permits_for(999_000_000), 1, "any size → 1 permit");
+            assert_eq!(upload_sem_total_permits(), MAX_INFLIGHT_UPLOADS);
         }
     }
 }

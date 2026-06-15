@@ -35,6 +35,10 @@ forst-rs-engine = { workspace = true }
 forst-rs-ffi = { workspace = true }
 forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
+# upload_byte_budget bench: drives the in-flight upload admission policy
+# (tokio Semaphore + modeled per-MiB transfer time) to show the byte budget
+# bounds resident upload memory. Needs the `time` feature for `sleep`.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 # remote_compaction_offload bench: per-thread CPU time (CLOCK_THREAD_CPUTIME_ID)
 # to show the calling (TM) thread does ~0 compaction work under the offload
 # executor. Build-only standard dep; no run-time service.
@@ -226,3 +230,13 @@ path = "src/bin/cache_admission_epoch.rs"
 [[bin]]
 name = "vlog_scan_readahead"
 path = "src/bin/vlog_scan_readahead.rs"
+
+# FRS-PHASE2 UPLOAD-BYTE-BUDGET: byte-aware in-flight upload admission resident
+# bound. Drives the exact admission math (count cap = 1 permit/upload vs byte
+# budget = ceil(bytes/MiB) over a MiB pool) through a tokio Semaphore over a
+# realistic MIXED SST-size stream; tracks PEAK resident upload bytes per arm and
+# prints an EFFECTIVE/MARGINAL/INCONCLUSIVE verdict. In-process, no network, no
+# NEXMark. Takes --smoke for CI.
+[[bin]]
+name = "upload_byte_budget"
+path = "src/bin/upload_byte_budget.rs"
