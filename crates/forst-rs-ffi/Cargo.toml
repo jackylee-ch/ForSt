@@ -71,6 +71,14 @@ tracing = { workspace = true, optional = true }
 # used), which also keeps the host A/B vs RocksDB fair.
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["disable_initial_exec_tls"] }
+# FRS-MEM-PRESSURE-PURGE (2026-06-16): the proactive purge valve's mallctl lives
+# HERE (this crate permits `unsafe`; forst-rs-engine is `#![forbid(unsafe_code)]`).
+# The valve calls the void `arena.<MALLCTL_ARENAS_ALL>.purge` mallctl directly —
+# the typed ctl API / `raw::write` always pass a non-null `newp`, which the purge
+# command rejects, so `mallctl(name, NULL, NULL, NULL, 0)` is the right void
+# invocation. This crate links the jemalloc global allocator above, so the
+# mallctl targets that same live heap.
+tikv-jemalloc-sys = { version = "0.6" }
 
 [dev-dependencies]
 # Used by P2 compat-jni tests to materialise on-disk checkpoint dirs that

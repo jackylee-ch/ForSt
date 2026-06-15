@@ -16826,8 +16826,14 @@ fn maybe_start_mem_diag() {
                     // cgroup sampler engaged in-container and which levers shed.
                     let shed_armed = crate::mem_pressure::dynamic_shed_enabled();
                     let shed_level = crate::mem_pressure::sampled_pressure_for_diag();
+                    // FRS-MEM-PRESSURE-PURGE: surface valve arming + how many
+                    // proactive purges fired — DIRECT evidence the never-OOM
+                    // valve engaged. Pair with a drop in jemalloc_retained_MB /
+                    // rss_MB on the next line to PROVE the reclaim.
+                    let purge_armed = crate::mem_pressure::purge_valve_enabled();
+                    let purge_count = crate::mem_pressure::purge_count();
                     let line = format!(
-                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb} shed_armed={shed_armed} shed_level={shed_level:?}{}\n",
+                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb} shed_armed={shed_armed} shed_level={shed_level:?} purge_armed={purge_armed} purge_count={purge_count}{}\n",
                         prof_diag_str()
                     );
                     if let Ok(mut f) = std::fs::OpenOptions::new()

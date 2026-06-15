@@ -1149,6 +1149,7 @@ dependencies = [
  "forst-rs-test-harness",
  "jni",
  "tempfile",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tracing",
 ]

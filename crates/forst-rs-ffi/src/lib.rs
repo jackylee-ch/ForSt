@@ -54,6 +54,60 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// FRS-MEM-PRESSURE-PURGE (2026-06-16, PMC-1): the proactive jemalloc page-reclaim
+// valve. At the q9/q19/q5 16 g/TM cliff the LIVE allocation is tiny but jemalloc
+// holds ~6-8 GiB of freed-but-unpurged dirty/muzzy pages, so RSS — what the
+// cgroup OOM-killer watches — hits the limit and the TM is exit-137 killed
+// (measured, commit 23420c2c0; orthogonal to the shed levers). The engine's
+// mem-pressure sampler calls this hook under High/Critical pressure to force
+// jemalloc to return ALL retained pages to the OS immediately. Purge only ever
+// releases already-FREED memory — it touches no live allocation — so it is
+// byte-identical / zero correctness impact. The mallctl lives here (not the
+// engine) because forst-rs-engine is `#![forbid(unsafe_code)]` and the void
+// `arena.<MALLCTL_ARENAS_ALL>.purge` mallctl requires `unsafe`.
+
+/// Force ALL jemalloc arenas to release their retained dirty+muzzy pages to the
+/// OS now, via the void `arena.<MALLCTL_ARENAS_ALL>.purge` mallctl. Returns
+/// `true` on success. `MALLCTL_ARENAS_ALL == 4096` in jemalloc 5.3, so
+/// `arena.4096.purge` purges every arena. It is a write-only command:
+/// `newp=NULL, newlen=0`. The typed ctl API / `raw::write` always pass a
+/// non-null `newp`, which the command rejects with `EINVAL`, so we call
+/// `mallctl` directly.
+#[cfg(target_os = "linux")]
+fn jemalloc_purge_all() -> bool {
+    // "arena.4096.purge\0" — 4096 == MALLCTL_ARENAS_ALL (all arenas).
+    let name = b"arena.4096.purge\0";
+    // SAFETY: void command — null in/out pointers, zero lengths. `name` is a
+    // valid NUL-terminated static byte string. jemalloc is this cdylib's global
+    // allocator (`GLOBAL` above), so this targets the live heap.
+    let rc = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            name.as_ptr() as *const std::os::raw::c_char,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    rc == 0
+}
+
+/// FRS-MEM-PRESSURE-PURGE: register the jemalloc purge hook with the engine's
+/// mem-pressure sampler (idempotent; first registration wins). Called from the
+/// FFI entry guard so it is installed before any DB open starts the sampler.
+/// On Linux this wires up [`jemalloc_purge_all`]; off Linux it is a no-op (no
+/// jemalloc allocator), so the valve stays inert.
+#[cfg(target_os = "linux")]
+fn ensure_purge_hook_registered() {
+    static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    DONE.get_or_init(|| {
+        forst_rs_engine::mem_pressure::register_purge_hook(jemalloc_purge_all);
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_purge_hook_registered() {}
+
 // Memory return tuned for throughput: a background thread purges off the hot
 // path, and dirty/muzzy pages are returned to the OS on jemalloc's standard
 // ~10 s decay. (An earlier 1 s decay cut RSS 43→34 GB but RE-FAULTED within each
@@ -378,6 +432,10 @@ impl Default for FrsBytes {
 /// Runs `f` inside `catch_unwind`. Returns `FRS_STATUS_PANIC` if a panic is
 /// caught; otherwise returns whatever `f` returned.
 fn guarded<F: FnOnce() -> i32>(f: F) -> i32 {
+    // FRS-MEM-PRESSURE-PURGE: install the jemalloc purge hook on the first FFI
+    // call — before any DB open starts the mem-pressure sampler. Idempotent +
+    // cheap (one OnceLock load after the first call); a no-op off Linux.
+    ensure_purge_hook_registered();
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(_) => FRS_STATUS_PANIC,

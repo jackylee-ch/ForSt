@@ -210,6 +210,93 @@
 # Mac q9 needs >16g/TM (or the engine valve) regardless. FRS_DYNAMIC_SHED stays
 # default-OFF (it is not the never-OOM mechanism).
 #
+# ───────────────────────────────────────────────────────────────────────────
+# ★★★ PMC-1 PROACTIVE JEMALLOC-PURGE VALVE 2026-06-16 (FRS_MEM_PRESSURE_PURGE) ─
+# ───────────────────────────────────────────────────────────────────────────
+# Built the proactive valve the two verdicts above called for: at High/Critical
+# cgroup pressure, force jemalloc to return retained pages via the void
+# `arena.<MALLCTL_ARENAS_ALL>.purge` mallctl (4096 == ALL arenas, newp=NULL).
+#
+# ── IMPLEMENTATION (committed; branch jemalloc-purge → forst-rs) ──
+#  * forst-rs-ffi/src/lib.rs: `jemalloc_purge_all()` (the unsafe mallctl — the
+#    engine is `#![forbid(unsafe_code)]`, so the call lives in the FFI crate
+#    which already links the jemalloc global allocator + permits unsafe). New
+#    Linux-only dep `tikv-jemalloc-sys`. Registered into the engine via a fn-ptr
+#    hook from `guarded()` (first FFI call, before any DB open).
+#  * forst-rs-engine/src/mem_pressure.rs: `register_purge_hook` (OnceLock fn-ptr),
+#    `purge_valve_enabled()` (armed by `FRS_MEM_PRESSURE_PURGE=1` OR the master
+#    `FRS_DYNAMIC_SHED=1`; DEFAULT OFF), `maybe_purge(level)` — the sampler tick
+#    calls it after publishing the level; fires the hook + bumps a counter iff
+#    armed AND pressure >= High. Off ⇒ no hook, no purge — byte-identical.
+#  * `[FRS_MEM_DIAG]` line gains `purge_armed` + `purge_count` (the proof).
+#  * Harness: forwarded `FRS_MEM_PRESSURE_PURGE` into the ENVS array.
+#  * Tests: `cargo test -p forst-rs-engine --lib` 445/0 (4 new purge-valve tests:
+#    off-by-default, armed-by-sub-flag-or-master, fires-only-at-High, registered-
+#    hook-fires-at-High-not-below). fmt/clippy/rustdoc-strict clean. Linux .so
+#    builds (the unsafe mallctl path compiles in the container).
+#
+# ── VERIFICATION (Mac DOCKER-LINUX container, cgroup-v2, --memory=16g) ──
+# Ran q9 + q19 @100M, uniform 2×4c/16g, process.size=10240m, FULL join_stack,
+# FRS_MEM_PRESSURE_PURGE=1 + FRS_MEM_DIAG=1, BOTH 1 s and 200 ms sampler cadence.
+#
+# | query | cadence | shed/purge outcome | OOM? | out_rows | verdict |
+# |---|---|---|---|---|---|
+# | q9  | 1 s   | tm2 exit-137 @~16.8M | YES | — (req 91,813,372) | ✗ FAIL (truncating restart) |
+# | q9  | 200ms | tm1 exit-137 @~17M    | YES | — (req 91,813,372) | ✗ FAIL (faster cadence did NOT save it) |
+# | q19 | 200ms | tm2 exit-137 @~60M    | YES | — (req 92,000,000) | ✗ FAIL (survived longer, OOM in the compaction storm) |
+# (q5 NOT re-run: q9+q19 + the mechanism below make the outcome a foregone OOM on
+#  this VM — same JVM-dominated RSS. Honest: q5 is owed on a non-overcommitted box.)
+#
+# ── THE VALVE WORKS — BUT IT TARGETS THE WRONG POOL (decisive new finding) ──
+# The purge fires perfectly: purge_armed=true on every line, purge_count climbs
+# (q9 hit 271 @200ms in ~110 s; q19 hit 537), and jemalloc_retained DOES drop on
+# each fire (q9: 6092→5471→4956 MB as count 22→25→28). BUT the TM still OOMs,
+# because **jemalloc `retained` is NOT resident memory.** Per jemalloc's own ctl
+# docs (stats.retained): "Retained virtual memory is typically untouched,
+# DECOMMITTED, or purged ... excluded from mapped memory statistics." Retained
+# pages were already `MADV_DONTNEED`/decommitted — they are virtual-only and do
+# NOT count toward RSS or the cgroup `memory.current` the OOM-killer watches.
+# The PRIOR analysis (and this work-order's premise) CONFLATED `retained` with
+# resident dirty pages. The in-container [FRS_MEM_DIAG] at each cliff proves it:
+#   q9  cliff: rss=15734  jemalloc_RESIDENT=5628  retained=4956  wbm=1656
+#              (purge fired; retained virtual; RSS = JVM ~10.1G + jemalloc 5.6G)
+#   q9  cliff: rss=15296  jemalloc_RESIDENT=5516  retained=817   wbm=2049
+#              (retained crushed to 0.8G by purge — RSS STILL 15.3G ⇒ retained
+#               was NEVER the pressure; live resident + WBM + JVM are)
+#   q19 cliff: rss=16346  jemalloc_RESIDENT=1897  retained=8585  wbm=645
+#              (retained 8.6G but jemalloc-resident only 1.9G ⇒ ~14.4G is the
+#               JVM/FFM process, NOT jemalloc; purging retained can't touch it)
+# So the actual 16 g RSS = the JVM process (heap + FFM off-heap state buffers,
+# ~10–14 G) + jemalloc RESIDENT (live alloc + dirty, 2–6 G during the join/flush
+# spike) + heavy-I/O page cache in `memory.current`. The proactive purge reclaims
+# `retained` (already-decommitted virtual mappings) — which is exactly the pool
+# that was NOT contributing to RSS. NET RSS EFFECT OF THE PURGE: ~0.
+#
+# ── VERDICT — proactive jemalloc-purge is NOT a clean never-OOM fix ──
+# It is mechanically correct, byte-identical when off (purge only ever releases
+# already-freed memory ⇒ zero correctness impact), inert/cheap when off, and the
+# Mac container DID exercise the real cgroup sampler + the real mallctl. But it
+# does NOT make q9/q19/q5 never-OOM at 16 g/TM, because the cliff is JVM-side +
+# live-jemalloc-resident + page-cache RSS, and jemalloc `retained` (the only pool
+# the purge touches) is virtual/decommitted and was never in RSS. DO NOT default-
+# ON as a never-OOM promise — it would be a false one. Keep it default-OFF, armed
+# (FRS_MEM_PRESSURE_PURGE=1) as a cheap, safe hygiene knob that genuinely trims the
+# retained virtual footprint (helps `vm.overcommit`/address-space pressure, NOT
+# RSS) and may help on a box where retained pages are still DIRTY (not yet
+# decommitted) — which depends on the kernel's MADV_FREE behaviour and is worth a
+# one-shot check on the real x86 box.
+# HONEST NEGATIVES: (1) the 35.18 GiB Mac Docker VM OVERCOMMITS the split
+# (2×16g + 4g = 36 g > 35.18 g VM RAM), so the host itself is memory-starved and
+# the cgroup cliff is partly the VM, not pure forst-rs — the definitive verdict is
+# owed on a box with ≥40 GiB free. (2) `_RJEM_MALLOC_CONF` env stays ignored
+# (strong symbol); the compiled 10 s decay is unchanged (kept for q4). (3) q5 not
+# re-run (mechanism makes it a foregone OOM here).
+# WHAT ACTUALLY BOUNDS IT (next, unchanged from the two verdicts above): a
+# PROACTIVE ADMISSION valve that caps the JVM-side / WBM working set BEFORE the
+# join-build + compaction spike (e.g. a lower process.size + a hard WBM cap +
+# bounding the FFM off-heap state-buffer pool), and/or simply >16 g/TM. The
+# never-OOM lever is on the RESIDENT working set, not the virtual retained pool.
+#
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
 # ═══════════════════════════════════════════════════════════════════════════

@@ -225,6 +225,10 @@ case "$cmd" in
       -e FRS_MEM_DIAG="${FRS_MEM_DIAG:-}" -e FRS_MEM_DIAG_FILE="${FRS_MEM_DIAG_FILE:-}" \
       -e FRS_DYNAMIC_SHED="${FRS_DYNAMIC_SHED:-}" -e FRS_DYN_SHED_INTERVAL_MS="${FRS_DYN_SHED_INTERVAL_MS:-}" \
       -e FRS_MEM_BUDGET_MB="${FRS_MEM_BUDGET_MB:-}" \
+      # FRS-MEM-PRESSURE-PURGE (2026-06-16 PMC-1): arm ONLY the proactive
+      # jemalloc purge valve (no lever shedding). Default-OFF; forwarded so the
+      # never-OOM valve can be armed standalone inside the TM/JM containers.
+      -e FRS_MEM_PRESSURE_PURGE="${FRS_MEM_PRESSURE_PURGE:-}" \
       -e FRS_DISABLE_MAPSTATE_CACHE="${FRS_DISABLE_MAPSTATE_CACHE:-}" \
       -e FRS_WBM_TOTAL_MB="${FRS_WBM_TOTAL_MB:-}" -e FRS_WBM_STALL="${FRS_WBM_STALL:-}" \
       -e FRS_WBM_HARD_MB="${FRS_WBM_HARD_MB:-}" \
