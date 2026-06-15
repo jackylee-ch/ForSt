@@ -25,6 +25,26 @@
 #   Subset:  QUERIES="q4 q9" run-best.sh sweep
 #   Per-run cap: MAXSEC (default per-query from the table's MAXSEC map).
 #
+# FULL-STACK-ON VALIDATION (the goal-critical "beat BOTH RocksDB and ForSt" proof)
+#   run-best.sh validate print [<query>]   # DRY-RUN: print the resolved full-stack-ON
+#                                            forst-rs flag set per query (NO run).
+#   run-best.sh validate <query>           # run ONE query, full-stack-ON forst-rs arm
+#                                            PLUS the rocksdb + forst-local baselines
+#                                            (the cross-backend A vs B vs C comparison).
+#   run-best.sh validate sweep             # all 8 priority queries × 3 arms, serial.
+#   run-best.sh validate-ab <query>        # forst-rs full-stack-ON (A) vs forst-rs
+#                                            flags-OFF (B) — the lever-attribution A/B
+#                                            for the read-amp joins (q7/q9/q20).
+#
+#   The validate profile turns ON, PER QUERY, the levers that query wants (see the
+#   VALIDATE config table below; every flag name is verified against the engine
+#   source in configs/best-config.tsv and crates/forst-rs-engine/src/db.rs). It is
+#   DISTINCT from the plain best-config rows above: best-config is the conservative
+#   already-MEASURED per-query winner; validate is the experimental full-built-stack
+#   that the e2e run is meant to CONFIRM (it may beat, match, or regress best-config).
+#   ARMS (validate only): default "forst-rs-ffm-local rocksdb forst-local"; override
+#   with ARMS="forst-rs-ffm-local rocksdb".
+#
 # ENV (passed through to run-8c32g.sh; the harness uses absolute host paths):
 #   REPO WORKENV FLINK IMG PLAT NEXMARK_HOME TAG_PREFIX FRS_CTMP_BASE MAXSEC
 #
@@ -173,8 +193,187 @@ run_q9_36g() {
   )
 }
 
+# =====================================================================
+# FULL-STACK-ON VALIDATION PROFILE (the goal-critical "beat BOTH" proof)
+# =====================================================================
+# Per-query full-built-stack flag set for the forst-rs arm. Each query gets the
+# levers it wants (read-amp joins vs windowed/OVER vs the q17 inline carve-out).
+# Flag names are verified against crates/forst-rs-engine/src/db.rs (line refs in
+# configs/best-config.tsv header) and the OPT-N04 merge-RMW backend design doc.
+#
+# Sets the FRS_* env then defers to the SAME run_one / topology path the best
+# config uses, so the docker plumbing (TOPO=split, namespacing, cross-platform
+# detection) is identical. Echoes a human-readable summary for `validate print`.
+#
+# The shared join read-amp stack (q7/q9/q20): KV-sep + min_blob 256 + coalesced
+# vlog deref (A) + S2-pinned + adaptive-S2 (R1) + probe-bloom prune (MR-1) +
+# leveled-hot-CF (Approach-1) + persistent probe-iter (Approach-1). q9 ALSO needs
+# the 8c/36g single-TM topology (else KV-sep OOMs the split's 16g cgroup); it
+# routes through run_q9_36g's resource block with the join stack layered on.
+# The windowed/OVER stack (q8/q11/q12/q18): merge-RMW (A2) + routing-adaptive (R2a).
+# q17: zero-handoff inline carve-out (routing-adaptive selects the iter-free path),
+# KV-sep OFF. q19: KV-sep ON (already wins).
+apply_validate() {
+  local q="$1"
+  # Clear everything the validate/best paths may set so nothing leaks across queries.
+  unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE \
+        FRS_RS_S2_PINNED FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF \
+        FRS_RS_PROBE_BLOOM_PRUNE FRS_RS_LEVELED_HOT_CF FRS_PERSISTENT_PROBE_ITER \
+        FRS_RS_MERGE_RMW FRS_RS_MERGE_RMW_STATES 2>/dev/null || true
+
+  # Always-on fairness/reproducibility baseline.
+  export FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}"
+  export FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}"
+
+  # --- the shared read-amp-join lever stack (used by q4/q7/q9/q19/q20) ---
+  join_stack() {
+    export FRS_KV_SEPARATION=true
+    export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
+    export FRS_TRIVIAL_MOVE="${FRS_TRIVIAL_MOVE:-true}"
+    export FRS_RS_S2_PINNED="${FRS_RS_S2_PINNED:-1}"
+    export FRS_S2_FANOUT_MIN="${FRS_S2_FANOUT_MIN:-8}"   # R1 adaptive S2 (deep/shallow split)
+    export FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-1}"      # Approach A
+    export FRS_RS_PROBE_BLOOM_PRUNE="${FRS_RS_PROBE_BLOOM_PRUNE:-1}"    # MR-1
+    export FRS_RS_LEVELED_HOT_CF="${FRS_RS_LEVELED_HOT_CF:-1}"          # Approach-1
+    export FRS_PERSISTENT_PROBE_ITER="${FRS_PERSISTENT_PROBE_ITER:-1}"  # Approach-1
+  }
+  # --- the windowed/OVER lever stack (used by q8/q11/q12/q18) ---
+  window_stack() {
+    export FRS_RS_MERGE_RMW="${FRS_RS_MERGE_RMW:-1}"                    # Approach-2 / A2
+    export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}"        # Approach-3 / R2a
+  }
+
+  case "$q" in
+    q7|q20)  join_stack ;;                       # read-amp joins, 8c/32g split
+    q9)      join_stack ;;                        # read-amp join, BUT 8c/36g (see run_validate_one)
+    q4)      join_stack ;;                        # write/value-carrying join
+    q19)     join_stack ;;                        # KV-sep already wins; full stack layered
+    q8|q11|q12|q18)
+             window_stack ;;                      # windowed / OVER
+    q17)     # zero-handoff inline carve-out: routing-adaptive selects the iter-free
+             # path for the unbounded group-agg; KV-sep OFF (q17 STRUCTURAL vs RDB,
+             # beats ForSt 3.3x on this path). NO join stack, NO merge-RMW.
+             export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}" ;;
+    *)       echo "WARN: $q has no validate profile; running fairness baseline only" ;;
+  esac
+
+  echo "  query=$q  VALIDATE full-stack-ON (forst-rs arm)"
+  echo "  KV: FRS_KV_SEPARATION=${FRS_KV_SEPARATION:-<unset>} min_blob=${FRS_KV_MIN_BLOB_SIZE:-<unset>} trivial=${FRS_TRIVIAL_MOVE:-<unset>}"
+  echo "  S2: FRS_RS_S2_PINNED=${FRS_RS_S2_PINNED:-<unset>} FRS_S2_FANOUT_MIN=${FRS_S2_FANOUT_MIN:-<unset>}"
+  echo "  read-amp: COALESCE_DEREF=${FRS_VLOG_COALESCE_DEREF:-<unset>} PROBE_BLOOM_PRUNE=${FRS_RS_PROBE_BLOOM_PRUNE:-<unset>} LEVELED_HOT_CF=${FRS_RS_LEVELED_HOT_CF:-<unset>} PERSISTENT_PROBE_ITER=${FRS_PERSISTENT_PROBE_ITER:-<unset>}"
+  echo "  window/OVER: MERGE_RMW=${FRS_RS_MERGE_RMW:-<unset>} EXECUTOR=${FRS_RS_EXECUTOR:-<unset>}"
+  echo "  compression: SST=$FRS_SST_COMPRESSION VLOG=$FRS_VLOG_COMPRESSION"
+  if [ "$q" = "q9" ]; then
+    echo "  topology: q9 routes through the 8c/36g single-TM resource (run_q9_36g block) with the join stack layered."
+  fi
+}
+
+# Run ONE query under the validate profile across the requested ARMS (the forst-rs
+# arm gets the full stack; rocksdb / forst-local are the baseline backends with NO
+# forst-rs flags — they ignore FRS_* env). q9 uses the 8c/36g topology.
+run_validate_one() {
+  local q="$1"
+  local ms="${MAXSEC:-$(maxsec_for "$q")}"
+  local arms="${ARMS_VALIDATE:-forst-rs-ffm-local rocksdb forst-local}"
+  echo ""
+  echo "################ VALIDATE $q (arms: $arms) MAXSEC=$ms ################"
+  for a in $arms; do
+    local tag="validate-$q-$a"
+    echo ""
+    echo "---------------- VALIDATE $q [$a] tag=$tag ----------------"
+    if [ "$a" = "forst-rs-ffm-local" ]; then
+      ( apply_validate "$q"
+        if [ "$q" = "q9" ]; then
+          # 8c/36g single-TM: KV-sep needs the per-TM memory the split's 16g lacks.
+          export TOPO=single
+          export SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}"
+          export SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}"
+          export FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}"
+          export FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}"
+          export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
+          export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-512}"
+          export FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-1}"
+          echo "  -> q9 8c/36g single-TM topology"
+        else
+          export TOPO=split
+        fi
+        echo "  -> $RUNNER run $q $a $ms $tag"
+        CLUSTER="$tag" bash "$RUNNER" run "$q" "$a" "$ms" "$tag"
+      )
+    else
+      # Baseline backend: no forst-rs flags. q9 uses the same 36g topology so the
+      # comparison is at the SAME resource (apples to apples for the beat-both proof).
+      ( if [ "$q" = "q9" ]; then
+          export TOPO=single SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}" SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}"
+          export FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}" FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}"
+        else
+          export TOPO=split
+        fi
+        export FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}"
+        echo "  -> $RUNNER run $q $a $ms $tag"
+        CLUSTER="$tag" bash "$RUNNER" run "$q" "$a" "$ms" "$tag"
+      )
+    fi
+  done
+}
+
+# Lever-attribution A/B for the read-amp joins: forst-rs full-stack-ON (A) vs
+# forst-rs flags-OFF (B), SAME resource, SAME jar/.so — proves the stack is the
+# cause of any beat-both win (not box noise).
+run_validate_ab() {
+  local q="$1"
+  local ms="${MAXSEC:-$(maxsec_for "$q")}"
+  echo ""
+  echo "################ VALIDATE-AB $q (full-stack-ON vs flags-OFF) MAXSEC=$ms ################"
+  # Arm A: full stack ON
+  ( apply_validate "$q"
+    if [ "$q" = "q9" ]; then export TOPO=single SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}" SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}" FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}" FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}" FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-512}" FRS_KV_ADAPTIVE_PRESSURE=1; else export TOPO=split; fi
+    echo "== ARM A (full-stack-ON) =="
+    CLUSTER="validate-ab-on-$q" bash "$RUNNER" run "$q" forst-rs-ffm-local "$ms" "validate-ab-on-$q" )
+  # Arm B: all forst-rs levers OFF (engine defaults; lz4 kept for fairness)
+  ( unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE FRS_RS_S2_PINNED \
+          FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF FRS_RS_PROBE_BLOOM_PRUNE \
+          FRS_RS_LEVELED_HOT_CF FRS_PERSISTENT_PROBE_ITER FRS_RS_MERGE_RMW 2>/dev/null || true
+    export FRS_SST_COMPRESSION=lz4
+    if [ "$q" = "q9" ]; then export TOPO=single SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}" SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}" FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}" FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}"; else export TOPO=split; fi
+    echo "== ARM B (flags-OFF) =="
+    CLUSTER="validate-ab-off-$q" bash "$RUNNER" run "$q" forst-rs-ffm-local "$ms" "validate-ab-off-$q" )
+}
+
 cmd="${1:-}"; [ -n "$cmd" ] && shift || true
 case "$cmd" in
+  validate)
+    sub="${1:-}"; [ -n "$sub" ] && shift || true
+    case "$sub" in
+      print)
+        q="${1:-}"
+        if [ -n "$q" ]; then
+          echo "== VALIDATE full-stack-ON config for $q =="
+          ( apply_validate "$q" )
+        else
+          for q in $ALL_QUERIES q8 q18; do
+            echo "== VALIDATE full-stack-ON config for $q =="
+            ( apply_validate "$q" )
+            echo ""
+          done
+        fi
+        ;;
+      sweep)
+        QS="${QUERIES:-q4 q7 q8 q9 q11 q12 q17 q18 q19 q20}"
+        echo "== VALIDATE full-stack-ON sweep: $QS =="
+        for q in $QS; do run_validate_one "$q"; done
+        echo ""
+        echo "== VALIDATE sweep done =="
+        ;;
+      q*) run_validate_one "$sub" ;;
+      ""|-h|--help) echo "usage: run-best.sh validate (print [<q>] | sweep | <query>)"; exit 0 ;;
+      *) echo "unknown validate subcommand: $sub"; exit 1 ;;
+    esac
+    ;;
+  validate-ab)
+    q="${1:-}"; [ -n "$q" ] || { echo "usage: run-best.sh validate-ab <query>"; exit 1; }
+    run_validate_ab "$q"
+    ;;
   q9-36g)
     run_q9_36g
     ;;
@@ -207,6 +406,6 @@ case "$cmd" in
     sed -n '2,40p' "$0"
     ;;
   *)
-    echo "unknown: $cmd (expected: <query> | sweep | print [<query>] | help)"; exit 1
+    echo "unknown: $cmd (expected: <query> | sweep | print [<query>] | validate ... | validate-ab <query> | q9-36g | help)"; exit 1
     ;;
 esac

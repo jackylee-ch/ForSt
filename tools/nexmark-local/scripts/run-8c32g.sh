@@ -161,6 +161,27 @@ case "$cmd" in
       -e FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-}" -e FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-}" \
       -e FRS_TRIVIAL_MOVE="${FRS_TRIVIAL_MOVE:-}" -e FRS_REMOTE_COMPACTION="${FRS_REMOTE_COMPACTION:-}" \
       -e FRS_RS_S2_PINNED="${FRS_RS_S2_PINNED:-}" \
+      # FULL-STACK-ON validation levers (Phase-1 query-perf, run-best.sh validate).
+      # All default-OFF in the engine; forwarded so the validate profile can turn
+      # them ON inside the TM/JM containers. Empty => engine default (OFF).
+      #   FRS_S2_FANOUT_MIN            adaptive S2 loser-tree threshold (R1; usize, default OFF) db.rs:15601
+      #   FRS_RS_PROBE_BLOOM_PRUNE     metadata-resident probe bloom prune (MR-1)               db.rs:677
+      #   FRS_RS_LEVELED_HOT_CF        leveled-bottom discipline on hot probe CFs (Approach-1)  db.rs:712
+      #   FRS_RS_LEVELED_HOT_CF_FANOUT_MIN / _L0_TRIGGER   Approach-1 tuning (defaults 8 / 4)   db.rs:743/755
+      #   FRS_PERSISTENT_PROBE_ITER    reusable per-(CF,version) probe iterator (Approach-1)     db.rs:16850
+      #   FRS_VLOG_RESIDENT_BUDGET_MB  KV-sep resident vlog byte budget (already wired below via the q9 block; re-listed for the join validate stack)
+      -e FRS_S2_FANOUT_MIN="${FRS_S2_FANOUT_MIN:-}" \
+      -e FRS_RS_PROBE_BLOOM_PRUNE="${FRS_RS_PROBE_BLOOM_PRUNE:-}" \
+      -e FRS_RS_LEVELED_HOT_CF="${FRS_RS_LEVELED_HOT_CF:-}" \
+      -e FRS_RS_LEVELED_HOT_CF_FANOUT_MIN="${FRS_RS_LEVELED_HOT_CF_FANOUT_MIN:-}" \
+      -e FRS_RS_LEVELED_HOT_CF_L0_TRIGGER="${FRS_RS_LEVELED_HOT_CF_L0_TRIGGER:-}" \
+      -e FRS_PERSISTENT_PROBE_ITER="${FRS_PERSISTENT_PROBE_ITER:-}" \
+      # Approach-2 / OPT-N04 backend merge-RMW (windowed/OVER). Engine + backend
+      # (jar) side; default-OFF. FRS_RS_MERGE_RMW master gate, _STATES per-state
+      # opt-in list, _CHAIN_REBASE max merge-chain before rebase (default 4096).
+      -e FRS_RS_MERGE_RMW="${FRS_RS_MERGE_RMW:-}" \
+      -e FRS_RS_MERGE_RMW_STATES="${FRS_RS_MERGE_RMW_STATES:-}" \
+      -e FRS_RS_MERGE_CHAIN_REBASE="${FRS_RS_MERGE_CHAIN_REBASE:-}" \
       -e FRS_BG_COMPACT_THREADS="${FRS_BG_COMPACT_THREADS:-}" -e FRS_BG_FLUSH_THREADS="${FRS_BG_FLUSH_THREADS:-}" \
       -e FRS_L0_STOP_TRIGGER="${FRS_L0_STOP_TRIGGER:-}" -e FRS_L0_COMPACTION_TRIGGER="${FRS_L0_COMPACTION_TRIGGER:-}" \
       -e FRS_DECAY_DIAG="${FRS_DECAY_DIAG:-}" -e FRS_BULK_SAMPLE="${FRS_BULK_SAMPLE:-}" -e FRS_ITER_DIAG="${FRS_ITER_DIAG:-}" \

@@ -52,8 +52,12 @@ This package supports **two intentionally-distinct** ways to run the sweep:
 |---|---|---|---|
 | **Uniform-config** | `run-remote-nexmark-v3.sh` | SAME config for every query | research: how good is forst-rs under ONE config (matching ForSt)? |
 | **Best-per-query** | `run-best.sh` | each query at its EMPIRICALLY-BEST config | reproduction: the best wall forst-rs achieves per query |
+| **Full-stack-ON validate** | `run-best.sh validate ...` | every built lever ON per query, vs rocksdb + forst | the goal proof: do priority queries beat BOTH backends with the full stack? |
 
-**Both are legitimate; they answer different questions — do not conflate them.**
+**All three are legitimate; they answer different questions — do not conflate them.**
+The validate mode (`run-best.sh validate print|<query>|sweep`, `validate-ab <query>`) and
+its A/B + canary protocol are specified in
+`docs/superpowers/specs/2026-06-15-levers-on-validation-plan.md`.
 
 - **Uniform-config (research).** SAME config for ALL queries; per-query tuning is
   out of scope for that mode. The only allowed optimization is *dynamic /
