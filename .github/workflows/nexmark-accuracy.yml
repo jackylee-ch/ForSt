@@ -366,29 +366,19 @@ jobs:
       - name: Verify CSV generated
         run: grep -q "GEN OK" /tmp/gen.log
 
-      # forst-rs runs failed with "cluster up (tms=)" (TaskManager never
-      # registered) + connection-refused. Bring up the forst-rs (JDK25 + FFM)
-      # cluster directly with VISIBLE output and dump JM/TM logs to surface the
-      # TM startup crash (native-lib load / JDK25 opts / memory).
-      - name: forst-rs cluster smoke (JDK25 + FFM) — diagnostics
+      # The forst-rs (JDK25+FFM) JM+TM come up and register fine (verified), but
+      # the per-query measure-print loop hit a port race: gen-CSV's JDK17 cluster
+      # and back-to-back restarts could still hold 6123/8081/8083 when the next
+      # cluster starts (measure-print's pkill+sleep 3 is too short on a loaded
+      # hosted runner) -> "cluster up (tms=)" + connection-refused. Hard-stop any
+      # stale Flink process and free the ports before the loop.
+      - name: Stop any stale Flink cluster + free ports
         run: |
-          set -x
-          export FLINK_HOME JAVA_HOME="$JDK25"
-          export S3_ENDPOINT=x S3_ACCESS_KEY=x S3_SECRET_KEY=x S3_BUCKET=x S3_REGION=x S3_PREFIX=x RUN_ID=smoke
-          envsubst '${S3_ENDPOINT} ${S3_ACCESS_KEY} ${S3_SECRET_KEY} ${S3_BUCKET} ${S3_REGION} ${S3_PREFIX} ${RUN_ID}' \
-            < "$TEMPLATES/config-forst-rs-local.yaml.tpl" > "$FLINK_HOME/conf/config.yaml"
-          mkdir -p "$FLINK_HOME/log"
-          rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache /tmp/flink-forst-rs-data /tmp/nexmark-checkpoints-forst-rs
-          "$FLINK_HOME/bin/start-cluster.sh" || echo "start-cluster rc=$?"
-          sleep 15
-          echo "--- REST overview ---"; curl -s --max-time 8 http://localhost:8081/overview || echo "(no REST)"
-          echo "--- taskexecutor .out (native-load errors land here) ---"
-          tail -n 80 "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null || echo "(no TM .out)"
-          echo "--- taskexecutor .log ---"
-          tail -n 120 "$FLINK_HOME"/log/*taskexecutor*.log 2>/dev/null || echo "(no TM log)"
-          echo "--- jobmanager .log ---"
-          tail -n 60 "$FLINK_HOME"/log/*standalonesession*.log 2>/dev/null || echo "(no JM log)"
-          "$FLINK_HOME/bin/stop-cluster.sh" || true
+          "$FLINK_HOME"/bin/sql-gateway.sh stop >/dev/null 2>&1 || true
+          "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1 || true
+          pkill -9 -f 'TaskManagerRunner|StandaloneSession|SqlGateway|SqlClient' 2>/dev/null || true
+          sleep 8
+          echo "remaining flink procs:"; pgrep -af 'TaskManagerRunner|StandaloneSession|SqlGateway' || echo none
 
       - name: Run each query on BOTH backends through real Flink SQL
         run: |
