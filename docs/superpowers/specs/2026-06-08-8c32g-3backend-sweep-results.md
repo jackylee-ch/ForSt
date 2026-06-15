@@ -39,7 +39,32 @@
 #     directive) would keep it OFF for these — the uniform-ON config is suboptimal
 #     for 3 of the 5 windowed queries.
 #
-# (join family q4/q7/q9/q19/q20 + light queries appended below as they land)
+# ── JOIN family (KV-sep ON + full join_stack: coalesce+S2-pinned+bloom+leveled-
+#    hot+persistent-iter; q9 also resident-bounds). forst-rs V3, reused baselines. ──
+# | query | frs V3 wall_s | out_rows | rdb (reused) | forst (reused) | verdict |
+# |---|---|---|---|---|---|
+# | q4  | 1069.9 | 25,830,256 (cadence ✓) | 503.0 (changelog 177.6M) | DNF | FINISHED but SLOW — 2.1× the reused rdb 503; ⚠ this run's bid-join BUILD phase ran ~530s (vs prior 450.4 total) = severe box variance, NOT a regression signal. rows = cadence vs rdb changelog (semantics, not a bug) |
+# | q7  | 947.8  | 92,000,002 ✓ | (no local baseline; remote rdb 1367.6) | — | FINISHED, correct; ~97s FASTER than prior 1044.9. No same-pop rdb/forst on Mac to gate |
+# | q9  | **OOM-DNF** | — (reached ~14.5M then both TMs killed 137) | 1057.4 | 1982.0 | ✗ OOM-DNF — KV-sep ON + FULL join_stack exceeds the 16g/TM cgroup on THIS Mac. (Prior section's "q9 fits 1285.5s" used a LEANER stack; adding coalesce+persistent-probe-iter+S2-pinned pushed native footprint over.) Both TMs exit 137 during the join build |
+# | q19 | **OOM-DNF** | — (reached ~62M then tm2 killed 137, RESTARTING) | 305.5 | 272.4 | ✗ OOM-DNF — same as q9: full join_stack OOMs tm2 mid-build. (Prior LEANER stack FINISHED 238.6 and BEAT BOTH.) |
+# | q20 | 1195.2 | 93,201,404 ✓ | (no local baseline; remote ~1477.7) | — | FINISHED, correct, NO OOM — the only big-join that survived the full stack here (slower path, no persistent-iter blowup). ~282s faster than the remote 1477.7 directional |
+#
+# ★★ JOIN-FAMILY HONEST NEGATIVE (V3 full join_stack on Mac 16g/TM):
+#   q9 AND q19 OOM-DNF with the FULL uniform join_stack (KV-sep + coalesce +
+#   S2-pinned + probe-bloom + leveled-hot + persistent-probe-iter). The prior
+#   PMC-1 section ran q9 (1285.5 FIT) and q19 (238.6 BEAT-BOTH) with a LEANER
+#   config; the V3 directive's "full validate stack" ADDS native-memory-resident
+#   structures (persistent per-(CF,version) probe iterators + coalesce deref
+#   buffers + pinned S2) that push the join build over the 16g/TM cgroup on this
+#   Mac (TMs exit 137). This is the SAME class of finding as the windowed stack:
+#   the uniform full-stack-ON config is NOT universally safe — it OOMs the two
+#   biggest scatter-join states. A DYNAMIC, never-OOM-bounded gate (the standing
+#   "same-config dynamic only" directive) is REQUIRED: the engine must shed
+#   persistent-iter / coalesce / pinning under cgroup pressure rather than the
+#   harness turning them all on unconditionally. q4/q7/q20 survive the full stack;
+#   q9/q19 do not. (Linux box has more headroom and may not OOM — directional.)
+#
+# (light queries q0-q3,q5,q10,q13-16,q21,q22 appended below as they land)
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★★★ PMC-1 UNIFORM-SPLIT q0-q22 SWEEP 2026-06-15 (process.size=10240m fit)
