@@ -16821,8 +16821,13 @@ fn maybe_start_mem_diag() {
                         .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()))
                         .map(|pages| pages * 4 / 1024)
                         .unwrap_or(0);
+                    // FRS-DYN-SHED: surface the sampler's most-recent pressure
+                    // level + arming so the diag log is DIRECT evidence the
+                    // cgroup sampler engaged in-container and which levers shed.
+                    let shed_armed = crate::mem_pressure::dynamic_shed_enabled();
+                    let shed_level = crate::mem_pressure::sampled_pressure_for_diag();
                     let line = format!(
-                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb}{}\n",
+                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb} shed_armed={shed_armed} shed_level={shed_level:?}{}\n",
                         prof_diag_str()
                     );
                     if let Ok(mut f) = std::fs::OpenOptions::new()

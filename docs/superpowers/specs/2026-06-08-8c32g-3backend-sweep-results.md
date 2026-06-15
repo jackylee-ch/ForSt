@@ -75,6 +75,69 @@
 #    conservative first cut; the box may want tuning (env-overridable design,
 #    but thresholds are currently compiled — a follow-up can env-gate them).
 #
+# ───────────────────────────────────────────────────────────────────────────
+# ★★ PMC-1 e2e NEVER-OOM VALIDATION 2026-06-16 (Mac DOCKER-LINUX container) ──
+# ───────────────────────────────────────────────────────────────────────────
+# CORRECTION to the "needs the Linux box" note above: the never-OOM gate IS
+# testable on the Mac. The HOST is Darwin (no cgroup) but the NexMark TM runs
+# INSIDE a Docker LINUX container where /sys/fs/cgroup/memory.current exists and
+# --memory=16g sets memory.max; the exit-137 OOM is the container cgroup killer.
+# Ran q9/q19/q5 @100M at the uniform 2×4c/16g split, process.size=10240m, FULL
+# join_stack (KV-sep+persistent-probe-iter+coalesce+S2-pinned+leveled-hot-CF+
+# vlog-resident) with FRS_DYNAMIC_SHED=1 + FRS_MEM_DIAG=1. Harness: forwarded
+# FRS_DYNAMIC_SHED / FRS_DYN_SHED_INTERVAL_MS / FRS_MEM_BUDGET_MB into the ENVS
+# array (they were MISSING — the flag never reached the engine before this fix);
+# added shed_armed/shed_level to the [FRS_MEM_DIAG] line for in-container proof.
+#
+# ── RESULT: FRS_DYNAMIC_SHED does NOT make the full-lever config never-OOM at
+#    16g/TM on this Mac. ALL THREE gate queries still OOM-killed a TM (exit-137,
+#    OOMKilled=true confirmed via docker inspect): ──
+# | query | shed=1 outcome | OOM? | out_rows | wall | verdict |
+# |---|---|---|---|---|---|
+# | q9  | tm1 exit-137 @~22.6M, job crash-looped → DNF | YES (oom=true) | — (req 91,813,372) | aborted 1003s | ✗ FAIL |
+# | q19 | tm2 exit-137 @~49.7M, restarted degraded 1-TM, "FINISHED" but TRUNCATED | YES (oom=true) | 48,686,526 (req 92,000,000) | 441.4 (degraded) | ✗ FAIL (wrong rows) |
+# | q5  | tm1 exit-137 @~6M, job crash-looped → DNF | YES (oom=true) | — (req ~29,988,416) | aborted 461.5s | ✗ FAIL |
+#
+# ── WHY (the [FRS_MEM_DIAG] in-container evidence — sampler DID engage) ──
+# The cgroup sampler worked perfectly: shed_armed=true on every line, and the
+# ladder climbed IN ORDER as RSS rose: Ample→Elevated→High→Critical (q9 level
+# histogram over its run: Ample 9 / Elevated 2 / High 8 / Critical 44). So the
+# flag reached the engine, the in-container cgroup reads happened, and shedding
+# fired pre-cliff (Critical = 0.92 ⇒ ~15.07 GiB of the 16.0 GiB limit). It STILL
+# OOM'd because the join-build RSS SPIKE outruns the shed+drain rate:
+#   q9:  RSS 12600(Ample) → 13212(High) → 15431(Critical) → cliff in ~2 samples
+#        (+2.2 GiB in one 3 s window); kernel killed at ~16081 MB.
+#   q19: RSS 14037(Critical) → 16174(Critical) → killed (+2.1 GiB / sample).
+# The 1 s sampler detects pressure and sheds, but during the initial build the
+# memtable/WBM backlog + jemalloc arenas + join state grow ~0.7–1.4 GiB/s, so by
+# the time shedding+flush free headroom the cgroup cliff is already crossed.
+# Shedding bounds STEADY STATE (a lone surviving q9 TM held ~13.1 GiB at Critical
+# with all levers shed) but NOT the transient build spike — which is the OOM.
+#
+# ── q7 ample-memory A/B (beneficiary spot-check) — PASS, no regression ──
+# | q7 | wall_s | out_rows | OOM? |
+# | shed=1 | 909.9 | 92,000,002 | no (Ample-dominant; brief Elevated/High shed) |
+# | shed=0 | 982.9 | 92,000,002 | no |
+# shed ON is +0% (8% FASTER, within this Mac's known q7 coordination-bound
+# variance). q7 fits 16g WITHOUT shedding too (both TMs healthy at shed=0), so
+# shedding is correctly mostly a no-op for q7 and does NOT hurt its wall/rows.
+#
+# ── VERDICT ──
+# FRS_DYNAMIC_SHED is mechanically CORRECT (cgroup sampler engages in-container,
+# ladder sheds in priority order pre-cliff, byte-identical when off, q7 unharmed)
+# but is NOT SUFFICIENT to make the full-lever uniform config never-OOM at 16g/TM
+# on this Mac — q9/q19/q5 still exit-137. The reactive lever-shedding cannot
+# catch the join-build RSS spike. DO NOT default-ON: it gives a false never-OOM
+# promise. To actually bound it the engine must (a) PROACTIVELY refuse value-
+# separation / cap the WBM memtable BEFORE the build spike (admission control,
+# not reactive shedding), and/or (b) drop the build-phase peak (the levers'
+# transient buffers) rather than only future flushes, and/or (c) the directional
+# fallback: the LEANER stack (no persistent-probe-iter/coalesce/S2) which FIT q9
+# (1285.5s) and q19 (238.6s) earlier — i.e. ship the lean stack by default and
+# only ADD heavy levers when a pre-flight headroom check passes. Linux box has
+# more RAM headroom and MAY survive (directional), but the spike-vs-shed-rate
+# physics is the same; needs the proactive valve regardless.
+#
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
 # ═══════════════════════════════════════════════════════════════════════════
