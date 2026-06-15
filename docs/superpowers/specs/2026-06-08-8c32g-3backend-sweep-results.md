@@ -138,6 +138,78 @@
 # more RAM headroom and MAY survive (directional), but the spike-vs-shed-rate
 # physics is the same; needs the proactive valve regardless.
 #
+# ───────────────────────────────────────────────────────────────────────────
+# ★★★ PMC-1 LEANER-CONFIG NEVER-OOM VALIDATION 2026-06-16 (Mac DOCKER-LINUX) ──
+# ───────────────────────────────────────────────────────────────────────────
+# HYPOTHESIS (directive): the LEANER lever stack — KV-sep ON (uniform format) +
+# FRS_VLOG_POINT_DEREF (windowed read-path) + lz4, with the HEAVY memory levers
+# OFF (persistent-probe-iter / coalesce-deref / S2-pinned / leveled-hot-CF /
+# probe-bloom-prune) — is the never-OOM uniform LOCAL default that keeps the wins.
+# Ran @100M, uniform 2×4c/16g split, process.size=10240m, REPO tip cf7816d96 (.so
+# from frs-dync, identical engine — only env flags differ from full-stack-ON).
+#
+# ── EXACT leaner env set (vs full-stack-ON: which levers DROPPED) ──
+#   FRS_SST_COMPRESSION=lz4  FRS_VLOG_COMPRESSION=inherit
+#   FRS_KV_SEPARATION=true   FRS_KV_MIN_BLOB_SIZE=256   FRS_TRIVIAL_MOVE=true
+#   FRS_VLOG_POINT_DEREF=1   (windowed stack: q8/q11/q12/q17/q18 — NOT coalesce)
+#   DROPPED vs full-stack-ON: FRS_VLOG_COALESCE_DEREF, FRS_RS_S2_PINNED,
+#     FRS_S2_FANOUT_MIN, FRS_RS_PROBE_BLOOM_PRUNE, FRS_RS_LEVELED_HOT_CF,
+#     FRS_PERSISTENT_PROBE_ITER, FRS_RS_MERGE_RMW, FRS_RS_EXECUTOR=routing-adaptive.
+#   (q9 also kept vlog reader-cap=2048 / resident-budget=256 / adaptive=1.)
+#
+# ── RESULT TABLE (leaner config; out_rows verified EXACTLY, OOM via docker inspect) ──
+# | query | state | wall_s | out_rows | OOM? | vs prior |
+# |---|---|---|---|---|---|
+# | q9  | OOM_DNF | — | — (req 91,813,372) | YES tm2 exit137 | died ~16.7M/100s — leaner did NOT fix the OOM |
+# | q9 (KV-sep OFF) | OOM_DNF | — | — | YES tm2 exit137 | died ~14.3M/100s — KV-sep OFF ALSO OOMs today (contradicts the 2026-06-14 1828.7 "clean") |
+# | q19 | OOM_DNF | — | — (req 92,000,000) | YES tm2 exit137 | died ~64.8M/281s — LIVE alloc only 1.4 GiB at the cliff |
+# | q19 (+aggressive jemalloc purge env) | OOM_DNF | — | — | YES tm2 exit137 | _RJEM_MALLOC_CONF env IGNORED (compiled static wins); retained stayed ~8 GiB |
+# | q17 | FINISHED | 180.9 | 92,000,000 ✓ | no | ★ BEATS ForSt 245.9; better than full-stack-ON 333.7 (which was pathological); KV-sep-OFF was 110.7 |
+# | q11 | FINISHED | 189.9 | 92,000,000 ✓ | no | better than full-stack-ON 219.9; KV-sep-OFF was 118.8 |
+# | q12 | FINISHED | 57.7  | 92,000,000 ✓ | no | source-bound; full-stack 43.6 (point-deref overhead/box noise) |
+# | q8  | FINISHED | 63.8  | 3,064,453 ✓(band) | no | src 3,064,719; in-band w/ rdb 3,064,413 / full-stack 3,064,481 |
+# | q18 | FINISHED | 430.5 | 92,000,000 ✓ | no | ✗ SLOWER than full-stack-ON 199.1 (lost MERGE_RMW+routing-adaptive) → now FAILS rdb 360.4 |
+#
+# ── ★ ROOT CAUSE (the [FRS_MEM_DIAG] in-container evidence) — NOT the lever stack ──
+# The OOM is JEMALLOC RETAINED MEMORY, orthogonal to which levers are on. At every
+# cliff the LIVE allocation is small but jemalloc holds ~6–8 GiB of freed-but-
+# unpurged (dirty/muzzy) pages that alone push RSS to the 16384 MiB cgroup limit:
+#   q9  lean : rss 15391 | live(alloc) 3831 | RETAINED 7087–8035 | wbm 1470
+#   q9  OFF  : rss 16357 | live(alloc) 4895 | RETAINED 6124      | wbm 1998
+#   q19 lean : rss 16090 | live(alloc) 1372 | RETAINED 7926      | wbm 472  (!)
+# q19's live working set is ~1.4 GiB yet RSS is 16 GiB — ~8 GiB is pure jemalloc
+# retained pool during the high-churn compaction phase (comp_cnt=32). The compiled
+# MALLOC_CONF (forst-rs-ffi/src/lib.rs:66) uses dirty/muzzy_decay_ms:10000 (10 s,
+# deliberately, to avoid re-faulting inside a 30 s checkpoint burst — it speeds q4).
+# That 10 s decay is exactly why the retained pool can't drain before a build/churn
+# spike (~0.7–1.4 GiB/s) crosses the cliff. Trying to override it at runtime FAILED:
+# tikv_jemallocator exports `_rjem_malloc_conf` as a STRONG symbol, so the
+# `_RJEM_MALLOC_CONF` env is ignored (retained stayed ~8 GiB) — the fix MUST be an
+# engine change (a pressure-triggered `mallctl arena.<i>.purge` proactive valve, or
+# a cgroup-aware decay) — config/env ALONE cannot make q9/q19/q5 never-OOM here.
+#
+# ── VERDICT ──
+# The leaner config is NOT a clean never-OOM uniform local default on this Mac
+# (35.18 GiB Docker VM; the split's 2×16g+4g = 36g OVERCOMMITS it). q9 OOMs with
+# the leaner stack, with the heavy stack, AND with KV-sep OFF — the OOM is the
+# jemalloc-retained pool + the VM overcommit, NOT the lever set. The earlier
+# "q9 1285.5s FIT" (pmc1-uniform) and "1828.7s KV-sep-OFF clean" (2026-06-14) were
+# LUCKY runs where host memory slack let the retained pool sit under the cliff;
+# they are NON-DETERMINISTIC (q9 OOM'd in ≥3 other sessions incl. today, both arms).
+# WHAT THE LEANER CONFIG *DOES* WIN (genuine, repeatable): the windowed/light family
+# FINISHES clean with EXACT out_rows and KEEPS q17's beat-ForSt (180.9 < 245.9) and
+# is BETTER than the (pathological) full-stack-ON on q17/q11. HONEST NEGATIVE: it is
+# WORSE than full-stack-ON on q18 (430.5 vs 199.1 — the window MERGE_RMW + routing-
+# adaptive levers it drops were load-bearing for q18) and slightly on q12/q8.
+# CONCLUSION: there is NO env-only never-OOM uniform local default for the memory-
+# bound joins (q9/q19/q5) at 16g/TM on a 36g-overcommitted VM. The never-OOM
+# mechanism is a PROACTIVE jemalloc-purge / admission valve in the ENGINE (matches
+# the FRS_DYNAMIC_SHED verdict above: reactive shedding can't catch the spike). The
+# documented default therefore stays SELECTIVE (§"RECOMMENDED SELECTIVE KV-SEP
+# PROFILE" below): KV-sep OFF for q9/q11/q17, ON for q4/q7/q19/q20 — and on THIS
+# Mac q9 needs >16g/TM (or the engine valve) regardless. FRS_DYNAMIC_SHED stays
+# default-OFF (it is not the never-OOM mechanism).
+#
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
 # ═══════════════════════════════════════════════════════════════════════════
