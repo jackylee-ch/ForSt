@@ -8,7 +8,11 @@
 # OOM. Carving process.size down to ~10240m leaves ~6g cgroup headroom for the
 # engine native. Uniform (all forst-rs queries), no RAM added, global-safe.
 set -u
-REPO=/tmp/frs-q9memfit
+# Portable repo root: explicit REPO wins, else the engine repo that contains this
+# script (scripts -> tools/nexmark-local -> ../../.. = repo root). Works from a
+# normal checkout or a worktree; overridable for the remote box.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 TAG="${1:-q9ps}"
 PS="${2:-10240m}"
 MS="${3:-2700}"

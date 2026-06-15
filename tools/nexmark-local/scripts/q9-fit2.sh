@@ -10,7 +10,8 @@
 #      ceiling. Global-safe (uniform; engine decides).
 # Goal: keep the end-of-run spike under 16g/TM so q9 finishes EXACT 91,813,372.
 set -u
-REPO=/tmp/frs-q9memfit
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 TAG="${1:-q9fit2}"
 MS="${2:-2700}"
 

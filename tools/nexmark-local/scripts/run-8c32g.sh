@@ -125,9 +125,9 @@ case "$cmd" in
     ENVS=(
       -e QUERY="$Q" -e CONFIG="$CFG" -e MAXSEC="$MS" -e EVENTS_NUM="${EVENTS_NUM:-}" -e TPS="${TPS:-}" \
       -e S3_ENDPOINT=x -e S3_ACCESS_KEY=x -e S3_SECRET_KEY=x -e S3_BUCKET=x -e S3_REGION=x -e S3_PREFIX=x \
-      # JVM process.size overrides consumed by measure-sql.sh INSIDE the container
-      # (the q9 8c/36g single-TM profile sets these). Forward them so the profile
-      # actually takes effect through this package's runner.
+      # JVM process.size overrides consumed by measure-sql.sh INSIDE the container.
+      # Default unset => the templates' value applies (10240m for the q9 16g/TM
+      # native-headroom carve-out, §3a). Forward an override so callers can retune.
       -e FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-}" -e FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-}" \
       # FRS-M5 FAIRNESS FIX (2026-06-13 cycle 2, PMC-1): the default was pinned
       # to `none` (a 2026-06-02 zero-copy read-path experiment), which forced
@@ -199,6 +199,12 @@ case "$cmd" in
       -e FRS_DISABLE_MAPSTATE_CACHE="${FRS_DISABLE_MAPSTATE_CACHE:-}" \
       -e FRS_WBM_TOTAL_MB="${FRS_WBM_TOTAL_MB:-}" -e FRS_WBM_STALL="${FRS_WBM_STALL:-}" \
       -e FRS_WBM_HARD_MB="${FRS_WBM_HARD_MB:-}" \
+      # L4 compaction-input windowed reads (runtime_tuning.rs): bound the
+      # compaction-input transient (double-buffered, cache-skip) so the
+      # end-of-run compaction storm can't spike one TM over its cgroup. Default
+      # empty=OFF (byte-identical). FRS_COMPACT_WINDOWED=1 turns it on.
+      -e FRS_COMPACT_WINDOWED="${FRS_COMPACT_WINDOWED:-}" -e FRS_COMPACT_WINDOW_BYTES="${FRS_COMPACT_WINDOW_BYTES:-}" \
+      -e FRS_COMPACT_PREFETCH_BUDGET="${FRS_COMPACT_PREFETCH_BUDGET:-}" \
       # LOCAL S3 SIMULATION (tools/nexmark-local): forward the remote-leg
       # bandwidth throttle into the TM/JM containers so the engine inside reads
       # it. Default empty/0 = OFF (byte-identical). Set FRS_REMOTE_BW_MBPS=6250
@@ -312,9 +318,10 @@ case "$cmd" in
       exit 0
     fi
     # SINGLE-TM resource budget (TOPO=single). Default = the canonical 8c/32g.
-    # q9 KV-sep OOM fix (2026-06-15 PMC-1): a BIGGER single-TM profile gives q9
-    # far more PER-TM headroom than the 16 g-capped TOPO=split TMs. The
-    # `q9-36g` profile (see run-best.sh / docs) uses 8c/36g. Size via
+    # NOTE (2026-06-15 user directive): NexMark now runs EVERY query on the
+    # 2×4c/16g split (TOPO=split), q9 included (it fits 16g/TM via the
+    # process.size=10240m carve-out). This TOPO=single path is retained only as a
+    # generic harness capability; no NexMark query routes to it. Size via
     # SINGLE_TM_CPUS / SINGLE_TM_MEM; both default per the 8c/32g budget and
     # are checked against DETECTED physical RAM below (no 64GiB hardcode).
     SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}"

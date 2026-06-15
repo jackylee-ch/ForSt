@@ -144,24 +144,23 @@ run_one() {
   )
 }
 
-# q9 KV-sep OOM fix (2026-06-15 PMC-1): q9 with KV-separation ON on a SINGLE
-# BIG TM (8c/36g) instead of the 2×4c/16g split. The split capped each TM at
-# 16g, and KV-sep's resident vlog state pushed q9 over that cgroup (DNF/OOM).
-# A single TM with all 8 cores + 36g gives q9 the per-TM memory the split could
-# not. The 36g default assumes a box with >=40 GiB physical RAM (the dev Mac and
-# the origin Linux box both qualify); run-8c32g.sh auto-detects physical RAM and
-# WARNS if 36g + OS headroom won't fit, so override SINGLE_TM_MEM on a smaller
-# box. KV-sep's resident vlog readers are additionally BOUNDED (count cap + byte
-# budget + adaptive pressure back-off) so the engine delta stays small.
-#
-# This is a PER-QUERY topology profile (the per-query best-config exception the
-# user allowed) — it does NOT change any other query's run.
-run_q9_36g() {
+# q9 KV-sep at the UNIFORM 2×4c/16g split (2026-06-15, supersedes the old
+# 8c/36g single-TM profile per user directive: EVERY query runs on the split,
+# NO single TM). q9 + KV-sep ON previously OOM'd the 16g/TM cgroup because
+# Flink's taskmanager.memory.process.size budgets only the JVM — the engine's
+# native (jemalloc-in-the-.so) allocation lives in the cgroup ON TOP of it.
+# FIX (efdc5997a, config-only): carve process.size 12288m -> 10240m in the
+# templates so ~6 GiB of cgroup stays free for the engine native, PLUS bound the
+# resident vlog readers (count cap + byte budget + adaptive pressure back-off).
+# VALIDATED: q9 @100M KV-sep ON @2×4c/16g split FINISHED 1463.3s, EXACT out_rows
+# 91,813,372, peak per-TM ~15.2 GiB (never hit 16). Same uniform topology as
+# every other query — no per-query topology, no single TM.
+run_q9_split() {
   local ms="${MAXSEC:-2700}"
-  local tag="${TAG_PREFIX}-q9-36g-$ARM"
+  local tag="${TAG_PREFIX}-q9-split-$ARM"
   echo ""
-  echo "============ q9 KV-sep 8c/36g PROFILE [$ARM] tag=$tag MAXSEC=$ms ============"
-  ( # KV-sep ON + coalesced deref (the per-query best read path), lz4.
+  echo "============ q9 KV-sep 2x4c/16g SPLIT PROFILE [$ARM] tag=$tag MAXSEC=$ms ============"
+  ( # KV-sep ON + coalesced deref (the join read path), lz4.
     export FRS_KV_SEPARATION=true
     export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
     export FRS_TRIVIAL_MOVE="${FRS_TRIVIAL_MOVE:-true}"
@@ -169,25 +168,17 @@ run_q9_36g() {
     export FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-1}"
     export FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}"
     export FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}"
-    # KV-sep resident MEMORY BOUNDS — the engine delta that the split's 16g
-    # cgroup could not hold. Count cap is on by default (2048); add the BYTE
-    # budget + adaptive pressure so resident vlog bytes are guaranteed bounded
-    # regardless of q9's scattered-death segment pattern.
+    # KV-sep resident MEMORY BOUNDS — keep the engine native delta inside the
+    # ~6 GiB the process.size=10240m carve-out leaves free in the 16g cgroup.
     export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
-    export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-512}"
+    export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-256}"
     export FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-1}"
-    # Single BIG TM topology: 8 cores, 36g container; JVM heap bumped from the
-    # split-default 8192m so q9's on-heap join state has the headroom that two
-    # split TMs gave it across their two 8g JVMs. JM 3g; the rest is native
-    # off-heap (bounded vlog readers + shadow + decoded cache) + OS page cache.
-    export TOPO=single
-    export SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}"
-    export SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}"
-    export FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}"
-    export FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}"
+    # UNIFORM topology: the 2×4c/16g split, identical to every other query. The
+    # native-headroom carve-out (process.size=10240m) is set in the templates.
+    export TOPO=split
     echo "  KV-sep=ON min_blob=$FRS_KV_MIN_BLOB_SIZE coalesce=$FRS_VLOG_COALESCE_DEREF"
     echo "  bounds: reader_cap=$FRS_VLOG_READER_CACHE_CAP budget_mb=$FRS_VLOG_RESIDENT_BUDGET_MB adaptive=$FRS_KV_ADAPTIVE_PRESSURE"
-    echo "  topo=single cpus=$SINGLE_TM_CPUS mem=$SINGLE_TM_MEM tm_jvm=$FRS_TM_PROCESS_SIZE jm_jvm=$FRS_JM_PROCESS_SIZE"
+    echo "  topo=split (2x4c/16g) process.size=10240m carve-out (templates)"
     echo "  -> $RUNNER run q9 $ARM $ms $tag"
     CLUSTER="$tag" bash "$RUNNER" run q9 "$ARM" "$ms" "$tag"
   )
@@ -207,9 +198,9 @@ run_q9_36g() {
 #
 # The shared join read-amp stack (q7/q9/q20): KV-sep + min_blob 256 + coalesced
 # vlog deref (A) + S2-pinned + adaptive-S2 (R1) + probe-bloom prune (MR-1) +
-# leveled-hot-CF (Approach-1) + persistent probe-iter (Approach-1). q9 ALSO needs
-# the 8c/36g single-TM topology (else KV-sep OOMs the split's 16g cgroup); it
-# routes through run_q9_36g's resource block with the join stack layered on.
+# leveled-hot-CF (Approach-1) + persistent probe-iter (Approach-1). q9 runs on
+# the SAME 2×4c/16g split as every query (no single TM); KV-sep ON fits via the
+# process.size=10240m native-headroom carve-out + the adaptive vlog budget.
 # The windowed/OVER stack (q8/q11/q12/q18): merge-RMW (A2) + routing-adaptive (R2a).
 # q17: zero-handoff inline carve-out (routing-adaptive selects the iter-free path),
 # KV-sep OFF. q19: KV-sep ON (already wins).
@@ -244,8 +235,9 @@ apply_validate() {
   }
 
   case "$q" in
-    q7|q20)  join_stack ;;                       # read-amp joins, 8c/32g split
-    q9)      join_stack ;;                        # read-amp join, BUT 8c/36g (see run_validate_one)
+    q7|q20)  join_stack ;;                       # read-amp joins, 2x4c/16g split
+    q9)      join_stack ;;                        # read-amp join, 2x4c/16g split (fits via the
+                                                  # process.size=10240m native-headroom carve-out)
     q4)      join_stack ;;                        # write/value-carrying join
     q19)     join_stack ;;                        # KV-sep already wins; full stack layered
     q8|q11|q12|q18)
@@ -264,13 +256,14 @@ apply_validate() {
   echo "  window/OVER: MERGE_RMW=${FRS_RS_MERGE_RMW:-<unset>} EXECUTOR=${FRS_RS_EXECUTOR:-<unset>}"
   echo "  compression: SST=$FRS_SST_COMPRESSION VLOG=$FRS_VLOG_COMPRESSION"
   if [ "$q" = "q9" ]; then
-    echo "  topology: q9 routes through the 8c/36g single-TM resource (run_q9_36g block) with the join stack layered."
+    echo "  topology: q9 runs on the UNIFORM 2x4c/16g split like every query; KV-sep ON fits"
+    echo "            via process.size=10240m + adaptive vlog budget (no single-TM, no per-query topo)."
   fi
 }
 
 # Run ONE query under the validate profile across the requested ARMS (the forst-rs
 # arm gets the full stack; rocksdb / forst-local are the baseline backends with NO
-# forst-rs flags — they ignore FRS_* env). q9 uses the 8c/36g topology.
+# forst-rs flags — they ignore FRS_* env). q9 uses the SAME 2x4c/16g split.
 run_validate_one() {
   local q="$1"
   local ms="${MAXSEC:-$(maxsec_for "$q")}"
@@ -283,32 +276,24 @@ run_validate_one() {
     echo "---------------- VALIDATE $q [$a] tag=$tag ----------------"
     if [ "$a" = "forst-rs-ffm-local" ]; then
       ( apply_validate "$q"
+        # UNIFORM topology: EVERY query runs on the 2x4c/16g split (no single-TM,
+        # no per-query topology — user directive 2026-06-15). q9 + KV-sep ON fits
+        # 16g/TM via the native-headroom carve-out (process.size=10240m, set in
+        # the templates) + the adaptive vlog budget.
+        export TOPO=split
         if [ "$q" = "q9" ]; then
-          # 8c/36g single-TM: KV-sep needs the per-TM memory the split's 16g lacks.
-          export TOPO=single
-          export SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}"
-          export SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}"
-          export FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}"
-          export FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}"
           export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
-          export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-512}"
+          export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-256}"
           export FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-1}"
-          echo "  -> q9 8c/36g single-TM topology"
-        else
-          export TOPO=split
+          echo "  -> q9 2x4c/16g split (process.size=10240m carve-out, adaptive vlog budget)"
         fi
         echo "  -> $RUNNER run $q $a $ms $tag"
         CLUSTER="$tag" bash "$RUNNER" run "$q" "$a" "$ms" "$tag"
       )
     else
-      # Baseline backend: no forst-rs flags. q9 uses the same 36g topology so the
-      # comparison is at the SAME resource (apples to apples for the beat-both proof).
-      ( if [ "$q" = "q9" ]; then
-          export TOPO=single SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}" SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}"
-          export FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}" FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}"
-        else
-          export TOPO=split
-        fi
+      # Baseline backend: no forst-rs flags. SAME 2x4c/16g split as the forst-rs
+      # arm so the beat-both comparison is at the SAME resource for every query.
+      ( export TOPO=split
         export FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}"
         echo "  -> $RUNNER run $q $a $ms $tag"
         CLUSTER="$tag" bash "$RUNNER" run "$q" "$a" "$ms" "$tag"
@@ -325,17 +310,19 @@ run_validate_ab() {
   local ms="${MAXSEC:-$(maxsec_for "$q")}"
   echo ""
   echo "################ VALIDATE-AB $q (full-stack-ON vs flags-OFF) MAXSEC=$ms ################"
-  # Arm A: full stack ON
+  # Arm A: full stack ON — UNIFORM 2x4c/16g split for every query (q9 included;
+  # fits via the process.size=10240m carve-out + adaptive vlog budget).
   ( apply_validate "$q"
-    if [ "$q" = "q9" ]; then export TOPO=single SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}" SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}" FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}" FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}" FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-512}" FRS_KV_ADAPTIVE_PRESSURE=1; else export TOPO=split; fi
+    export TOPO=split
+    if [ "$q" = "q9" ]; then export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-256}" FRS_KV_ADAPTIVE_PRESSURE=1; fi
     echo "== ARM A (full-stack-ON) =="
     CLUSTER="validate-ab-on-$q" bash "$RUNNER" run "$q" forst-rs-ffm-local "$ms" "validate-ab-on-$q" )
-  # Arm B: all forst-rs levers OFF (engine defaults; lz4 kept for fairness)
+  # Arm B: all forst-rs levers OFF (engine defaults; lz4 kept for fairness) — SAME split.
   ( unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE FRS_RS_S2_PINNED \
           FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF FRS_RS_PROBE_BLOOM_PRUNE \
           FRS_RS_LEVELED_HOT_CF FRS_PERSISTENT_PROBE_ITER FRS_RS_MERGE_RMW 2>/dev/null || true
     export FRS_SST_COMPRESSION=lz4
-    if [ "$q" = "q9" ]; then export TOPO=single SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}" SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}" FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}" FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}"; else export TOPO=split; fi
+    export TOPO=split
     echo "== ARM B (flags-OFF) =="
     CLUSTER="validate-ab-off-$q" bash "$RUNNER" run "$q" forst-rs-ffm-local "$ms" "validate-ab-off-$q" )
 }
@@ -374,8 +361,10 @@ case "$cmd" in
     q="${1:-}"; [ -n "$q" ] || { echo "usage: run-best.sh validate-ab <query>"; exit 1; }
     run_validate_ab "$q"
     ;;
-  q9-36g)
-    run_q9_36g
+  q9-split|q9-36g)
+    # q9-36g kept as a back-compat alias; it now runs the UNIFORM 2x4c/16g split
+    # (no single TM) — same as q9-split. The old 8c/36g single-TM path is retired.
+    run_q9_split
     ;;
   print)
     q="${1:-}"
@@ -406,6 +395,6 @@ case "$cmd" in
     sed -n '2,40p' "$0"
     ;;
   *)
-    echo "unknown: $cmd (expected: <query> | sweep | print [<query>] | validate ... | validate-ab <query> | q9-36g | help)"; exit 1
+    echo "unknown: $cmd (expected: <query> | sweep | print [<query>] | validate ... | validate-ab <query> | q9-split | help)"; exit 1
     ;;
 esac

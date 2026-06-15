@@ -67,7 +67,8 @@ its A/B + canary protocol are specified in
 - **Best-per-query (reproduction).** Per-query config is **INTENTIONAL** here —
   the same-config constraint was **reversed 2026-06-14**. Each query runs with
   the knobs the sweep data shows are best for it (KV-separation ON for the
-  write / value-carrying joins, OFF for the read-bound / OOM-prone queries, plus
+  write / value-carrying / heavy-JOIN queries — q4/q7/q9/q19/q20; OFF only where
+  it MEASURABLY hurts — the windowed-AGG-drain q11/q17, and neutral q12; plus
   the R2a routing-adaptive executor where it helps). This is the
   best-PERFORMANCE reproduction package — see §3b and `configs/best-config.tsv`.
 
@@ -157,7 +158,7 @@ cross-compare these Mac numbers with the REMOTE-x86 pins.**
 |-------|--------|-------------|--------------|-----------|-------------|----------|--------|-----|
 | q4  | ON  | 256 | on | 1 | (inline) | **311**  | measured | KV-sep ON wins (vs 384 OFF, +23%); beats RDB 1.09×; ForSt DNF |
 | q7  | ON  | 256 | on | 1 | (inline) | **695**  | measured | KV-sep ON wins big (vs 937 OFF, +35%); PASS RDB 1.16× |
-| q9  | OFF | –   | –  | – | (inline) | **1828** | measured | MUST be OFF on 35g Mac — ON **OOMs/DNFs** (×2). Beats ForSt 2002 by finishing |
+| q9  | ON  | 256 | on | 1 | (inline) | **1463** | measured | KV-sep ON FITS the 2×4c/16g split via the `process.size=10240m` native-headroom carve-out (efdc5997a). FINISHED 1463.3s, **EXACT** out_rows 91,813,372, peak per-TM ~15.2 GiB. (Pre-carve-out at 12288m it OOM'd; OFF/1828s is the fallback for tighter boxes.) See **§3a Q9 + KV-separation**. |
 | q11 | OFF | –   | –  | – | (inline) | **119**  | measured | KV-sep OFF wins (vs 216 ON, −45%); flips both-FAIL→both-PASS |
 | q12 | (def OFF) | – | – | – | (inline) | **41** | measured | source-bound; KV-sep neutral (40.6 ON ≈ 41.6 OFF) |
 | q17 | OFF | –   | –  | – | **routing-adaptive** | **83.7** | **needs-confirm** | best = OFF-regime + R2a; plain OFF/inline = **110.7 (measured fallback)**; ON = 150.7 |
@@ -179,11 +180,91 @@ unmeasured — the cell keeps the measured plain-OFF 118.8s) and q20 with the R1
 adaptive-S2 knob `FRS_S2_FANOUT_MIN` (a candidate deep-probe lever, unmeasured).
 
 **Lever summary (the read-path shape).** KV-separation is not globally good or
-bad — interval-join + Top-N + heavy windowed-JOIN (q4/q7/q19/q20) want it **ON**
-(write-amp / value-carrying read path); windowed-AGG-drain (q11/q17) wants it
-**OFF**; the memory-bound q9 **must** run OFF on a ≤16g/TM box regardless of its
-read-path preference (ON OOMs the cgroup). R2a (`routing-adaptive`) helps q17
-(and historically q11).
+bad — interval-join + Top-N + heavy windowed-JOIN (q4/q7/q9/q19/q20) want it
+**ON** (write-amp / value-carrying read path); windowed-AGG-drain (q11/q17) wants
+it **OFF**. The memory-bound **q9** wants KV-sep ON too, and now **fits the same
+2×4c/16g split as every other query** via the `process.size=10240m` native-headroom
+carve-out (no single TM, no per-query topology — see §3a). R2a (`routing-adaptive`)
+helps q17 (and historically q11).
+
+> **Topology directive (2026-06-15): EVERY query runs on the uniform 2×4c/16g
+> split (`TOPO=split`). No single-TM topology for any query, q9 included.**
+>
+> **KV-sep policy (2026-06-15): prefer KV-sep ON wherever it performs better.**
+> q4/q7/q9/q19/q20 are ON (q9 flipped this session — it now fits the split, §3a).
+> The only OFF queries are where a same-pass A/B MEASURED ON to be *slower*:
+> **q11** (ON 215.8 vs OFF 118.8s, +82%) and **q17** (ON 150.7 vs OFF 110.7s,
+> +36%) — both windowed-AGG-drain — plus neutral **q12**. ⚠ Those q11/q17 OFF-wins
+> predate the current read-path lever stack; **re-measure KV-sep ON for q11/q17 on
+> the current tip and flip them if ON is now ≥ OFF** (open action — not yet
+> re-measured, so the table keeps the last MEASURED OFF winner).
+
+---
+
+## 3a. Q9 + KV-separation — the 16g/TM fit (READ FIRST for q9)
+
+**TL;DR:** q9 @100M with **KV-separation ON** fits the uniform **2×4c/16g split**
+— FINISHED **1463.3s**, **EXACT** `out_rows = 91,813,372`, peak per-TM **~15.2 GiB**
+(never hit 16). The single lever that makes it fit is lowering Flink's
+`taskmanager.memory.process.size` **12288m → 10240m** (commit `efdc5997a`, already
+in `scripts/templates-linux/config-forst-rs-local.yaml.tpl`).
+
+**Command (forst-rs arm only, the winning launcher):**
+
+```bash
+# from a checkout/worktree root; REPO auto-detected, override for the box.
+bash tools/nexmark-local/scripts/q9-procsize.sh q9fit 10240m 2700
+# or via the per-query driver (KV-sep ON + the join stack at the split):
+bash tools/nexmark-local/scripts/run-best.sh q9-split
+# or the full 3-backend beat-both validate at the split:
+bash tools/nexmark-local/scripts/run-best.sh validate q9
+```
+
+**Expected result (forst-rs arm):**
+
+| metric | value |
+|---|---|
+| status | FINISHED |
+| `out_rows` | **91,813,372** (exact) |
+| `wall_ms` | ~**1,463,338** (≈1463.3s) |
+| peak per-TM cgroup RSS | ~**15.2 GiB** (oscillates 12–15.2, never 16) |
+| topology | `TOPO=split` (2 TM × 4c/16g + 1 JM 4g) |
+
+**Root cause (why the carve-out is needed).** Flink's
+`taskmanager.memory.process.size` budgets **only the JVM** (heap + managed +
+network + overhead). The forst-rs engine allocates its state, block cache,
+memtables and compaction buffers in **native memory** through the `.so`
+(jemalloc) — Flink does **not** account for those bytes; they live in the cgroup
+**on top of** `process.size`. At `process.size=12288m`, JVM (~12 GiB) + engine
+native (~5–6 GiB at the q9 join peak) ≈ 17–18 GiB > the 16g/TM cgroup → an
+end-of-run OOM-kill (q9 died ~0.4M rows short). Lowering `process.size` to
+`10240m` carves ~2 GiB of the cgroup back for the engine native, leaving ~6 GiB
+headroom; the JVM still gets ~4.25 GiB heap + ~3.5 GiB managed (forst-rs keeps
+state in engine-native memory, not Flink managed, so managed is ample). This is a
+**pure budget re-partition — no RAM added** — and it is **uniform across all
+forst-rs queries** (the others have smaller native peaks, so the extra headroom
+is harmless). It is set in the template, so every query already gets it.
+
+The KV-sep resident vlog readers are additionally **bounded** (count cap 2048 +
+`FRS_VLOG_RESIDENT_BUDGET_MB=256` byte budget + `FRS_KV_ADAPTIVE_PRESSURE=1`
+back-off) so resident vlog bytes stay inside that ~6 GiB headroom regardless of
+q9's scattered-death segment pattern.
+
+**Do NOT do (refuted levers, kept as repro scripts).**
+
+- **Aggressive jemalloc decay** (`_RJEM_MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:0`,
+  via `q9-decay.sh`): returns freed pages faster but **speeds ingestion past
+  compaction** → more uncompacted state → OOMs **earlier** (~59.5M). The 10s
+  default's slower re-faulting actually paces ingestion. **Worse, not better.**
+- **Fewer compaction threads** (`FRS_BG_COMPACT_THREADS=1`, via `q9-fit2.sh`): a
+  single compaction's working set is already ~5 GiB (the spike is working-set,
+  not concurrency), and fewer threads → L0 buildup → **higher** base. **Worse.**
+
+**Env note.** The macOS Docker Desktop VM is ~35 GiB total, so the 2×16g split +
+4g JM (≈36 GiB) **barely** fits — the carve-out fit was validated under exactly
+that constraint. The remote x86_64 Linux box has more headroom, so the same split
+config has more slack there. (The retired 8c/36g single-TM q9 profile required a
+≥40 GiB Docker VM and is no longer used — every query is split-only.)
 
 ---
 
@@ -290,8 +371,10 @@ bash tools/nexmark-local/scripts/run-best.sh print            # all 8
 bash tools/nexmark-local/scripts/run-best.sh q19              # one query
 bash tools/nexmark-local/scripts/run-best.sh sweep           # all 8, serial
 
-# 2) the q9 8c/36g single-TM profile (KV-sep ON; needs >=40 GiB RAM):
-bash tools/nexmark-local/scripts/run-best.sh q9-36g
+# 2) q9 + KV-sep ON at the uniform 2×4c/16g split (§3a; process.size=10240m carve-out):
+bash tools/nexmark-local/scripts/run-best.sh q9-split
+#    (or the winning launcher directly:)
+bash tools/nexmark-local/scripts/q9-procsize.sh q9fit 10240m 2700
 
 # 3) the uniform-config research sweep (8 queries x 3 backends):
 bash tools/nexmark-local/scripts/run-remote-nexmark-v3.sh
@@ -330,8 +413,8 @@ bash tools/nexmark-local/scripts/run-8c32g.sh build
 # 1) per-query BEST config sweep (forst-rs arm):
 bash tools/nexmark-local/scripts/run-best.sh sweep
 
-# 2) q9 8c/36g single-TM profile (KV-sep ON; the box has the RAM headroom):
-bash tools/nexmark-local/scripts/run-best.sh q9-36g
+# 2) q9 + KV-sep ON at the uniform 2×4c/16g split (§3a; process.size=10240m carve-out):
+bash tools/nexmark-local/scripts/run-best.sh q9-split
 
 # 3) uniform-config research sweep (8 queries x 3 backends, serial):
 bash tools/nexmark-local/scripts/run-remote-nexmark-v3.sh
@@ -354,14 +437,14 @@ with the resource knobs below.
 | `FRS_IO_URING` | `0` (no-op) | `1` (seccomp=unconfined) | enable the io_uring path (q7 needs it on Linux) |
 | `FRS_CTMP_BASE` | `$TMPDIR/jackylee/...` | `pick-disk.sh` (NVMe) | scratch base; explicit override wins on both |
 | `FRS_DISK_CANDIDATES` | `$TMPDIR/jackylee` | `/ssd2 /ssd1 /tmp` under `$USER` | candidate scratch dirs for `pick-disk.sh` |
-| `SINGLE_TM_CPUS` / `SINGLE_TM_MEM` | `8` / `32g` | `8` / `32g` | TOPO=single resources (RAM-checked vs physical) |
+| `SINGLE_TM_CPUS` / `SINGLE_TM_MEM` | `8` / `32g` | `8` / `32g` | TOPO=single resources — generic harness knob; **no NexMark query uses single-TM** (all run the split, §3a) |
 | `SPLIT_TM_CPUS` / `SPLIT_TM_MEM` | `4` / `16g` | `4` / `16g` | TOPO=split per-TM resources (2 TMs) |
 | `SPLIT_JM_CPUS` / `SPLIT_JM_MEM` | `2` / `4g` | `2` / `4g` | TOPO=split JM resources |
-| `FRS_TM_PROCESS_SIZE` / `FRS_JM_PROCESS_SIZE` | (unset) | (unset) | Flink JVM process.size (q9-36g sets `16384m` / `3072m`) |
+| `FRS_TM_PROCESS_SIZE` / `FRS_JM_PROCESS_SIZE` | (unset) | (unset) | Flink JVM process.size override (the template default is `10240m` for the q9 native-headroom carve-out, §3a) |
 | `FLINK_SRC` / `JAVA25_HOME` | `$REPO/../flink` / java_home | `$REPO/../flink` / `$JAVA_HOME` | `jar` build inputs |
 
 Physical RAM is auto-detected (macOS `sysctl hw.memsize`, Linux `/proc/meminfo`)
 and used only to **warn** (not fail) when the requested container memory + ~4 GiB
-OS headroom exceeds it. The 8c/36g q9 profile assumes a box with ≥40 GiB RAM
-(both the dev Mac at 64 GiB and the origin Linux box qualify); on a smaller box
-lower `SINGLE_TM_MEM`.
+OS headroom exceeds it. Every NexMark query runs the 2×4c/16g split (≈36 GiB total
+with the JM); on the macOS Docker VM (~35 GiB) that barely fits — see §3a for the
+q9 native-headroom carve-out that keeps q9+KV-sep inside 16g/TM.

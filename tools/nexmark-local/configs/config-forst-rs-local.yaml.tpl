@@ -21,8 +21,24 @@ taskmanager:
   host: localhost
   numberOfTaskSlots: 4
   memory:
+    # FRS-Q9-NATIVE-HEADROOM (2026-06-15, PMC-1): carve Flink's process.size DOWN
+    # so the forst-rs engine's NATIVE (off-heap, jemalloc-in-the-.so) allocation
+    # fits the per-TM cgroup. Flink does NOT account for the engine's native bytes
+    # in process.size — they live in the cgroup ON TOP of it. At process.size=12288m
+    # the JVM (heap+managed+network+overhead) + engine native (~5-6 GiB at the q9
+    # join peak) summed to ~17-18 GiB > the 16g/TM split cgroup -> end-of-run
+    # OOM-kill (q9 died ~0.4M rows short). Lowering to 10240m leaves ~6 GiB cgroup
+    # headroom for the engine native; the JVM still gets 4.25 GiB heap + 3.5 GiB
+    # managed, ample for the Flink-side join/operator state (forst-rs keeps its
+    # state in engine-native memory, not Flink managed). VALIDATED: q9 @100M @2x4c/
+    # 16g SPLIT, KV-sep ON, uniform config -> FINISHED 1463.3s, EXACT out_rows
+    # 91,813,372, peak cgroup ~15.2 GiB (was OOM at 16). Uniform across ALL forst-rs
+    # queries (no per-query config); other queries have smaller native peaks so the
+    # extra headroom is harmless. NO RAM added — pure budget re-partition.
+    # NOTE: this configs/ copy is a reference mirror; run-8c32g.sh uses
+    # scripts/templates-linux/ by default (override with TEMPLATES=).
     process:
-      size: 12288m
+      size: 10240m
 
 parallelism:
   default: 4

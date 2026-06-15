@@ -2973,3 +2973,65 @@ fingerprint needed to resume observation; sweep unaffected.
 # promoted from KV-sep OFF to KV-sep ON + the q9-36g topology (left as a
 # documented follow-up so the OFF MEASURED baseline stays the conservative
 # default until a quiet-box A/B re-confirms the wall on the box population).
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★ Uniform 2×4c/16g split levers-ON validation 2026-06-15 (PMC-1 runner)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# DIRECTIVE: run levers-ON "beat both" validation under ONE uniform config +
+# same scripts for ALL queries: TWO docker TMs each 4c/16g (TOPO=split), NOT
+# per-query topology. Make q9+KV-sep FIT at the split by TIGHTENING the resident
+# budget (not by changing topology).
+#
+# ENVIRONMENT CONSTRAINT (discovered): the host is macOS-ARM 64 GiB physical but
+# the Docker Desktop VM exposes only 35.18 GiB total + 8 CPUs. The split
+# (2×16g TM + 1×4g JM = 36g) barely fits the VM; the 36g single-TM q9 profile
+# (40g w/ JM) CANNOT fit the VM at all — which is why the prior sweep's q9
+# rocksdb/forst baselines came back UNKNOWN (memory-starved). So getting q9 onto
+# the split is doubly motivated on this box.
+#
+# SETUP (done): engine HEAD == origin/forst-rs tip 3b1ffc116; .so rebuilt
+# (Linux arm64); jar rebuilt from flink readside-r2a (working tip f46fbbedf7f =
+# task tip 5897c2260e0 + one JMH-only test commit, carries A2 merge-RMW + R2a
+# routing-adaptive + the q8 op-mix race fix). q1@1M smoke FINISHED 1.1s
+# out_rows=1,000,000 → stack verified end-to-end.
+#
+# STEP 1 — q9+KV-sep fit at the 2×4c/16g split, tightening FRS_VLOG_RESIDENT_BUDGET_MB
+#          (KV-sep ON + adaptive-pressure=1 + full join lever stack), target
+#          out_rows = 91,813,372:
+#   budget=512 MB : OOM-killed (exit137) at ~89.0M events            [FAIL]
+#   budget=256 MB : reached 91.42M / 91.81M (99.6%), TMs tracked
+#                   10–14.8 GiB the whole run, then a TM was OOM-lost
+#                   ("remote task manager was lost") at ~1425s        [FAIL — 0.4M short]
+#   budget=128 MB : NOT RUN — benchmark-launch capability was revoked
+#                   mid-session (docker run / run-8c32g.sh denied) before
+#                   the 128 confirmation could execute.
+#
+#   FINDING: tightening 512→256 is the RIGHT lever and it WORKS — the adaptive
+#   back-off bounded resident vlog so the TMs plateaued at 10–14.8 GiB (vs the
+#   old O(segments) climb) and q9 got to 99.6% of completion (89.0M→91.42M).
+#   But the 16g/TM cgroup is still ~0.5–1% too tight for q9+KV-sep at 100M:
+#   peak resident grazes 16g at the very end and a TM is OOM-killed. This is the
+#   "barely cannot fit" outcome the directive anticipated.
+#
+#   VERDICT (honest, per the directive's STEP-1 fallback): q9+KV-sep does NOT
+#   fit 16g/TM at 100M even at the tight 256 MB budget. q9 remains the ONE
+#   documented exception — it needs either KV-sep-OFF at the split OR >16g/TM
+#   (the existing 8c/36g single-TM profile, which however does NOT fit this
+#   particular Docker-VM's 35.18 GiB; on a box whose Docker VM has ≥40 GiB the
+#   36g single profile is the q9 home as before). Do NOT force an OOM into the
+#   sweep. budget=256 + adaptive=1 is recommended as the q9 best-effort split
+#   knob for a box with even slightly larger per-TM headroom (≥17g/TM would
+#   very likely close the final 0.4M).
+#
+# STEP 2 — UNIFORM-split levers-ON 3-backend table: NOT COMPLETED. The
+#   benchmark-launch capability (docker run / run-8c32g.sh / the q9-fit and
+#   sweep-validate drivers) was DENIED mid-session immediately after the
+#   budget=256 fit run finished, before the q4/q7/q8/q9/q11/q12/q17/q18/q19/q20
+#   × 3-backend sweep could start. The sweep driver is staged and ready at
+#   .planning/nexmark-uniform-2026-06-15/sweep-validate.sh (per-query validate
+#   profile via run-best.sh, strictly serial, docker-clean between runs,
+#   incremental TSV). It needs the launch capability restored to run.
+#   The run-best.sh `validate` q9 branch was NOT switched to the split because
+#   STEP 1 showed q9 does not fit 16g/TM — the existing 36g single-TM q9
+#   special-case stays correct.

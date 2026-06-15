@@ -6,7 +6,8 @@
 # end-of-run spike enough to fit the 16g/TM cgroup. Global-safe (allocator decay,
 # uniform across all queries).
 set -u
-REPO=/tmp/frs-q9memfit
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 TAG="${1:-q9decay}"
 DECAY="${2:-background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0}"
 MS="${3:-2700}"

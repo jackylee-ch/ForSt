@@ -5,6 +5,19 @@
 # from the uniform-config research question driven by run-remote-nexmark-v3.sh,
 # which deliberately holds ONE config for all queries. Use run-best.sh to apply.
 #
+# ★ KV-SEP POLICY (2026-06-15, user directive): prefer KV-sep ON wherever it has
+# BETTER performance. q4/q7/q19/q20 already ON; q9 FLIPPED to ON this session
+# (the 16g/TM split now fits via the process.size=10240m carve-out — efdc5997a).
+# The ONLY queries still encoded KV-sep OFF are where a SAME-PASS A/B MEASURED ON
+# to be slower: q11 (ON 215.8 vs OFF 118.8, ON +82%) and q17 (ON 150.7 vs OFF
+# 110.7, ON +36%) — both windowed-AGG-drain, where KV-sep adds a value-deref hop
+# the agg read path does not benefit from; plus q12 (neutral, ON 40.6 ~ OFF 41.6,
+# source-bound). ⚠ OPEN ACTION: those q11/q17 OFF-wins predate the CURRENT
+# read-path lever stack (coalesced deref + join stack + R2a). Re-measure KV-sep
+# ON for q11/q17 on the current engine tip before trusting the OFF default; if ON
+# is now >= OFF, flip them. NOT flipped yet because no ON re-measure exists on the
+# current tip (this is an RD/docs task; the runner re-measures on the box).
+#
 # SOURCE: docs/superpowers/specs/2026-06-08-8c32g-3backend-sweep-results.md
 #   - "V3 FULL 8-QUERY" (flag-ON: lz4 + KV-sep + trivial-move + S2-pinned)  tip 1cda0e724
 #   - "V3 FLAG-OFF"     (ForSt-matching default: KV-sep OFF)                tip 15436bfde
@@ -40,7 +53,7 @@
 query	KV_SEPARATION	KV_MIN_BLOB_SIZE	TRIVIAL_MOVE	S2_PINNED	S2_FANOUT_MIN	RS_EXECUTOR	SST_COMPRESSION	VLOG_COALESCE_DEREF	expected_wall_s	status	note
 q4	true	256	true	1	-	-	lz4	1	311	MEASURED	KV-sep ON wins (flag-ON 311 vs flag-OFF 384, +23%). +FRS_VLOG_COALESCE_DEREF=1 (coalesced batched vlog deref, part of best config). Retract-changelog cadence rows ~25.8M (documented, not a defect). Beats RDB 1.09x; ForSt DNF(OOM).
 q7	true	256	true	1	-	-	lz4	1	695	MEASURED	KV-sep ON wins big (flag-ON 695 vs flag-OFF 937, +35%). +FRS_VLOG_COALESCE_DEREF=1 (coalesced probe-side vlog deref, part of best config). Heaviest windowed-join; -26% vs prior V10. PASS RDB 1.16x; loses to ForSt.
-q9	false	-	false	-	-	-	lz4	1	1828	MEASURED	KV-sep MUST be OFF on the 35g Mac: flag-ON DNF (TM OOM ~75-83M, reproducible x2); flag-OFF FINISHES 1828.7s (RSS ~2GiB lower). Beats ForSt 2002.5 by completing. VLOG_COALESCE_DEREF=1 is a NO-OP here (KV-sep OFF => no separated values); set uniformly, harmless.
+q9	false	-	false	-	-	-	lz4	1	1828	MEASURED	KV-sep MUST be OFF on the 35g Mac at this topology: flag-ON DNF (TM OOM ~75-83M, reproducible x2) at process.size=12288m; flag-OFF FINISHES 1828.7s (RSS ~2GiB lower). Beats ForSt 2002.5 by completing. VLOG_COALESCE_DEREF=1 is a NO-OP here (KV-sep OFF => no separated values); set uniformly, harmless. ★ UPDATE 2026-06-15 (efdc5997a): q9 KV-sep ON NOW FITS the 2x4c/16g SPLIT via the native-headroom carve-out (Flink taskmanager.memory.process.size 12288m->10240m, leaving ~6GiB cgroup for the engine's native/jemalloc allocation that Flink does NOT budget). VALIDATED: q9 @100M KV-sep ON @split FINISHED 1463.3s, EXACT out_rows 91,813,372, peak per-TM ~15.2GiB. Repro: tools/nexmark-local/scripts/q9-procsize.sh <tag> 10240m 2700  (the winning launcher). The KV-sep-ON+10240m split is now the q9 best when the box's per-TM cgroup is a true 16g; this OFF row stays the conservative fallback for tighter boxes.
 q11	false	-	false	-	-	-	lz4	1	119	MEASURED	KV-sep OFF wins (flag-OFF 118.8 vs flag-ON 215.8, -45%). Flips both-FAIL->both-PASS (1.12x RDB). Windowed-MapState-agg drain. NOTE: R2a (routing-adaptive) ALSO helped q11 historically (318.9->135.7); the OFF+R2a combo is UNMEASURED -- current cell encodes the best MEASURED (plain OFF, 118.8). See run-best.sh q11-r2a variant.
 q12	-	-	-	-	-	-	lz4	1	41	MEASURED	Source-bound parity; KV-sep neutral (flag-ON 40.6 ~ flag-OFF 41.6). Either works; left at engine default (OFF).
 q17	false	-	false	-	-	routing-adaptive	lz4	1	83.7	NEEDS-CONFIRM	BEST wall 83.7 = KV-sep-OFF regime + R2a routing-adaptive (/tmp/v3-q17 capture). Plain KV-sep-OFF inline measured 110.7 (flag-OFF pass); KV-sep-ON measured 150.7 (flag-ON). The OFF+routing-adaptive 83.7 is from a SEPARATE capture, NOT the clean serial flag-OFF pass -> CONFIRM the OFF+routing-adaptive wall on a quiet box. Fallback MEASURED config = OFF/inline @110.7.

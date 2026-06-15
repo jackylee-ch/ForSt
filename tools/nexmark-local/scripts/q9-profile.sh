@@ -5,7 +5,8 @@
 # spike can be attributed (rss / jemalloc alloc-resident-retained / wbm / shadow /
 # flush+compaction bytes-ns). Poll the docker logs for [FRS_MEM_DIAG] lines.
 set -u
-REPO=/tmp/frs-q9memfit
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 TAG="${1:-q9prof}"
 MS="${2:-2700}"
 
