@@ -76,6 +76,12 @@ case "$cmd" in
       -e FRS_BLOCK_SIZE_KB=8 -e FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}" \
       -e FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}" \
       -e FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-}" \
+      # KV-sep per-TM MEMORY BOUNDS (q9 KV-sep OOM fix, 2026-06-15 PMC-1) — the
+      # engine knobs that bound resident vlog state so KV-sep fits the cgroup.
+      -e FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-}" \
+      -e FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-}" \
+      -e FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-}" \
+      -e FRS_VLOG_GC_AGE_CUTOFF="${FRS_VLOG_GC_AGE_CUTOFF:-}" \
       # FRS write-amp / disagg lever stack (2026-06-13 PMC-1 V10 local validation):
       # forwarded so the engine inside the TM/JM containers can read them.
       -e FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-}" -e FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-}" \
@@ -189,7 +195,14 @@ case "$cmd" in
       echo "--- RESULT line ---"; grep -E 'RESULT:|MAXSEC' "$OUT" | tail -1
       exit 0
     fi
-    docker run --rm --cpus=8 --memory=32g --memory-swap=32g ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" \
+    # SINGLE-TM resource budget (TOPO=single). Default = the canonical 8c/32g.
+    # q9 KV-sep OOM fix (2026-06-15 PMC-1): SINGLE_TM_CPUS/SINGLE_TM_MEM size a
+    # BIGGER single TM (e.g. 8c/36g) that gives q9 KV-sep far more per-TM
+    # headroom than the 16g-capped TOPO=split TMs. Unset = byte-identical 8c/32g.
+    SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}"
+    SINGLE_TM_MEM="${SINGLE_TM_MEM:-32g}"
+    echo "== TOPO=single resources: --cpus=$SINGLE_TM_CPUS --memory=$SINGLE_TM_MEM =="
+    docker run --rm --cpus="$SINGLE_TM_CPUS" --memory="$SINGLE_TM_MEM" --memory-swap="$SINGLE_TM_MEM" ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" \
       "${ENVS[@]}" \
       "$IMG" bash -lc "
         cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&

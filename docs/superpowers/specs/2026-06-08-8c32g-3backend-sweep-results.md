@@ -2824,3 +2824,98 @@ fingerprint needed to resume observation; sweep unaffected.
 # scattered deref is a network round-trip -- THERE coalescing collapses N RTTs
 # to ~1 and should show end-to-end. Local-FS confirm = NO REGRESSION, no win.
 # RE-RUN on the REMOTE x86/NVMe + disagg vlog to capture the network-RTT win.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★★ q9-8c36g-KVsep — q9 KV-SEPARATION OOM **FIXED** (2026-06-15, PMC-1)
+# ═══════════════════════════════════════════════════════════════════════════
+# THE RESULT: q9 @100M with KV-separation ON now FINISHES (no OOM) on an
+# 8c/36g single-TM profile. Prior status (best-config.tsv) was "q9 KV-sep MUST
+# be OFF, else OOM ×2 (~75-83M)". This closes that — q9 KV-sep ON is now viable.
+#
+# ── Measured (Mac, 64 GiB physical, docker single-TM, ARM=forst-rs-ffm-local) ──
+#   profile : TOPO=single  --cpus=8  --memory=36g   (vs the 2×4c/16g split)
+#             TM JVM process.size 16384m, JM 3072m  (FRS_TM/JM_PROCESS_SIZE)
+#   engine  : FRS_KV_SEPARATION=true  FRS_KV_MIN_BLOB_SIZE=256
+#             FRS_TRIVIAL_MOVE=true  FRS_RS_S2_PINNED=1
+#             FRS_VLOG_COALESCE_DEREF=1  FRS_SST_COMPRESSION=lz4
+#   bounds  : FRS_VLOG_READER_CACHE_CAP=2048 (default; 128 MiB chunk ceiling)
+#             FRS_VLOG_RESIDENT_BUDGET_MB=512 (byte budget)
+#             FRS_KV_ADAPTIVE_PRESSURE=1 (back off separation when over budget)
+#
+#   | metric            | q9 KV-sep ON (8c/36g)        | prior q9 KV-sep ON (split) |
+#   |-------------------|-----------------------------|----------------------------|
+#   | result            | **FINISHED ×2**             | DNF — TM OOM ×2 (~75-83M)  |
+#   | wall              | run-1 1432 s / run-2 1357.1 s| n/a (never finished)      |
+#   | out_rows          | **91,813,372** (== canonical, EXACT) | n/a               |
+#   | src_out           | 98,000,000 (full 100M input)| crashed ~75-83M            |
+#   | peak container RSS| **26.2 GiB / 35.18 GiB**    | busted the 16 GiB cgroup   |
+#   |                   | (flat 23-26 GiB band; no    |                            |
+#   |                   |  monotonic climb-to-OOM)    |                            |
+#
+#   Re-run RESULT line (run-2, exact, captured clean):
+#     RESULT: q9 FINISHED wall_ms=1357117 (=1357.1s) src_out=98000000 out_rows=91813372
+#
+#   Reference: q9 KV-sep OFF on the split finished 1828.7 s @ peak ~18.2 GiB
+#   (best-config.tsv). KV-sep ON @ 1357-1432 s is ~22-26% FASTER wall AND fits — the
+#   write-amp + value-carrying read win KV-sep gives the other join queries
+#   (q4/q7/q19/q20) now also applies to q9 once the memory is bounded.
+#
+# ── Why it OOM'd before, and the two-pronged fix ──
+# ROOT CAUSE (docs/.../2026-06-14-q9-kvsep-oom-rootcause.md, code-verified):
+# KV-sep diverts each Put value ≥ min_blob into an append-only .vlog segment
+# (one per flush) and caches an open VlogReader (file handle + 64 KiB chunk)
+# per segment EVER dereferenced. The cache was an UNCAPPED HashMap reclaimed
+# only when a segment's live_bytes hits 0. q9's multi-way interval JOIN + Rank
+# has SCATTERED (non-FIFO) segment death, so segments essentially never hit 0 →
+# the reader set grew monotonically (≈ O(segments)) and busted the 16 GiB/TM
+# cgroup at ~75-83M rows. Quantified by the mini-bench (forst-rs-bench
+# vlog_reader_cache_footprint, 50 000 segments): UNCAPPED = 3.05 GiB resident
+# chunk bytes; the same engine delta that, on top of q9's ~18 GiB working set,
+# crossed the cgroup.
+#
+# PRONG 1 — reduce the engine delta (bounded vlog readers, already landed in
+# 9e0438eb7 + 7c53011be, NEVER confirmed against a real q9 until now):
+#   * VlogReaderCache: bounded-LRU over the reader set — count cap (default
+#     2048 = 128 MiB chunk ceiling) + optional charged BYTE budget + adaptive
+#     pressure back-off. Reader re-open on a miss is byte-identical (segments
+#     are immutable once published), so the bound is correctness-free.
+#     - crates/forst-rs-storage/src/vlog.rs:402  DEFAULT_VLOG_READER_CACHE_CAP
+#     - crates/forst-rs-storage/src/vlog.rs:413  VLOG_READER_CHARGE_BYTES (68 KiB)
+#     - crates/forst-rs-storage/src/vlog.rs:465  with_capacity_and_budget
+#     - crates/forst-rs-engine/src/db.rs:158     vlog_resident_budget_bytes (FRS_VLOG_RESIDENT_BUDGET_MB)
+#     - crates/forst-rs-engine/src/db.rs:13466   should_separate_now (adaptive back-off)
+#   * mini-bench VERDICT (50 000 segments): 3.05 GiB → 128 MiB (count cap, 24×)
+#     and → ~64 MiB at a 64 MiB byte budget (O(budget), not O(segments)).
+#   THE HARNESS GAP this cycle closed: the bounding env vars were NOT forwarded
+#   into the TM/JM containers, so the bound was UNREACHABLE from the run path
+#   (q9 could only "fit" by disabling KV-sep). Forwarding added in:
+#     - scripts/run-8c32g.sh  and  tools/nexmark-local/scripts/run-8c32g.sh
+#       (FRS_VLOG_READER_CACHE_CAP / _RESIDENT_BUDGET_MB / FRS_KV_ADAPTIVE_PRESSURE
+#        / FRS_VLOG_GC_AGE_CUTOFF + FRS_VLOG_COALESCE_DEREF on the package copy)
+#
+# PRONG 2 — bigger per-TM topology (8c/36g single TM):
+#   * SINGLE_TM_CPUS / SINGLE_TM_MEM parameterize the TOPO=single container
+#     (default unchanged 8c/32g). A single 8c/36g TM gives q9 far more per-TM
+#     headroom than the 16 GiB-capped split TMs. Physical RAM here is 64 GiB,
+#     so 36 g TM + OS/JM headroom fits with room to spare.
+#     - tools/nexmark-local/scripts/run-8c32g.sh / scripts/run-8c32g.sh (SINGLE_TM_*)
+#   * FRS_TM_PROCESS_SIZE / FRS_JM_PROCESS_SIZE override the Flink JVM
+#     process.size (default templates untouched when unset = byte-identical).
+#     The single big TM gets a 16384m JVM (vs the split-default 8192m) so q9's
+#     on-heap join state has the headroom the two split TMs gave it across
+#     their two 8 g JVMs.
+#     - scripts/measure-sql.sh (FRS-Q9-36G process.size override)
+#   * Profile wired as: tools/nexmark-local/scripts/run-best.sh  q9-36g
+#       MAXSEC=2700 ARM=forst-rs-ffm-local bash run-best.sh q9-36g
+#
+# DISPOSITION: q9 KV-sep OOM is FIXED via (1) the bounded vlog-reader cache
+# (engine delta 3.05 GiB → 128 MiB, now reachable from the harness) + (2) the
+# 8c/36g single-TM profile. Memory stayed in a flat 23-26 GiB band for the
+# whole run — the never-OOM signature (plateau, not the old O(segments) climb).
+# This is a PER-QUERY topology profile (the per-query best-config exception);
+# it does not change any other query's run. CORRECTNESS gate PASSED:
+# out_rows=91,813,372 == canonical (×2 finishing runs). q9 KV-sep ON is now a
+# viable best config on the 8c/36g profile — the best-config.tsv q9 row can be
+# promoted from KV-sep OFF to KV-sep ON + the q9-36g topology (left as a
+# documented follow-up so the OFF MEASURED baseline stays the conservative
+# default until a quiet-box A/B re-confirms the wall on the box population).

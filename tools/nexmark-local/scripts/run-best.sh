@@ -124,8 +124,58 @@ run_one() {
   )
 }
 
+# q9 KV-sep OOM fix (2026-06-15 PMC-1): q9 with KV-separation ON on a SINGLE
+# BIG TM (8c/36g) instead of the 2×4c/16g split. The split capped each TM at
+# 16g, and KV-sep's resident vlog state pushed q9 over that cgroup (DNF/OOM).
+# A single TM with all 8 cores + 36g (physical RAM is 64g here, so OS+JM
+# headroom is ample) gives q9 the per-TM memory the split could not. KV-sep's
+# resident vlog readers are additionally BOUNDED (count cap + byte budget +
+# adaptive pressure back-off) so the engine delta stays small.
+#
+# This is a PER-QUERY topology profile (the per-query best-config exception the
+# user allowed) — it does NOT change any other query's run.
+run_q9_36g() {
+  local ms="${MAXSEC:-2700}"
+  local tag="${TAG_PREFIX}-q9-36g-$ARM"
+  echo ""
+  echo "============ q9 KV-sep 8c/36g PROFILE [$ARM] tag=$tag MAXSEC=$ms ============"
+  ( # KV-sep ON + coalesced deref (the per-query best read path), lz4.
+    export FRS_KV_SEPARATION=true
+    export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
+    export FRS_TRIVIAL_MOVE="${FRS_TRIVIAL_MOVE:-true}"
+    export FRS_RS_S2_PINNED="${FRS_RS_S2_PINNED:-1}"
+    export FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-1}"
+    export FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}"
+    export FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}"
+    # KV-sep resident MEMORY BOUNDS — the engine delta that the split's 16g
+    # cgroup could not hold. Count cap is on by default (2048); add the BYTE
+    # budget + adaptive pressure so resident vlog bytes are guaranteed bounded
+    # regardless of q9's scattered-death segment pattern.
+    export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
+    export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-512}"
+    export FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-1}"
+    # Single BIG TM topology: 8 cores, 36g container; JVM heap bumped from the
+    # split-default 8192m so q9's on-heap join state has the headroom that two
+    # split TMs gave it across their two 8g JVMs. JM 3g; the rest is native
+    # off-heap (bounded vlog readers + shadow + decoded cache) + OS page cache.
+    export TOPO=single
+    export SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}"
+    export SINGLE_TM_MEM="${SINGLE_TM_MEM:-36g}"
+    export FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-16384m}"
+    export FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-3072m}"
+    echo "  KV-sep=ON min_blob=$FRS_KV_MIN_BLOB_SIZE coalesce=$FRS_VLOG_COALESCE_DEREF"
+    echo "  bounds: reader_cap=$FRS_VLOG_READER_CACHE_CAP budget_mb=$FRS_VLOG_RESIDENT_BUDGET_MB adaptive=$FRS_KV_ADAPTIVE_PRESSURE"
+    echo "  topo=single cpus=$SINGLE_TM_CPUS mem=$SINGLE_TM_MEM tm_jvm=$FRS_TM_PROCESS_SIZE jm_jvm=$FRS_JM_PROCESS_SIZE"
+    echo "  -> $RUNNER run q9 $ARM $ms $tag"
+    CLUSTER="$tag" bash "$RUNNER" run q9 "$ARM" "$ms" "$tag"
+  )
+}
+
 cmd="${1:-}"; [ -n "$cmd" ] && shift || true
 case "$cmd" in
+  q9-36g)
+    run_q9_36g
+    ;;
   print)
     q="${1:-}"
     if [ -n "$q" ]; then

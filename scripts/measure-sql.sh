@@ -33,6 +33,31 @@ case "$CONFIG" in
   forst-local) cp "$TEMPLATES/config-forst-local.yaml.tpl" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-forst-io /tmp/flink-forst-data /tmp/nexmark-checkpoints-forst ;;
   *) echo "unknown config $CONFIG"; exit 1 ;;
 esac
+# FRS-Q9-36G (2026-06-15 PMC-1): optional Flink memory-budget override for the
+# bigger single-TM q9 KV-sep profile. Default UNSET = byte-identical (templates
+# untouched). When set, rewrite taskmanager/jobmanager process.size in $CONF so
+# the single 8c/36g TM gets a bigger JVM than the 16g-split's 8192m default
+# (q9's join state needs the heap headroom that two split TMs gave it across
+# their two 8g JVMs). Only the two process.size lines are touched.
+if [ -n "${FRS_TM_PROCESS_SIZE:-}" ] || [ -n "${FRS_JM_PROCESS_SIZE:-}" ]; then
+  python3 - "$CONF" "${FRS_TM_PROCESS_SIZE:-}" "${FRS_JM_PROCESS_SIZE:-}" <<'PYEOF'
+import sys
+p, tm, jm = sys.argv[1], sys.argv[2], sys.argv[3]
+out, sect = [], None
+for ln in open(p):
+    s = ln.rstrip('\n')
+    if s and not s[0].isspace() and s.endswith(':'):
+        sect = s[:-1]
+    if s.strip().startswith('size:') and s.startswith('      size:'):
+        if sect == 'taskmanager' and tm:
+            s = '      size: ' + tm
+        elif sect == 'jobmanager' and jm:
+            s = '      size: ' + jm
+    out.append(s + '\n')
+open(p, 'w').writelines(out)
+PYEOF
+  echo "== FRS-Q9-36G process.size override: TM=${FRS_TM_PROCESS_SIZE:-<unchanged>} JM=${FRS_JM_PROCESS_SIZE:-<unchanged>} =="
+fi
 # The repo's sql-client.sh is a WRAPPER that reroutes nexmark's hardcoded
 # `embedded` to `sql-client.sh.orig gateway --endpoint localhost:8083`, so a
 # SqlGateway daemon MUST be running at 8083. Append its endpoint config + start it.

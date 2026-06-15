@@ -75,6 +75,20 @@ case "$cmd" in
       # FRS_SST_COMPRESSION=none for the zero-copy read-path A/B. See survey §12.
       -e FRS_BLOCK_SIZE_KB=8 -e FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}" \
       -e FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}" \
+      -e FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-}" \
+      # KV-sep per-TM MEMORY BOUNDS (q9 KV-sep OOM fix, 2026-06-15 PMC-1).
+      # These are the engine knobs that bound resident vlog state so KV-sep
+      # fits the per-TM cgroup. Previously NOT forwarded → the bounded LRU /
+      # byte-budget / adaptive-pressure machinery could not be turned on from
+      # the harness, so q9 KV-sep ON could only "fit" by disabling KV-sep.
+      #   FRS_VLOG_READER_CACHE_CAP   resident reader COUNT cap (default 2048)
+      #   FRS_VLOG_RESIDENT_BUDGET_MB resident reader BYTE budget (default 0=off)
+      #   FRS_KV_ADAPTIVE_PRESSURE    back off separation when over budget+stalled
+      #   FRS_VLOG_GC_AGE_CUTOFF      vlog-GC relocation cutoff %% (default 0=off)
+      -e FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-}" \
+      -e FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-}" \
+      -e FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-}" \
+      -e FRS_VLOG_GC_AGE_CUTOFF="${FRS_VLOG_GC_AGE_CUTOFF:-}" \
       # FRS write-amp / disagg lever stack (2026-06-13 PMC-1 V10 local validation):
       # forwarded so the engine inside the TM/JM containers can read them.
       -e FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-}" -e FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-}" \
@@ -194,7 +208,16 @@ case "$cmd" in
       echo "--- RESULT line ---"; grep -E 'RESULT:|MAXSEC' "$OUT" | tail -1
       exit 0
     fi
-    docker run --rm --cpus=8 --memory=32g --memory-swap=32g ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" \
+    # SINGLE-TM resource budget (TOPO=single). Default = the canonical 8c/32g.
+    # q9 KV-sep OOM fix (2026-06-15 PMC-1): a BIGGER single-TM profile gives q9
+    # far more PER-TM headroom than the 16 g-capped TOPO=split TMs. Physical RAM
+    # on this box is 64 GiB, so a single TM at ~36 g + OS/JM headroom fits
+    # comfortably. Set SINGLE_TM_CPUS / SINGLE_TM_MEM to size it; the
+    # `q9-36g` profile (see run-best.sh / docs) uses 8c/36g.
+    SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}"
+    SINGLE_TM_MEM="${SINGLE_TM_MEM:-32g}"
+    echo "== TOPO=single resources: --cpus=$SINGLE_TM_CPUS --memory=$SINGLE_TM_MEM =="
+    docker run --rm --cpus="$SINGLE_TM_CPUS" --memory="$SINGLE_TM_MEM" --memory-swap="$SINGLE_TM_MEM" ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" \
       "${ENVS[@]}" \
       "$IMG" bash -lc "
         cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
