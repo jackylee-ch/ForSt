@@ -286,6 +286,26 @@ jobs:
       - name: Pin NEXMARK_HOME
         run: echo "NEXMARK_HOME=$RUNTIME/nexmark-flink" >> "$GITHUB_ENV"
 
+      # The forst-rs state backend pulls in org.apache.hadoop.conf.Configuration
+      # at SQL-submit time (the harness puts $HADOOP_HOME/share/hadoop/**/*.jar on
+      # HADOOP_CLASSPATH). rocksdb does not need it. Provide a Hadoop dist so the
+      # forst-rs backend can submit. (Cached; ~700 MB download only on cache miss.)
+      - name: Cache Hadoop dist
+        id: cache-hadoop
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.hadoop/hadoop-3.3.6
+          key: hadoop-3.3.6-dist
+      - name: Download Hadoop 3.3.6 (cache miss only)
+        if: steps.cache-hadoop.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/.hadoop"
+          curl -fsSL --retry 3 -o /tmp/hadoop.tgz \
+            https://archive.apache.org/dist/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz
+          tar -C "$GITHUB_WORKSPACE/.hadoop" -xzf /tmp/hadoop.tgz
+      - name: Pin HADOOP_HOME
+        run: echo "HADOOP_HOME=$GITHUB_WORKSPACE/.hadoop/hadoop-3.3.6" >> "$GITHUB_ENV"
+
       # The packaged dist intentionally omits the (stale) log/ dir to stay small.
       # flink-daemon.sh writes its .out to $FLINK_HOME/log and aborts the daemon
       # if the dir is missing ("No such file or directory") — which silently
