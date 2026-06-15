@@ -1,6 +1,34 @@
 # 8c/32g 3-backend NexMark sweep — verified time + accuracy (2026-06-08)
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ★★★★ PMC-1 UNIFORM-SPLIT q0-q22 SWEEP 2026-06-15 (process.size=10240m fit)
+# ═══════════════════════════════════════════════════════════════════════════
+# Population: M2 = Mac (Darwin, arm64 container, jemalloc OFF, io_uring no-op),
+# THIS box, 2026-06-15. SAME machine A/B for the process.size regression check.
+# Topology: UNIFORM 2×4c/16g SPLIT for EVERY query incl. q9 (NO 36g single-TM
+# special case) — the whole point of commit efdc5997a (process.size 12288m→10240m
+# carves ~2 GiB of the 16g cgroup back for the engine's native/jemalloc state so
+# q9 KV-sep ON fits the split). forst-rs arm = the established "validate" full-
+# stack-ON lever set per query (KV-sep+coalesce+S2+bloom+leveled-hot+persistent-
+# iter for join family; merge-RMW+routing-adaptive for windowed). EVENTS_NUM=100M
+# TPS=10M. Each backend its OWN backend+timer. 3 backends BACK-TO-BACK per query.
+#
+# ★ HEADLINE: q9 KV-sep ON **FITS the uniform 16g split** — FINISHED, out_rows
+#   EXACT (91,813,372), NO OOM. wall 1285.5s (FASTER than the commit's 36g single-
+#   TM 1463.3s AND the legacy Mac 2349.3s). The 10240m carve-out is validated.
+#
+# | query | forst-rs (M2) wall_s | out_rows | rocksdb wall_s | out_rows | forst wall_s | out_rows | beat-both verdict |
+# |---|---|---|---|---|---|---|---|
+# | q9 | 1285.5 | 91,813,372 ✓ | (running) | — | (running) | — | (pending baselines) |
+#
+# (table filled incrementally below as the sweep records each RESULT)
+#
+# ── process.size=10240m REGRESSION CHECK (vs prior 12288m, same machine) ──
+# q9: 10240m is REQUIRED for the fit (12288m OOM'd the split). For non-q9 queries
+# the check is each query's M2 wall vs the prior recorded forst-rs wall — flagged
+# below per query. (results appended as runs complete)
+#
+# ═══════════════════════════════════════════════════════════════════════════
 # ★★★ CURRENT STATUS 2026-06-12 — REMOTE-x86 IS THE BINDING POPULATION
 # ═══════════════════════════════════════════════════════════════════════════
 NexMark runs on the remote Linux box ONLY (yq01, x86_64, NVMe /ssd2, docker
