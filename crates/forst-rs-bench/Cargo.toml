@@ -106,6 +106,12 @@ harness = false
 name = "join_probe_open"
 harness = false
 
+# APPROACH-1 (2026-06-15 omnipotent rethink §4.1): persistent seekable probe
+# iterator — read-amp (q7 win) + memory-additive (q9 fix) mini-bench.
+[[bench]]
+name = "persistent_probe_iter"
+harness = false
+
 # B1 (2026-06-12 local FFI/flush/compaction bench design): boundary-tax
 # bench over the real frs_* FFI entry points vs engine-direct equivalents.
 [[bench]]

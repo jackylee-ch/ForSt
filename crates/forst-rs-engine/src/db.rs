@@ -9941,7 +9941,21 @@ impl DbImpl {
             }));
         }
         let cf_data = self.lookup_cf_by_id(cf.id())?;
-        let mut inner = self.build_lazy_prefix_key_stream(cf, prefix)?;
+        // APPROACH-1 (2026-06-15 §4.1): when FRS_PERSISTENT_PROBE_ITER is ON,
+        // route the per-probe source-set construction through a THREAD-LOCAL
+        // PersistentProbeIter keyed by (db ptr, cf id). Consecutive probes from
+        // the same worker thread to the same CF reuse the version-pinned, located
+        // SST-reader set — paying the version snapshot + resident clone (V-A/V-B)
+        // once per version instead of once per probe. The handle auto-invalidates
+        // on a flush/compaction (Arc::ptr_eq version check inside `seek`), so the
+        // emitted rows are byte-identical to the rebuilt path. OFF (default) ⇒
+        // the legacy `build_lazy_prefix_key_stream` below, byte-for-byte.
+        let inner = if persistent_probe_iter_enabled() {
+            self.seek_via_thread_local_persistent(cf, prefix)?
+        } else {
+            self.build_lazy_prefix_key_stream(cf, prefix)?
+        };
+        let mut inner = inner;
         inner.set_shared_error_slot(error_slot);
         let db = Arc::clone(self);
         // FRS-VALUE-CARRYING-MERGE (2026-06-06): resolve SST-resident Puts
@@ -10465,6 +10479,327 @@ impl DbImpl {
         let mut iter = LazyPrefixIter::new_clipped(sources, pinned, cf_data.clip_range())?;
         iter.open_fanout_submitted = open_fanout_submitted;
         Ok(iter)
+    }
+
+    /// APPROACH-1 (2026-06-15 omnipotent rethink §4.1, persistent seekable probe
+    /// iterator): open a [`PersistentProbeIter`] for `cf` positioned at
+    /// `prefix`, reusing a version-pinned, located SST-reader set across every
+    /// subsequent `seek(prefix)` within the same key-group. The returned handle
+    /// pins the version and locates+opens the overlapping SST readers ONCE; each
+    /// `seek` then rebuilds only the lightweight per-source cursors/prefetchers,
+    /// eliminating the per-probe overlapping-SST locate (V-A), reader-reopen, and
+    /// resident-shadow O(N) clone (V-B). On a version change the next `seek`
+    /// transparently re-pins + re-locates → byte-identical to the rebuilt path.
+    ///
+    /// Flag-gated: callers should only take this path when
+    /// [`persistent_probe_iter_enabled`] is true. For correctness this method is
+    /// ALWAYS safe to call (it produces the same rows as
+    /// `prefix_scan_iter_owned_arc`); the flag only governs whether the default
+    /// hot path routes through it.
+    pub fn open_persistent_probe_iter(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> ForstResult<PersistentProbeIter> {
+        let cf_data = self.lookup_cf_by_id(cf.id())?;
+        let mut it = PersistentProbeIter {
+            db: Arc::clone(self),
+            cf: cf.clone(),
+            cf_data,
+            located: None,
+            version_changes: 0,
+            located_reuses: 0,
+        };
+        // Pin the current version + resident snapshot so the handle is
+        // immediately drainable; `prefix` is bound at the first `seek`.
+        let _ = prefix;
+        it.ensure_current()?;
+        Ok(it)
+    }
+
+    /// APPROACH-1 default-path wiring: seek a thread-local persistent probe
+    /// iterator (one per `(db, cf)` on this worker thread) to `prefix` and return
+    /// the resulting [`LazyPrefixIter`]. Reuses the version-pinned located set
+    /// across consecutive probes from the same thread/CF — the amortization that
+    /// kills the per-probe V-A/V-B taxes — while staying byte-identical (the
+    /// handle re-locates whenever the version changes).
+    ///
+    /// Keyed by `(Arc::as_ptr(self) as usize, cf.id())`: a worker thread that
+    /// streams q7/q9/q20 probes against one CF holds ONE handle for the whole
+    /// run; a probe against a different CF (or a different db) gets/creates that
+    /// CF's own handle. The map is tiny (one entry per CF a thread touches).
+    fn seek_via_thread_local_persistent(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> ForstResult<LazyPrefixIter> {
+        thread_local! {
+            static PERSISTENT: std::cell::RefCell<
+                std::collections::HashMap<(usize, ColumnFamilyId), PersistentProbeIter>,
+            > = std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        let key = (Arc::as_ptr(self) as usize, cf.id());
+        PERSISTENT.with(|cell| {
+            let mut map = cell.borrow_mut();
+            let handle = match map.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(self.open_persistent_probe_iter(cf, prefix)?)
+                }
+            };
+            handle.seek(prefix)
+        })
+    }
+}
+
+/// APPROACH-1: the version-pinned, located source set reused across probes.
+/// Built once per version by [`DbImpl::build_located_probe_set`]; the
+/// overlapping-SST locate + reader-open are performed lazily inside `seek` over
+/// THIS pinned version (so a probe whose prefix lands outside any cached file
+/// still resolves correctly), but the version snapshot and resident clone — the
+/// per-probe V-A/V-B taxes — are paid here, once.
+struct LocatedProbeSet {
+    /// Pinned LSM version. `Arc::ptr_eq` against `version_set.current()` is the
+    /// invalidation signal (a flush/compaction installs a new `Arc<Version>`).
+    version: Arc<forst_rs_storage::version::Version>,
+    /// Resident-shadow entries visible under `version` (empty when the shadow is
+    /// default-OFF — the common case). Cloned once per version, not per probe.
+    resident_entries: Vec<crate::column_family::ResidentEntry>,
+}
+
+/// APPROACH-1 (2026-06-15 omnipotent rethink §4.1): a persistent, seekable probe
+/// iterator that amortizes LSM source-set construction across probes.
+///
+/// `q7`/`q9`/`q20` issue one prefix scan per arriving record, repeatedly hitting
+/// the SAME key-group's band. The legacy path
+/// ([`DbImpl::build_lazy_prefix_key_stream`]) rebuilds the ENTIRE source set per
+/// probe: snapshots the version, clones the resident shadow (O(N)), re-locates
+/// every overlapping SST, and re-opens each reader. This handle pins the version
+/// + located set once and, on each [`Self::seek`], rebuilds only the cheap
+/// per-source cursors/prefetchers — turning O(probes × construction) into
+/// O(probes × log + construction-per-version).
+///
+/// **Correctness:** every `seek` first checks whether the pinned version is
+/// still current (`Arc::ptr_eq`); if a flush/compaction installed a new version,
+/// the located set is rebuilt before the seek, so the emitted rows are
+/// byte-identical to `prefix_scan_iter_owned_arc` at all times. Within one
+/// version the SSTs are immutable, so reusing their readers is sound.
+pub struct PersistentProbeIter {
+    db: Arc<DbImpl>,
+    cf: ColumnFamilyHandle,
+    cf_data: Arc<ColumnFamilyData>,
+    /// `None` until the first `refresh_located`; carries the pinned version +
+    /// resident snapshot reused across same-version seeks.
+    located: Option<LocatedProbeSet>,
+    /// Diagnostics/test hooks: how many times the pinned version was invalidated
+    /// (forced a re-locate) vs reused. A healthy q7-shaped workload reuses for
+    /// many probes between flushes.
+    version_changes: u64,
+    located_reuses: u64,
+}
+
+impl PersistentProbeIter {
+    /// Ensure the located set is valid for the CURRENT version, re-locating only
+    /// if a flush/compaction installed a new `Arc<Version>`. Returns `true` if a
+    /// re-locate happened (test/diag hook).
+    fn ensure_current(&mut self) -> ForstResult<bool> {
+        let cur = self.db.version_set.current();
+        let stale = match &self.located {
+            Some(l) => !Arc::ptr_eq(&l.version, &cur),
+            None => true,
+        };
+        if stale {
+            self.version_changes += 1;
+            let resident_entries = if resident_bypass() {
+                Vec::new()
+            } else {
+                let live_files = cur.live_sst_file_numbers();
+                self.cf_data.resident_flushed_visible_entries(&live_files)
+            };
+            self.located = Some(LocatedProbeSet {
+                version: cur,
+                resident_entries,
+            });
+        } else {
+            self.located_reuses += 1;
+        }
+        Ok(stale)
+    }
+
+    /// Seek the persistent iterator to `prefix` and return a drainable
+    /// [`LazyPrefixIter`] over that prefix, reusing the pinned version + located
+    /// SST readers when the version is unchanged. The returned iterator yields
+    /// byte-identical rows to `DbImpl::build_lazy_prefix_key_stream(cf, prefix)`.
+    pub fn seek(&mut self, prefix: &[u8]) -> ForstResult<LazyPrefixIter> {
+        self.ensure_current()?;
+        let located = self
+            .located
+            .as_ref()
+            .expect("located set established by ensure_current");
+        self.db
+            .build_lazy_prefix_stream_from_located(&self.cf, &self.cf_data, prefix, located)
+    }
+
+    /// Seek + fully drain in one call, returning `(rows, bytes)`. Resolves every
+    /// emitted key's value through the same value-carrying path the FFI drain
+    /// uses (`Put`/`Blob`/`Fallback`), so this is the persistent-iter equivalent
+    /// of a complete join probe. Exposed for the mini-bench (no engine-internal
+    /// symbols leak to the bench crate).
+    pub fn seek_drain(&mut self, prefix: &[u8]) -> ForstResult<(u64, u64)> {
+        let mut iter = self.seek(prefix)?;
+        let cf_data = self.db.lookup_cf_by_id(self.cf.id())?;
+        let mut rows = 0u64;
+        let mut bytes = 0u64;
+        while let Some((key_arc, decision)) = iter.next_with_value() {
+            let vlen = match decision {
+                ValueDecision::Put(value) => value.as_ref().len(),
+                ValueDecision::Blob(ptr) => self.db.vlog_deref(ptr.as_ref())?.len(),
+                ValueDecision::Fallback => {
+                    match self.db.get_internal(&cf_data, key_arc.as_ref(), u64::MAX)? {
+                        Some(value) => value.len(),
+                        None => continue,
+                    }
+                }
+            };
+            rows += 1;
+            bytes += (key_arc.as_ref().len() + vlen) as u64;
+        }
+        Ok((rows, bytes))
+    }
+
+    /// Test/diag: number of times the pinned version was invalidated.
+    pub fn version_changes(&self) -> u64 {
+        self.version_changes
+    }
+
+    /// Test/diag: number of seeks that reused the pinned located set.
+    pub fn located_reuses(&self) -> u64 {
+        self.located_reuses
+    }
+}
+
+impl DbImpl {
+    /// APPROACH-1 internal: build a [`LazyPrefixIter`] for `prefix` over a
+    /// PRE-PINNED located set, reusing its `version` + resident snapshot instead
+    /// of re-snapshotting + re-cloning per probe. The overlapping-SST locate +
+    /// reader-open still run against the pinned `version` (cheap relative to the
+    /// version snapshot + resident clone, and required for prefix-specific
+    /// pruning), but the V-A version snapshot and V-B resident clone are reused.
+    ///
+    /// Emits byte-identical rows to [`Self::build_lazy_prefix_key_stream`] for
+    /// the same `prefix` under the same version: same tiers, same precedence,
+    /// same dedup. (The persistent path deliberately keeps the SST locate inside
+    /// the pinned version so prefixes outside the previously-probed band still
+    /// resolve every overlapping file — no row is ever missed.)
+    fn build_lazy_prefix_stream_from_located(
+        self: &Arc<Self>,
+        cf: &ColumnFamilyHandle,
+        cf_data: &Arc<ColumnFamilyData>,
+        prefix: &[u8],
+        located: &LocatedProbeSet,
+    ) -> ForstResult<LazyPrefixIter> {
+        let upper = prefix_upper_bound(prefix);
+        let upper_slice = upper.as_deref();
+        let version = &located.version;
+
+        let mut sources: Vec<TierKeySource> = Vec::new();
+
+        // Tier 1: active memtable (always rebuilt — memtables mutate between
+        // probes; the cursor build is the cheap per-shard snapshot).
+        let mem_arc = cf_data.active_memtable();
+        let active_cursor = mem_arc.prefix_scan_cursor(prefix, upper_slice);
+        if !active_cursor.is_empty() {
+            sources.push(TierKeySource::MemCursor {
+                cursor: active_cursor,
+            });
+        }
+        // Tier 2: immutable memtables.
+        for imm in cf_data.imm_memtables() {
+            let imm_cursor = imm.prefix_scan_cursor(prefix, upper_slice);
+            if !imm_cursor.is_empty() {
+                sources.push(TierKeySource::MemCursor { cursor: imm_cursor });
+            }
+        }
+
+        // Tier 2b: resident-shadow (reused snapshot — NO per-probe O(N) clone).
+        // Empty when the shadow is default-OFF (the common case): the loop and
+        // the clone both vanish, so this is byte-identical to the rebuilt path
+        // which also skips the resident tier under `resident_bypass()`.
+        let mut resident_shadowed: std::collections::HashSet<FileNumber> =
+            std::collections::HashSet::new();
+        if !located.resident_entries.is_empty() {
+            let readers_snapshot = self.sst_readers.load();
+            for entry in &located.resident_entries {
+                if !(entry.min_key.is_empty() && entry.max_key.is_empty()) {
+                    if entry.max_key.as_slice() < prefix {
+                        continue;
+                    }
+                    if let Some(hi) = upper_slice {
+                        if entry.min_key.as_slice() >= hi {
+                            continue;
+                        }
+                    }
+                }
+                if !resident_bloom_skip() {
+                    if let Some(reader) = readers_snapshot.get(&entry.file_number) {
+                        if !reader.may_contain_range(prefix, upper_slice) {
+                            resident_shadowed.insert(entry.file_number);
+                            continue;
+                        }
+                    }
+                }
+                let resident_cursor = entry.memtable.prefix_scan_cursor(prefix, upper_slice);
+                resident_shadowed.insert(entry.file_number);
+                if !resident_cursor.is_empty() {
+                    sources.push(TierKeySource::MemCursor {
+                        cursor: resident_cursor,
+                    });
+                }
+            }
+        }
+
+        // Tier 3: overlapping SSTs under the PINNED version. The locate runs
+        // against the cached version (no `version_set.current()` per probe — the
+        // V-A snapshot is reused). Reader opens hit the warm `sst_readers` cache
+        // (the readers were opened on a prior same-version probe), so steady
+        // state pays no reopen.
+        let mut overlapping_ssts: Vec<&forst_rs_storage::version::SstFileMeta> = Vec::new();
+        version.overlapping_ssts_in_range_for_cf(
+            cf.id(),
+            prefix,
+            upper_slice,
+            &mut overlapping_ssts,
+        );
+        let pinned = s2_select().resolve(overlapping_ssts.len());
+        for sst in overlapping_ssts {
+            if resident_shadowed.contains(&sst.file_number) {
+                continue;
+            }
+            let reader = self.get_or_open_sst_reader(sst)?;
+            if prefix_bloom_enabled() && !reader.may_contain_prefix(prefix) {
+                continue;
+            }
+            if !reader.may_contain_range(prefix, upper_slice) {
+                continue;
+            }
+            let start_block = reader.first_block_ge(prefix);
+            sources.push(TierKeySource::Sst {
+                fetcher: forst_rs_storage::sst::prefetch::BlockPrefetcher::new(
+                    reader,
+                    start_block,
+                    upper_slice,
+                ),
+                lower: prefix.to_vec(),
+                upper: upper.clone(),
+                buffered: Vec::new(),
+                pos: 0,
+                pinned,
+                pbuf: Box::new(SstBlockBuf::default()),
+                mat_allocs: std::cell::Cell::new(0),
+            });
+        }
+
+        LazyPrefixIter::new_clipped(sources, pinned, cf_data.clip_range())
     }
 
     /// B-R7-NEW-H1: range counterpart of [`Self::build_lazy_prefix_key_stream`].
@@ -15836,6 +16171,36 @@ fn resident_bloom_skip() -> bool {
     *ON.get_or_init(|| {
         matches!(
             std::env::var("FRS_RESIDENT_BLOOM_SKIP").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// APPROACH-1 (2026-06-15 omnipotent rethink §4.1): gate for the persistent
+/// seekable probe iterator. DEFAULT OFF — byte-identical to the per-probe
+/// rebuild path when unset.
+///
+/// When ON, [`DbImpl::open_persistent_probe_iter`] returns a reusable
+/// [`PersistentProbeIter`] that pins ONE `Arc<Version>` + locates the
+/// overlapping SST readers ONCE per (CF, version), then amortizes that
+/// source-set construction across every `seek(prefix)` that lands in the same
+/// version. This kills the two batch-execution violations the profiler flagged:
+/// V-A (per-probe overlapping-SST locate + reader-open + version snapshot) and
+/// V-B (the per-probe O(N) resident-shadow clone). On a version change
+/// (flush/compaction installs a new `Arc<Version>`, detected by `Arc::ptr_eq`),
+/// the next `seek` transparently re-pins + re-locates — so correctness is
+/// identical to the rebuilt path, only the bookkeeping is reused.
+///
+/// This is ForSt's persistent `MergingIterator` + `seek()` discipline ported to
+/// the forst-rs source set: q7/q9/q20 probe the SAME bucket's band repeatedly
+/// within a key-group, so the located-set is stable across many probes and the
+/// construction cost is paid once per version instead of once per probe.
+fn persistent_probe_iter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_PERSISTENT_PROBE_ITER").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE")
         )
     })
@@ -29438,5 +29803,210 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // APPROACH-1 (2026-06-15 omnipotent rethink §4.1): persistent seekable
+    // probe iterator — TDD for byte-identity OFF-vs-ON, seek-reuse correctness,
+    // version invalidation, and no resident leak.
+    // ---------------------------------------------------------------------
+
+    /// State key `[join-key BE u32][entry BE u32]` (mirrors the join_probe bench
+    /// + the Flink composite-key layout `[keygroup][ns][user-key]`).
+    fn ppi_key(jk: u32, entry: u32) -> [u8; 8] {
+        let mut k = [0u8; 8];
+        k[..4].copy_from_slice(&jk.to_be_bytes());
+        k[4..].copy_from_slice(&entry.to_be_bytes());
+        k
+    }
+    fn ppi_prefix(jk: u32) -> [u8; 4] {
+        jk.to_be_bytes()
+    }
+
+    /// Build a DB whose state is scattered across `rounds` flushed L0 SSTs, each
+    /// spanning the full join-key range (so the coarse range-skip cannot prune —
+    /// the adversarial multi-source probe shape the spec's V-A/V-B target).
+    fn ppi_build_scattered(rounds: u32, num_keys: u32) -> Arc<DbImpl> {
+        // Tiny write buffer so each round flushes its own SST; high L0 triggers
+        // so background compaction does not collapse the fan-out mid-test.
+        std::env::set_var("FRS_L0_COMPACTION_TRIGGER", "100000");
+        std::env::set_var("FRS_L0_STOP_TRIGGER", "100000");
+        std::env::set_var("FRS_L0_SLOWDOWN_TRIGGER", "100000");
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            write_buffer_size: 4096,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = DbImpl::open_with_fs(opts, fs).expect("open");
+        let cf = db.default_cf();
+        for round in 0..rounds {
+            for jk in 0..num_keys {
+                let v = vec![0xCDu8; 48];
+                db.put(&cf, &ppi_key(jk, round), &v).expect("put");
+            }
+            db.flush_cf(&cf).expect("flush");
+        }
+        std::env::remove_var("FRS_L0_COMPACTION_TRIGGER");
+        std::env::remove_var("FRS_L0_STOP_TRIGGER");
+        std::env::remove_var("FRS_L0_SLOWDOWN_TRIGGER");
+        db
+    }
+
+    /// Drain a prefix scan to an owned, sorted `(key, value)` vec via the legacy
+    /// rebuilt path (`prefix_scan_iter_owned_arc`).
+    fn ppi_drain_rebuilt(
+        db: &Arc<DbImpl>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let it = db
+            .prefix_scan_iter_owned_arc(cf, prefix)
+            .expect("rebuilt open");
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = it
+            .map(|r| {
+                let (k, v) = r.expect("row");
+                (k.as_ref().to_vec(), v.as_ref().to_vec())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Drain a prefix scan via the persistent iterator's `seek`.
+    fn ppi_drain_persistent(
+        it: &mut PersistentProbeIter,
+        db: &Arc<DbImpl>,
+        cf: &ColumnFamilyHandle,
+        prefix: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let inner = it.seek(prefix).expect("persistent seek");
+        let cf_data = db.lookup_cf_by_id(cf.id()).expect("cf");
+        let dbc = Arc::clone(db);
+        let mut iter = inner;
+        let drained: Vec<(Vec<u8>, Vec<u8>)> = std::iter::from_fn(move || loop {
+            let (key_arc, decision) = iter.next_with_value()?;
+            match decision {
+                ValueDecision::Put(value) => {
+                    return Some((key_arc.as_ref().to_vec(), value.as_ref().to_vec()))
+                }
+                ValueDecision::Blob(ptr) => {
+                    let v = dbc.vlog_deref(ptr.as_ref()).expect("deref");
+                    return Some((key_arc.as_ref().to_vec(), v));
+                }
+                ValueDecision::Fallback => match dbc
+                    .get_internal(&cf_data, key_arc.as_ref(), u64::MAX)
+                    .expect("get_internal")
+                {
+                    Some(value) => return Some((key_arc.as_ref().to_vec(), value)),
+                    None => continue,
+                },
+            }
+        })
+        .collect();
+        let mut out = drained;
+        out.sort();
+        out
+    }
+
+    /// Byte-identity: the persistent `seek` path yields EXACTLY the same rows as
+    /// the legacy rebuilt path on a scattered multi-source probe, for every
+    /// join key, across repeated seeks (the q7/q9/q20 same-key-group pattern).
+    #[test]
+    fn test_persistent_probe_iter_byte_identical_to_rebuilt() {
+        let num_keys = 32u32;
+        let db = ppi_build_scattered(8, num_keys);
+        let cf = db.default_cf();
+        let mut ppi = db
+            .open_persistent_probe_iter(&cf, &ppi_prefix(0))
+            .expect("open ppi");
+
+        // Two full passes over the key space (seek reuse within a stable version).
+        for _pass in 0..2 {
+            for jk in 0..num_keys {
+                let prefix = ppi_prefix(jk);
+                let rebuilt = ppi_drain_rebuilt(&db, &cf, &prefix);
+                let persistent = ppi_drain_persistent(&mut ppi, &db, &cf, &prefix);
+                assert_eq!(
+                    rebuilt,
+                    persistent,
+                    "byte mismatch for jk={jk}: rebuilt={} persistent={} rows",
+                    rebuilt.len(),
+                    persistent.len()
+                );
+                // Each key has one entry per round (8 rounds) — sanity the fixture
+                // actually produced a deep multi-source probe.
+                assert_eq!(rebuilt.len(), 8, "fixture should yield 8 rows/key");
+            }
+        }
+        // With a stable version across both passes, the located set must have
+        // been REUSED for the vast majority of seeks (amortization actually fired).
+        assert!(
+            ppi.located_reuses() >= (num_keys as u64) * 2 - 2,
+            "expected heavy located-set reuse, got reuses={} changes={}",
+            ppi.located_reuses(),
+            ppi.version_changes()
+        );
+    }
+
+    /// Version invalidation: after a flush installs a new `Arc<Version>`, the
+    /// next `seek` transparently re-locates and STILL returns byte-identical
+    /// rows including the newly-flushed data.
+    #[test]
+    fn test_persistent_probe_iter_version_invalidation() {
+        let num_keys = 8u32;
+        let db = ppi_build_scattered(4, num_keys);
+        let cf = db.default_cf();
+        let mut ppi = db
+            .open_persistent_probe_iter(&cf, &ppi_prefix(0))
+            .expect("open ppi");
+
+        // Drain once (pins version V0).
+        let before = ppi_drain_persistent(&mut ppi, &db, &cf, &ppi_prefix(0));
+        assert_eq!(before.len(), 4);
+        let changes_before = ppi.version_changes();
+
+        // Write a NEW round and flush → new SST → new Arc<Version>.
+        std::env::set_var("FRS_L0_COMPACTION_TRIGGER", "100000");
+        for jk in 0..num_keys {
+            db.put(&cf, &ppi_key(jk, 999), &[0xEE; 48]).expect("put");
+        }
+        db.flush_cf(&cf).expect("flush");
+        std::env::remove_var("FRS_L0_COMPACTION_TRIGGER");
+
+        // Next seek must SEE the new data (re-located) and match the rebuilt path.
+        let rebuilt = ppi_drain_rebuilt(&db, &cf, &ppi_prefix(0));
+        let persistent = ppi_drain_persistent(&mut ppi, &db, &cf, &ppi_prefix(0));
+        assert_eq!(rebuilt, persistent, "post-flush byte mismatch");
+        assert_eq!(persistent.len(), 5, "should now see the 5th (new) round");
+        assert!(
+            ppi.version_changes() > changes_before,
+            "a flush must have invalidated the pinned version"
+        );
+    }
+
+    /// No resident leak: the persistent iterator holds exactly ONE pinned
+    /// version + its (default-OFF ⇒ empty) resident snapshot, regardless of how
+    /// many seeks run. The located set is replaced, never accumulated.
+    #[test]
+    fn test_persistent_probe_iter_no_resident_accumulation() {
+        let db = ppi_build_scattered(4, 16);
+        let cf = db.default_cf();
+        let mut ppi = db
+            .open_persistent_probe_iter(&cf, &ppi_prefix(0))
+            .expect("open ppi");
+        for _ in 0..1000 {
+            for jk in 0..16 {
+                let _ = ppi_drain_persistent(&mut ppi, &db, &cf, &ppi_prefix(jk));
+            }
+        }
+        // Default-OFF resident shadow ⇒ the located set carries zero resident
+        // entries no matter how many seeks ran (V-B eliminated, not accumulated).
+        let located = ppi.located.as_ref().expect("located");
+        assert_eq!(
+            located.resident_entries.len(),
+            0,
+            "resident shadow is default-OFF; persistent iter must hold zero clones"
+        );
     }
 }

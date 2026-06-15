@@ -123,7 +123,7 @@ pub use db::{
     set_vlog_gc_age_cutoff_override, set_vlog_resident_budget_mb_override, trivial_move_enabled,
     vlog_coalesce_deref_enabled, vlog_gc_adaptive_enabled, vlog_gc_age_cutoff_percent, DbImpl,
     FillOutcome, IncrementalCheckpointResult, LinkedCheckpointDiscard, LiveFileInfo,
-    PrefixScanStream, RowSink, DEFAULT_CF_NAME,
+    PersistentProbeIter, PrefixScanStream, RowSink, DEFAULT_CF_NAME,
 };
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};
