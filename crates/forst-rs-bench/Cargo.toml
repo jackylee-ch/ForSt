@@ -190,6 +190,16 @@ path = "src/bin/vlog_deref_fanout.rs"
 name = "nexmark_disagg_s3"
 path = "src/bin/nexmark_disagg_s3.rs"
 
+# FRS-PHASE2 COMBINED-STACK e2e validation: runs the FULL disagg relief stack ON
+# together (KV-sep + coalesce-deref + deref-fanout + reader-cache + rate-split +
+# async-flush + byte-budget + WAL-DELTA link-ckpt) through open_remote(file://)
+# under the FRS_REMOTE_BW_MBPS throttle, three arms (OFF / KV-sep substrate /
+# full-ON) each in its own process for OnceLock-faithful flags. Gates correctness
+# (byte-identical) + lever-interaction regression. Wall-clock; takes --smoke.
+[[bin]]
+name = "disagg_combined_stack"
+path = "src/bin/disagg_combined_stack.rs"
+
 # FRS-WA-V2a-2-LRU (q9 KV-sep OOM fix, 2026-06-14): resident vlog-reader
 # footprint, uncapped (pre-fix) vs bounded (cap=2048), over a wide live-segment
 # set. Shows the bound takes footprint from O(segments) to O(cap). Wall-clock
