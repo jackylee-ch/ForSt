@@ -341,6 +341,53 @@ pub fn set_vlog_coalesce_deref_override(v: Option<bool>) {
     );
 }
 
+/// FRS-VLOG-DEREF-FANOUT master flag for parallelizing the coalesced
+/// value-log deref's PER-SEGMENT reads (`FRS_VLOG_DEREF_FANOUT=1`, **DEFAULT
+/// OFF**). Design: `2026-06-15-vlog-deref-segment-fanout-design.md`.
+///
+/// `FRS_VLOG_COALESCE_DEREF` already groups a batch's deferred `BlobRef` derefs
+/// by `segment_id` and sorts each group by offset, so each segment is ONE ranged
+/// read. But [`DbImpl::coalesced_vlog_deref_into`] then walks those segments in a
+/// SERIAL `for` loop — on the disaggregated/remote path a batch spanning `M`
+/// segments pays `M x remote-RTT` back-to-back. When this flag is ON (AND the FS
+/// is remote AND `M >= 2`), the per-segment coalesced reads are submitted to the
+/// shared read-I/O pool and barriered, so the `M` segment GETs overlap (bounded
+/// by the pool width) instead of running serially. Byte-identical OUTPUT: each
+/// slot still receives exactly its pointer's value (slots are disjoint across
+/// segments); only the ORDER the `M` reads are issued in changes. Default OFF =>
+/// the serial loop, byte-for-byte. Read LIVE (test-toggle-able), once per
+/// coalesced batch (one env read off the hot path).
+fn vlog_deref_fanout_enabled() -> bool {
+    let ov = VLOG_DEREF_FANOUT_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    matches!(
+        std::env::var("FRS_VLOG_DEREF_FANOUT").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// FRS-VLOG-DEREF-FANOUT test override for [`vlog_deref_fanout_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static VLOG_DEREF_FANOUT_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-VLOG-DEREF-FANOUT: forces the per-segment deref fan-out on/off for
+/// tests/benches (`None` = defer to `FRS_VLOG_DEREF_FANOUT`).
+pub fn set_vlog_deref_fanout_override(v: Option<bool>) {
+    VLOG_DEREF_FANOUT_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// FRS-ACCUM-MERGE (Approach 2, 2026-06-15): the in-engine windowed-agg
 /// accumulator-merge capability gate (`FRS_ACCUM_MERGE=1`, **DEFAULT OFF**).
 ///
@@ -13856,20 +13903,123 @@ impl DbImpl {
                 .or_default()
                 .push((slot, ptr));
         }
-        for (segment_id, mut group) in by_segment {
-            // Sort by physical offset — the coalesce (chunk-cache HIT / one
-            // ranged read per segment).
+        // Each group is sorted by physical offset — the coalesce (chunk-cache
+        // HIT / one ranged read per segment). Sort here so BOTH the serial and
+        // the fan-out path below operate on offset-ordered groups (byte-identity).
+        for group in by_segment.values_mut() {
             group.sort_by_key(|(_, p)| p.offset);
-            let reader = self.get_or_open_vlog_reader(segment_id)?;
-            let ptr_refs: Vec<&forst_rs_storage::vlog::ValuePointer> =
-                group.iter().map(|(_, p)| p).collect();
-            let values = reader.get_coalesced(&ptr_refs)?;
-            debug_assert_eq!(values.len(), group.len());
-            for ((slot, _), value) in group.into_iter().zip(values) {
-                resolved[slot] = Some(Some(value));
+        }
+
+        // FRS-VLOG-DEREF-FANOUT: when ON + remote + M>=2 segments, fan the
+        // per-segment coalesced reads across the read-I/O pool so the M segment
+        // GETs overlap instead of running serially. Byte-identical OUTPUT (each
+        // disjoint slot still receives its own pointer's value); timing-only.
+        if vlog_deref_fanout_enabled() && !self.fs.is_local() && by_segment.len() >= 2 {
+            if let Some(weak) = self.self_weak.get().cloned() {
+                return self.coalesced_vlog_deref_fanout(by_segment, resolved, weak);
             }
+            // No self_weak (can't form 'static jobs) => fall through to serial.
+        }
+
+        for (segment_id, group) in by_segment {
+            self.deref_one_segment_into(segment_id, group, resolved)?;
         }
         Ok(())
+    }
+
+    /// FRS-VLOG-DEREF-FANOUT: resolve ONE segment's offset-sorted group and
+    /// scatter its values into `resolved`. The unit of work shared by the serial
+    /// loop and the fan-out collector (so both paths produce byte-identical
+    /// `resolved[slot]` assignments).
+    fn deref_one_segment_into(
+        &self,
+        segment_id: u64,
+        group: Vec<(usize, forst_rs_storage::vlog::ValuePointer)>,
+        resolved: &mut [Option<Option<Vec<u8>>>],
+    ) -> ForstResult<()> {
+        let reader = self.get_or_open_vlog_reader(segment_id)?;
+        let ptr_refs: Vec<&forst_rs_storage::vlog::ValuePointer> =
+            group.iter().map(|(_, p)| p).collect();
+        let values = reader.get_coalesced(&ptr_refs)?;
+        debug_assert_eq!(values.len(), group.len());
+        for ((slot, _), value) in group.into_iter().zip(values) {
+            resolved[slot] = Some(Some(value));
+        }
+        Ok(())
+    }
+
+    /// FRS-VLOG-DEREF-FANOUT: the parallel sibling of the serial segment loop in
+    /// [`Self::coalesced_vlog_deref_into`]. Submits one job per segment to the
+    /// shared read-I/O pool — each job opens its reader and runs `get_coalesced`,
+    /// returning `(slot, value)` pairs (or the first error) through an `mpsc`
+    /// channel — barriers on all jobs, then scatters the results into `resolved`.
+    /// The M segment round-trips overlap (bounded by the pool width); the
+    /// scattered assignment is identical to the serial path because the slots are
+    /// disjoint across segments. First error wins (matches the serial `?`).
+    fn coalesced_vlog_deref_fanout(
+        &self,
+        by_segment: std::collections::HashMap<
+            u64,
+            Vec<(usize, forst_rs_storage::vlog::ValuePointer)>,
+        >,
+        resolved: &mut [Option<Option<Vec<u8>>>],
+        weak: Weak<DbImpl>,
+    ) -> ForstResult<()> {
+        // Per-segment job result: the offset-ordered (slot, value) pairs, or the
+        // segment's error. Sent back over the channel; the receiver scatters.
+        type SegResult = ForstResult<Vec<(usize, Vec<u8>)>>;
+        let (tx, rx) = std::sync::mpsc::channel::<SegResult>();
+        let total = by_segment.len();
+        let mut jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::with_capacity(total);
+        for (segment_id, group) in by_segment {
+            let weak = weak.clone();
+            let tx = tx.clone();
+            jobs.push(Box::new(move || {
+                let res: SegResult = (|| {
+                    let db = weak
+                        .upgrade()
+                        .ok_or_else(|| ForstError::corruption("db dropped during vlog deref"))?;
+                    let reader = db.get_or_open_vlog_reader(segment_id)?;
+                    let ptr_refs: Vec<&forst_rs_storage::vlog::ValuePointer> =
+                        group.iter().map(|(_, p)| p).collect();
+                    let values = reader.get_coalesced(&ptr_refs)?;
+                    debug_assert_eq!(values.len(), group.len());
+                    Ok(group
+                        .into_iter()
+                        .map(|(slot, _)| slot)
+                        .zip(values)
+                        .collect())
+                })();
+                // Send is best-effort; the barrier below counts completions even
+                // if the receiver was dropped (cancellation).
+                let _ = tx.send(res);
+            }));
+        }
+        // Drop our extra sender so the channel closes once all jobs finish.
+        drop(tx);
+        // Barrier: prime_opens_concurrent submits + joins all jobs (panic-safe).
+        forst_rs_storage::sst::prime_opens_concurrent(jobs);
+        // Scatter results; first error wins (serial-path `?` parity).
+        let mut first_err: Option<ForstError> = None;
+        for _ in 0..total {
+            match rx.recv() {
+                Ok(Ok(pairs)) => {
+                    for (slot, value) in pairs {
+                        resolved[slot] = Some(Some(value));
+                    }
+                }
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                Err(_) => break, // channel closed early (a job dropped its sender)
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// FRS-VLOG-COALESCE: finalize a `batch_get_vectorized` result vector at a
@@ -19145,6 +19295,162 @@ mod tests {
 
         set_vlog_coalesce_deref_override(None);
         set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-DEREF-FANOUT (2026-06-15): the per-segment deref fan-out must be
+    /// BYTE-IDENTICAL to the serial coalesce path (it only parallelizes the
+    /// segment GETs). Built on a REMOTE-reporting FS (so the fan-out's
+    /// `!is_local()` guard engages) with KV-sep ON + LARGE values spanning
+    /// MULTIPLE vlog segments (so `M >= 2` and the fan-out actually fires), this
+    /// asserts the coalesced `batch_get` with the fan-out forced ON equals the
+    /// coalesced result with it forced OFF AND the per-key `get` oracle, over a
+    /// scattered (join-probe-shaped) key order with interleaved misses.
+    #[test]
+    fn test_vlog_deref_fanout_byte_identical_kvsep_remote() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        // The coalesce must be ON for the fan-out to have a deferred set to
+        // parallelize (fan-out is a child of the coalesce path).
+        set_vlog_coalesce_deref_override(Some(true));
+
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 200;
+        // THREE flushes ⇒ ≥3 vlog segments so M >= 2 reliably (the fan-out only
+        // engages at M >= 2). On the REMOTE-reporting FS the open + ranged read
+        // per segment is the round-trip the fan-out overlaps.
+        let build = || -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<(Vec<u8>, Vec<u8>)>) {
+            let opts = EngineOptions {
+                db_path: "/db".to_string(),
+                write_buffer_size: 2_000_000_000,
+                max_write_buffer_number: 8,
+                ..EngineOptions::default()
+            };
+            let fs: Arc<dyn FileSystem> = Arc::new(RemoteFakeFs::new());
+            let db = DbImpl::open_with_fs(opts, fs).expect("open remote-fake");
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("deref-fanout"))
+                .unwrap();
+            let mut kv: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N);
+            // Wave 0: all keys, large incompressible values (separate to seg 0).
+            for i in 0..N as u32 {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x1000 + i as u64, 256 + (i as usize % 64));
+                db.put(&cf, &k, &v).unwrap();
+                kv.push((k, v));
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 0");
+            // Wave 1: overwrite every 2nd key → seg 1.
+            for i in (0..N as u32).step_by(2) {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x5000 + i as u64, 256 + (i as usize % 48));
+                db.put(&cf, &k, &v).unwrap();
+                kv[i as usize].1 = v;
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 1");
+            // Wave 2: overwrite every 3rd key → seg 2.
+            for i in (0..N as u32).step_by(3) {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x9000 + i as u64, 256 + (i as usize % 32));
+                db.put(&cf, &k, &v).unwrap();
+                kv[i as usize].1 = v;
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 2");
+            assert!(
+                db.version_set.current().vlog_segments.len() >= 2,
+                "need >= 2 vlog segments to exercise the fan-out (got {})",
+                db.version_set.current().vlog_segments.len()
+            );
+            (db, cf, kv)
+        };
+
+        // Scattered read order with interleaved genuine misses.
+        let scattered_keys = |kv: &[(Vec<u8>, Vec<u8>)]| -> Vec<Vec<u8>> {
+            let mut order: Vec<usize> = (0..kv.len()).collect();
+            let mut s: u64 = 0xD1B54A32D192ED03;
+            for i in (1..order.len()).rev() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let j = (s as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            let mut out = Vec::with_capacity(order.len() + order.len() / 8);
+            for (n, &i) in order.iter().enumerate() {
+                if n % 7 == 2 {
+                    out.push(format!("absent{n:05}").into_bytes());
+                }
+                out.push(kv[i].0.clone());
+            }
+            out
+        };
+
+        // Arm 1: fan-out forced OFF (serial coalesce) = the baseline.
+        set_vlog_deref_fanout_override(Some(false));
+        let (db_off, cf_off, kv) = build();
+        let keys = scattered_keys(&kv);
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let off = db_off
+            .batch_get_vectorized(&cf_off, &key_refs, u64::MAX)
+            .unwrap();
+
+        // Arm 2: fan-out forced ON on a FRESH (deterministic) build.
+        set_vlog_deref_fanout_override(Some(true));
+        let (db_on, cf_on, kv2) = build();
+        assert_eq!(kv, kv2, "build must be deterministic across arms");
+        let keys2 = scattered_keys(&kv2);
+        assert_eq!(keys, keys2);
+        let key_refs2: Vec<&[u8]> = keys2.iter().map(|k| k.as_slice()).collect();
+        let on = db_on
+            .batch_get_vectorized(&cf_on, &key_refs2, u64::MAX)
+            .unwrap();
+
+        // (a) ON == OFF, value-for-value (the byte-identity gate).
+        assert_eq!(on.len(), off.len());
+        assert_eq!(
+            on, off,
+            "vlog-deref fan-out must be byte-identical to the serial coalesce"
+        );
+
+        // (b) Each present key got its CORRECT latest value; misses are None —
+        //     also the per-key `get` oracle (a third independent path).
+        let want: std::collections::HashMap<Vec<u8>, Vec<u8>> = kv.iter().cloned().collect();
+        for (k, got) in keys.iter().zip(on.iter()) {
+            match want.get(k) {
+                Some(v) => {
+                    assert_eq!(got.as_deref(), Some(v.as_slice()), "wrong value for a key");
+                    let oracle = db_on.get(&cf_on, k).unwrap();
+                    assert_eq!(oracle.as_deref(), Some(v.as_slice()), "get oracle mismatch");
+                }
+                None => assert_eq!(got, &None, "absent key must miss"),
+            }
+        }
+
+        set_vlog_deref_fanout_override(None);
+        set_vlog_coalesce_deref_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-DEREF-FANOUT: the gate defaults OFF and the override flips it
+    /// deterministically (without racing the env read).
+    #[test]
+    fn test_vlog_deref_fanout_flag_default_off_and_override() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_vlog_deref_fanout_override(Some(false));
+        assert!(!vlog_deref_fanout_enabled(), "forced-off must read false");
+        set_vlog_deref_fanout_override(Some(true));
+        assert!(vlog_deref_fanout_enabled(), "forced-on must read true");
+        set_vlog_deref_fanout_override(None);
     }
 
     /// FRS-ACCUM-MERGE (Approach 2): the gate defaults OFF and the override

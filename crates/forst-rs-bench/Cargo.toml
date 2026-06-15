@@ -162,6 +162,15 @@ path = "src/bin/remote_compaction_offload.rs"
 name = "scan_cold_start"
 path = "src/bin/scan_cold_start.rs"
 
+# FRS-VLOG-DEREF-FANOUT (Phase-2 cycle 4): coalesced vlog-deref SEGMENT fan-out
+# cost model — serial per-segment loop vs concurrent through the read-I/O pool
+# (FRS_VLOG_DEREF_FANOUT). Models per-segment ranged-read RTT; quantifies the
+# cross-segment deref latency the fan-out removes. Wall-clock bin; takes --smoke
+# for CI (caps RTT, asserts the win holds at M>=4).
+[[bin]]
+name = "vlog_deref_fanout"
+path = "src/bin/vlog_deref_fanout.rs"
+
 # FRS-PHASE2 NEXMARK-shaped disagg validation: drives q5/q7/q9-q20/q4 query-
 # shaped state workloads through the full disaggregated path on fs-emulation,
 # disagg-ON vs disagg-OFF, with a correctness gate + S3 bandwidth projection.
