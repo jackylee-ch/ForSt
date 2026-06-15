@@ -629,6 +629,19 @@ fn vlog_scan_readahead_launched() -> u64 {
     VLOG_SCAN_READAHEAD_LAUNCHED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// FRS-COMPACT-INPUT-WARM diag: total next-job input-reader opens fired
+/// fire-and-forget onto the read-I/O pool to overlap their cold-start latency
+/// with the current merge+upload. Bumped once per warmed input file. Proves the
+/// set-point engaged (the mini-bench / unit test read it).
+static COMPACT_INPUT_WARM_FIRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// FRS-COMPACT-INPUT-WARM diag: total inputs warmed (the private
+/// `COMPACT_INPUT_WARM_FIRED` counter). Test/bench-only — proves engagement.
+pub fn compact_input_warm_fired() -> u64 {
+    COMPACT_INPUT_WARM_FIRED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// FRS-VLOG-DEREF-FANOUT master flag for parallelizing the coalesced
 /// value-log deref's PER-SEGMENT reads (`FRS_VLOG_DEREF_FANOUT=1`, **DEFAULT
 /// OFF**). Design: `2026-06-15-vlog-deref-segment-fanout-design.md`.
@@ -14693,6 +14706,79 @@ impl DbImpl {
         self.sst_readers.store(std::sync::Arc::new(HashMap::new()));
     }
 
+    /// FRS-COMPACT-INPUT-WARM (Phase-2 cycle 9): hide the NEXT compaction job's
+    /// input-reader cold-start latency behind the CURRENT job's merge+upload.
+    ///
+    /// Called from `run_compaction` BEFORE the (long) L0 rollup merge runs. It
+    /// PREDICTS the L1 drain that will follow — using the current Version's
+    /// `pick_compaction_level_for_cf` + the shared `SortedRunPolicy` descent pick
+    /// (both pure metadata over cached footers, no I/O, no engine write locks) —
+    /// and for each predicted input file NOT already reader-cached, FIRE-AND-
+    /// FORGET submits its `get_or_open_sst_reader` (footer + sparse-index
+    /// `GetObject`) onto the shared read-I/O pool. The drain job then opens
+    /// against a warm reader cache (or one already in flight on the pool), so the
+    /// remote input-download latency overlaps the current merge+upload rather
+    /// than running serially after it — the write-path analogue of depth-D read
+    /// readahead.
+    ///
+    /// Correctness-safe: `get_or_open_sst_reader` is idempotent + cache-keyed
+    /// (double-checked RCU insert), so a warm-up racing the real open is harmless
+    /// (the loser's reader is dropped). The prediction may be wrong (a racing
+    /// flush/compaction shifts the post-L0 pick) — warming an unused file only
+    /// leaves an evictable reader cached. A `Weak<Self>` is captured so a DB
+    /// teardown mid-flight makes the pool job a benign no-op. Default OFF; the
+    /// helper is only called when `compact_input_warm_on()`.
+    fn warm_next_compaction_inputs(self: &Arc<Self>, cf_data: &Arc<ColumnFamilyData>) {
+        let cf_id = cf_data.handle().id();
+        let version = self.version_set.current();
+        // Predict the level the post-L0 drain will descend (pure metadata).
+        let Some(level) = self.pick_compaction_level_for_cf(cf_id) else {
+            return;
+        };
+        // The L0 rollup itself is the current job — only PRE-warm a deeper
+        // descent (level >= 1), never re-warm L0 inputs the caller is about to
+        // open synchronously anyway.
+        if level == 0 {
+            return;
+        }
+        let readers = self.sst_readers.load();
+        let tombstones = |fnum: FileNumber| -> u64 {
+            readers
+                .get(&fnum)
+                .map(|r| r.footer().tombstone_count)
+                .unwrap_or(0)
+        };
+        let ctx = self.policy_ctx(&readers, cf_data.compaction_filter().is_some(), &tombstones);
+        let plan = match crate::compaction_policy::SortedRunPolicy
+            .pick_level_descent(&version, cf_id, level, &ctx)
+        {
+            Some(crate::compaction_policy::CompactionDecision::Merge(plan)) => plan,
+            // TrivialMove ⇒ no rewrite, no input read to hide; None ⇒ nothing due.
+            _ => return,
+        };
+        // Collect the input file metas NOT already reader-cached (a warm reader
+        // needs no pool job). `readers` is the live snapshot loaded above.
+        let cold: Vec<SstFileMeta> = plan
+            .inputs
+            .iter()
+            .filter(|(_, m)| !readers.contains_key(&m.file_number))
+            .map(|(_, m)| m.clone())
+            .collect();
+        drop(readers);
+        for meta in cold {
+            let weak = Arc::downgrade(self);
+            COMPACT_INPUT_WARM_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            forst_rs_storage::sst::submit_read_job(Box::new(move || {
+                // DB torn down mid-flight ⇒ benign no-op. A warm-up open error is
+                // swallowed: the real `get_or_open_sst_reader` on the drain path
+                // re-runs it and surfaces any genuine fault there.
+                if let Some(db) = weak.upgrade() {
+                    let _ = db.get_or_open_sst_reader(&meta);
+                }
+            }));
+        }
+    }
+
     fn get_or_open_sst_reader(&self, meta: &SstFileMeta) -> ForstResult<Arc<SstReaderImpl>> {
         {
             let cache = self.sst_readers.load();
@@ -15750,6 +15836,16 @@ impl FlushExecutor for DbImpl {
         // imm list and return `Ok(None)`, so we treat that as a no-op.
         // (FRS-WAMP ingested-bytes accounting lives inside flush_cf_data so it
         // captures every flush path, not just this one.)
+        // FRS-UPLOAD-FLUSH-QOS (Item B, cycle 8→9): declare this worker's uploads
+        // as FLUSH class for the whole flush body, so each `close_writer` it drives
+        // is eligible for the RESERVED flush lane (`FRS_UPLOAD_FLUSH_RESERVED>0`) —
+        // its memtable-rotation-gating L0 upload then takes an always-available slot
+        // instead of queueing behind compaction on the shared budget. BYTE- AND
+        // BEHAVIOUR-IDENTICAL when the reserved lane is OFF (default 0 permits):
+        // the flush-lane `try_acquire` always fails and the upload falls back to the
+        // shared lane exactly as the default Compaction class would. The guard
+        // restores the thread's prior class on drop (incl. panic / early return).
+        let _upload_class = forst_rs_io::opendal_backend::ThreadUploadClassGuard::flush();
         // FRS_PROF_DIAG: attribute flush wall-time + bytes (gap-map dim 3, flush ms/MB).
         let _flush_t0 = std::time::Instant::now();
         let _flushed = self.flush_cf_data(cf_data)?;
@@ -15842,6 +15938,18 @@ impl CompactionExecutor for DbImpl {
         // compaction tuning is negative-return here; the next lever is the
         // read-side B_resident tier, not more compaction).
         let _comp_t0 = std::time::Instant::now(); // FRS_PROF_DIAG: compaction wall-time (dim 4)
+                                                  // FRS-COMPACT-INPUT-WARM (cycle 9, default OFF): fire the predicted L1
+                                                  // drain's input-reader opens onto the read-I/O pool BEFORE the L0 merge,
+                                                  // so the drain's remote input-download latency overlaps this merge+upload
+                                                  // instead of running serially after it. Correctness-safe + byte-identical
+                                                  // (warm-up is fire-and-forget cache priming; see
+                                                  // `warm_next_compaction_inputs`). Needs an `Arc<Self>` for the `Weak`
+                                                  // capture — available via `self_weak`.
+        if compact_input_warm_on() && drain_l1_on() && !cf_data.is_dropped() {
+            if let Some(this) = self.self_weak.get().and_then(Weak::upgrade) {
+                this.warm_next_compaction_inputs(cf_data);
+            }
+        }
         let r = self.compact_l0_for_cf(cf_data);
         // FRS-COMPACT-DRAIN-L1 (2026-06-05, DEFAULT ON; opt out =0): after the
         // L0→L1 rollup, if L1 has grown past its size budget, do ONE bounded
@@ -16035,6 +16143,35 @@ fn compact_diag_on() -> bool {
     *ON.get_or_init(|| {
         matches!(
             std::env::var("FRS_COMPACT_DIAG").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-COMPACT-INPUT-WARM (Phase-2 cycle 9, default OFF; ON with
+/// `FRS_COMPACT_INPUT_WARM=1`). The WRITE-side analogue of the depth-D read
+/// readahead: a remote compaction today is serial `open inputs (footer +
+/// sparse-index GET) → merge → upload`, so the NEXT job's input-reader cold
+/// start (one remote `GetObject` per input for its footer/index) is paid on the
+/// critical path AFTER the current merge+upload finished. When ON,
+/// [`DbImpl::warm_next_compaction_inputs`] PREDICTS the following L1 drain's
+/// inputs from the current Version (pure metadata) and fires their
+/// `get_or_open_sst_reader` opens — and each reader's `for_compaction` first
+/// window submits at construction, see `prefetch.rs` — onto the shared read-I/O
+/// pool FIRE-AND-FORGET, so the drain's input-download latency overlaps the
+/// current L0 merge+upload instead of running serially after it.
+///
+/// Correctness-safe + byte-identical: `get_or_open_sst_reader` is cache-keyed by
+/// file number with a double-checked RCU insert, so a warm-up open races a later
+/// real open harmlessly (the loser's reader is dropped); warming a file the
+/// post-L0 pick does not end up using only leaves an evictable reader in the
+/// cache. OFF ⇒ the helper is never called and the path is unchanged.
+fn compact_input_warm_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_COMPACT_INPUT_WARM").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE")
         )
     })
@@ -22992,6 +23129,132 @@ mod tests {
             );
             assert_eq!(v.as_slice(), val(i).as_bytes(), "scan value wrong at {i}");
         }
+    }
+
+    /// FRS-COMPACT-INPUT-WARM (Phase-2 cycle 9): the write-path input warm-up
+    /// SET-POINT ENGAGES. With an L1 over budget (a level descent is due),
+    /// `warm_next_compaction_inputs` must (a) bump the
+    /// [`compact_input_warm_fired`] counter once per predicted-cold input, and
+    /// (b) actually populate the `sst_readers` cache for those inputs (proving
+    /// the fire-and-forget pool opens ran), so the later real descent opens
+    /// against a WARM reader cache instead of paying the cold-start remote
+    /// footer/index `GetObject` on the critical path. Also asserts the no-op
+    /// arms: no warm-up when nothing is due, and zero double-counting when the
+    /// inputs are already reader-cached.
+    #[test]
+    fn test_compact_input_warm_engages_and_warms_readers() {
+        // Build a multi-file L1 over budget (same recipe as the split test):
+        // tiny target_file_size_base splits L0→L1 into many SSTs, and the small
+        // level base puts L1 over budget so a descent is due.
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            target_file_size_base: 4096,
+            block_size: 512,
+            max_bytes_for_level_base: 4096,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = DbImpl::open_with_fs(opts, fs).expect("open");
+        // Pin the legacy fixed-target layout (rollup→L1, shallowest-over-budget
+        // pick) so the L1-over-base descent is deterministic — the warm-up
+        // mechanism is layout-agnostic; this test only needs a due descent.
+        db.force_fixed_levels();
+        let cf = db.default_cf();
+
+        const N: usize = 2000;
+        let val = |i: usize| format!("value-{i:06}-paddingpaddingpaddingpadding");
+        let key = |i: usize| format!("key{i:06}");
+        for i in 0..N {
+            db.put(&cf, key(i).as_bytes(), val(i).as_bytes()).unwrap();
+        }
+        db.force_switch_memtable(&cf).unwrap();
+        db.flush_cf(&cf).unwrap();
+        db.compact_l0(&cf).unwrap();
+
+        let cf_id = cf.id();
+        // Precondition: a level descent (>=1) must be due, else the warm-up has
+        // nothing to predict and the test would vacuously pass.
+        let level = db
+            .pick_compaction_level_for_cf(cf_id)
+            .expect("a level descent must be due for the warm-up to predict");
+        assert!(
+            level >= 1,
+            "predicted descent level must be >= 1, got {level}"
+        );
+
+        // Compute the exact inputs the descent will pick (the same prediction the
+        // warm-up makes) so we can assert those readers become cached.
+        let predicted: Vec<FileNumber> = {
+            let version = db.version_set.current();
+            let readers = db.sst_readers.load();
+            let tomb = |fnum: FileNumber| -> u64 {
+                readers
+                    .get(&fnum)
+                    .map(|r| r.footer().tombstone_count)
+                    .unwrap_or(0)
+            };
+            let ctx = db.policy_ctx(&readers, false, &tomb);
+            match crate::compaction_policy::SortedRunPolicy
+                .pick_level_descent(&version, cf_id, level, &ctx)
+            {
+                Some(crate::compaction_policy::CompactionDecision::Merge(plan)) => {
+                    plan.inputs.iter().map(|(_, m)| m.file_number).collect()
+                }
+                other => panic!("expected a Merge descent, got {other:?}"),
+            }
+        };
+        assert!(!predicted.is_empty(), "descent must have inputs");
+
+        // COLD start: evict the reader cache so the predicted inputs are not
+        // resident — this is the remote-cold-start regime the warm-up targets.
+        db.evict_all_sst_readers();
+        for fnum in &predicted {
+            assert!(
+                !db.sst_readers.load().contains_key(fnum),
+                "precondition: input {} must be reader-cold",
+                fnum.value()
+            );
+        }
+
+        // ENGAGE: fire the warm-up. The counter must bump once per cold input.
+        let cf_data = db.lookup_cf_by_id(cf_id).expect("cf_data");
+        let fired_before = compact_input_warm_fired();
+        db.warm_next_compaction_inputs(&cf_data);
+        let fired = compact_input_warm_fired() - fired_before;
+        assert_eq!(
+            fired as usize,
+            predicted.len(),
+            "warm-up must fire one fire-and-forget open per cold predicted input"
+        );
+
+        // The pool opens are async; poll briefly until every predicted input is
+        // reader-cached (the warm-up's whole point — readers warm off the
+        // critical path). A bounded spin keeps the unit test deterministic.
+        let warmed = || {
+            predicted
+                .iter()
+                .all(|f| db.sst_readers.load().contains_key(f))
+        };
+        let mut spins = 0;
+        while !warmed() && spins < 2000 {
+            std::thread::yield_now();
+            spins += 1;
+        }
+        assert!(
+            warmed(),
+            "warm-up must populate the reader cache for every predicted input \
+             (the latency-hiding effect)"
+        );
+
+        // No double-counting: a SECOND warm-up with the inputs now cached fires
+        // ZERO pool jobs (the `contains_key` filter skips warm readers).
+        let fired_warm = compact_input_warm_fired();
+        db.warm_next_compaction_inputs(&cf_data);
+        assert_eq!(
+            compact_input_warm_fired(),
+            fired_warm,
+            "warm-up must not re-fire opens for already-cached inputs"
+        );
     }
 
     #[test]
