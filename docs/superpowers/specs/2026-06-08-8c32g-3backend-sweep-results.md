@@ -23,6 +23,7 @@
 # | q9 | 1285.5 | 91,813,372 ✓ | 1057.4 | 91,813,372 ✓ | 1982.0 | 91,813,372 ✓ | PASS (vs RDB 1.22× ≤1.25 bar; BEATS ForSt 1.54×; rows EXACT all 3) |
 # | q12 | 43.6 | 92,000,000 ✓ | 39.6 | 92,000,000 ✓ | 43.9 | 92,000,000 ✓ | PASS both (RDB 1.10×; BEATS ForSt by 0.3s); rows EXACT |
 # | q17 | 333.7 | 92,000,000 ✓ | 73.9 | 92,000,000 ✓ | 275.4 | 92,000,000 ✓ | ⚠ FAIL BOTH (RDB 4.52×; ForSt 1.21×) — routing-adaptive lever PATHOLOGICAL (see negative below) |
+# | q11 | 219.9 | 92,000,000 ✓ | 107.0 | 92,000,000 ✓ | 133.1 | 92,000,000 ✓ | FAIL both (RDB 2.06×; ForSt 1.65×) — read-path gap; merge-RMW IMPROVED frs −45s vs prior 264.8 (no procsize regression) |
 #
 # ⚠⚠ q17 HONEST NEGATIVE: forst-rs under the validate full-stack-ON profile
 #   (FRS_RS_EXECUTOR=routing-adaptive) ran 333.7s — 4.52× SLOWER than RocksDB
