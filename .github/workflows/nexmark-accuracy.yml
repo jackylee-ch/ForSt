@@ -318,6 +318,21 @@ jobs:
 
       - name: Generate fixed CSV (deterministic, JDK17 datagen)
         run: JDK17="$JDK17" bash scripts/accuracy-gate/gen-fixed-csv.sh 2>&1 | tee /tmp/gen.log
+
+      - name: Dump Flink logs if gen did not reach GEN OK (diagnostics)
+        if: always()
+        run: |
+          if ! grep -q "GEN OK" /tmp/gen.log; then
+            echo "===== sql-gateway daemon log ====="
+            tail -n 200 "$FLINK_HOME"/log/*sql-gateway*.log 2>/dev/null || echo "(no sql-gateway log)"
+            echo "===== jobmanager (standalonesession) log ====="
+            tail -n 120 "$FLINK_HOME"/log/*standalonesession*.log 2>/dev/null || echo "(no JM log)"
+            echo "===== taskexecutor log ====="
+            tail -n 80 "$FLINK_HOME"/log/*taskexecutor*.log 2>/dev/null || echo "(no TM log)"
+            echo "===== log dir listing ====="
+            ls -la "$FLINK_HOME"/log 2>/dev/null || true
+          fi
+
       - name: Verify CSV generated
         run: grep -q "GEN OK" /tmp/gen.log
 
