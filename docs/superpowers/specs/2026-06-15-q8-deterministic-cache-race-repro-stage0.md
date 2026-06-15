@@ -1,6 +1,7 @@
 # Stage-0 — q8 cache-corruption race: DETERMINISTIC repro + root cause + residual assessment
 
-**Date:** 2026-06-15 · **Status:** repro SHIPPED (test-only, main); residual op-mix race still OPEN
+**Date:** 2026-06-15 · **Status:** cache-race repro SHIPPED (prior cycle); **residual op-mix race
+DETERMINISTICALLY REPRODUCED + root-caused this cycle** (seam + test on `readside-r2a`)
 **Repo:** flink-statebackend-forst-rs (test-only, JDK 25 module)
 **Context:** Stage-0 of the two-regime executor design
 (`2026-06-11-two-regime-executor-design.md` §4) is the BLOCKING gate for Approach-3
@@ -97,8 +98,99 @@ That seam is the next concrete deliverable; it is a multi-component change (exec
   -Pforst-rs-jdk25 test -Dtest=MapStateCacheConcurrentCorruptionTest
   -Dforstrs.native.tests.skip=false -o` (module is JDK-25-gated; pure-Java test, no native lib).
 
-## 6. Next-cycle candidate
+## 6. Residual op-mix race — SEAM BUILT + DETERMINISTIC REPRO + ROOT CAUSE (2026-06-15 cycle)
 
-The residual op-mix race (executor-boundary seam, §4) is the real Stage-0 long-pole. If it again
-proves intractable in a single timeboxed cycle, the parallel pivot is the q20 Top-N lever — see
-`2026-06-15-q20-topn-residual-wall-design.md` (this cycle's pivot deliverable).
+The §4 plan was executed. All artifacts are on the Flink fork branch `readside-r2a`.
+
+### 6.1 The pause-point seam (test-only, zero production effect)
+
+`BatchDrainPausePoint` (`flink-statebackend-forst-rs/.../forstrs/BatchDrainPausePoint.java`) — a
+package-private static hook invoked exactly once per batch from
+`VectorizedExecutor.executeBatchRequests` immediately BEFORE the batch's writes are applied to the
+engine (the precise in-flight window where a worker's queued LIST_ADD / PUT / DELETE is dispatched
+but not yet engine-visible). Default `hook == null` ⇒ a single volatile-read + null-check no-op on
+the production hot path; no allocation, no lock, no behavioral change. A public test bridge
+(`TestPausePointAccess`) lets tests in other packages arm/disarm it. This is the §4 "package-private
+pause-point latch lifted one layer into the executor", and it is the cross-thread analogue of the
+prior cycle's `CyclicBarrier` cache-race seam.
+
+### 6.2 The deterministic repro
+
+`Q8OpMixBoundaryRaceTest` (exec package, 2 tests, 5/5 deterministic, full module suite 592/0):
+
+- `blockingRoutingOrdersWriteBeforeRead_control` (CONTROL) — under blocking `routing`,
+  `executeBatchRequests` blocks the mailbox until the LIST_ADD has drained to the engine, so the
+  fire-path GET reads-its-writes byte-exact. Proves correctness is the executor-mode property, not
+  the op logic.
+- `routingAsyncFirePathReadMissesQueuedWrite_repro` (REPRO) — under non-blocking `routing-async`:
+  (1) the mailbox dispatches a LIST_ADD; the non-blocking executor returns an INCOMPLETE future and
+  the worker parks at the production pause-point (write queued, not yet applied); (2) the window
+  timer fires on the MAILBOX under overdraft and issues a same-key GET via the REAL
+  `VectorizedExecutor.executeRequestSync` (real classifier + real `executeGets` decode) on a route
+  that does NOT funnel behind the parked worker write; (3) the GET deterministically observes the
+  list as **EMPTY** — the dropped window-join row. A post-drain read then sees the value, proving
+  the data was read TOO EARLY (a serialization/ordering violation), not lost.
+
+  Only the FFI leaves are stubbed (an in-memory key→bytes engine over the
+  `invokeVectorizedBatch*`/`invokeVecMergeAppendBatch` seams — the established seam-override test
+  pattern) plus the single production pause-point barrier. The reproduced under-read IS the
+  production mechanism.
+
+### 6.3 Root cause (file:line)
+
+The residual q8 under-emit is a **read-your-writes violation across the mailbox→worker boundary**,
+and it is structural to the non-blocking executor, NOT the cache and NOT the staging buffers:
+
+1. The event-time fire runs as a non-record under SERIAL_BETWEEN_EPOCH
+   (`AbstractAsyncStateStreamOperatorV2.java:372` → `EpochManager.onNonRecord:124` →
+   `drainInflightRecords(0):134`). The epoch drain is sound *when* every preceding write's
+   `inFlightRecordNum` decrement (`AsyncExecutionController.disposeContext:279`) happens-after the
+   engine write — which holds because the per-row future is completed on the worker thread AFTER
+   the FFI write (`VectorizedExecutor.completePut`, ~line 647, after
+   `flushOffHeapListBuffersIfDirty`/`dispatchAppendMerge` at ~594).
+2. The hazard is the timer fire's read itself: `InternalTimerServiceAsyncImpl.maintainContextAndProcess:134`
+   issues the trigger via `syncPointRequestWithCallback(runnable, allowOverdraft=TRUE):141`.
+   **Under overdraft `seizeCapacity` does NOT drain** (`AsyncExecutionController.java:384-407`). Any
+   state op the trigger issues on a route that bypasses the owning key-group worker FIFO — a
+   mailbox-direct engine op (the documented `MapStateArrowBuffer` watermark/snapshot drain and
+   Reducing/Aggregating RMW mailbox flush; `ForStRsMapStateV2.java:140-142`; or a sync read that
+   jumps the FIFO) — can run while that key-group's LIST_ADD is still queued/in-flight on the
+   worker, reading the pre-write state. That is the −77% dropped rows.
+
+The single-worker FIFO (`RoutingStateExecutor` kg-affine routing) DOES order same-kg async ops, so
+the race only manifests for fire-path effects that take a **non-FIFO / mailbox-direct route** — which
+is exactly why it is timing-dependent and rare at workers=1 (the ledger's `✓ / ✓ / −77%`), and why
+the staging-buffer env-gates reduced but never eliminated it.
+
+### 6.4 The fix — DESIGNED (next cycle), not shipped (timeboxed honestly)
+
+The fix is the two-regime design's invariant 3 made real: **no fire-path effect may bypass the
+key-group worker FIFO while that FIFO has queued/in-flight work.** Two coherent options:
+
+- **(A) Route ALL fire-path engine ops through the kg worker FIFO** (drop every mailbox-direct
+  drain under the non-blocking executor; the off-heap MapState/RMW buffers are already env-gated OFF
+  there — extend that to the sync/overdraft read path so the timer GET enqueues on the kg FIFO TAIL,
+  behind the queued LIST_ADD). Read-your-writes then holds by FIFO construction, the property the
+  blocking `routing` mode already has. The seam + repro become the regression gate.
+- **(B) Make the overdraft fire-path drain its key-group first**: before a timer trigger runs its
+  reads, drain the owning kg worker FIFO (a targeted, per-kg `drainInflightRecords` analogue) so the
+  queued writes are applied. Narrower than option A but needs a kg-scoped drain primitive on
+  `RoutingStateExecutor`.
+
+Option A is preferred (simpler, no new drain primitive, byte-identical to the proven blocking mode).
+It is flag-gated to the non-blocking executor path and is byte-identical under blocking/inline modes
+by construction. The fix is the next concrete deliverable; the deterministic repro + root cause make
+it tractable and verifiable without NexMark.
+
+### 6.5 Approach-3 unblock status
+
+Approach-3 (coordination-free / non-blocking executor) is **now UNBLOCKABLE**: the residual is no
+longer an OPEN mystery — it is a precisely root-caused, deterministically reproduced FIFO-bypass on
+the fire path, with a flag-gated fix designed and a permanent regression gate (the seam + repro) in
+place. Shipping Approach-3 requires implementing §6.4 option A and re-running the q8/q17 NexMark
+canaries; no further investigation is needed.
+
+## 7. Prior next-cycle candidate (superseded by §6)
+
+If §6.4 had proven intractable, the parallel pivot was the q20 Top-N lever
+(`2026-06-15-q20-topn-residual-wall-design.md`). §6 supersedes it — the op-mix race is now cracked.
