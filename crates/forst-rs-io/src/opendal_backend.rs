@@ -479,6 +479,23 @@ fn upload_sem_total_permits() -> usize {
     }
 }
 
+/// FRS-UPLOAD-FLUSH-QOS: build the `(shared, flush)` semaphore pair for a new
+/// filesystem. The TOTAL budget ([`upload_sem_total_permits`]) is unchanged; the
+/// reserved flush lane ([`upload_flush_reserved_permits`]) is CARVED OUT of it, so
+/// the shared lane gets `total - reserved`. When the lever is OFF (reserved `0`,
+/// the default) the shared lane is the full budget and the flush lane is empty (and
+/// never consulted) → byte-AND-behaviour-identical to the prior single-semaphore
+/// path.
+fn build_upload_semaphores() -> (Arc<Semaphore>, Arc<Semaphore>) {
+    let total = upload_sem_total_permits();
+    let reserved = upload_flush_reserved_permits();
+    let shared = total.saturating_sub(reserved);
+    (
+        Arc::new(Semaphore::new(shared)),
+        Arc::new(Semaphore::new(reserved)),
+    )
+}
+
 /// Permits one upload of `nbytes` must reserve from `upload_sem`.
 ///
 /// Count regime (default) → always `1` (byte-identical). Byte regime →
@@ -487,6 +504,123 @@ fn upload_permits_for(nbytes: u64) -> u32 {
     match upload_byte_budget_mib() {
         None => 1,
         Some(mib) => byte_budget_permits_for(nbytes, mib),
+    }
+}
+
+/// FRS-UPLOAD-FLUSH-QOS (Phase-2 cycle 8): the size of the RESERVED flush lane —
+/// in-flight upload permits that ONLY flush-class uploads may take
+/// (`FRS_UPLOAD_FLUSH_RESERVED`, in the SAME unit as the budget: count permits in
+/// the count regime, MiB permits in the byte regime). **Default `0` ⇒ OFF**, the
+/// single class-blind `upload_sem` — byte-AND-behaviour-identical to the prior
+/// path.
+///
+/// # Why a reserved lane
+///
+/// The shared `upload_sem` is CLASS-BLIND: flush-output (L0 SST) and
+/// compaction-output (L1+ SST) uploads compete for the same budget. Flush is
+/// LATENCY-critical (its in-flight permit gates memtable rotation /
+/// WriteBufferManager reclaim → ingest stall under `FRS_ASYNC_FLUSH_UPLOAD`),
+/// while compaction is THROUGHPUT/background. A burst of large compaction uploads
+/// can occupy the whole budget and STARVE flush — the mini-bench
+/// (`upload_flush_qos`) measured a flush-acquire p99 of ~2.3 s behind saturating
+/// compaction at a throttled endpoint. Carving `reserved` permits into a flush-only
+/// lane guarantees flush an always-available slot (acquire p99 → ~0) while leaving
+/// `budget - reserved` shared, so compaction stays work-conserving (its rate is
+/// retained to ~`(budget-reserved)/budget`). Clamped so the shared lane keeps at
+/// least one permit. Resolved once per process.
+fn upload_flush_reserved_permits() -> usize {
+    let ov = UPLOAD_FLUSH_RESERVED_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let requested = if ov != u32::MAX {
+        ov as usize
+    } else {
+        use std::sync::OnceLock;
+        static V: OnceLock<usize> = OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var(UPLOAD_FLUSH_RESERVED_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    };
+    // The shared lane must keep >= 1 permit (else compaction can deadlock when the
+    // whole budget is the flush lane). Clamp the reserved lane to budget - 1.
+    let total = upload_sem_total_permits();
+    requested.min(total.saturating_sub(1))
+}
+
+/// FRS-UPLOAD-FLUSH-QOS env knob (default OFF / `0`): the number of in-flight
+/// upload permits reserved as a flush-only lane (carved from the total budget).
+/// `0` ⇒ the class-blind single-semaphore path (byte-identical). See the
+/// `upload_flush_reserved_permits` resolver for the clamp + sizing rules.
+pub const UPLOAD_FLUSH_RESERVED_ENV: &str = "FRS_UPLOAD_FLUSH_RESERVED";
+
+/// FRS-UPLOAD-FLUSH-QOS test/bench override for [`upload_flush_reserved_permits`]:
+/// `u32::MAX` (sentinel) = env/default; any other value = forced reserved count.
+static UPLOAD_FLUSH_RESERVED_OVERRIDE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Forces the reserved flush-lane size for tests/benches (`None` = defer to
+/// [`UPLOAD_FLUSH_RESERVED_ENV`]).
+pub fn set_upload_flush_reserved_override(v: Option<usize>) {
+    UPLOAD_FLUSH_RESERVED_OVERRIDE.store(
+        match v {
+            None => u32::MAX,
+            Some(n) => (n as u32).min(u32::MAX - 1),
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-UPLOAD-FLUSH-QOS: the class of the upload the CURRENT thread is producing.
+/// `close_writer` reads this to pick the acquire lane. Defaults to
+/// [`UploadClass::Compaction`] (the safe, shared-lane class) so any thread that
+/// has NOT explicitly declared itself a flush thread uses the shared budget
+/// exactly as before. The engine flush worker sets [`UploadClass::Flush`] via
+/// [`ThreadUploadClassGuard`] around its flush body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UploadClass {
+    /// Latency-critical flush output (L0) — may take the reserved flush lane.
+    Flush,
+    /// Background compaction output (L1+) — shared lane only.
+    Compaction,
+}
+
+thread_local! {
+    static THREAD_UPLOAD_CLASS: std::cell::Cell<UploadClass> =
+        const { std::cell::Cell::new(UploadClass::Compaction) };
+}
+
+/// The current thread's [`UploadClass`] (default [`UploadClass::Compaction`]).
+fn thread_upload_class() -> UploadClass {
+    THREAD_UPLOAD_CLASS.with(|c| c.get())
+}
+
+/// RAII guard that sets the current thread's [`UploadClass`] for its lifetime and
+/// restores the previous class on drop. The engine flush worker wraps its flush
+/// body in `ThreadUploadClassGuard::flush()` so every `close_writer` it drives is
+/// classified as flush (and thus eligible for the reserved lane); compaction
+/// threads leave the default. Exception-safe (restores on unwind).
+pub struct ThreadUploadClassGuard {
+    prev: UploadClass,
+}
+
+impl ThreadUploadClassGuard {
+    /// Mark the current thread as producing FLUSH uploads until the guard drops.
+    pub fn flush() -> Self {
+        Self::set(UploadClass::Flush)
+    }
+
+    /// Mark the current thread as producing the given class until the guard drops.
+    pub fn set(class: UploadClass) -> Self {
+        let prev = THREAD_UPLOAD_CLASS.with(|c| c.replace(class));
+        Self { prev }
+    }
+}
+
+impl Drop for ThreadUploadClassGuard {
+    fn drop(&mut self) {
+        let prev = self.prev;
+        THREAD_UPLOAD_CLASS.with(|c| c.set(prev));
     }
 }
 
@@ -499,8 +633,14 @@ pub struct OpendalFileSystem {
     /// its spawned upload, and consulted by `await_upload`/`await_all_uploads`.
     pending: PendingUploads,
     /// 2026-05-29 WRITE-BACK FLUSH: backpressure semaphore limiting concurrent
-    /// in-flight buffered uploads to [`MAX_INFLIGHT_UPLOADS`].
+    /// in-flight buffered uploads — the SHARED lane (either class may take it),
+    /// sized to `total - reserved` permits.
     upload_sem: Arc<Semaphore>,
+    /// FRS-UPLOAD-FLUSH-QOS (cycle 8): the RESERVED flush lane —
+    /// [`upload_flush_reserved_permits`] permits that ONLY flush-class uploads may
+    /// take. Sized to `0` when the lever is OFF (default), in which case it is
+    /// never consulted and the shared lane is the full budget (byte-identical).
+    flush_sem: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for OpendalFileSystem {
@@ -612,12 +752,14 @@ impl OpendalFileSystem {
         // multiplicative behaviour is the actual semantics, and the
         // wording here now matches.
         let op = op.layer(default_retry_layer());
+        let (upload_sem, flush_sem) = build_upload_semaphores();
         Ok(Self {
             op,
             rt,
             name,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            upload_sem: Arc::new(Semaphore::new(upload_sem_total_permits())),
+            upload_sem,
+            flush_sem,
         })
     }
 
@@ -631,12 +773,14 @@ impl OpendalFileSystem {
     pub fn with_operator_no_retry(op: Operator) -> ForstResult<Self> {
         let rt = RuntimeHandle::acquire()?;
         let name = format!("OpendalFileSystem({})", op.info().scheme().into_static());
+        let (upload_sem, flush_sem) = build_upload_semaphores();
         Ok(Self {
             op,
             rt,
             name,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            upload_sem: Arc::new(Semaphore::new(upload_sem_total_permits())),
+            upload_sem,
+            flush_sem,
         })
     }
 
@@ -1198,8 +1342,14 @@ pub struct OpendalWritableFile {
     /// can later block on it. `None` for blocking/append paths (synchronous).
     pending: Option<PendingUploads>,
     /// 2026-05-29 WRITE-BACK FLUSH: backpressure semaphore (clone of the
-    /// backend's). The spawned upload acquires a permit before touching S3.
+    /// backend's SHARED lane). The spawned upload acquires a permit before touching
+    /// S3.
     upload_sem: Option<Arc<Semaphore>>,
+    /// FRS-UPLOAD-FLUSH-QOS (cycle 8): clone of the backend's RESERVED flush lane.
+    /// A flush-class `close_writer` prefers a permit here (an always-available slot
+    /// that compaction cannot take) before falling back to the shared lane. `None`
+    /// on non-upload paths; the empty (0-permit) lane when the lever is OFF.
+    flush_sem: Option<Arc<Semaphore>>,
     /// FRS-FADVISE (2026-06-08): absolute on-disk path, set ONLY when this file is
     /// backed by the local `fs` opendal service. On close we `fsync` + `posix_fadvise
     /// (POSIX_FADV_DONTNEED)` it so its pages leave the OS page cache — bounding the
@@ -1330,6 +1480,11 @@ impl OpendalWritableFile {
                         (Some(pending), Some(sem)) => {
                             let op = op.clone();
                             let sem = sem.clone();
+                            // FRS-UPLOAD-FLUSH-QOS: the reserved flush lane (empty
+                            // when the lever is OFF). A flush-class upload prefers a
+                            // permit here before queueing on the shared lane.
+                            let flush_sem = self.flush_sem.clone();
+                            let upload_class = thread_upload_class();
                             let path_for_task = p.clone();
                             // FRS-ASYNC-FLUSH-UPLOAD (flag-gated, default OFF): acquire the
                             // in-flight permit SYNCHRONOUSLY on this (flush) thread BEFORE
@@ -1349,18 +1504,38 @@ impl OpendalWritableFile {
                             let permits = upload_permits_for(expected);
                             let prefetched_permit: Option<tokio::sync::OwnedSemaphorePermit> =
                                 if async_flush_upload_backpressure() {
-                                    match self
-                                        .handle
-                                        .block_on(sem.clone().acquire_many_owned(permits))
-                                    {
-                                        Ok(permit) => Some(permit),
-                                        Err(e) => {
-                                            return Err(ForstError::Io(std::io::Error::other(
-                                                format!(
-                                                    "OpenDAL upload semaphore closed: {p}: {e}"
-                                                ),
-                                            )));
+                                    // FRS-UPLOAD-FLUSH-QOS: a FLUSH-class upload first
+                                    // tries the reserved flush lane WITHOUT blocking
+                                    // (`try_acquire_many_owned`). If it gets the
+                                    // permits there, compaction saturating the shared
+                                    // lane never delayed it (the win). Otherwise — and
+                                    // for every COMPACTION-class upload — fall back to
+                                    // blocking on the shared lane, exactly as before.
+                                    // When the lever is OFF the flush lane has 0
+                                    // permits, so `try_acquire` always fails and every
+                                    // upload blocks on the shared (full-budget) lane:
+                                    // byte-AND-behaviour-identical to the prior path.
+                                    let reserved_first = match (upload_class, flush_sem.as_ref()) {
+                                        (UploadClass::Flush, Some(fs)) => {
+                                            fs.clone().try_acquire_many_owned(permits).ok()
                                         }
+                                        _ => None,
+                                    };
+                                    match reserved_first {
+                                        Some(permit) => Some(permit),
+                                        None => match self
+                                            .handle
+                                            .block_on(sem.clone().acquire_many_owned(permits))
+                                        {
+                                            Ok(permit) => Some(permit),
+                                            Err(e) => {
+                                                return Err(ForstError::Io(std::io::Error::other(
+                                                    format!(
+                                                        "OpenDAL upload semaphore closed: {p}: {e}"
+                                                    ),
+                                                )));
+                                            }
+                                        },
                                     }
                                 } else {
                                     None
@@ -1695,10 +1870,14 @@ impl FileSystem for OpendalFileSystem {
         // eligible for asynchronous upload; carry the registry + semaphore into
         // the writer for that case. Blocking/append (WAL) paths stay synchronous
         // (None), so the WAL is durable on `sync()`.
-        let (file_pending, file_sem) = if use_buffered_object_store {
-            (Some(self.pending.clone()), Some(self.upload_sem.clone()))
+        let (file_pending, file_sem, file_flush_sem) = if use_buffered_object_store {
+            (
+                Some(self.pending.clone()),
+                Some(self.upload_sem.clone()),
+                Some(self.flush_sem.clone()),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
         let writer_kind = if use_buffered_object_store {
             // FRS-S3-MULTIPART-TRUNC-FIX: object-store CreateNew/CreateOrTruncate
@@ -1764,6 +1943,7 @@ impl FileSystem for OpendalFileSystem {
             closed: false,
             pending: file_pending,
             upload_sem: file_sem,
+            flush_sem: file_flush_sem,
             fadvise_path,
             coalesce: Vec::new(),
         }))
@@ -3053,6 +3233,161 @@ mod tests {
             assert!(fs.file_exists(Path::new("sst/blocked.sst")).unwrap());
             drop(fs);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FRS-UPLOAD-FLUSH-QOS (cycle 8): reserved flush lane in the upload budget.
+    // -----------------------------------------------------------------------
+
+    /// RAII guard restoring the reserved-lane override on drop.
+    struct ReservedOverrideGuard;
+    impl Drop for ReservedOverrideGuard {
+        fn drop(&mut self) {
+            set_upload_flush_reserved_override(None);
+        }
+    }
+
+    /// The thread upload class defaults to Compaction and the guard sets +
+    /// restores it (including on nested guards).
+    #[test]
+    fn thread_upload_class_guard_sets_and_restores() {
+        assert_eq!(thread_upload_class(), UploadClass::Compaction, "default");
+        {
+            let _g = ThreadUploadClassGuard::flush();
+            assert_eq!(
+                thread_upload_class(),
+                UploadClass::Flush,
+                "guard sets flush"
+            );
+            {
+                let _g2 = ThreadUploadClassGuard::set(UploadClass::Compaction);
+                assert_eq!(thread_upload_class(), UploadClass::Compaction, "nested set");
+            }
+            assert_eq!(thread_upload_class(), UploadClass::Flush, "nested restored");
+        }
+        assert_eq!(thread_upload_class(), UploadClass::Compaction, "restored");
+    }
+
+    /// The reserved-lane size clamps so the SHARED lane always keeps >= 1 permit,
+    /// and the semaphore pair carves the reserved permits OUT of the total budget
+    /// (total unchanged). OFF (default 0) ⇒ shared = full budget, flush lane empty.
+    #[test]
+    fn reserved_flush_lane_sizing_and_clamp() {
+        let _g = ASYNC_FLUSH_TEST_LOCK.lock().unwrap();
+        let _r = ReservedOverrideGuard;
+
+        // OFF (default 0): shared = full budget, flush lane empty (byte-identical).
+        set_upload_flush_reserved_override(Some(0));
+        assert_eq!(upload_flush_reserved_permits(), 0);
+        let (shared, flush) = build_upload_semaphores();
+        assert_eq!(shared.available_permits(), MAX_INFLIGHT_UPLOADS);
+        assert_eq!(flush.available_permits(), 0);
+
+        // Reserve 2: carved from the total — shared = total-2, flush = 2.
+        set_upload_flush_reserved_override(Some(2));
+        assert_eq!(upload_flush_reserved_permits(), 2);
+        let (shared, flush) = build_upload_semaphores();
+        assert_eq!(shared.available_permits(), MAX_INFLIGHT_UPLOADS - 2);
+        assert_eq!(flush.available_permits(), 2);
+        assert_eq!(
+            shared.available_permits() + flush.available_permits(),
+            MAX_INFLIGHT_UPLOADS,
+            "total budget unchanged"
+        );
+
+        // Over-reserve (>= budget): clamped so the shared lane keeps >= 1 permit.
+        set_upload_flush_reserved_override(Some(MAX_INFLIGHT_UPLOADS + 5));
+        assert_eq!(upload_flush_reserved_permits(), MAX_INFLIGHT_UPLOADS - 1);
+        let (shared, flush) = build_upload_semaphores();
+        assert_eq!(shared.available_permits(), 1, "shared keeps >= 1");
+        assert_eq!(flush.available_permits(), MAX_INFLIGHT_UPLOADS - 1);
+    }
+
+    /// THE QOS INVARIANT. With the reserved lane ON and `FRS_ASYNC_FLUSH_UPLOAD`
+    /// ON, when the SHARED lane is fully saturated (by compaction) a FLUSH-class
+    /// `close_writer` STILL proceeds — it takes its private reserved permit instead
+    /// of blocking — whereas a COMPACTION-class `close_writer` BLOCKS until the
+    /// shared lane frees. This is the starvation fix the mini-bench quantifies.
+    #[test]
+    fn reserved_flush_lane_lets_flush_bypass_saturated_shared() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _g = ASYNC_FLUSH_TEST_LOCK.lock().unwrap();
+        let _r = OverrideGuard;
+        let _r2 = ReservedOverrideGuard;
+        set_async_flush_upload_override(Some(true));
+        set_upload_flush_reserved_override(Some(2)); // 2 reserved, 6 shared
+
+        let fs = Arc::new(OpendalFileSystem::memory().expect("build memory fs"));
+        // Saturate the SHARED lane (compaction would hold these).
+        let held = fs
+            .rt
+            .handle()
+            .block_on(
+                fs.upload_sem
+                    .clone()
+                    .acquire_many_owned((MAX_INFLIGHT_UPLOADS - 2) as u32),
+            )
+            .expect("acquire all shared permits");
+        assert_eq!(fs.upload_sem.available_permits(), 0, "shared saturated");
+
+        // Spawn a writer of the given class; return (returned-flag, join handle).
+        let spawn_writer =
+            |class_flush: bool, path: &str| -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+                let returned = Arc::new(AtomicBool::new(false));
+                let fs2 = Arc::clone(&fs);
+                let returned2 = Arc::clone(&returned);
+                let path = path.to_string();
+                let h = std::thread::spawn(move || {
+                    let _cls = if class_flush {
+                        Some(ThreadUploadClassGuard::flush())
+                    } else {
+                        None // default = Compaction
+                    };
+                    let mut w = fs2
+                        .open_writable_file(&PathBuf::from(path), WriteMode::CreateOrTruncate)
+                        .expect("open writable");
+                    w.append(&[9u8; 4096]).expect("append");
+                    w.sync().expect("sync");
+                    returned2.store(true, Ordering::Release);
+                });
+                (returned, h)
+            };
+
+        let (flush_ret, flush_h) = spawn_writer(true, "sst/flush.sst");
+        let (comp_ret, comp_h) = spawn_writer(false, "sst/compaction.sst");
+        // Give both time to reach close_writer.
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            flush_ret.load(Ordering::Acquire),
+            "FLUSH-class close_writer must bypass the saturated shared lane via the reserved lane"
+        );
+        assert!(
+            !comp_ret.load(Ordering::Acquire),
+            "COMPACTION-class close_writer must block on the saturated shared lane"
+        );
+
+        // Release the shared lane → the blocked compaction upload proceeds; join both.
+        drop(held);
+        flush_h.join().expect("flush writer joined");
+        comp_h.join().expect("compaction writer joined");
+        assert!(comp_ret.load(Ordering::Acquire), "compaction unblocked");
+        fs.await_all_uploads().expect("await_all_uploads");
+        assert!(fs.file_exists(Path::new("sst/flush.sst")).unwrap());
+        assert!(fs.file_exists(Path::new("sst/compaction.sst")).unwrap());
+    }
+
+    /// Durability/byte-identity with the reserved lane ON: flush-class uploads
+    /// routed through the reserved lane still land byte-exact (no lost / dup /
+    /// truncated SST). Reuses the durability harness under a flush-class thread.
+    #[test]
+    fn reserved_flush_lane_on_is_durable() {
+        let _g = ASYNC_FLUSH_TEST_LOCK.lock().unwrap();
+        let _r = OverrideGuard;
+        let _r2 = ReservedOverrideGuard;
+        set_upload_flush_reserved_override(Some(2));
+        let _cls = ThreadUploadClassGuard::flush();
+        // ON mode: flush-thread admission + the reserved lane in play.
+        assert_uploads_durable_in_mode(true);
     }
 
     // -----------------------------------------------------------------------
