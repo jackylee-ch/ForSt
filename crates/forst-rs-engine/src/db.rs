@@ -400,6 +400,50 @@ pub fn set_vlog_coalesce_deref_override(v: Option<bool>) {
     );
 }
 
+/// FRS-VLOG-POINT-DEREF master flag (`FRS_VLOG_POINT_DEREF=1`, **DEFAULT OFF**).
+/// Design: `2026-06-15-kvsep-on-readpath-q11-q17-design.md` (the q11/q17 fix).
+///
+/// Under UNIFORM KV-separation, the windowed-agg RMW (q11/q17) reads ONE small
+/// (≤80 B) accumulator per record, scattered across many single-flush segments.
+/// [`VlogReader::get`] fills a 64 KiB chunk per cold deref to amortize scan
+/// locality — but a scattered point-get has NO subsequent same-segment hit, so
+/// that chunk fill is ~2000x read-amp (a 64 KiB ranged GET for a 32 B value on
+/// the disagg path). When this flag is ON, a deref that contributes ≤1 pointer
+/// to its segment (no coalesce locality to exploit) routes through
+/// [`VlogReader::get_point`], which reads EXACTLY the record bytes — the deref
+/// I/O collapses to ≈ the value size. Byte-identical OUTPUT (same CRC +
+/// decompress); only the read size changes. Default OFF => the legacy chunk
+/// fill, byte-for-byte. Read LIVE (test-toggle-able).
+pub fn vlog_point_deref_enabled() -> bool {
+    let ov = VLOG_POINT_DEREF_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    matches!(
+        std::env::var("FRS_VLOG_POINT_DEREF").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// FRS-VLOG-POINT-DEREF test override for [`vlog_point_deref_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static VLOG_POINT_DEREF_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-VLOG-POINT-DEREF: forces the right-sized point deref on/off for
+/// tests/benches (`None` = defer to `FRS_VLOG_POINT_DEREF`).
+pub fn set_vlog_point_deref_override(v: Option<bool>) {
+    VLOG_POINT_DEREF_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// FRS-VLOG-SCAN-COALESCE master flag for windowed-coalesced value-log deref on
 /// the SINGLE-ITERATOR SCAN path (`FRS_VLOG_SCAN_COALESCE=1`, **DEFAULT OFF**).
 /// Design: `2026-06-15-vlog-scan-coalesce-design.md`.
@@ -14494,7 +14538,15 @@ impl DbImpl {
         let ptr = forst_rs_storage::vlog::ValuePointer::decode(ptr_bytes).ok_or_else(|| {
             ForstError::corruption("BlobRef row carries malformed value-pointer bytes")
         })?;
-        self.get_or_open_vlog_reader(ptr.segment_id)?.get(&ptr)
+        let reader = self.get_or_open_vlog_reader(ptr.segment_id)?;
+        // FRS-VLOG-POINT-DEREF: a single-key inline deref (single-key `get`, the
+        // non-coalesce batch arms, the windowed-agg RMW) has no scan locality —
+        // read EXACTLY the record, not a 64 KiB chunk. Byte-identical value.
+        if vlog_point_deref_enabled() {
+            reader.get_point(&ptr)
+        } else {
+            reader.get(&ptr)
+        }
     }
 
     /// FRS-VLOG-COALESCE: resolve a batch's DEFERRED `BlobRef` derefs in ONE
@@ -14607,6 +14659,17 @@ impl DbImpl {
         resolved: &mut [Option<Option<Vec<u8>>>],
     ) -> ForstResult<()> {
         let reader = self.get_or_open_vlog_reader(segment_id)?;
+        // FRS-VLOG-POINT-DEREF: a single-pointer group has NO coalesce locality
+        // (the spanning-range read of `get_coalesced` would still fill a 64 KiB
+        // chunk via `get`); read EXACTLY that one record instead. This is the
+        // scattered windowed-agg RMW shape (q11/q17), where each batch contributes
+        // ~1 pointer per single-flush segment. Byte-identical value.
+        if vlog_point_deref_enabled() && group.len() == 1 {
+            let (slot, ptr) = &group[0];
+            let value = reader.get_point(ptr)?;
+            resolved[*slot] = Some(Some(value));
+            return Ok(());
+        }
         let ptr_refs: Vec<&forst_rs_storage::vlog::ValuePointer> =
             group.iter().map(|(_, p)| p).collect();
         let values = reader.get_coalesced(&ptr_refs)?;
@@ -20847,6 +20910,141 @@ mod tests {
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].as_deref(), Some(kv[0].1.as_slice()));
 
+        set_vlog_coalesce_deref_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-POINT-DEREF (2026-06-15, q11/q17 read-path fix): the right-sized
+    /// point deref (`FRS_VLOG_POINT_DEREF`) produces BYTE-IDENTICAL output to the
+    /// 64 KiB-chunk deref, across the windowed-agg RMW shape: small (≥22 B, so
+    /// separated under min-blob=22) accumulators flushed to MULTIPLE segments,
+    /// read SCATTERED through both single-key `get` and `batch_get_vectorized`
+    /// (the latter with and without coalesce). The point path only changes the
+    /// read SIZE (and skips chunk-cache pollution), never the bytes — same CRC,
+    /// same decompress. Default OFF must equal the pre-flag path; ON must equal
+    /// OFF, value-for-value, including interleaved genuine misses.
+    #[test]
+    fn test_vlog_point_deref_byte_identical_windowed_agg_rmw() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        // NOTE: `kv_min_blob_size()` caches `FRS_KV_MIN_BLOB_SIZE` via a process
+        // OnceLock (default 256), so it cannot be forced per-test. We therefore
+        // use values >= 256 B so they separate regardless of the cached threshold
+        // — the point-deref byte-identity property holds for ANY separated value,
+        // and the per-record scattered-deref SHAPE (one pointer per segment) is
+        // what `get_point` targets, independent of the value size. The
+        // `windowed_agg_rmw` mini-bench exercises the true small-accumulator size.
+
+        // Incompressible bytes so lz4 cannot shrink a value below 256 B.
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 200;
+        // Several flushes => several vlog segments => a scattered batch contributes
+        // ~1 pointer per segment (the q11/q17 shape that triggers get_point).
+        let build = || -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<(Vec<u8>, Vec<u8>)>) {
+            let db = open();
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("point"))
+                .unwrap();
+            let mut kv: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N);
+            for i in 0..N as u32 {
+                let k = format!("agg{i:05}").into_bytes();
+                // 256..=295 B values: separate regardless of the cached min-blob.
+                let v = mkrand(0x2000 + i as u64, 256 + (i as usize % 40));
+                db.put(&cf, &k, &v).unwrap();
+                kv.push((k, v));
+                if (i + 1) % 32 == 0 {
+                    db.switch_and_flush(&cf).unwrap();
+                }
+            }
+            db.switch_and_flush(&cf).unwrap();
+            assert!(
+                db.version_set.current().vlog_segments.len() >= 2,
+                "accumulators must separate into multiple segments"
+            );
+            (db, cf, kv)
+        };
+
+        let scattered_keys = |kv: &[(Vec<u8>, Vec<u8>)]| -> Vec<Vec<u8>> {
+            let mut order: Vec<usize> = (0..kv.len()).collect();
+            let mut s: u64 = 0x9E3779B97F4A7C15;
+            for i in (1..order.len()).rev() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let j = (s as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            let mut out = Vec::with_capacity(order.len() + order.len() / 8);
+            for (n, &i) in order.iter().enumerate() {
+                if n % 8 == 5 {
+                    out.push(format!("miss{n:05}").into_bytes());
+                }
+                out.push(kv[i].0.clone());
+            }
+            out
+        };
+
+        let want: std::collections::HashMap<Vec<u8>, Vec<u8>>;
+
+        // Baseline: point OFF, coalesce OFF (legacy 64 KiB-chunk per-key deref).
+        set_vlog_point_deref_override(Some(false));
+        set_vlog_coalesce_deref_override(Some(false));
+        let (db_off, cf_off, kv) = build();
+        want = kv.iter().cloned().collect();
+        let keys = scattered_keys(&kv);
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let off_batch = db_off
+            .batch_get_vectorized(&cf_off, &key_refs, u64::MAX)
+            .unwrap();
+        let off_single: Vec<Option<Vec<u8>>> = keys
+            .iter()
+            .map(|k| db_off.get(&cf_off, k).unwrap())
+            .collect();
+
+        // Helper: build a fresh db under the current flags and assert == baseline.
+        let check = |point: bool, coalesce: bool| {
+            set_vlog_point_deref_override(Some(point));
+            set_vlog_coalesce_deref_override(Some(coalesce));
+            let (db, cf, kv2) = build();
+            assert_eq!(kv, kv2, "build deterministic across arms");
+            let keys2 = scattered_keys(&kv2);
+            let refs2: Vec<&[u8]> = keys2.iter().map(|k| k.as_slice()).collect();
+            let batch = db.batch_get_vectorized(&cf, &refs2, u64::MAX).unwrap();
+            assert_eq!(
+                batch, off_batch,
+                "batch_get_vectorized must be byte-identical (point={point}, coalesce={coalesce})"
+            );
+            let single: Vec<Option<Vec<u8>>> =
+                keys2.iter().map(|k| db.get(&cf, k).unwrap()).collect();
+            assert_eq!(
+                single, off_single,
+                "single-key get must be byte-identical (point={point}, coalesce={coalesce})"
+            );
+            // Every present key returned its correct value; misses are None.
+            for (k, got) in keys2.iter().zip(batch.iter()) {
+                match want.get(k) {
+                    Some(v) => assert_eq!(got.as_deref(), Some(v.as_slice())),
+                    None => assert_eq!(got, &None),
+                }
+            }
+        };
+
+        check(true, false); // point ON, coalesce OFF (the q11/q17 fix path)
+        check(true, true); // point ON + coalesce ON (single-pointer groups → get_point)
+        check(false, true); // coalesce ON only (regression guard for the existing lever)
+
+        set_vlog_point_deref_override(None);
         set_vlog_coalesce_deref_override(None);
         set_kv_separation_override(None);
     }

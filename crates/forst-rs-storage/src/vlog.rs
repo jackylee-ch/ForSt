@@ -302,6 +302,48 @@ impl VlogReader {
         out
     }
 
+    /// FRS-VLOG-POINT-DEREF (q11/q17 read-path, 2026-06-15): deref ONE value
+    /// reading EXACTLY its record bytes (`header + ptr.len`) with a single
+    /// positioned read — NO 64 KiB chunk fill, NO chunk-cache pollution.
+    ///
+    /// [`Self::get`]'s chunk fill exists to amortize SCAN locality (consecutive
+    /// key-order rows in one segment share a chunk). For a SCATTERED POINT-GET —
+    /// the windowed-agg RMW shape (q11/q17): one small (≤80 B) accumulator deref
+    /// per record, keys spread across many single-flush segments — that chunk
+    /// fill is pure read-amp: a 64 KiB read (one ranged GET on the disagg/remote
+    /// path) for a 32 B value, ~2000x over-read, with no subsequent hit to
+    /// amortize it (the next record's key lives in a DIFFERENT segment). This
+    /// path reads just the record, so the deref I/O ≈ the value size.
+    ///
+    /// Byte-identical OUTPUT to [`Self::get`] (same CRC check, same decompress,
+    /// same returned value); only the read SIZE differs, and the chunk cache is
+    /// left untouched so an interleaved scan keeps its locality. The oversized
+    /// branch (`total > VLOG_READ_CHUNK`) is already a direct per-record pread in
+    /// `get`, so this method only changes the small-record case. Used by the
+    /// engine's deref tier when a batch contributes ≤1 pointer to a segment (no
+    /// coalesce locality to exploit) and `FRS_VLOG_POINT_DEREF` is ON.
+    pub fn get_point(&self, ptr: &ValuePointer) -> ForstResult<Vec<u8>> {
+        let total = VLOG_RECORD_HEADER + ptr.len as usize;
+        // A chunk-cache HIT is still cheaper than a fresh pread — honor it.
+        {
+            let guard = self.chunk.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((start, bytes)) = guard.as_ref() {
+                if ptr.offset >= *start && ptr.offset + total as u64 <= *start + bytes.len() as u64
+                {
+                    let lo = (ptr.offset - *start) as usize;
+                    return Self::parse_record(&bytes[lo..lo + total], ptr);
+                }
+            }
+        }
+        // Miss: read EXACTLY the record (no chunk fill, no cache write).
+        let mut record = vec![0u8; total];
+        let n = self.file.read_at(ptr.offset, &mut record)?;
+        if n != total {
+            return Err(ForstError::corruption("vlog record short read (point)"));
+        }
+        Self::parse_record(&record, ptr)
+    }
+
     /// FRS-VLOG-COALESCE: coalesced batched deref of MANY pointers into THIS
     /// segment in ONE pass. `ptrs` must all target this segment and be SORTED by
     /// `offset` (the caller groups by `segment_id` + sorts). The reader computes
@@ -822,6 +864,62 @@ mod tests {
             VlogReader::open(&fs, dir, 21).unwrap().get(&p_lz4).unwrap(),
             payload
         );
+    }
+
+    /// FRS-VLOG-POINT-DEREF (2026-06-15): `get_point` reads EXACTLY the record
+    /// (no 64 KiB chunk fill) and returns BYTE-IDENTICAL values to `get`, across
+    /// codecs, value sizes, an empty value, an oversized (> chunk) value, and a
+    /// chunk-cache HIT (a prior `get` warmed the chunk → `get_point` must serve
+    /// from it identically). Also asserts `get_point` does NOT pollute the chunk
+    /// cache on a miss (so an interleaved scan keeps its locality).
+    #[test]
+    fn test_vlog_get_point_byte_identical() {
+        for codec in [
+            CompressionType::None,
+            CompressionType::Lz4,
+            CompressionType::Zstd,
+        ] {
+            let fs = MemoryFileSystem::new();
+            let dir = Path::new("/db");
+            fs.create_dir_all(dir).unwrap();
+            let mut w = VlogWriter::create_with_compression(&fs, dir, 40, codec).unwrap();
+            // Small accumulators, an empty value, and one OVERSIZED value
+            // (> VLOG_READ_CHUNK) so the > chunk branch is exercised too.
+            let mut values: Vec<Vec<u8>> = Vec::new();
+            for i in 0..16usize {
+                values.push((0..(8 + i * 5)).map(|b| (b as u8) ^ (i as u8)).collect());
+            }
+            values.push(Vec::new());
+            values.push((0..(VLOG_READ_CHUNK + 1024)).map(|b| b as u8).collect());
+            let ptrs: Vec<ValuePointer> = values.iter().map(|v| w.append(v).unwrap()).collect();
+            w.sync().unwrap();
+
+            // Fresh reader: get_point == the value, for every record.
+            let r = VlogReader::open(&fs, dir, 40).unwrap();
+            for (v, p) in values.iter().zip(&ptrs) {
+                assert_eq!(&r.get_point(p).unwrap(), v, "{codec:?} get_point value");
+            }
+
+            // get_point on a fresh reader must not have populated the chunk cache
+            // (a small-record miss reads only the record). The very next get from
+            // a DIFFERENT fresh reader still works, and get_point == get for all.
+            let r2 = VlogReader::open(&fs, dir, 40).unwrap();
+            for (v, p) in values.iter().zip(&ptrs) {
+                let via_get = r2.get(p).unwrap();
+                let via_point = r2.get_point(p).unwrap();
+                assert_eq!(via_get, *v, "{codec:?} get value");
+                assert_eq!(via_point, via_get, "{codec:?} get_point == get");
+            }
+
+            // Chunk-cache HIT path: warm the chunk with a `get`, then `get_point`
+            // for a record covered by that chunk must serve from the cache and be
+            // byte-identical.
+            let r3 = VlogReader::open(&fs, dir, 40).unwrap();
+            let _ = r3.get(&ptrs[0]).unwrap(); // warms the chunk around ptr 0
+            for (v, p) in values.iter().take(8).zip(ptrs.iter().take(8)) {
+                assert_eq!(&r3.get_point(p).unwrap(), v, "{codec:?} get_point hit");
+            }
+        }
     }
 
     #[test]

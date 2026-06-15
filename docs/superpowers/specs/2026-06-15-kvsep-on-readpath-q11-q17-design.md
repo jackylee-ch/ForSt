@@ -108,12 +108,160 @@ lands:
 
 ## 4. Profiler evidence
 
-(filled in as collected — see §4.1 mini-bench, §4.2 q11/q17 profile)
+### 4.1 windowed-agg RMW mini-bench (`windowed_agg_rmw.rs`)
+
+Reproduces the per-record accumulator RMW over FLUSHED (SST-resident)
+accumulators under uniform KV-sep (min-blob=22 ⇒ every value separated).
+LocalFileSystem, acc_size=32 B, batch=256.
+
+Small scale (20k keys, 200k records — warm working set, reads mostly re-hit):
+
+```
+  OFF             650.2 ns/rec
+  ON-uniform      828.5 ns/rec   (+27%, the regression)
+  ON+coalesce     687.2 ns/rec   (recovers ~78% of the gap)
+```
+
+Full scale (200k keys, 2M records — genuinely COLD, reads scattered across
+many vlog segments):
+
+```
+  OFF            1107.2 ns/rec
+  ON-uniform     1737.6 ns/rec   (+57%, matches q11's ~1.8x regression ratio)
+  ON+coalesce    2397.4 ns/rec   (WORSE — coalesce HURTS here)
+```
+
+**Root cause:** under uniform KV-sep, a 32-byte accumulator separated into the
+vlog forces a `VlogReader::get` that reads a **64 KiB chunk** (`VLOG_READ_CHUNK`)
+per cold deref — catastrophic read-amp (64 KiB I/O for 32 B of value). At large
+scale each batch's keys scatter across MANY single-flush segments (1-2 pointers
+per segment), so `coalesced_vlog_deref_into`'s group-by-segment + sort + HashMap
+overhead exceeds any benefit (each "group" is ~1 pointer → no coalescing to do)
+and coalesce REGRESSES. Coalesce only wins when many pointers land in ONE
+segment (the q9/q20 join-scan shape), not the q11/q17 scattered-point-RMW shape.
+
+### 4.2 C-vs-B decision: **B (structural staging buffer)**
+
+The deref lands on COLD/flushed accumulators read per-record. Crucially:
+
+- **C's premise does NOT hold.** Once an accumulator flushes to SST under uniform
+  KV-sep, the value lives ONLY in the vlog (the SST row is a BlobRef) — there is
+  NO cheaper inline copy to read instead. The resident-flushed shadow (Phase 4,
+  checked before the SST tier) DOES hold the pre-separation full value and is
+  already served inline — but only while that shadow is alive; the deref fires
+  exactly when no inline copy exists. So "read inline first, deref only flushed"
+  is already what the engine does; there is no avoidable indirection for C to
+  remove. C cannot help the truly-cold case.
+- **B is the structural fix.** Keep the active window's accumulators in an
+  off-heap Arrow staging buffer for the window's lifetime so per-record RMW hits
+  memory (zero deref, zero SST read), flushing to the engine (uniform key-LSM +
+  vlog) only at window-fire / checkpoint. This eliminates BOTH the SST read and
+  the 64 KiB-chunk deref read-amp for the hot window working set.
+  - ⚠ B is gated by the checkpoint state-equivalence TDD test (§5).
+- **A (foundation) still applies** to the residual cold derefs that B does not
+  cover (cross-window / restore / eviction): zero-copy the deref into the Arrow
+  builder so each unavoidable deref costs one decompress-into-buffer, no owned
+  Vec + memcpy. A is correctness-neutral and byte-identical.
+
+### 4.3 Refinement: the cost is a once-per-flush-cycle deref read-amp
+
+A key structural observation that re-frames C vs B for the RMW shape:
+
+- Under uniform KV-sep a re-WRITTEN accumulator goes to the active memtable as a
+  full INLINE value (separation is flush-time only). So after the first
+  write-back, re-reads within the window hit the memtable (Phase 1) and NEVER
+  reach the deref. Each accumulator is therefore dereffed AT MOST ONCE per flush
+  cycle (first read after a flush → write-back makes it inline again).
+- B's win (no deref for the hot window) requires NOT flushing the active window's
+  accumulators, which needs WINDOW-BOUNDARY knowledge that lives in the Flink
+  windowed-agg state layer + checkpoint capture — a cross-layer change, NOT an
+  engine read-path change, and exactly the silent-corruption-risk surface the B
+  equivalence gate warns about.
+- The pure READ-PATH lever is therefore to make that unavoidable once-per-cycle
+  deref CHEAP: kill the 64 KiB chunk read-amp (`get_point`) + (foundation A)
+  coalesce/zero-copy the residual. This is what the profiler demands and what
+  fits the "fix entirely in the read path / uniform format" constraint.
+
+**Decision: ship the read-path point-deref (the A-family fix). B (Flink-layer
+window staging) is deferred as a larger cross-layer change** — it is NOT an
+engine read-path fix and would need the mandated checkpoint state-equivalence
+gate before shipping.
 
 ## 5. Implementation log
 
-(filled in)
+All changes are READ-PATH only; the on-disk/vlog format is UNCHANGED (uniform
+KV-sep). All flag-gated, default OFF, byte-identical when ON.
+
+1. **`VlogReader::get_point`** (storage/vlog.rs): reads EXACTLY the record bytes
+   (`header + ptr.len`) with one positioned read — no 64 KiB chunk fill, no
+   chunk-cache pollution; honors an existing chunk-cache HIT. Same CRC +
+   decompress as `get` ⇒ byte-identical value. The oversized branch is already a
+   direct pread in `get`.
+2. **`FRS_VLOG_POINT_DEREF` flag** + `vlog_point_deref_enabled()` /
+   `set_vlog_point_deref_override()` (engine/db.rs), exported from lib.rs.
+3. **Deref-tier routing** (engine/db.rs): `vlog_deref` (single-key inline path:
+   single `get`, the non-coalesce batch arms, the RMW) routes through `get_point`
+   when ON; `deref_one_segment_into` routes SINGLE-pointer groups (no coalesce
+   locality — the scattered RMW shape) through `get_point` when ON.
+4. **Tests (byte-identity gates):**
+   - storage `test_vlog_get_point_byte_identical` — `get_point` == `get` across
+     codecs, sizes, empty, oversized, and chunk-cache-hit.
+   - engine `test_vlog_point_deref_byte_identical_windowed_agg_rmw` — fresh-db
+     A/B: point ON vs OFF byte-identical for both single-key `get` and
+     `batch_get_vectorized` (scattered, with/without coalesce), separated values
+     across multiple segments, interleaved misses.
+5. **Mini-bench** `crates/forst-rs-bench/src/bin/windowed_agg_rmw.rs`.
 
 ## 6. Results
 
-(filled in)
+### 6.1 Mini-bench (LocalFS; storage-layer COLD RMW)
+
+q11-like (32 B accumulator, 200k keys, 2M records):
+
+```
+  OFF           1116.2 ns/rec
+  ON-uniform    1791.6 ns/rec   (+60.5% regression)
+  ON+coalesce   2397.7 ns/rec   (HURTS — scattered single-pointer segments)
+  ON+point      1270.0 ns/rec   (closes 77% of the gap; +13.8% residual)
+```
+
+q17-like (72 B accumulator, 150k keys, 1.5M records):
+
+```
+  OFF           1119.0 ns/rec
+  ON-uniform    1687.5 ns/rec   (+50.8% regression)
+  ON+coalesce   3887.6 ns/rec   (HURTS)
+  ON+point      1156.9 ns/rec   (closes 93% of the gap; +3.4% residual)
+```
+
+`FRS_VLOG_POINT_DEREF` collapses most/all of the storage-layer regression and
+NEVER changes the bytes. On LocalFS the 64 KiB chunk is page-cache-cheap so this
+UNDERSTATES the disagg/remote win (there each chunk = a 64 KiB ranged GET, vs a
+~45 B point read) — the NEXMark disagg A/B (§6.2) is the real magnitude.
+
+The residual gap is the structural SST→vlog double-indirection (2 lookups per
+cold accumulator vs OFF's 1 inline read); eliminating it entirely would require
+not-derefing-at-all = B (Flink-layer window staging), out of scope for a
+read-path-only engine fix.
+
+### 6.2 NEXMark disagg A/B (q11 + q17, 2x4c/16g split)
+
+(pending — run after the live sweep's docker box is idle, per coordination rule)
+
+Suggested arms (uniform KV-sep, min-blob driven low for the uniform premise):
+- ON pre-fix  (FRS_KV_SEPARATION=1, FRS_VLOG_POINT_DEREF=0)
+- ON post-fix (FRS_KV_SEPARATION=1, FRS_VLOG_POINT_DEREF=1)
+- OFF         (FRS_KV_SEPARATION=0)
+SUCCESS = q11/q17 ON post-fix FINISH exact rows AND beat their OFF walls
+(q11 < 118.8s, q17 < 110.7s).
+
+## 7. Correctness / honesty notes
+
+- All read-path changes are flag-gated, DEFAULT OFF, byte-identical when ON
+  (two dedicated byte-identity A/B tests + the existing kvsep/coalesce/vlog
+  suites all green).
+- Honest negative: this is the A-family read-path fix. It does NOT implement B
+  (window staging). If the disagg A/B shows a residual ON-vs-OFF gap, the
+  remaining cost is the SST→vlog double-indirection per cold accumulator, which
+  only B (not-derefing) can remove — and B is a Flink-layer change gated by the
+  checkpoint state-equivalence test.
