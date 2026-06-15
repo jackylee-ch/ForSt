@@ -36,6 +36,7 @@ apply_validate() {
   local q="$1"
   unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE \
         FRS_RS_S2_PINNED FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF \
+        FRS_VLOG_POINT_DEREF \
         FRS_RS_PROBE_BLOOM_PRUNE FRS_RS_LEVELED_HOT_CF FRS_PERSISTENT_PROBE_ITER \
         FRS_RS_MERGE_RMW FRS_RS_MERGE_RMW_STATES 2>/dev/null || true
   export FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}"
@@ -54,11 +55,21 @@ apply_validate() {
   window_stack() {
     export FRS_RS_MERGE_RMW="${FRS_RS_MERGE_RMW:-1}"
     export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}"
+    # PMC-1 2026-06-15 windowed-agg KV-sep-ON read path: the Reducing/
+    # Aggregating accumulator RMW is single-key (no scan locality), so a chunk
+    # deref pays 64 KiB read-amp PER record. POINT deref reads exactly the
+    # record (mini-bench windowed_agg_rmw: closes ~80-91% of the KV-sep-ON gap,
+    # 5233->2224 ns/rec read; 83.7s->41.8s full RMW @2M keys/16M recs).
+    # COALESCE deref is the OPPOSITE lever (batches scattered derefs for SCAN
+    # locality) and is 2.5x HARMFUL on this single-key pattern (12865 ns/rec),
+    # so it stays OFF here — point-deref only.
+    export FRS_VLOG_POINT_DEREF="${FRS_VLOG_POINT_DEREF:-1}"
   }
   case "$q" in
     q4|q7|q9|q19|q20) join_stack ;;
     q8|q11|q12|q18)   window_stack ;;
-    q17)              export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}" ;;
+    q17)              export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}"
+                      export FRS_VLOG_POINT_DEREF="${FRS_VLOG_POINT_DEREF:-1}" ;;
     *)                : ;;  # light/source-bound: fairness baseline only
   esac
   # q9 KV-sep resident bounds (so KV-sep fits the 16g split cgroup — the whole
@@ -107,11 +118,12 @@ for q in $QUERIES; do
       else
         # baselines: only fairness compression; no forst-rs levers
         unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE FRS_RS_S2_PINNED \
-              FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF FRS_RS_PROBE_BLOOM_PRUNE \
+              FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF FRS_VLOG_POINT_DEREF \
+              FRS_RS_PROBE_BLOOM_PRUNE \
               FRS_RS_LEVELED_HOT_CF FRS_PERSISTENT_PROBE_ITER FRS_RS_MERGE_RMW 2>/dev/null || true
         export FRS_SST_COMPRESSION=lz4
       fi
-      echo "  levers: KV_SEP=${FRS_KV_SEPARATION:-OFF} EXEC=${FRS_RS_EXECUTOR:-default} MERGE_RMW=${FRS_RS_MERGE_RMW:-OFF}"
+      echo "  levers: KV_SEP=${FRS_KV_SEPARATION:-OFF} EXEC=${FRS_RS_EXECUTOR:-default} MERGE_RMW=${FRS_RS_MERGE_RMW:-OFF} POINT_DEREF=${FRS_VLOG_POINT_DEREF:-OFF}"
       CLUSTER="$tag" bash "$RUNNER" run "$q" "$arm" "$MAXSEC" "$tag"
     )
     parse_and_record "$q" "$arm" "$tag" "$out"
