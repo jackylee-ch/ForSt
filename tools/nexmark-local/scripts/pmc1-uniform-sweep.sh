@@ -55,6 +55,11 @@ apply_validate() {
   window_stack() {
     export FRS_RS_MERGE_RMW="${FRS_RS_MERGE_RMW:-1}"
     export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}"
+    # PMC-1 uniform V3 directive (2026-06-15): the windowed stack runs KV-sep ON
+    # (uniform config) so the newly-wired point-deref read path actually engages
+    # on vlog-separated accumulators. Point-deref is a no-op when KV-sep is OFF.
+    export FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-true}"
+    export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
     # PMC-1 2026-06-15 windowed-agg KV-sep-ON read path: the Reducing/
     # Aggregating accumulator RMW is single-key (no scan locality), so a chunk
     # deref pays 64 KiB read-amp PER record. POINT deref reads exactly the
@@ -69,6 +74,8 @@ apply_validate() {
     q4|q7|q9|q19|q20) join_stack ;;
     q8|q11|q12|q18)   window_stack ;;
     q17)              export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}"
+                      export FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-true}"
+                      export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
                       export FRS_VLOG_POINT_DEREF="${FRS_VLOG_POINT_DEREF:-1}" ;;
     *)                : ;;  # light/source-bound: fairness baseline only
   esac

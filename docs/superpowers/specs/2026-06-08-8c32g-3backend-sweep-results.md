@@ -1,6 +1,47 @@
 # 8c/32g 3-backend NexMark sweep — verified time + accuracy (2026-06-08)
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
+# ═══════════════════════════════════════════════════════════════════════════
+# Population: M2 = Mac (Darwin, arm64 container, jemalloc OFF, io_uring no-op),
+# THIS box. forst-rs ENGINE = commit c60ecae35 (FRS_VLOG_POINT_DEREF wired into
+# the window-stack q8/q11/q12/q18 + q17). V3 RULE: forst-rs ONLY this pass — the
+# rdb/forst baselines are REUSED from the prior 3-backend section below (resources
+# unchanged). UNIFORM 2×4c/16g SPLIT, process.size=10240m, EVENTS_NUM=100M TPS=10M.
+# Lever stack = pmc1-uniform-sweep.sh validate profile. For the windowed stack
+# (q8/q11/q12/q18) and q17, this V3 pass runs **KV-sep ON + POINT-DEREF=1** (so the
+# newly-wired point-deref read path actually engages on vlog-separated accumulators
+# — point-deref is a no-op when KV-sep is OFF; window_stack() patched to set
+# FRS_KV_SEPARATION=true + MIN_BLOB=256). COALESCE stays OFF in the window stack.
+#
+# ── NEW forst-rs windowed results (KV-sep ON + point-deref) vs REUSED baselines ──
+# | query | frs V3 wall_s | out_rows | rdb (reused) | forst (reused) | verdict |
+# |---|---|---|---|---|---|
+# | q11 | 208.9 | 92,000,000 ✓ | 107.0 | 133.1 | FAIL both (RDB 1.95×; ForSt 1.57×) — point-deref helped only ~5% vs prior KV-sep-ON 219.9 |
+# | q17 | 217.9 | 92,000,000 ✓ | 71.6/73.9 | 245.9/275.4 | ★ BEATS ForSt (217.9 < 245.9); FAIL RDB (3.0×) — point-deref −35% vs prior KV-sep-ON 333.7 |
+# | q8  | 50.7  | 3,064,465 ✓ (src 3.064M) | 44.3 | 41.2 | FAIL both (RDB 1.15×; ForSt 1.23×) — KV-sep adds overhead on tiny-state q8 (was 46.7 OFF) |
+# | q12 | 57.7  | 92,000,000 ✓ | 39.6 | 43.9 | FAIL both (RDB 1.46×; ForSt 1.31×) — KV-sep REGRESSES q12 (was 43.6 OFF) |
+# | q18 | 442.6 | 92,000,000 ✓ | 360.4 | 441.7 | FAIL RDB (1.23× — within bar!); ~tie ForSt (442.6 vs 441.7) — KV-sep ON DOUBLED q18 (was 199.1 OFF); point-deref did NOT save it |
+#
+# ★ POINT-DEREF VERDICT on real NEXMark (Mac, directional):
+#   - q17: KV-sep-ON 333.7 → +point-deref 217.9 (−116s, −35%). Now BEATS ForSt
+#     (245.9). The single-key OVER-window RMW is exactly the pattern point-deref
+#     targets, and it delivered the predicted ~78-80% ingest-gap close directionally.
+#     Still 3× RocksDB (RocksDB has no vlog read-amp at all).
+#   - q11: KV-sep-ON 219.9 → +point-deref 208.9 (−11s, −5%). Marginal here — q11's
+#     COUNT/agg accumulator chains are less single-key-deref-bound than q17's OVER.
+#   - q8/q12/q18: KV-sep ON is a NET LOSS vs the OFF baseline (q8 46.7→50.7,
+#     q12 43.6→57.7, q18 199.1→442.6). These have small/medium accumulator state
+#     where vlog separation buys nothing and the deref read-amp dominates even WITH
+#     point-deref. HONEST: for the windowed stack, KV-sep ON only pays for q17;
+#     q11 is roughly break-even; q8/q12/q18 are better with KV-sep OFF (the prior
+#     section's numbers). A DYNAMIC KV-sep gate (per the "same-config dynamic only"
+#     directive) would keep it OFF for these — the uniform-ON config is suboptimal
+#     for 3 of the 5 windowed queries.
+#
+# (join family q4/q7/q9/q19/q20 + light queries appended below as they land)
+#
+# ═══════════════════════════════════════════════════════════════════════════
 # ★★★★ PMC-1 UNIFORM-SPLIT q0-q22 SWEEP 2026-06-15 (process.size=10240m fit)
 # ═══════════════════════════════════════════════════════════════════════════
 # Population: M2 = Mac (Darwin, arm64 container, jemalloc OFF, io_uring no-op),
