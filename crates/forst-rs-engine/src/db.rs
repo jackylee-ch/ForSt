@@ -10562,7 +10562,7 @@ impl DbImpl {
     /// transparently re-pins + re-locates → byte-identical to the rebuilt path.
     ///
     /// Flag-gated: callers should only take this path when
-    /// [`persistent_probe_iter_enabled`] is true. For correctness this method is
+    /// `persistent_probe_iter_enabled` is true. For correctness this method is
     /// ALWAYS safe to call (it produces the same rows as
     /// `prefix_scan_iter_owned_arc`); the flag only governs whether the default
     /// hot path routes through it.
@@ -10642,7 +10642,7 @@ struct LocatedProbeSet {
 ///
 /// `q7`/`q9`/`q20` issue one prefix scan per arriving record, repeatedly hitting
 /// the SAME key-group's band. The legacy path
-/// ([`DbImpl::build_lazy_prefix_key_stream`]) rebuilds the ENTIRE source set per
+/// (`DbImpl::build_lazy_prefix_key_stream`) rebuilds the ENTIRE source set per
 /// probe: snapshots the version, clones the resident shadow (O(N)), re-locates
 /// every overlapping SST, and re-opens each reader. This handle pins the version
 /// + located set once and, on each [`Self::seek`], rebuilds only the cheap
