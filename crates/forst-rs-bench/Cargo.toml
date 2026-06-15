@@ -217,3 +217,12 @@ path = "src/bin/checkpoint_upload.rs"
 [[bin]]
 name = "cache_admission_epoch"
 path = "src/bin/cache_admission_epoch.rs"
+
+# FRS-VLOG-SCAN-READAHEAD (Phase-2 cycle 6): scan-side prefetch-pipelining
+# latency-hiding cost model — serial windows (cycle-5) vs one-window-deep
+# readahead (window k+1's coalesced read overlaps window k's consume). Models the
+# cross-window RTT term (FRS_MODEL_RTT_MS / FRS_MODEL_CONSUME_MS) over a bounded
+# pool mirroring read_io_pool. std-only; --smoke asserts the win at consume≈rtt.
+[[bin]]
+name = "vlog_scan_readahead"
+path = "src/bin/vlog_scan_readahead.rs"

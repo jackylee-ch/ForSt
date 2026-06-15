@@ -35,7 +35,8 @@ pub use file_header::FileHeader;
 pub use footer::{ChecksumType, FooterV1, FOOTER_FIXED_FIELDS_SIZE, FOOTER_TAIL_SIZE};
 pub use kv_block::{encode_kv_data_block, KvBlock, RowRanges, SliceRef};
 pub use prefetch::{
-    prefetch_buffered_bytes, prime_opens_concurrent, BlockPrefetcher, CompactionReadStats,
+    prefetch_buffered_bytes, prime_opens_concurrent, submit_read_job, BlockPrefetcher,
+    CompactionReadStats,
 };
 pub use reader::{
     batch_key_value_data, for_each_row_in_batch, for_each_row_ranges_in_batch,

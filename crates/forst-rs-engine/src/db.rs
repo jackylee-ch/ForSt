@@ -406,6 +406,87 @@ fn vlog_scan_coalesce_window() -> usize {
     })
 }
 
+/// FRS-VLOG-SCAN-READAHEAD master flag for SCAN-side prefetch pipelining of the
+/// windowed value-log deref (`FRS_VLOG_SCAN_READAHEAD=1`, **DEFAULT OFF**).
+/// Design: `2026-06-15-vlog-scan-readahead-design.md`.
+///
+/// `FRS_VLOG_SCAN_COALESCE` resolves a scan's `BlobRef` derefs ONE WINDOW at a
+/// time, but [`ScanCoalesceIter`] processes windows SERIALLY relative to
+/// consumption: `next` drains window `k`'s `ready` queue, and only when it is
+/// EMPTY does it BLOCK on window `k+1`'s coalesced remote reads. On the
+/// disaggregated/remote path that is one window-worth of remote RTT of dead time
+/// between every window. When this flag is ON (AND the FS is remote AND a
+/// `self_weak` is available), [`ScanCoalesceIter`] instead does ONE-WINDOW-DEEP
+/// look-ahead: while the consumer drains window `k`, window `k+1`'s coalesced
+/// per-segment reads run ASYNCHRONOUSLY on the shared read-I/O pool — the
+/// iterator-side analogue of ForSt's async `readahead_size`. The look-ahead pulls
+/// exactly the rows the inner cursor would have yielded, in the SAME order (the
+/// inner cursor is advanced only on the consumer thread, in window order — see
+/// [`ScanCoalesceIter::assemble_window`]); only WHEN each blob is read changes, so
+/// the emitted row sequence is byte-AND-order-identical. An early iterator drop
+/// cancels cleanly (the in-flight pool job's send becomes a no-op when the
+/// receiver drops; nothing leaks, no thread strands). Default OFF => the legacy
+/// blocking `fill_window`, byte-for-byte. Read LIVE (test-toggle-able), once at
+/// iterator construction.
+fn vlog_scan_readahead_enabled() -> bool {
+    let ov = VLOG_SCAN_READAHEAD_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    matches!(
+        std::env::var("FRS_VLOG_SCAN_READAHEAD").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// FRS-VLOG-SCAN-READAHEAD: optional per-window look-ahead depth OVERRIDE
+/// (`FRS_VLOG_SCAN_READAHEAD_WINDOW`). When UNSET (`None`) the readahead reuses
+/// the coalesce window ([`vlog_scan_coalesce_window`]) — a single source of truth
+/// for the window granularity. When SET it overrides that window (clamped to
+/// `[1, 65536]`) so the look-ahead can be exercised at a small window (many
+/// pipeline boundaries) without perturbing the process-wide coalesce window. Read
+/// LIVE so tests toggle it deterministically.
+fn vlog_scan_readahead_window_override() -> Option<usize> {
+    std::env::var("FRS_VLOG_SCAN_READAHEAD_WINDOW")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(1, 65536))
+}
+
+/// FRS-VLOG-SCAN-READAHEAD test override for [`vlog_scan_readahead_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static VLOG_SCAN_READAHEAD_OVERRIDE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-VLOG-SCAN-READAHEAD: forces the scan-side readahead on/off for
+/// tests/benches (`None` = defer to `FRS_VLOG_SCAN_READAHEAD`).
+pub fn set_vlog_scan_readahead_override(v: Option<bool>) {
+    VLOG_SCAN_READAHEAD_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// FRS-VLOG-SCAN-READAHEAD: process-global count of windows launched onto the
+/// read-I/O pool by [`ScanCoalesceIter::launch_prefetch`]. Diagnostic only —
+/// lets a test PROVE the readahead path actually engaged (vs a silent fallback
+/// to the blocking `fill_window`). Never read on the hot path.
+static VLOG_SCAN_READAHEAD_LAUNCHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// FRS-VLOG-SCAN-READAHEAD diag: total windows launched (see
+/// [`VLOG_SCAN_READAHEAD_LAUNCHED`]). Test-only — proves engagement.
+#[cfg(test)]
+fn vlog_scan_readahead_launched() -> u64 {
+    VLOG_SCAN_READAHEAD_LAUNCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// FRS-VLOG-DEREF-FANOUT master flag for parallelizing the coalesced
 /// value-log deref's PER-SEGMENT reads (`FRS_VLOG_DEREF_FANOUT=1`, **DEFAULT
 /// OFF**). Design: `2026-06-15-vlog-deref-segment-fanout-design.md`.
@@ -10181,12 +10262,11 @@ impl DbImpl {
         // serial remote GET per row — while emitting in the SAME key order.
         // Default OFF ⇒ the inline per-row path below, byte-for-byte.
         if vlog_scan_coalesce_enabled() {
-            return Ok(Box::new(ScanCoalesceIter::new(
-                db,
-                cf_data,
-                inner,
-                vlog_scan_coalesce_window(),
-            )));
+            // The coalesce window is the granularity; FRS-VLOG-SCAN-READAHEAD may
+            // override it (smaller ⇒ more pipeline boundaries) when set.
+            let window =
+                vlog_scan_readahead_window_override().unwrap_or_else(vlog_scan_coalesce_window);
+            return Ok(Box::new(ScanCoalesceIter::new(db, cf_data, inner, window)));
         }
         // FRS-VALUE-CARRYING-MERGE (2026-06-06): resolve SST-resident Puts
         // inline from the merge's cursor position — eliminating the per-key
@@ -11259,6 +11339,19 @@ impl DbImpl {
         let mut inner = self.build_lazy_range_key_stream(cf, lower, upper)?;
         inner.set_shared_error_slot(error_slot);
         let db = Arc::clone(self);
+        // FRS-VLOG-SCAN-COALESCE / FRS-VLOG-SCAN-READAHEAD (Phase-2 cycles 5-6):
+        // route the RANGE path through the same windowed-coalesce iterator the
+        // prefix path uses (this range scan backs q9/q11/q19/q20). When the
+        // coalesce flag is ON the window batches `BlobRef` derefs (group-by-
+        // segment + offset-sort + optional per-segment fan-out); when readahead is
+        // additionally ON (+ remote FS) the next window's coalesced read overlaps
+        // the current window's drain. Both emit in the SAME key order. Default OFF
+        // ⇒ the inline per-row deref below, byte-for-byte.
+        if vlog_scan_coalesce_enabled() {
+            let window =
+                vlog_scan_readahead_window_override().unwrap_or_else(vlog_scan_coalesce_window);
+            return Ok(Box::new(ScanCoalesceIter::new(db, cf_data, inner, window)));
+        }
         Ok(Box::new(std::iter::from_fn(move || loop {
             let (key_arc, decision) = inner.next_with_value()?;
             match decision {
@@ -18262,6 +18355,31 @@ struct ScanCoalesceIter {
     ready: std::collections::VecDeque<ForstResult<(Arc<[u8]>, Arc<[u8]>)>>,
     /// Set once the inner cursor is exhausted; no further windows are filled.
     inner_done: bool,
+    /// FRS-VLOG-SCAN-READAHEAD: when `Some`, the iterator runs one-window-deep
+    /// look-ahead — `weak` forms the `'static` pool job that resolves the next
+    /// window's coalesced derefs while the consumer drains the current window.
+    /// `None` ⇒ the legacy blocking `fill_window` (flag OFF / local FS / no
+    /// `self_weak`). Set once at construction.
+    readahead: Option<Weak<DbImpl>>,
+    /// FRS-VLOG-SCAN-READAHEAD: the NEXT window's in-flight resolution (at most
+    /// one window deep). `recv` yields the resolved rows (in slot order) or the
+    /// in-band deref error; on early drop the channel disconnects and the pool
+    /// job's send becomes a no-op (clean cancellation, nothing strands).
+    prefetch: Option<WindowPrefetch>,
+}
+
+/// FRS-VLOG-SCAN-READAHEAD: a single window's in-flight resolution, owned by the
+/// consumer. The pool job (launched by [`ScanCoalesceIter::launch_prefetch`])
+/// resolves the assembled slots' coalesced derefs and SENDS the slot-ordered
+/// `ready` rows back; the consumer JOINS by blocking on `rx.recv()` — but only
+/// after it has drained the previous window, so the read overlapped consumption.
+struct WindowPrefetch {
+    /// The resolved, slot-ordered rows of this window (or a disconnect on
+    /// cancellation / DB teardown — surfaced as a benign empty window).
+    rx: std::sync::mpsc::Receiver<std::collections::VecDeque<ForstResult<(Arc<[u8]>, Arc<[u8]>)>>>,
+    /// Whether the assemble that produced this prefetch hit the inner cursor's
+    /// end (so after joining it, no further window should be launched).
+    inner_done_after: bool,
 }
 
 /// One slot's resolved state while a window is being assembled. The slot order
@@ -18289,6 +18407,15 @@ impl ScanCoalesceIter {
         inner: LazyPrefixIter,
         window: usize,
     ) -> Self {
+        // FRS-VLOG-SCAN-READAHEAD: engage one-window-deep look-ahead only when
+        // the flag is ON, the FS is remote (local derefs are µs-class preads with
+        // no RTT to hide — the pool hop would be pure overhead), AND a
+        // `self_weak` exists to form the `'static` pool job. Resolved once here.
+        let readahead = if vlog_scan_readahead_enabled() && !db.fs.is_local() {
+            db.self_weak.get().cloned()
+        } else {
+            None
+        };
         Self {
             db,
             cf_data,
@@ -18296,26 +18423,35 @@ impl ScanCoalesceIter {
             window: window.max(1),
             ready: std::collections::VecDeque::new(),
             inner_done: false,
+            readahead,
+            prefetch: None,
         }
     }
 
-    /// Drain up to `window` rows from the inner cursor, resolve the window's
-    /// `BlobRef` derefs in ONE coalesced pass, and push the resolved rows into
-    /// `self.ready` IN SLOT (== key) ORDER. Sets `self.inner_done` when the inner
-    /// cursor exhausts. A window can legitimately produce zero `ready` rows (all
-    /// slots `Skip`); the `next` loop re-fills in that case.
-    fn fill_window(&mut self) {
-        // `slots` keeps window order; `deferred` carries (slot_index, pointer)
-        // for the coalesced pass. A coalesced-deref error converts every still
-        // PendingBlob slot to a `Skip` and queues one in-band error (first-error
-        // wins — the serial `?` behaviour).
+    /// Pull up to `window` rows from the inner cursor and classify each into a
+    /// [`ScanSlot`] IN SLOT (== key) ORDER, recording `(slot_index, pointer)`
+    /// pairs for the coalesced deref pass. This is the synchronous, order-defining
+    /// phase: it ADVANCES the inner cursor (so under readahead it always runs on
+    /// the consumer thread, in window order — the look-ahead never races the
+    /// cursor or its version pin). Returns the assembled slots, the deferred set,
+    /// and whether the inner cursor reached its end (so the caller can stop
+    /// launching further windows). NO blob I/O happens here — only the pointer
+    /// decode; the remote read is the resolve phase's job.
+    fn assemble_window(
+        &mut self,
+    ) -> (
+        Vec<ScanSlot>,
+        Vec<(usize, forst_rs_storage::vlog::ValuePointer)>,
+        bool,
+    ) {
         let mut slots: Vec<ScanSlot> = Vec::new();
         let mut deferred: Vec<(usize, forst_rs_storage::vlog::ValuePointer)> = Vec::new();
+        let mut done = false;
         while slots.len() < self.window {
             let (key_arc, decision) = match self.inner.next_with_value() {
                 Some(kv) => kv,
                 None => {
-                    self.inner_done = true;
+                    done = true;
                     break;
                 }
             };
@@ -18344,46 +18480,106 @@ impl ScanCoalesceIter {
                 }
             }
         }
+        (slots, deferred, done)
+    }
 
-        // Resolve the deferred Blob derefs in ONE coalesced pass. `resolved`
-        // mirrors the slot convention `coalesced_vlog_deref_into` scatters into
-        // (`Some(Some(value))` at each deferred slot).
+    /// Resolve an assembled window's deferred `BlobRef` derefs in ONE coalesced
+    /// pass and flatten the slots into slot-ordered emit rows. A free function
+    /// over `&DbImpl` (NOT `&self`) so it can run identically on the consumer
+    /// thread (the blocking path) and on a read-I/O pool worker (the readahead
+    /// path) over an upgraded `Weak<DbImpl>`. Byte-AND-order-identical to the
+    /// legacy `fill_window` tail: Put/Fallback rows resolve in place, Blob slots
+    /// are filled by the coalesced pass, `Skip` slots emit nothing, and a
+    /// coalesced-deref error is surfaced at the FIRST pending Blob slot with the
+    /// remaining pending Blobs discarded (the serial `?` behaviour).
+    fn resolve_window_slots(
+        db: &DbImpl,
+        slots: Vec<ScanSlot>,
+        deferred: Vec<(usize, forst_rs_storage::vlog::ValuePointer)>,
+    ) -> std::collections::VecDeque<ForstResult<(Arc<[u8]>, Arc<[u8]>)>> {
+        let mut out = std::collections::VecDeque::with_capacity(slots.len());
+        // `resolved` mirrors the slot convention `coalesced_vlog_deref_into`
+        // scatters into (`Some(Some(value))` at each deferred slot).
         let mut resolved: Vec<Option<Option<Vec<u8>>>> = vec![None; slots.len()];
         let mut deref_err: Option<ForstError> = None;
         if !deferred.is_empty() {
-            if let Err(e) = self.db.coalesced_vlog_deref_into(deferred, &mut resolved) {
+            if let Err(e) = db.coalesced_vlog_deref_into(deferred, &mut resolved) {
                 deref_err = Some(e);
             }
         }
-
-        // Emit the window IN SLOT ORDER. On a coalesced-deref error, the FIRST
-        // PendingBlob slot carries the error and every remaining PendingBlob is
-        // dropped (the serial `?` aborts the rest of the batch); Put/Fallback
-        // rows that already resolved still emit ahead of it, preserving order.
         for (i, slot) in slots.into_iter().enumerate() {
             match slot {
-                ScanSlot::Ready(k, v) => self.ready.push_back(Ok((k, v))),
-                ScanSlot::Err(e) => self.ready.push_back(Err(e)),
+                ScanSlot::Ready(k, v) => out.push_back(Ok((k, v))),
+                ScanSlot::Err(e) => out.push_back(Err(e)),
                 ScanSlot::Skip => {}
                 ScanSlot::PendingBlob(k) => {
                     if let Some(e) = deref_err.take() {
-                        // Surface the deref error at the first pending slot; the
-                        // rest of the window's pending Blobs are discarded.
-                        self.ready.push_back(Err(e));
-                        // Leave `deref_err` as `None` so subsequent PendingBlob
-                        // slots below are silently dropped (no value, no error).
+                        out.push_back(Err(e));
+                        // Leave `deref_err` None so the remaining pending Blobs
+                        // below are silently dropped (no value, no error).
                         continue;
                     }
-                    // The coalesced pass scattered this slot's value in.
                     let value = resolved
                         .get_mut(i)
                         .and_then(|s| s.take())
                         .flatten()
                         .unwrap_or_default();
-                    self.ready.push_back(Ok((k, Arc::<[u8]>::from(value))));
+                    out.push_back(Ok((k, Arc::<[u8]>::from(value))));
                 }
             }
         }
+        out
+    }
+
+    /// Legacy blocking window fill (readahead OFF): assemble the next window on
+    /// the consumer thread, resolve its derefs synchronously, and push the rows
+    /// into `self.ready` in slot order. Sets `self.inner_done` at cursor end. A
+    /// window can legitimately produce zero `ready` rows (all `Skip`); the `next`
+    /// loop re-fills in that case. Byte-AND-timing-identical to the cycle-5 path.
+    fn fill_window(&mut self) {
+        let (slots, deferred, done) = self.assemble_window();
+        if done {
+            self.inner_done = true;
+        }
+        let rows = Self::resolve_window_slots(&self.db, slots, deferred);
+        self.ready.extend(rows);
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD: assemble the next window on the consumer thread
+    /// (advancing the inner cursor in order), then LAUNCH its coalesced deref on
+    /// the read-I/O pool, returning IMMEDIATELY with a [`WindowPrefetch`] handle.
+    /// The job upgrades the `Weak<DbImpl>` and runs [`Self::resolve_window_slots`]
+    /// off-thread, sending the slot-ordered rows back; the consumer joins it
+    /// (blocking on `recv`) only after draining the current window, so the read
+    /// overlaps consumption. If the inner cursor was already exhausted (the
+    /// assembled window is empty AND done), no job is launched and `None` is
+    /// returned. On DB teardown mid-flight the `Weak` upgrade fails and an empty
+    /// window is sent (benign — by then the receiver is the only observer).
+    fn launch_prefetch(&mut self, weak: Weak<DbImpl>) -> Option<WindowPrefetch> {
+        let (slots, deferred, done) = self.assemble_window();
+        if slots.is_empty() && done {
+            // Cursor exhausted with nothing assembled — no window to prefetch.
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        VLOG_SCAN_READAHEAD_LAUNCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        forst_rs_storage::sst::submit_read_job(Box::new(move || {
+            let rows = match weak.upgrade() {
+                Some(db) => Self::resolve_window_slots(&db, slots, deferred),
+                // DB dropped mid-flight: emit an empty window. The receiver, if
+                // still alive, observes no rows (the scan is being torn down);
+                // if the receiver dropped (early-drop cancellation), `send`
+                // below is a harmless no-op.
+                None => std::collections::VecDeque::new(),
+            };
+            // Best-effort send: a dropped receiver (early iterator drop) makes
+            // this a no-op — the resolved rows are dropped, nothing leaks.
+            let _ = tx.send(rows);
+        }));
+        Some(WindowPrefetch {
+            rx,
+            inner_done_after: done,
+        })
     }
 }
 
@@ -18395,12 +18591,48 @@ impl Iterator for ScanCoalesceIter {
             if let Some(row) = self.ready.pop_front() {
                 return Some(row);
             }
+            // FRS-VLOG-SCAN-READAHEAD: pipelined path. While the consumer drained
+            // the previous window, the NEXT window's coalesced read was running on
+            // the pool; join it here (the read has overlapped the drain), promote
+            // its rows to `ready`, and immediately launch the window after it.
+            if let Some(weak) = self.readahead.clone() {
+                // Ensure a window is in flight (the very first call has none — it
+                // launches, then immediately joins, so cold-start = one un-hidden
+                // RTT, exactly as the inline path's first window).
+                if self.prefetch.is_none() && !self.inner_done {
+                    self.prefetch = self.launch_prefetch(weak.clone());
+                    if self.prefetch.is_none() {
+                        // Nothing left to assemble.
+                        self.inner_done = true;
+                    }
+                }
+                // No window in flight and nothing left to assemble ⇒ the scan is
+                // exhausted (`?` returns `None` from `next`).
+                let pf = self.prefetch.take()?;
+                // Join the in-flight window. A channel disconnect (pool job
+                // panicked / DB torn down) yields an empty window — the scan ends
+                // cleanly rather than stranding.
+                let rows = pf.rx.recv().unwrap_or_default();
+                self.ready.extend(rows);
+                if pf.inner_done_after {
+                    self.inner_done = true;
+                } else {
+                    // Look one window ahead: launch window k+1 so it overlaps the
+                    // drain of the window we just promoted.
+                    self.prefetch = self.launch_prefetch(weak);
+                    if self.prefetch.is_none() {
+                        self.inner_done = true;
+                    }
+                }
+                // A window can resolve to ZERO ready rows (all `Skip`) yet leave
+                // more inner rows; loop to join/launch again rather than return a
+                // spurious None.
+                continue;
+            }
+            // Legacy blocking path (readahead OFF / local / no self_weak).
             if self.inner_done {
                 return None;
             }
-            // Window empty and inner not exhausted — fill the next window. A
-            // window can resolve to ZERO ready rows (all `Skip`) yet leave more
-            // inner rows; loop to fill again rather than return a spurious None.
             self.fill_window();
         }
     }
@@ -19973,6 +20205,259 @@ mod tests {
         set_vlog_deref_fanout_override(None);
         set_vlog_coalesce_deref_override(None);
         set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD (2026-06-15, Phase-2 cycle 6): the scan-side
+    /// prefetch-pipelined path MUST be byte-AND-order-identical to the
+    /// non-readahead windowed coalesce over a scan of KV-separated values. Built
+    /// on a REMOTE-reporting FS (so readahead engages — it is gated on
+    /// `!fs.is_local()`) with KV-sep ON, multi-segment values, deletes, and a
+    /// SMALL window (`FRS_VLOG_SCAN_READAHEAD_WINDOW=4`) so the scan crosses MANY
+    /// pipeline boundaries (the look-ahead actually overlaps windows, not one
+    /// giant window). Drives the FFI RANGE scan path
+    /// (`scan_iter_owned_arc_with_error_slot`) — the path q9/q11/q19/q20 use.
+    #[test]
+    fn test_vlog_scan_readahead_byte_identical_kvsep_remote() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        // Readahead is a CHILD of the windowed scan-coalesce path — coalesce ON.
+        set_vlog_scan_coalesce_override(Some(true));
+        // Force a tiny window so the scan pipelines across many boundaries.
+        std::env::set_var("FRS_VLOG_SCAN_READAHEAD_WINDOW", "4");
+
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 160;
+        // THREE flush waves ⇒ >= 2 vlog segments so a window spans M >= 2
+        // segments; deletes create tombstones the scan must hide (Skip slots,
+        // which the pipeline must drop without emitting a spurious None).
+        let build = || -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<(Vec<u8>, Vec<u8>)>) {
+            let opts = EngineOptions {
+                db_path: "/db".to_string(),
+                write_buffer_size: 2_000_000_000,
+                max_write_buffer_number: 8,
+                ..EngineOptions::default()
+            };
+            let fs: Arc<dyn FileSystem> = Arc::new(RemoteFakeFs::new());
+            let db = DbImpl::open_with_fs(opts, fs).expect("open remote-fake");
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("scan-readahead"))
+                .unwrap();
+            let mut kv: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N);
+            for i in 0..N as u32 {
+                let k = format!("row{i:05}").into_bytes();
+                let v = mkrand(0x1000 + i as u64, 256 + (i as usize % 64));
+                db.put(&cf, &k, &v).unwrap();
+                kv.push((k, v));
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 0");
+            for i in (0..N as u32).step_by(2) {
+                let k = format!("row{i:05}").into_bytes();
+                let v = mkrand(0x5000 + i as u64, 256 + (i as usize % 48));
+                db.put(&cf, &k, &v).unwrap();
+                kv[i as usize].1 = v;
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 1");
+            for i in (0..N as u32).step_by(19) {
+                let k = format!("row{i:05}").into_bytes();
+                db.delete(&cf, &k).unwrap();
+            }
+            for i in (0..N as u32).step_by(3) {
+                if i % 19 == 0 {
+                    continue; // keep the deletes as genuine misses
+                }
+                let k = format!("row{i:05}").into_bytes();
+                let v = mkrand(0x9000 + i as u64, 256 + (i as usize % 32));
+                db.put(&cf, &k, &v).unwrap();
+                kv[i as usize].1 = v;
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed seg 2");
+            assert!(
+                db.version_set.current().vlog_segments.len() >= 2,
+                "need >= 2 vlog segments to exercise the readahead pipeline (got {})",
+                db.version_set.current().vlog_segments.len()
+            );
+            (db, cf, kv)
+        };
+
+        // Full RANGE scan (FFI path) in emit order, owned (key, value) pairs.
+        let collect_scan = |db: &Arc<DbImpl>, cf: &ColumnFamilyHandle| -> Vec<(Vec<u8>, Vec<u8>)> {
+            let slot: Arc<Mutex<Option<ForstError>>> = Arc::new(Mutex::new(None));
+            let it = db
+                .scan_iter_owned_arc_with_error_slot(cf, b"", None, Arc::clone(&slot))
+                .unwrap();
+            let rows: Vec<(Vec<u8>, Vec<u8>)> = it
+                .map(|r| {
+                    let (k, v) = r.unwrap();
+                    (k.to_vec(), v.to_vec())
+                })
+                .collect();
+            assert!(
+                slot.lock().unwrap().is_none(),
+                "no tier-peek error expected"
+            );
+            rows
+        };
+
+        // Arm 1: readahead forced OFF (the cycle-5 blocking windowed coalesce).
+        set_vlog_scan_readahead_override(Some(false));
+        let (db_off, cf_off, kv) = build();
+        let off = collect_scan(&db_off, &cf_off);
+
+        // Sorted-key + latest-value oracle (the deleted rows are MISSES).
+        let deleted: std::collections::HashSet<u32> = (0..N as u32).step_by(19).collect();
+        let mut want: Vec<(Vec<u8>, Vec<u8>)> = kv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !deleted.contains(&(*i as u32)))
+            .map(|(_, (k, v))| (k.clone(), v.clone()))
+            .collect();
+        want.sort();
+        assert_eq!(off, want, "OFF scan must be sorted keys w/ latest values");
+
+        // Arm 2: readahead forced ON on a fresh deterministic build.
+        set_vlog_scan_readahead_override(Some(true));
+        let (db_on, cf_on, kv_on) = build();
+        assert_eq!(kv, kv_on, "build must be deterministic across arms");
+        let launched_before = vlog_scan_readahead_launched();
+        let on = collect_scan(&db_on, &cf_on);
+        // PROVE the readahead path actually engaged (not a silent fallback): with
+        // a 4-row window over ~150 rows the scan must launch many windows.
+        let launched = vlog_scan_readahead_launched() - launched_before;
+        assert!(
+            launched >= 2,
+            "readahead must launch multiple windows (launched={launched}) — engagement proof"
+        );
+        assert_eq!(
+            on, off,
+            "scan readahead ON must be byte-identical (rows + ORDER) to OFF"
+        );
+        assert_eq!(on, want, "ON scan must be sorted keys w/ latest values");
+
+        std::env::remove_var("FRS_VLOG_SCAN_READAHEAD_WINDOW");
+        set_vlog_scan_readahead_override(None);
+        set_vlog_scan_coalesce_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD: a mid-scan overwrite+flush yields the SAME rows as
+    /// the inline path (version-pin parity — the look-ahead resolves only pointers
+    /// the cursor already yielded), AND an EARLY DROP of the readahead iterator
+    /// cancels cleanly: no panic, no stranded pool job, no leaked prefetch, and a
+    /// follow-up scan still returns correct data (the pool is intact).
+    #[test]
+    fn test_vlog_scan_readahead_midscan_overwrite_and_early_drop() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+        set_vlog_scan_coalesce_override(Some(true));
+        std::env::set_var("FRS_VLOG_SCAN_READAHEAD_WINDOW", "4");
+        set_vlog_scan_readahead_override(Some(true));
+
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 64;
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            write_buffer_size: 2_000_000_000,
+            max_write_buffer_number: 8,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(RemoteFakeFs::new());
+        let db = DbImpl::open_with_fs(opts, fs).expect("open remote-fake");
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("ra-drop"))
+            .unwrap();
+        let mut want: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            std::collections::BTreeMap::new();
+        for i in 0..N as u32 {
+            let k = format!("row{i:05}").into_bytes();
+            let v = mkrand(0x1000 + i as u64, 300);
+            db.put(&cf, &k, &v).unwrap();
+            want.insert(k, v);
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flushed seg 0");
+
+        // EARLY DROP: open a readahead scan, pull only a few rows, then drop the
+        // iterator while a window is in flight. Must not panic / strand / leak.
+        {
+            let slot: Arc<Mutex<Option<ForstError>>> = Arc::new(Mutex::new(None));
+            let mut it = db
+                .scan_iter_owned_arc_with_error_slot(&cf, b"", None, Arc::clone(&slot))
+                .unwrap();
+            let mut pulled = 0usize;
+            for _ in 0..5 {
+                if it.next().is_some() {
+                    pulled += 1;
+                }
+            }
+            assert!(pulled > 0, "expected to pull a few rows before dropping");
+            // `it` (and its prefetch Receiver) drop here — the in-flight pool
+            // job's `send` becomes a no-op; nothing leaks.
+        }
+
+        // MID-SCAN OVERWRITE + FLUSH: overwrite every key to a NEW segment, then
+        // confirm a fresh readahead scan sees the LATEST values (version parity).
+        for i in 0..N as u32 {
+            let k = format!("row{i:05}").into_bytes();
+            let v = mkrand(0x9000 + i as u64, 320);
+            db.put(&cf, &k, &v).unwrap();
+            want.insert(k, v);
+        }
+        db.switch_and_flush(&cf).unwrap().expect("flushed seg 1");
+
+        let slot: Arc<Mutex<Option<ForstError>>> = Arc::new(Mutex::new(None));
+        let it = db
+            .scan_iter_owned_arc_with_error_slot(&cf, b"", None, Arc::clone(&slot))
+            .unwrap();
+        let got: Vec<(Vec<u8>, Vec<u8>)> = it
+            .map(|r| {
+                let (k, v) = r.unwrap();
+                (k.to_vec(), v.to_vec())
+            })
+            .collect();
+        assert!(slot.lock().unwrap().is_none());
+        let want_vec: Vec<(Vec<u8>, Vec<u8>)> = want.into_iter().collect();
+        assert_eq!(
+            got, want_vec,
+            "post-drop + post-overwrite readahead scan must return the latest values in order"
+        );
+
+        std::env::remove_var("FRS_VLOG_SCAN_READAHEAD_WINDOW");
+        set_vlog_scan_readahead_override(None);
+        set_vlog_scan_coalesce_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-SCAN-READAHEAD: the gate defaults OFF and the override flips it
+    /// deterministically (without racing the env read).
+    #[test]
+    fn test_vlog_scan_readahead_flag_default_off_and_override() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_vlog_scan_readahead_override(Some(false));
+        assert!(!vlog_scan_readahead_enabled(), "forced-off must read false");
+        set_vlog_scan_readahead_override(Some(true));
+        assert!(vlog_scan_readahead_enabled(), "forced-on must read true");
+        set_vlog_scan_readahead_override(None);
     }
 
     /// FRS-VLOG-SCAN-COALESCE: the gate defaults OFF and the override flips it
@@ -25022,6 +25507,13 @@ mod tests {
     /// compaction input's unlink is deferred until the pin releases.
     #[test]
     fn test_phase2_s1_mapping_checkpoint_link_lifecycle() {
+        // Serialize against the KV-sep-override-mutating tests (cycle-4 fanout /
+        // cycle-5 scan-coalesce / cycle-6 readahead) which flip the PROCESS-GLOBAL
+        // `KV_SEPARATION_OVERRIDE`: a parallel test forcing KV-sep ON would change
+        // this test's compaction separation behaviour mid-run. Holding the shared
+        // `WA_V1_TEST_LOCK` (the same mutex those override-setters hold) removes
+        // the cross-test race without touching any product code.
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use forst_rs_io::{FileMappingManager, MemoryFileSystem, UnlinkOutcome};
 
         fn read_all(fs: &dyn FileSystem, path: &Path) -> Vec<u8> {

@@ -336,6 +336,21 @@ pub fn prime_opens_concurrent(jobs: Vec<Box<dyn FnOnce() + Send + 'static>>) {
     }
 }
 
+/// FRS-VLOG-SCAN-READAHEAD (Phase-2 cycle 6): submit ONE fire-and-forget job to
+/// the shared read-I/O pool and return IMMEDIATELY (the non-blocking,
+/// no-barrier sibling of [`prime_opens_concurrent`]). The scan-readahead
+/// iterator uses this to launch window `k+1`'s coalesced deref while the consumer
+/// drains window `k`; the CONSUMER is the barrier (it joins the job's result
+/// channel only when window `k` empties), so no completion counter is needed
+/// here. The job runs under the pool's `catch_unwind` (a panic is contained and
+/// the job's result channel disconnects, which the consumer converts to an
+/// error / cancellation). Use this only when the work owns its own completion
+/// signalling (a channel the caller waits on); for "do K opens then continue"
+/// use the barriering [`prime_opens_concurrent`].
+pub fn submit_read_job(job: Box<dyn FnOnce() + Send + 'static>) {
+    read_io_pool().submit(job);
+}
+
 /// L4 (2026-06-12 compaction windowed-readpath design §2.1): what
 /// [`fetch_window`] does with blocks it had to READ (cache misses).
 /// The cache-first check (window splitting around hits) is unconditional —
