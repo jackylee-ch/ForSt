@@ -489,11 +489,64 @@ fn upload_sem_total_permits() -> usize {
 fn build_upload_semaphores() -> (Arc<Semaphore>, Arc<Semaphore>) {
     let total = upload_sem_total_permits();
     let reserved = upload_flush_reserved_permits();
+    warn_reserved_lane_undersized_for_byte_budget(reserved);
     let shared = total.saturating_sub(reserved);
     (
         Arc::new(Semaphore::new(shared)),
         Arc::new(Semaphore::new(reserved)),
     )
+}
+
+/// FRS-PHASE2 UPLOAD-QoS COMPOSE (2026-06-15): H1 footgun guard.
+///
+/// When BOTH the byte budget ([`UPLOAD_BYTE_BUDGET_MIB_ENV`]) and the reserved
+/// flush lane ([`UPLOAD_FLUSH_RESERVED_ENV`]) are ON, the reserved lane is sized
+/// in MiB-permits (same unit as the budget), so a flush-output SST reserves
+/// `ceil(sst_bytes / 1 MiB)` permits — typically several. If the reserved lane is
+/// sized with COUNT intuition (e.g. `1`, "one flush slot") it can NEVER grant a
+/// multi-MiB flush's permit request, so `try_acquire_many_owned` always fails and
+/// the flush silently falls back to the shared lane — the reserved lane does
+/// NOTHING (reserved-lane hit rate → 0%, validated by the `disagg_upload_qos_compose`
+/// mini-bench). This is purely a CONFIGURATION footgun: the levers compose
+/// correctly when the lane is sized to at least one flush SST worth of MiB-permits.
+///
+/// This is a DIAGNOSTIC ONLY — it logs a one-time WARN and changes NO permits, NO
+/// bytes, NO data path, so it is byte-identical whether or not it fires. We warn
+/// when the reserved lane is `1` MiB-permit while the byte budget is engaged,
+/// because a `1`-permit lane is below any realistic flush SST size (a flush SST is
+/// MiB-scale) and is the canonical mis-sizing. We do NOT auto-resize the lane: the
+/// flush SST size is not known here, and (per the mini-bench) the byte budget
+/// itself supplies the granular shared-lane headroom that prevents flush
+/// starvation, so an under-sized reserved lane degrades gracefully rather than
+/// regressing — a silent no-op, which the warning makes visible.
+fn warn_reserved_lane_undersized_for_byte_budget(reserved: usize) {
+    if reserved_lane_is_undersized(reserved, upload_byte_budget_mib().is_some()) {
+        use std::sync::OnceLock;
+        static WARNED: OnceLock<()> = OnceLock::new();
+        WARNED.get_or_init(|| {
+            tracing::warn!(
+                target: "forst_rs_io::opendal_backend",
+                reserved_permits = reserved,
+                "FRS_UPLOAD_FLUSH_RESERVED={reserved} is sized in MiB-permits because \
+                 FRS_UPLOAD_BYTE_BUDGET_MIB is set, but a flush-output SST reserves \
+                 ceil(sst_bytes / 1 MiB) permits (several). A {reserved}-permit reserved lane \
+                 can never grant a multi-MiB flush, so the flush-priority lane is a silent \
+                 no-op (flushes fall back to the shared lane). Size the reserved lane to at \
+                 least one flush SST worth of MiB (e.g. target_file_size in MiB), or rely on \
+                 the byte budget alone (it already bounds flush starvation)."
+            );
+        });
+    }
+}
+
+/// Pure predicate for `warn_reserved_lane_undersized_for_byte_budget`: a
+/// reserved flush lane is "undersized" (a silent no-op) only when the byte budget
+/// is engaged AND a reserved lane was requested (`reserved > 0`) AND that lane is
+/// `1` MiB-permit — below any realistic flush SST. In the count regime
+/// (`byte_budget == false`) the lane is in count units and `1` is a valid "one
+/// flush slot", so it is NEVER undersized. Unit-testable without process env.
+fn reserved_lane_is_undersized(reserved: usize, byte_budget: bool) -> bool {
+    byte_budget && reserved > 0 && reserved <= 1
 }
 
 /// Permits one upload of `nbytes` must reserve from `upload_sem`.
@@ -3301,6 +3354,25 @@ mod tests {
         let (shared, flush) = build_upload_semaphores();
         assert_eq!(shared.available_permits(), 1, "shared keeps >= 1");
         assert_eq!(flush.available_permits(), MAX_INFLIGHT_UPLOADS - 1);
+    }
+
+    /// FRS-PHASE2 UPLOAD-QoS COMPOSE — H1 footgun predicate. A reserved lane is
+    /// "undersized" (a silent no-op) ONLY when the byte budget is engaged and the
+    /// lane is `1` MiB-permit (below any flush SST). In the count regime, or with
+    /// the lever OFF (`reserved == 0`), or sized >= a flush SST, it is fine.
+    #[test]
+    fn reserved_lane_undersized_predicate() {
+        // Count regime: 1 is a valid "one flush slot" — never undersized.
+        assert!(!reserved_lane_is_undersized(0, false));
+        assert!(!reserved_lane_is_undersized(1, false));
+        assert!(!reserved_lane_is_undersized(4, false));
+        // Byte regime, lever OFF (reserved 0) — nothing to warn about.
+        assert!(!reserved_lane_is_undersized(0, true));
+        // Byte regime, reserved == 1 MiB-permit — the H1 cliff (silent no-op).
+        assert!(reserved_lane_is_undersized(1, true));
+        // Byte regime, reserved >= a flush SST worth of MiB-permits — composes.
+        assert!(!reserved_lane_is_undersized(4, true));
+        assert!(!reserved_lane_is_undersized(64, true));
     }
 
     /// THE QOS INVARIANT. With the reserved lane ON and `FRS_ASYNC_FLUSH_UPLOAD`

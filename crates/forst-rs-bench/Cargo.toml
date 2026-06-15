@@ -261,3 +261,14 @@ path = "src/bin/upload_byte_budget.rs"
 [[bin]]
 name = "disagg_readpool_contention"
 path = "src/bin/disagg_readpool_contention.rs"
+
+# disagg_upload_qos_compose: WRITE-side analogue of disagg_readpool_contention.
+# Factorial model of the three upload QoS levers (FRS_UPLOAD_FLUSH_RESERVED ×
+# FRS_UPLOAD_BYTE_BUDGET_MIB × FRS_UPLOAD_RATE_SPLIT) under a SATURATING
+# compaction-output upload stream competing with latency-critical flush uploads.
+# Quantifies whether they COMPOSE or INTERFERE (flush p99, reserved-lane hit
+# rate, compaction throughput, wall). Pure timing model, no engine state, no S3.
+# Takes --smoke for CI.
+[[bin]]
+name = "disagg_upload_qos_compose"
+path = "src/bin/disagg_upload_qos_compose.rs"
