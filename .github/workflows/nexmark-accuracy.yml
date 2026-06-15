@@ -300,7 +300,10 @@ jobs:
         if: steps.cache-hadoop.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.hadoop"
-          curl -fsSL --retry 3 -o /tmp/hadoop.tgz \
+          # dlcdn is the fast CDN mirror; archive.apache.org is the slow fallback.
+          curl -fL --retry 3 -o /tmp/hadoop.tgz \
+            https://dlcdn.apache.org/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz \
+            || curl -fL --retry 3 -o /tmp/hadoop.tgz \
             https://archive.apache.org/dist/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz
           tar -C "$GITHUB_WORKSPACE/.hadoop" -xzf /tmp/hadoop.tgz
       - name: Pin HADOOP_HOME
