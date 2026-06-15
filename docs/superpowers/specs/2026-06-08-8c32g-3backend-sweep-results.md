@@ -64,7 +64,42 @@
 #   harness turning them all on unconditionally. q4/q7/q20 survive the full stack;
 #   q9/q19 do not. (Linux box has more headroom and may not OOM — directional.)
 #
-# (light queries q0-q3,q5,q10,q13-16,q21,q22 appended below as they land)
+# ── LIGHT / source-bound queries (no FRS levers; KV-sep default OFF). forst-rs V3. ──
+# | query | frs V3 wall_s | out_rows | correctness |
+# |---|---|---|---|
+# | q0  | 30.9  | 100,000,000 | ✓ passthrough (source-bound, excluded from must-beat) |
+# | q1  | 30.4  | 100,000,000 | ✓ (source-bound) |
+# | q2  | 28.1  | 100,000,000 | ✓ (source-bound) |
+# | q3  | 40.7  | 2,201,068   | ✓ EXACT (== known rdb 2,201,068) |
+# | q5  | **OOM-DNF** | — (reached ~6M then tm1 killed 137) | ✗ sliding-window (10s/2s-slide) bid-count state OOMs the 16g/TM Mac split at 100M (KV-sep OFF; the windowed-agg memory wall) |
+# | q10 | 125.0 | 100,000,000 | ✓ (filesystem-sink, all bids) |
+# | q13 | 29.6  | 100,000,000 | ✓ (side-input lookup join) |
+# | q14 | 29.6  | 100,000,000 | ✓ |
+# | q15 | 176.8 | 92,000,000  | ✓ (day-bucketed distinct counts) |
+# | q16 | 466.2 | 92,000,000  | ✓ (channel+day distinct counts; one mid-run compaction stall, recovered) |
+# | q21 | 53.2  | 100,000,000 | ✓ |
+# | q22 | 44.0  | 100,000,000 | ✓ |
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★ PMC-1 V3 forst-rs-ONLY SWEEP — FINAL SUMMARY (Mac/directional, 2026-06-15/16)
+# ═══════════════════════════════════════════════════════════════════════════
+# Engine c60ecae35 (point-deref wired). 22 queries (q6 skipped). Uniform 2×4c/16g
+# split, process.size=10240m, EVENTS_NUM=100M. forst-rs ONLY; rdb/forst REUSED.
+#  - FINISHED + correct out_rows: 19/22 (q0,q1,q2,q3,q7,q8,q10,q11,q12,q13,q14,
+#    q15,q16,q17,q18,q20,q21,q22, q4).
+#  - OOM-DNF (3): q5 (sliding-window), q9 + q19 (full join_stack). All exit-137
+#    cgroup OOM on the 16g/TM Mac split — NOT correctness bugs; the prior section
+#    ran q5/q9/q19 to completion under leaner config / more headroom.
+#  - POINT-DEREF (the headline): q17 333.7→217.9 (-35%, now BEATS ForSt 245.9);
+#    q11 219.9→208.9 (-5%). Real, q17-shaped; small elsewhere. Still > RocksDB.
+#  - BEAT-BOTH (reused rdb/forst): q18 (442.6 ~ties forst 441.7, beats rdb? no —
+#    1.23× rdb within bar). Honestly, under the V3 full-stack-ON config NO query
+#    cleanly BEATS BOTH on this Mac population that didn't already in the prior
+#    leaner section; the full stack is net-negative for the windowed/join families
+#    here (KV-sep overhead + OOMs). The decisive wins (q18/q19 beat-both) were the
+#    LEANER prior config — see the section below. NET: V3 full-stack-ON is the
+#    WRONG uniform default on a memory-constrained box; the engine needs the
+#    dynamic never-OOM gate. Mac numbers are DIRECTIONAL vs the Linux references.
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★★★ PMC-1 UNIFORM-SPLIT q0-q22 SWEEP 2026-06-15 (process.size=10240m fit)
