@@ -20995,13 +20995,11 @@ mod tests {
             out
         };
 
-        let want: std::collections::HashMap<Vec<u8>, Vec<u8>>;
-
         // Baseline: point OFF, coalesce OFF (legacy 64 KiB-chunk per-key deref).
         set_vlog_point_deref_override(Some(false));
         set_vlog_coalesce_deref_override(Some(false));
         let (db_off, cf_off, kv) = build();
-        want = kv.iter().cloned().collect();
+        let want: std::collections::HashMap<Vec<u8>, Vec<u8>> = kv.iter().cloned().collect();
         let keys = scattered_keys(&kv);
         let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
         let off_batch = db_off
