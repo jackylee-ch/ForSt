@@ -26,7 +26,7 @@
 # | q11 | 219.9 | 92,000,000 ✓ | 107.0 | 92,000,000 ✓ | 133.1 | 92,000,000 ✓ | FAIL both (RDB 2.06×; ForSt 1.65×) — read-path gap; merge-RMW IMPROVED frs −45s vs prior 264.8 (no procsize regression) |
 # | q18 | 199.1 | 92,000,000 ✓ | 360.4 | 92,000,000 ✓ | 441.7 | 92,000,000 ✓ | ★ PASS — BEATS BOTH (RDB 1.81×; ForSt 2.22×); rows EXACT all 3; ForSt FINISHES here (was DNF Mac legacy) |
 # | q19 | 238.6 | 92,000,000 ✓ | 305.5 | 92,000,000 ✓ | 272.4 | 92,000,000 ✓ | ★ PASS — BEATS BOTH (RDB 1.28×; ForSt 1.14×) — FLIPPED from prior FAIL-both via KV-sep full-stack (frs 527.9→238.6, −55%); rows EXACT |
-# | q4 | 450.4 | 25,843,878 (cadence) | 503.0 | 177,629,788 (changelog) | (running) | — | BEATS RDB (0.90×) but ⚠ rdb 503 anomalous (prior 302.7 — concurrent load; RE-RUN). out_rows = changelog(rdb)-vs-compacted-cadence(frs) semantics, final-result compare owed (not a bug). ForSt arm pending |
+# | q4 | 450.4 | 25,843,878 (cadence) | 503.0 | 177,629,788 (changelog) | DNF (crash-loop) | — | BEATS BOTH (vs RDB 0.90×; ForSt DNF) but ⚠ rdb 503 anomalous (prior 302.7 — RE-RUN). ForSt DNF = TM heartbeat-unreachable crash-loop (ForSt instability, NOT forst-rs). out_rows = changelog(rdb)/cadence(frs), final-result compare owed (not a bug) |
 #
 # ⚠⚠ q17 HONEST NEGATIVE: forst-rs under the validate full-stack-ON profile
 #   (FRS_RS_EXECUTOR=routing-adaptive) ran 333.7s — 4.52× SLOWER than RocksDB
