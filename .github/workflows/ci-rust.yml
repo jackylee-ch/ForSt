@@ -118,6 +118,20 @@ jobs:
   coverage:
     name: Coverage (≥80% gate)
     runs-on: ubuntu-latest
+    # The ≥80% line floor measures the SHIPPABLE library code (engine / common /
+    # ffi / io / storage). `forst-rs-bench` is `publish = false` internal-only
+    # perf/diagnostic tooling: dozens of wall-clock harness binaries that are not
+    # — and are not meant to be — unit-tested, so each new bench bin adds hundreds
+    # of 0%-covered lines and would silently erode the floor measured against the
+    # real library. Excluding it via `--ignore-filename-regex` keeps the gate
+    # honest: it gates the production crates (which run ~92% covered) and does NOT
+    # mask any real library regression. The bench crate is still BUILT + run by
+    # the `Test`/`Build Release` jobs and the dedicated bench workflows.
+    # cargo-llvm-cov reports filenames relative to the package root, so the bench
+    # crate's files appear as `forst-rs-bench/...` (NOT `crates/forst-rs-bench/...`).
+    # The regex must match that displayed form.
+    env:
+      COV_IGNORE: 'forst-rs-bench/'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -139,7 +153,7 @@ jobs:
         run: cargo llvm-cov --workspace --no-report
 
       - name: Generate JSON summary
-        run: cargo llvm-cov report --json --output-path coverage.json --summary-only
+        run: cargo llvm-cov report --json --output-path coverage.json --summary-only --ignore-filename-regex "$COV_IGNORE"
 
       - name: Write coverage summary to job summary (always, even on later gate fail)
         if: always()
@@ -166,8 +180,8 @@ jobs:
       - name: Generate lcov + HTML reports
         if: always()
         run: |
-          cargo llvm-cov report --lcov --output-path lcov.info || true
-          cargo llvm-cov report --html --output-dir target/coverage-html || true
+          cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$COV_IGNORE" || true
+          cargo llvm-cov report --html --output-dir target/coverage-html --ignore-filename-regex "$COV_IGNORE" || true
 
       - name: Upload coverage HTML
         if: always() && hashFiles('target/coverage-html/**') != ''
@@ -186,7 +200,7 @@ jobs:
           retention-days: 7
 
       - name: Enforce coverage gate (≥80%)
-        run: cargo llvm-cov report --fail-under-lines 80
+        run: cargo llvm-cov report --fail-under-lines 80 --ignore-filename-regex "$COV_IGNORE"
 
   s3-integration:
     # B-Prod-followup-3 (§6c): validates `frs_db_open_remote` end-to-end
