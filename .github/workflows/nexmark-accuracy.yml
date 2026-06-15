@@ -301,6 +301,21 @@ jobs:
       - name: Sanity — rocksdb + forst JNI Linux native libs bundled in flink-dist
         run: unzip -l "$FLINK_HOME/lib/flink-dist-2.2.1.jar" | grep -E 'librocksdbjni-linux64\.so'
 
+      # The dist's bin/sql-client.sh locates the SQL-client/gateway jars in opt/
+      # via a fragile `find -regex`; on the runner that resolved empty and the
+      # SqlClient class wasn't on the classpath (ClassNotFoundException). Copy the
+      # two client jars into lib/ so constructFlinkClassPath (which globs lib/*.jar)
+      # puts them on the classpath unconditionally — robust, find-independent.
+      - name: Put SQL client + gateway jars on the Flink lib classpath
+        run: cp "$FLINK_HOME"/opt/flink-sql-client-*.jar "$FLINK_HOME"/opt/flink-sql-gateway-*.jar "$FLINK_HOME/lib/"
+
+      - name: Debug — opt/lib layout + SqlClient class presence
+        run: |
+          echo "== opt =="; ls -la "$FLINK_HOME/opt" | grep -iE 'sql-client|sql-gateway' || true
+          echo "== lib sql jars =="; ls -la "$FLINK_HOME/lib" | grep -iE 'sql-client|sql-gateway' || true
+          echo "== find regex (as in sql-client.sh.orig) =="; find "$FLINK_HOME/opt" -regex ".*flink-sql-client.*.jar" || true
+          echo "== SqlClient class in jar? =="; unzip -l "$FLINK_HOME"/lib/flink-sql-client-*.jar | grep -E 'table/client/SqlClient\.class' || echo "MISSING SqlClient.class"
+
       - name: Generate fixed CSV (deterministic, JDK17 datagen)
         run: JDK17="$JDK17" bash scripts/accuracy-gate/gen-fixed-csv.sh 2>&1 | tee /tmp/gen.log
       - name: Verify CSV generated
