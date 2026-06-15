@@ -151,7 +151,7 @@ or `run-8c32g.sh run <q> rocksdb|forst-local`.
 8c/32g Mac, TOPO=split (2 TM 4c/16g + 1 JM 2c/4g), @100M, serial. Walls are
 forst-rs only. Source: the `V3 FULL 8-QUERY` (flag-ON) vs `V3 FLAG-OFF` same-pass
 A/B in `docs/superpowers/specs/2026-06-08-8c32g-3backend-sweep-results.md` (plus
-the `/tmp/v3-q17` routing-adaptive capture for q17's 83.7s). **Never
+the `/tmp/v3-q17` adaptive capture as a non-default A/B candidate). **Never
 cross-compare these Mac numbers with the REMOTE-x86 pins.**
 
 | query | KV-sep | KV_MIN_BLOB | TRIVIAL_MOVE | S2_PINNED | RS_EXECUTOR | wall (s) | status | why |
@@ -161,23 +161,20 @@ cross-compare these Mac numbers with the REMOTE-x86 pins.**
 | q9  | ON  | 256 | on | 1 | (inline) | **1463** | measured | KV-sep ON FITS the 2×4c/16g split via the `process.size=10240m` native-headroom carve-out (efdc5997a). FINISHED 1463.3s, **EXACT** out_rows 91,813,372, peak per-TM ~15.2 GiB. (Pre-carve-out at 12288m it OOM'd; OFF/1828s is the fallback for tighter boxes.) See **§3a Q9 + KV-separation**. |
 | q11 | OFF | –   | –  | – | (inline) | **119**  | measured | KV-sep OFF wins (vs 216 ON, −45%); flips both-FAIL→both-PASS |
 | q12 | (def OFF) | – | – | – | (inline) | **41** | measured | source-bound; KV-sep neutral (40.6 ON ≈ 41.6 OFF) |
-| q17 | OFF | –   | –  | – | **routing-adaptive** | **83.7** | **needs-confirm** | best = OFF-regime + R2a; plain OFF/inline = **110.7 (measured fallback)**; ON = 150.7 |
+| q17 | OFF | –   | –  | – | (inline) | **110.7** | measured | stable measured default; OFF+adaptive had a separate 83.7s capture but is not counted until confirmed on a quiet box |
 | q19 | ON  | 256 | on | 1 | (inline) | **216**  | measured | #1 KV-sep beneficiary (vs 464 OFF, +115%); **BEATS BOTH** (0.82× RDB, 1.18× ForSt) |
 | q20 | ON  | 256 | on | 1 | (inline) | **824**  | measured | KV-sep ON wins (vs 956 OFF, +16%); NEAR RDB 1.26× (busy-disk noise); PASS ForSt 1.63× |
 
 (KV-sep ON also implies `FRS_VLOG_COMPRESSION=inherit`; `FRS_SST_COMPRESSION=lz4`
 is set for every query — engine default and the fair match vs RocksDB/ForSt.)
 
-**Measured vs needs-confirm.** All cells are MEASURED from the captured runs
-**except q17**, which is **NEEDS-CONFIRM**: the 83.7s best comes from a separate
-`/tmp/v3-q17` routing-adaptive capture, not the clean serial flag-OFF pass. The
-table encodes that best config but flags it — treat 83.7s as an estimate and
-re-confirm `KV-sep-OFF + routing-adaptive` on a quiet box; the MEASURED fallback
-is plain `KV-sep-OFF / inline` at 110.7s. Two further combos are **unmeasured**
-and called out in `best-config.tsv` notes rather than guessed into the table:
-q11 with `routing-adaptive` (historically 318.9→135.7s, but the OFF+R2a wall is
-unmeasured — the cell keeps the measured plain-OFF 118.8s) and q20 with the R1
-adaptive-S2 knob `FRS_S2_FANOUT_MIN` (a candidate deep-probe lever, unmeasured).
+**Measured vs candidate.** The default table only counts measured cells from the
+captured runs. q17 deliberately keeps the measured `KV-sep-OFF / inline` cell at
+110.7s; the separate `KV-sep-OFF + adaptive` 83.7s capture remains a targeted A/B
+candidate and must be confirmed on a quiet box before it replaces the default.
+Two further combos are called out in `best-config.tsv` notes rather than guessed
+into the table: q11 with `adaptive` and q20 with the R1 adaptive-S2 knob
+`FRS_S2_FANOUT_MIN`.
 
 **Lever summary (the read-path shape).** KV-separation is not globally good or
 bad — interval-join + Top-N + heavy windowed-JOIN (q4/q7/q9/q19/q20) want it

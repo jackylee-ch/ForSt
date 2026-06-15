@@ -20,7 +20,11 @@ FLINK="${FLINK:-$WORKENV/flink-2.2.1}"
 IMG="${IMG:-forst-bench:arm64}"
 PLAT="${PLAT:-linux/arm64}"
 
-DKR_COMMON=(--platform "$PLAT"
+DKR_COMMON=()
+if [ -n "${PLAT:-}" ] && [ "$PLAT" != "auto" ]; then
+  DKR_COMMON+=(--platform "$PLAT")
+fi
+DKR_COMMON+=(
   -v "$REPO:$REPO" -v "$WORKENV:$WORKENV"
   # FRS-SCRATCH (2026-06-08): the container's /tmp is a ~59 GB overlay on Docker.raw
   # (the Docker-Desktop VM disk), NOT the host's 425 GB volume. q9/q20/q4 write
@@ -29,6 +33,10 @@ DKR_COMMON=(--platform "$PLAT"
   # Bind-mount /tmp to a host dir on the big volume so all engine scratch uses it.
   -v forst-cargo:/cargo-cache
   -e CARGO_HOME=/cargo-cache
+  -e REPO="$REPO"
+  -e WORKENV="$WORKENV"
+  -e FLINK="$FLINK"
+  -e FLINK_HOME="$FLINK"
   -e JDK17="${JDK17_IN_IMG:-/usr/lib/jvm/java-17-openjdk-arm64}"
   -e JDK25=/opt/java/openjdk
   -e TEMPLATES="${TEMPLATES:-$REPO/scripts/templates-linux}"
@@ -62,6 +70,9 @@ case "$cmd" in
     ENVS=(
       -e QUERY="$Q" -e CONFIG="$CFG" -e MAXSEC="$MS" -e EVENTS_NUM="${EVENTS_NUM:-}" -e TPS="${TPS:-}" \
       -e S3_ENDPOINT=x -e S3_ACCESS_KEY=x -e S3_SECRET_KEY=x -e S3_BUCKET=x -e S3_REGION=x -e S3_PREFIX=x \
+      -e FRS_BLOCK_CACHE_MB="${FRS_BLOCK_CACHE_MB:-}" \
+      -e FRS_SST_KV_BLOCK_FORMAT="${FRS_SST_KV_BLOCK_FORMAT:-}" -e FRS_SST_SKIP_READ_CHECKSUM="${FRS_SST_SKIP_READ_CHECKSUM:-}" \
+      -e FRS_DYNAMIC_LEVELS="${FRS_DYNAMIC_LEVELS:-}" -e FRS_FADVISE="${FRS_FADVISE:-}" \
       # FRS-M5 FAIRNESS FIX (2026-06-13 cycle 2, PMC-1): the default was pinned
       # to `none` (a 2026-06-02 zero-copy read-path experiment), which forced
       # forst-rs to write SST blocks UNCOMPRESSED while the ForSt and RocksDB
@@ -89,6 +100,7 @@ case "$cmd" in
       -e FRS_RS_S2_PINNED="${FRS_RS_S2_PINNED:-}" \
       -e FRS_BG_COMPACT_THREADS="${FRS_BG_COMPACT_THREADS:-}" -e FRS_BG_FLUSH_THREADS="${FRS_BG_FLUSH_THREADS:-}" \
       -e FRS_L0_STOP_TRIGGER="${FRS_L0_STOP_TRIGGER:-}" -e FRS_L0_COMPACTION_TRIGGER="${FRS_L0_COMPACTION_TRIGGER:-}" \
+      -e FRS_L0_SLOWDOWN_TRIGGER="${FRS_L0_SLOWDOWN_TRIGGER:-}" \
       -e FRS_DECAY_DIAG="${FRS_DECAY_DIAG:-}" -e FRS_BULK_SAMPLE="${FRS_BULK_SAMPLE:-}" -e FRS_ITER_DIAG="${FRS_ITER_DIAG:-}" \
       -e FRS_READ_AT_DIAG="${FRS_READ_AT_DIAG:-}" -e FRS_REENTRY_DIAG="${FRS_REENTRY_DIAG:-}" \
       -e FRS_DISABLE_PREFIX_BLOOM="${FRS_DISABLE_PREFIX_BLOOM:-}" -e FRS_GARBAGE_DRAIN_TOMBSTONES="${FRS_GARBAGE_DRAIN_TOMBSTONES:-}" \
@@ -104,6 +116,35 @@ case "$cmd" in
       -e FRS_DISABLE_MAPSTATE_CACHE="${FRS_DISABLE_MAPSTATE_CACHE:-}" \
       -e FRS_WBM_TOTAL_MB="${FRS_WBM_TOTAL_MB:-}" -e FRS_WBM_STALL="${FRS_WBM_STALL:-}" \
       -e FRS_WBM_HARD_MB="${FRS_WBM_HARD_MB:-}" \
+      -e FRS_SCAN_OPEN_FANOUT="${FRS_SCAN_OPEN_FANOUT:-}" -e FRS_SCAN_COLD_PRIME="${FRS_SCAN_COLD_PRIME:-}" \
+      -e FRS_S2_FANOUT_MIN="${FRS_S2_FANOUT_MIN:-}" \
+      -e FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-}" \
+      -e FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-}" \
+      -e FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-}" \
+      -e FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-}" \
+      -e FRS_VLOG_GC_ADAPTIVE="${FRS_VLOG_GC_ADAPTIVE:-}" -e FRS_VLOG_GC_ADAPTIVE_CUTOFF="${FRS_VLOG_GC_ADAPTIVE_CUTOFF:-}" \
+      -e FRS_VLOG_GC_AGE_CUTOFF="${FRS_VLOG_GC_AGE_CUTOFF:-}" \
+      -e FRS_COMPACT_WINDOWED="${FRS_COMPACT_WINDOWED:-}" -e FRS_COMPACT_WINDOW_BYTES="${FRS_COMPACT_WINDOW_BYTES:-}" \
+      -e FRS_COMPACT_PREFETCH_BUDGET="${FRS_COMPACT_PREFETCH_BUDGET:-}" -e FRS_COMPACT_PARALLEL="${FRS_COMPACT_PARALLEL:-}" \
+      -e FRS_CACHE_ADMISSION="${FRS_CACHE_ADMISSION:-}" -e FRS_CACHE_BG_EXEMPT="${FRS_CACHE_BG_EXEMPT:-}" \
+      -e FRS_CACHE_ADMISSION_EPOCH="${FRS_CACHE_ADMISSION_EPOCH:-}" -e FRS_CACHE_SPACE_LIMIT_MB="${FRS_CACHE_SPACE_LIMIT_MB:-}" \
+      -e FRS_IO_URING="${FRS_IO_URING:-}" -e FRS_RS_INLINE_MAX="${FRS_RS_INLINE_MAX:-}" \
+      -e FRS_RS_SYNC_DIRECT="${FRS_RS_SYNC_DIRECT:-}" \
+      -e FRS_RS_MIXED_BATCH="${FRS_RS_MIXED_BATCH:-}" -e FRS_TIMER_INDEX_MAX="${FRS_TIMER_INDEX_MAX:-}" \
+      -e FRS_RS_BLOCK_PREFETCH="${FRS_RS_BLOCK_PREFETCH:-}" -e FRS_RS_PREFETCH_THREADS="${FRS_RS_PREFETCH_THREADS:-}" \
+      -e FRS_LIFECYCLE_COHORT_TRIGGER="${FRS_LIFECYCLE_COHORT_TRIGGER:-}" \
+      -e FRS_LIFECYCLE_DROP_IGNORE_SNAPSHOTS="${FRS_LIFECYCLE_DROP_IGNORE_SNAPSHOTS:-}" \
+      -e FRS_LIFECYCLE_SEGMENTS="${FRS_LIFECYCLE_SEGMENTS:-}" -e FRS_LIFECYCLE_STAMPED_CEILING="${FRS_LIFECYCLE_STAMPED_CEILING:-}" \
+      -e FRS_CKPT_LINK_MODE="${FRS_CKPT_LINK_MODE:-}" -e FRS_CKPT_PARALLEL_UPLOAD="${FRS_CKPT_PARALLEL_UPLOAD:-}" \
+      -e FRS_COMPACT_CONCURRENT="${FRS_COMPACT_CONCURRENT:-}" -e FRS_COMPACT_DIAG="${FRS_COMPACT_DIAG:-}" \
+      -e FRS_COMPACT_DRAIN_L1="${FRS_COMPACT_DRAIN_L1:-}" -e FRS_COMPACT_RELEASE_LOCK="${FRS_COMPACT_RELEASE_LOCK:-}" \
+      -e FRS_REMOTE_COMPACTION_SERIALIZE="${FRS_REMOTE_COMPACTION_SERIALIZE:-}" -e FRS_REMOTE_NONSST_LOCAL="${FRS_REMOTE_NONSST_LOCAL:-}" \
+      -e FRS_RESIDENT_BLOOM_SKIP="${FRS_RESIDENT_BLOOM_SKIP:-}" -e FRS_RESIDENT_SHADOW="${FRS_RESIDENT_SHADOW:-}" \
+      -e FRS_RESIDENT_SHADOW_MB="${FRS_RESIDENT_SHADOW_MB:-}" \
+      -e FRS_RESTORE_BG_FILL="${FRS_RESTORE_BG_FILL:-}" -e FRS_RESTORE_BG_FILL_PACE_MB="${FRS_RESTORE_BG_FILL_PACE_MB:-}" \
+      -e FRS_RESTORE_BG_FILL_WORKERS="${FRS_RESTORE_BG_FILL_WORKERS:-}" \
+      -e S3_DIR="${S3_DIR:-}" -e LOCAL_DIR="${LOCAL_DIR:-}" \
+      -e FRS_REMOTE_BW_MBPS="${FRS_REMOTE_BW_MBPS:-}" \
     )
     # TOPO=split (2026-06-11 user directive): the 8c/32g budget is TM-ONLY.
     # 2 TM containers x 4c/16g (the measured resource) + 1 JM container 2c/4g
@@ -175,7 +216,9 @@ case "$cmd" in
           "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e FLINK_CONF_DIR="$CCONF" "$IMG" bash -lc "
             mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
             cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
-            for t in \$(seq 1 150); do curl -sf http://$CLUSTER-jm:8081/overview >/dev/null 2>&1 && break; sleep 2; done
+            jm_ip=\$(getent hosts '$CLUSTER-jm' | awk '{print \$1; exit}')
+            [ -z \"\$jm_ip\" ] && jm_ip='$CLUSTER-jm'
+            for t in \$(seq 1 150); do timeout 2 bash -lc \"</dev/tcp/\$jm_ip/8081\" >/dev/null 2>&1 && break; sleep 2; done
             exec bash '$FLINK/bin/taskmanager.sh' start-foreground
           " >/dev/null
       done
@@ -220,7 +263,7 @@ case "$cmd" in
   jar)
     echo "== rebuild + redeploy forst-rs jar on host (mounted into container) =="
     cd "$REPO/../flink/flink-state-backends/flink-statebackend-forst-rs" &&
-    JAVA_HOME=/Library/Java/JavaVirtualMachines/zulu-25.jdk/Contents/Home ../../mvnw -o -q -DskipTests \
+    JAVA_HOME="${JAVA_HOME:-$WORKENV/jdk25.0.2-linux_x64_gcc12}" ../../mvnw -o -q -DskipTests \
       -Denforcer.skip=true -Dcheckstyle.skip=true -Dspotless.check.skip=true -Drat.skip=true \
       -Dmaven.javadoc.skip=true clean package &&
     cp target/flink-statebackend-forst-rs-2.2.0.jar "$FLINK/lib/" && echo "jar redeployed"

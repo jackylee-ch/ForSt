@@ -22,7 +22,7 @@ MAXSEC="${MAXSEC:-3000}"
 # nexmark default workload: tps=10M, eventsNum=100M, bid:46 auction:3 person:1
 TPS="${TPS:-10000000}"; EVENTS_NUM="${EVENTS_NUM:-100000000}"
 PERSON_PROPORTION=1; AUCTION_PROPORTION=3; BID_PROPORTION=46
-S3VARS='${S3_ENDPOINT} ${S3_ACCESS_KEY} ${S3_SECRET_KEY} ${S3_BUCKET} ${S3_REGION} ${S3_PREFIX} ${RUN_ID}'
+S3VARS='${S3_ENDPOINT} ${S3_ACCESS_KEY} ${S3_SECRET_KEY} ${S3_BUCKET} ${S3_REGION} ${S3_PREFIX} ${RUN_ID} ${S3_DIR} ${LOCAL_DIR}'
 # Per-cluster conf dir (concurrent clusters): honor FLINK_CONF_DIR when set.
 CONF="${FLINK_CONF_DIR:-$FLINK_HOME/conf}/config.yaml"
 TEMPLATES="${TEMPLATES:-$FLINK_HOME/conf/templates}"
@@ -30,6 +30,7 @@ case "$CONFIG" in
   rocksdb) cp "$TEMPLATES/config-rocksdb.yaml" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-rocksdb-io /tmp/nexmark-checkpoints-rocksdb ;;
   forst-rs-ffm-s3) envsubst "$S3VARS" < "$TEMPLATES/config-forst-rs.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache ;;
   forst-rs-ffm-local) envsubst "$S3VARS" < "$TEMPLATES/config-forst-rs-local.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache /tmp/flink-forst-rs-data /tmp/nexmark-checkpoints-forst-rs "${TMPDIR:-/tmp}/forst-rs-ckpt-stage" /tmp/forst-rs-ckpt-stage ;;
+  forst-rs-s3sim) envsubst "$S3VARS" < "$TEMPLATES/config-forst-rs-s3sim.yaml.tpl" > "$CONF"; JDK="$JDK25"; rm -rf "${LOCAL_DIR:-/tmp}/flink-forst-rs-io" "${LOCAL_DIR:-/tmp}/forst-rs-cache" "${LOCAL_DIR:-/tmp}/nexmark-checkpoints-forst-rs" "${S3_DIR:-/tmp}/forst-rs-data" "${TMPDIR:-/tmp}/forst-rs-ckpt-stage" /tmp/forst-rs-ckpt-stage ;;
   forst-local) cp "$TEMPLATES/config-forst-local.yaml.tpl" "$CONF"; JDK="$JDK17"; rm -rf /tmp/flink-forst-io /tmp/flink-forst-data /tmp/nexmark-checkpoints-forst ;;
   *) echo "unknown config $CONFIG"; exit 1 ;;
 esac
@@ -58,6 +59,28 @@ open(p, 'w').writelines(out)
 PYEOF
   echo "== FRS-Q9-36G process.size override: TM=${FRS_TM_PROCESS_SIZE:-<unchanged>} JM=${FRS_JM_PROCESS_SIZE:-<unchanged>} =="
 fi
+# Optional Linux-local performance profile override. NexMark local runs in this
+# package are measured with split topology: 2 TaskManagers x 4 slots and
+# parallelism 8. Keep the default byte-identical unless the local runner
+# explicitly sets these values for that required resource shape.
+if [ -n "${FRS_FLINK_PARALLELISM:-}" ] || [ -n "${FRS_TM_SLOTS:-}" ]; then
+  python3 - "$CONF" "${FRS_FLINK_PARALLELISM:-}" "${FRS_TM_SLOTS:-}" <<'PYEOF'
+import sys
+p, par, slots = sys.argv[1], sys.argv[2], sys.argv[3]
+out, sect = [], None
+for ln in open(p):
+    s = ln.rstrip('\n')
+    if s and not s[0].isspace() and s.endswith(':'):
+        sect = s[:-1]
+    if slots and sect == 'taskmanager' and s.strip().startswith('numberOfTaskSlots:'):
+        s = '  numberOfTaskSlots: ' + slots
+    elif par and sect == 'parallelism' and s.strip().startswith('default:'):
+        s = '  default: ' + par
+    out.append(s + '\n')
+open(p, 'w').writelines(out)
+PYEOF
+  echo "== FRS-FLINK-PARALLELISM override: parallelism=${FRS_FLINK_PARALLELISM:-<unchanged>} slots=${FRS_TM_SLOTS:-<unchanged>} =="
+fi
 # The repo's sql-client.sh is a WRAPPER that reroutes nexmark's hardcoded
 # `embedded` to `sql-client.sh.orig gateway --endpoint localhost:8083`, so a
 # SqlGateway daemon MUST be running at 8083. Append its endpoint config + start it.
@@ -73,8 +96,12 @@ EOF
 # CLUSTER_MODE=external (TOPO=split, 2026-06-11 user directive): the 8c/32g budget
 # is TM-ONLY. TMs run in their own containers (2 x 4c/16g); this container (2c/4g)
 # hosts ONLY JM + sql-gateway + client. Rewrite the conf for cross-container RPC:
-# bind 0.0.0.0, JM advertised as ${JM_HOST}, 2 slots/TM (parallelism 4 = 2+2 spread),
-# JM process shrunk to 1600m so JM+gateway+client fit the 4g envelope.
+# bind 0.0.0.0, JM RPC advertised as ${JM_HOST}, keep 4 slots/TM
+# (2 TMs = 8 slots total), JM process shrunk to 1600m so JM+gateway+client fit
+# the 4g envelope. Keep REST address as localhost: the SqlGateway and sql-client
+# run in the JM container and Flink's client code resolves rest.address there.
+# The REST bind-address remains 0.0.0.0 so external TM containers can probe it
+# via http://${JM_HOST}:8081 during startup.
 if [ "${CLUSTER_MODE:-}" = "external" ]; then
   JMH="${JM_HOST:-frs-jm}"
   python3 - "$CONF" "$JMH" <<'PYEOF'
@@ -91,12 +118,10 @@ for ln in open(p):
         s = '    address: ' + jmh
     elif s == '  host: localhost' and sect == 'taskmanager':
         continue  # each external TM must register its own hostname
-    elif s == '  numberOfTaskSlots: 4':
-        s = '  numberOfTaskSlots: 2'
     elif s == '      size: 4096m' and sect == 'jobmanager':
         s = '      size: 1600m'
     elif s == '  address: localhost' and sect == 'rest':
-        s = '  address: ' + jmh
+        s = '  address: localhost'
     elif s == '  bind-address: localhost' and sect == 'rest':
         s = '  bind-address: 0.0.0.0'
     out.append(s + '\n')
@@ -121,6 +146,12 @@ for i in $(seq 1 40); do
   [ -n "$tms" ] && [ "$tms" -ge "$EXPECT_TMS" ] && break
   sleep 3
 done
+if [ "${CLUSTER_MODE:-}" = "external" ]; then
+  if [ -z "${tms:-}" ] || [ "$tms" -lt "$EXPECT_TMS" ]; then
+    echo "FATAL: expected $EXPECT_TMS TaskManagers, got ${tms:-0}; refusing to submit $QUERY"
+    exit 1
+  fi
+fi
 JAVA_HOME="$JDK" "$FLINK_HOME"/bin/sql-gateway.sh start >/dev/null 2>&1
 # Wait for the gateway REST port to accept connections.
 for i in $(seq 1 20); do

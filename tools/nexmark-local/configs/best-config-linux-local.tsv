@@ -1,0 +1,70 @@
+# Linux local ForSt-RS per-query best-config table.
+#
+# Scope:
+#   - Scenario: NexMark LOCAL on the origin Linux box.
+#   - Backend: forst-rs-ffm-local only; timer service must be FORSTRS.
+#   - Resource budget: 8c/32g TM budget as 2 TaskManagers x 4c/16g.
+#   - Parallelism must be 8, with 4 task slots per TaskManager. Per-query
+#     tuning is allowed for SQL/backend knobs, but topology is fixed to split.
+#   - q6 is listed only for completeness; Flink SQL q6 submission is currently
+#     unsupported in this harness and remains excluded from totals.
+#
+# Format, tab-separated:
+#   query  profile  topology  maxsec  env_assignments  expected_wall_s  status  note
+#
+# `env_assignments` is a space-separated KEY=VALUE list. Use `-` for no explicit
+# query-specific knobs. The runner still applies conservative Linux local
+# defaults unless overridden here:
+#   FRS_SST_COMPRESSION=lz4
+#   FRS_VLOG_COMPRESSION=inherit
+#   FRS_TM_JEMALLOC=1
+#   FRS_IO_URING=1
+#   FRS_SCAN_OPEN_FANOUT=1
+#   FRS_SCAN_COLD_PRIME=1
+#   FRS_RS_READ_IO_PARALLELISM=3
+#   FRS_VLOG_COALESCE_DEREF=1
+#
+# Code-backed knob mapping:
+#   - FRS_KV_SEPARATION / FRS_KV_MIN_BLOB_SIZE / FRS_TRIVIAL_MOVE:
+#     crates/forst-rs-engine/src/db.rs (KV-sep and write-amp levers).
+#   - FRS_RS_S2_PINNED / FRS_S2_FANOUT_MIN:
+#     crates/forst-rs-engine/src/db.rs (scan fan-out pinned/loser-tree path).
+#   - FRS_RS_EXECUTOR / FRS_RS_READ_IO_PARALLELISM / FRS_RS_INLINE_MAX:
+#     flink-statebackend-forst-rs Java RoutingStateExecutor.
+#   - FRS_TIMER_INDEX_MAX:
+#     ForStRsKeyGroupedInternalPriorityQueue.java.
+#   - FRS_DISABLE_MAPSTATE_CACHE:
+#     ForStRsMapStateV2.java.
+#   - FRS_PERSISTENT_PROBE_ITER:
+#     crates/forst-rs-engine/src/db.rs persistent probe iterator. This is the
+#     ForSt-style persistent MergingIterator/seek path for q7/q9/q20 repeated
+#     probe scans.
+#
+# The initial values below are the latest Linux-local known-good profile as of
+# 2026-06-15 plus conservative targeted changes for currently regressed query
+# families. Treat `SEED` rows as candidates until the current-head A/B run
+# promotes them to `MEASURED`.
+query	profile	topology	maxsec	env_assignments	expected_wall_s	status	note
+q0	baseline-split	split	3600	-	112.2	MEASURED	latest clean Linux local final sweep 20260615-145226.
+q1	baseline-split	split	3600	-	110.0	MEASURED	latest clean Linux local final sweep 20260615-145226.
+q2	baseline-split	split	3600	-	100.5	MEASURED	latest clean Linux local final sweep 20260615-145226.
+q3	join-light-split	split	3600	FRS_S2_FANOUT_MIN=8	162.3	SEED	q3 is an incremental join; adaptive S2 only engages on deep fan-out, avoiding static pinned tax.
+q4	kvsep-split	split	3600	FRS_KV_SEPARATION=true FRS_KV_MIN_BLOB_SIZE=256 FRS_TRIVIAL_MOVE=true FRS_RS_S2_PINNED=1	903.1	SEED	previous best observation predates the strict split/p8 run; remeasure under required split.
+q5	baseline-split	split	3600	-	540.9	SEED	previous best observation predates the strict split/p8 run; remeasure under required split.
+q6	baseline-split	split	3600	-	-	UNSUPPORTED	Flink SQL submission fails; excluded from totals.
+q7	kvsep-persistent-probe-split	split	3600	FRS_KV_SEPARATION=true FRS_KV_MIN_BLOB_SIZE=256 FRS_TRIVIAL_MOVE=true FRS_RS_S2_PINNED=1 FRS_S2_FANOUT_MIN=4 FRS_RS_BLOCK_PREFETCH=1 FRS_RS_PREFETCH_THREADS=6 FRS_PERSISTENT_PROBE_ITER=1	1144.5	MEASURED	strict split/p8 2x4c16g run nexmark-local-q7-ppi-181206; persistent probe improves q7 vs same-resource no-PPI 1172.6s.
+q8	join-light-split	split	3600	FRS_S2_FANOUT_MIN=8	204.6	SEED	q8 regressed vs previous; avoid static S2 pinned, allow adaptive deep scans only.
+q9	rownum-kvsep-uniform-split	split	3600	FRS_KV_SEPARATION=true FRS_KV_MIN_BLOB_SIZE=256 FRS_TRIVIAL_MOVE=true FRS_RS_S2_PINNED=1 FRS_S2_FANOUT_MIN=8 FRS_VLOG_COALESCE_DEREF=1 FRS_RS_PROBE_BLOOM_PRUNE=1 FRS_RS_LEVELED_HOT_CF=1 FRS_PERSISTENT_PROBE_ITER=1 FRS_VLOG_READER_CACHE_CAP=2048 FRS_VLOG_RESIDENT_BUDGET_MB=512 FRS_KV_ADAPTIVE_PRESSURE=1	1285.5	MEASURED	pmc1 uniform-split run on 2026-06-15: q9 KV-sep ON now fits 2x4c16g via 10240m process-size carve-out; FINISHED src_out=98,000,000 out_rows=91,813,372; beats native ForSt 1982.0s and is within RocksDB bar 1057.4s * 1.25.
+q10	baseline-split	split	3600	-	224.3	MEASURED	latest clean Linux local final sweep 20260615-145226.
+q11	session-timer-split	split	3600	FRS_KV_SEPARATION=false FRS_TRIVIAL_MOVE=false FRS_TIMER_INDEX_MAX=16000000	544.2	SEED	timer/session query; keep KV-sep off, raise timer index cap for spill avoidance.
+q12	proctime-timer-split	split	3600	FRS_KV_SEPARATION=false FRS_TRIVIAL_MOVE=false FRS_TIMER_INDEX_MAX=16000000	223.0	SEED	processing-time window; keep KV-sep off, raise timer index cap.
+q13	baseline-split	split	3600	-	181.5	MEASURED	latest clean Linux local final sweep 20260615-145226.
+q14	baseline-split	split	3600	-	105.5	MEASURED	latest clean Linux local final sweep 20260615-145226.
+q15	baseline-split	split	3600	-	695.2	MEASURED	latest clean Linux local final sweep 20260615-145226.
+q16	distinct-agg-split	split	3600	FRS_KV_SEPARATION=false FRS_TRIVIAL_MOVE=false FRS_DISABLE_MAPSTATE_CACHE=1	1048.4	SEED	distinct aggregation; test cache bypass because MapState cache lookup can dominate CPU.
+q17	agg-inline-split	split	3600	FRS_KV_SEPARATION=false FRS_TRIVIAL_MOVE=false FRS_RS_EXECUTOR=inline	490.5	SEED	unbounded aggregation; inline executor preserves cache/staging, KV-sep off for small accumulators.
+q18	dedup-split	split	3600	FRS_KV_SEPARATION=false FRS_TRIVIAL_MOVE=false FRS_S2_FANOUT_MIN=8	694.1	SEED	deduplicate/top-row state; keep KV-sep off, allow adaptive deep scans only.
+q19	topn-kvsep-split	split	3600	FRS_KV_SEPARATION=true FRS_KV_MIN_BLOB_SIZE=256 FRS_TRIVIAL_MOVE=true FRS_RS_S2_PINNED=1	557.7	SEED	previous best observation predates the strict split/p8 run; remeasure under required split with KV-sep ON.
+q20	join-kvsep-persistent-probe-split	split	3600	FRS_KV_SEPARATION=true FRS_KV_MIN_BLOB_SIZE=256 FRS_TRIVIAL_MOVE=true FRS_RS_S2_PINNED=1 FRS_S2_FANOUT_MIN=4 FRS_RS_BLOCK_PREFETCH=1 FRS_RS_PREFETCH_THREADS=6 FRS_PERSISTENT_PROBE_ITER=1	927.2	MEASURED	strict split/p8 2x4c16g run nexmark-local-q9q20-ppi-183240; persistent probe/S2/block-prefetch cuts q20 from prior 2079.3s to 927.2s.
+q21	baseline-split	split	3600	-	220.2	MEASURED	latest clean Linux local final sweep 20260615-145226.
+q22	baseline-split	split	3600	-	156.4	MEASURED	latest clean Linux local final sweep 20260615-145226.

@@ -16,6 +16,7 @@
 # host (host glibc ≤ jammy's 2.35, so the host-built .so loads here — verify
 # once with: docker run --rm -v <so>:/t/x.so forst-bench:x86 bash -c 'ldd /t/x.so').
 FROM docker.m.daocloud.io/eclipse-temurin:17-jre-jammy
+USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Relocate the base JRE17, then install JDK25 at the path the harness templates
@@ -38,4 +39,5 @@ RUN sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g; s|http://se
     ln -s /usr/lib/*-linux-gnu/libjemalloc.so.2 /usr/local/lib/libjemalloc-preload.so
 
 WORKDIR /work
+USER flink
 CMD ["bash"]

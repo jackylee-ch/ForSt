@@ -75,11 +75,14 @@ case "$MODE" in
     echo "         a clean Mac or the remote box only (see docs/README.md §S3-sim)."
     RUNNER="$SCRIPT_DIR/run-remote-nexmark-v3.sh"
     [ -f "$RUNNER" ] || { echo "FATAL: missing $RUNNER"; exit 1; }
-    # The forst-rs arm uses the S3-sim config; keep the uniform matrix otherwise.
-    ARMS="${ARMS:-forst-rs-ffm-local}" \
+    # The forst-rs arm uses the S3-sim config and the package-local templates.
+    ARMS="${ARMS:-forst-rs-s3sim}" \
       QUERIES="${QUERIES:-q7 q9}" \
       MAXSEC="${MAXSEC:-3600}" \
       TAG_PREFIX="${TAG_PREFIX:-s3sim}" \
+      TEMPLATES="$REPO/tools/nexmark-local/configs" \
+      S3_DIR="$S3_DIR" \
+      LOCAL_DIR="$LOCAL_DIR" \
       REPO="$REPO" \
       bash "$RUNNER"
     ;;
