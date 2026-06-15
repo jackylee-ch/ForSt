@@ -250,3 +250,14 @@ path = "src/bin/vlog_scan_readahead.rs"
 [[bin]]
 name = "upload_byte_budget"
 path = "src/bin/upload_byte_budget.rs"
+
+# FRS-PHASE2 READ-I/O POOL COMBINED-STACK + CONTENTION: the three read-pool
+# latency-hiding levers (scan-readahead depth-D, compact-input reader-warm,
+# compact-input data-prime) running CONCURRENTLY on the ONE shared FIFO read-I/O
+# pool. Quantifies (a) combined wall + per-lever marginal, (b) FIFO contention
+# (foreground scan vs background warm head-of-line block), (c) a 2-class
+# foreground-first fairness fix, and the forst-rs-vs-ForSt-equivalent headline.
+# Pure timing model, no engine state. Takes --smoke for CI.
+[[bin]]
+name = "disagg_readpool_contention"
+path = "src/bin/disagg_readpool_contention.rs"

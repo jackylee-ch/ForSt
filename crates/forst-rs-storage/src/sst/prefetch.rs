@@ -220,8 +220,56 @@ fn prefetch_diag() -> bool {
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+/// FRS-READ-POOL-FAIRNESS (Phase-2 cycle 11): when set, the shared read-I/O
+/// pool becomes a 2-class FOREGROUND-FIRST queue — latency-critical foreground
+/// reads (scan readahead windows, scan cold-prime opens) are served before
+/// BACKGROUND warm-ups (compaction-input reader opens + first-data-block
+/// primes). Gated by `FRS_RS_READ_POOL_FAIRNESS=1`, **DEFAULT OFF**. When OFF
+/// every job (regardless of class) is pushed to the single foreground queue and
+/// the background queue stays empty — BYTE-AND-SCHEDULE-IDENTICAL to the
+/// pre-cycle-11 single FIFO. The fix is work-conserving either way: a worker
+/// only takes a background job when the foreground queue is empty, so background
+/// warm-ups still use the whole pool whenever no foreground read is waiting.
+///
+/// WHY (the contention this removes): all three read-pool latency-hiding levers
+/// share this ONE pool. Under the plain FIFO a burst of background
+/// compaction-warm + data-prime jobs (one L1 drain fans in K inputs x up to 2
+/// jobs each) can occupy every worker, so a foreground scan window submitted
+/// just behind them waits the whole burst out — head-of-line blocking that
+/// inflates foreground scan-window join latency. The `disagg_readpool_contention`
+/// mini-bench measures a 1.25-1.91x foreground scan slowdown under FIFO when the
+/// background levers are co-resident (sharper at higher bandwidth, where the
+/// jobs are RTT-dominated and more of them queue), fully removed by this
+/// foreground-first discipline (slowdown -> 1.00-1.13x) with no loss to the
+/// background throughput (work-conserving).
+fn read_pool_fairness_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_RS_READ_POOL_FAIRNESS").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// Read-I/O pool job class for the 2-class fairness scheduler. Ignored (every
+/// job treated as foreground) when `FRS_RS_READ_POOL_FAIRNESS` is OFF.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReadJobClass {
+    /// Latency-critical foreground read (scan readahead window, cold-prime open).
+    Foreground,
+    /// Background warm-up (compaction-input reader open / data-block prime) — a
+    /// foreground read always precedes these in the queue (never preempts a
+    /// background job already RUNNING; jobs run to completion).
+    Background,
+}
+
 struct PoolShared {
-    queue: Mutex<VecDeque<Job>>,
+    /// `(foreground, background)` queues. With fairness OFF everything lands in
+    /// `foreground` and `background` stays empty (the original single FIFO).
+    /// With fairness ON a worker drains `foreground` fully before taking from
+    /// `background` (work-conserving foreground-first).
+    queue: Mutex<(VecDeque<Job>, VecDeque<Job>)>,
     cv: Condvar,
 }
 
@@ -232,7 +280,7 @@ struct ReadIoPool {
 impl ReadIoPool {
     fn new(n_workers: usize) -> Self {
         let shared = Arc::new(PoolShared {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new((VecDeque::new(), VecDeque::new())),
             cv: Condvar::new(),
         });
         for _ in 0..n_workers.max(1) {
@@ -243,7 +291,14 @@ impl ReadIoPool {
                     let job = {
                         let mut q = sh.queue.lock().unwrap_or_else(|p| p.into_inner());
                         loop {
-                            if let Some(job) = q.pop_front() {
+                            // Foreground first; background only when foreground
+                            // is empty (work-conserving). With fairness OFF the
+                            // background queue is never populated, so this is the
+                            // original single-FIFO pop.
+                            if let Some(job) = q.0.pop_front() {
+                                break job;
+                            }
+                            if let Some(job) = q.1.pop_front() {
                                 break job;
                             }
                             q = sh.cv.wait(q).unwrap_or_else(|p| p.into_inner());
@@ -263,9 +318,16 @@ impl ReadIoPool {
         Self { shared }
     }
 
-    fn submit(&self, job: Job) {
+    fn submit(&self, class: ReadJobClass, job: Job) {
         let mut q = self.shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-        q.push_back(job);
+        // Background jobs go to the background queue ONLY when fairness is on;
+        // otherwise everything is foreground (the single-FIFO byte-identical
+        // path).
+        if read_pool_fairness_enabled() && class == ReadJobClass::Background {
+            q.1.push_back(job);
+        } else {
+            q.0.push_back(job);
+        }
         drop(q);
         self.shared.cv.notify_one();
     }
@@ -321,22 +383,26 @@ pub fn prime_opens_concurrent(jobs: Vec<Box<dyn FnOnce() + Send + 'static>>) {
     let pool = read_io_pool();
     for job in jobs {
         let d = Arc::clone(&done);
-        pool.submit(Box::new(move || {
-            // Whether the open returns or panics, the `Signal` guard's Drop
-            // increments the barrier counter so the wait below can never strand
-            // (the worker's `catch_unwind` contains the panic; this guard fires
-            // during the unwind before the worker re-arms for the next job).
-            struct Signal(Arc<(Mutex<usize>, Condvar)>);
-            impl Drop for Signal {
-                fn drop(&mut self) {
-                    let (m, cv) = &*self.0;
-                    *m.lock().unwrap_or_else(|p| p.into_inner()) += 1;
-                    cv.notify_all();
+        // Scan-side cold opens are FOREGROUND (the merge build barriers on them).
+        pool.submit(
+            ReadJobClass::Foreground,
+            Box::new(move || {
+                // Whether the open returns or panics, the `Signal` guard's Drop
+                // increments the barrier counter so the wait below can never strand
+                // (the worker's `catch_unwind` contains the panic; this guard fires
+                // during the unwind before the worker re-arms for the next job).
+                struct Signal(Arc<(Mutex<usize>, Condvar)>);
+                impl Drop for Signal {
+                    fn drop(&mut self) {
+                        let (m, cv) = &*self.0;
+                        *m.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                        cv.notify_all();
+                    }
                 }
-            }
-            let _signal = Signal(d);
-            job();
-        }));
+                let _signal = Signal(d);
+                job();
+            }),
+        );
     }
     let (m, cv) = &*done;
     let mut g = m.lock().unwrap_or_else(|p| p.into_inner());
@@ -356,8 +422,26 @@ pub fn prime_opens_concurrent(jobs: Vec<Box<dyn FnOnce() + Send + 'static>>) {
 /// error / cancellation). Use this only when the work owns its own completion
 /// signalling (a channel the caller waits on); for "do K opens then continue"
 /// use the barriering [`prime_opens_concurrent`].
+///
+/// FOREGROUND class: this is the scan-readahead window launch (latency-critical
+/// — a consumer is blocked on its result). For background warm-ups that should
+/// yield to foreground reads under `FRS_RS_READ_POOL_FAIRNESS`, use
+/// [`submit_read_job_background`].
 pub fn submit_read_job(job: Box<dyn FnOnce() + Send + 'static>) {
-    read_io_pool().submit(job);
+    read_io_pool().submit(ReadJobClass::Foreground, job);
+}
+
+/// FRS-READ-POOL-FAIRNESS: submit a BACKGROUND warm-up job (compaction-input
+/// reader open / first-data-block prime) to the shared read-I/O pool. Identical
+/// to [`submit_read_job`] except the job is classed `Background`, so when
+/// `FRS_RS_READ_POOL_FAIRNESS=1` a worker only runs it once the foreground queue
+/// (scan readahead windows / cold-prime opens) is empty — removing the
+/// head-of-line block a burst of warm-ups otherwise imposes on latency-critical
+/// foreground scan windows. With the flag OFF this is byte-AND-schedule-identical
+/// to [`submit_read_job`] (the single FIFO), so the warm-up levers behave exactly
+/// as they did pre-fix.
+pub fn submit_read_job_background(job: Box<dyn FnOnce() + Send + 'static>) {
+    read_io_pool().submit(ReadJobClass::Background, job);
 }
 
 /// L4 (2026-06-12 compaction windowed-readpath design §2.1): what
@@ -582,10 +666,13 @@ impl BlockPrefetcher {
         let policy = CacheFillPolicy::Insert(CachePriority::Low);
         let reader = Arc::clone(&self.reader);
         let (tx, rx) = std::sync::mpsc::sync_channel::<WindowResult>(1);
-        read_io_pool().submit(Box::new(move || {
-            let result = fetch_window(&reader, start, end, policy);
-            let _ = tx.send(result);
-        }));
+        read_io_pool().submit(
+            ReadJobClass::Foreground,
+            Box::new(move || {
+                let result = fetch_window(&reader, start, end, policy);
+                let _ = tx.send(result);
+            }),
+        );
         prefetch_charge_add(window_bytes as usize);
         if prefetch_diag() {
             let agg = prefetch_buffered_bytes();
@@ -818,11 +905,14 @@ impl BlockPrefetcher {
         let reader = Arc::clone(&self.reader);
         // Rendezvous-free oneshot: capacity 1 so the producer never blocks.
         let (tx, rx) = std::sync::mpsc::sync_channel::<WindowResult>(1);
-        read_io_pool().submit(Box::new(move || {
-            let result = fetch_window(&reader, start, end, policy);
-            // Receiver dropped (iterator closed/aborted) ⇒ result discarded.
-            let _ = tx.send(result);
-        }));
+        read_io_pool().submit(
+            ReadJobClass::Foreground,
+            Box::new(move || {
+                let result = fetch_window(&reader, start, end, policy);
+                // Receiver dropped (iterator closed/aborted) ⇒ result discarded.
+                let _ = tx.send(result);
+            }),
+        );
         // M3 telemetry: charge the window at submit (released at delivery /
         // failure / terminate / drop). The aggregate (shard sum) is only
         // materialized when diag is on — the hot path does one Relaxed RMW
@@ -1365,11 +1455,17 @@ mod tests {
     fn pool_worker_survives_panicking_job() {
         let pool = ReadIoPool::new(1);
         let (tx, rx) = std::sync::mpsc::channel::<u8>();
-        pool.submit(Box::new(|| panic!("deliberate test panic")));
+        pool.submit(
+            ReadJobClass::Foreground,
+            Box::new(|| panic!("deliberate test panic")),
+        );
         let tx2 = tx.clone();
-        pool.submit(Box::new(move || {
-            let _ = tx2.send(7);
-        }));
+        pool.submit(
+            ReadJobClass::Foreground,
+            Box::new(move || {
+                let _ = tx2.send(7);
+            }),
+        );
         drop(tx);
         assert_eq!(
             rx.recv_timeout(std::time::Duration::from_secs(10))
@@ -1878,5 +1974,45 @@ mod tests {
         // the guard's unwind drop).
         prime_opens_concurrent(jobs);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// FRS-READ-POOL-FAIRNESS: both foreground (`submit_read_job`) and background
+    /// (`submit_read_job_background`) submissions are WORK-CONSERVING — every job
+    /// runs to completion exactly once regardless of the fairness flag. This is
+    /// the safety invariant the 2-class scheduler must never break: a background
+    /// warm-up is DEPRIORITISED (served only when foreground is empty), never
+    /// dropped or starved. Independent of `FRS_RS_READ_POOL_FAIRNESS` (which is
+    /// read once via OnceLock) because correctness holds in BOTH regimes — with
+    /// fairness OFF every job is foreground (single FIFO); with it ON the
+    /// background queue is still fully drained once foreground empties.
+    #[test]
+    fn read_pool_background_and_foreground_jobs_all_run() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        let fg = Arc::new(AtomicUsize::new(0));
+        let bg = Arc::new(AtomicUsize::new(0));
+        let n = 16usize; // > pool width (<= 6) so jobs queue past the workers
+        let (tx, rx) = mpsc::channel::<()>();
+        for _ in 0..n {
+            let c = Arc::clone(&fg);
+            let t = tx.clone();
+            submit_read_job(Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                let _ = t.send(());
+            }));
+            let c = Arc::clone(&bg);
+            let t = tx.clone();
+            submit_read_job_background(Box::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                let _ = t.send(());
+            }));
+        }
+        drop(tx);
+        // Drain all 2n completion signals (proves none was starved/dropped).
+        for _ in 0..(2 * n) {
+            rx.recv().expect("every read-pool job must complete");
+        }
+        assert_eq!(fg.load(Ordering::SeqCst), n, "all foreground jobs ran");
+        assert_eq!(bg.load(Ordering::SeqCst), n, "all background jobs ran");
     }
 }

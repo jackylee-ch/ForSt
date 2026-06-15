@@ -217,3 +217,14 @@ real network latency variance, multi-tenant contention, or true object-store PUT
 RTT distributions. The mock-S3 result is necessary and now sufficient for the
 combined surface; the final confirmation is a real-BOS / online-box run of the same
 shapes (the cycle's stated endgame).
+
+### Follow-up: shared read-I/O pool contention (separate validation)
+
+This bin exercises the read levers through the `batch_get_vectorized` multiGet
+deref path. The SCAN-iterator read levers (`FRS_VLOG_SCAN_READAHEAD_DEPTH`,
+`FRS_COMPACT_INPUT_WARM[_DATA]`) share the one process-global read-I/O pool and
+have their own composition + contention surface, validated separately in
+`2026-06-15-disagg-readpool-contention-validation.md`. That found a real
+FIFO head-of-line block (background compaction warm-ups slow foreground scan
+windows 1.25–1.91×) and shipped the fix: a foreground-first 2-class read-I/O pool
+(`FRS_RS_READ_POOL_FAIRNESS`, default-OFF, byte-identical OFF).

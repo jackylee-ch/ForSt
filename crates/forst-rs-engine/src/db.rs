@@ -14805,7 +14805,13 @@ impl DbImpl {
         for meta in cold {
             let weak = Arc::downgrade(self);
             COMPACT_INPUT_WARM_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            forst_rs_storage::sst::submit_read_job(Box::new(move || {
+            // FRS-READ-POOL-FAIRNESS: this is a BACKGROUND warm-up (fire-and-
+            // forget; no operator blocks on it). Classed Background so that with
+            // `FRS_RS_READ_POOL_FAIRNESS=1` it yields to latency-critical
+            // foreground scan-readahead windows instead of head-of-line blocking
+            // them on the shared read-I/O pool. Flag OFF ⇒ identical to the
+            // pre-fix `submit_read_job` (single FIFO).
+            forst_rs_storage::sst::submit_read_job_background(Box::new(move || {
                 // DB torn down mid-flight ⇒ benign no-op. A warm-up open error is
                 // swallowed: the real `get_or_open_sst_reader` on the drain path
                 // re-runs it and surfaces any genuine fault there.
