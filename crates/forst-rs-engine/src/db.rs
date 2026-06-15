@@ -341,6 +341,76 @@ pub fn set_vlog_coalesce_deref_override(v: Option<bool>) {
     );
 }
 
+/// FRS-ACCUM-MERGE (Approach 2, 2026-06-15): the in-engine windowed-agg
+/// accumulator-merge capability gate (`FRS_ACCUM_MERGE=1`, **DEFAULT OFF**).
+///
+/// # The V-C batch-execution violation this gates away
+///
+/// For keyed-window / OVER aggregation (q8/q11/q12/q17/q18/q19) the SQL
+/// accumulator RMW today round-trips Java↔engine **per record**: the front-end
+/// pulls the accumulator out of the engine (`frs_get`), folds the delta in Java,
+/// and writes it back (`frs_put`). That is TWO FFI crossings per record AND a
+/// dependent get→put chain — the structural floor ForSt's synchronous C++
+/// backend beats forst-rs on (omnipotent-rethink §1.C / §2 V-C).
+///
+/// When this gate is ON, the backend instead submits ONLY the delta as a real
+/// engine `OpType::Merge` operand (`frs_merge` / `frs_vec_merge_append[_batch]`)
+/// against a CF carrying the matching merge operator (`NumericAddBeMergeOperator`
+/// for Flink `Long` accumulators, `RawConcatMergeOperator` for list-shaped
+/// accumulators). The engine combines operands at read/flush/compaction time via
+/// the operator's `full_merge`/`partial_merge`. Per record that is ONE FFI
+/// crossing and NO dependent read — the merge happens in-engine.
+///
+/// # Byte-identity contract
+///
+/// OFF and ON produce a BYTE-IDENTICAL accumulator value: only WHERE the fold
+/// runs changes (Java get→fold→put vs in-engine merge-fold). For `Long`
+/// accumulators the in-engine fold is `NumericAddBeMergeOperator`, whose
+/// big-endian wrapping add is byte-equivalent to Java `long +` over
+/// `DataOutputSerializer.writeLong` bytes (proven by the operator's G1 property
+/// tests in `merge_operator.rs`). The read-cost guard (operand-chain length
+/// bounded by partial-merge at flush/compaction) is the q20-regression falsifier.
+///
+/// # Capability gate, not behavior change
+///
+/// This is purely an *enablement* flag the FFI/backend consults; with it OFF the
+/// engine behaves exactly as before. No production default is changed this cycle.
+pub fn accumulator_merge_enabled() -> bool {
+    let ov = ACCUM_MERGE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_ACCUM_MERGE").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-ACCUM-MERGE test override for [`accumulator_merge_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static ACCUM_MERGE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-ACCUM-MERGE: forces the in-engine accumulator merge on/off for
+/// tests/benches (`None` = defer to `FRS_ACCUM_MERGE`). The override is an
+/// atomic so a single-threaded test can flip the gate without racing the
+/// `OnceLock` env cache.
+pub fn set_accumulator_merge_override(v: Option<bool>) {
+    ACCUM_MERGE_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// FRS-SST-COMPRESSION env override (perf experiment, 2026-06-02): force the
 /// SST block compression via `FRS_SST_COMPRESSION=none|lz4|zstd`. A differential
 /// q7 profile showed LZ4 `decompress` is ~43% of the heavy-join prefix-iter CPU
@@ -19075,6 +19145,132 @@ mod tests {
 
         set_vlog_coalesce_deref_override(None);
         set_kv_separation_override(None);
+    }
+
+    /// FRS-ACCUM-MERGE (Approach 2): the gate defaults OFF and the override
+    /// flips it deterministically (without racing the OnceLock env cache).
+    /// This guards the default-OFF contract — no production behavior changes
+    /// until a backend opts in.
+    #[test]
+    fn test_accumulator_merge_flag_default_off_and_override() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Forced OFF.
+        set_accumulator_merge_override(Some(false));
+        assert!(!accumulator_merge_enabled(), "forced-off must read false");
+        // Forced ON.
+        set_accumulator_merge_override(Some(true));
+        assert!(accumulator_merge_enabled(), "forced-on must read true");
+        // Back to env/default — DEFAULT is OFF (env unset in the test harness).
+        set_accumulator_merge_override(None);
+        assert!(
+            !accumulator_merge_enabled(),
+            "default (env unset) must be OFF"
+        );
+    }
+
+    /// FRS-ACCUM-MERGE byte-identity at the engine level: a `Long` accumulator
+    /// folded by the in-engine `NumericAddBeMergeOperator` (Arm B — submit only
+    /// the delta) equals the same accumulator folded by a get→`long +`→put
+    /// round-trip (Arm A), byte-for-byte, INCLUDING wrap-around and retraction.
+    /// The companion FFI test exercises the real `frs_*` boundary; this one
+    /// pins the engine path directly.
+    #[test]
+    fn test_accumulator_merge_engine_byte_identical() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let deltas: [i64; 8] = [9, -2, i64::MAX, 3, i64::MIN, -7, 1000, -1];
+
+        // Arm A — get → fold (Java `long +`) → put, on a plain CF.
+        let db_a = open();
+        let cf_a = db_a
+            .create_column_family(ColumnFamilyDescriptor::new("accA"))
+            .unwrap();
+        let key = b"acc";
+        for d in deltas {
+            let cur = match db_a.get(&cf_a, key).unwrap() {
+                Some(v) => i64::from_be_bytes(v.as_slice().try_into().unwrap()),
+                None => 0,
+            };
+            let next = cur.wrapping_add(d);
+            db_a.put(&cf_a, key, &next.to_be_bytes()).unwrap();
+        }
+        let a_final = db_a.get(&cf_a, key).unwrap().unwrap();
+
+        // Arm B — in-engine merge (submit only the delta) on a merge CF.
+        let db_b = open();
+        let cf_b = db_b
+            .create_column_family(
+                ColumnFamilyDescriptor::new("accB")
+                    .with_merge_operator(Arc::new(NumericAddBeMergeOperator::new())),
+            )
+            .unwrap();
+        for d in deltas {
+            db_b.merge(&cf_b, key, &d.to_be_bytes()).unwrap();
+        }
+        let b_final = db_b.get(&cf_b, key).unwrap().unwrap();
+
+        assert_eq!(
+            a_final, b_final,
+            "in-engine merge accumulator must be byte-identical to get-fold-put"
+        );
+        // And identical after a flush-collapse (operand chain folded).
+        db_b.flush_cf(&cf_b).unwrap();
+        let b_after_flush = db_b.get(&cf_b, key).unwrap().unwrap();
+        assert_eq!(
+            b_final, b_after_flush,
+            "flush-collapse must not change the accumulator value"
+        );
+    }
+
+    /// FRS-ACCUM-MERGE read-cost guard (Approach 2 §4.2 / q20-regression
+    /// falsifier): K in-engine merge operands for a `Long` accumulator,
+    /// spread across K flushes, must COLLAPSE to a SINGLE entry after
+    /// compaction — so the post-compaction read is O(1), not O(K). This is the
+    /// correctness backstop for the microbench's read-cost arms: the operand
+    /// chain is BOUNDED by compaction, so in-engine merge cannot permanently
+    /// inflate the read path.
+    #[test]
+    fn test_accumulator_merge_read_cost_chain_collapses_on_compaction() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let db = open();
+        // Pin the legacy fixed-target layout so compact_l0 rolls into a single
+        // bottommost L1 file (the collapse path the chain-resolve test uses).
+        db.force_fixed_levels();
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("accChain")
+                    .with_merge_operator(Arc::new(NumericAddBeMergeOperator::new())),
+            )
+            .unwrap();
+        let key = b"acc";
+        let k: i64 = 12;
+        // One merge per flush => K separate L0 SSTs each carrying one operand.
+        let mut expected: i64 = 0;
+        for i in 1..=k {
+            db.merge(&cf, key, &i.to_be_bytes()).unwrap();
+            expected = expected.wrapping_add(i);
+            db.switch_and_flush(&cf).unwrap().unwrap();
+        }
+        // Pre-compaction: the chain is spread across K L0 files.
+        assert_eq!(db.version_set.current().l0_files().len() as i64, k);
+        assert_eq!(
+            db.get(&cf, key).unwrap().as_deref(),
+            Some(expected.to_be_bytes().as_ref()),
+            "pre-compaction chain read must already fold correctly"
+        );
+
+        // Compaction collapses the whole chain to ONE entry (O(1) read).
+        db.compact_l0(&cf).unwrap();
+        let v = db.version_set.current();
+        assert_eq!(v.l0_files().len(), 0);
+        assert_eq!(
+            v.levels[1].files[0].num_entries, 1,
+            "operand chain must collapse to a single entry after compaction"
+        );
+        assert_eq!(
+            db.get(&cf, key).unwrap().as_deref(),
+            Some(expected.to_be_bytes().as_ref()),
+            "post-compaction value must be byte-identical to the folded chain"
+        );
     }
 
     /// FRS-AKV-B1 (2026-06-14): with `FRS_KV_ADAPTIVE_PRESSURE` OFF (default),

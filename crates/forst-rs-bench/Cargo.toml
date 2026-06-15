@@ -112,6 +112,13 @@ harness = false
 name = "persistent_probe_iter"
 harness = false
 
+# Approach 2 / V-C pre-build gate: windowed-agg accumulator RMW —
+# per-record get→fold→put (today) vs in-engine merge. Confirms the
+# round-trip reduction + the read-cost guard (operand-chain bound on flush).
+[[bench]]
+name = "accumulator_rmw"
+harness = false
+
 # B1 (2026-06-12 local FFI/flush/compaction bench design): boundary-tax
 # bench over the real frs_* FFI entry points vs engine-direct equivalents.
 [[bench]]

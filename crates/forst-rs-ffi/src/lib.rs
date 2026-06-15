@@ -7985,6 +7985,164 @@ mod tests {
     }
 
     #[test]
+    fn test_accumulator_merge_byte_identical_to_get_fold_put() {
+        // Approach 2 / V-C byte-identity gate (the core falsifier):
+        // for windowed-agg `Long` accumulation, the in-engine MERGE path
+        // (Arm B — submit only the delta, engine folds via
+        // NumericAddBeMergeOperator) must produce a BYTE-IDENTICAL
+        // accumulator to today's per-record GET→fold-in-Java→PUT round-trip
+        // (Arm A). Only WHERE the fold runs changes; the bytes must not.
+        //
+        // The fold is Java `long +` over DataOutputSerializer.writeLong
+        // (big-endian) bytes, including wrap-around and retraction (negative
+        // deltas) — exactly the operator's contract.
+        unsafe {
+            // A deterministic delta stream that exercises positives, negatives
+            // (retraction), and an overflow wrap. Same stream feeds both arms.
+            let deltas: [i64; 9] = [7, -3, i64::MAX, 1, -100, 50, i64::MIN, -1, 42];
+
+            // --- Arm A: get → fold-in-caller (Java `long +`) → put. ---
+            // A plain CF with NO merge operator (the legacy RMW path).
+            let a_final: [u8; 8] = {
+                let mut db: FrsDb = ptr::null_mut();
+                assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+                let mut cf: FrsCfHandle = ptr::null_mut();
+                assert_eq!(frs_db_default_cf(db, &mut cf), FRS_STATUS_OK);
+                let k = b"acc";
+                for d in deltas {
+                    // get current accumulator (absent → 0)
+                    let mut out = FrsBytes::NULL;
+                    assert_eq!(
+                        frs_get(db, cf, k.as_ptr(), k.len(), &mut out),
+                        FRS_STATUS_OK
+                    );
+                    let acc = if out.data.is_null() {
+                        0
+                    } else {
+                        let s = slice::from_raw_parts(out.data, out.len);
+                        i64::from_be_bytes(s.try_into().unwrap())
+                    };
+                    frs_bytes_free(&mut out);
+                    // fold in caller-space (Java `long +`) and write back
+                    let acc = acc.wrapping_add(d);
+                    let bytes = acc.to_be_bytes();
+                    assert_eq!(
+                        frs_put(db, cf, k.as_ptr(), k.len(), bytes.as_ptr(), bytes.len()),
+                        FRS_STATUS_OK
+                    );
+                }
+                // final read
+                let mut out = FrsBytes::NULL;
+                frs_get(db, cf, k.as_ptr(), k.len(), &mut out);
+                let s = slice::from_raw_parts(out.data, out.len);
+                let arr: [u8; 8] = s.try_into().unwrap();
+                frs_bytes_free(&mut out);
+                frs_cf_close(cf);
+                frs_db_close(db);
+                arr
+            };
+
+            // --- Arm B: in-engine merge (submit only the delta). ---
+            // A CF carrying NumericAddBeMergeOperator; engine folds the chain.
+            let b_final: [u8; 8] = {
+                let mut db: FrsDb = ptr::null_mut();
+                assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+                let name = CString::new("agg-merge-i64").unwrap();
+                let op_name = CString::new("NumericAddBeMergeOperator").unwrap();
+                let mut cf: FrsCfHandle = ptr::null_mut();
+                assert_eq!(
+                    frs_db_create_cf_with_merge(db, name.as_ptr(), op_name.as_ptr(), &mut cf),
+                    FRS_STATUS_OK
+                );
+                let k = b"acc";
+                for d in deltas {
+                    let bytes = d.to_be_bytes();
+                    assert_eq!(
+                        frs_merge(db, cf, k.as_ptr(), k.len(), bytes.as_ptr(), bytes.len()),
+                        FRS_STATUS_OK
+                    );
+                }
+                let mut out = FrsBytes::NULL;
+                frs_get(db, cf, k.as_ptr(), k.len(), &mut out);
+                let s = slice::from_raw_parts(out.data, out.len);
+                let arr: [u8; 8] = s.try_into().unwrap();
+                frs_bytes_free(&mut out);
+                frs_cf_close(cf);
+                frs_db_close(db);
+                arr
+            };
+
+            // Byte-identical accumulator: the WHERE changed, the bytes did not.
+            assert_eq!(
+                a_final, b_final,
+                "in-engine merge accumulator must be byte-identical to get-fold-put"
+            );
+            // Sanity: the expected wrapping fold.
+            let mut expected: i64 = 0;
+            for d in deltas {
+                expected = expected.wrapping_add(d);
+            }
+            assert_eq!(a_final, expected.to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn test_accumulator_merge_byte_identical_after_flush() {
+        // Read-cost guard companion: the byte-identity must survive a
+        // flush-collapse (partial/full-merge folds the chain at flush) — the
+        // in-engine accumulator read AFTER a flush equals the same wrapping
+        // fold. This is the q20-regression falsifier's correctness half:
+        // collapsing the operand chain must not change the value.
+        unsafe {
+            let deltas: [i64; 6] = [10, -4, i64::MAX, 2, i64::MIN, 99];
+            let mut db: FrsDb = ptr::null_mut();
+            assert_eq!(frs_db_open_memory(&mut db), FRS_STATUS_OK);
+            let name = CString::new("agg-merge-i64").unwrap();
+            let op_name = CString::new("NumericAddBeMergeOperator").unwrap();
+            let mut cf: FrsCfHandle = ptr::null_mut();
+            assert_eq!(
+                frs_db_create_cf_with_merge(db, name.as_ptr(), op_name.as_ptr(), &mut cf),
+                FRS_STATUS_OK
+            );
+            let k = b"acc";
+            for d in deltas {
+                let bytes = d.to_be_bytes();
+                assert_eq!(
+                    frs_merge(db, cf, k.as_ptr(), k.len(), bytes.as_ptr(), bytes.len()),
+                    FRS_STATUS_OK
+                );
+            }
+            // Read pre-flush (walks the operand chain).
+            let pre = {
+                let mut out = FrsBytes::NULL;
+                frs_get(db, cf, k.as_ptr(), k.len(), &mut out);
+                let arr: [u8; 8] = slice::from_raw_parts(out.data, out.len).try_into().unwrap();
+                frs_bytes_free(&mut out);
+                arr
+            };
+            // Collapse the chain.
+            assert_eq!(frs_flush(db), FRS_STATUS_OK);
+            // Read post-flush (sees one folded value).
+            let post = {
+                let mut out = FrsBytes::NULL;
+                frs_get(db, cf, k.as_ptr(), k.len(), &mut out);
+                let arr: [u8; 8] = slice::from_raw_parts(out.data, out.len).try_into().unwrap();
+                frs_bytes_free(&mut out);
+                arr
+            };
+            let mut expected: i64 = 0;
+            for d in deltas {
+                expected = expected.wrapping_add(d);
+            }
+            assert_eq!(pre, expected.to_be_bytes(), "pre-flush chain read");
+            assert_eq!(post, expected.to_be_bytes(), "post-flush collapsed read");
+            assert_eq!(pre, post, "flush-collapse must not change the value");
+            frs_cf_close(cf);
+            frs_db_close(db);
+        }
+    }
+
+    #[test]
     fn test_batch_put_and_get() {
         unsafe {
             let mut db: FrsDb = ptr::null_mut();
