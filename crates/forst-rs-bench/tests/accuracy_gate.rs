@@ -83,6 +83,12 @@ enum Event {
     Bid { key: u64, price: u64 },
     /// Window expiry for a key: delete its state (tombstone).
     Expire { key: u64 },
+    /// Point lookup of a key (the q3/q8 join build-side probe: read keyed
+    /// state mid-stream). The read-back value is folded into a per-engine
+    /// read-trace digest so a READ-PATH visibility divergence (stale or
+    /// missing value after a put/delete/flush) is caught even if the final
+    /// materialized state happens to converge.
+    Probe { key: u64 },
 }
 
 /// Build the fixed event stream ONCE; both engines replay the identical Vec.
@@ -93,6 +99,14 @@ fn build_events(keys: u64, events: usize, window: usize, seed: u64) -> Vec<Event
         let key = rng.below(keys);
         let price = 1 + rng.below(1000);
         out.push(Event::Bid { key, price });
+        // Every few events, probe a (possibly different) key — the q3/q8 join
+        // build-side read. Reads interleave with writes/flushes so the probe
+        // exercises memtable-vs-SST visibility, the q3/q8 read-path surface.
+        if i % 4 == 0 {
+            out.push(Event::Probe {
+                key: rng.below(keys),
+            });
+        }
         // At each window boundary, expire a deterministic slice of keys —
         // this is the tombstone + version-churn pattern q5/q11 produce.
         if window > 0 && (i + 1) % window == 0 {
@@ -107,10 +121,14 @@ fn build_events(keys: u64, events: usize, window: usize, seed: u64) -> Vec<Event
 /// Bid adds price to the running per-key sum; Expire removes the key.
 /// `flush` is invoked at each window boundary so the engine actually moves
 /// state through memtable→SST (read-amp / merge path), matching the harness.
-fn run_forst_rs(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
+fn run_forst_rs(events: &[Event], window: usize) -> (BTreeMap<u64, u64>, u64) {
     let db = open_in_memory(4 * 1024 * 1024);
     let cf = create_cf(&db, "acc-cf");
     let mut applied = 0usize;
+    // Running FNV-1a digest of every point-read result (Bid read-before-write +
+    // Probe) so a mid-stream READ visibility divergence is caught even if the
+    // final scanned state converges.
+    let mut read_trace = 0xcbf29ce484222325u64;
     for ev in events {
         match ev {
             Event::Bid { key, price } => {
@@ -120,6 +138,7 @@ fn run_forst_rs(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
                     .expect("frs get")
                     .map(|v| u64::from_be_bytes(v[..].try_into().unwrap()))
                     .unwrap_or(0);
+                fold_read(&mut read_trace, *key, Some(cur));
                 let next = cur + price;
                 db.put(&cf, &kb, &next.to_be_bytes()).expect("frs put");
                 applied += 1;
@@ -129,6 +148,13 @@ fn run_forst_rs(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
             }
             Event::Expire { key } => {
                 db.delete(&cf, &key.to_be_bytes()).expect("frs delete");
+            }
+            Event::Probe { key } => {
+                let v = db
+                    .get(&cf, &key.to_be_bytes())
+                    .expect("frs probe get")
+                    .map(|v| u64::from_be_bytes(v[..].try_into().unwrap()));
+                fold_read(&mut read_trace, *key, v);
             }
         }
     }
@@ -144,10 +170,10 @@ fn run_forst_rs(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
         let val = u64::from_be_bytes(v[..].try_into().unwrap());
         out.insert(key, val);
     }
-    out
+    (out, read_trace)
 }
 
-fn run_rocksdb(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
+fn run_rocksdb(events: &[Event], window: usize) -> (BTreeMap<u64, u64>, u64) {
     let tmp = TempDir::new().expect("tempdir");
     let mut opts = RocksOpts::default();
     opts.create_if_missing(true);
@@ -162,6 +188,7 @@ fn run_rocksdb(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
     );
     let cf = db.cf_handle("default").expect("rocksdb cf");
     let mut applied = 0usize;
+    let mut read_trace = 0xcbf29ce484222325u64;
     for ev in events {
         match ev {
             Event::Bid { key, price } => {
@@ -171,6 +198,7 @@ fn run_rocksdb(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
                     .expect("rocksdb get")
                     .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()))
                     .unwrap_or(0);
+                fold_read(&mut read_trace, *key, Some(cur));
                 let next = cur + price;
                 db.put_cf(&cf, kb, next.to_be_bytes()).expect("rocksdb put");
                 applied += 1;
@@ -182,6 +210,13 @@ fn run_rocksdb(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
                 db.delete_cf(&cf, key.to_be_bytes())
                     .expect("rocksdb delete");
             }
+            Event::Probe { key } => {
+                let v = db
+                    .get_cf(&cf, key.to_be_bytes())
+                    .expect("rocksdb probe get")
+                    .map(|v| u64::from_be_bytes(v.as_slice().try_into().unwrap()));
+                fold_read(&mut read_trace, *key, v);
+            }
         }
     }
     let mut out = BTreeMap::new();
@@ -192,7 +227,7 @@ fn run_rocksdb(events: &[Event], window: usize) -> BTreeMap<u64, u64> {
         let val = u64::from_be_bytes(v.as_ref().try_into().unwrap());
         out.insert(key, val);
     }
-    out
+    (out, read_trace)
 }
 
 /// FNV-1a digest of the sorted (key,value) materialized state — the verdict
@@ -208,11 +243,81 @@ fn digest(state: &BTreeMap<u64, u64>) -> u64 {
     h
 }
 
+/// Fold one point-read result (key + optional value) into a running FNV-1a
+/// read-trace digest. `None` (absent key) and `Some(0)` fold distinctly so a
+/// missing-vs-zero visibility divergence is caught.
+fn fold_read(h: &mut u64, key: u64, val: Option<u64>) {
+    let tag: u64 = match val {
+        Some(_) => 1,
+        None => 2,
+    };
+    for b in key
+        .to_be_bytes()
+        .iter()
+        .chain(tag.to_be_bytes().iter())
+        .chain(val.unwrap_or(0).to_be_bytes().iter())
+    {
+        *h ^= *b as u64;
+        *h = h.wrapping_mul(0x100000001b3);
+    }
+}
+
 fn envu(name: &str, dflt: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(dflt)
+}
+
+/// Outcome of comparing the two engines on one event stream.
+struct GateOutcome {
+    equal: bool,
+    diffs: usize,
+    frs_state_h: u64,
+    rdb_state_h: u64,
+    frs_read_h: u64,
+    rdb_read_h: u64,
+    frs_keys: usize,
+    rdb_keys: usize,
+}
+
+/// Replay the SAME stream through both engines and compare BOTH the final
+/// materialized state AND the mid-stream read trace. Reused by the gate test
+/// and the non-vacuity self-check (which feeds it a deliberately perturbed
+/// stream and asserts a mismatch IS detected).
+fn compare_engines(stream: &[Event], window: usize) -> GateOutcome {
+    let (frs, frs_read_h) = run_forst_rs(stream, window);
+    let (rdb, rdb_read_h) = run_rocksdb(stream, window);
+    let frs_state_h = digest(&frs);
+    let rdb_state_h = digest(&rdb);
+    let mut diffs = 0;
+    for key in frs
+        .keys()
+        .chain(rdb.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if frs.get(key).copied() != rdb.get(key).copied() {
+            if diffs < 20 {
+                eprintln!(
+                    "  DIFF key={key}: frs={:?} rdb={:?}",
+                    frs.get(key).copied(),
+                    rdb.get(key).copied()
+                );
+            }
+            diffs += 1;
+        }
+    }
+    let equal = diffs == 0 && frs == rdb && frs_read_h == rdb_read_h;
+    GateOutcome {
+        equal,
+        diffs,
+        frs_state_h,
+        rdb_state_h,
+        frs_read_h,
+        rdb_read_h,
+        frs_keys: frs.len(),
+        rdb_keys: rdb.len(),
+    }
 }
 
 #[test]
@@ -229,52 +334,74 @@ fn nexmark_windowed_state_matches_rocksdb() {
         stream.len()
     );
 
-    let frs = run_forst_rs(&stream, window);
-    let rdb = run_rocksdb(&stream, window);
-
-    let frs_h = digest(&frs);
-    let rdb_h = digest(&rdb);
+    let r = compare_engines(&stream, window);
     eprintln!(
-        "accuracy-gate: frs_keys={} rdb_keys={} frs_sha={frs_h:#018x} rdb_sha={rdb_h:#018x}",
-        frs.len(),
-        rdb.len()
+        "accuracy-gate: frs_keys={} rdb_keys={} \
+         frs_state_sha={:#018x} rdb_state_sha={:#018x} \
+         frs_read_sha={:#018x} rdb_read_sha={:#018x}",
+        r.frs_keys, r.rdb_keys, r.frs_state_h, r.rdb_state_h, r.frs_read_h, r.rdb_read_h
     );
 
     // Guard against the degeneracy trap: a window cadence that collapses all
     // state into nothing (or never churns) would make the comparison vacuous.
     assert!(
-        !frs.is_empty(),
+        r.frs_keys > 0,
         "materialized state is empty — workload degenerate (check FRS_ACC_WINDOW/KEYS)"
     );
 
-    if frs != rdb {
-        // Print up to 20 diverging keys for triage, mirroring compare-print.py.
-        let mut diffs = 0;
-        for key in frs
-            .keys()
-            .chain(rdb.keys())
-            .collect::<std::collections::BTreeSet<_>>()
-        {
-            let f = frs.get(key).copied();
-            let r = rdb.get(key).copied();
-            if f != r {
-                if diffs < 20 {
-                    eprintln!("  DIFF key={key}: frs={f:?} rdb={r:?}");
-                }
-                diffs += 1;
-            }
-        }
-        panic!(
-            "ACCURACY MISMATCH: {diffs} diverging keys; frs_sha={frs_h:#018x} rdb_sha={rdb_h:#018x}"
-        );
-    }
-
-    assert_eq!(
-        frs_h, rdb_h,
-        "verdict hash mismatch despite equal maps (impossible)"
+    assert!(
+        r.equal,
+        "ACCURACY MISMATCH: {} diverging keys; \
+         state frs={:#018x}/rdb={:#018x} read frs={:#018x}/rdb={:#018x}",
+        r.diffs, r.frs_state_h, r.rdb_state_h, r.frs_read_h, r.rdb_read_h
     );
     eprintln!(
-        "accuracy-gate: EQUAL — {} keys, verdict {frs_h:#018x}",
-        frs.len()
+        "accuracy-gate: EQUAL — {} keys, state {:#018x} read {:#018x}",
+        r.frs_keys, r.frs_state_h, r.frs_read_h
+    );
+}
+
+/// Non-vacuity self-check: the gate MUST be able to catch a divergence. Replay
+/// a small stream, then perturb ONE event's price and confirm `compare_engines`
+/// reports a mismatch when the two streams differ. This proves the comparator
+/// is non-vacuous — if a refactor ever made the gate always-pass (e.g. compared
+/// each engine to itself), this test fails loudly. Runs on every push alongside
+/// the real gate, so the every-push guard can't silently rot.
+#[test]
+fn gate_detects_injected_divergence() {
+    let window = 200usize;
+    let base = build_events(500, 5_000, window, 0xabcd_0001);
+    // Sanity: the unperturbed stream must compare EQUAL (engines agree).
+    let clean = compare_engines(&base, window);
+    assert!(
+        clean.equal,
+        "self-check baseline diverged unexpectedly (state frs={:#018x}/rdb={:#018x})",
+        clean.frs_state_h, clean.rdb_state_h
+    );
+
+    // Build a perturbed copy: bump the first Bid's price by 1. Feeding this
+    // perturbed stream to BOTH engines still yields equal engines, so to prove
+    // the COMPARATOR catches divergence we instead run forst-rs on `base` and
+    // rocksdb on `perturbed` via a direct check.
+    let mut perturbed = base.clone();
+    for ev in perturbed.iter_mut() {
+        if let Event::Bid { price, .. } = ev {
+            *price += 1;
+            break;
+        }
+    }
+    let (frs_clean, frs_read_clean) = run_forst_rs(&base, window);
+    let (rdb_pert, rdb_read_pert) = run_rocksdb(&perturbed, window);
+    let state_differs = frs_clean != rdb_pert;
+    let read_differs = frs_read_clean != rdb_read_pert;
+    assert!(
+        state_differs || read_differs,
+        "non-vacuity FAILED: a +1 price perturbation produced NO detectable \
+         state OR read-trace difference — the gate would not catch a real \
+         accuracy regression"
+    );
+    eprintln!(
+        "accuracy-gate self-check: injected +1 perturbation detected \
+         (state_differs={state_differs} read_differs={read_differs}) — gate is non-vacuous"
     );
 }

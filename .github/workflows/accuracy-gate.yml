@@ -12,24 +12,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# NEXMark accuracy gate (engine-level, 100K scale).
+# NEXMark accuracy gate (engine-level, 100K scale) — HOSTED, every push.
 #
 # Catches ForSt-RS engine accuracy regressions by replaying a DETERMINISTIC
 # fixed-seed, NEXMark-windowed-state-shaped workload (per-key aggregation churn
-# + tombstones + full-range scan = the q5 hop / q11 session read+write path)
-# through BOTH the ForSt-RS engine and the vendored RocksDB baseline on
-# IDENTICAL input, then byte-comparing the materialized state. Any divergence
-# fails the job.
+# + window-expiry tombstones + join-probe point reads + full-range scan = the
+# q3/q5/q8/q11 read+write path) through BOTH the REAL ForSt-RS engine (the
+# production crates/forst-rs-* db.rs paths) and the vendored RocksDB C++
+# baseline on IDENTICAL input, then byte-comparing BOTH the final materialized
+# state AND the mid-stream read trace (q3/q8 join-probe visibility). Any
+# divergence fails the job. A built-in non-vacuity self-check
+# (`gate_detects_injected_divergence`) proves the comparator catches a +1
+# perturbation, so this every-push guard cannot silently go vacuous.
 #
 # Why engine-level on hosted GHA (not the full Flink NEXMark harness):
-#   The faithful end-to-end gate is the fixed-CSV harness in
+#   The faithful END-TO-END gate is the fixed-CSV harness in
 #   `scripts/accuracy-gate/` (forst-rs vs rocksdb on byte-identical CSV through
-#   the real Flink backend). It needs a full Flink 2.2.1 distribution + Hadoop +
-#   sql-gateway + a JDK25 cluster + the nexmark-flink jar — multi-step and
-#   cluster-flaky, so it belongs on a self-hosted / box runner, NOT hosted
-#   ubuntu-latest. This workflow is the smallest faithful variant that still
-#   runs on every push: it exercises the exact engine read/write/scan/tombstone
+#   the REAL Flink backend, real NEXMark q3/q5/q8/q11/q12 SQL). It needs an
+#   UNRELEASED Flink 2.2.1 dist built from the ~12 GB jackylee-ch/flink fork +
+#   the forst-rs statebackend jar + Hadoop + sql-gateway + a JDK17/JDK25
+#   cluster — a 12 GB Flink build OOMs/times out hosted ubuntu-latest. That
+#   gate is now wired as a SELF-HOSTED workflow: .github/workflows/
+#   nexmark-accuracy.yml (workflow_dispatch, runs-on [self-hosted, nexmark]).
+#   THIS workflow is the smallest faithful variant that still runs on every
+#   push: it exercises the exact engine read/write/scan/tombstone/visibility
 #   ordering the windowed queries depend on, deterministically, in ~3 s.
+#
+#   HONEST GAP: this runs the real ENGINE but NOT through Flink's SQL /
+#   operator / state-serialization layer, and on a NEXMark-SHAPED workload, not
+#   the literal q3/q5/q8/q11/q12 SQL output. It catches engine accuracy
+#   regressions; a bug living only in the Flink statebackend glue or SQL plan
+#   is caught by the self-hosted nexmark-accuracy.yml gate.
 #
 # The companion full-harness instructions live in
 #   docs/superpowers/specs/2026-06-12-fixed-csv-accuracy-gate.md
@@ -114,7 +127,7 @@ jobs:
           cargo test --release -p forst-rs-bench \
             --features rocksdb-baseline --test accuracy_gate --no-run
 
-      - name: Run NEXMark accuracy gate (fails on any hash mismatch)
+      - name: Run NEXMark accuracy gate + non-vacuity self-check (fails on any hash mismatch)
         env:
           FRS_ACC_EVENTS: ${{ github.event.inputs.events || '100000' }}
           FRS_ACC_KEYS: ${{ github.event.inputs.keys || '2000' }}

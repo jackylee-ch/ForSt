@@ -1,0 +1,165 @@
+# Copyright 2026 The ForSt-RS Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ============================================================================
+# Full-stack NEXMark accuracy gate — REAL NEXMark SQL through the REAL Flink
+# forst-rs backend vs the rocksdb backend, on a fixed deterministic CSV.
+# forst-rs vs rocksdb, exact compare, FAIL on ANY output mismatch.
+# ============================================================================
+#
+# This is the GENUINELY FAITHFUL end-to-end accuracy gate: it runs the actual
+# NEXMark q3/q5/q8/q11/q12 query SQL through a real Flink standalone cluster on
+# BOTH the forst-rs disaggregated backend AND the rocksdb backend, replaying a
+# byte-identical fixed CSV, and byte-compares the print-sink changelog rows
+# (materialized multiset, sha256). Any DIFF or any missing/failed query FAILS
+# the job. It wraps the proven `scripts/accuracy-gate/` harness (spec:
+# docs/superpowers/specs/2026-06-12-fixed-csv-accuracy-gate.md, which verified
+# 5/5 EQUAL at 1M and is determinism-stable run-to-run).
+#
+# ---------------------------------------------------------------------------
+# WHY SELF-HOSTED (and not hosted ubuntu-latest):
+#   The full Flink stack is NOT reproducible on a hosted runner within its
+#   limits. It requires:
+#     * Flink 2.2.1 — an UNRELEASED version; the only artifact is the dist
+#       built from the jackylee-ch/flink fork, a ~12 GB Apache Flink source
+#       tree. A full Flink maven build is 30-60+ min and OOMs the ~16 GB
+#       hosted runner.
+#     * the forst-rs Flink statebackend jar, built from that same fork.
+#     * Hadoop, a JDK17 (rocksdb) + JDK25 (forst-rs) standalone cluster, the
+#       sql-gateway, and the nexmark-flink jar.
+#   So this gate runs on a SELF-HOSTED runner (label: nexmark) that already
+#   has the box's prebuilt FLINK_HOME / WORKENV / nexmark-flink. The EVERY-PUSH
+#   guard is the hosted engine-level gate in accuracy-gate.yml (the real
+#   ForSt-RS engine vs real RocksDB on a NEXMark-shaped workload); this job is
+#   the faithful E2E confirmation, run on demand / when a box runner is online.
+#
+#   If no self-hosted runner with the `nexmark` label is registered, this
+#   workflow simply queues and never starts — it never blocks the repo.
+# ---------------------------------------------------------------------------
+#
+# Set these as repo/org Variables (Settings -> Variables -> Actions) to match
+# the box, or accept the defaults if the runner uses them:
+#   NEXMARK_WORKENV, NEXMARK_FLINK_HOME, NEXMARK_HADOOP_HOME,
+#   NEXMARK_JDK17, NEXMARK_JDK25
+# The runner must already have nexmark-flink built at
+#   nexmark/nexmark-flink/target/nexmark-flink-bin/nexmark-flink/queries/
+
+name: nexmark-accuracy-fullstack
+
+on:
+  workflow_dispatch:
+    inputs:
+      events:
+        description: "Fixed-CSV event count (100000 = CI scale ~50 windows, 1000000 = full)"
+        required: false
+        default: "100000"
+      queries:
+        description: "NEXMark queries to verify (space-separated)"
+        required: false
+        default: "q3 q5 q8 q11 q12"
+      force_gen:
+        description: "Regenerate the fixed CSV even if present"
+        type: boolean
+        required: false
+        default: false
+
+permissions: read-all
+
+jobs:
+  fullstack-nexmark-accuracy:
+    name: "full-stack NEXMark accuracy (real Flink, forst-rs vs rocksdb)"
+    runs-on: [self-hosted, nexmark]
+    timeout-minutes: 180
+    env:
+      WORKENV: ${{ vars.NEXMARK_WORKENV || '/home/runner/workenv' }}
+      FLINK_HOME: ${{ vars.NEXMARK_FLINK_HOME || '/home/runner/workenv/flink-2.2.1' }}
+      HADOOP_HOME: ${{ vars.NEXMARK_HADOOP_HOME || '/home/runner/workenv/hadoop-3.4.3' }}
+      JDK17: ${{ vars.NEXMARK_JDK17 || '/usr/lib/jvm/java-17-openjdk-amd64' }}
+      JDK25: ${{ vars.NEXMARK_JDK25 || '/opt/java/openjdk' }}
+      EVENTS_NUM: ${{ github.event.inputs.events || '100000' }}
+      QUERIES: ${{ github.event.inputs.queries || 'q3 q5 q8 q11 q12' }}
+      REPO: ${{ github.workspace }}
+      TEMPLATES: ${{ github.workspace }}/scripts/templates-linux
+      NEXMARK_HOME: ${{ github.workspace }}/nexmark/nexmark-flink/target/nexmark-flink-bin/nexmark-flink
+      CSV_DIR: /tmp/nexmark-fixed-csv-acc
+    steps:
+      - name: Checkout (with nexmark submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build forst-rs .so (Linux release) and deploy into Flink lib
+        run: |
+          cargo build --release -p forst-rs-ffi
+          test -f target/release/libforst_rs_ffi.so
+          cp target/release/libforst_rs_ffi.so "$FLINK_HOME/lib/libforst_rs_ffi.so"
+
+      - name: Sanity — Flink dist + nexmark queries present on the runner
+        run: |
+          test -x "$FLINK_HOME/bin/start-cluster.sh" \
+            || { echo "::error::FLINK_HOME=$FLINK_HOME is not a Flink dist — register a self-hosted 'nexmark' runner with the box's workenv (see workflow header)"; exit 1; }
+          test -d "$NEXMARK_HOME/queries" \
+            || { echo "::error::nexmark-flink not built at $NEXMARK_HOME — build it on the runner first"; exit 1; }
+          ls "$NEXMARK_HOME/queries"/q*.sql | head
+
+      - name: Generate fixed CSV (deterministic) — once
+        run: |
+          if [ "${{ github.event.inputs.force_gen }}" = "true" ] || [ ! -d "$CSV_DIR/bid" ]; then
+            bash scripts/accuracy-gate/gen-fixed-csv.sh 2>&1 | tee /tmp/gen.log
+            grep -q "GEN OK" /tmp/gen.log || { echo "::error::CSV generation failed"; exit 1; }
+          else
+            echo "reusing existing fixed CSV at $CSV_DIR"
+          fi
+
+      - name: Run each query on BOTH backends + compare (FAIL on ANY mismatch)
+        env:
+          MAXSEC: "900"
+        run: |
+          set -u
+          mkdir -p /tmp/acc-rows
+          fail=0
+          for q in $QUERIES; do
+            for cfg in forst-rs-ffm-local rocksdb; do
+              echo "== RUN $q [$cfg] =="
+              OUT_FILE="/tmp/acc-rows/$q-$cfg.rows" QUERY="$q" CONFIG="$cfg" \
+                bash scripts/accuracy-gate/measure-print.sh \
+                2>&1 | tee "/tmp/acc-rows/$q-$cfg.log" || true
+              if ! grep -q "VERDICT_TSV	$q	$cfg	" "/tmp/acc-rows/$q-$cfg.log"; then
+                echo "::error::$q/$cfg produced no VERDICT_TSV"; fail=1
+              fi
+            done
+          done
+          echo "== A/B comparison (forst-rs vs rocksdb) =="
+          EB=$(( EVENTS_NUM * 46 / 50 ))   # q12 invariant: bid count = BP/50 of events
+          for q in $QUERIES; do
+            frs="/tmp/acc-rows/$q-forst-rs-ffm-local.rows"
+            rdb="/tmp/acc-rows/$q-rocksdb.rows"
+            if [ ! -s "$frs" ] || [ ! -s "$rdb" ]; then
+              echo "::error::$q missing capture (frs=$([ -s "$frs" ] && echo ok || echo MISSING) rdb=$([ -s "$rdb" ] && echo ok || echo MISSING))"
+              fail=1; continue
+            fi
+            if ! python3 scripts/accuracy-gate/compare-print.py "$q" "$frs" "$rdb" "$EB"; then
+              echo "::error::$q ACCURACY MISMATCH (forst-rs vs rocksdb)"; fail=1
+            fi
+          done
+          [ "$fail" = "0" ] || { echo "NEXMark full-stack accuracy gate FAILED"; exit 1; }
+          echo "NEXMark full-stack accuracy gate: ALL PASS ($QUERIES)"
+
+      - name: Upload captures + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexmark-accuracy-fullstack
+          path: /tmp/acc-rows
+          retention-days: 7
