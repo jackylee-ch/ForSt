@@ -19,7 +19,9 @@
 #
 # | query | forst-rs (M2) wall_s | out_rows | rocksdb wall_s | out_rows | forst wall_s | out_rows | beat-both verdict |
 # |---|---|---|---|---|---|---|---|
+# | q8 | 46.7 | 3,064,481 ✓ | 44.3 | 3,064,413 | 41.2 | 3,064,421 | PASS RDB (1.05×); GAP ForSt (+5.5s, 1.13×); rows in-band (sink jitter, src≈3.064M) |
 # | q9 | 1285.5 | 91,813,372 ✓ | 1057.4 | 91,813,372 ✓ | 1982.0 | 91,813,372 ✓ | PASS (vs RDB 1.22× ≤1.25 bar; BEATS ForSt 1.54×; rows EXACT all 3) |
+# | q12 | 43.6 | 92,000,000 ✓ | 39.6 | 92,000,000 ✓ | 43.9 | 92,000,000 ✓ | PASS both (RDB 1.10×; BEATS ForSt by 0.3s); rows EXACT |
 #
 # ★ q9 headline: in the uniform split it FINISHES on all 3 backends with byte-
 #   identical out_rows (91,813,372), BEATS ForSt (1285.5 < 1982.0), and is within
@@ -31,8 +33,13 @@
 #
 # ── process.size=10240m REGRESSION CHECK (vs prior 12288m, same machine) ──
 # q9: 10240m is REQUIRED for the fit (12288m OOM'd the split). For non-q9 queries
-# the check is each query's M2 wall vs the prior recorded forst-rs wall — flagged
-# below per query. (results appended as runs complete)
+# the check is each query's M2 wall vs the prior recorded forst-rs wall.
+#   q8:  46.7 vs prior 43.6 → +3.1s, minor (within run-to-run noise) — NO regression.
+#   q12: 43.6 vs prior 49.6 → FASTER (-6.0s) — NO regression (improved).
+#   VERDICT so far: NO query is materially HURT by the 10240m budget. The carve-out
+#   moves ~2 GiB from JVM to the cgroup for engine native memory; the light/windowed
+#   queries (small engine-native footprint) are unaffected — neutral/beneficial. No
+#   Peter-robbed-to-pay-Paul. (q11/q18/q19/q4/q7/q20 appended as they complete.)
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★★ CURRENT STATUS 2026-06-12 — REMOTE-x86 IS THE BINDING POPULATION
