@@ -6,15 +6,31 @@ thin wrapper of the canonical assets under `scripts/`, `scripts/templates-linux/
 and `docs/superpowers/specs/` — kept together so a fresh checkout can run the
 local sweep + the S3-sim test without hunting across the tree.
 
+**Portable across two platforms.** Every script detects the OS (`uname -s`) and
+branches only where behavior differs, so the SAME package reproduces the results
+on BOTH:
+
+- **macOS** (Apple-Silicon dev box) — arm64 Linux containers under Docker Desktop.
+- **the origin Linux box** (x86_64, checkout at `/ssd2/$USER/ForSt`) — amd64
+  containers, NVMe scratch disks, `LD_PRELOAD`ed jemalloc, io_uring.
+
+All machine-specific values (paths, image tag, platform, RAM-derived sizing,
+jemalloc `.so`, scratch disk, io_uring) are auto-detected with per-OS defaults
+and are **fully env-overridable** — nothing is hardcoded to one machine. Jump to
+**§7 Reproduce on macOS** or **§8 Reproduce on the origin Linux box**.
+
 ```
 tools/nexmark-local/
   scripts/
     run-best.sh                  NEW — per-query BEST-config driver (<query>|sweep|print)
     run-s3sim.sh                 NEW — local S3-simulation driver (smoke | sweep)
-    run-8c32g.sh                 copy of scripts/run-8c32g.sh + ONE delta:
-                                   forwards FRS_REMOTE_BW_MBPS into the containers
-    run-remote-nexmark-v3.sh     copy — uniform-config NexMark sweep wrapper
-    pick-disk.sh                 copy — picks one scratch disk for a whole sweep
+    run-8c32g.sh                 portable copy of scripts/run-8c32g.sh: forwards
+                                   FRS_REMOTE_BW_MBPS + JVM process.size into the
+                                   containers, and adds OS-aware defaults
+                                   (paths/image/jemalloc/io_uring/RAM sizing)
+    run-remote-nexmark-v3.sh     uniform-config NexMark sweep wrapper (portable)
+    pick-disk.sh                 portable scratch-disk picker (Linux NVMe %util;
+                                   macOS $TMPDIR; FRS_CTMP_BASE override)
   configs/
     best-config.tsv              NEW — per-query EMPIRICALLY-BEST config table
     config-forst-rs-s3sim.yaml.tpl   NEW — disagg config: S3 dir + local dir + throttle
@@ -245,3 +261,103 @@ byte-identical and there is zero overhead.
   arm — the disaggregated read-amp cost the cap is meant to model.
 - Compare same-config across backends; a forst-rs time *below* RocksDB means
   forst-rs is faster (the perf target).
+
+---
+
+## 7. Reproduce on macOS (dev box)
+
+macOS is the development/UT/micro-bench box. The arm64 Linux container runs under
+Docker Desktop. Defaults are auto-detected; you normally only set `REPO` if your
+checkout is not at the documented path.
+
+**Platform behavior (auto):** `IMG=forst-bench:arm64`, `PLAT=linux/arm64`, JDK17
+path `…-arm64`; jemalloc `LD_PRELOAD` defaults **OFF** (the known macOS jemalloc
+TSD crash — see `MEMORY.md`); io_uring/seccomp defaults **OFF** (the engine falls
+back to blocking I/O inside the Docker-Desktop VM); scratch base defaults under
+`$TMPDIR`; physical RAM auto-detected via `sysctl hw.memsize`.
+
+```bash
+# 0) build the forst-rs Linux .so (once + on engine changes) and the jar:
+bash tools/nexmark-local/scripts/run-8c32g.sh build
+bash tools/nexmark-local/scripts/run-8c32g.sh jar       # host maven, JAVA_HOME auto
+
+# 1) show / run the per-query BEST config (forst-rs arm):
+bash tools/nexmark-local/scripts/run-best.sh print            # all 8
+bash tools/nexmark-local/scripts/run-best.sh q19              # one query
+bash tools/nexmark-local/scripts/run-best.sh sweep           # all 8, serial
+
+# 2) the q9 8c/36g single-TM profile (KV-sep ON; needs >=40 GiB RAM):
+bash tools/nexmark-local/scripts/run-best.sh q9-36g
+
+# 3) the uniform-config research sweep (8 queries x 3 backends):
+bash tools/nexmark-local/scripts/run-remote-nexmark-v3.sh
+
+# 4) the LOCAL S3-simulation smoke (no Docker):
+bash tools/nexmark-local/scripts/run-s3sim.sh smoke
+```
+
+---
+
+## 8. Reproduce on the origin Linux box (x86_64)
+
+The origin box is the perf authority (NexMark = remote only). The checkout lives
+at **`/ssd2/$USER/ForSt`** (documented, not hardcoded). Deploy with a plain
+`git pull`:
+
+```bash
+# deploy: pull the package to the box's checkout (origin/forst-rs):
+cd /ssd2/$USER/ForSt && git fetch origin && git checkout forst-rs && git pull
+```
+
+**Platform behavior (auto):** `REPO=/ssd2/$USER/ForSt`, `WORKENV=$HOME/workenv`,
+`IMG=forst-bench:x86`, `PLAT=linux/amd64`, JDK17 path `…-amd64`; jemalloc
+`LD_PRELOAD` defaults **ON** (the box's bundled `libjemalloc-preload.so`;
+override the `.so` with `FRS_JEMALLOC_SO=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2`
+if the image lacks the bundle); io_uring/seccomp defaults **ON**
+(`--security-opt seccomp=unconfined` — **required**, else q7 DNFs); scratch disk
+chosen by `pick-disk.sh` across the NVMe mounts (`/ssd2|/ssd1|/tmp` under `$USER`,
+least-busy by an `iostat -x` %util sample); physical RAM auto-detected via
+`/proc/meminfo`.
+
+```bash
+# 0) build the x86 image + .so + jar per the E2E runbook (DOCS-INDEX), then .so:
+bash tools/nexmark-local/scripts/run-8c32g.sh build
+
+# 1) per-query BEST config sweep (forst-rs arm):
+bash tools/nexmark-local/scripts/run-best.sh sweep
+
+# 2) q9 8c/36g single-TM profile (KV-sep ON; the box has the RAM headroom):
+bash tools/nexmark-local/scripts/run-best.sh q9-36g
+
+# 3) uniform-config research sweep (8 queries x 3 backends, serial):
+bash tools/nexmark-local/scripts/run-remote-nexmark-v3.sh
+```
+
+If the box's core/RAM counts differ from the 8c/32g budget, size the topology
+with the resource knobs below.
+
+---
+
+## 9. Platform env knobs (override any default)
+
+| Knob | macOS default | Linux default | Meaning |
+|---|---|---|---|
+| `REPO` | `/Users/.../ForSt` | `/ssd2/$USER/ForSt` | engine checkout (absolute host path; the harness uses absolute paths) |
+| `WORKENV` | `~/Downloads/workenv` | `$HOME/workenv` | Flink/Hadoop/NexMark workenv root |
+| `IMG` / `PLAT` | `forst-bench:arm64` / `linux/arm64` | `forst-bench:x86` / `linux/amd64` | container image + platform |
+| `FRS_TM_JEMALLOC` | `0` (OFF) | `1` (ON) | LD_PRELOAD jemalloc into the TM JVM |
+| `FRS_JEMALLOC_SO` | (n/a) | `/usr/local/lib/libjemalloc-preload.so` | the preload `.so` (override to the box's libjemalloc.so.2) |
+| `FRS_IO_URING` | `0` (no-op) | `1` (seccomp=unconfined) | enable the io_uring path (q7 needs it on Linux) |
+| `FRS_CTMP_BASE` | `$TMPDIR/jackylee/...` | `pick-disk.sh` (NVMe) | scratch base; explicit override wins on both |
+| `FRS_DISK_CANDIDATES` | `$TMPDIR/jackylee` | `/ssd2 /ssd1 /tmp` under `$USER` | candidate scratch dirs for `pick-disk.sh` |
+| `SINGLE_TM_CPUS` / `SINGLE_TM_MEM` | `8` / `32g` | `8` / `32g` | TOPO=single resources (RAM-checked vs physical) |
+| `SPLIT_TM_CPUS` / `SPLIT_TM_MEM` | `4` / `16g` | `4` / `16g` | TOPO=split per-TM resources (2 TMs) |
+| `SPLIT_JM_CPUS` / `SPLIT_JM_MEM` | `2` / `4g` | `2` / `4g` | TOPO=split JM resources |
+| `FRS_TM_PROCESS_SIZE` / `FRS_JM_PROCESS_SIZE` | (unset) | (unset) | Flink JVM process.size (q9-36g sets `16384m` / `3072m`) |
+| `FLINK_SRC` / `JAVA25_HOME` | `$REPO/../flink` / java_home | `$REPO/../flink` / `$JAVA_HOME` | `jar` build inputs |
+
+Physical RAM is auto-detected (macOS `sysctl hw.memsize`, Linux `/proc/meminfo`)
+and used only to **warn** (not fail) when the requested container memory + ~4 GiB
+OS headroom exceeds it. The 8c/36g q9 profile assumes a box with ≥40 GiB RAM
+(both the dev Mac at 64 GiB and the origin Linux box qualify); on a smaller box
+lower `SINGLE_TM_MEM`.

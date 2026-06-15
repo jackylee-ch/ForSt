@@ -127,10 +127,12 @@ run_one() {
 # q9 KV-sep OOM fix (2026-06-15 PMC-1): q9 with KV-separation ON on a SINGLE
 # BIG TM (8c/36g) instead of the 2×4c/16g split. The split capped each TM at
 # 16g, and KV-sep's resident vlog state pushed q9 over that cgroup (DNF/OOM).
-# A single TM with all 8 cores + 36g (physical RAM is 64g here, so OS+JM
-# headroom is ample) gives q9 the per-TM memory the split could not. KV-sep's
-# resident vlog readers are additionally BOUNDED (count cap + byte budget +
-# adaptive pressure back-off) so the engine delta stays small.
+# A single TM with all 8 cores + 36g gives q9 the per-TM memory the split could
+# not. The 36g default assumes a box with >=40 GiB physical RAM (the dev Mac and
+# the origin Linux box both qualify); run-8c32g.sh auto-detects physical RAM and
+# WARNS if 36g + OS headroom won't fit, so override SINGLE_TM_MEM on a smaller
+# box. KV-sep's resident vlog readers are additionally BOUNDED (count cap + byte
+# budget + adaptive pressure back-off) so the engine delta stays small.
 #
 # This is a PER-QUERY topology profile (the per-query best-config exception the
 # user allowed) — it does NOT change any other query's run.

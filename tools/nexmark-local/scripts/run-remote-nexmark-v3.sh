@@ -71,11 +71,14 @@ export FRS_TM_JEMALLOC="${FRS_TM_JEMALLOC:-1}"
 export FRS_MODEL_BW_MBPS="${FRS_MODEL_BW_MBPS:-6250}"
 
 # --- pick ONE disk for the whole sweep so populations don't mix ---
+# pick-disk.sh is platform-aware (Linux NVMe %util sample; macOS $TMPDIR). On a
+# Linux box the default candidates are /ssd2|/ssd1|/tmp under $USER; the origin
+# checkout lives at /ssd2/$USER/ForSt (documented, not hardcoded).
 if [ -z "${FRS_CTMP_BASE:-}" ]; then
   if [ -x "$PICK_DISK" ] || [ -f "$PICK_DISK" ]; then
     BASE="$(bash "$PICK_DISK")"
   else
-    BASE="/ssd2/jackylee"
+    BASE="/tmp/$USER"
   fi
   export FRS_CTMP_BASE="$BASE/frs-bench-tmp"
 fi

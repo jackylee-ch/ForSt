@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 8c/32g TRUE-resource benchmark driver (arm64 Linux container, native on Apple Silicon).
+# 8c/32g TRUE-resource benchmark driver — PORTABLE across macOS (Apple Silicon
+# dev box, arm64 container) AND the origin x86_64 Linux box (amd64 container).
 #
 #   scripts/run-8c32g.sh build              # build the forst-rs Linux .so (once + on engine changes)
 #   scripts/run-8c32g.sh run <q> <cfg> <maxsec> [tag]
@@ -7,18 +8,63 @@
 #            run-8c32g.sh run q4  rocksdb            900 c32
 #   scripts/run-8c32g.sh jar                # rebuild + redeploy the forst-rs jar (host maven), then it's mounted
 #
-# Hard limits: --cpus=8 --memory=32g. Mounts the repo + workenv at their SAME
-# host paths so the harness's absolute paths resolve; only JDK/template paths
-# are overridden to Linux. The Linux .so lives at target-linux/release and is
-# copied into FLINK_HOME/lib at run time.
+# Hard limits: --cpus=8 --memory=32g (split = 2 TM 4c/16g + 1 JM 2c/4g). Mounts
+# the repo + workenv at their SAME host paths so the harness's absolute paths
+# resolve; only JDK/template paths are overridden to Linux. The Linux .so lives
+# at target-linux/release and is copied into FLINK_HOME/lib at run time.
+#
+# PLATFORM PORTABILITY (see docs/README.md "Reproduce on ..."):
+#   - OS detected via `uname -s` (Darwin = macOS dev, Linux = origin box).
+#   - Defaults for REPO/WORKENV, the container PLAT/IMG, the jemalloc preload
+#     path, and physical-RAM-derived sizing all branch on OS but are FULLY
+#     env-overridable. Nothing is hardcoded to one machine.
+#   - Physical RAM is auto-detected (macOS sysctl hw.memsize; Linux
+#     /proc/meminfo MemTotal) and used only to sanity-warn that the requested
+#     TM/JM container memory fits with OS headroom — it never forces a size.
 set -u
-# All env-overridable so the SAME script drives the remote Linux box
-# (x86_64, repos under ~/code/stczwd, workenv under ~/workenv).
-REPO="${REPO:-/Users/lijunqing/Code/stczwd/ForSt}"
-WORKENV="${WORKENV:-/Users/lijunqing/Downloads/workenv}"
+
+# --- platform detection (branch only where behavior differs) ---
+OS="$(uname -s)"        # Darwin (macOS) | Linux (origin box)
+
+# Physical RAM in MiB (used to size/sanity-check the single-TM profile; never
+# hardcode 64GiB). Portable: macOS sysctl vs Linux /proc/meminfo|free.
+detect_ram_mib() {
+  case "$OS" in
+    Darwin) local b; b="$(sysctl -n hw.memsize 2>/dev/null)"; [ -n "$b" ] && echo $(( b / 1024 / 1024 )) || echo 0 ;;
+    Linux)
+      if [ -r /proc/meminfo ]; then
+        awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo
+      else
+        local b; b="$(free -b 2>/dev/null | awk '/^Mem:/ {print $2}')"; [ -n "$b" ] && echo $(( b / 1024 / 1024 )) || echo 0
+      fi ;;
+    *) echo 0 ;;
+  esac
+}
+PHYS_RAM_MIB="${PHYS_RAM_MIB:-$(detect_ram_mib)}"
+
+# Parse a docker --memory value ("36g"/"32g"/"512m") into MiB for the headroom check.
+mem_to_mib() {
+  local v="$1"; local n="${v%[gGmM]}"; case "$v" in
+    *g|*G) echo $(( n * 1024 )) ;; *m|*M) echo "$n" ;; *) echo $(( n / 1024 / 1024 )) ;;
+  esac
+}
+
+# All env-overridable so the SAME script drives macOS and the remote Linux box.
+# Per-OS defaults: macOS dev checkout under /Users/...; Linux origin checkout
+# under /ssd2/$USER (documented, NOT hardcoded — REPO/WORKENV override both).
+if [ "$OS" = "Darwin" ]; then
+  REPO="${REPO:-/Users/lijunqing/Code/stczwd/ForSt}"
+  WORKENV="${WORKENV:-/Users/lijunqing/Downloads/workenv}"
+  IMG="${IMG:-forst-bench:arm64}"
+  PLAT="${PLAT:-linux/arm64}"
+else
+  # Linux origin box: checkout lives at /ssd2/$USER/ForSt; x86_64 container.
+  REPO="${REPO:-/ssd2/$USER/ForSt}"
+  WORKENV="${WORKENV:-$HOME/workenv}"
+  IMG="${IMG:-forst-bench:x86}"
+  PLAT="${PLAT:-linux/amd64}"
+fi
 FLINK="${FLINK:-$WORKENV/flink-2.2.1}"
-IMG="${IMG:-forst-bench:arm64}"
-PLAT="${PLAT:-linux/arm64}"
 
 DKR_COMMON=(--platform "$PLAT"
   -v "$REPO:$REPO" -v "$WORKENV:$WORKENV"
@@ -29,7 +75,9 @@ DKR_COMMON=(--platform "$PLAT"
   # Bind-mount /tmp to a host dir on the big volume so all engine scratch uses it.
   -v forst-cargo:/cargo-cache
   -e CARGO_HOME=/cargo-cache
-  -e JDK17="${JDK17_IN_IMG:-/usr/lib/jvm/java-17-openjdk-arm64}"
+  # JDK17 path INSIDE the container depends on the container arch (the .deb
+  # package suffix), not the host: arm64 image -> ...-arm64, amd64 -> ...-amd64.
+  -e JDK17="${JDK17_IN_IMG:-/usr/lib/jvm/java-17-openjdk-$([ "$PLAT" = "linux/amd64" ] && echo amd64 || echo arm64)}"
   -e JDK25=/opt/java/openjdk
   -e TEMPLATES="${TEMPLATES:-$REPO/scripts/templates-linux}"
   -e HADOOP_HOME="$WORKENV/hadoop-3.4.3"
@@ -59,9 +107,28 @@ case "$cmd" in
     # seccomp only when profiling is requested (benchmarks stay confined).
     PERF_OPTS=()
     [ -n "${FRS_PERF:-}" ] && PERF_OPTS=(--security-opt seccomp=unconfined --cap-add SYS_ADMIN)
+
+    # io_uring / seccomp (PORTABLE, parameterized):
+    #   The engine's async I/O path uses io_uring on Linux; Docker's DEFAULT
+    #   seccomp profile blocks the io_uring_* syscalls, so q7 (and other
+    #   io_uring-dependent read paths) DNF on the origin Linux box unless the
+    #   container runs with seccomp relaxed. On macOS the engine falls back to
+    #   blocking I/O inside the Docker-Desktop Linux VM, so this is a NO-OP.
+    #   FRS_IO_URING: 1|true => add --security-opt seccomp=unconfined (default
+    #   ON for Linux, OFF/no-op for macOS). Set FRS_IO_URING=0 to force OFF.
+    URING_OPTS=()
+    FRS_IO_URING_DEFAULT=0
+    [ "$OS" = "Linux" ] && FRS_IO_URING_DEFAULT=1
+    case "${FRS_IO_URING:-$FRS_IO_URING_DEFAULT}" in
+      1|true|TRUE|yes) URING_OPTS=(--security-opt seccomp=unconfined) ;;
+    esac
     ENVS=(
       -e QUERY="$Q" -e CONFIG="$CFG" -e MAXSEC="$MS" -e EVENTS_NUM="${EVENTS_NUM:-}" -e TPS="${TPS:-}" \
       -e S3_ENDPOINT=x -e S3_ACCESS_KEY=x -e S3_SECRET_KEY=x -e S3_BUCKET=x -e S3_REGION=x -e S3_PREFIX=x \
+      # JVM process.size overrides consumed by measure-sql.sh INSIDE the container
+      # (the q9 8c/36g single-TM profile sets these). Forward them so the profile
+      # actually takes effect through this package's runner.
+      -e FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-}" -e FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-}" \
       # FRS-M5 FAIRNESS FIX (2026-06-13 cycle 2, PMC-1): the default was pinned
       # to `none` (a 2026-06-02 zero-copy read-path experiment), which forced
       # forst-rs to write SST blocks UNCOMPRESSED while the ForSt and RocksDB
@@ -177,14 +244,29 @@ case "$cmd" in
         fi
       fi
       docker rm -f "$CLUSTER-jm" "$CLUSTER-tm1" "$CLUSTER-tm2" >/dev/null 2>&1 || true
-      # TM JVM allocator: jemalloc via LD_PRELOAD (uniform across ALL backends —
-      # an environment property of the box, like the kernel). The engine's own
-      # jemalloc is statically bundled in the .so and unaffected (prefixed symbols).
+      # TM JVM allocator: jemalloc via LD_PRELOAD inside the (Linux) container.
+      # PORTABLE: the preload .so is a CONTAINER path (the image's bundled
+      # libjemalloc-preload.so), independent of the host OS — but it can be
+      # overridden per box via FRS_JEMALLOC_SO (e.g. the origin box's
+      # /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 if the image lacks the bundle).
+      # Default ON for Linux hosts; OFF on macOS (the known jemalloc macOS TSD
+      # crash — see MEMORY.md "jemalloc macOS TSD crash"). Note the preload runs
+      # INSIDE the Linux container even on macOS, but we keep the macOS default
+      # OFF to mirror the documented dev-box behavior. Set FRS_TM_JEMALLOC=1/0
+      # to force. The engine's own jemalloc is statically bundled in the .so and
+      # unaffected (prefixed symbols).
+      FRS_TM_JEMALLOC_DEFAULT=1; [ "$OS" = "Darwin" ] && FRS_TM_JEMALLOC_DEFAULT=0
       TM_PRELOAD=()
-      [ "${FRS_TM_JEMALLOC:-1}" = "1" ] && TM_PRELOAD=(-e LD_PRELOAD=/usr/local/lib/libjemalloc-preload.so)
+      [ "${FRS_TM_JEMALLOC:-$FRS_TM_JEMALLOC_DEFAULT}" = "1" ] \
+        && TM_PRELOAD=(-e "LD_PRELOAD=${FRS_JEMALLOC_SO:-/usr/local/lib/libjemalloc-preload.so}")
+      # Split TM/JM resource profile (parameterized; sane 8c/32g default = 2 TM
+      # 4c/16g + 1 JM 2c/4g). The origin box may have different core/RAM counts;
+      # override SPLIT_TM_CPUS / SPLIT_TM_MEM / SPLIT_JM_CPUS / SPLIT_JM_MEM.
+      SPLIT_TM_CPUS="${SPLIT_TM_CPUS:-4}"; SPLIT_TM_MEM="${SPLIT_TM_MEM:-16g}"
+      SPLIT_JM_CPUS="${SPLIT_JM_CPUS:-2}"; SPLIT_JM_MEM="${SPLIT_JM_MEM:-4g}"
       for i in 1 2; do
-        docker run -d --name "$CLUSTER-tm$i" --network "$NET" --cpus=4 --memory=16g --memory-swap=16g \
-          ${TM_PRELOAD[@]+"${TM_PRELOAD[@]}"} \
+        docker run -d --name "$CLUSTER-tm$i" --network "$NET" --cpus="$SPLIT_TM_CPUS" --memory="$SPLIT_TM_MEM" --memory-swap="$SPLIT_TM_MEM" \
+          ${TM_PRELOAD[@]+"${TM_PRELOAD[@]}"} ${URING_OPTS[@]+"${URING_OPTS[@]}"} \
           "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e FLINK_CONF_DIR="$CCONF" "$IMG" bash -lc "
             mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
             cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
@@ -192,7 +274,7 @@ case "$cmd" in
             exec bash '$FLINK/bin/taskmanager.sh' start-foreground
           " >/dev/null
       done
-      docker run --rm --name "$CLUSTER-jm" --network "$NET" --cpus=2 --memory=4g \
+      docker run --rm --name "$CLUSTER-jm" --network "$NET" --cpus="$SPLIT_JM_CPUS" --memory="$SPLIT_JM_MEM" \
         "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e CLUSTER_MODE=external -e EXPECT_TMS=2 -e JM_HOST="$CLUSTER-jm" -e FLINK_CONF_DIR="$CCONF" \
         "$IMG" bash -lc "
           mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
@@ -210,14 +292,29 @@ case "$cmd" in
     fi
     # SINGLE-TM resource budget (TOPO=single). Default = the canonical 8c/32g.
     # q9 KV-sep OOM fix (2026-06-15 PMC-1): a BIGGER single-TM profile gives q9
-    # far more PER-TM headroom than the 16 g-capped TOPO=split TMs. Physical RAM
-    # on this box is 64 GiB, so a single TM at ~36 g + OS/JM headroom fits
-    # comfortably. Set SINGLE_TM_CPUS / SINGLE_TM_MEM to size it; the
-    # `q9-36g` profile (see run-best.sh / docs) uses 8c/36g.
+    # far more PER-TM headroom than the 16 g-capped TOPO=split TMs. The
+    # `q9-36g` profile (see run-best.sh / docs) uses 8c/36g. Size via
+    # SINGLE_TM_CPUS / SINGLE_TM_MEM; both default per the 8c/32g budget and
+    # are checked against DETECTED physical RAM below (no 64GiB hardcode).
     SINGLE_TM_CPUS="${SINGLE_TM_CPUS:-8}"
     SINGLE_TM_MEM="${SINGLE_TM_MEM:-32g}"
-    echo "== TOPO=single resources: --cpus=$SINGLE_TM_CPUS --memory=$SINGLE_TM_MEM =="
-    docker run --rm --cpus="$SINGLE_TM_CPUS" --memory="$SINGLE_TM_MEM" --memory-swap="$SINGLE_TM_MEM" ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" \
+    # RAM headroom sanity check: warn (don't fail) if the requested container
+    # memory + ~4 GiB OS/Docker-VM headroom exceeds detected physical RAM.
+    if [ "${PHYS_RAM_MIB:-0}" -gt 0 ]; then
+      REQ_MIB="$(mem_to_mib "$SINGLE_TM_MEM")"
+      if [ $(( REQ_MIB + 4096 )) -gt "$PHYS_RAM_MIB" ]; then
+        echo "WARN: SINGLE_TM_MEM=$SINGLE_TM_MEM (${REQ_MIB} MiB) + 4 GiB headroom > detected RAM ${PHYS_RAM_MIB} MiB."
+        echo "      The container may swap/OOM. Lower SINGLE_TM_MEM or run on a bigger box."
+      fi
+    fi
+    # jemalloc preload for the single TM too (parameterized; default ON for
+    # Linux hosts, OFF on macOS — same policy as the split path).
+    FRS_TM_JEMALLOC_DEFAULT=1; [ "$OS" = "Darwin" ] && FRS_TM_JEMALLOC_DEFAULT=0
+    SINGLE_PRELOAD=()
+    [ "${FRS_TM_JEMALLOC:-$FRS_TM_JEMALLOC_DEFAULT}" = "1" ] \
+      && SINGLE_PRELOAD=(-e "LD_PRELOAD=${FRS_JEMALLOC_SO:-/usr/local/lib/libjemalloc-preload.so}")
+    echo "== TOPO=single resources: --cpus=$SINGLE_TM_CPUS --memory=$SINGLE_TM_MEM (detected RAM ${PHYS_RAM_MIB:-?} MiB) =="
+    docker run --rm --cpus="$SINGLE_TM_CPUS" --memory="$SINGLE_TM_MEM" --memory-swap="$SINGLE_TM_MEM" ${PERF_OPTS[@]+"${PERF_OPTS[@]}"} ${URING_OPTS[@]+"${URING_OPTS[@]}"} ${SINGLE_PRELOAD[@]+"${SINGLE_PRELOAD[@]}"} "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" \
       "${ENVS[@]}" \
       "$IMG" bash -lc "
         cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
@@ -234,8 +331,22 @@ case "$cmd" in
     ;;
   jar)
     echo "== rebuild + redeploy forst-rs jar on host (mounted into container) =="
-    cd "$REPO/../flink/flink-state-backends/flink-statebackend-forst-rs" &&
-    JAVA_HOME=/Library/Java/JavaVirtualMachines/zulu-25.jdk/Contents/Home ../../mvnw -o -q -DskipTests \
+    # The flink checkout sits ALONGSIDE the engine repo by default (REPO/../flink);
+    # override with FLINK_SRC. JAVA_HOME for the host maven build is OS-detected
+    # (macOS: java_home -v 25; Linux: $JAVA_HOME or a common JDK path) and can be
+    # forced via JAVA25_HOME.
+    FLINK_SRC="${FLINK_SRC:-$REPO/../flink}"
+    SB_DIR="$FLINK_SRC/flink-state-backends/flink-statebackend-forst-rs"
+    [ -d "$SB_DIR" ] || { echo "FATAL: state-backend source not found at $SB_DIR (set FLINK_SRC)"; exit 1; }
+    if [ -n "${JAVA25_HOME:-}" ]; then
+      J25="$JAVA25_HOME"
+    elif [ "$OS" = "Darwin" ]; then
+      J25="$(/usr/libexec/java_home -v 25 2>/dev/null || echo /Library/Java/JavaVirtualMachines/zulu-25.jdk/Contents/Home)"
+    else
+      J25="${JAVA_HOME:-/usr/lib/jvm/java-25-openjdk-amd64}"
+    fi
+    cd "$SB_DIR" &&
+    JAVA_HOME="$J25" "$FLINK_SRC/mvnw" -o -q -DskipTests \
       -Denforcer.skip=true -Dcheckstyle.skip=true -Dspotless.check.skip=true -Drat.skip=true \
       -Dmaven.javadoc.skip=true clean package &&
     cp target/flink-statebackend-forst-rs-2.2.0.jar "$FLINK/lib/" && echo "jar redeployed"
