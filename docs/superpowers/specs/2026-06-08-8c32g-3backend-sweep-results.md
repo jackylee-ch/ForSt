@@ -25,7 +25,7 @@
 # | q17 | 333.7 | 92,000,000 ✓ | 73.9 | 92,000,000 ✓ | 275.4 | 92,000,000 ✓ | ⚠ FAIL BOTH (RDB 4.52×; ForSt 1.21×) — routing-adaptive lever PATHOLOGICAL (see negative below) |
 # | q11 | 219.9 | 92,000,000 ✓ | 107.0 | 92,000,000 ✓ | 133.1 | 92,000,000 ✓ | FAIL both (RDB 2.06×; ForSt 1.65×) — read-path gap; merge-RMW IMPROVED frs −45s vs prior 264.8 (no procsize regression) |
 # | q18 | 199.1 | 92,000,000 ✓ | 360.4 | 92,000,000 ✓ | 441.7 | 92,000,000 ✓ | ★ PASS — BEATS BOTH (RDB 1.81×; ForSt 2.22×); rows EXACT all 3; ForSt FINISHES here (was DNF Mac legacy) |
-# | q19 | 238.6 | 92,000,000 ✓ | 305.5 | 92,000,000 ✓ | (running) | — | ★ BEATS RDB (0.78×, 1.28× faster) — FLIPPED from prior FAIL via KV-sep full-stack (527.9→238.6); ForSt arm pending |
+# | q19 | 238.6 | 92,000,000 ✓ | 305.5 | 92,000,000 ✓ | 272.4 | 92,000,000 ✓ | ★ PASS — BEATS BOTH (RDB 1.28×; ForSt 1.14×) — FLIPPED from prior FAIL-both via KV-sep full-stack (frs 527.9→238.6, −55%); rows EXACT |
 #
 # ⚠⚠ q17 HONEST NEGATIVE: forst-rs under the validate full-stack-ON profile
 #   (FRS_RS_EXECUTOR=routing-adaptive) ran 333.7s — 4.52× SLOWER than RocksDB
