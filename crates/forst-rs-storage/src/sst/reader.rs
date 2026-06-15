@@ -1027,6 +1027,42 @@ impl SstReaderImpl {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// FRS-COMPACT-INPUT-WARM-DATA (Phase-2 cycle 10): prime this input's FIRST
+    /// data block into the decoded-block cache, off the compaction critical path.
+    ///
+    /// The reader warm-up (cycle 9) hides the input-reader OPEN (footer + sparse
+    /// index `GetObject`) behind the previous job's merge+upload, but the drain's
+    /// compaction prefetcher reads its windows with `CacheFillPolicy::Skip`
+    /// (each input block is read exactly once → inserting would only evict the
+    /// foreground's hot set). `Skip` still does a CACHE-FIRST read, so a block
+    /// already resident is served for free — but the first DATA block is never
+    /// resident after a bare reader warm-up, so the merge's first `next_decoded`
+    /// pays a cold remote `GetObject` for it ON the critical path.
+    ///
+    /// This primitive reads + decodes block 0 via the SAME demand path
+    /// (`read_decoded_block`) the cold merge would use — which inserts at
+    /// [`CachePriority::Low`] — so when the drain's `Skip` window later runs, its
+    /// cache-first pass HITS the primed block and issues no GET. The fetched
+    /// bytes, the cache key, and the insert priority are identical to the cold
+    /// demand read; only the GET's TIMING moves earlier (onto the read-I/O pool,
+    /// overlapping the previous merge+upload). It is therefore byte- and
+    /// cache-identical to the cold path: the decoded-block cache is a transparent
+    /// read cache, so the merge output is unchanged whether or not block 0 was
+    /// primed. A single `Low` (evictable) entry per input ⇒ no hot-set pollution
+    /// beyond one evictable block even when the prediction is wrong.
+    ///
+    /// No-op (`Ok(())`) when the file has no data block. Errors are the caller's
+    /// to swallow: a warm-up read failure is benign because the real demand read
+    /// on the drain path re-runs and surfaces any genuine fault there.
+    pub fn prime_first_data_block(&self) -> ForstResult<()> {
+        let Some((off, size)) = self.block_region(0) else {
+            return Ok(()); // empty file — nothing to prime
+        };
+        // Cache-first read + `Insert(Low)` — identical to the cold demand path.
+        let _ = self.read_decoded_block(off, size)?;
+        Ok(())
+    }
+
     /// Reads and decodes the data block at `block_idx` (0-based). Returns the
     /// `RecordBatch` plus the index entry's `last_key`. Used by the streaming
     /// compaction path to feed rows into the k-way merge without first
@@ -1657,6 +1693,52 @@ mod tests {
         }
         let (data, _info) = writer.finish().unwrap();
         Arc::new(data)
+    }
+
+    /// FRS-COMPACT-INPUT-WARM-DATA (Phase-2 cycle 10): `prime_first_data_block`
+    /// reads + decodes block 0 and inserts it into the decoded cache at `Low` —
+    /// so a later compaction-input `Skip`-policy read serves it for free. Asserts
+    /// (a) block 0 is NOT cache-resident before priming, (b) it IS resident after,
+    /// and (c) a second prime stays a cache hit (idempotent, residency preserved).
+    #[test]
+    fn prime_first_data_block_makes_block0_cache_resident() {
+        use crate::cache::clock::ShardedClockCache;
+
+        let data = write_test_sst_fmt(2000, false); // many blocks (1 KiB block_size)
+        let file = Box::new(MemRandomAccessFile {
+            data: Arc::clone(&data),
+        });
+        let cache: Arc<dyn BlockCache> = Arc::new(ShardedClockCache::new(8 * 1024 * 1024, 2));
+        let reader = SstReaderImpl::open(file)
+            .unwrap()
+            .with_block_cache(cache, 1, 7);
+        assert!(
+            reader.index_entry_count() >= 1,
+            "test SST must have at least one data block"
+        );
+
+        let (off0, _sz0) = reader.block_region(0).expect("block 0 region");
+        // (a) cold: block 0 not yet decoded-cache-resident.
+        assert!(
+            reader.cache_get_decoded(off0).is_none(),
+            "precondition: block 0 must be cache-cold before priming"
+        );
+
+        // (b) prime → block 0 becomes resident (the latency-hiding effect: the
+        // drain's `Skip`-policy first window will hit this instead of a cold GET).
+        reader.prime_first_data_block().unwrap();
+        assert!(
+            reader.cache_get_decoded(off0).is_some(),
+            "prime_first_data_block must make block 0 decoded-cache-resident"
+        );
+
+        // (c) idempotent: a second prime keeps block 0 resident (a cache hit, no
+        // observable change) — safe to call from a racing warm-up.
+        reader.prime_first_data_block().unwrap();
+        assert!(
+            reader.cache_get_decoded(off0).is_some(),
+            "second prime must leave block 0 cache-resident (idempotent)"
+        );
     }
 
     /// FRS-WA-V2a-1 (KV separation groundwork): a `BlobRef` entry (op 17 =

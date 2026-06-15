@@ -642,6 +642,21 @@ pub fn compact_input_warm_fired() -> u64 {
     COMPACT_INPUT_WARM_FIRED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// FRS-COMPACT-INPUT-WARM-DATA diag (Phase-2 cycle 10): total predicted inputs
+/// whose FIRST DATA block was primed into the decoded cache off the critical
+/// path (`reader.prime_first_data_block()` succeeded). Bumped at most once per
+/// warmed input; only when `FRS_COMPACT_INPUT_WARM_DATA=1`. Proves the
+/// data-priming extension engaged (the mini-bench / unit test read it).
+static COMPACT_INPUT_WARM_DATA_PRIMED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// FRS-COMPACT-INPUT-WARM-DATA diag accessor for the private
+/// `COMPACT_INPUT_WARM_DATA_PRIMED` counter. Test/bench-only — proves the
+/// first-data-block priming extension engaged.
+pub fn compact_input_warm_data_primed() -> u64 {
+    COMPACT_INPUT_WARM_DATA_PRIMED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// FRS-VLOG-DEREF-FANOUT master flag for parallelizing the coalesced
 /// value-log deref's PER-SEGMENT reads (`FRS_VLOG_DEREF_FANOUT=1`, **DEFAULT
 /// OFF**). Design: `2026-06-15-vlog-deref-segment-fanout-design.md`.
@@ -14729,6 +14744,21 @@ impl DbImpl {
     /// teardown mid-flight makes the pool job a benign no-op. Default OFF; the
     /// helper is only called when `compact_input_warm_on()`.
     fn warm_next_compaction_inputs(self: &Arc<Self>, cf_data: &Arc<ColumnFamilyData>) {
+        // Production entry: read the cycle-10 data-priming flag (process-global
+        // `OnceLock`) once here and delegate. The `_inner` form takes the
+        // decision explicitly so tests can force it without an env-var race.
+        self.warm_next_compaction_inputs_inner(cf_data, compact_input_warm_data_on());
+    }
+
+    /// Body of [`Self::warm_next_compaction_inputs`], parameterised on whether to
+    /// ALSO prime each predicted input's first DATA block into the decoded cache
+    /// (FRS-COMPACT-INPUT-WARM-DATA, cycle 10). The public wrapper passes
+    /// `compact_input_warm_data_on()`; the engagement test passes it explicitly.
+    fn warm_next_compaction_inputs_inner(
+        self: &Arc<Self>,
+        cf_data: &Arc<ColumnFamilyData>,
+        prime_data: bool,
+    ) {
         let cf_id = cf_data.handle().id();
         let version = self.version_set.current();
         // Predict the level the post-L0 drain will descend (pure metadata).
@@ -14765,6 +14795,13 @@ impl DbImpl {
             .map(|(_, m)| m.clone())
             .collect();
         drop(readers);
+        // FRS-COMPACT-INPUT-WARM-DATA (cycle 10): extend the warm-up so the same
+        // fire-and-forget pool job ALSO primes each predicted input's first DATA
+        // block into the decoded cache (off the critical path), not just the
+        // reader's footer/index. Composes with the reader warm-up (this flag
+        // ALONE without `FRS_COMPACT_INPUT_WARM` is meaningless because the helper
+        // is only called when the reader warm-up is on); default OFF. The
+        // decision is passed in by the caller (production reads the flag).
         for meta in cold {
             let weak = Arc::downgrade(self);
             COMPACT_INPUT_WARM_FIRED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -14773,7 +14810,19 @@ impl DbImpl {
                 // swallowed: the real `get_or_open_sst_reader` on the drain path
                 // re-runs it and surfaces any genuine fault there.
                 if let Some(db) = weak.upgrade() {
-                    let _ = db.get_or_open_sst_reader(&meta);
+                    if let Ok(reader) = db.get_or_open_sst_reader(&meta) {
+                        // Cycle 10: prime block 0 into the decoded cache at the
+                        // SAME `Low` priority the cold demand read would use, so
+                        // the drain's `Skip`-policy first window hits it (no cold
+                        // GET). Byte/cache-identical to the cold path; a primed
+                        // block on a mispredicted file is a single evictable
+                        // entry. A prime read error is swallowed for the same
+                        // reason as the open error above.
+                        if prime_data && reader.prime_first_data_block().is_ok() {
+                            COMPACT_INPUT_WARM_DATA_PRIMED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
             }));
         }
@@ -16172,6 +16221,40 @@ fn compact_input_warm_on() -> bool {
     *ON.get_or_init(|| {
         matches!(
             std::env::var("FRS_COMPACT_INPUT_WARM").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        )
+    })
+}
+
+/// FRS-COMPACT-INPUT-WARM-DATA (Phase-2 cycle 10, default OFF; ON with
+/// `FRS_COMPACT_INPUT_WARM_DATA=1`). Extends the cycle-9 reader warm-up: the
+/// SAME fire-and-forget pool job that opens a predicted input's reader (footer +
+/// sparse index) ALSO primes that input's FIRST DATA block into the decoded
+/// cache, off the critical path.
+///
+/// Why this is needed: the drain's compaction prefetcher reads its windows with
+/// `CacheFillPolicy::Skip` (each input block is read exactly once, so inserting
+/// would only evict the foreground's hot set). `Skip` still does a cache-FIRST
+/// read, so a resident block is free — but after a bare reader warm-up the first
+/// data block is NOT resident, so the merge's first `next_decoded` pays a cold
+/// remote `GetObject` ON the critical path. Priming block 0 via the same demand
+/// path (`SstReaderImpl::prime_first_data_block`, which inserts at
+/// `Low`) makes the drain's first `Skip` window hit it → no cold GET. Only
+/// meaningful with `FRS_COMPACT_INPUT_WARM=1` (the helper that consults this is
+/// reached only when the reader warm-up is on).
+///
+/// Correctness-safe + byte-identical: the decoded-block cache is a transparent
+/// read cache, so priming block 0 — same bytes, same key, same `Low` insert as
+/// the cold demand read, only the GET's TIMING moved earlier — never changes the
+/// merge output. A primed block on a mispredicted file is a single evictable
+/// entry. OFF ⇒ block 0 is never primed and the path is byte-identical to
+/// cycle 9.
+fn compact_input_warm_data_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("FRS_COMPACT_INPUT_WARM_DATA").ok().as_deref(),
             Some("1") | Some("true") | Some("TRUE")
         )
     })
@@ -23141,8 +23224,17 @@ mod tests {
     /// footer/index `GetObject` on the critical path. Also asserts the no-op
     /// arms: no warm-up when nothing is due, and zero double-counting when the
     /// inputs are already reader-cached.
+    /// Serializes the two warm-up engagement tests: both assert on the
+    /// process-global `COMPACT_INPUT_WARM_FIRED` / `COMPACT_INPUT_WARM_DATA_PRIMED`
+    /// counters via deltas, so they must not run concurrently (cargo's default
+    /// multi-thread test runner would interleave their fires).
+    static COMPACT_INPUT_WARM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_compact_input_warm_engages_and_warms_readers() {
+        let _g = COMPACT_INPUT_WARM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // Build a multi-file L1 over budget (same recipe as the split test):
         // tiny target_file_size_base splits L0→L1 into many SSTs, and the small
         // level base puts L1 over budget so a descent is due.
@@ -23254,6 +23346,101 @@ mod tests {
             compact_input_warm_fired(),
             fired_warm,
             "warm-up must not re-fire opens for already-cached inputs"
+        );
+    }
+
+    /// FRS-COMPACT-INPUT-WARM-DATA (Phase-2 cycle 10): the FIRST-DATA-BLOCK
+    /// priming EXTENSION engages. With `prime_data = true`, the warm-up must
+    /// prime each predicted-cold input's first data block into the decoded cache
+    /// off the critical path (counter `compact_input_warm_data_primed` bumps once
+    /// per cold input). With `prime_data = false` (cycle-9 behaviour / default
+    /// OFF), it must prime ZERO blocks — proving the extension is byte-identical
+    /// OFF and the reader warm-up alone never touches data blocks.
+    #[test]
+    fn test_compact_input_warm_data_primes_first_block() {
+        let _g = COMPACT_INPUT_WARM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let opts = EngineOptions {
+            db_path: "/db".to_string(),
+            target_file_size_base: 4096,
+            block_size: 512,
+            max_bytes_for_level_base: 4096,
+            ..EngineOptions::default()
+        };
+        let fs: Arc<dyn FileSystem> = Arc::new(MemoryFileSystem::new());
+        let db = DbImpl::open_with_fs(opts, fs).expect("open");
+        db.force_fixed_levels();
+        let cf = db.default_cf();
+
+        const N: usize = 2000;
+        let val = |i: usize| format!("value-{i:06}-paddingpaddingpaddingpadding");
+        let key = |i: usize| format!("key{i:06}");
+        for i in 0..N {
+            db.put(&cf, key(i).as_bytes(), val(i).as_bytes()).unwrap();
+        }
+        db.force_switch_memtable(&cf).unwrap();
+        db.flush_cf(&cf).unwrap();
+        db.compact_l0(&cf).unwrap();
+
+        let cf_id = cf.id();
+        let level = db
+            .pick_compaction_level_for_cf(cf_id)
+            .expect("a level descent must be due");
+        assert!(level >= 1, "descent level must be >= 1, got {level}");
+
+        let predicted: Vec<FileNumber> = {
+            let version = db.version_set.current();
+            let readers = db.sst_readers.load();
+            let tomb = |fnum: FileNumber| -> u64 {
+                readers
+                    .get(&fnum)
+                    .map(|r| r.footer().tombstone_count)
+                    .unwrap_or(0)
+            };
+            let ctx = db.policy_ctx(&readers, false, &tomb);
+            match crate::compaction_policy::SortedRunPolicy
+                .pick_level_descent(&version, cf_id, level, &ctx)
+            {
+                Some(crate::compaction_policy::CompactionDecision::Merge(plan)) => {
+                    plan.inputs.iter().map(|(_, m)| m.file_number).collect()
+                }
+                other => panic!("expected a Merge descent, got {other:?}"),
+            }
+        };
+        assert!(!predicted.is_empty(), "descent must have inputs");
+
+        let cf_data = db.lookup_cf_by_id(cf_id).expect("cf_data");
+
+        // (a) OFF arm: warm WITHOUT data priming (cycle-9 behaviour). The data
+        // counter must NOT move — proving the extension is byte-identical OFF.
+        db.evict_all_sst_readers();
+        let data_before_off = compact_input_warm_data_primed();
+        db.warm_next_compaction_inputs_inner(&cf_data, false);
+        assert_eq!(
+            compact_input_warm_data_primed(),
+            data_before_off,
+            "prime_data=false (OFF) must prime ZERO data blocks (byte-identical to cycle 9)"
+        );
+
+        // (b) ON arm: cold again, then warm WITH data priming. The data counter
+        // must bump once per cold predicted input (the latency-hiding effect:
+        // each input's first data block is read off the critical path).
+        db.evict_all_sst_readers();
+        let data_before_on = compact_input_warm_data_primed();
+        db.warm_next_compaction_inputs_inner(&cf_data, true);
+        // The opens + primes run on the pool; poll until the data counter
+        // reaches one-per-cold-input (bounded spin keeps the test deterministic).
+        let target = data_before_on + predicted.len() as u64;
+        let mut spins = 0;
+        while compact_input_warm_data_primed() < target && spins < 5000 {
+            std::thread::yield_now();
+            spins += 1;
+        }
+        assert_eq!(
+            compact_input_warm_data_primed(),
+            target,
+            "prime_data=true must prime the first data block of every cold predicted input"
         );
     }
 
