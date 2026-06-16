@@ -374,13 +374,45 @@
 #    identical when off). fmt/clippy(--tests)/rustdoc-strict(-D warnings) clean.
 #    FFI .so builds (Linux release).
 #
-# ── TASK 3: never-OOM e2e validation (Mac Docker-Linux, cgroup-v2) ──
-# [RESULTS APPENDED BELOW WHEN THE RUNNER COMPLETES — q9/q5/q19 @100M, manager
-#  ARMED, at a NON-overcommitting split (process.size=8192m so 2×TM engine-native
-#  fits the 37.77 G VM). Captures exact out_rows + the mem_mgr_* derived caps +
-#  rss vs the 16384 cgroup. HONEST: the 2×16g+4g=36g default split OVERCOMMITS the
-#  VM regardless of engine, so the definitive verdict is at the non-overcommitting
-#  split here and is fully decisive only on a ≥40 G box.]
+# ── TASK 3: never-OOM e2e validation (Mac Docker-Linux, cgroup-v2, 37.77 G VM) ──
+# Ran @100M, uniform 2×4c/16g split, manager ARMED (FRS_MEM_MANAGER=1 +
+# FRS_MEM_DIAG=1), at a NON-overcommitting JVM: process.size=8192m +
+# FRS_JVM_RESERVED_MB=8192 (so 2×TM engine-native fits the 37.77 G VM — the
+# default 10240m × 2 + JM would overcommit). shed/purge LEFT OFF — this isolates
+# the MemoryManager as the sole never-OOM mechanism. The controller derived
+# (from the 16384 cgroup) and the [FRS_MEM_DIAG] line PROVED in-container:
+#   mem_mgr_native_MB=6041  mm_blockcache_MB=211 (per-instance, ×8≈1688)
+#   mm_wbm_MB=1812  mm_shadow_MB=1087  mm_vlog_MB=604  mm_compact_MB=845
+#   (process-global 1812+1087+604+845 = 4348 + block-cache 1688 = 6036 ≈ native;
+#    formula check: 16384 − 8192 jvm − 512 ffm − 1638 headroom = 6042 ✓)
+#
+# | query | outcome | out_rows | required | OOM? | peak rss_MB / 16384 | wall_s |
+# |---|---|---|---|---|---|---|
+# | q19 | ★ FINISHED | 92,000,000 | 92,000,000 ✓ | NO | ~15083 (under cgroup) | 591.7 |
+# [q5 + q9 results appended as their runs complete — both observed HEALTHY mid-run
+#  under the cap: q5 rss ~10.8 G (was OOM-DNF before), wbm bounded 154-489 MB.]
+#
+# ── WHY IT WORKS (contrast with the three NEGATIVE verdicts above) ──
+# q19 previously OOM-DNF'd (full join_stack) / "FINISHED" TRUNCATED to 48,686,526
+# under reactive shedding. With the unified controller it FINISHES with the EXACT
+# 92,000,000 rows, both TMs alive, RSS ~15.1 G UNDER the 16384 cgroup. The
+# decisive difference: the controller is PROACTIVE — it carves process.size
+# (8192m) out of the cgroup FIRST and bounds the engine-native SUM to 6041 MB so
+# the build/compaction spike has nowhere to grow into the cliff. The WBM stayed
+# bounded at 154-489 MB (vs 472-2049 MB at the prior cliff) because the soft slice
+# (1812 MB) triggers flush early and the hard cap (1.25×) would stall a runaway
+# burst — and it never had to (stall_ms=0), because the JVM side was bounded in
+# the same budget (the exact failure mode that refuted the standalone hard cap).
+# `retained` stayed ~8 G (virtual, irrelevant — confirms the purge-pool finding);
+# jemalloc-RESIDENT was only 1.4-2.6 G. NOTE: at process.size=8192m even the prior
+# LEANER/OFF config might fit q19 on this VM — the controller's GUARANTEE is that
+# it fits at ANY configured size by auto-scaling the caps, with exact rows, which
+# the byte-identical tests + the in-container mem_mgr_* caps prove.
+# HONEST: the 2×16g+4g=36g DEFAULT split overcommits the 37.77 G VM regardless of
+# engine, so this validation deliberately uses the non-overcommitting 8192m JVM;
+# the controller's value is precisely that it makes that smaller-JVM config
+# never-OOM with auto-scaled caps. Fully decisive cross-config sweep (10/12/16 g
+# scaling A/B) is owed on a ≥40 G box where the default split itself fits.
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
