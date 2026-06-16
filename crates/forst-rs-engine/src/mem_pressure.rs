@@ -401,8 +401,22 @@ pub fn purge_valve_enabled() -> bool {
     let on = matches!(
         std::env::var("FRS_MEM_PRESSURE_PURGE").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE")
-    ) || dynamic_shed_enabled();
-    PURGE_ARMED.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    ) || dynamic_shed_enabled()
+        // FRS-MEM-MANAGER: the unified controller bounds the LIVE engine-native
+        // working set, but on a kernel where freed jemalloc pages stay resident
+        // (MADV_FREE not yet reclaimed) the RETAINED pool can still push RSS to
+        // the cliff (q9 cliff: live 4675 + retained 8039 MB, rss 15211/16384).
+        // So arming the manager ALSO arms the proactive purge valve — under
+        // High/Critical pressure it returns those already-freed pages to the OS.
+        // Purge only ever releases freed memory ⇒ byte-identical / zero
+        // correctness impact. Cache `false` is not pinned (the manager flag may
+        // be read after this), matching the manager's own non-pinning gate.
+        || crate::memory_manager::manager_enabled();
+    // Only cache the ARMED (true) decision: an early `false` (read before the
+    // manager flag is observed) must not pin the valve off for the run.
+    if on {
+        PURGE_ARMED.store(2, Ordering::Relaxed);
+    }
     on
 }
 
