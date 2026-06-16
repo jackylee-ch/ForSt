@@ -62,6 +62,46 @@ EFFECTIVE_CONFIG_OK: rocksdb BOS config active ...
 
 No auth values are recorded in this document.
 
+## Accuracy Validation
+
+After the 100M BOS performance baseline, a separate BOS accuracy harness was
+added under `tools/nexmark-bos/accuracy`. It generates one fixed 100K NexMark CSV
+input, replays the same files through `forst-rs` and RocksDB, captures print-sink
+changelog output, and compares the materialized result. The harness uses the same
+BOS access model as the benchmark: forst-rs remote state through the BOS
+S3-compatible endpoint, and RocksDB checkpoints through Hadoop `bos://` with the
+BOS filesystem jar loaded by Flink.
+
+Accuracy run artifacts:
+
+| item | path |
+| --- | --- |
+| Full fixed-CSV sweep | `/tmp/jackylee/nexmark-bos-accuracy/nexmark-bos-accuracy-sweep-20260616-111205/SUMMARY.md` |
+| Q4 focused run | `/tmp/jackylee/nexmark-bos-accuracy/nexmark-bos-accuracy-q4-20260616-110733/SUMMARY.md` |
+| Q9 focused rerun | `/tmp/jackylee/nexmark-bos-accuracy/nexmark-bos-accuracy-q9-20260616-123242/SUMMARY.md` |
+
+Final accuracy verdict:
+
+| query group | verdict | note |
+| --- | --- | --- |
+| q0-q5, q7-q8, q10-q11, q13-q22 | PASS | Strict materialized equality between forst-rs and RocksDB. |
+| q9 | PASS | Final winner per auction matches the expected winner computed directly from the fixed CSV input. |
+| q12 | PASS | Processing-time query; invariant check passed with equal bid sum and bidder set. |
+
+Q4 accuracy was validated with materialized changelog comparison:
+
+```text
+COMPARE_TSV q4 EQUAL left_rows=5 right_rows=5 diff_rows=0
+```
+
+Q9 requires a query-specific final-winner comparator. The raw top-1 update stream
+contains different numbers of intermediate updates on the two backends, but the
+final winner for every auction is identical and matches the fixed CSV input:
+
+```text
+COMPARE_TSV q9 PASS_FINAL_WINNER expected_auctions=5567 left_auctions=5567 right_auctions=5567 cross_diff=0 left_wrong=0 right_wrong=0
+```
+
 ## Executive Summary
 
 Both backends completed all 22 scoped queries on BOS.
@@ -140,7 +180,7 @@ Largest forst-rs losses:
 | q21 | 112.4 | 127.5 | +15.1 | 1.13 | forst-rs | 100000000 | 100000000 |
 | q22 | 79.5 | 91.8 | +12.3 | 1.15 | forst-rs | 100000000 | 100000000 |
 
-`*` q4 note: see the q4 validation section below. The q4 `out_rows` values are the sink/Writer vertex `read-records` metric and are not a reliable final-result row-count comparison for this changelog aggregation query.
+`*` q4 note: see the q4 validation section below. The q4 `out_rows` values are the sink/Writer vertex `read-records` metric and are not a reliable final-result row-count comparison for this changelog aggregation query. Q4 final semantic output was separately validated by the accuracy harness.
 
 ## Q4 Validation
 
@@ -179,9 +219,9 @@ Interpretation:
 - q4 wall time is a valid run-time measurement for this BOS benchmark: forst-rs `891.6s`, RocksDB `955.7s`.
 - q4 `out_rows` is not a valid final-result equality signal in this harness. The harness reads the Flink REST sink/Writer vertex `read-records` metric. For q4, which is a join plus inner aggregation plus outer aggregation, that metric reflects changelog/update traffic observed by the sink path, not the final category-level aggregate result.
 - The q4 `out_rows` difference therefore cannot by itself prove a semantic result mismatch.
-- A separate q4 correctness run should use a materialized sink, such as filesystem or a dedicated collecting sink, and compare the final retracted/upserted category aggregate values.
+- The separate fixed-CSV accuracy run did use captured changelog materialization and confirmed equal final category aggregates: `left_rows=5`, `right_rows=5`, `diff_rows=0`.
 
-For the current performance summary, q4 wall time is included, while q4 output-count equality is explicitly excluded from correctness conclusions.
+For the current performance summary, q4 wall time is included, while q4 REST `out_rows` equality is explicitly excluded from correctness conclusions. Correctness is based on the separate materialized accuracy run.
 
 ## q9 Root Cause and Final Profile
 
@@ -219,6 +259,26 @@ Final q9 result:
 
 q9 conclusion: the failure mode was TaskManager cgroup memory pressure, not BOS reachability. The successful profile reduced JVM/process memory, forst-rs native memory, async-state buffering, background work, and local file cache pressure enough to keep the run inside the 16GiB/TM cgroup.
 
+The post-benchmark fixed-CSV accuracy rerun also confirmed that q9 has no final
+winner correctness issue. The original strict materialized multiset comparator
+reported a difference because q9 emits a top-1 update stream: intermediate
+`+U` winner updates are not final result rows. The q9-specific comparator now
+checks the final winner per auction against the expected winner computed from the
+fixed CSV input:
+
+| q9 accuracy item | value |
+| --- | ---: |
+| expected winner auctions | 5567 |
+| forst-rs final winner auctions | 5567 |
+| RocksDB final winner auctions | 5567 |
+| backend final-winner differences | 0 |
+| forst-rs wrong/missing/extra winners | 0/0/0 |
+| RocksDB wrong/missing/extra winners | 0/0/0 |
+
+q9 accuracy conclusion: the final winning bid result is correct on both
+backends. The raw output-row-count difference is intermediate update traffic, not
+a semantic mismatch.
+
 ## BOS Bottleneck Assessment
 
 BOS access was not the root cause of the observed failures.
@@ -236,8 +296,7 @@ BOS/local-cache interaction still matters for memory accounting. The local `/tmp
 
 Recommended next steps:
 
-1. Validate q4 final semantic output with a materialized sink rather than the REST sink `read-records` metric.
-2. Investigate q7 and q17, where RocksDB is meaningfully faster.
-3. Investigate smaller RocksDB wins on q5, q8, q12, and q19.
-4. Keep a separate q9 low-memory profile for the 2 x 4c/16g resource model.
-5. After this baseline, rebuild a new `nexmark-bos*` image from the latest jars/test files and rerun the sensitive queries first: q4, q7, q9, q17, q5, q12, and q19.
+1. Investigate q7 and q17, where RocksDB is meaningfully faster.
+2. Investigate smaller RocksDB wins on q5, q8, q12, and q19.
+3. Keep a separate q9 low-memory profile for the 2 x 4c/16g resource model.
+4. After this baseline, rebuild a new `nexmark-bos*` image from the latest jars/test files and rerun the sensitive queries first: q4, q7, q9, q17, q5, q12, and q19.
