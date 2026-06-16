@@ -449,10 +449,21 @@ pub fn vlog_point_deref_enabled() -> bool {
         2 => return true,
         _ => {}
     }
-    matches!(
-        std::env::var("FRS_VLOG_POINT_DEREF").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
+    // PMC-1 (2026-06-16): the env var, when SET, is authoritative (explicit
+    // operator choice, any query). When UNSET, the default FOLLOWS KV-sep: the
+    // mini-bench `windowed_agg_rmw` proves that under uniform KV-sep ON the
+    // scattered RMW (q11/q17) is ~1.65x SLOWER without point-deref (a 64 KiB
+    // chunk fill per 32 B accumulator deref) and recovers to near-OFF parity
+    // WITH it. point-deref is byte-identical (only the read SIZE changes) and a
+    // no-op for the scan shape (multi-pointer groups still take `get_coalesced`),
+    // so coupling it to `kv_separation_enabled()` makes "all queries KV-sep ON"
+    // perf-clean under ONE config knob — no separate flag for an operator to
+    // forget. When KV-sep is OFF no BlobRef row exists, so this is moot.
+    match std::env::var("FRS_VLOG_POINT_DEREF").ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") => true,
+        Some(_) => false,
+        None => kv_separation_enabled(),
+    }
 }
 
 /// FRS-VLOG-POINT-DEREF test override for [`vlog_point_deref_enabled`]:
@@ -496,10 +507,19 @@ pub fn vlog_sink_deref_enabled() -> bool {
         2 => return true,
         _ => {}
     }
-    matches!(
-        std::env::var("FRS_VLOG_SINK_DEREF").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
+    // PMC-1 (2026-06-16): like point-deref, the SET env var is authoritative;
+    // UNSET defaults to FOLLOW KV-sep. sink-deref derefs a found separated value
+    // DIRECTLY into the Arrow builder (one memcpy, no intermediate `Vec` for the
+    // uncompressed codec) on the q9 join-probe path; it is byte-identical for
+    // every codec (`test_vlog_sink_deref_byte_identical_batch_get_arrow`). The
+    // win is modest (the second copy is a small fraction of the deref) but always
+    // >= 0 and removes an allocation per separated probe, so it is safe to couple
+    // to `kv_separation_enabled()` for the all-queries-ON regime. Moot when OFF.
+    match std::env::var("FRS_VLOG_SINK_DEREF").ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") => true,
+        Some(_) => false,
+        None => kv_separation_enabled(),
+    }
 }
 
 /// FRS-VLOG-SINK-DEREF test override for [`vlog_sink_deref_enabled`]:
@@ -21586,6 +21606,62 @@ mod tests {
         set_vlog_sink_deref_override(Some(true));
         assert!(vlog_sink_deref_enabled(), "forced-on must read true");
         set_vlog_sink_deref_override(None);
+    }
+
+    /// PMC-1 (2026-06-16): with the env vars UNSET, the point-deref and
+    /// sink-deref defaults FOLLOW KV-sep — flipping KV-sep ON auto-enables the
+    /// read-path levers that make the scattered RMW (q11/q17) and q9 join probe
+    /// perf-clean under ONE config knob. The explicit per-flag override still
+    /// wins (it models `FRS_VLOG_*=0/1`). KV-sep OFF ⇒ both default OFF (moot:
+    /// no BlobRef rows exist). Guards against a future refactor decoupling them.
+    #[test]
+    #[ignore = "toggles process-global KV-sep override; run explicitly (serial)"]
+    fn test_vlog_deref_levers_default_follow_kvsep() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Ensure no per-flag override is forcing a value (env is unset in CI).
+        set_vlog_point_deref_override(None);
+        set_vlog_sink_deref_override(None);
+
+        // KV-sep ON ⇒ both levers default ON.
+        set_kv_separation_override(Some(true));
+        assert!(
+            vlog_point_deref_enabled(),
+            "point-deref must default ON when KV-sep is ON"
+        );
+        assert!(
+            vlog_sink_deref_enabled(),
+            "sink-deref must default ON when KV-sep is ON"
+        );
+
+        // KV-sep OFF ⇒ both default OFF (moot — no separated rows).
+        set_kv_separation_override(Some(false));
+        assert!(
+            !vlog_point_deref_enabled(),
+            "point-deref must default OFF when KV-sep is OFF"
+        );
+        assert!(
+            !vlog_sink_deref_enabled(),
+            "sink-deref must default OFF when KV-sep is OFF"
+        );
+
+        // Explicit per-flag override beats the KV-sep coupling either way.
+        set_kv_separation_override(Some(true));
+        set_vlog_point_deref_override(Some(false));
+        assert!(
+            !vlog_point_deref_enabled(),
+            "forced-off point-deref must win over KV-sep ON"
+        );
+        set_vlog_point_deref_override(None);
+        set_kv_separation_override(Some(false));
+        set_vlog_point_deref_override(Some(true));
+        assert!(
+            vlog_point_deref_enabled(),
+            "forced-on point-deref must win over KV-sep OFF"
+        );
+
+        set_vlog_point_deref_override(None);
+        set_vlog_sink_deref_override(None);
+        set_kv_separation_override(None);
     }
 
     /// FRS-VLOG-POINT-DEREF (2026-06-15, q11/q17 read-path fix): the right-sized
