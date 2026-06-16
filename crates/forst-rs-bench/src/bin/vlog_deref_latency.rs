@@ -169,6 +169,38 @@ fn main() {
             .report();
         }
 
+        // ---- B': warm random POINT-DEREF — the SAME scattered batch as arm B,
+        // but each deref uses `get_point` (FRS-VLOG-POINT-DEREF): read EXACTLY the
+        // record bytes, no 64 KiB chunk fill. This is the q11/q17 scattered-RMW
+        // fix at the primitive level — for a scattered point-get there is no
+        // subsequent same-segment hit to amortize the chunk fill, so the chunk
+        // read in arm B is pure read-amp. Byte-identical value to arm B's `get`.
+        {
+            let reader = VlogReader::open(&fs, &tmp, seg).expect("open");
+            let mut order: Vec<usize> = (0..n).collect();
+            let mut s: u64 = 0x9E3779B97F4A7C15;
+            for i in (1..n).rev() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let j = (s as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            let mut bytes = 0usize;
+            let t = Instant::now();
+            for &i in &order {
+                let v = reader.get_point(&ptrs[i]).expect("get_point");
+                bytes += v.len();
+            }
+            Stats {
+                label: format!("[{codec_name}] random POINT (point-deref fix)"),
+                n,
+                total_ns: t.elapsed().as_nanos(),
+                bytes,
+            }
+            .report();
+        }
+
         // ---- C: hot single-record re-deref — same pointer repeatedly. Isolates
         // the per-deref FIXED cost ABOVE the I/O: chunk-cache HIT path = bounds
         // check + memcpy(value_size) + CRC32 + (lz4) decompress + Vec alloc.
@@ -235,7 +267,9 @@ fn main() {
     let _ = std::fs::remove_dir_all(&tmp);
     println!("Interpretation:");
     println!("  cold SEQ ~= the scan/value-carrying drain deref cost (q4/q7/q9/q20).");
-    println!("  random   ~= the point-get / scattered join probe deref cost.");
+    println!("  random   ~= the point-get / scattered join probe deref cost (chunk-fill get).");
+    println!("  random POINT ~= the SAME scattered batch via get_point (FRS-VLOG-POINT-DEREF):");
+    println!("             reads EXACTLY the record (no 64 KiB chunk fill) — the q11/q17 fix.");
     println!("  hot HIT  ~= the irreducible per-deref CPU floor (memcpy+CRC+alloc[+lz4]).");
     println!("  Gap cold->hot = the I/O+chunk-fill amortization a coalesce/cache removes.");
 
