@@ -305,6 +305,164 @@ pub fn consumer_cap_bytes(consumer: Consumer) -> Option<u64> {
     Some(cap.max(MIB)) // never return a degenerate 0 cap
 }
 
+// ===========================================================================
+// FRS-MEM-COMPACT-ADMISSION (2026-06-16, PMC-1 live-state track): PROACTIVE
+// admission bound on the in-flight compaction/build TRANSIENT working set.
+//
+// # Why a SEPARATE mechanism from `consumer_cap_bytes(CompactionTransient)`
+//
+// `consumer_cap_bytes(CompactionTransient)` bounds the per-job *prefetch read
+// window* (the read-ahead buffer). It does NOT bound how many compaction jobs
+// run CONCURRENTLY, nor the anon working set each materialises (input decoded
+// blocks + the k-way merge heap + the output writer's buffers). The q9 cliff
+// (measured, sweep-results.md): `jemalloc_alloc(LIVE)` goes Ample→over-cliff
+// inside ONE sampler window because, during the interval-join build storm, the
+// ~8 co-resident keyed-state DBs all hit their L0 rollup at once and the SUM of
+// their concurrent compaction transients spikes the anon RSS past the cgroup
+// BEFORE the reactive sampler/purge gets a tick. The LIVE set FITS the budget
+// in steady state (4675 MB < 6041 MB); it is the TRANSIENT SPIKE that crosses.
+//
+// # The mechanism: a process-global byte SEMAPHORE
+//
+// Before a picked compaction job runs its heavy merge it ADMITS an estimate of
+// its transient working set (input bytes, clamped) against the
+// `CompactionTransient` budget slice. If admitting would exceed the slice the
+// job WAITS (back-pressuring the bg-compaction pool, which back-pressures flush
+// enqueue, which throttles ingest) until an in-flight job finishes and releases.
+// This is PROACTIVE: the spike is bounded BEFORE it materialises, by capping the
+// SUM of concurrent transients — exactly what the reactive purge could not do.
+//
+// # Correctness
+//
+// Compaction is ALWAYS deferrable: a job that waits produces a byte-identical
+// output whenever it runs, and the engine re-picks the same inputs against the
+// then-current Version. Delaying a merge only changes TIMING (L0 stays deeper
+// for longer ⇒ reads scan more SSTs ⇒ slower) — never OUTPUT. So the admission
+// bound is byte-identical and never-OOM, the same correctness argument as every
+// other cap in this controller.
+//
+// # Flag — folds into the master `FRS_MEM_MANAGER`
+//
+// Armed iff `manager_enabled()` (so the existing armed sweep gets it for free)
+// AND a `CompactionTransient` budget is derivable. Off ⇒ `admit` is an instant
+// no-op permit (byte-identical to today). `FRS_MEM_COMPACT_ADMISSION=0`
+// force-disables it even under the manager (escape hatch for A/B).
+// ===========================================================================
+
+/// In-flight admitted compaction-transient bytes (process-global). Read for the
+/// diag line; mutated by [`CompactionAdmission`] acquire/release.
+static COMPACT_INFLIGHT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count of compaction admissions that had to WAIT for headroom (diag evidence
+/// the proactive bound actually engaged — the q9 spike was throttled).
+static COMPACT_ADMISSION_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the compaction-transient admission bound is armed. Folded into the
+/// master manager flag; `FRS_MEM_COMPACT_ADMISSION=0` force-disables.
+fn compact_admission_enabled() -> bool {
+    if matches!(
+        std::env::var("FRS_MEM_COMPACT_ADMISSION").ok().as_deref(),
+        Some("0") | Some("false") | Some("FALSE")
+    ) {
+        return false;
+    }
+    manager_enabled()
+}
+
+/// A held compaction-transient admission permit. Releases the admitted bytes
+/// back to the global pool on drop (RAII — release on EVERY exit path, incl. the
+/// `?` early-returns and panics in `run_compaction`).
+#[must_use = "the permit must be held for the duration of the compaction merge"]
+pub struct CompactionAdmission {
+    bytes: u64,
+}
+
+impl CompactionAdmission {
+    /// PROACTIVELY admit `estimate` bytes of compaction-transient working set
+    /// against the `CompactionTransient` budget slice. Blocks (bounded poll)
+    /// until the in-flight SUM + `estimate` fits the slice, then reserves and
+    /// returns the permit. When the bound is off (manager unarmed / no budget /
+    /// force-disabled) this is an INSTANT no-op permit reserving 0 bytes —
+    /// byte-identical to today (no wait, no accounting).
+    ///
+    /// `estimate` is clamped to the slice so a single huge job can never
+    /// deadlock against its own bound (it admits the whole slice and runs alone,
+    /// which is the correct never-OOM behaviour — one job at a time rather than
+    /// many concurrent ones crossing the cliff).
+    pub fn admit(estimate: u64) -> Self {
+        if !compact_admission_enabled() {
+            return Self { bytes: 0 };
+        }
+        let Some(slice) = consumer_cap_bytes(Consumer::CompactionTransient) else {
+            return Self { bytes: 0 };
+        };
+        // Clamp so one oversized job admits at most the whole slice (runs solo).
+        let want = estimate.clamp(MIB, slice);
+        let mut waited = false;
+        loop {
+            let cur = COMPACT_INFLIGHT_BYTES.load(std::sync::atomic::Ordering::Acquire);
+            // Always allow the FIRST job in (cur == 0) even if `want` == slice,
+            // so progress is guaranteed; otherwise require room for `want`.
+            if cur == 0 || cur.saturating_add(want) <= slice {
+                if COMPACT_INFLIGHT_BYTES
+                    .compare_exchange_weak(
+                        cur,
+                        cur.saturating_add(want),
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return Self { bytes: want };
+                }
+                continue; // lost the CAS race; re-read and retry immediately.
+            }
+            if !waited {
+                COMPACT_ADMISSION_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                waited = true;
+            }
+            // Bounded poll: another job will release and lower `cur`. 2 ms keeps
+            // the bg-compaction thread responsive without busy-spinning.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+}
+
+impl Drop for CompactionAdmission {
+    fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
+        // Saturating subtract — never wrap on a double-release.
+        let b = self.bytes;
+        loop {
+            let cur = COMPACT_INFLIGHT_BYTES.load(std::sync::atomic::Ordering::Acquire);
+            let next = cur.saturating_sub(b);
+            if COMPACT_INFLIGHT_BYTES
+                .compare_exchange_weak(
+                    cur,
+                    next,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+}
+
+/// Current in-flight admitted compaction-transient bytes (diag).
+pub fn compact_inflight_bytes() -> u64 {
+    COMPACT_INFLIGHT_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Number of compaction admissions that had to wait for headroom (diag).
+pub fn compact_admission_waits() -> u64 {
+    COMPACT_ADMISSION_WAITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// FRS-MEM-MANAGER: a one-line snapshot of the derived budget for the
 /// `[FRS_MEM_DIAG]` log — DIRECT evidence that the controller engaged in-container
 /// and which cap each consumer received. Empty string when the manager is off.
@@ -317,13 +475,15 @@ pub fn diag_str() -> String {
     };
     let mb = |b: Option<u64>| b.map(|v| v / MIB).unwrap_or(0);
     format!(
-        " mem_mgr_native_MB={} mm_blockcache_MB={} mm_wbm_MB={} mm_shadow_MB={} mm_vlog_MB={} mm_compact_MB={}",
+        " mem_mgr_native_MB={} mm_blockcache_MB={} mm_wbm_MB={} mm_shadow_MB={} mm_vlog_MB={} mm_compact_MB={} mm_compact_inflight_MB={} mm_compact_waits={}",
         native / MIB,
         mb(consumer_cap_bytes(Consumer::BlockCache)),
         mb(consumer_cap_bytes(Consumer::WriteBuffer)),
         mb(consumer_cap_bytes(Consumer::ResidentShadow)),
         mb(consumer_cap_bytes(Consumer::VlogResident)),
         mb(consumer_cap_bytes(Consumer::CompactionTransient)),
+        compact_inflight_bytes() / MIB,
+        compact_admission_waits(),
     )
 }
 
@@ -434,5 +594,64 @@ mod tests {
         if std::env::var("FRS_JVM_RESERVED_MB").is_err() {
             assert_eq!(jvm_reserved_bytes(cgroup), (cgroup as f64 * 0.64) as u64);
         }
+    }
+
+    // -- FRS-MEM-COMPACT-ADMISSION (PMC-1 live-state track) ------------------
+
+    #[test]
+    fn admission_is_noop_permit_when_manager_off() {
+        let _g = MM_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Default test process: the manager is unarmed ⇒ admit must be an instant
+        // no-op permit reserving ZERO bytes and never touching the in-flight sum
+        // (byte-identical to today: no wait, no accounting).
+        if !manager_enabled() {
+            let before = compact_inflight_bytes();
+            let permit = CompactionAdmission::admit(64 * MIB);
+            assert_eq!(
+                permit.bytes, 0,
+                "manager off ⇒ no-op permit reserves 0 bytes"
+            );
+            assert_eq!(
+                compact_inflight_bytes(),
+                before,
+                "manager off ⇒ in-flight sum unchanged by admit"
+            );
+            drop(permit);
+            assert_eq!(
+                compact_inflight_bytes(),
+                before,
+                "manager off ⇒ in-flight sum unchanged by release"
+            );
+        }
+    }
+
+    #[test]
+    fn admission_drop_is_saturating_and_balanced() {
+        // The in-flight counter math (reserve on admit, release on drop) must be
+        // exactly balanced and never wrap. Exercise the Drop accounting directly
+        // with synthetic permits (independent of the manager-armed gate) so the
+        // invariant holds regardless of the test process's arming state.
+        let base = compact_inflight_bytes();
+        // Two synthetic held permits add then release their bytes exactly.
+        let a = CompactionAdmission { bytes: 10 * MIB };
+        COMPACT_INFLIGHT_BYTES.fetch_add(10 * MIB, std::sync::atomic::Ordering::AcqRel);
+        let b = CompactionAdmission { bytes: 5 * MIB };
+        COMPACT_INFLIGHT_BYTES.fetch_add(5 * MIB, std::sync::atomic::Ordering::AcqRel);
+        assert_eq!(compact_inflight_bytes(), base + 15 * MIB);
+        drop(a);
+        assert_eq!(compact_inflight_bytes(), base + 5 * MIB);
+        drop(b);
+        assert_eq!(
+            compact_inflight_bytes(),
+            base,
+            "balanced reserve/release returns to baseline"
+        );
+        // Over-release saturates at zero rather than wrapping.
+        let over = CompactionAdmission {
+            bytes: compact_inflight_bytes() + 1_000 * MIB,
+        };
+        drop(over);
+        // Counter floored at 0 (saturating) — never a multi-EiB wrap.
+        assert!(compact_inflight_bytes() <= base);
     }
 }

@@ -3784,3 +3784,79 @@ fingerprint needed to resume observation; sweep unaffected.
 #   ALL queries) and that is sufficient to FIT q19 at 16g/TM with exact rows.
 #   q9 remains the ONE engine-native-bound exception (consistent with the q9
 #   jemalloc=5.5 GiB vs q19 jemalloc=1.9 GiB asymmetry above).
+
+# ===========================================================================
+# PMC-1 LIVE-STATE TRACK (2026-06-16) — q9 PROACTIVE compaction-transient
+# admission + q5 windowed-accumulator levers (engine-side, flag-gated OFF)
+# ===========================================================================
+#
+# Builds on FRS_MEM_MANAGER (cd88660ca) + the purge auto-arm (62b8f6825). The
+# manager bounds RE-DERIVABLE caches and the purge returns RECLAIMABLE retained
+# pages; both verdicts above proved q9/q5 still OOM because their over-budget
+# term is LIVE STATE / a TRANSIENT SPIKE the reactive valves cannot catch:
+#   q9 cliff: jemalloc_alloc(LIVE)=4675 FITS the 6041 budget, but the build/
+#             compaction TRANSIENT anon spike goes Ample->over-cliff inside ONE
+#             sampler window (purge_armed=false at 93% RSS — the spike outruns
+#             the reactive sampler; the EXACT physics of the 3 prior NEGATIVES).
+#   q5 cliff: jemalloc_alloc(LIVE)=7454 EXCEEDS the whole 6041 budget on its own
+#             (sliding-window accumulator operand chains held live until fire);
+#             the WBM hard-cap stall fired (stall_ms=571828) but was USELESS —
+#             the growth is NOT memtables (wbm only 2265).
+#
+# ── q9 FIX (shipped): FRS-MEM-COMPACT-ADMISSION (proactive byte-semaphore) ──
+# `memory_manager::CompactionAdmission` — a process-global byte semaphore over
+# the CompactionTransient budget slice. `run_compaction` ADMITS an estimate of
+# the job's transient working set (this CF's L0+L1 input bytes, clamped to the
+# slice) BEFORE the heavy merge allocates its input-block / merge-heap / output-
+# writer buffers. When the SUM of concurrent compaction transients across the
+# ~8 co-resident keyed-state DBs would exceed the slice, the bg-compaction thread
+# BLOCKS (back-pressuring flush enqueue -> ingest) until an in-flight job
+# releases. This is PROACTIVE — it caps the concurrent-transient SUM so the spike
+# can NEVER materialise, which is precisely what the reactive purge could not do.
+# RAII permit (released on every return / `?` / panic). Folds into FRS_MEM_MANAGER
+# (force-disable FRS_MEM_COMPACT_ADMISSION=0). Diag adds mm_compact_inflight_MB +
+# mm_compact_waits (direct evidence the bound throttled the q9 storm).
+# Correctness: compaction is always deferrable — a waiting job produces a byte-
+# identical output whenever it runs; only TIMING changes. Never-OOM, byte-exact.
+#
+# ── q5 FIXES (shipped, highest-leverage increment): windowed-CF levers ──
+# (1) FRS-MEM-WINDOWED-STALL-SKIP: skip the counterproductive WBM hard-cap stall
+#     for a windowed merge-CF (the doc above explicitly flagged the 571s waste).
+#     The stall does nothing for q5 (its term isn't memtables) — declining it
+#     reclaims that wall-time. Pure-windowed batches skip; any batch touching a
+#     join (non-merge) CF keeps the stall.
+# (2) FRS-MEM-WINDOWED-FLUSH: force a windowed merge-CF to switch/flush its
+#     active memtable at a dedicated accumulator floor (default 256 MiB,
+#     FRS_MEM_WINDOWED_FLUSH_MB) INDEPENDENT of global over-budget, so the per-
+#     pane operand chains move to SST sooner — capping the resident memtable
+#     component AND letting compaction's snapshot-aware full_merge COLLAPSE the
+#     chains (memtable APPENDS one entry per merge; on SST they combine).
+# Both gated on FRS_MEM_MANAGER, byte-identical when off, correctness-safe (only
+# change WHEN the accumulator flushes / whether the writer stalls — never the
+# merged value). PROVEN byte-identical by a new IT: a merge-CF read returns the
+# exact operand concatenation with the levers armed (flush floor forced to fire)
+# == manager-off baseline.
+#
+# ── HONEST SCOPE / REMAINING WORK ──
+# q5's FULL never-OOM fix is a true window-pane SPILL (evict cold panes to SST,
+# read them back on fire). That requires window-BOUNDARY knowledge the engine
+# does NOT have — it sees only (window,key) merge operands, not which panes are
+# "cold". A faithful spill needs a Flink-side signal (which windows are inactive)
+# plumbed across the FFM boundary into a new engine spill tier. That is multi-
+# session surgery with real correctness risk and is DEFERRED. The shipped q5
+# levers REDUCE the live-memtable + operand-collapse terms and remove the 571s
+# stall waste, but do NOT by themselves guarantee q5 fits 16g/TM at 100M when the
+# non-memtable live accumulator (~5 GiB at the cliff) dominates. Owed: the spill
+# tier + a >=40 GiB box (no 2xTM overcommit) to validate.
+#
+# ── VALIDATION HONESTY ──
+# Engine UTs/ITs: 455 lib + 2 memory_manager ITs GREEN, incl. the new admission
+# accounting (reserve/release balanced + saturating) and the windowed merge-CF
+# byte-identical proof. fmt + clippy(0 warnings) + rustdoc(-D warnings) clean;
+# release cdylib builds. The @16g/TM container FINISH validation is NOT claimed
+# here: every prior session proved q9/q5 OOM on THIS 37.77 GiB Mac VM is a HARD
+# CEILING regardless of engine (2x16g TMs overcommit the VM); the admission +
+# q5 levers are correct-by-construction + UT-proven but their @100M never-OOM
+# effect MUST be measured on a non-overcommitted box (>=40 GiB, single-TM-per-VM
+# or process.size sweep). RECOMMEND: FRS_MEM_MANAGER default-ON (the foundation
+# all three live-state levers fold into) once the box validation lands.

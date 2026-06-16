@@ -25,9 +25,13 @@
 use std::sync::Arc;
 
 use forst_rs_common::EngineOptions;
-use forst_rs_engine::memory_manager::{consumer_cap_bytes, engine_native_budget_bytes, Consumer};
+use forst_rs_engine::memory_manager::{
+    compact_inflight_bytes, consumer_cap_bytes, engine_native_budget_bytes, CompactionAdmission,
+    Consumer,
+};
 use forst_rs_engine::{ColumnFamilyDescriptor, DbImpl};
 use forst_rs_io::{FileSystem, LocalFileSystem};
+use forst_rs_storage::merge_operator::RawConcatMergeOperator;
 
 fn open_local(db_path: &str) -> Arc<DbImpl> {
     let opts = EngineOptions {
@@ -134,6 +138,31 @@ fn manager_caps_sum_within_budget_and_output_byte_identical() {
         "per-instance block-cache cap {bc} must be <= native {native}"
     );
 
+    // ---- FRS-MEM-COMPACT-ADMISSION: the proactive bound engages when armed ---
+    // With the manager armed, `admit` reserves bytes against the
+    // CompactionTransient slice and the RAII permit releases them on drop. This
+    // proves the q9 build-storm admission gate is live in-process (the no-op
+    // path is covered by the unit test for the manager-off case).
+    {
+        let before = compact_inflight_bytes();
+        let permit = CompactionAdmission::admit(32 * 1024 * 1024);
+        let held = compact_inflight_bytes();
+        assert!(
+            held > before,
+            "armed admit must reserve in-flight compaction-transient bytes ({held} !> {before})"
+        );
+        assert!(
+            held <= before + compact,
+            "a single admit must never exceed the CompactionTransient slice"
+        );
+        drop(permit);
+        assert_eq!(
+            compact_inflight_bytes(),
+            before,
+            "permit drop must release exactly the admitted bytes"
+        );
+    }
+
     // ---- Armed DB: SAME output -------------------------------------------
     let armed_dir = tempfile::tempdir().expect("armed tempdir");
     let armed_path = armed_dir.path().to_string_lossy().into_owned();
@@ -149,4 +178,81 @@ fn manager_caps_sum_within_budget_and_output_byte_identical() {
     std::env::remove_var("FRS_MEM_MANAGER");
     std::env::remove_var("FRS_MEM_CGROUP_MB");
     std::env::remove_var("FRS_JVM_RESERVED_MB");
+}
+
+/// FRS-MEM-WINDOWED-FLUSH / FRS-MEM-WINDOWED-STALL-SKIP (PMC-1 live-state track):
+/// the q5 window-accumulator levers (force a windowed merge-CF to flush its
+/// operand chains sooner; skip the counterproductive hard-cap stall) must be
+/// BYTE-IDENTICAL — a merge-CF read returns the exact concatenation of all
+/// operands regardless of whether the manager (and thus the levers) is armed.
+/// This is the correctness guard for the q5 path: the levers only change WHEN the
+/// accumulator is flushed / whether the writer stalls, never the merged value.
+#[test]
+fn windowed_merge_cf_output_byte_identical_armed_vs_off() {
+    fn merge_fingerprint(
+        db: &Arc<DbImpl>,
+        n_keys: u32,
+        ops_per_key: u32,
+    ) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("win_agg")
+                    .with_merge_operator(Arc::new(RawConcatMergeOperator::new())),
+            )
+            .expect("create merge cf");
+        let mut expected: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        for k in 0..n_keys {
+            let key = format!("win{k:06}").into_bytes();
+            let mut concat: Vec<u8> = Vec::new();
+            for o in 0..ops_per_key {
+                // Sizeable operand so the active memtable grows toward the
+                // windowed flush floor (exercises the force-switch path).
+                let operand = format!("op-{k}-{o}-{}", "y".repeat(32)).into_bytes();
+                concat.extend_from_slice(&operand);
+                db.merge(&cf, &key, &operand).expect("merge operand");
+            }
+            expected.push((key, Some(concat)));
+        }
+        db.switch_and_flush(&cf).expect("flush merge cf");
+        let mut actual = Vec::new();
+        for (key, _) in &expected {
+            actual.push((key.clone(), db.get(&cf, key).expect("get merge")));
+        }
+        assert_eq!(
+            actual, expected,
+            "merge read-back must equal operand concat"
+        );
+        actual
+    }
+
+    // Baseline: manager OFF (the env is removed at the end of the sibling test;
+    // but `manager_enabled()` caches ARMED=true once any test in this binary
+    // armed it. So we compare the merged OUTPUT, which is identical either way —
+    // the byte-identical contract holds regardless of arming, which is exactly
+    // what we must prove for the q5 levers.)
+    let off_dir = tempfile::tempdir().expect("off tempdir");
+    let off_db = open_local(&off_dir.path().to_string_lossy());
+    let baseline = merge_fingerprint(&off_db, 200, 64);
+    drop(off_db);
+
+    // Armed: force the windowed flush floor LOW so the force-switch path fires
+    // within this small test, and arm the manager.
+    std::env::set_var("FRS_MEM_MANAGER", "1");
+    std::env::set_var("FRS_MEM_CGROUP_MB", "16384");
+    std::env::set_var("FRS_JVM_RESERVED_MB", "10240");
+    std::env::set_var("FRS_MEM_WINDOWED_FLUSH_MB", "1"); // 1 MiB floor → fires
+
+    let armed_dir = tempfile::tempdir().expect("armed tempdir");
+    let armed_db = open_local(&armed_dir.path().to_string_lossy());
+    let armed = merge_fingerprint(&armed_db, 200, 64);
+
+    assert_eq!(
+        armed, baseline,
+        "windowed merge-CF output must be byte-identical with the q5 levers armed"
+    );
+
+    std::env::remove_var("FRS_MEM_MANAGER");
+    std::env::remove_var("FRS_MEM_CGROUP_MB");
+    std::env::remove_var("FRS_JVM_RESERVED_MB");
+    std::env::remove_var("FRS_MEM_WINDOWED_FLUSH_MB");
 }

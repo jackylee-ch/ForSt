@@ -4495,7 +4495,7 @@ impl DbImpl {
         }
 
         if wbm_over {
-            self.wait_for_wbm_headroom();
+            self.wait_for_wbm_headroom_windowed(cf_data.merge_operator().is_some());
         }
 
         Ok(old_value)
@@ -4510,7 +4510,31 @@ impl DbImpl {
     /// 1.3 GiB). The flush runs on the shared bg pool (separate threads) so it drains concurrently
     /// while this writer parks; no lock is held here (write_mutex released, wbm_guard committed) so
     /// there is no deadlock. Bounded by a 30s backstop. Disable with `FRS_WBM_STALL=0`.
-    fn wait_for_wbm_headroom(&self) {
+    /// FRS-MEM-WINDOWED-STALL-SKIP (2026-06-16, PMC-1 live-state track): the
+    /// WBM hard-cap stall, but skipped for a windowed merge-CF when armed.
+    ///
+    /// The q5 cliff profile (sweep-results.md) is DECISIVE: the WBM hard-cap stall
+    /// DID fire (wbm pinned at 1.25× hard cap, `stall_ms=571828` — 571 s wasted)
+    /// yet did NOTHING to stop the OOM, because q5's over-budget term is NOT
+    /// memtables — it is the sliding-window AGGREGATION ACCUMULATOR (per-pane
+    /// merge-operand chains) held LIVE until each window fires. Stalling the
+    /// memtable writer there only burns wall-time while the live window state
+    /// keeps growing. So for a windowed merge-CF we DECLINE the hard-cap stall
+    /// (we still ENQUEUED the flush above, which is always correctness-safe) and
+    /// let the writer proceed — the window state is bounded by the window-pane
+    /// spill path (the larger follow-up), not by memtable backpressure.
+    ///
+    /// Gated: only skips when `FRS_MEM_MANAGER` is armed AND
+    /// `FRS_MEM_WINDOWED_STALL_SKIP` is not force-disabled (default: skip when
+    /// armed). When the manager is off, NEVER skips — byte-identical to today.
+    fn wait_for_wbm_headroom_windowed(&self, windowed_cf: bool) {
+        if windowed_cf && windowed_stall_skip_enabled() {
+            return;
+        }
+        self.wait_for_wbm_headroom_inner()
+    }
+
+    fn wait_for_wbm_headroom_inner(&self) {
         // FRS-WBM-TRUE-BACKPRESSURE (2026-06-08): block the writer while the memtable
         // budget (per-instance cap OR the process-global SOFT budget) is exceeded,
         // until enqueued flushes drain it back under budget. This makes the budget a
@@ -4955,7 +4979,7 @@ impl DbImpl {
             self.enqueue_flush(cf_data.clone())?;
         }
         if wbm_over {
-            self.wait_for_wbm_headroom();
+            self.wait_for_wbm_headroom_windowed(cf_data.merge_operator().is_some());
         }
 
         Ok(seq)
@@ -5889,7 +5913,13 @@ impl DbImpl {
         // FFM async backend uses, so the stall MUST live here (not just write_single) or
         // it never engages (q17/q9 memtables grew to 11/7 GB → OOM). Self-guards via
         // over_budget(); returns immediately when under budget.
-        self.wait_for_wbm_headroom();
+        // FRS-MEM-WINDOWED-STALL-SKIP: skip the (counterproductive) hard-cap stall
+        // only when EVERY CF in this batch is a windowed merge-CF — see
+        // `wait_for_wbm_headroom`. NexMark batches that touch a join (non-merge) CF
+        // keep the stall; pure windowed-agg batches (q5) skip it.
+        let all_windowed =
+            !cf_datas.is_empty() && cf_datas.values().all(|cf| cf.merge_operator().is_some());
+        self.wait_for_wbm_headroom_windowed(all_windowed);
 
         Ok(last_seq)
     }
@@ -6067,7 +6097,10 @@ impl DbImpl {
         }
         // FRS-WBM-TRUE-BACKPRESSURE: dominant FFM single-CF vectorized write path —
         // stall here so memtables are a hard bound. Self-guards via over_budget().
-        self.wait_for_wbm_headroom();
+        // FRS-MEM-WINDOWED-STALL-SKIP: a windowed merge-CF (q5) skips the
+        // counterproductive hard-cap stall — its growth is live window state, not
+        // memtables, so stalling wastes wall-time without bounding the OOM term.
+        self.wait_for_wbm_headroom_windowed(cf_data.merge_operator().is_some());
 
         Ok(last_seq)
     }
@@ -6226,7 +6259,8 @@ impl DbImpl {
         }
         // FRS-WBM-TRUE-BACKPRESSURE: Arrow zero-copy batch path — stall on over-budget
         // (self-guards) so this path is also a hard memtable bound.
-        self.wait_for_wbm_headroom();
+        // FRS-MEM-WINDOWED-STALL-SKIP: windowed merge-CF (q5) skips the stall.
+        self.wait_for_wbm_headroom_windowed(cf_data.merge_operator().is_some());
 
         Ok(last_seq)
     }
@@ -6788,6 +6822,26 @@ impl DbImpl {
                     .sum()
             })
             .unwrap_or(0)
+    }
+
+    /// FRS-MEM-COMPACT-ADMISSION (PMC-1 live-state track): estimate the
+    /// TRANSIENT working-set bytes a compaction of `cf_id` will materialise, used
+    /// by [`crate::memory_manager::CompactionAdmission::admit`] to proactively
+    /// bound the concurrent-compaction spike. The transient is dominated by the
+    /// input files the merge decodes + rewrites: this CF's L0 (the rollup inputs)
+    /// plus its L1 (the overlap the L0→L1 merge reads and the bounded L1→L2 drain
+    /// rewrites). We use raw `file_size` (compressed on-disk bytes) as a
+    /// conservative proxy — the live decoded transient is a windowed FRACTION of
+    /// this (only the active merge windows are resident at once), so admitting
+    /// against the on-disk total OVER-estimates the resident spike, which is the
+    /// safe (never-OOM) direction. Cheap: pure version-metadata sums, no I/O. The
+    /// `admit` clamp bounds a huge estimate to the slice so one big job runs solo
+    /// rather than deadlocking.
+    fn estimate_compaction_transient_bytes(&self, cf_id: ColumnFamilyId) -> u64 {
+        let version = self.version_set.current();
+        let l0 = Self::cf_level_bytes(&version, cf_id, 0);
+        let l1 = Self::cf_level_bytes(&version, cf_id, 1);
+        l0.saturating_add(l1)
     }
 
     /// CF-scoped TOMBSTONE-COMPENSATED byte total at `level` (FRS-M4).
@@ -12932,7 +12986,25 @@ impl DbImpl {
         const WBM_FORCE_SWITCH_FLOOR: usize = 256 * 1024 * 1024;
         let force_for_budget =
             usage >= WBM_FORCE_SWITCH_FLOOR && self.write_buffer_manager.over_budget();
-        if usage < threshold && !force_for_budget {
+        // FRS-MEM-WINDOWED-FLUSH (2026-06-16, PMC-1 live-state track): for a
+        // windowed merge-CF (q5 sliding-window aggregation) under the unified
+        // manager, FORCE a switch at a dedicated accumulator floor INDEPENDENT of
+        // the global over-budget signal. q5's live OOM term is the per-pane
+        // merge-operand accumulator held in the ACTIVE memtable until each window
+        // fires; flushing it to SST sooner (a) caps the resident memtable
+        // component AND (b) lets compaction's snapshot-aware `full_merge` COLLAPSE
+        // the operand chains (memtable APPENDS one entry per merge — uncollapsed
+        // they accumulate; on SST they combine), shrinking the downstream
+        // operand-collection working set. This is correctness-safe (flush only
+        // moves bytes to durable SST; reads merge memtable+SST identically) and
+        // byte-identical — it only changes WHEN the accumulator is flushed. The
+        // floor (default 256 MiB, `FRS_MEM_WINDOWED_FLUSH_MB`) stays ≥ the
+        // L0-explosion floor so forced SSTs are still large. Off when the manager
+        // is off ⇒ byte-identical to today.
+        let force_for_windowed = cf_data.merge_operator().is_some()
+            && crate::memory_manager::manager_enabled()
+            && usage >= windowed_accumulator_flush_floor();
+        if usage < threshold && !force_for_budget && !force_for_windowed {
             return Ok(false);
         }
 
@@ -16459,6 +16531,23 @@ impl CompactionExecutor for DbImpl {
             .lock()
             .expect("lock poisoned")
             .remove(&cf_data.handle().id());
+        // FRS-MEM-COMPACT-ADMISSION (PMC-1 live-state track): PROACTIVELY admit
+        // this compaction's transient working set against the coordinated
+        // CompactionTransient budget slice BEFORE the heavy merge allocates its
+        // input-block / merge-heap / output-writer buffers. When the SUM of
+        // concurrent compaction transients across the co-resident keyed-state
+        // DBs would exceed the slice, this BLOCKS the bg-compaction thread (which
+        // back-pressures flush enqueue → ingest) until an in-flight job releases
+        // — bounding the q9 build-storm spike that the reactive purge could not
+        // catch. The permit is held by RAII for the whole function (released on
+        // every return / `?` / panic path). Estimate = this CF's current L0+
+        // input bytes (the bytes the merge will decode+rewrite), clamped inside
+        // `admit` to at most the whole slice (one oversized job runs solo). A
+        // no-op instant permit when the manager is off ⇒ byte-identical.
+        let _compact_permit = {
+            let est = self.estimate_compaction_transient_bytes(cf_data.handle().id());
+            crate::memory_manager::CompactionAdmission::admit(est)
+        };
         // FRS-COMPACT-DIAG (env FRS_COMPACT_DIAG=1, off by default): time each
         // L0→L1 rollup + record the L0 depth it absorbed, so the maintenance
         // poll's compaction frequency + per-run DURATION can be correlated
@@ -17204,8 +17293,8 @@ fn jemalloc_mb() -> (u64, u64, u64) {
 }
 
 /// FRS-WBM-TRUE-BACKPRESSURE toggle (`FRS_WBM_STALL=0`/`false` disables; ON by
-/// default), cached. When enabled, [`DbImpl::wait_for_wbm_headroom`] blocks writers
-/// until flush drains memtables back under the WBM budget (RocksDB `allow_stall`).
+/// default), cached. When enabled, [`DbImpl::wait_for_wbm_headroom_inner`] blocks
+/// writers until flush drains memtables back under the WBM budget (`allow_stall`).
 fn wbm_stall_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -17214,6 +17303,42 @@ fn wbm_stall_enabled() -> bool {
             std::env::var("FRS_WBM_STALL").ok().as_deref(),
             Some("0") | Some("false") | Some("FALSE")
         )
+    })
+}
+
+/// FRS-MEM-WINDOWED-STALL-SKIP (PMC-1 live-state track): whether to skip the WBM
+/// hard-cap stall for a windowed merge-CF. Armed iff `FRS_MEM_MANAGER` is on
+/// (folds into the master flag so the armed sweep gets it) AND not force-disabled
+/// via `FRS_MEM_WINDOWED_STALL_SKIP=0`. When the manager is off this is always
+/// `false` → the stall behaves exactly as today (byte-identical). NOT cached
+/// `false`: the manager flag may be observed after an early probe (same
+/// non-pinning contract as the manager's own gate).
+fn windowed_stall_skip_enabled() -> bool {
+    if matches!(
+        std::env::var("FRS_MEM_WINDOWED_STALL_SKIP").ok().as_deref(),
+        Some("0") | Some("false") | Some("FALSE")
+    ) {
+        return false;
+    }
+    crate::memory_manager::manager_enabled()
+}
+
+/// FRS-MEM-WINDOWED-FLUSH (PMC-1 live-state track): the active-memtable byte
+/// floor at which a windowed merge-CF force-switches (flushes) to move its
+/// per-pane accumulator operand chains onto SST sooner. Default 256 MiB (kept
+/// ≥ the L0-explosion floor so forced SSTs stay large); override via
+/// `FRS_MEM_WINDOWED_FLUSH_MB`. Only consulted when the manager is armed.
+fn windowed_accumulator_flush_floor() -> usize {
+    use std::sync::OnceLock;
+    static FLOOR: OnceLock<usize> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        const DEFAULT_MB: usize = 256;
+        let mb = std::env::var("FRS_MEM_WINDOWED_FLUSH_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MB);
+        mb * 1024 * 1024
     })
 }
 
