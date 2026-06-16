@@ -298,6 +298,91 @@
 # never-OOM lever is on the RESIDENT working set, not the virtual retained pool.
 #
 # ═══════════════════════════════════════════════════════════════════════════
+# ★★★★★ PMC-1 UNIFIED MEMORY MANAGER (FRS_MEM_MANAGER) 2026-06-16 — THE FIX THE
+#        THREE VERDICTS ABOVE CALLED FOR (proactive admission, not reactive)
+# ═══════════════════════════════════════════════════════════════════════════
+# The three preceding verdicts (FRS_DYNAMIC_SHED, leaner-config, jemalloc-purge)
+# converge on ONE conclusion: the OOM is a SUM problem on the RESIDENT working
+# set, and the fix must be PROACTIVE ADMISSION — bound the total BEFORE the
+# build/compaction spike — not reactive shedding/purging (which can't catch the
+# spike, and which the purge proved targets the wrong pool: `retained` is virtual,
+# not RSS). This section builds exactly that.
+#
+# ── TASK 1: THE ENGINE-NATIVE PROFILE AT THE CLIFF (from the diag above) ──
+# The cgroup `memory.current` the OOM-killer watches decomposes into THREE pools:
+#   (1) JVM process (Flink heap+managed+FFM off-heap) — sized by process.size.
+#       q19 cliff: ~14.4 GiB of 16 GiB was JVM/FFM (jemalloc-resident only 1.9 G).
+#   (2) engine-native (jemalloc) RESIDENT — block cache + memtables(WBM) +
+#       resident shadow + vlog reader cache + the compaction/build TRANSIENT.
+#       q9 cliff: jemalloc_RESIDENT 5.5-5.6 G + WBM 1.6-2.0 G on a ~10 G JVM.
+#   (3) page cache / kernel — small, uncontrollable.
+#   DOMINANT OVER-BUDGET TERM: for q9 it is the engine-native RESIDENT (block
+#   cache + WBM + the build/compaction TRANSIENT) stacked on the JVM; for q19 it
+#   is the JVM process itself (process.size too high for the cgroup). NEITHER is
+#   `retained` (virtual). The standalone caps (block cache 256M×~8≈2G; WBM soft
+#   2G; shadow 2G; vlog 2048 handles; compact-prefetch 64M) were sized for a 32G
+#   budget, do NOT coordinate (their SUM is unbounded vs the cgroup) and do NOT
+#   scale to 10/12/16 g — so the sum + the transient spike crosses the cliff.
+#
+# ── TASK 2: THE UNIFIED MemoryManager (committed; module memory_manager.rs) ──
+# ONE controller reads the cgroup ONCE and derives a coordinated budget:
+#   cgroup        = FRS_MEM_CGROUP_MB | /sys/fs/cgroup/memory.max
+#   jvm_reserved  = FRS_JVM_RESERVED_MB (== taskmanager.memory.process.size)
+#                   (default 0.64×cgroup if unset — a 16g TM's ~10g process.size)
+#   ffm_reserved  = FRS_FFM_RESERVED_MB (default 512M; FFM is already bounded)
+#   headroom      = max(FRS_MEM_HEADROOM_MB[1G floor], 0.10×cgroup)
+#   engine_native = cgroup − jvm_reserved − ffm_reserved − headroom  (floor 1.5G)
+# engine_native is then SPLIT by fixed fractions that sum to 1.0:
+#   block cache 0.28 (÷FRS_MEM_INSTANCES, per-instance) · WBM 0.30 ·
+#   resident shadow 0.18 · vlog resident 0.10 · compaction transient 0.14.
+# Every existing consumer's cap fn (global_wbm_cap_bytes, the WBM HARD cap,
+# global_resident_shadow_cap_bytes, vlog_resident_budget_bytes, the per-instance
+# block-cache size, compaction_prefetch_budget_bytes) now consults
+# `memory_manager::consumer_cap_bytes(consumer)` FIRST and only falls back to its
+# env/default when the manager is OFF or an explicit env pin is set. So the SUM is
+# bounded BY CONSTRUCTION and EVERY cap AUTO-SCALES with the configured TM size
+# (10/12/16 g) — never-OOM at any size, only perf differs.
+# KEY: the WBM HARD cap (refuted STANDALONE — it stalled writers while the
+# UNBOUNDED Java AEC in-flight grew → earlier OOM) is SAFE here because the JVM
+# side is bounded in the SAME budget (process.size carved out). It is derived at
+# 1.25× the WBM soft slice; the SOFT slice stays the flush trigger, the HARD cap
+# is the stall point (wait_for_wbm_headroom switches to the hard cap when armed).
+# The compaction TRANSIENT — the spike the standalone caps never bounded — gets a
+# dedicated PRE-RESERVED slice (0.14) instead of growing on top of everything.
+# Master flag FRS_MEM_MANAGER=1, DEFAULT-OFF, byte-identical when off
+# (consumer_cap_bytes returns None → every consumer keeps its current default; no
+# cgroup reads). Correctness: every cap is a pure RAM bound on a CACHE / flush /
+# prefetch — tightening changes TIMING never OUTPUT (rows byte-identical).
+#
+# COMMITS (branch forst-rs): memory_manager.rs module + wiring of the 6 consumer
+# caps + the hard-cap stall switch + the [FRS_MEM_DIAG] mem_mgr_* line + harness
+# forwarding of FRS_MEM_MANAGER/CGROUP_MB/JVM_RESERVED_MB/FFM_RESERVED_MB/
+# HEADROOM_MB/INSTANCES. (hashes recorded on commit — see git log.)
+#
+# ── TESTS (Mac) ──
+#  * `cargo test -p forst-rs-engine --lib`: 451 passed / 0 failed (6 new
+#    memory_manager unit tests: fractions_sum_to_one, budget_formula, scales-down-
+#    with-smaller-cgroup, headroom-max-of-floor-and-fraction, off-by-default-None,
+#    jvm-reserved-0.64-default).
+#  * NEW integration test `memory_manager_it.rs`: opens a DB with the manager OFF
+#    (baseline fingerprint), arms it (FRS_MEM_CGROUP_MB=16384, FRS_JVM_RESERVED_MB
+#    =10240), asserts the 5 per-consumer caps SUM within the derived engine-native
+#    budget, then opens a DB with it ARMED and asserts the put/get/flush/delete
+#    output is BYTE-IDENTICAL to the OFF baseline. PASSES — proves the controller
+#    bounds without changing output.
+#  * All pre-existing lever A/B + WBM backpressure ITs PASS unchanged (byte-
+#    identical when off). fmt/clippy(--tests)/rustdoc-strict(-D warnings) clean.
+#    FFI .so builds (Linux release).
+#
+# ── TASK 3: never-OOM e2e validation (Mac Docker-Linux, cgroup-v2) ──
+# [RESULTS APPENDED BELOW WHEN THE RUNNER COMPLETES — q9/q5/q19 @100M, manager
+#  ARMED, at a NON-overcommitting split (process.size=8192m so 2×TM engine-native
+#  fits the 37.77 G VM). Captures exact out_rows + the mem_mgr_* derived caps +
+#  rss vs the 16384 cgroup. HONEST: the 2×16g+4g=36g default split OVERCOMMITS the
+#  VM regardless of engine, so the definitive verdict is at the non-overcommitting
+#  split here and is fully decisive only on a ≥40 G box.]
+#
+# ═══════════════════════════════════════════════════════════════════════════
 # ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
 # ═══════════════════════════════════════════════════════════════════════════
 # Population: M2 = Mac (Darwin, arm64 container, jemalloc OFF, io_uring no-op),
