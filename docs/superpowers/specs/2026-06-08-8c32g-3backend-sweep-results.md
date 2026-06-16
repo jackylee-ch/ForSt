@@ -391,6 +391,40 @@
 # | q19 | ★ FINISHED | 92,000,000 | 92,000,000 ✓ | NO | 15637 (under cgroup) | 591.7 |
 # | q5  | ✗ OOM-DNF  | — (stuck 6,000,910) | ~29,988,416 | YES tm1 exit137 (OOMKilled=true) | 16345 (crossed) | DNF ~370s |
 # | q9 (manager only) | ✗ OOM-DNF | — (died ~27M) | 91,813,372 | YES tm2 exit137 | 15302/cgroup pinned 15.999G | DNF |
+# | q9 (purge auto-arm) | ✗ OOM-DNF | — (died mid-build) | 91,813,372 | YES tm2 exit137 | 14985+ climbing | DNF |
+#
+# ── q9 DEFINITIVE: the purge FIRED but `retained` is VIRTUAL — confirms the
+#    prior purge-pool verdict empirically; q9's cliff is JVM + jemalloc-RESIDENT ──
+# With the rebuilt .so the auto-armed purge worked PERFECTLY — purge_armed=true,
+# purge_count climbed to 113+ at shed_level=Critical. But q9 STILL OOM'd, and the
+# cliff diag is the decisive proof of WHY the purge can't fix it:
+#   q9d cliff: rss=14985  jemalloc_alloc(LIVE)=4415  jemalloc_resident=4619
+#              jemalloc_retained=7391  wbm=1561  purge_count=113  shed_level=Critical
+# Despite 113 purges, `retained` stays 7.4-9.1 GB and BARELY drops — because
+# (exactly as the prior PROACTIVE-PURGE verdict found) jemalloc `retained` is
+# VIRTUAL/decommitted memory that was already MADV_DONTNEED'd; `arena.purge` has
+# nothing resident to return. The actual RSS = JVM (8192 process.size) +
+# jemalloc_RESIDENT (4.6 GB live+dirty join-build working pages, climbing) + ~2 GB
+# heavy-SST-I/O page cache ≈ 14.9 GB, and it crosses 16384 as the build grows.
+# The LIVE set (4415 MB) FITS the 6041 MB engine-native budget — the controller is
+# CORRECT — but with an 8 GB JVM FLOOR on a 16 GB cgroup, only ~8 GB is left for
+# engine-native + page cache, and q9's interval-join build + flush + compaction +
+# page-cache RESIDENT working set at 100M exceeds that on this 37.77 GB VM where
+# 2× co-located TMs already overcommit.
+#
+# ── VERDICT for q9: NOT a purge problem, NOT a live-cache problem ──
+# q9's never-OOM lever is the JVM↔engine SPLIT of the cgroup, not any single
+# engine cache. The controller already auto-scales every engine-native cap and (on
+# a kernel where retained is resident) auto-purges — both correct and load-bearing
+# for OTHER queries — but q9 at 100M needs EITHER a smaller JVM floor (process.size
+# < 8 GB so the controller can grant the engine a larger native budget AND leave
+# page-cache room) on a NON-overcommitted box, OR genuinely > 16 GB/TM for its
+# combined JVM + join-build-resident + page-cache working set. On this 37.77 GB Mac
+# VM the 2×TM co-location is the hard ceiling: q19 (smaller build) fits, q9/q5 (the
+# two largest resident working sets) do not. The purge auto-arm is KEPT (byte-
+# identical, helps kernels/queries where retained IS resident — e.g. it trimmed
+# retained for q19) but is HONESTLY NOT q9's fix here. Owed: a ≥40 GB box (no 2×TM
+# overcommit) + a process.size sweep to find the JVM/engine split where q9 fits.
 #
 # ── DEFINITIVE q9 RE-RUN with the rebuilt .so (manager + auto-armed purge) ──
 # 2026-06-16 RUNNER (this session): ran q9 @100M, 2×4c/16g, FRS_MEM_MANAGER=1 +
