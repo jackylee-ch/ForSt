@@ -128,6 +128,78 @@ fn rmw_pass(
     (t.elapsed(), bytes)
 }
 
+/// PMC-1 q17 BATCHED-WRITE-BACK arm: the SAME RMW workload as [`rmw_pass`], but
+/// the per-record `db.put` write-back is replaced by ONE `batch_put_arrow` per
+/// batch — the whole batch's updated accumulators are appended into an Arrow
+/// `RecordBatch` (key, value, op=Put) and written in a single vectorized call.
+/// This collapses N per-record write syscalls / WBM reservations / memtable
+/// inserts into one batched insert (E2E vectorized, zero per-record boundary).
+/// Returns (elapsed, total_bytes_read).
+fn rmw_pass_batched_writeback(
+    db: &Arc<DbImpl>,
+    keys: usize,
+    records: usize,
+    acc_size: usize,
+    batch: usize,
+    seed: u64,
+) -> (std::time::Duration, usize) {
+    use arrow::array::{BinaryBuilder, RecordBatch, UInt8Builder};
+    use arrow::datatypes::{DataType, Field, Schema};
+    let cf = db.default_cf();
+    let mut prng = Rng(seed);
+    let mut bytes = 0usize;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Binary, false),
+        Field::new("value", DataType::Binary, true),
+        Field::new("op_type", DataType::UInt8, false),
+    ]));
+    // OpType::Put discriminant (1) — matches the engine's Put op byte.
+    const OP_PUT: u8 = 1;
+    let t = Instant::now();
+    let mut processed = 0usize;
+    while processed < records {
+        let this = batch.min(records - processed);
+        let mut keys_owned: Vec<String> = Vec::with_capacity(this);
+        for _ in 0..this {
+            let i = prng.next() as usize % keys;
+            keys_owned.push(format!("agg|k{i:012}"));
+        }
+        let key_refs: Vec<&[u8]> = keys_owned.iter().map(|k| k.as_bytes()).collect();
+        let vals = db
+            .batch_get_vectorized(&cf, &key_refs, u64::MAX)
+            .expect("rmw read");
+        // Build the write-back batch (vectorized) instead of per-record put.
+        let mut kb = BinaryBuilder::new();
+        let mut vb = BinaryBuilder::new();
+        let mut ob = UInt8Builder::new();
+        for (k, v) in key_refs.iter().zip(vals) {
+            let mut acc = vec![0u8; acc_size];
+            if let Some(cur) = v {
+                bytes += cur.len();
+                let n = cur.len().min(8);
+                acc[..n].copy_from_slice(&cur[..n]);
+            }
+            let c = u64::from_le_bytes(acc[..8].try_into().unwrap());
+            acc[..8].copy_from_slice(&(c + 1).to_le_bytes());
+            kb.append_value(k);
+            vb.append_value(&acc);
+            ob.append_value(OP_PUT);
+        }
+        let rb = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(kb.finish()),
+                Arc::new(vb.finish()),
+                Arc::new(ob.finish()),
+            ],
+        )
+        .expect("writeback batch");
+        db.batch_put_arrow(&cf, &rb).expect("batched writeback");
+        processed += this;
+    }
+    (t.elapsed(), bytes)
+}
+
 fn build_and_flush(db: &Arc<DbImpl>, keys: usize, acc_size: usize) {
     let cf = db.default_cf();
     let acc = vec![7u8; acc_size];
@@ -337,12 +409,91 @@ fn run_drain_arm(
     set_vlog_point_deref_override(None);
 }
 
+/// PMC-1 q17 WRITE-BACK A/B: per-record `db.put` vs ONE `batch_put_arrow` per
+/// batch, holding the (batched) read path fixed. Runs under KV-sep ON + point
+/// (the q17 production regime). Reports per-record COLD-RMW latency for both
+/// write-back strategies + the speedup, and asserts the final accumulator counts
+/// are byte-identical between the two (same RMW, just batched I/O).
+#[allow(clippy::too_many_arguments)]
+fn run_writeback_arm(
+    kvsep: bool,
+    point: bool,
+    keys: usize,
+    records: usize,
+    acc_size: usize,
+    batch: usize,
+) {
+    let run = |batched: bool| -> (f64, u64) {
+        set_kv_separation_override(Some(kvsep));
+        set_vlog_coalesce_deref_override(Some(false));
+        set_vlog_point_deref_override(Some(point));
+        let tmp = std::env::temp_dir().join(format!(
+            "wagg-wb-{}-{}",
+            if batched { "batched" } else { "perrec" },
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let opts = EngineOptions {
+            db_path: tmp.to_string_lossy().to_string(),
+            write_buffer_size: 64 * 1024 * 1024,
+            ..EngineOptions::default()
+        };
+        let db = DbImpl::open(opts).expect("open");
+        build_and_flush(&db, keys, acc_size);
+        let (cold, _) = if batched {
+            rmw_pass_batched_writeback(&db, keys, records, acc_size, batch, 0x1234_5678_9abc_def0)
+        } else {
+            rmw_pass(&db, keys, records, acc_size, batch, 0x1234_5678_9abc_def0)
+        };
+        // Checksum the final accumulator state (byte-identity across strategies).
+        let cf = db.default_cf();
+        let mut sum: u64 = 0;
+        for i in 0..keys {
+            let k = format!("agg|k{i:012}");
+            if let Some(v) = db.get(&cf, k.as_bytes()).expect("get") {
+                sum = sum.wrapping_add(u64::from_le_bytes(v[..8].try_into().unwrap()));
+            }
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&tmp);
+        (cold.as_secs_f64() * 1e9 / records as f64, sum)
+    };
+
+    let (perrec_ns, perrec_sum) = run(false);
+    let (batched_ns, batched_sum) = run(true);
+    set_kv_separation_override(None);
+    set_vlog_coalesce_deref_override(None);
+    set_vlog_point_deref_override(None);
+
+    assert_eq!(
+        perrec_sum, batched_sum,
+        "batched write-back must produce byte-identical accumulator state"
+    );
+    let label = if kvsep { "KV-sep ON" } else { "KV-sep OFF" };
+    println!(
+        "  {label:<12}  per-record put {perrec_ns:>8.1}   batch_put_arrow {batched_ns:>8.1} ns/rec   speedup {:>5.2}x   (acc-sum {perrec_sum} == {batched_sum})",
+        perrec_ns / batched_ns
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let keys = parse_arg(&args, "--keys", 200_000);
     let records = parse_arg(&args, "--records", 2_000_000);
     let acc_size = parse_arg(&args, "--acc-size", 32);
     let batch = parse_arg(&args, "--batch", 256);
+
+    if args.iter().any(|a| a == "--writeback") {
+        std::env::set_var("FRS_KV_MIN_BLOB_SIZE", "22");
+        println!("=== windowed-agg WRITE-BACK A/B (q17: per-record put vs batch_put_arrow) ===");
+        println!(
+            "keys={keys}  records={records}  acc_size={acc_size}B  batch={batch}  min_blob=22 (LocalFS)\n"
+        );
+        run_writeback_arm(false, false, keys, records, acc_size, batch);
+        run_writeback_arm(true, true, keys, records, acc_size, batch);
+        return;
+    }
 
     if args.iter().any(|a| a == "--phase-breakdown") {
         let flush_every = parse_arg(&args, "--flush-every", 100_000);

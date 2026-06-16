@@ -35,6 +35,10 @@ forst-rs-engine = { workspace = true }
 forst-rs-ffi = { workspace = true }
 forst-rs-io = { workspace = true }
 forst-rs-storage = { workspace = true }
+# blob_deref_sink_copy bench: drives the REAL `batch_get_arrow` path (which
+# takes/returns `arrow::array` types) so the FRS_VLOG_SINK_DEREF A/B can read
+# the Arrow output directly. (Also a dev-dependency for the criterion benches.)
+arrow = { workspace = true }
 # upload_byte_budget bench: drives the in-flight upload admission policy
 # (tokio Semaphore + modeled per-MiB transfer time) to show the byte budget
 # bounds resident upload memory. Needs the `time` feature for `sleep`.

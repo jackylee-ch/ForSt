@@ -124,10 +124,11 @@ pub use db::{
     set_s2_adaptive_fanout_min_override, set_s2_pinned_override, set_trivial_move_override,
     set_vlog_coalesce_deref_override, set_vlog_gc_adaptive_override,
     set_vlog_gc_age_cutoff_override, set_vlog_point_deref_override,
-    set_vlog_resident_budget_mb_override, trivial_move_enabled, vlog_coalesce_deref_enabled,
-    vlog_gc_adaptive_enabled, vlog_gc_age_cutoff_percent, vlog_point_deref_enabled, DbImpl,
-    FillOutcome, IncrementalCheckpointResult, LinkedCheckpointDiscard, LiveFileInfo,
-    PersistentProbeIter, PrefixScanStream, RowSink, DEFAULT_CF_NAME,
+    set_vlog_resident_budget_mb_override, set_vlog_sink_deref_override, trivial_move_enabled,
+    vlog_coalesce_deref_enabled, vlog_gc_adaptive_enabled, vlog_gc_age_cutoff_percent,
+    vlog_point_deref_enabled, vlog_sink_deref_enabled, DbImpl, FillOutcome,
+    IncrementalCheckpointResult, LinkedCheckpointDiscard, LiveFileInfo, PersistentProbeIter,
+    PrefixScanStream, RowSink, DEFAULT_CF_NAME,
 };
 pub use file_deletion_guard::{FileDeletionGuard, PinHandle};
 pub use flush::{sst_file_path, FlushJob};

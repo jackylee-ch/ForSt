@@ -449,6 +449,53 @@ pub fn set_vlog_point_deref_override(v: Option<bool>) {
     );
 }
 
+/// FRS-VLOG-SINK-DEREF master flag (`FRS_VLOG_SINK_DEREF=1`, **DEFAULT OFF**).
+/// PMC-1 q9 KV-sep-ON read-path residual (2026-06-16).
+///
+/// On the `batch_get_arrow` (q9 join-probe) slow path, a found separated value is
+/// copied TWICE between the vlog read buffer and the Arrow batch: once when
+/// `vlog_deref` allocates a fresh `Vec<u8>` (`parse_record` ->
+/// `decompress`; for the uncompressed codec this is `stored.to_vec()`), and again
+/// when `batch_get_arrow` does `append_value(&value)` into the `BinaryBuilder`.
+/// When this flag is ON, [`DbImpl::batch_get_arrow`]'s blob tail dereferences the
+/// value DIRECTLY into the Arrow builder via the `ValueSink` trait
+/// (`vlog_deref_into_sink`): for the uncompressed codec the stored
+/// record slice is appended borrowed (read buffer -> Arrow buffer, ONE memcpy, no
+/// intermediate `Vec`); for a compressed codec the decompressor still produces one
+/// buffer which is then appended (the win is bounded to the uncompressed case +
+/// the eliminated alloc). Byte-identical OUTPUT for every codec (same CRC +
+/// decompress). Default OFF => the legacy `vlog_deref -> Vec -> append` two-copy
+/// path, byte-for-byte. Read LIVE (test-toggle-able).
+pub fn vlog_sink_deref_enabled() -> bool {
+    let ov = VLOG_SINK_DEREF_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    match ov {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    matches!(
+        std::env::var("FRS_VLOG_SINK_DEREF").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+/// FRS-VLOG-SINK-DEREF test override for [`vlog_sink_deref_enabled`]:
+/// 0 = env/default, 1 = forced off, 2 = forced on.
+static VLOG_SINK_DEREF_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// FRS-VLOG-SINK-DEREF: forces the sink-deref on/off for tests/benches
+/// (`None` = defer to `FRS_VLOG_SINK_DEREF`).
+pub fn set_vlog_sink_deref_override(v: Option<bool>) {
+    VLOG_SINK_DEREF_OVERRIDE.store(
+        match v {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// FRS-VLOG-SCAN-COALESCE master flag for windowed-coalesced value-log deref on
 /// the SINGLE-ITERATOR SCAN path (`FRS_VLOG_SCAN_COALESCE=1`, **DEFAULT OFF**).
 /// Design: `2026-06-15-vlog-scan-coalesce-design.md`.
@@ -13629,6 +13676,8 @@ impl DbImpl {
         // (`get_into` → HitPut) bypasses `get_internal`'s clip gate, so an
         // out-of-range key with a memtable Put would leak. Load the clip once.
         let clip = cf_data.clip_range();
+        // FRS-VLOG-SINK-DEREF: read the gate once for the whole batch.
+        let sink_deref = vlog_sink_deref_enabled();
         for i in 0..n {
             let mem = cf_data.active_memtable();
             let key = keys.value(i);
@@ -13655,14 +13704,25 @@ impl DbImpl {
                     // `Option<Vec<u8>>` path below can re-borrow `value_builder` freely. No
                     // explicit `drop(sink)` is needed (and `drop()` on a non-`Drop` borrow
                     // would only EXTEND its lifetime, not shorten it — clippy::drop_non_drop).
-                    match self.get_internal(&cf_data, key, read_seq)? {
-                        Some(value) => {
-                            value_builder.append_value(&value);
-                            found_builder.append_value(true);
-                        }
-                        None => {
-                            value_builder.append_null();
-                            found_builder.append_value(false);
+                    if sink_deref {
+                        // FRS-VLOG-SINK-DEREF: resolve straight into the Arrow
+                        // builder — a separated (BlobRef) value is dereferenced
+                        // directly into the value buffer (no intermediate `Vec`,
+                        // no second `append_value` copy). Byte-identical output.
+                        let mut bb_sink = BinaryBuilderSink(&mut value_builder);
+                        let found =
+                            self.get_internal_into_sink(&cf_data, key, read_seq, &mut bb_sink)?;
+                        found_builder.append_value(found);
+                    } else {
+                        match self.get_internal(&cf_data, key, read_seq)? {
+                            Some(value) => {
+                                value_builder.append_value(&value);
+                                found_builder.append_value(true);
+                            }
+                            None => {
+                                value_builder.append_null();
+                                found_builder.append_value(false);
+                            }
                         }
                     }
                 }
@@ -13928,6 +13988,170 @@ impl DbImpl {
         self.sst_get(cf_data, &version, key, &mut Vec::new())
     }
 
+    /// FRS-VLOG-SINK-DEREF (q9, 2026-06-16): sink-writing twin of
+    /// [`Self::get_internal`]. Resolves `key` through the SAME tier order (active
+    /// memtable → immutable memtables → resident-flushed → SST), but instead of
+    /// returning an owned `Option<Vec<u8>>` it writes the resolved value DIRECTLY
+    /// into `sink`:
+    /// - a found value → `sink.append_borrowed(...)`, returns `Ok(true)`;
+    /// - absent / tombstoned → `sink.append_null()`, returns `Ok(false)`.
+    ///
+    /// The ONLY tier that can produce a `BlobRef` is the SST tier (memtables never
+    /// hold pointer rows — they fail loud), so the second-copy win lands exactly
+    /// there: `sst_get_resolve(..., Some(sink))` derefs a separated value straight
+    /// into the Arrow builder (no intermediate `Vec`). Every memtable / merge
+    /// terminal returns an owned `Vec` (as `get_internal` does) which is then
+    /// `append_borrowed`-ed — byte-identical bytes, one copy into the builder,
+    /// exactly as the legacy `append_value(&value)` did. Used only by
+    /// [`Self::batch_get_arrow`] when `FRS_VLOG_SINK_DEREF` is ON.
+    fn get_internal_into_sink<S: ValueSink>(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+        key: &[u8],
+        read_seq: u64,
+        sink: &mut S,
+    ) -> ForstResult<bool> {
+        self.check_fatal_error()?;
+        if let Some(clip) = cf_data.clip_range() {
+            if !clip.contains(key) {
+                sink.append_null();
+                return Ok(false);
+            }
+        }
+        // Stage 1: Active memtable.
+        let active_hit = cf_data.active_memtable().get(key, read_seq)?;
+        match active_hit {
+            Some(entry) if entry.op_type == OpType::Put => {
+                return Ok(Self::sink_owned(sink, entry.value));
+            }
+            Some(entry)
+                if entry.op_type == OpType::Delete || entry.op_type == OpType::SingleDelete =>
+            {
+                sink.append_null();
+                return Ok(false);
+            }
+            Some(entry) => {
+                debug_assert_eq!(entry.op_type, OpType::Merge);
+                let first_operand = entry
+                    .value
+                    .ok_or_else(|| ForstError::corruption("Merge entry missing operand payload"))?;
+                let mut operands: Vec<Vec<u8>> = vec![first_operand];
+                let base =
+                    self.collect_merge_operands(cf_data, key, entry.sequence, &mut operands)?;
+                let v = self.apply_merge_operator(cf_data, key, base, operands)?;
+                sink.append_borrowed(&v);
+                return Ok(true);
+            }
+            None => {}
+        }
+
+        // Stage 2: Immutable memtables (newest → oldest).
+        let imm_list = cf_data.imm_memtables();
+        for imm in imm_list.iter().rev() {
+            let Some(entry) = imm.get(key, read_seq)? else {
+                continue;
+            };
+            match entry.op_type {
+                OpType::Put => return Ok(Self::sink_owned(sink, entry.value)),
+                OpType::Delete | OpType::SingleDelete => {
+                    sink.append_null();
+                    return Ok(false);
+                }
+                OpType::BlobRef => {
+                    return Err(ForstError::corruption(
+                        "get_internal(imm): BlobRef in a memtable tier (separation is flush-time only)",
+                    ));
+                }
+                OpType::Merge => {
+                    let first_operand = entry.value.ok_or_else(|| {
+                        ForstError::corruption("Merge entry missing operand payload")
+                    })?;
+                    let mut operands: Vec<Vec<u8>> = vec![first_operand];
+                    let base = self.collect_merge_operands_from_imm_start(
+                        cf_data,
+                        key,
+                        entry.sequence,
+                        imm_list.clone(),
+                        &mut operands,
+                    )?;
+                    let v = self.apply_merge_operator(cf_data, key, base, operands)?;
+                    sink.append_borrowed(&v);
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Stage 2.5: resident-flushed memtables.
+        let version = self.version_set.current();
+        let resident_mts: Vec<crate::column_family::SharedMemTable> =
+            if cf_data.has_resident_flushed() {
+                let live_files = version.live_sst_file_numbers();
+                let (mts, _shadowed) = cf_data.resident_flushed_visible_for_key(&live_files, key);
+                mts
+            } else {
+                Vec::new()
+            };
+        for resident in resident_mts.iter().rev() {
+            let Some(entry) = resident.get(key, read_seq)? else {
+                continue;
+            };
+            match entry.op_type {
+                OpType::Put => return Ok(Self::sink_owned(sink, entry.value)),
+                OpType::Delete | OpType::SingleDelete => {
+                    sink.append_null();
+                    return Ok(false);
+                }
+                OpType::BlobRef => {
+                    return Err(ForstError::corruption(
+                        "get_internal(resident): BlobRef in a memtable tier (separation is flush-time only)",
+                    ));
+                }
+                OpType::Merge => {
+                    let first_operand = entry.value.ok_or_else(|| {
+                        ForstError::corruption("Merge entry missing operand payload")
+                    })?;
+                    let mut operands: Vec<Vec<u8>> = vec![first_operand];
+                    let base =
+                        self.collect_merge_operands(cf_data, key, entry.sequence, &mut operands)?;
+                    let v = self.apply_merge_operator(cf_data, key, base, operands)?;
+                    sink.append_borrowed(&v);
+                    return Ok(true);
+                }
+            }
+        }
+
+        // Stage 3: SST tier — the BlobRef terminal sinks the deref directly.
+        match self.sst_get_resolve(cf_data, &version, key, &mut Vec::new(), Some(sink))? {
+            SstResolve::Sunk => Ok(true),
+            SstResolve::Value(Some(v)) => {
+                sink.append_borrowed(&v);
+                Ok(true)
+            }
+            SstResolve::Value(None) => {
+                sink.append_null();
+                Ok(false)
+            }
+        }
+    }
+
+    /// FRS-VLOG-SINK-DEREF helper: append an owned memtable value (or null) into
+    /// `sink`, returning whether a value was written. Mirrors `get_internal`'s
+    /// `Ok(entry.value)` terminal (a `Put` entry always carries `Some`; the `None`
+    /// case is defensive and emits a null).
+    #[inline]
+    fn sink_owned<S: ValueSink + ?Sized>(sink: &mut S, value: Option<Vec<u8>>) -> bool {
+        match value {
+            Some(v) => {
+                sink.append_borrowed(&v);
+                true
+            }
+            None => {
+                sink.append_null();
+                false
+            }
+        }
+    }
+
     /// FRS-L0-SHORTCIRCUIT (2026-06-03): consumes one SST `LookupResult` during
     /// `Self::sst_get`'s L0 walk. Returns `Break(value)` when a Put/Delete base
     /// is reached (the value, with any accumulated merge operands applied) — the
@@ -13935,13 +14159,15 @@ impl DbImpl {
     /// pushed and the walk must proceed to the next-older version. The arms are
     /// the proven B-R27-NEW-H1 / A-R6-H2 corruption-checking logic, factored out
     /// so the newest-first short-circuit and the overlap fallback share one path.
+    #[allow(clippy::doc_markdown)]
     fn sst_get_consume_l0(
         &self,
         cf_data: &Arc<ColumnFamilyData>,
         key: &[u8],
         res: forst_rs_storage::sst::LookupResult,
         merge_operands: &mut Vec<Vec<u8>>,
-    ) -> ForstResult<std::ops::ControlFlow<Option<Vec<u8>>>> {
+        sink: &mut Option<&mut dyn ValueSink>,
+    ) -> ForstResult<std::ops::ControlFlow<SstResolve>> {
         use std::ops::ControlFlow;
         match res.op_type {
             OpType::Put => {
@@ -13954,10 +14180,10 @@ impl DbImpl {
                     ));
                 }
                 if merge_operands.is_empty() {
-                    return Ok(ControlFlow::Break(res.value));
+                    return Ok(ControlFlow::Break(SstResolve::Value(res.value)));
                 }
                 self.apply_merge_operator(cf_data, key, res.value, std::mem::take(merge_operands))
-                    .map(|v| ControlFlow::Break(Some(v)))
+                    .map(|v| ControlFlow::Break(SstResolve::Value(Some(v))))
             }
             OpType::Delete | OpType::SingleDelete => {
                 // B-R27-NEW-H1: a tombstone carrying a payload is corrupt.
@@ -13967,10 +14193,10 @@ impl DbImpl {
                     ));
                 }
                 if merge_operands.is_empty() {
-                    return Ok(ControlFlow::Break(None));
+                    return Ok(ControlFlow::Break(SstResolve::Value(None)));
                 }
                 self.apply_merge_operator(cf_data, key, None, std::mem::take(merge_operands))
-                    .map(|v| ControlFlow::Break(Some(v)))
+                    .map(|v| ControlFlow::Break(SstResolve::Value(Some(v))))
             }
             // FRS-WA-V2a-2: pointer row — dereference the value log. A
             // BlobRef base under accumulated merge operands violates P12
@@ -13984,8 +14210,15 @@ impl DbImpl {
                 let ptr_bytes = res.value.ok_or_else(|| {
                     ForstError::corruption("sst_get: L0 BlobRef missing pointer payload")
                 })?;
-                self.vlog_deref(&ptr_bytes)
-                    .map(|v| ControlFlow::Break(Some(v)))
+                // FRS-VLOG-SINK-DEREF: with a sink, deref the blob straight into
+                // it (no owned `Vec`); otherwise the legacy owned-`Vec` path.
+                if let Some(s) = sink.as_deref_mut() {
+                    self.vlog_deref_into_sink(&ptr_bytes, s)?;
+                    Ok(ControlFlow::Break(SstResolve::Sunk))
+                } else {
+                    self.vlog_deref(&ptr_bytes)
+                        .map(|v| ControlFlow::Break(SstResolve::Value(Some(v))))
+                }
             }
             OpType::Merge => match res.value {
                 // A-R6-H2: surface corruption on a missing operand payload.
@@ -14017,6 +14250,31 @@ impl DbImpl {
         key: &[u8],
         merge_operands: &mut Vec<Vec<u8>>,
     ) -> ForstResult<Option<Vec<u8>>> {
+        // Sink-less legacy entry: resolve into an owned `Vec` (byte-for-byte the
+        // historical behaviour). The sink-aware path is `sst_get_resolve` with a
+        // `None` sink here, so a `BlobRef` terminal can only return `Value`.
+        match self.sst_get_resolve(cf_data, version, key, merge_operands, None)? {
+            SstResolve::Value(v) => Ok(v),
+            SstResolve::Sunk => unreachable!("sst_get(None sink) never sinks"),
+        }
+    }
+
+    /// FRS-VLOG-SINK-DEREF: the resolve core shared by [`Self::sst_get`] (None
+    /// sink) and [`Self::batch_get_arrow`]'s blob tail (Some sink). When `sink` is
+    /// `Some` AND the resolved terminal is a `BlobRef`, the value is dereferenced
+    /// DIRECTLY into the sink ([`Self::vlog_deref_into_sink`]) and `Sunk` is
+    /// returned — skipping the owned-`Vec` round-trip + the caller's second copy.
+    /// Every OTHER outcome (Put / merge-resolved / absent) returns `Value`, and
+    /// with a `None` sink a `BlobRef` ALSO returns `Value` (legacy path) — so the
+    /// sink-less behaviour is byte-for-byte unchanged.
+    fn sst_get_resolve(
+        &self,
+        cf_data: &Arc<ColumnFamilyData>,
+        version: &Version,
+        key: &[u8],
+        merge_operands: &mut Vec<Vec<u8>>,
+        mut sink: Option<&mut dyn ValueSink>,
+    ) -> ForstResult<SstResolve> {
         let cf_id = cf_data.handle().id();
         use std::ops::ControlFlow;
 
@@ -14064,7 +14322,7 @@ impl DbImpl {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for res in versions {
                     if let ControlFlow::Break(v) =
-                        self.sst_get_consume_l0(cf_data, key, res, merge_operands)?
+                        self.sst_get_consume_l0(cf_data, key, res, merge_operands, &mut sink)?
                     {
                         return Ok(v);
                     }
@@ -14087,7 +14345,7 @@ impl DbImpl {
             l0_hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
             for (_, _, res) in l0_hits {
                 if let ControlFlow::Break(v) =
-                    self.sst_get_consume_l0(cf_data, key, res, merge_operands)?
+                    self.sst_get_consume_l0(cf_data, key, res, merge_operands, &mut sink)?
                 {
                     return Ok(v);
                 }
@@ -14127,7 +14385,14 @@ impl DbImpl {
                         let ptr_bytes = res.value.ok_or_else(|| {
                             ForstError::corruption("sst_get: L1+ BlobRef missing pointer payload")
                         })?;
-                        return self.vlog_deref(&ptr_bytes).map(Some);
+                        // FRS-VLOG-SINK-DEREF: sink-deref when a sink is present.
+                        if let Some(s) = sink.as_deref_mut() {
+                            self.vlog_deref_into_sink(&ptr_bytes, s)?;
+                            return Ok(SstResolve::Sunk);
+                        }
+                        return self
+                            .vlog_deref(&ptr_bytes)
+                            .map(|v| SstResolve::Value(Some(v)));
                     }
                     OpType::Put => {
                         // B-R27-NEW-H1 (L1+ sibling): Put-with-None is
@@ -14139,7 +14404,7 @@ impl DbImpl {
                             ));
                         }
                         if merge_operands.is_empty() {
-                            return Ok(res.value);
+                            return Ok(SstResolve::Value(res.value));
                         }
                         return self
                             .apply_merge_operator(
@@ -14148,7 +14413,7 @@ impl DbImpl {
                                 res.value,
                                 std::mem::take(merge_operands),
                             )
-                            .map(Some);
+                            .map(|v| SstResolve::Value(Some(v)));
                     }
                     OpType::Delete | OpType::SingleDelete => {
                         // B-R27-NEW-H1 (L1+ sibling): tombstone-with-payload
@@ -14159,7 +14424,7 @@ impl DbImpl {
                             ));
                         }
                         if merge_operands.is_empty() {
-                            return Ok(None);
+                            return Ok(SstResolve::Value(None));
                         }
                         return self
                             .apply_merge_operator(
@@ -14168,7 +14433,7 @@ impl DbImpl {
                                 None,
                                 std::mem::take(merge_operands),
                             )
-                            .map(Some);
+                            .map(|v| SstResolve::Value(Some(v)));
                     }
                     OpType::Merge => {
                         // A-R6-H2: L1+ sibling — same corruption check.
@@ -14190,9 +14455,9 @@ impl DbImpl {
         if !merge_operands.is_empty() {
             return self
                 .apply_merge_operator(cf_data, key, None, std::mem::take(merge_operands))
-                .map(Some);
+                .map(|v| SstResolve::Value(Some(v)));
         }
-        Ok(None)
+        Ok(SstResolve::Value(None))
     }
 
     fn sst_lookup_versions(
@@ -14569,6 +14834,29 @@ impl DbImpl {
             reader.get_point(&ptr)
         } else {
             reader.get(&ptr)
+        }
+    }
+
+    /// FRS-VLOG-SINK-DEREF (q9, 2026-06-16): sink-writing sibling of
+    /// [`Self::vlog_deref`] — decode the pointer, open the segment reader, and
+    /// deref the value DIRECTLY into `sink` (no owned `Vec<u8>` round-trip). Same
+    /// point-vs-chunk read selection as `vlog_deref` (honors
+    /// [`vlog_point_deref_enabled`]); the value written into the sink is
+    /// byte-identical to what `vlog_deref` would return. Used by
+    /// [`Self::batch_get_arrow`]'s blob tail when `FRS_VLOG_SINK_DEREF` is ON.
+    fn vlog_deref_into_sink<S: ValueSink + ?Sized>(
+        &self,
+        ptr_bytes: &[u8],
+        sink: &mut S,
+    ) -> ForstResult<()> {
+        let ptr = forst_rs_storage::vlog::ValuePointer::decode(ptr_bytes).ok_or_else(|| {
+            ForstError::corruption("BlobRef row carries malformed value-pointer bytes")
+        })?;
+        let reader = self.get_or_open_vlog_reader(ptr.segment_id)?;
+        if vlog_point_deref_enabled() {
+            reader.get_point_into(&ptr, sink)
+        } else {
+            reader.get_into(&ptr, sink)
         }
     }
 
@@ -19047,6 +19335,16 @@ impl LazyPrefixIter {
     }
 }
 
+/// FRS-VLOG-SINK-DEREF: outcome of the SST resolve core `sst_get_resolve`.
+/// `Value` carries the owned resolved value (the legacy, sink-less result —
+/// `None` for absent/tombstoned). `Sunk` means a `BlobRef` terminal was
+/// dereferenced DIRECTLY into the caller's `ValueSink` (no owned `Vec`), and is
+/// only ever produced when a `Some` sink was supplied.
+enum SstResolve {
+    Value(Option<Vec<u8>>),
+    Sunk,
+}
+
 /// FRS-VALUE-CARRYING-MERGE: outcome of [`LazyPrefixIter::next_with_value`].
 enum ValueDecision {
     /// Newest version is an SST-resident Put; the value is final.
@@ -20958,6 +21256,164 @@ mod tests {
 
         set_vlog_coalesce_deref_override(None);
         set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-SINK-DEREF (2026-06-16, q9 read-path): `FRS_VLOG_SINK_DEREF`
+    /// dereferences separated values DIRECTLY into the Arrow `BinaryBuilder`
+    /// (no intermediate `Vec` + no second `append_value` copy) on the
+    /// `batch_get_arrow` (join-probe) path. This MUST be byte-identical to the
+    /// legacy two-copy path, across the scattered join-probe shape: separated
+    /// values at BOTH the L0 and L1+ deref sites, interleaved genuine misses,
+    /// under point-deref ON and OFF. Default OFF must equal the pre-flag path;
+    /// ON must equal OFF, byte-for-byte (value bytes + found flags).
+    #[test]
+    fn test_vlog_sink_deref_byte_identical_batch_get_arrow() {
+        use arrow::array::{Array, BinaryArray, BinaryBuilder, BooleanArray};
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_kv_separation_override(Some(true));
+
+        let mkrand = |seed: u64, n: usize| -> Vec<u8> {
+            let mut x = seed | 1;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect()
+        };
+
+        const N: usize = 240;
+        // Two cohorts across two segments: first compacted to L1 (L1+ deref
+        // site), second left in L0 (L0 deref site), so both BlobRef terminals
+        // run through the sink path.
+        let build = || -> (Arc<DbImpl>, ColumnFamilyHandle, Vec<(Vec<u8>, Vec<u8>)>) {
+            let db = open();
+            let cf = db
+                .create_column_family(ColumnFamilyDescriptor::new("sink-deref"))
+                .unwrap();
+            let mut kv: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(N);
+            for i in 0..N as u32 {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x1000 + i as u64, 256 + (i as usize % 64));
+                db.put(&cf, &k, &v).unwrap();
+                kv.push((k, v));
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed");
+            db.compact_all().unwrap();
+            for i in (0..N as u32).step_by(2) {
+                let k = format!("key{i:05}").into_bytes();
+                let v = mkrand(0x9000 + i as u64, 256 + (i as usize % 48));
+                db.put(&cf, &k, &v).unwrap();
+                kv[i as usize].1 = v;
+            }
+            db.switch_and_flush(&cf).unwrap().expect("flushed");
+            assert!(
+                !db.version_set.current().vlog_segments.is_empty(),
+                "values must have separated"
+            );
+            (db, cf, kv)
+        };
+
+        let scattered_keys = |kv: &[(Vec<u8>, Vec<u8>)]| -> Vec<Vec<u8>> {
+            let mut order: Vec<usize> = (0..kv.len()).collect();
+            let mut s: u64 = 0x9E3779B97F4A7C15;
+            for i in (1..order.len()).rev() {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let j = (s as usize) % (i + 1);
+                order.swap(i, j);
+            }
+            let mut out = Vec::with_capacity(order.len() + order.len() / 8);
+            for (n, &i) in order.iter().enumerate() {
+                if n % 8 == 3 {
+                    out.push(format!("absent{n:05}").into_bytes());
+                }
+                out.push(kv[i].0.clone());
+            }
+            out
+        };
+
+        let read_arrow = |db: &Arc<DbImpl>,
+                          cf: &ColumnFamilyHandle,
+                          keys: &[Vec<u8>]|
+         -> (Vec<Option<Vec<u8>>>, Vec<bool>) {
+            let mut kb = BinaryBuilder::new();
+            for k in keys {
+                kb.append_value(k);
+            }
+            let karr: BinaryArray = kb.finish();
+            let rb = db.batch_get_arrow(cf, &karr).unwrap();
+            let vals = rb.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            let found = rb
+                .column(1)
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap();
+            let mut v = Vec::with_capacity(vals.len());
+            let mut f = Vec::with_capacity(found.len());
+            for i in 0..vals.len() {
+                v.push(if vals.is_valid(i) {
+                    Some(vals.value(i).to_vec())
+                } else {
+                    None
+                });
+                f.push(found.value(i));
+            }
+            (v, f)
+        };
+
+        // Run both point-deref regimes (the sink path mirrors get/get_point).
+        for point in [false, true] {
+            set_vlog_point_deref_override(Some(point));
+
+            set_vlog_sink_deref_override(Some(false));
+            let (db_off, cf_off, kv) = build();
+            let keys = scattered_keys(&kv);
+            let (off_v, off_f) = read_arrow(&db_off, &cf_off, &keys);
+
+            set_vlog_sink_deref_override(Some(true));
+            let (db_on, cf_on, kv2) = build();
+            assert_eq!(kv, kv2, "deterministic build across arms");
+            let keys2 = scattered_keys(&kv2);
+            assert_eq!(keys, keys2);
+            let (on_v, on_f) = read_arrow(&db_on, &cf_on, &keys2);
+
+            assert_eq!(
+                off_v, on_v,
+                "sink-deref values must be byte-identical (point={point})"
+            );
+            assert_eq!(
+                off_f, on_f,
+                "sink-deref found flags must match (point={point})"
+            );
+
+            // Spot-check correctness against the source-of-truth map.
+            let want: std::collections::HashMap<Vec<u8>, Vec<u8>> = kv.iter().cloned().collect();
+            for (k, got) in keys.iter().zip(on_v.iter()) {
+                match want.get(k) {
+                    Some(v) => assert_eq!(got.as_deref(), Some(v.as_slice())),
+                    None => assert_eq!(got, &None),
+                }
+            }
+        }
+
+        set_vlog_sink_deref_override(None);
+        set_vlog_point_deref_override(None);
+        set_kv_separation_override(None);
+    }
+
+    /// FRS-VLOG-SINK-DEREF flag default-OFF + override semantics.
+    #[test]
+    fn test_vlog_sink_deref_flag_default_off_and_override() {
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_vlog_sink_deref_override(Some(false));
+        assert!(!vlog_sink_deref_enabled(), "forced-off must read false");
+        set_vlog_sink_deref_override(Some(true));
+        assert!(vlog_sink_deref_enabled(), "forced-on must read true");
+        set_vlog_sink_deref_override(None);
     }
 
     /// FRS-VLOG-POINT-DEREF (2026-06-15, q11/q17 read-path fix): the right-sized

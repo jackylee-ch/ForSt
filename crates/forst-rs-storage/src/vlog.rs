@@ -344,6 +344,84 @@ impl VlogReader {
         Self::parse_record(&record, ptr)
     }
 
+    /// FRS-VLOG-SINK-DEREF (q9 KV-sep-ON read path, 2026-06-16): point-deref ONE
+    /// value DIRECTLY into a [`ValueSink`] — no owned `Vec<u8>` round-trip.
+    ///
+    /// Identical read shape to [`Self::get_point`] (chunk-cache HIT honored, else
+    /// one exact positioned read of `header + ptr.len`, no chunk fill / no cache
+    /// write), but the resolved value is written into `sink` via
+    /// `parse_record_into` instead of returned as a freshly-allocated
+    /// `Vec`. For the uncompressed codec this appends the stored record slice
+    /// BORROWED (read buffer -> sink, single memcpy, zero intermediate alloc); a
+    /// compressed codec still materializes the decompressed buffer once and then
+    /// appends it. Byte-identical VALUE to [`Self::get_point`] for every codec.
+    pub fn get_point_into<S: crate::memtable::ValueSink + ?Sized>(
+        &self,
+        ptr: &ValuePointer,
+        sink: &mut S,
+    ) -> ForstResult<()> {
+        let total = VLOG_RECORD_HEADER + ptr.len as usize;
+        // A chunk-cache HIT is still cheaper than a fresh pread — honor it.
+        {
+            let guard = self.chunk.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((start, bytes)) = guard.as_ref() {
+                if ptr.offset >= *start && ptr.offset + total as u64 <= *start + bytes.len() as u64
+                {
+                    let lo = (ptr.offset - *start) as usize;
+                    return Self::parse_record_into(&bytes[lo..lo + total], ptr, sink);
+                }
+            }
+        }
+        // Miss: read EXACTLY the record (no chunk fill, no cache write).
+        let mut record = vec![0u8; total];
+        let n = self.file.read_at(ptr.offset, &mut record)?;
+        if n != total {
+            return Err(ForstError::corruption(
+                "vlog record short read (point/sink)",
+            ));
+        }
+        Self::parse_record_into(&record, ptr, sink)
+    }
+
+    /// FRS-VLOG-SINK-DEREF: chunk-filling sibling of [`Self::get_point_into`],
+    /// mirroring [`Self::get`]'s read shape (chunk-cache amortized over scan
+    /// locality) but writing the value into `sink` instead of returning a `Vec`.
+    /// Used when point-deref is OFF (scan locality preferred). Byte-identical
+    /// VALUE to [`Self::get`].
+    pub fn get_into<S: crate::memtable::ValueSink + ?Sized>(
+        &self,
+        ptr: &ValuePointer,
+        sink: &mut S,
+    ) -> ForstResult<()> {
+        let total = VLOG_RECORD_HEADER + ptr.len as usize;
+        // Oversized records bypass the chunk cache (one direct pread).
+        if total > VLOG_READ_CHUNK {
+            let mut record = vec![0u8; total];
+            let n = self.file.read_at(ptr.offset, &mut record)?;
+            if n != total {
+                return Err(ForstError::corruption("vlog record short read (sink)"));
+            }
+            return Self::parse_record_into(&record, ptr, sink);
+        }
+        let mut guard = self.chunk.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((start, bytes)) = guard.as_ref() {
+            if ptr.offset >= *start && ptr.offset + total as u64 <= *start + bytes.len() as u64 {
+                let lo = (ptr.offset - *start) as usize;
+                return Self::parse_record_into(&bytes[lo..lo + total], ptr, sink);
+            }
+        }
+        // Miss: read forward from the record start (scans walk forward).
+        let mut buf = vec![0u8; VLOG_READ_CHUNK];
+        let n = self.file.read_at(ptr.offset, &mut buf)?;
+        if n < total {
+            return Err(ForstError::corruption("vlog record short read (sink)"));
+        }
+        buf.truncate(n);
+        let out = Self::parse_record_into(&buf[..total], ptr, sink);
+        *guard = Some((ptr.offset, buf));
+        out
+    }
+
     /// FRS-VLOG-COALESCE: coalesced batched deref of MANY pointers into THIS
     /// segment in ONE pass. `ptrs` must all target this segment and be SORTED by
     /// `offset` (the caller groups by `segment_id` + sorts). The reader computes
@@ -441,6 +519,61 @@ impl VlogReader {
         // `decompress` validates the output against `uncompressed_len` (the
         // trusted size bound — defends against a crafted compressed frame).
         decompress(stored, compression, uncompressed_len as usize)
+    }
+
+    /// FRS-VLOG-SINK-DEREF: validate + decompress one framed record and write the
+    /// resolved value into `sink` instead of returning an owned `Vec`. Performs
+    /// the SAME length check, CRC verification, and codec dispatch as
+    /// [`Self::parse_record`] (so it accepts/rejects byte-for-byte the same
+    /// records). For [`CompressionType::None`] the stored payload IS the value, so
+    /// it is appended BORROWED directly from the read buffer — the alloc + copy
+    /// that `parse_record`'s `decompress` -> `stored.to_vec()` would do is gone.
+    /// For a compressed codec the decompressor still materializes one buffer,
+    /// which is then appended borrowed (one copy into the sink, same as before but
+    /// without the caller's second `append_value` copy). Byte-identical VALUE.
+    fn parse_record_into<S: crate::memtable::ValueSink + ?Sized>(
+        record: &[u8],
+        ptr: &ValuePointer,
+        sink: &mut S,
+    ) -> ForstResult<()> {
+        let stored_len = u32::from_le_bytes(record[0..4].try_into().expect("4 bytes"));
+        let stored_crc = u32::from_le_bytes(record[4..8].try_into().expect("4 bytes"));
+        let codec_byte = record[8];
+        let uncompressed_len = u32::from_le_bytes(record[9..13].try_into().expect("4 bytes"));
+        if stored_len != ptr.len {
+            return Err(ForstError::corruption(format!(
+                "vlog pointer/record length mismatch: pointer {} record {}",
+                ptr.len, stored_len
+            )));
+        }
+        let stored = &record[VLOG_RECORD_HEADER..];
+        if crc32c(stored) != stored_crc {
+            return Err(ForstError::corruption("vlog payload checksum mismatch"));
+        }
+        match codec_byte {
+            // Uncompressed: the stored payload IS the value — append borrowed,
+            // NO intermediate `Vec`. (Byte-identical to `decompress(None)` =
+            // `stored.to_vec()`, minus the alloc+copy.)
+            0 => {
+                sink.append_borrowed(stored);
+                Ok(())
+            }
+            1 | 2 => {
+                let compression = if codec_byte == 1 {
+                    CompressionType::Lz4
+                } else {
+                    CompressionType::Zstd
+                };
+                // Compressed: the decompressor must materialize a buffer; append
+                // it borrowed (the caller's second copy is what this avoids).
+                let value = decompress(stored, compression, uncompressed_len as usize)?;
+                sink.append_borrowed(&value);
+                Ok(())
+            }
+            other => Err(ForstError::corruption(format!(
+                "vlog record carries unknown compression codec {other}"
+            ))),
+        }
     }
 }
 
@@ -830,6 +963,60 @@ mod tests {
             w.sync().unwrap();
             let r = VlogReader::open(&fs, dir, 30).unwrap();
             assert_eq!(r.get(&p).unwrap(), b"", "{codec:?} empty value");
+        }
+    }
+
+    /// FRS-VLOG-SINK-DEREF (q9, 2026-06-16): `get_into` / `get_point_into` write
+    /// the value into a `ValueSink` instead of returning a `Vec`. For EVERY codec
+    /// (None appends the stored slice borrowed; Lz4/Zstd decompress then append)
+    /// the sunk bytes MUST equal what `get` / `get_point` return. Includes an
+    /// oversized value (> chunk) and an empty value (the compressed-empty case).
+    #[test]
+    fn test_vlog_sink_deref_byte_identical_across_codecs() {
+        struct CollectSink(Vec<u8>, bool);
+        impl crate::memtable::ValueSink for CollectSink {
+            fn append_borrowed(&mut self, value: &[u8]) {
+                self.0.extend_from_slice(value);
+                self.1 = true;
+            }
+            fn append_null(&mut self) {
+                self.1 = false;
+            }
+        }
+        for codec in [
+            CompressionType::None,
+            CompressionType::Lz4,
+            CompressionType::Zstd,
+        ] {
+            let fs = MemoryFileSystem::new();
+            let dir = Path::new("/db");
+            fs.create_dir_all(dir).unwrap();
+            let mut w = VlogWriter::create_with_compression(&fs, dir, 40, codec).unwrap();
+            let values: Vec<Vec<u8>> = vec![
+                b"".to_vec(),
+                b"small".to_vec(),
+                format!("{{\"a\":{},\"b\":42}}", 7).repeat(8).into_bytes(),
+                vec![0xABu8; VLOG_READ_CHUNK + 4096], // oversized (direct pread)
+            ];
+            let ptrs: Vec<ValuePointer> = values.iter().map(|v| w.append(v).unwrap()).collect();
+            w.sync().unwrap();
+            let r = VlogReader::open(&fs, dir, 40).unwrap();
+            for (v, p) in values.iter().zip(&ptrs) {
+                let want_get = r.get(p).unwrap();
+                let want_point = r.get_point(p).unwrap();
+                assert_eq!(&want_get, v, "{codec:?} get baseline");
+                assert_eq!(&want_point, v, "{codec:?} get_point baseline");
+
+                let mut s1 = CollectSink(Vec::new(), false);
+                r.get_into(p, &mut s1).unwrap();
+                assert_eq!(&s1.0, v, "{codec:?} get_into byte-identical");
+                assert!(s1.1, "{codec:?} get_into must append a value");
+
+                let mut s2 = CollectSink(Vec::new(), false);
+                r.get_point_into(p, &mut s2).unwrap();
+                assert_eq!(&s2.0, v, "{codec:?} get_point_into byte-identical");
+                assert!(s2.1, "{codec:?} get_point_into must append a value");
+            }
         }
     }
 
