@@ -229,6 +229,9 @@ case "$cmd" in
       # jemalloc purge valve (no lever shedding). Default-OFF; forwarded so the
       # never-OOM valve can be armed standalone inside the TM/JM containers.
       -e FRS_MEM_PRESSURE_PURGE="${FRS_MEM_PRESSURE_PURGE:-}" \
+      # FRS_FFM_DIAG (2026-06-16 PMC-1): periodic dump of the bounded FFM
+      # off-heap working set (columnar/GET-out/iter-scratch + freed-on-grow).
+      -e FRS_FFM_DIAG="${FRS_FFM_DIAG:-}" \
       -e FRS_DISABLE_MAPSTATE_CACHE="${FRS_DISABLE_MAPSTATE_CACHE:-}" \
       -e FRS_WBM_TOTAL_MB="${FRS_WBM_TOTAL_MB:-}" -e FRS_WBM_STALL="${FRS_WBM_STALL:-}" \
       -e FRS_WBM_HARD_MB="${FRS_WBM_HARD_MB:-}" \
