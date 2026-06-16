@@ -61,6 +61,24 @@ EOF
 "$FLINK_HOME"/bin/sql-gateway.sh stop >/dev/null 2>&1
 pkill -9 -f 'TaskManagerRunner|StandaloneSession|SqlGateway|SqlClient' 2>/dev/null || true
 sleep 3
+# The previous run's JM/TM may have just been killed; its 6123/8081/8083 sockets
+# can linger in TIME_WAIT, so a fresh JM silently fails to bind 8081 -> the
+# /overview poll never returns ("tms=") -> ConnectException at INSERT time. This
+# is the exact race that made every forst-rs accuracy run report SUBMIT_FAILED
+# while the identical config came up cleanly in the standalone DIAG smoke. Wait
+# until the JM/TM/gateway ports are actually free before starting the cluster.
+for i in $(seq 1 30); do
+  busy=0
+  for p in 6123 8081 8083; do
+    if command -v ss >/dev/null 2>&1; then
+      ss -ltn 2>/dev/null | grep -qE "[:.]$p\b" && busy=1
+    else
+      curl -s --max-time 1 "http://localhost:$p" >/dev/null 2>&1 && busy=1
+    fi
+  done
+  [ "$busy" = "0" ] && break
+  sleep 2
+done
 # Isolate THIS run's TM stdout (the print sink writes there).
 rm -f "$FLINK_HOME"/log/* 2>/dev/null || true
 JAVA_HOME="$JDK" "$FLINK_HOME"/bin/start-cluster.sh >/dev/null 2>&1
@@ -71,6 +89,34 @@ for i in $(seq 1 30); do
   [ -n "$tms" ] && [ "$tms" -ge 1 ] && break
   sleep 3
 done
+# If the cluster never registered a TaskManager, dump the JM/TM boot logs NOW
+# (the submit would only show a generic ConnectException) and retry once with a
+# clean port wait — a single restart clears a transient bind race on a loaded
+# hosted runner.
+if [ -z "$tms" ] || [ "$tms" -lt 1 ]; then
+  echo "=== cluster did NOT register a TM (tms='$tms') — JM/TM boot logs ==="
+  echo "--- standalonesession ---"; tail -n 60 "$FLINK_HOME"/log/*standalonesession*.log 2>/dev/null || echo "(none)"
+  echo "--- taskexecutor .log ---"; tail -n 60 "$FLINK_HOME"/log/*taskexecutor*.log 2>/dev/null || echo "(none)"
+  echo "--- taskexecutor .out ---"; tail -n 40 "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null || echo "(none)"
+  echo "=== retrying cluster start once ==="
+  "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1
+  pkill -9 -f 'TaskManagerRunner|StandaloneSession' 2>/dev/null || true
+  for i in $(seq 1 30); do
+    busy=0
+    for p in 6123 8081; do
+      if command -v ss >/dev/null 2>&1; then ss -ltn 2>/dev/null | grep -qE "[:.]$p\b" && busy=1; fi
+    done
+    [ "$busy" = "0" ] && break; sleep 2
+  done
+  rm -f "$FLINK_HOME"/log/* 2>/dev/null || true
+  JAVA_HOME="$JDK" "$FLINK_HOME"/bin/start-cluster.sh >/dev/null 2>&1
+  sleep 5
+  for i in $(seq 1 30); do
+    tms=$(curl -sf http://localhost:8081/overview 2>/dev/null | grep -oE '"taskmanagers":[0-9]+' | grep -oE '[0-9]+$' || true)
+    [ -n "$tms" ] && [ "$tms" -ge 1 ] && break
+    sleep 3
+  done
+fi
 JAVA_HOME="$JDK" "$FLINK_HOME"/bin/sql-gateway.sh start >/dev/null 2>&1
 for i in $(seq 1 20); do
   curl -sf "http://localhost:8083/v1/info" >/dev/null 2>&1 && break
