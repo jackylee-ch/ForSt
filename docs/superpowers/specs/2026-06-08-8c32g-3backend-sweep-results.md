@@ -389,8 +389,33 @@
 # | query | outcome | out_rows | required | OOM? | peak rss_MB / 16384 | wall_s |
 # |---|---|---|---|---|---|---|
 # | q19 | ★ FINISHED | 92,000,000 | 92,000,000 ✓ | NO | ~15083 (under cgroup) | 591.7 |
-# [q5 + q9 results appended as their runs complete — both observed HEALTHY mid-run
-#  under the cap: q5 rss ~10.8 G (was OOM-DNF before), wbm bounded 154-489 MB.]
+# | q5  | ✗ OOM-DNF  | — (stuck 6,000,665) | ~29,988,416 | YES tm1 exit137 | 16052 (crossed) | DNF ~370s |
+# [q9 result appended when its run completes.]
+#
+# ── q5 HONEST NEGATIVE — the controller bounds CACHES, not LIVE window state ──
+# q5 (sliding-window 10s/2s-slide bid-count) STILL OOMs even with the manager
+# armed at process.size=8192m. The cliff diag is DECISIVE about WHY — and it is
+# NOT a cache the budget can evict:
+#   q5 cliff: rss=16052  jemalloc_alloc(LIVE)=7454  jemalloc_resident=7761
+#             wbm=2265  retained=6572  mem_mgr_native=6041  stall_ms=571828
+# The LIVE jemalloc allocation (7454 MB) EXCEEDS the entire engine-native budget
+# (6041 MB) on its own — and it kept CLIMBING. The WBM hard-cap stall DID fire
+# (wbm pinned at 2265 = exactly the 1.25× hard cap; stall_ms=571s) but it did
+# NOTHING to stop the OOM, because the growth is NOT memtables: it is the
+# sliding-window AGGREGATION ACCUMULATOR state (per-pane merge-operand chains)
+# held LIVE in the engine until each window fires. That state is
+# CORRECTNESS-LOAD-BEARING — it cannot be evicted/re-read like a block-cache or a
+# vlog reader (the values are not yet on a durable SST in a re-derivable form;
+# they are the in-flight window result). So NONE of the controller's five
+# cache/buffer caps can bound it. The unified MemoryManager bounds every
+# RE-DERIVABLE consumer (cache / flush buffer / prefetch) to a coordinated sum,
+# but it does NOT — and architecturally CANNOT, without a window-state SPILL path
+# — bound genuinely-live application state. q5's never-OOM fix is a separate,
+# larger change: SPILL window panes to SST under pressure (the "bound/spill the
+# build state" branch the work-order flagged), or admit q5 needs >16 g/TM for its
+# live window working set at 100M. The stall is also counterproductive here (571s
+# wasted stalling memtables while the window state grew) — a follow-up should gate
+# the hard-cap stall OFF for pure-windowed CFs whose growth isn't memtable-bound.
 #
 # ── WHY IT WORKS (contrast with the three NEGATIVE verdicts above) ──
 # q19 previously OOM-DNF'd (full join_stack) / "FINISHED" TRUNCATED to 48,686,526
