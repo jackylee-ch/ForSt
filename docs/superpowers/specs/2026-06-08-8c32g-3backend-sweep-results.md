@@ -3436,3 +3436,61 @@ fingerprint needed to resume observation; sweep unaffected.
 #   The run-best.sh `validate` q9 branch was NOT switched to the split because
 #   STEP 1 showed q9 does not fit 16g/TM — the existing 36g single-TM q9
 #   special-case stays correct.
+
+# =====================================================================
+# PMC-1 FFM OFF-HEAP BOUND — q19 FITS 16g/TM (2026-06-16)
+# flink readside-r2a daf68d4be88 ; ForSt forst-rs 897ca9b63
+# =====================================================================
+#
+#   TARGET (measured): at the q9/q19 16g/TM cliff jemalloc (engine native) is
+#   only ~1.9 GiB (q19) / ~5.5 GiB (q9) of the ~16 GiB RSS. process.size budgets
+#   the JVM heap+managed but NOT the FFM off-heap (the forst-rs backend's
+#   java.lang.foreign MemorySegment/Arena allocations) — which grew UNBOUNDED on
+#   the join build and pushed RSS over 16g.
+#
+#   ROOT CAUSE (code-grounded): worker arenas are Arena.ofShared() (one per
+#   worker, slot-lifetime; RoutingStateExecutor.java:318). A shared arena NEVER
+#   frees an individual allocation. Every doubling-growth in
+#   ColumnarBatchBuffer.ensure{Capacity,Data} + VectorizedExecutor.ensure{
+#   OutCapacity,PrefixesOff,PrefixesData,OutHandles,OutChunks,IterBatchChunkData}
+#   called arena.allocate and abandoned the predecessor segment, which stayed
+#   committed for the slot's whole life = unbounded, process.size-uncounted FFM
+#   off-heap. (The prior FFM iter-leak fix — executeIters->parseChunkInto per-
+#   call confined `scratch` — was verified still intact; this is a DIFFERENT,
+#   residual grow-and-leak.)
+#
+#   FIX: each growable buffer owns a dedicated Arena.ofShared() sub-arena; on
+#   grow allocate-fresh + close-old (free-on-grow). ColumnarBatchBuffer also
+#   shrinks-on-reset (16-batch hysteresis) so a transient outlier batch can't pin
+#   its peak. Sub-arenas released in VectorizedExecutor.closeOwnedBuffers() at
+#   slot teardown. New FfmOffHeapAccounting + FRS_FFM_DIAG=1 periodic dump.
+#   Byte-identical: 4 new ColumnarBatchBuffer bound UTs + 11 native executor/
+#   mixed-batch/iter round-trip UTs pass.
+#
+#   PROFILE (q9/q19 @100M, 2x4c/16g, per TM, FRS_FFM_DIAG): live FFM off-heap
+#   BOUNDED at ~260-268 MiB — iterScratch 256 (DOMINANT; q9/q19 iterator-heavy
+#   joins), columnar ~3-11, getOut 0 — stable across the build; freedOnGrow
+#   climbs into the thousands (q9) = the bound actively reclaims what the old
+#   path leaked.
+#
+#   RESULTS @16g/TM (FFM-bound + process.size 8192m carve-out; full-stack-ON cfg):
+#     q19  FINISHED  624.8s  out_rows=92,000,000 (EXACT)  both TMs alive,
+#          0 restarts, RSS peak 15.05 GiB.  WAS OOM-DNF before. ✅ FIT.
+#     q9   OOM (exit137, OOMKilled=true) at ~141s build peak, RSS 15.8->16.
+#          Honest negative: q9's DOMINANT over-budget term is ENGINE-NATIVE
+#          (state + compaction transient ~5.5 GiB), NOT the FFM off-heap (only
+#          ~268 MiB), so the FFM bound — though correct + necessary — cannot
+#          bridge q9's GiB-scale gap. q9 needs a separate ENGINE-side lever
+#          (bound the compaction-input / live state transient) to fit 16g/TM.
+#          (process.size 10240m -> 8192m delayed q9's OOM from ~125s to ~141s
+#          but did not prevent it.)
+#     q5   OOM (exit137, OOMKilled=true) at ~482s, RSS peak 14.42->16.
+#          q5's FFM off-heap is liveMiB=0 (windowed-agg uses MERGE/RMW state, not
+#          the vectorized iter/columnar buffers) — so q5's entire ~16 GiB is
+#          engine-native (accumulator state + compaction) + JVM. The FFM bound is
+#          orthogonal to q5's OOM; like q9, q5 is purely engine-native bound.
+#
+#   NET: the FFM off-heap is now BOUNDED + REUSED (the unbounded leak is gone for
+#   ALL queries) and that is sufficient to FIT q19 at 16g/TM with exact rows.
+#   q9 remains the ONE engine-native-bound exception (consistent with the q9
+#   jemalloc=5.5 GiB vs q19 jemalloc=1.9 GiB asymmetry above).
