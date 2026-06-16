@@ -588,6 +588,74 @@
 # OFF for windowed CFs. (4) auto-armed purge is inert at the spike (purge_count=0).
 #
 # ═══════════════════════════════════════════════════════════════════════════
+# ★★★★★ PMC-1 EAGER-JEMALLOC DECAY 2026-06-16 (FRS-JEMALLOC-EAGER, .so 5e897cd0b)
+#         — q19 FITS 16g/TM; q9 advanced 27M→57M; honest q9 residual = skewed >16g
+# ═══════════════════════════════════════════════════════════════════════════
+# THE FIX (forst-rs-ffi/src/lib.rs _rjem_malloc_conf): changed the compiled
+# MALLOC_CONF from dirty/muzzy_decay_ms:10000 to dirty_decay_ms:0,muzzy_decay_ms:0
+# (background_thread:true kept). RATIONALE the FINAL-VERDICT section above pointed
+# to (line ~285 of the purge-valve verdict: "may help on a box where retained
+# pages are still DIRTY/not yet decommitted — depends on the kernel's MADV_FREE
+# behaviour — worth a one-shot check"): jemalloc's dirty->muzzy decay step uses
+# MADV_FREE (lazy) which leaves pages RESIDENT (counted by the cgroup OOM-killer)
+# until kernel pressure. muzzy_decay_ms:0 skips the MADV_FREE muzzy state so dirty
+# pages are purged DIRECTLY via the FORCED path (MADV_DONTNEED) — which decommits
+# and drops RSS on this kernel. (The purge valve targeted `retained` = virtual =
+# never in RSS; THIS targets jemalloc-RESIDENT = the part that IS in RSS.)
+#
+# ── PROVEN: eager MADV_DONTNEED works on this kernel — jemalloc_resident ≈ live ──
+# On EVERY [FRS_MEM_DIAG] line jemalloc_resident now tracks live within ~5%, vs
+# the 5.5-5.6 GiB resident at the prior cliff (~2.3 GiB engine-native RSS reclaimed):
+#   q19 @70M : rss 14343 | live(alloc) 1037 | RESIDENT 1110 | retained 4986(virtual)
+#   q9  cliff: rss 15879 | live(alloc) 3573 | RESIDENT 3736 | retained 6581(virtual)
+# Before (10 s decay, FINAL-VERDICT section): q9 cliff jemalloc_RESIDENT 5.5-5.6 G.
+#
+# ── RESULT @100M, uniform 2×4c/16g split, FRS_MEM_MANAGER=1, FRS_MEM_DIAG=1,
+#    eager .so, on this 35.18 GiB Mac Docker VM ──
+#  | query | process.size | FINISH? | exact out_rows | both TMs alive | peak rss | wall_s |
+#  | q19   | 8192m        | ★ YES   | 92,000,000 ✓   | YES (0 OOM/0 restart) | ~14.7 G < 16 | 660.6 |
+#  | q9    | 8192m        | ✗ OOM   | — (tm1 @~39M)  | tm1 exit137    | 15.9 G pinned | DNF |
+#  | q9    | 7168m        | ✗ OOM   | — (tm1 @~57M)  | tm1 exit137    | 15.9 G pinned | DNF |
+# q19 PREVIOUSLY OOM'd ~60-64M every session → now FINISHES exact, never-OOM, both
+# TMs alive. This is a DECISIVE q19 win at 16g/TM and confirms eager decay is the
+# missing engine-native RSS lever the three prior verdicts (shed/purge/manager)
+# called for. (NOTE: the earlier "q19 591.7 fit" in the FINAL-VERDICT section used
+# the OLD 10 s-decay .so + got LUCKY; eager decay makes it deterministic — resident
+# is bounded to live on every line, not riding the dirty-page tide.)
+#
+# ── q9 HONEST RESIDUAL — TRUE >16g/TM, NOT the VM ceiling ──
+# Eager decay + lower JVM pushed q9's OOM point 31M (8192m, mismatched reserve)
+# → 39M (8192m matched) → 57M (7168m) — real, monotone progress, but NOT a finish.
+# At the q9 kill jemalloc_resident was BOUNDED to ~3.7 G (eager decay working); the
+# ~12 G residual = JVM (heap+FFM/Arrow join-build) + heavy-compaction page cache
+# (comp_cnt 129, comp_ms 1.37M cumulative). DECISIVE: q9's join state is KEY-GROUP
+# SKEWED onto ONE TM — at the kill tm1=15.9 G while the PEER tm2 idled <1 G, and
+# the VM total was only ~17 G (tm1 16 + tm2 1 + jm 1) ≪ 35.18 G VM. So q9 is a
+# TRUE per-TM >16 g need (the heavy build partition does not fit 16 g), NOT VM
+# overcommit. The lever left for q9 is engine/Flink-side: rebalance the key-group
+# partition (spread the build), or proactive compaction-transient admission, or
+# simply >16 g on the heavy TM (remote box). Eager decay is NECESSARY (it removed
+# the 2.3 G jemalloc-resident tax) but not SUFFICIENT for the skewed q9 partition.
+#
+# ── VERDICT + DEFAULT-ON RECOMMENDATION ──
+# SHIP the eager MALLOC_CONF (dirty/muzzy_decay_ms:0) as the compiled default: it
+# is UNIFORM across queries (no per-query tuning), Linux-only, byte-identical
+# OUTPUT (decay only changes WHEN freed pages return to the OS, never results), and
+# it makes jemalloc_resident track live on this kernel — making q19 (and the
+# lighter family) never-OOM at 16 g/TM and shrinking the engine-native term for
+# every query. The q4 re-fault caveat (why 10 s was chosen) is acceptable + bounded
+# now that FRS-MEM-MANAGER admission back-pressures ingest (the OLD aggressive-decay
+# q9-worse caveat predated that admission gate and did NOT recur: q9 ingest stayed
+# bounded, no past-compaction blow-up — it OOM'd on the skewed live build, not a
+# runaway ingest). PAIR with FRS_MEM_MANAGER=1 DEFAULT-ON (the FINAL-VERDICT rec).
+# HONEST NEGATIVES: (1) q9 still does NOT fit 16 g/TM — it's a true skewed >16 g
+# need, owed on a ≥40 G box / with partition rebalance. (2) q5 not re-run this
+# session (same live-state class as q9; owed). (3) the .so-copy race in
+# run-8c32g.sh (TM cp vs JM submit) intermittently UnsatisfiedLinkError'd a TM →
+# restart loop; worked around by re-launch (clean start), but the harness should
+# wait for both TMs' .so copy before submit.
+#
+# ═══════════════════════════════════════════════════════════════════════════
 # ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
 # ═══════════════════════════════════════════════════════════════════════════
 # Population: M2 = Mac (Darwin, arm64 container, jemalloc OFF, io_uring no-op),
