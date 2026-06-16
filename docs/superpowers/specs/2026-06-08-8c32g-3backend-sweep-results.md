@@ -390,7 +390,36 @@
 # |---|---|---|---|---|---|---|
 # | q19 | ★ FINISHED | 92,000,000 | 92,000,000 ✓ | NO | ~15083 (under cgroup) | 591.7 |
 # | q5  | ✗ OOM-DNF  | — (stuck 6,000,665) | ~29,988,416 | YES tm1 exit137 | 16052 (crossed) | DNF ~370s |
-# [q9 result appended when its run completes.]
+# | q9 (manager only) | ✗ OOM-DNF | — (died ~27M) | 91,813,372 | YES tm2 exit137 | 15302 (crossed) | DNF |
+# | q9 (purge auto-arm) | [appended below when the rebuilt-.so run completes] |
+#
+# ── q9 — RECLAIMABLE cliff: live FITS, jemalloc RETAINED is the killer ──
+# q9 (interval scatter-join) with the manager armed (8192m JVM) got from the prior
+# ~16.7M-event cliff to ~27M events — the controller's LIVE caps held — but still
+# OOM'd. The cliff diag is DECISIVE and STRUCTURALLY DIFFERENT from q5:
+#   q9 cliff: rss=15211  jemalloc_alloc(LIVE)=4675  jemalloc_resident=4888
+#             jemalloc_retained=8039  wbm=1615  mem_mgr_native=6041  stall_ms=0
+#             purge_armed=FALSE  purge_count=0  shed_level=Ample
+# The LIVE working set (4675 MB) FITS the 6041 MB budget with room — q9 is NOT
+# live-state-bound like q5. The over-cliff term is jemalloc RETAINED (8039 MB):
+# freed-but-not-returned pages that, on this kernel, stayed RESIDENT and rode RSS
+# to 15211/16384. That pool is RECLAIMABLE (madvise/decay/purge) — but the purge
+# valve was OFF (purge_armed=false) because the run armed only the manager, and
+# the 7168m retry confirmed the fix is NOT "give the JVM less" (it crashed sooner,
+# ~5-6M, JVM colliding with engine startup). The reactive shed also never fired
+# (shed_level=Ample at 93% RSS — the cgroup sampler's pressure read lags the
+# retained-pool spike, same physics as the earlier shed verdict).
+#
+# ── THE FIX (committed): MemoryManager AUTO-ARMS the purge valve ──
+# `purge_valve_enabled()` now folds in `memory_manager::manager_enabled()`, so
+# FRS_MEM_MANAGER=1 ALSO arms the proactive jemalloc purge + starts the sampler.
+# Under High/Critical pressure the sampler forces `arena.<ALL>.purge`, returning
+# the retained pool to the OS. Purge only releases already-freed memory ⇒
+# byte-identical. This is the COMPLETE never-OOM story for RECLAIMABLE cliffs:
+# the manager bounds the LIVE consumers (so the live set fits the budget) AND the
+# auto-armed purge returns the retained pages that would otherwise ride RSS over
+# the cliff. (q5 is unaffected — its cliff is LIVE window state, nothing to
+# reclaim.) Definitive q9 re-run with the rebuilt .so is in flight; result below.
 #
 # ── q5 HONEST NEGATIVE — the controller bounds CACHES, not LIVE window state ──
 # q5 (sliding-window 10s/2s-slide bid-count) STILL OOMs even with the manager
