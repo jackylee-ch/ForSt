@@ -4091,3 +4091,115 @@ fingerprint needed to resume observation; sweep unaffected.
 # effectively transparent — the levers stay full and perf == off. CONFIRMS Task 2.
 # (Owed for completeness: the explicit q4/q7 OFF arm wall-time A/B; the prior-run
 # 450.4s frs q4 baseline in this doc serves as the OFF reference here.)
+#
+# ============================================================================
+# ── EMPIRICAL @16g/TM VALIDATION — PMC-1, 2026-06-16 (the run prior sessions
+#    skipped). FULL MemoryManager stack ON @ commit 79a9a40c0 (mm-empirical
+#    worktree, freshly-built linux/arm64 .so) ────────────────────────────────
+# ============================================================================
+# DIRECTIVE: do q9/q5 NOW FINISH @2x4c/16g (TOPO=split) with the full stack ON
+# (controller + compaction-admission + windowed levers, all folded into
+# FRS_MEM_MANAGER=1)? Run it; the per-TM OOM is the 16g CGROUP, so if each TM's
+# actual RSS stays <16g it fits regardless of the 37.77 GiB VM total.
+#
+# CONFIG: TOPO=split (2 TM 4c/16g + 1 JM 2c/4g), FRS_MEM_MANAGER=1 + FRS_MEM_DIAG=1
+# + FRS_JVM_RESERVED_MB={8192|6144} (process.size matched) + the uniform KV-sep
+# lever stack (FRS_KV_SEPARATION=true, MIN_BLOB=256, TRIVIAL_MOVE, S2_PINNED,
+# S2_FANOUT_MIN=8, VLOG_COALESCE_DEREF=1, PROBE_BLOOM_PRUNE, LEVELED_HOT_CF,
+# PERSISTENT_PROBE_ITER, READER_CACHE_CAP=2048). @100M each. docker-clean between.
+# (Harness already forwards all FRS_MEM_* + FRS_COMPACT_WINDOWED + KV-sep envs —
+# no harness change needed. The new q9 admission + q5 windowed levers auto-arm
+# under FRS_MEM_MANAGER=1; confirmed live in the diag below.)
+#
+# | run | query | JVM | outcome | reached | peak RSS / 16384 | OOMKilled | dominant term |
+# |-----|-------|-----|---------|---------|------------------|-----------|---------------|
+# | mmq9c   | q9  | 8192 | ✗ OOM-DNF | ~36.4M src | tm1 15994.9 (97.6%) | YES exit137 | jemalloc_RETAINED 8.3 GiB |
+# | mmq9j6  | q9  | 6144 | ✗ OOM-DNF | ~59.4M src | tm1 16097.3 (98.2%) | YES exit137 | jemalloc_RETAINED 9.6 GiB |
+# | mmq5a   | q5  | 8192 | ✗ OOM-DNF | frozen 6.0M src | tm2 15933.4 (97.2%) | YES exit137 | LIVE window accum 8.1 GiB |
+# | mmq19   | q19 | 8192 | ✗ OOM-DNF (full KV-sep) | ~78.2M src | tm2 15677.4 (95.7%) | YES exit137 | jemalloc_RETAINED 6.2 GiB |
+# | mmq19lean | q19 | 8192 | (manager-only, no KV-sep coalesce) — see result line below |
+#
+# ── q9 — the NEW compaction-admission FIRED but q9 still OOMs; cliff = RETAINED ──
+# The full stack IS engaged and the new levers DO work: diag at the cliff (mmq9c)
+#   q9 cliff: rss_MB=15383 jemalloc_alloc(LIVE)=2686 jemalloc_RETAINED=8338
+#             wbm=511 mem_mgr_native=6041 mm_compact_inflight_MB=171
+#             mm_compact_WAITS=3 purge_count=305 shed=Critical stall_ms=0
+# - mm_compact_waits=3 ⇒ the CompactionAdmission semaphore DID block compaction
+#   jobs to bound the concurrent-transient SUM (the new proactive lever works).
+# - purge_count=305 ⇒ the auto-armed purge fired hard (this time it DID tick, vs
+#   the prior "purge never fired" runs — the controller's slower ingest gave the
+#   sampler windows to act).
+# - BUT: LIVE (2686 MB) FITS the 6041 budget with huge room; the over-cliff term
+#   is jemalloc_RETAINED (8338 MB) — freed-but-not-returned pages that, on this
+#   Docker-Linux kernel, stay RESIDENT and ride RSS to 15383 engine / 15994 docker
+#   → crosses 16384. arena.purge fired 305× and retained BARELY dropped: it is
+#   MADV_DONTNEED'd virtual memory the kernel hasn't reclaimed. EXACTLY the prior
+#   purge-pool verdict, now reproduced WITH admission armed.
+# - LOWER JVM HELPS BUT DOES NOT FIX: at JVM=6144 the controller granted the
+#   engine mem_mgr_native=8089 (2 GiB more) → q9 got from 36.4M (8192) to 59.4M
+#   src (a real +63% progress!) before OOM, but RETAINED just grew into the larger
+#   slice (to 9.6 GiB) and crossed the cap at the same RSS ceiling (16097). So the
+#   JVM/engine split shifts WHERE it dies, not WHETHER — the wall is the
+#   16 GiB cgroup vs (JVM floor + unreclaimable retained + page-cache).
+#
+# ── q5 — the windowed levers WORK early but q5 OOMs on genuinely-LIVE window state ──
+# The new q5 levers are confirmed live and effective in the early phase:
+#   - stall_ms=0 the WHOLE run (windowed-stall-skip ACTIVE) vs the prior cliff's
+#     stall_ms=571828 (571 s wasted) — the counterproductive stall is GONE. ✓
+#   - flush_cnt=33 windowed-accumulator flushes fired (windowed-flush floor). ✓
+#   - through ~6M src the LIVE set held ~1.5 GiB (vs prior monotonic growth).
+# BUT the source then FROZE at 6.0M while the live HOP-window accumulator grew:
+#   q5 cliff (mmq5a): rss_MB=16364 jemalloc_alloc(LIVE)=8126 (CLIMBING)
+#             wbm=2637(=1.25x hard cap) RETAINED=4300 mem_mgr_native=6041
+#             stall_ms=0 purge_count=27 shed=Critical
+# The LIVE allocation (8126 MB) EXCEEDS the entire engine-native budget (6041)
+# on its own — it is the un-fired sliding-window (10s/2s) AGGREGATION ACCUMULATOR
+# held LIVE until each window fires. The windowed-flush moves the engine MEMTABLE
+# operand chains to SST, but the in-flight window result is genuinely-live
+# application state the controller architecturally CANNOT bound (== the commit's
+# own HONEST note). q5 grew to 8126 MB live (≈ the prior 7454 cliff) and OOM'd
+# at 97.2%. q5's fix remains the deferred window-pane SPILL (Flink-boundary
+# signal across FFM) OR >16 g/TM.
+#
+# ── q19 — full-KV-sep config ALSO OOMs (retained); manager-only is the fit ──
+# IMPORTANT NUANCE the prior "q19 FINISHED 591.7s" entry omitted: that FINISH was
+# manager-ON but WITHOUT the heavy KV-sep coalesce stack. Under the SAME uniform
+# full-KV-sep config used for q9/q5 here, q19 ALSO OOMs (mmq19): reached ~78.2M
+# src, tm2 peak 15677, exit137, cliff RETAINED=6202 / LIVE=1952 (fits budget) —
+# the coalesce-deref adds resident vlog state that, plus retained, crosses the cap.
+# A LEAN re-run (manager-only, NO KV-sep stack at all, mmq19lean2) did NOT
+# reproduce the prior "FINISHED 591.7s" on this VM today: it ALSO OOM-DNF'd —
+# reached ~76.8M src, tm2 peak 15697.9 (95.8%), exit137, cliff RETAINED=5436 /
+# LIVE=1986 (fits budget), mm_compact_waits=1, stall_ms=0. So even manager-only
+# is at the knife's edge on this 37.77 GiB VM (the build-spike retained pool +
+# JVM floor + 2x16g co-location overcommit), and a single lucky/leaner run is
+# what produced the earlier 591.7s FINISH — it is NOT robust here. The LIVE set
+# fits 6 GiB in every q19 variant; only the unreclaimable RETAINED + the VM
+# overcommit push it over.
+#
+# ── VERDICT (the decisive empirical answer) ──
+# With the FULL MemoryManager stack ON, q9 and q5 do NOT fit 16g/TM at 100M on
+# this 37.77 GiB Mac VM. The new levers are CORRECT and DEMONSTRABLY FIRING
+# (admission mm_compact_waits>0; windowed stall_ms=0 + flushes; purge active) and
+# they MOVE THE CLIFF MEANINGFULLY (q9 8192→6144 pushed 36.4M→59.4M src), but two
+# distinct walls remain, NEITHER of which the controller can close on THIS box:
+#   (a) q9 / q19: jemalloc RETAINED (6-10 GiB) rides RSS over the cgroup because
+#       arena.purge cannot reclaim MADV_DONTNEED'd-but-resident pages on this
+#       Docker-Desktop Linux kernel. The LIVE set always FITS the budget. This is
+#       a kernel/allocator-reclaim property, not an engine over-allocation — on a
+#       kernel that honours purge (or with jemalloc dirty_decay tuned to
+#       physically return pages), or on a box where 16 GiB is a REAL cgroup (no
+#       2x16g TM overcommit of a 37.77 GiB VM), the LIVE-fits-budget result says
+#       it should fit. ⇒ (b)-class: needs the remote box at the SAME 2x16g config.
+#   (b) q5: genuinely-LIVE window-accumulator state (8.1 GiB > 6 GiB budget) that
+#       is NOT re-derivable / not a cache ⇒ a TRUE >16g/TM live need at 100M for
+#       this query, OR the deferred window-pane spill. This is a real engine/state
+#       reduction owed, not just the VM overcommit.
+# So: q5 = (a) true live-state need (→ more reduction / spill). q9+q19 = the LIVE
+# set fits 6 GiB; the over-cliff is unreclaimable RETAINED + the 2x16g-on-37.77G
+# VM overcommit ⇒ (b) re-run on a >=40 GiB non-overcommit box, same 2x16g config,
+# is required for the definitive fit verdict (and a jemalloc decay/purge-returns
+# config sweep). The Mac VM CANNOT answer q9/q19's fit — its 2 co-resident 16g TMs
+# already overcommit, so page-cache + retained have nowhere to go.
+# Repro: /tmp/frs-mme (worktree mm-empirical) run-mm.sh / run-mm-lean.sh; logs in
+# /tmp/mme-logs/{mmq9c,mmq9j6,mmq5a,mmq19,mmq19lean2}.{log,sampler,tm*.diag}.
