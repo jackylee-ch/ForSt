@@ -108,17 +108,39 @@ fn ensure_purge_hook_registered() {
 #[cfg(not(target_os = "linux"))]
 fn ensure_purge_hook_registered() {}
 
-// Memory return tuned for throughput: a background thread purges off the hot
-// path, and dirty/muzzy pages are returned to the OS on jemalloc's standard
-// ~10 s decay. (An earlier 1 s decay cut RSS 43→34 GB but RE-FAULTED within each
-// checkpoint burst and slowed q4 — 10 s spans the 30 s checkpoint cycle so memory
-// is returned between bursts without re-faulting inside one.) jemalloc ignores
-// `background_thread` where unsupported; the decay settings still apply.
+// FRS-JEMALLOC-EAGER (2026-06-16, PMC-1): EAGER page reclaim so retained pages
+// NEVER accumulate at the q9/q19 16 g/TM cliff.
+//
+// Root cause this fixes: the prior 10 s decay let jemalloc hold ~8-9 GiB of
+// freed-but-resident pages while the LIVE set was only ~3 GiB. The proactive
+// `arena.purge` valve fired 300+× but RSS stayed pinned: on this kernel the
+// dirty→muzzy decay step uses MADV_FREE (lazy), which marks pages reclaimable
+// but leaves them RESIDENT until the kernel feels pressure — so the cgroup
+// OOM-killer (which counts MADV_FREE'd pages as RSS) still hit the limit and
+// exit-137'd the TM.
+//
+// The fix — `muzzy_decay_ms:0`: with zero muzzy decay jemalloc skips the muzzy
+// (MADV_FREE) intermediate state entirely and purges dirty pages DIRECTLY with
+// the FORCED path (MADV_DONTNEED), which actually decommits and drops RSS on
+// this kernel. `dirty_decay_ms:0` makes that return immediate (no decay delay),
+// so freed pages leave RSS as soon as the background thread runs. Combined,
+// retained tracks the live set instead of climbing to 8-9 GiB.
+//
+// q4 re-fault caveat (the old reason 10 s was chosen): immediate decay can
+// re-fault inside a checkpoint burst and cost a little q4 throughput. That is
+// now acceptable AND bounded because the FRS-MEM-MANAGER admission stack
+// back-pressures ingest so the build can't outrun compaction (the earlier
+// aggressive-decay q9 OOM-at-17.6 M predates that admission gate). The fit at
+// 16 g/TM is worth far more than a few % of q4 steady-state throughput; the
+// allocator config stays UNIFORM across every query (no per-query tuning).
+//
+// jemalloc ignores `background_thread` where unsupported; the decay settings
+// still apply. The runtime env `_RJEM_MALLOC_CONF` is IGNORED (this compiled
+// strong symbol wins), so this is the ONLY place the config can be set.
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8] =
-    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:10000\0";
+pub static MALLOC_CONF: &[u8] = b"background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 /// JNI compatibility shim — exports `Java_org_forstdb_RocksDB_*` symbols
 /// so the resulting cdylib is a drop-in for the community
