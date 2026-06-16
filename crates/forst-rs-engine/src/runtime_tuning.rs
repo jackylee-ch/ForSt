@@ -55,13 +55,23 @@ static GLOBAL_WBM_USED: AtomicU64 = AtomicU64::new(0);
 fn global_wbm_cap_bytes() -> u64 {
     static CAP: OnceLock<u64> = OnceLock::new();
     *CAP.get_or_init(|| {
-        match std::env::var("FRS_WBM_TOTAL_MB")
+        // FRS-MEM-MANAGER: an explicit `FRS_WBM_TOTAL_MB` always wins (operator
+        // pin); otherwise, when the unified controller is armed, take the WBM
+        // slice of the coordinated engine-native budget (auto-scales with the
+        // cgroup). Falls back to the historical 2 GiB default when neither
+        // applies — byte-identical to pre-manager.
+        if let Some(mb) = std::env::var("FRS_WBM_TOTAL_MB")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
         {
-            Some(mb) => mb.saturating_mul(1024 * 1024),
-            None => 2 * 1024 * 1024 * 1024,
+            return mb.saturating_mul(1024 * 1024);
         }
+        if let Some(cap) =
+            crate::memory_manager::consumer_cap_bytes(crate::memory_manager::Consumer::WriteBuffer)
+        {
+            return cap;
+        }
+        2 * 1024 * 1024 * 1024
     })
 }
 
@@ -84,13 +94,28 @@ pub fn global_wbm_hard_cap_bytes() -> u64 {
         // Java AEC in-flight → earlier OOM; memtables still hit 7.2GB). Opt in via
         // FRS_WBM_HARD_MB for experiments; the real memory-model fix must bound the
         // compaction transient + Java off-heap, not memtables.
-        match std::env::var("FRS_WBM_HARD_MB")
+        if let Some(mb) = std::env::var("FRS_WBM_HARD_MB")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
         {
-            Some(mb) => mb.saturating_mul(1024 * 1024),
-            None => 0,
+            return mb.saturating_mul(1024 * 1024);
         }
+        // FRS-MEM-MANAGER: the standalone hard cap was REFUTED (it stalled
+        // writers while the UNBOUNDED Java AEC in-flight grew → EARLIER OOM).
+        // Under the unified controller it is SAFE because the JVM side is
+        // bounded in the SAME budget (process.size is carved out, leaving the
+        // Java in-flight room). Derive the hard stall point at 1.25× the WBM
+        // soft slice: writers stall only after exceeding the coordinated WBM
+        // budget by a margin, so steady/bounded-state queries never stall but a
+        // runaway ingest burst is throttled to a flush-sustainable rate BEFORE
+        // the engine-native sum can cross the cliff. Disabled (0) when the
+        // manager is off — byte-identical to today.
+        if let Some(soft) =
+            crate::memory_manager::consumer_cap_bytes(crate::memory_manager::Consumer::WriteBuffer)
+        {
+            return soft.saturating_add(soft / 4);
+        }
+        0
     })
 }
 
@@ -147,11 +172,25 @@ pub fn compaction_window_bytes() -> u64 {
 pub fn compaction_prefetch_budget_bytes() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {
-        std::env::var("FRS_COMPACT_PREFETCH_BUDGET")
+        if let Some(v) = std::env::var("FRS_COMPACT_PREFETCH_BUDGET")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&v| v > 0)
-            .unwrap_or(64 * 1024 * 1024)
+        {
+            return v;
+        }
+        // FRS-MEM-MANAGER: bound the compaction/build TRANSIENT prefetch working
+        // set — the spike the standalone caps never bounded — with the
+        // coordinated CompactionTransient slice when the controller is armed.
+        // Floored at the historical 64 MiB default so small-budget configs don't
+        // starve compaction below a usable window; falls back to 64 MiB when the
+        // manager is off (byte-identical).
+        if let Some(cap) = crate::memory_manager::consumer_cap_bytes(
+            crate::memory_manager::Consumer::CompactionTransient,
+        ) {
+            return cap.max(64 * 1024 * 1024);
+        }
+        64 * 1024 * 1024
     })
 }
 

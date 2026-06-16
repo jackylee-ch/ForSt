@@ -229,6 +229,19 @@ case "$cmd" in
       # jemalloc purge valve (no lever shedding). Default-OFF; forwarded so the
       # never-OOM valve can be armed standalone inside the TM/JM containers.
       -e FRS_MEM_PRESSURE_PURGE="${FRS_MEM_PRESSURE_PURGE:-}" \
+      # FRS-MEM-MANAGER (2026-06-16 PMC-1): the UNIFIED engine-native memory
+      # controller. FRS_MEM_MANAGER=1 arms it (default-OFF, byte-identical when
+      # off). It reads the cgroup limit (FRS_MEM_CGROUP_MB override else
+      # /sys/fs/cgroup/memory.max), subtracts the JVM reservation
+      # (FRS_JVM_RESERVED_MB == process.size), FFM (FRS_FFM_RESERVED_MB) and
+      # headroom (FRS_MEM_HEADROOM_MB floor), derives ONE engine-native budget and
+      # splits it across block-cache / WBM / shadow / vlog / compaction so their
+      # SUM is bounded and every cap AUTO-SCALES with the configured TM size.
+      # FRS_MEM_INSTANCES = assumed co-resident DB count for the per-instance
+      # block-cache slice. Forwarded so the controller engages in the TM/JM.
+      -e FRS_MEM_MANAGER="${FRS_MEM_MANAGER:-}" -e FRS_MEM_CGROUP_MB="${FRS_MEM_CGROUP_MB:-}" \
+      -e FRS_JVM_RESERVED_MB="${FRS_JVM_RESERVED_MB:-}" -e FRS_FFM_RESERVED_MB="${FRS_FFM_RESERVED_MB:-}" \
+      -e FRS_MEM_HEADROOM_MB="${FRS_MEM_HEADROOM_MB:-}" -e FRS_MEM_INSTANCES="${FRS_MEM_INSTANCES:-}" \
       # FRS_FFM_DIAG (2026-06-16 PMC-1): periodic dump of the bounded FFM
       # off-heap working set (columnar/GET-out/iter-scratch + freed-on-grow).
       -e FRS_FFM_DIAG="${FRS_FFM_DIAG:-}" \

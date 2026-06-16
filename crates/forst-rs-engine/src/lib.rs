@@ -98,6 +98,7 @@ pub mod file_deletion_guard;
 pub mod flush;
 pub mod list_merge;
 pub mod mem_pressure;
+pub mod memory_manager;
 pub mod mvcc;
 pub mod runtime_tuning;
 pub mod snapshot_view;

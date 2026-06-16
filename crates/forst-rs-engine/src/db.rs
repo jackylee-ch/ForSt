@@ -101,6 +101,19 @@ fn apply_block_cache_env_override(cache_bytes: usize) -> usize {
     }
 }
 
+/// FRS-MEM-MANAGER: cap the per-instance block cache to its coordinated slice of
+/// the unified engine-native budget so the SUM across co-resident DBs stays
+/// within budget. A CAP (`min`), never a raise — a smaller cache only re-reads
+/// from the durable SST on a miss (correctness-trivial). No-op (returns
+/// `cache_bytes` unchanged) when the manager is off → byte-identical to today.
+/// An explicit `FRS_BLOCK_CACHE_MB` operator pin is applied AFTER this and wins.
+fn apply_block_cache_manager_cap(cache_bytes: usize) -> usize {
+    match crate::memory_manager::consumer_cap_bytes(crate::memory_manager::Consumer::BlockCache) {
+        Some(cap) => cache_bytes.min(cap.min(usize::MAX as u64) as usize),
+        None => cache_bytes,
+    }
+}
+
 /// FRS-BLOCK-SIZE env override (q4 read-amp experiment, 2026-06-03): force the
 /// SST data-block size (in KiB) via `FRS_BLOCK_SIZE_KB` without a rebuild. The
 /// default is 64 KiB; q4's interval-join probes scatter across keys, so each
@@ -165,11 +178,21 @@ fn vlog_resident_budget_bytes() -> usize {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0)
     };
-    if mb == 0 {
-        usize::MAX // disabled — no byte bound (default, byte-identical)
-    } else {
-        (mb as usize).saturating_mul(1024 * 1024)
+    if mb != 0 {
+        return (mb as usize).saturating_mul(1024 * 1024);
     }
+    // FRS-MEM-MANAGER: when no explicit budget is set AND the unified controller
+    // is armed, bound the resident vlog-reader working set with the VlogResident
+    // slice of the coordinated engine-native budget (auto-scales with cgroup).
+    // This is the missing BYTE bound for the q9 scattered-death KV-sep path —
+    // correctness-trivial (a miss re-opens the immutable segment). When the
+    // manager is off, stays disabled (usize::MAX) → byte-identical to today.
+    if let Some(cap) =
+        crate::memory_manager::consumer_cap_bytes(crate::memory_manager::Consumer::VlogResident)
+    {
+        return cap.min(usize::MAX as u64) as usize;
+    }
+    usize::MAX // disabled — no byte bound (default, byte-identical)
 }
 
 /// FRS-AKV-B1 test override for [`vlog_resident_budget_bytes`]: `u64::MAX` =
@@ -2285,6 +2308,7 @@ impl DbImpl {
         // fits the 32 GiB budget alongside JVM heap + the (now 1 GiB) resident shadow.
         const BLOCK_CACHE_FLOOR: usize = 256 * 1024 * 1024;
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
+        let cache_bytes = apply_block_cache_manager_cap(cache_bytes);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
         maybe_start_mem_diag(); // FRS_MEM_DIAG: pinpoint engine resident native (join-OOM 16GB)
         crate::mem_pressure::maybe_start_sampler(); // FRS-DYN-SHED: cgroup pressure watermark (no-op unless armed)
@@ -4508,14 +4532,32 @@ impl DbImpl {
         if !wbm_stall_enabled() {
             return;
         }
-        if !self.write_buffer_manager.over_budget() {
+        // FRS-MEM-MANAGER: under the unified controller the SOFT cap (the WBM
+        // slice) only TRIGGERS flush (advisory); writers STALL on the separate
+        // HARD cap (1.25× soft). The standalone soft-cap stall was refuted —
+        // stalling at the small soft cap let the unbounded Java AEC in-flight
+        // grow → earlier OOM, and it froze q5. Stalling at the hard cap (with a
+        // margin above the flush trigger) throttles only a runaway ingest burst
+        // while the bounded JVM side (carved out of the same budget) has room.
+        // When the manager is off, the hard cap is 0 ⇒ this falls back to the
+        // legacy soft-cap stall, byte-identical to today.
+        let mgr_on = crate::memory_manager::manager_enabled()
+            && crate::runtime_tuning::global_wbm_hard_cap_bytes() != 0;
+        let over = |db: &Self| -> bool {
+            if mgr_on {
+                crate::runtime_tuning::over_global_hard_budget()
+            } else {
+                db.write_buffer_manager.over_budget()
+            }
+        };
+        if !over(self) {
             return;
         }
         const STALL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_secs(60);
         let stall_start = std::time::Instant::now(); // FRS_PROF_DIAG: attribute backpressure stall
         let mut last_used = crate::runtime_tuning::global_wbm_used_bytes();
         let mut last_progress = std::time::Instant::now();
-        while self.write_buffer_manager.over_budget() {
+        while over(self) {
             std::thread::sleep(std::time::Duration::from_millis(1));
             let now_used = crate::runtime_tuning::global_wbm_used_bytes();
             if now_used < last_used {
@@ -7811,6 +7853,7 @@ impl DbImpl {
         // fits the 32 GiB budget alongside JVM heap + the (now 1 GiB) resident shadow.
         const BLOCK_CACHE_FLOOR: usize = 256 * 1024 * 1024;
         let cache_bytes = cache_bytes.max(BLOCK_CACHE_FLOOR);
+        let cache_bytes = apply_block_cache_manager_cap(cache_bytes);
         let cache_bytes = apply_block_cache_env_override(cache_bytes);
         maybe_start_mem_diag(); // FRS_MEM_DIAG: pinpoint engine resident native (join-OOM 16GB)
         crate::mem_pressure::maybe_start_sampler(); // FRS-DYN-SHED: cgroup pressure watermark (no-op unless armed)
@@ -17120,8 +17163,12 @@ fn maybe_start_mem_diag() {
                     // rss_MB on the next line to PROVE the reclaim.
                     let purge_armed = crate::mem_pressure::purge_valve_enabled();
                     let purge_count = crate::mem_pressure::purge_count();
+                    // FRS-MEM-MANAGER: surface the unified budget + each
+                    // consumer's coordinated cap — DIRECT in-container proof the
+                    // controller engaged and which caps it derived from cgroup.
+                    let mm = crate::memory_manager::diag_str();
                     let line = format!(
-                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb} shed_armed={shed_armed} shed_level={shed_level:?} purge_armed={purge_armed} purge_count={purge_count}{}\n",
+                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb} shed_armed={shed_armed} shed_level={shed_level:?} purge_armed={purge_armed} purge_count={purge_count}{mm}{}\n",
                         prof_diag_str()
                     );
                     if let Ok(mut f) = std::fs::OpenOptions::new()

@@ -105,14 +105,22 @@ pub fn resident_flushed_cap_bytes() -> usize {
 fn global_resident_shadow_cap_bytes() -> usize {
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
-        match std::env::var("FRS_RESIDENT_SHADOW_TOTAL_MB")
+        // FRS-MEM-MANAGER: explicit env pin wins; else take the ResidentShadow
+        // slice of the unified engine-native budget (auto-scales with cgroup);
+        // else the historical 2 GiB default (byte-identical when off).
+        if let Some(mb) = std::env::var("FRS_RESIDENT_SHADOW_TOTAL_MB")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&mb| mb > 0)
         {
-            Some(mb) => mb.saturating_mul(1024 * 1024),
-            None => 2 * 1024 * 1024 * 1024,
+            return mb.saturating_mul(1024 * 1024);
         }
+        if let Some(cap) = crate::memory_manager::consumer_cap_bytes(
+            crate::memory_manager::Consumer::ResidentShadow,
+        ) {
+            return cap.min(usize::MAX as u64) as usize;
+        }
+        2 * 1024 * 1024 * 1024
     })
 }
 
