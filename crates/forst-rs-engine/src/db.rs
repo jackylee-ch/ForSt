@@ -459,12 +459,50 @@ pub fn vlog_point_deref_enabled() -> bool {
     // so coupling it to `kv_separation_enabled()` makes "all queries KV-sep ON"
     // perf-clean under ONE config knob — no separate flag for an operator to
     // forget. When KV-sep is OFF no BlobRef row exists, so this is moot.
-    match std::env::var("FRS_VLOG_POINT_DEREF").ok().as_deref() {
-        Some("1") | Some("true") | Some("TRUE") => true,
-        Some(_) => false,
+    // The env read is CACHED (it is a per-deref hot-path call under KV-sep ON;
+    // the pre-PMC-1 code did an uncached `std::env::var` per deref). The kvsep
+    // coupling stays LIVE — `kv_separation_enabled()` is itself OnceLock-cached
+    // so it is a cheap atomic+load, and keeping it live lets the test override
+    // (`set_kv_separation_override`) drive this path deterministically.
+    match cached_env_tristate(&FRS_VLOG_POINT_DEREF_ENV, "FRS_VLOG_POINT_DEREF") {
+        Some(v) => v,
         None => kv_separation_enabled(),
     }
 }
+
+/// Cached env tri-state for a `FRS_VLOG_*` deref lever: `Some(true)` if the var
+/// is set to a truthy value, `Some(false)` if set to anything else, `None` if
+/// unset. Cached in an `AtomicU8` (0 = uninit, 1 = unset, 2 = false, 3 = true)
+/// so the per-deref hot path under KV-sep ON does not re-read + re-allocate the
+/// env string every call. The env is process-stable (set once at open), so a
+/// one-shot cache is correct.
+fn cached_env_tristate(slot: &std::sync::atomic::AtomicU8, name: &str) -> Option<bool> {
+    use std::sync::atomic::Ordering;
+    match slot.load(Ordering::Relaxed) {
+        1 => return None,
+        2 => return Some(false),
+        3 => return Some(true),
+        _ => {}
+    }
+    let resolved = match std::env::var(name).ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") => Some(true),
+        Some(_) => Some(false),
+        None => None,
+    };
+    slot.store(
+        match resolved {
+            None => 1,
+            Some(false) => 2,
+            Some(true) => 3,
+        },
+        Ordering::Relaxed,
+    );
+    resolved
+}
+
+/// Cached env tri-state slot for `FRS_VLOG_POINT_DEREF` (see
+/// [`cached_env_tristate`]). 0 = uninitialized.
+static FRS_VLOG_POINT_DEREF_ENV: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// FRS-VLOG-POINT-DEREF test override for [`vlog_point_deref_enabled`]:
 /// 0 = env/default, 1 = forced off, 2 = forced on.
@@ -515,12 +553,15 @@ pub fn vlog_sink_deref_enabled() -> bool {
     // win is modest (the second copy is a small fraction of the deref) but always
     // >= 0 and removes an allocation per separated probe, so it is safe to couple
     // to `kv_separation_enabled()` for the all-queries-ON regime. Moot when OFF.
-    match std::env::var("FRS_VLOG_SINK_DEREF").ok().as_deref() {
-        Some("1") | Some("true") | Some("TRUE") => true,
-        Some(_) => false,
+    match cached_env_tristate(&FRS_VLOG_SINK_DEREF_ENV, "FRS_VLOG_SINK_DEREF") {
+        Some(v) => v,
         None => kv_separation_enabled(),
     }
 }
+
+/// Cached env tri-state slot for `FRS_VLOG_SINK_DEREF` (see
+/// [`cached_env_tristate`]). 0 = uninitialized.
+static FRS_VLOG_SINK_DEREF_ENV: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// FRS-VLOG-SINK-DEREF test override for [`vlog_sink_deref_enabled`]:
 /// 0 = env/default, 1 = forced off, 2 = forced on.
