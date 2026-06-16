@@ -404,6 +404,41 @@ jobs:
           sleep 8
           echo "remaining flink procs:"; pgrep -af 'TaskManagerRunner|StandaloneSession|SqlGateway' || echo none
 
+      # DIAGNOSTIC: bring up the forst-rs (JDK25+FFM) standalone cluster directly
+      # and dump the TaskManager .out/.log so a TM boot failure (native .so load /
+      # JDK25 module opts / memory) is VISIBLE. The per-query measure-print loop
+      # wipes $FLINK_HOME/log each run, so without this the TM crash is invisible
+      # and we only see "cluster up (tms=)" + connection-refused at submit time.
+      # never-fail (|| true): purely informational, the real gate is the loop.
+      - name: DIAG — forst-rs cluster smoke (dump TM boot log)
+        if: always()
+        run: |
+          set +e
+          "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1
+          pkill -9 -f 'TaskManagerRunner|StandaloneSession|SqlGateway|SqlClient' 2>/dev/null
+          sleep 5
+          rm -f "$FLINK_HOME"/log/* 2>/dev/null
+          # Apply the forst-rs config exactly as measure-print.sh does.
+          envsubst '' < "$TEMPLATES/config-forst-rs-local.yaml.tpl" > "$FLINK_HOME/conf/config.yaml"
+          rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache /tmp/flink-forst-rs-data /tmp/nexmark-checkpoints-forst-rs
+          echo "== JAVA_HOME(JDK25)=$JDK25 =="
+          "$JDK25/bin/java" -version 2>&1 || true
+          echo "== starting forst-rs cluster (JDK25) =="
+          JAVA_HOME="$JDK25" "$FLINK_HOME"/bin/start-cluster.sh 2>&1 || true
+          for i in $(seq 1 20); do
+            tms=$(curl -sf http://localhost:8081/overview 2>/dev/null | grep -oE '"taskmanagers":[0-9]+' | grep -oE '[0-9]+$')
+            echo "[poll $i] taskmanagers=$tms"
+            [ -n "$tms" ] && [ "$tms" -ge 1 ] && break
+            sleep 3
+          done
+          echo "===== taskexecutor .out ====="; tail -n 120 "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null || echo "(none)"
+          echo "===== taskexecutor .log ====="; tail -n 200 "$FLINK_HOME"/log/*taskexecutor*.log 2>/dev/null || echo "(none)"
+          echo "===== standalonesession .log ====="; tail -n 80 "$FLINK_HOME"/log/*standalonesession*.log 2>/dev/null || echo "(none)"
+          echo "===== log dir ====="; ls -la "$FLINK_HOME"/log 2>/dev/null
+          "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1
+          pkill -9 -f 'TaskManagerRunner|StandaloneSession' 2>/dev/null
+          true
+
       - name: Run each query on BOTH backends through real Flink SQL
         run: |
           set -u
