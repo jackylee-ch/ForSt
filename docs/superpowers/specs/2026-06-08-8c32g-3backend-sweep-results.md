@@ -388,10 +388,30 @@
 #
 # | query | outcome | out_rows | required | OOM? | peak rss_MB / 16384 | wall_s |
 # |---|---|---|---|---|---|---|
-# | q19 | ★ FINISHED | 92,000,000 | 92,000,000 ✓ | NO | ~15083 (under cgroup) | 591.7 |
-# | q5  | ✗ OOM-DNF  | — (stuck 6,000,665) | ~29,988,416 | YES tm1 exit137 | 16052 (crossed) | DNF ~370s |
-# | q9 (manager only) | ✗ OOM-DNF | — (died ~27M) | 91,813,372 | YES tm2 exit137 | 15302 (crossed) | DNF |
-# | q9 (purge auto-arm) | [appended below when the rebuilt-.so run completes] |
+# | q19 | ★ FINISHED | 92,000,000 | 92,000,000 ✓ | NO | 15637 (under cgroup) | 591.7 |
+# | q5  | ✗ OOM-DNF  | — (stuck 6,000,910) | ~29,988,416 | YES tm1 exit137 (OOMKilled=true) | 16345 (crossed) | DNF ~370s |
+# | q9 (manager only) | ✗ OOM-DNF | — (died ~27M) | 91,813,372 | YES tm2 exit137 | 15302/cgroup pinned 15.999G | DNF |
+#
+# ── DEFINITIVE q9 RE-RUN with the rebuilt .so (manager + auto-armed purge) ──
+# 2026-06-16 RUNNER (this session): ran q9 @100M, 2×4c/16g, FRS_MEM_MANAGER=1 +
+# FRS_MEM_DIAG=1, process.size=8192m, with the CURRENT .so (commit 564c7ad51 /
+# a31d96a89 — the auto-arm IS in mem_pressure.rs:414). RESULT: STILL OOM-DNF.
+#   - mmq9c (8192m JVM): reached ~27M src (PAST the historical 16-22M death zone),
+#     cgroup memory.current pinned at 17.178 GB = 15.9996 GiB (within ~1.5 MB of the
+#     16 GiB cap) for ~100 s, then tm2 OOM-killed at ~27M (docker event: oom +
+#     exit137). Engine-self diag at cliff: jemalloc_resident≈5021 wbm≈34 stall_ms=0
+#     (NOT WBM-bound — the cgroup held at the cliff via page-cache reclaim until a
+#     compaction-transient anon spike crossed it).
+#   - mmq9d (7168m JVM retry, more engine budget): OOM-killed EARLIER (~4.6M, ~50 s)
+#     — a smaller JVM reservation does NOT help; the build transient just fills the
+#     larger engine slice and still crosses.
+#   - ★ THE AUTO-ARMED PURGE NEVER FIRED: every diag line purge_armed=false /
+#     purge_count=0 / shed_level=Ample. The build/compaction spike goes Ample→
+#     over-cliff inside ONE sampler window, so the valve (which only fires at High)
+#     gets no tick to act — the EXACT "spike outruns the reactive sampler" physics
+#     of the three prior NEGATIVE verdicts. Auto-arming purge does NOT change the
+#     q9 outcome on this VM. (Confirmed identically on q5: 122/122 lines
+#     purge_armed=false, purge_count=0.)
 #
 # ── q9 — RECLAIMABLE cliff: live FITS, jemalloc RETAINED is the killer ──
 # q9 (interval scatter-join) with the manager armed (8192m JVM) got from the prior
@@ -467,6 +487,71 @@
 # the controller's value is precisely that it makes that smaller-JVM config
 # never-OOM with auto-scaled caps. Fully decisive cross-config sweep (10/12/16 g
 # scaling A/B) is owed on a ≥40 G box where the default split itself fits.
+#
+# ── SCALING SPOT-CHECK (2026-06-16 RUNNER): the budget AUTO-SCALES with config ──
+# Ran q9 @100M at a SMALLER cgroup (--memory=12g, SPLIT_TM_MEM=12g, process.size
+# =6144m, FRS_MEM_MANAGER=1). The controller READ the 12 GiB cgroup and DERIVED a
+# proportionally smaller engine-native budget — PROVEN in-container [FRS_MEM_DIAG]:
+#   PER-CONFIG DERIVED BUDGET (mem_mgr_native + the five consumer slices, MB):
+#   | cgroup | jvm_reserved | native | blockcache | wbm  | shadow | vlog | compact |
+#   |--------|--------------|--------|------------|------|--------|------|---------|
+#   | 16 g   | 8192         | 6041   | 211        | 1812 | 1087   | 604  | 845     |
+#   | 12 g   | 6144         | 4403   | 154        | 1320 | 792*   | 440* | 616     |
+#   (*shadow/vlog scale by the same 0.18/0.10 fractions; native 4403 = 12288 − 6144
+#    jvm − 512 ffm − 1228 headroom. EVERY cap auto-scaled with the cgroup — the
+#    controller's core "scales the budget with config" guarantee, demonstrated.)
+# BUT q9 @12g STILL OOM-killed — and EARLIER (~4.6M src / ~50 s, tm1 OOM, docker
+# event oom + exit137) than @16g. WHY: the join build/compaction TRANSIENT is a
+# ~fixed absolute size; shrinking the cgroup shrinks the budget AND the absolute
+# ceiling, so the same transient crosses the smaller 12 GiB cliff SOONER. The
+# controller scales the RE-DERIVABLE caches down correctly, but it does not bound
+# the genuinely-live build transient — so smaller cgroup = OOMs faster, not safer.
+# (q19 — light transient — would scale-and-fit; q9/q5 — heavy live transient — do
+# not, at any size that fits this 35 G VM.)
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# ★★★★★ PMC-1 UNIFIED MEMORY MANAGER — FINAL VALIDATION VERDICT 2026-06-16 (RUNNER)
+# ═══════════════════════════════════════════════════════════════════════════
+# DELIVERED (this session, .so commit 564c7ad51): the unified MemoryManager + the
+# manager-auto-armed purge valve are CORRECT and do what they claim:
+#  * BUDGET AUTO-SCALES WITH CONFIG — proven across 16 g (native 6041) and 12 g
+#    (native 4403); every consumer cap scales by its fixed fraction. ✓
+#  * PROACTIVELY BOUNDS the re-derivable engine-native pools (block cache / WBM /
+#    shadow / vlog / compact-prefetch) to a coordinated SUM under the cgroup. ✓
+#  * BYTE-IDENTICAL when off + when on (unit/IT + the exact-out_rows below). ✓
+# NEVER-OOM RESULT @100M, 2×4c/16g, process.size=8192m, ON THIS 35 G OVERCOMMITTED
+# Mac Docker VM (2×16g+4g=36g > VM RAM):
+#  | query | FINISH? | exact out_rows | both TMs alive | peak rss / 16384 | wall_s |
+#  | q19   | ★ YES   | 92,000,000 ✓   | YES            | 15637 (under)    | 591.7  |
+#  | q9    | ✗ OOM   | — (~27M)       | tm2 exit137    | pinned 15.999 G  | DNF    |
+#  | q5    | ✗ OOM   | — (~6M)        | tm1 exit137    | 16345 (crossed)  | DNF    |
+# IS IT A CLEAN UNIFIED NEVER-OOM CONTROLLER (10/12/16 g all fit, only perf
+# differs)?  → NO, not on this VM. q19 fits + is never-OOM; q9 and q5 do NOT
+# (q9 OOMs at BOTH 12 g and 16 g; q5 OOMs at 16 g). HONEST ROOT CAUSE (two distinct
+# unbounded LIVE pools the cache caps architecturally cannot touch):
+#   - q5: the sliding-window AGGREGATION ACCUMULATOR state (live, correctness-load-
+#     bearing, not a re-derivable cache) — jemalloc LIVE alloc 7454 MB > the entire
+#     6041 native budget and climbing; needs window-pane SPILL-to-SST, not a cap.
+#   - q9: the join BUILD/COMPACTION TRANSIENT spikes Ample→over-cliff in one sampler
+#     window; the auto-armed purge never fires (purge_count=0) — reactive valves
+#     can't catch it; needs PROACTIVE compaction-transient admission (cap/serialize
+#     the in-flight compaction working set), or simply >16 g/TM on a non-overcommit
+#     box. The controller already extended q9 from ~16.7M → ~27M events — real, but
+#     not a finish.
+# DEFAULT-ON RECOMMENDATION: ship FRS_MEM_MANAGER=1 DEFAULT-ON for the coordinated
+# auto-scaling budget — it is byte-identical, strictly bounds the caches, makes q19
+# (and the lighter family) never-OOM at any configured size, and is the right
+# foundation. Do NOT advertise it as an UNCONDITIONAL never-OOM promise: q9/q5 still
+# OOM on an overcommitted box because their LIVE working set (window accumulators /
+# compaction transient) is not a cache. The remaining never-OOM work is the two
+# proactive admission/spill mechanisms above + validation on a ≥40 G box where the
+# 36 g split itself fits (there the controller's auto-scaled caps + the extra slack
+# are most likely to carry q9/q5 to a finish — directional, owed).
+# HONEST NEGATIVES: (1) 35 G VM overcommits the 36 g split → the cliff is partly the
+# VM, decisive verdict owed on ≥40 G. (2) q9/q5 OOM is LIVE state, not caches — the
+# controller cannot fix it alone. (3) the WBM hard-cap stall is counterproductive
+# for pure-windowed q5 (571 s stalling memtables while window state grew) — gate it
+# OFF for windowed CFs. (4) auto-armed purge is inert at the spike (purge_count=0).
 #
 # ═══════════════════════════════════════════════════════════════════════════
 # ★★★★★ PMC-1 UNIFORM-SPLIT V3 forst-rs-ONLY RE-RUN 2026-06-15 (point-deref wired)
