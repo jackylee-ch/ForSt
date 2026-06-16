@@ -88,6 +88,46 @@ pub struct KvSepSpec {
     pub vlog_compression: forst_rs_common::CompressionType,
 }
 
+/// FRS-MEM-WINDOWED-FLUSH-COLLAPSE (2026-06-16, PMC-1 live-state track):
+/// flush-time merge-operand FOLD directive for a windowed merge-CF (q5
+/// sliding-window aggregation).
+///
+/// # Why fold at flush
+///
+/// The memtable APPENDS one entry per `merge` — an un-fired window pane that
+/// receives K updates carries a K-deep operand chain. Today flush writes those
+/// K rows VERBATIM to the L0 SST; only the much-later COMPACTION collapses them
+/// (snapshot-aware `full_merge`). Between flush and compaction the chain stays
+/// K-deep, so q5's window-fire read materialises the WHOLE chain
+/// (`collect_merge_operands` → `Vec<Vec<u8>>` of K operands) for every key — the
+/// dominant non-memtable term in q5's live working set (sweep-results.md: LIVE
+/// 8126 MiB, of which wbm only 2637). Folding each key's chain to ONE combined
+/// operand at flush shrinks BOTH the L0 SST and the read-side materialisation,
+/// directly reducing the live operand-collection footprint.
+///
+/// # Correctness — conservative no-live-snapshot fold
+///
+/// Folding operands across sequence numbers is the SAME MVCC hazard compaction
+/// guards with `min_active_snapshot`: a snapshot reading at a seq BETWEEN two
+/// folded operands must still see the intermediate value. To stay provably safe
+/// WITHOUT duplicating compaction's intricate snapshot-floor pinning, this fold
+/// is armed ONLY when there is **no live snapshot** (`min_active == u64::MAX`) —
+/// then every operand is invisible to any snapshot reader and the whole chain
+/// folds freely (exactly compaction's `min_active == u64::MAX` fast path). When
+/// any snapshot is live, the caller leaves this `None` and the flush writes
+/// verbatim (byte-identical to today; compaction still collapses later). q5's
+/// window-fire is a point-get, not a long-lived snapshot, so the no-snapshot
+/// path is the steady state.
+///
+/// The fold is byte-identical to the eventual compaction collapse: same
+/// `full_merge`/`partial_merge`, same newest-wins base resolution. It only
+/// changes WHEN the chain collapses (flush vs compaction), never the value.
+#[derive(Clone)]
+pub struct FlushCollapseSpec {
+    /// The CF's merge operator — folds the operand run for a key.
+    pub merge_operator: Arc<dyn forst_rs_storage::merge_operator::MergeOperator>,
+}
+
 /// A single flush operation: one frozen memtable → one SST file.
 pub struct FlushJob {
     memtable: SharedMemTable,
@@ -101,6 +141,11 @@ pub struct FlushJob {
     fs: Arc<dyn FileSystem>,
     /// FRS-WA-V2a-2: KV-separation directive (None = classic flush).
     kv_sep: Option<KvSepSpec>,
+    /// FRS-MEM-WINDOWED-FLUSH-COLLAPSE: flush-time operand fold (None = verbatim
+    /// flush, byte-identical to today). Mutually exclusive with `kv_sep` — a
+    /// windowed merge-CF is not KV-separation-eligible (merge operator present),
+    /// so the two never co-arm.
+    collapse: Option<FlushCollapseSpec>,
 }
 
 impl FlushJob {
@@ -130,12 +175,22 @@ impl FlushJob {
             options,
             fs,
             kv_sep: None,
+            collapse: None,
         }
     }
 
     /// FRS-WA-V2a-2: arms KV separation for this flush (builder-style).
     pub fn with_kv_separation(mut self, spec: KvSepSpec) -> Self {
         self.kv_sep = Some(spec);
+        self
+    }
+
+    /// FRS-MEM-WINDOWED-FLUSH-COLLAPSE: arms flush-time operand folding for a
+    /// windowed merge-CF (builder-style). The caller only passes this when the
+    /// manager is armed, the CF has a merge operator, AND there is no live
+    /// snapshot (the conservative no-MVCC-hazard fold) — see [`FlushCollapseSpec`].
+    pub fn with_collapse(mut self, spec: FlushCollapseSpec) -> Self {
+        self.collapse = Some(spec);
         self
     }
 
@@ -150,6 +205,198 @@ impl FlushJob {
     /// sections (proportional to block count, not byte count).
     pub fn run(self) -> ForstResult<SstFileMeta> {
         self.run_kv().map(|(meta, _)| meta)
+    }
+
+    /// FRS-MEM-WINDOWED-FLUSH-COLLAPSE: fold each key's Merge operand run in the
+    /// sorted (key ASC, seq DESC) flush stream into a SINGLE entry, mirroring
+    /// compaction's `min_active == u64::MAX` (no-live-snapshot) collapse. Returns
+    /// one rewritten `RecordBatch` carrying the folded rows in the same sorted
+    /// order the writer expects.
+    ///
+    /// Per key group (consecutive rows with equal key, already newest-first by
+    /// seq DESC):
+    ///   * a run of `Merge` operands followed by an optional `Put`/`BlobRef`
+    ///     base ⇒ ONE folded `Put` = `full_merge(base, operands oldest→newest)`,
+    ///     stamped with the group's NEWEST seq (the value a read would compute);
+    ///   * a run of `Merge` operands terminated by a `Delete`/`SingleDelete`
+    ///     (or the bottom of the group) ⇒ `full_merge(None, operands)` as a
+    ///     `Put` (the merge operator defines the no-base semantics — identical
+    ///     to what compaction/read does);
+    ///   * a group whose NEWEST entry is itself a `Put`/`Delete` with no merges
+    ///     above it ⇒ emitted VERBATIM (its newest entry wins; older shadowed
+    ///     entries are dropped, exactly as a read would resolve them).
+    /// Any group that does not match these shapes (defensive: an unexpected op
+    /// ordering) is emitted VERBATIM so the fold can never change semantics.
+    ///
+    /// CORRECTNESS: armed only with no live snapshot, so dropping the
+    /// intermediate (shadowed) versions is invisible to every reader — the
+    /// surviving folded value is byte-identical to resolving the chain on read.
+    fn collapse_merge_runs(
+        batches: &[arrow::array::RecordBatch],
+        spec: &FlushCollapseSpec,
+    ) -> ForstResult<Vec<arrow::array::RecordBatch>> {
+        use forst_rs_common::OpType;
+        let merge_u8 = OpType::Merge as u8;
+        let put_u8 = OpType::Put as u8;
+        let delete_u8 = OpType::Delete as u8;
+        let single_delete_u8 = OpType::SingleDelete as u8;
+        let blobref_u8 = OpType::BlobRef as u8;
+
+        // Decode every row into a flat owned sequence (the input is already
+        // globally sorted across batches: key ASC, seq DESC). Flush input is one
+        // bounded memtable, so materialising it once is the same order of memory
+        // the writer already touches, and the OUTPUT is strictly smaller.
+        struct Row {
+            key: Vec<u8>,
+            value: Vec<u8>,
+            seq: u64,
+            op: u8,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for batch in batches {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ForstError::corruption("collapse: key column not Binary"))?;
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ForstError::corruption("collapse: value column not Binary"))?;
+            let seqs = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| ForstError::corruption("collapse: seq column not UInt64"))?;
+            let ops = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt8Array>()
+                .ok_or_else(|| ForstError::corruption("collapse: op column not UInt8"))?;
+            for i in 0..batch.num_rows() {
+                rows.push(Row {
+                    key: keys.value(i).to_vec(),
+                    value: values.value(i).to_vec(),
+                    seq: seqs.value(i),
+                    op: ops.value(i),
+                });
+            }
+        }
+
+        let mut out_keys = BinaryBuilder::new();
+        let mut out_vals = BinaryBuilder::new();
+        let mut out_seqs: Vec<u64> = Vec::new();
+        let mut out_ops: Vec<u8> = Vec::new();
+
+        let emit_verbatim = |group: &[Row],
+                             out_keys: &mut BinaryBuilder,
+                             out_vals: &mut BinaryBuilder,
+                             out_seqs: &mut Vec<u64>,
+                             out_ops: &mut Vec<u8>| {
+            for r in group {
+                out_keys.append_value(&r.key);
+                out_vals.append_value(&r.value);
+                out_seqs.push(r.seq);
+                out_ops.push(r.op);
+            }
+        };
+
+        let mut idx = 0usize;
+        while idx < rows.len() {
+            // Group bound: consecutive equal-key rows (already newest-first).
+            let start = idx;
+            let gkey = rows[start].key.clone();
+            let mut end = idx + 1;
+            while end < rows.len() && rows[end].key == gkey {
+                end += 1;
+            }
+            let group = &rows[start..end];
+            idx = end;
+
+            // Count the leading Merge run (newest-first) and find the base.
+            let mut n_merge = 0usize;
+            while n_merge < group.len() && group[n_merge].op == merge_u8 {
+                n_merge += 1;
+            }
+            // The base is the first non-Merge entry after the merge run (if any).
+            let base = group.get(n_merge);
+            let base_ok = match base {
+                None => true,                         // chain ends at bottom (no base)
+                Some(r) if r.op == put_u8 => true,    // Put base
+                Some(r) if r.op == delete_u8 => true, // Delete base ⇒ None
+                Some(r) if r.op == single_delete_u8 => true,
+                _ => false, // BlobRef base under a merge chain ⇒ corruption: never fold
+            };
+            // Defensive: a group whose remainder (below the base) is anything but
+            // shadowed older versions we can safely drop is rare for a windowed
+            // merge-CF; only fold the clean shape, else verbatim.
+            let blob_in_merges = group[..n_merge].iter().any(|r| r.op == blobref_u8);
+
+            if n_merge == 0 || !base_ok || blob_in_merges {
+                // No merges to fold (newest is a Put/Delete — emit ONLY the
+                // newest, dropping shadowed older versions, which a read also
+                // does), OR an un-foldable shape ⇒ verbatim for safety.
+                if n_merge == 0 && !group.is_empty() {
+                    // Newest entry wins; older same-key versions are shadowed and
+                    // safe to drop with no live snapshot. Emit just the newest.
+                    let newest = &group[0];
+                    out_keys.append_value(&newest.key);
+                    out_vals.append_value(&newest.value);
+                    out_seqs.push(newest.seq);
+                    out_ops.push(newest.op);
+                } else {
+                    emit_verbatim(
+                        group,
+                        &mut out_keys,
+                        &mut out_vals,
+                        &mut out_seqs,
+                        &mut out_ops,
+                    );
+                }
+                continue;
+            }
+
+            // Fold: operands oldest→newest (group is newest-first, so reverse).
+            let operand_refs: Vec<&[u8]> = group[..n_merge]
+                .iter()
+                .rev()
+                .map(|r| r.value.as_slice())
+                .collect();
+            let base_val: Option<&[u8]> = match base {
+                Some(r) if r.op == put_u8 => Some(r.value.as_slice()),
+                _ => None, // None base, Delete base, or no base
+            };
+            let folded = spec
+                .merge_operator
+                .full_merge(&gkey, base_val, &operand_refs)?;
+            // Stamp the NEWEST seq (the value a read at HEAD computes) as a Put.
+            let newest_seq = group[0].seq;
+            out_keys.append_value(&gkey);
+            out_vals.append_value(&folded);
+            out_seqs.push(newest_seq);
+            out_ops.push(put_u8);
+        }
+
+        let schema = batches
+            .first()
+            .map(|b| b.schema())
+            .ok_or_else(|| ForstError::corruption("collapse: empty batch list"))?;
+        let key_arr = out_keys.finish();
+        let val_arr = out_vals.finish();
+        let seq_arr = UInt64Array::from(out_seqs);
+        let op_arr = UInt8Array::from(out_ops);
+        let batch = arrow::array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(key_arr),
+                Arc::new(val_arr),
+                Arc::new(seq_arr),
+                Arc::new(op_arr),
+            ],
+        )
+        .map_err(|e| ForstError::corruption(format!("collapse: RecordBatch::try_new: {e}")))?;
+        Ok(vec![batch])
     }
 
     /// FRS-WA-V2a-2: variant of [`Self::run`] that also reports the value-log
@@ -174,6 +421,15 @@ impl FlushJob {
             ));
         }
         let batches = self.memtable.to_flush_batches(FLUSH_BATCH_SIZE)?;
+        // FRS-MEM-WINDOWED-FLUSH-COLLAPSE: fold same-key Merge operand runs into
+        // a single combined operand BEFORE writing (windowed merge-CF, armed
+        // only with no live snapshot — see `FlushCollapseSpec`). Verbatim
+        // (byte-identical) when not armed.
+        let batches = if let Some(spec) = self.collapse.clone() {
+            Self::collapse_merge_runs(&batches, &spec)?
+        } else {
+            batches
+        };
 
         // 2. Open the temp file and stream the SST directly into it. We
         //    write to a temp file and rename into place so a mid-write
@@ -920,5 +1176,222 @@ mod tests {
             .expect("scan must accept writer-side prefix");
         let num: u64 = stem.parse().expect("inner stem must parse as u64");
         assert_eq!(num, 7);
+    }
+
+    // --- FRS-MEM-WINDOWED-FLUSH-COLLAPSE -----------------------------------
+
+    /// Test merge operator: i64 big-endian additive accumulator (the q5/q8
+    /// COUNT/SUM shape). `full_merge(base, ops)` = base + Σ ops.
+    #[derive(Debug)]
+    struct AddBe;
+    impl forst_rs_storage::merge_operator::MergeOperator for AddBe {
+        fn full_merge(
+            &self,
+            _key: &[u8],
+            base: Option<&[u8]>,
+            operands: &[&[u8]],
+        ) -> ForstResult<Vec<u8>> {
+            let to_i = |b: &[u8]| -> i64 {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(b);
+                i64::from_be_bytes(a)
+            };
+            let mut acc = base.map(to_i).unwrap_or(0);
+            for op in operands {
+                acc = acc.wrapping_add(to_i(op));
+            }
+            Ok(acc.to_be_bytes().to_vec())
+        }
+        fn partial_merge(&self, _key: &[u8], left: &[u8], right: &[u8]) -> ForstResult<Vec<u8>> {
+            let to_i = |b: &[u8]| -> i64 {
+                let mut a = [0u8; 8];
+                a.copy_from_slice(b);
+                i64::from_be_bytes(a)
+            };
+            Ok(to_i(left).wrapping_add(to_i(right)).to_be_bytes().to_vec())
+        }
+        fn name(&self) -> String {
+            "AddBe".to_string()
+        }
+    }
+
+    use forst_rs_storage::merge_operator::MergeOperator as _;
+
+    fn spec() -> FlushCollapseSpec {
+        FlushCollapseSpec {
+            merge_operator: Arc::new(AddBe),
+        }
+    }
+
+    /// Build a frozen memtable with explicit seqs so the (key ASC, seq DESC)
+    /// flush order is deterministic.
+    fn mem_with_seqs(entries: &[(&[u8], Option<&[u8]>, u8, u64)]) -> SharedMemTable {
+        let mem = ShardedMemTable::with_defaults();
+        for (k, v, op, seq) in entries {
+            mem.put_with_seq(k, *v, *op, *seq).unwrap();
+        }
+        mem.freeze();
+        Arc::new(mem)
+    }
+
+    /// Decode a single-batch collapse output into (key, value, op) tuples,
+    /// sorted ascending by key for stable assertions.
+    fn decode(batches: &[arrow::array::RecordBatch]) -> Vec<(Vec<u8>, Vec<u8>, u8)> {
+        let mut out = Vec::new();
+        for b in batches {
+            let keys = b.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+            let vals = b.column(1).as_any().downcast_ref::<BinaryArray>().unwrap();
+            let ops = b.column(3).as_any().downcast_ref::<UInt8Array>().unwrap();
+            for i in 0..b.num_rows() {
+                out.push((keys.value(i).to_vec(), vals.value(i).to_vec(), ops.value(i)));
+            }
+        }
+        out
+    }
+
+    fn i(v: i64) -> Vec<u8> {
+        v.to_be_bytes().to_vec()
+    }
+
+    /// A pure Merge chain (no base) folds to ONE Put = Σ operands, stamped at
+    /// the newest seq — byte-identical to what a read computes.
+    #[test]
+    fn collapse_folds_pure_merge_chain_to_single_put() {
+        // seq DESC within key: newest (+3,seq3) → (+5,seq2) → (+10,seq1).
+        let mem = mem_with_seqs(&[
+            (b"w", Some(&i(10)), OpType::Merge as u8, 1),
+            (b"w", Some(&i(5)), OpType::Merge as u8, 2),
+            (b"w", Some(&i(3)), OpType::Merge as u8, 3),
+        ]);
+        let batches = mem.to_flush_batches(FLUSH_BATCH_SIZE).unwrap();
+        let folded = FlushJob::collapse_merge_runs(&batches, &spec()).unwrap();
+        let rows = decode(&folded);
+        assert_eq!(rows.len(), 1, "3 operands must fold to ONE entry");
+        assert_eq!(rows[0].0, b"w");
+        assert_eq!(rows[0].1, i(18), "10+5+3 = 18");
+        assert_eq!(
+            rows[0].2,
+            OpType::Put as u8,
+            "folded chain emits a Put base"
+        );
+    }
+
+    /// A Merge chain over a Put base folds to ONE Put = base + Σ operands.
+    #[test]
+    fn collapse_folds_merge_over_put_base() {
+        let mem = mem_with_seqs(&[
+            (b"w", Some(&i(100)), OpType::Put as u8, 1), // base
+            (b"w", Some(&i(5)), OpType::Merge as u8, 2),
+            (b"w", Some(&i(7)), OpType::Merge as u8, 3),
+        ]);
+        let batches = mem.to_flush_batches(FLUSH_BATCH_SIZE).unwrap();
+        let folded = FlushJob::collapse_merge_runs(&batches, &spec()).unwrap();
+        let rows = decode(&folded);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, i(112), "100 + 5 + 7 = 112");
+        assert_eq!(rows[0].2, OpType::Put as u8);
+    }
+
+    /// Multiple keys each fold independently; folded output stays sorted.
+    #[test]
+    fn collapse_folds_each_key_independently() {
+        let mem = mem_with_seqs(&[
+            (b"a", Some(&i(1)), OpType::Merge as u8, 1),
+            (b"a", Some(&i(2)), OpType::Merge as u8, 2),
+            (b"b", Some(&i(40)), OpType::Merge as u8, 3),
+            (b"b", Some(&i(2)), OpType::Merge as u8, 4),
+        ]);
+        let batches = mem.to_flush_batches(FLUSH_BATCH_SIZE).unwrap();
+        let folded = FlushJob::collapse_merge_runs(&batches, &spec()).unwrap();
+        let rows = decode(&folded);
+        assert_eq!(rows.len(), 2, "two keys ⇒ two folded entries");
+        assert_eq!(rows[0].0, b"a");
+        assert_eq!(rows[0].1, i(3));
+        assert_eq!(rows[1].0, b"b");
+        assert_eq!(rows[1].1, i(42));
+    }
+
+    /// A key whose newest entry is a Put (no merges above it) emits ONLY the
+    /// newest — shadowed older versions are dropped (a read resolves the same).
+    #[test]
+    fn collapse_keeps_only_newest_for_put_only_key() {
+        let mem = mem_with_seqs(&[
+            (b"k", Some(&i(1)), OpType::Put as u8, 1), // shadowed
+            (b"k", Some(&i(9)), OpType::Put as u8, 2), // newest wins
+        ]);
+        let batches = mem.to_flush_batches(FLUSH_BATCH_SIZE).unwrap();
+        let folded = FlushJob::collapse_merge_runs(&batches, &spec()).unwrap();
+        let rows = decode(&folded);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, i(9), "newest Put wins");
+        assert_eq!(rows[0].2, OpType::Put as u8);
+    }
+
+    /// END-TO-END: a full `FlushJob::run` with collapse armed writes an SST
+    /// carrying ONE entry for a 4-deep merge chain (vs 4 verbatim), with the
+    /// correct min/max sequence — the durable on-disk shrink q5 needs.
+    #[test]
+    fn collapse_e2e_flush_writes_single_collapsed_sst_entry() {
+        let mem = mem_with_seqs(&[
+            (b"w", Some(&i(1)), OpType::Merge as u8, 1),
+            (b"w", Some(&i(1)), OpType::Merge as u8, 2),
+            (b"w", Some(&i(1)), OpType::Merge as u8, 3),
+            (b"w", Some(&i(1)), OpType::Merge as u8, 4),
+        ]);
+        let fs = Arc::new(MemoryFileSystem::new());
+        // Verbatim flush ⇒ 4 entries.
+        let verbatim = FlushJob::new(
+            mem.clone(),
+            FileNumber(1),
+            DEFAULT_CF_ID,
+            PathBuf::from("/db/000001.sst"),
+            default_writer_opts(),
+            fs.clone(),
+        )
+        .run()
+        .unwrap();
+        assert_eq!(verbatim.num_entries, 4, "verbatim flush keeps all operands");
+        // Collapse flush ⇒ 1 entry, seq stamped at the newest (4).
+        let collapsed = FlushJob::new(
+            mem,
+            FileNumber(2),
+            DEFAULT_CF_ID,
+            PathBuf::from("/db/000002.sst"),
+            default_writer_opts(),
+            fs.clone(),
+        )
+        .with_collapse(spec())
+        .run()
+        .unwrap();
+        assert_eq!(
+            collapsed.num_entries, 1,
+            "collapse folds the chain to ONE entry"
+        );
+        assert_eq!(collapsed.max_sequence, SequenceNumber(4));
+        assert!(fs.file_exists(&PathBuf::from("/db/000002.sst")).unwrap());
+    }
+
+    /// The fold value is byte-identical to applying full_merge over the raw
+    /// (verbatim) chain — the core correctness contract (collapse changes WHEN,
+    /// never the resolved value).
+    #[test]
+    fn collapse_value_matches_verbatim_full_merge() {
+        let mem = mem_with_seqs(&[
+            (b"w", Some(&i(-4)), OpType::Merge as u8, 1),
+            (b"w", Some(&i(11)), OpType::Merge as u8, 2),
+            (b"w", Some(&i(2)), OpType::Merge as u8, 3),
+        ]);
+        let batches = mem.to_flush_batches(FLUSH_BATCH_SIZE).unwrap();
+        // Reference: full_merge over the raw operands oldest→newest.
+        let reference = AddBe
+            .full_merge(b"w", None, &[&i(-4), &i(11), &i(2)])
+            .unwrap();
+        let folded = FlushJob::collapse_merge_runs(&batches, &spec()).unwrap();
+        let rows = decode(&folded);
+        assert_eq!(
+            rows[0].1, reference,
+            "folded value must equal verbatim merge"
+        );
+        assert_eq!(reference, i(9));
     }
 }

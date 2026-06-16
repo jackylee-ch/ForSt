@@ -12439,6 +12439,26 @@ impl DbImpl {
         if let Some(spec) = kv_spec {
             job = job.with_kv_separation(spec);
         }
+        // FRS-MEM-WINDOWED-FLUSH-COLLAPSE (PMC-1 live-state track): for a
+        // windowed merge-CF under the manager, fold the per-key operand chains
+        // into one combined operand AT FLUSH (shrinking the L0 SST AND the
+        // window-fire read-side `collect_merge_operands` materialisation — q5's
+        // dominant non-memtable live term). Armed ONLY when there is no live
+        // snapshot, so the fold cannot break MVCC visibility (a snapshot reading
+        // an intermediate seq); with a live snapshot we skip it and the flush
+        // writes verbatim (compaction still collapses later). KV-sep and collapse
+        // never co-arm — a merge-operator CF is not separation-eligible.
+        if kv_spec.is_none()
+            && windowed_flush_collapse_enabled()
+            && self.snapshot_registry.min_active().0 == u64::MAX
+        {
+            if let Some(op) = cf_data.merge_operator() {
+                job = job.with_collapse(crate::flush::FlushCollapseSpec {
+                    merge_operator: op.clone(),
+                });
+                crate::memory_manager::note_windowed_flush_collapse();
+            }
+        }
         let (mut meta, vlog_meta) = job.run_kv()?;
 
         // FRS-WA-V1: death-stamp the fresh L0 segment for lifecycle CFs.
@@ -17323,6 +17343,25 @@ fn windowed_stall_skip_enabled() -> bool {
     crate::memory_manager::manager_enabled()
 }
 
+/// FRS-MEM-WINDOWED-FLUSH-COLLAPSE (PMC-1 live-state track): whether to FOLD a
+/// windowed merge-CF's per-key operand chains into a single combined operand at
+/// FLUSH time (instead of waiting for compaction). Folds only with NO live
+/// snapshot (the caller enforces this), so the collapse is byte-identical to the
+/// eventual compaction `full_merge`. Armed when the manager is on; force-disable
+/// with `FRS_MEM_WINDOWED_FLUSH_COLLAPSE=0`. Off ⇒ verbatim flush, byte-identical
+/// to today.
+fn windowed_flush_collapse_enabled() -> bool {
+    if matches!(
+        std::env::var("FRS_MEM_WINDOWED_FLUSH_COLLAPSE")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false") | Some("FALSE")
+    ) {
+        return false;
+    }
+    crate::memory_manager::manager_enabled()
+}
+
 /// FRS-MEM-WINDOWED-FLUSH (PMC-1 live-state track): the active-memtable byte
 /// floor at which a windowed merge-CF force-switches (flushes) to move its
 /// per-pane accumulator operand chains onto SST sooner. Default 256 MiB (kept
@@ -20642,6 +20681,25 @@ mod tests {
         db.drop_cf(&cf2).unwrap();
         assert!(db.set_cf_lifecycle(&cf2, CfLifecycle::Unbounded).is_err());
         assert!(db.advance_cf_watermark(&cf2, 1).is_err());
+    }
+
+    /// FRS-MEM-WINDOWED-FLUSH-COLLAPSE gate contract: DEFAULT OFF (byte-identical
+    /// to today) in the standard test process where the manager is unarmed, and
+    /// the explicit `FRS_MEM_WINDOWED_FLUSH_COLLAPSE=0` force-disable always wins.
+    /// (The armed-ON path is proven by the FlushJob collapse unit/E2E tests in
+    /// `flush.rs`, which exercise the fold directly without the process-global
+    /// manager flag.)
+    #[test]
+    fn test_windowed_flush_collapse_off_by_default() {
+        // Manager unarmed in the default test process ⇒ collapse OFF (the
+        // byte-identical default). No env mutation here — `FRS_MEM_*` are
+        // process-global and other tests run in parallel.
+        if !crate::memory_manager::manager_enabled() {
+            assert!(
+                !windowed_flush_collapse_enabled(),
+                "collapse must be OFF when the manager is unarmed (byte-identical default)"
+            );
+        }
     }
 
     /// FRS-WA-V1 tests share the global `LIFECYCLE_SEGMENTS_OVERRIDE` /

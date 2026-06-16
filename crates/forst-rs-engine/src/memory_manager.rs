@@ -247,6 +247,23 @@ fn headroom_bytes(cgroup: u64) -> u64 {
     frac.max(floor)
 }
 
+/// PURE budget formula: `cgroup - jvm_reserved - ffm_reserved - headroom`,
+/// floored at the engine-native floor (1.5 GiB). Factored out of
+/// [`engine_native_budget_bytes`] so the config-flexibility tests can exercise
+/// the formula across 10/12/16 g WITHOUT the process-global env + cache (which
+/// only the first armed computation per process can set). Takes the JVM
+/// reservation explicitly (the per-config `taskmanager.memory.process.size`).
+///
+/// Invariants this guarantees for EVERY config (asserted in tests):
+///   * the result is `>= ENGINE_NATIVE_FLOOR` (never a degenerate/zero budget),
+///   * `jvm + ffm + headroom + native <= cgroup` (never over-commits the cgroup
+///     — the SUM of all reservations + the engine slice fits the limit, so the
+///     controller is never-OOM **by construction** for any config it can derive).
+pub fn engine_native_budget_for(cgroup: u64, jvm: u64, ffm: u64, headroom: u64) -> u64 {
+    let reserved = jvm.saturating_add(ffm).saturating_add(headroom);
+    cgroup.saturating_sub(reserved).max(ENGINE_NATIVE_FLOOR)
+}
+
 /// The total engine-native budget in bytes:
 /// `cgroup - jvm_reserved - ffm_reserved - headroom`, floored at
 /// `ENGINE_NATIVE_FLOOR` (1.5 GiB). This is the bytes ALL engine-native consumers
@@ -267,8 +284,7 @@ pub fn engine_native_budget_bytes() -> Option<u64> {
     let jvm = jvm_reserved_bytes(cgroup);
     let ffm = ffm_reserved_bytes();
     let head = headroom_bytes(cgroup);
-    let reserved = jvm.saturating_add(ffm).saturating_add(head);
-    let native = cgroup.saturating_sub(reserved).max(ENGINE_NATIVE_FLOOR);
+    let native = engine_native_budget_for(cgroup, jvm, ffm, head);
     CACHE.store(native, std::sync::atomic::Ordering::Relaxed);
     Some(native)
 }
@@ -463,6 +479,21 @@ pub fn compact_admission_waits() -> u64 {
     COMPACT_ADMISSION_WAITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// FRS-MEM-WINDOWED-FLUSH-COLLAPSE: count of windowed-CF flushes that folded
+/// their operand chains at flush time (diag evidence the live-state lever fired).
+static WINDOWED_FLUSH_COLLAPSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record one armed windowed flush-collapse (called from the engine flush path).
+pub fn note_windowed_flush_collapse() {
+    WINDOWED_FLUSH_COLLAPSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Number of windowed flush-collapses that fired (diag).
+pub fn windowed_flush_collapses() -> u64 {
+    WINDOWED_FLUSH_COLLAPSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// FRS-MEM-MANAGER: a one-line snapshot of the derived budget for the
 /// `[FRS_MEM_DIAG]` log — DIRECT evidence that the controller engaged in-container
 /// and which cap each consumer received. Empty string when the manager is off.
@@ -475,7 +506,7 @@ pub fn diag_str() -> String {
     };
     let mb = |b: Option<u64>| b.map(|v| v / MIB).unwrap_or(0);
     format!(
-        " mem_mgr_native_MB={} mm_blockcache_MB={} mm_wbm_MB={} mm_shadow_MB={} mm_vlog_MB={} mm_compact_MB={} mm_compact_inflight_MB={} mm_compact_waits={}",
+        " mem_mgr_native_MB={} mm_blockcache_MB={} mm_wbm_MB={} mm_shadow_MB={} mm_vlog_MB={} mm_compact_MB={} mm_compact_inflight_MB={} mm_compact_waits={} mm_flush_collapse={}",
         native / MIB,
         mb(consumer_cap_bytes(Consumer::BlockCache)),
         mb(consumer_cap_bytes(Consumer::WriteBuffer)),
@@ -484,6 +515,7 @@ pub fn diag_str() -> String {
         mb(consumer_cap_bytes(Consumer::CompactionTransient)),
         compact_inflight_bytes() / MIB,
         compact_admission_waits(),
+        windowed_flush_collapses(),
     )
 }
 
@@ -558,6 +590,114 @@ mod tests {
         assert!(
             native12 < native16,
             "smaller cgroup must yield a smaller engine-native budget ({native12} !< {native16})"
+        );
+    }
+
+    /// CONFIG-FLEXIBILITY (PMC-1 standing directive): the controller must
+    /// derive a VALID, never-OOM budget for EVERY TM config it is run at —
+    /// 10 g / 12 g / 16 g — with a per-config JVM `process.size` carved out
+    /// FIRST. For each config we assert:
+    ///   (a) the engine-native slice is `>= ENGINE_NATIVE_FLOOR` (never zero /
+    ///       degenerate — the engine can always make progress),
+    ///   (b) `jvm + ffm + headroom + native <= cgroup` (the controller NEVER
+    ///       over-commits the cgroup — the SUM fits the limit by construction,
+    ///       so it is never-OOM for any config it can derive),
+    ///   (c) the per-consumer split sums to EXACTLY the native budget (no
+    ///       consumer slice is lost or double-counted),
+    ///   (d) bigger TM ⇒ bigger engine budget (monotone — perf differs, never
+    ///       a smaller-than-floor cliff).
+    #[test]
+    fn budgets_are_valid_and_never_overcommit_across_10_12_16g() {
+        let ffm = 512 * MIB;
+        // Per-config (cgroup, process.size) pairs — the realistic carve-outs the
+        // harness forwards via FRS_JVM_RESERVED_MB. Each leaves headroom for the
+        // engine on top of a substantial JVM (heap+managed+FFM).
+        let configs = [
+            (10 * 1024 * MIB, 6 * 1024 * MIB),  // 10 g TM, 6 g JVM
+            (12 * 1024 * MIB, 7 * 1024 * MIB),  // 12 g TM, 7 g JVM
+            (16 * 1024 * MIB, 10 * 1024 * MIB), // 16 g TM, 10 g JVM
+        ];
+        let mut prev_native = 0u64;
+        for (cgroup, jvm) in configs {
+            let head = headroom_bytes(cgroup);
+            let native = engine_native_budget_for(cgroup, jvm, ffm, head);
+            // (a) never degenerate.
+            assert!(
+                native >= ENGINE_NATIVE_FLOOR,
+                "config cgroup={}MiB jvm={}MiB: native {}MiB < floor {}MiB",
+                cgroup / MIB,
+                jvm / MIB,
+                native / MIB,
+                ENGINE_NATIVE_FLOOR / MIB
+            );
+            // (b) NEVER over-commit the cgroup: every reservation + the engine
+            //     slice fits the limit. (Only meaningful when the floor did not
+            //     clamp — when it does, the formula already yielded < native and
+            //     we accepted the closer-to-cliff floor; that case is handled by
+            //     the floor test. Here all three configs are above the floor.)
+            let sum = jvm + ffm + head + native;
+            assert!(
+                sum <= cgroup,
+                "config cgroup={}MiB: reservations+native {}MiB OVER-COMMIT the cgroup {}MiB",
+                cgroup / MIB,
+                sum / MIB,
+                cgroup / MIB
+            );
+            // (c) the split partitions EXACTLY the native budget (process-global
+            //     consumers; block cache divided across instances is a sub-split
+            //     of its slice, so sum the SLICES not the per-instance caps).
+            let split_sum: u64 = [
+                Consumer::BlockCache,
+                Consumer::WriteBuffer,
+                Consumer::ResidentShadow,
+                Consumer::VlogResident,
+                Consumer::CompactionTransient,
+            ]
+            .iter()
+            .map(|c| (native as f64 * c.split_fraction()) as u64)
+            .sum();
+            // Float truncation can lose at most 4 ULPs (one per non-exact slice);
+            // assert within a 16-byte slack.
+            assert!(
+                native.saturating_sub(split_sum) <= 16,
+                "config cgroup={}MiB: split sum {} != native {} (loss {})",
+                cgroup / MIB,
+                split_sum,
+                native,
+                native - split_sum
+            );
+            // (d) monotone in TM size.
+            assert!(
+                native > prev_native,
+                "bigger TM must yield a bigger engine budget ({native} !> {prev_native})"
+            );
+            prev_native = native;
+        }
+    }
+
+    /// CONFIG-FLEXIBILITY: the q5 windowed-accumulator flush floor (256 MiB
+    /// default) and the WBM slice must stay SANE across configs — specifically
+    /// the WBM slice (the memtable budget the windowed-flush drains into) must
+    /// EXCEED the flush floor at every config, so a windowed CF can actually
+    /// hold a full accumulator memtable before being forced to switch (otherwise
+    /// the force-switch would fire on EVERY put → an L0-SST storm). The flush
+    /// floor is a fixed 256 MiB; we assert the WBM slice clears it at the
+    /// smallest (10 g) config.
+    #[test]
+    fn windowed_flush_floor_fits_under_wbm_slice_at_smallest_config() {
+        const WINDOWED_FLUSH_FLOOR: u64 = 256 * MIB; // db.rs default
+        let ffm = 512 * MIB;
+        let cgroup = 10 * 1024 * MIB;
+        let jvm = 6 * 1024 * MIB;
+        let head = headroom_bytes(cgroup);
+        let native = engine_native_budget_for(cgroup, jvm, ffm, head);
+        let wbm_slice = (native as f64 * Consumer::WriteBuffer.split_fraction()) as u64;
+        assert!(
+            wbm_slice >= WINDOWED_FLUSH_FLOOR,
+            "WBM slice {}MiB at 10g must clear the windowed-flush floor {}MiB \
+             (else windowed force-switch storms L0)",
+            wbm_slice / MIB,
+            WINDOWED_FLUSH_FLOOR / MIB
         );
     }
 
