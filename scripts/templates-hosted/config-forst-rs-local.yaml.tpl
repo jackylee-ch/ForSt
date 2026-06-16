@@ -98,3 +98,22 @@ rest:
 io:
   tmp:
     dirs: /tmp/flink-forst-rs-io
+
+# JDK 25 + Hadoop security: the forst-rs backend puts Hadoop 3.3.6 on the
+# classpath (it needs org.apache.hadoop.conf.Configuration), which makes Flink's
+# default HadoopModuleFactory run at installSecurityContext and call
+# UserGroupInformation.getCurrentUser() -> javax.security.auth.Subject.getSubject().
+# On JDK 25 that throws "UnsupportedOperationException: getSubject is not
+# supported" (SecurityManager removed, JEP 486) and the JM+TM crash on boot
+# (no TM registers -> ConnectException at INSERT). The earlier attempted fix
+# -Djava.security.manager=allow is WORSE on JDK 25: the VM refuses to start with
+# "java.lang.Error: A command line option has attempted to allow or enable the
+# Security Manager. Enabling a Security Manager is not supported." (=allow only
+# works on JDK 18-23). The correct JDK-25 fix is to NOT install Flink's Hadoop
+# security module at all: local file:// state needs no Kerberos/UGI. Override the
+# module list to drop HadoopModuleFactory so the getSubject path is never taken;
+# hadoop-common stays on the classpath for plain Configuration use.
+security:
+  module:
+    factory:
+      classes: org.apache.flink.runtime.security.modules.JaasModuleFactory;org.apache.flink.runtime.security.modules.ZookeeperModuleFactory
