@@ -58,26 +58,40 @@
 name: nexmark-accuracy-fullstack
 
 on:
-  # BOTH jobs in this workflow are OPT-IN (see each job's `if:` guard):
-  #   * fullstack-nexmark-accuracy — self-hosted `nexmark` runner, workflow_dispatch only.
-  #   * nexmark-accuracy-hosted   — hosted full-Flink-stack confirmation, on-demand
-  #     (workflow_dispatch) or repo-var `NEXMARK_HOSTED_ACCURACY == 'true'` opt-in.
-  # Neither gates every push: the hosted forst-rs JDK25+FFM Flink bring-up is
-  # infra-fragile on GitHub-hosted runners and was going red on every push. The
-  # faithful EVERY-PUSH accuracy guarantee is the engine-level Tier-1 gate in
-  # `accuracy-gate.yml` (real ForSt-RS engine vs real RocksDB), which is green.
-  # On a normal push both jobs are SKIPPED (green/neutral), never red.
+  # The hosted real-NEXMark accuracy gate (nexmark-accuracy-hosted) now runs on a
+  # DAILY schedule (the user-accepted minimum) so every change merged to forst-rs
+  # is accuracy-verified within 24 h by the FAITHFUL end-to-end gate: the actual
+  # q3/q5/q8/q11/q12 SQL through a real Flink 2.2.1 cluster on BOTH the forst-rs
+  # (JDK25+FFM) and rocksdb (JDK17) backends, byte-compared on a fixed 100K CSV.
+  # First GREEN hosted run (proving real-SQL, both backends, compare PASS):
+  # https://github.com/jackylee-ch/ForSt/actions/runs/27594789990
+  #
+  # Why DAILY (not per-commit): the bring-up is ~25-30 min (Rust .so build + lean
+  # Flink dist + Hadoop 3.4.3 + 10 sequential Flink SQL jobs). A daily cron keeps
+  # the cloud guarantee without that cost on every push. The fast EVERY-PUSH
+  # tripwire stays the engine-level gate in `accuracy-gate.yml` (real ForSt-RS
+  # engine vs real RocksDB on a NEXMark-shaped workload, green in ~3 s).
+  #
+  # Triggers below:
+  #   * schedule        — daily, runs nexmark-accuracy-hosted automatically.
+  #   * push/PR (forst-rs,main) on the gate's own files — re-validate the harness.
+  #   * workflow_dispatch — manual run (events/queries/force_gen inputs); set
+  #     run_selfhosted=true to ALSO run the self-hosted Tier-2 1M job.
+  schedule:
+    - cron: '0 7 * * *'   # 07:00 UTC daily
+  # push/PR triggers are intentionally SCOPED to the gate's OWN harness files
+  # (scripts + templates + this workflow) — NOT crates/** — so a code change does
+  # not fire the ~30-min hosted job on every commit; the DAILY schedule covers
+  # code changes. A harness/template/workflow edit re-validates the gate itself.
   push:
     branches: [forst-rs, main]
     paths:
-      - 'crates/**'
       - 'scripts/accuracy-gate/**'
       - 'scripts/templates-hosted/**'
       - '.github/workflows/nexmark-accuracy.yml'
   pull_request:
     branches: [forst-rs, main]
     paths:
-      - 'crates/**'
       - 'scripts/accuracy-gate/**'
       - 'scripts/templates-hosted/**'
       - '.github/workflows/nexmark-accuracy.yml'
@@ -96,16 +110,23 @@ on:
         type: boolean
         required: false
         default: false
+      run_selfhosted:
+        description: "Also run the self-hosted Tier-2 1M job (needs a [self-hosted,nexmark] runner)"
+        type: boolean
+        required: false
+        default: false
 
 permissions: read-all
 
 jobs:
   fullstack-nexmark-accuracy:
     name: "full-stack NEXMark accuracy (real Flink, forst-rs vs rocksdb)"
-    # Self-hosted Tier-2 (1M-scale confirmation) is on-demand ONLY: it would
-    # otherwise queue forever on every push when no `nexmark` runner is online.
-    # The every-push cloud guarantee is the nexmark-accuracy-hosted job below.
-    if: github.event_name == 'workflow_dispatch'
+    # Self-hosted Tier-2 (1M-scale confirmation) is OPT-IN ONLY: it must be
+    # explicitly requested with run_selfhosted=true on a manual dispatch, else it
+    # would queue forever when no `nexmark` runner is online (which made plain
+    # dispatch/schedule runs hang). The automatic cloud guarantee is the hosted
+    # nexmark-accuracy-hosted job below.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_selfhosted == 'true'
     runs-on: [self-hosted, nexmark]
     timeout-minutes: 180
     env:
@@ -217,24 +238,24 @@ jobs:
   # ==========================================================================
   nexmark-accuracy-hosted:
     name: "hosted real-NEXMark accuracy (real Flink SQL, forst-rs vs rocksdb, 100K)"
-    # OPT-IN ONLY — do NOT gate every push.
+    # RUNS AUTOMATICALLY on the DAILY schedule (and on manual dispatch, on push/PR
+    # touching the gate's own files, or via repo-var NEXMARK_HOSTED_ACCURACY opt-in).
     #
-    # This hosted full-Flink-stack attempt is INFRA-FRAGILE on GitHub-hosted
-    # runners: the rocksdb (JDK17) reference captures fine, but the forst-rs
-    # JDK25+FFM Flink standalone cluster does not reliably come up / produce
-    # captures within the hosted runner's resource + port-race envelope, so the
-    # compare step reports "frs=MISSING" and the job goes red on EVERY push — a
-    # pure infra failure, not a real accuracy regression. The genuinely faithful
-    # every-push accuracy GUARANTEE is the engine-level Tier-1 gate in
-    # `accuracy-gate.yml` (real ForSt-RS engine vs real RocksDB), which is green.
-    #
-    # Gate this real-Flink E2E confirmation to run only on `workflow_dispatch`
-    # (manual) or when a maintainer opts in via repo variable
-    # `NEXMARK_HOSTED_ACCURACY == 'true'` (Settings -> Variables -> Actions).
-    # On a normal push it is SKIPPED — a skipped job is green/neutral, never red.
-    # The real compare logic below is preserved intact for on-demand use; once the
-    # hosted Flink bring-up is made reliable the variable can be flipped on.
-    if: github.event_name == 'workflow_dispatch' || vars.NEXMARK_HOSTED_ACCURACY == 'true'
+    # The forst-rs JDK25+FFM cluster bring-up is now RELIABLE. The historical
+    # "frs=MISSING" failure was NOT a port/resource race: both the forst-rs JM and
+    # TM crashed on boot with "getSubject is not supported" because Hadoop 3.3.6's
+    # UserGroupInformation calls the JDK18+-removed Subject.getSubject(). Fixed by
+    # (1) bumping the downloaded Hadoop dist to 3.4.3 (HADOOP-19212 migrated UGI to
+    # Subject.current()/callAs) and (2) dropping Flink's HadoopModuleFactory for
+    # local file:// state. With that, the real q3/q5/q8/q11/q12 SQL runs on BOTH
+    # backends and the sha256 multiset compare PASSES (first green run linked in the
+    # `on:` block above). The fast every-push tripwire remains accuracy-gate.yml.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      vars.NEXMARK_HOSTED_ACCURACY == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -414,40 +435,10 @@ jobs:
           sleep 8
           echo "remaining flink procs:"; pgrep -af 'TaskManagerRunner|StandaloneSession|SqlGateway' || echo none
 
-      # DIAGNOSTIC: bring up the forst-rs (JDK25+FFM) standalone cluster directly
-      # and dump the TaskManager .out/.log so a TM boot failure (native .so load /
-      # JDK25 module opts / memory) is VISIBLE. The per-query measure-print loop
-      # wipes $FLINK_HOME/log each run, so without this the TM crash is invisible
-      # and we only see "cluster up (tms=)" + connection-refused at submit time.
-      # never-fail (|| true): purely informational, the real gate is the loop.
-      - name: DIAG — forst-rs cluster smoke (dump TM boot log)
-        if: always()
-        run: |
-          set +e
-          "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1
-          pkill -9 -f 'TaskManagerRunner|StandaloneSession|SqlGateway|SqlClient' 2>/dev/null
-          sleep 5
-          rm -f "$FLINK_HOME"/log/* 2>/dev/null
-          # Apply the forst-rs config exactly as measure-print.sh does.
-          envsubst '' < "$TEMPLATES/config-forst-rs-local.yaml.tpl" > "$FLINK_HOME/conf/config.yaml"
-          rm -rf /tmp/flink-forst-rs-io /tmp/flink-forst-rs-cache /tmp/flink-forst-rs-data /tmp/nexmark-checkpoints-forst-rs
-          echo "== JAVA_HOME(JDK25)=$JDK25 =="
-          "$JDK25/bin/java" -version 2>&1 || true
-          echo "== starting forst-rs cluster (JDK25) =="
-          JAVA_HOME="$JDK25" "$FLINK_HOME"/bin/start-cluster.sh 2>&1 || true
-          for i in $(seq 1 20); do
-            tms=$(curl -sf http://localhost:8081/overview 2>/dev/null | grep -oE '"taskmanagers":[0-9]+' | grep -oE '[0-9]+$')
-            echo "[poll $i] taskmanagers=$tms"
-            [ -n "$tms" ] && [ "$tms" -ge 1 ] && break
-            sleep 3
-          done
-          echo "===== taskexecutor .out ====="; tail -n 120 "$FLINK_HOME"/log/*taskexecutor*.out 2>/dev/null || echo "(none)"
-          echo "===== taskexecutor .log ====="; tail -n 200 "$FLINK_HOME"/log/*taskexecutor*.log 2>/dev/null || echo "(none)"
-          echo "===== standalonesession .log ====="; tail -n 80 "$FLINK_HOME"/log/*standalonesession*.log 2>/dev/null || echo "(none)"
-          echo "===== log dir ====="; ls -la "$FLINK_HOME"/log 2>/dev/null
-          "$FLINK_HOME"/bin/stop-cluster.sh >/dev/null 2>&1
-          pkill -9 -f 'TaskManagerRunner|StandaloneSession' 2>/dev/null
-          true
+      # (The standalone forst-rs cluster smoke that proved the getSubject boot
+      # crash has been removed now that the gate is green: measure-print.sh dumps
+      # the JM/TM boot logs itself on any tms-fail, so a future regression is still
+      # visible without paying the extra cluster start/stop on every green run.)
 
       - name: Run each query on BOTH backends through real Flink SQL
         run: |
