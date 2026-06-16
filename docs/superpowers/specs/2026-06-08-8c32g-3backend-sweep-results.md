@@ -1,6 +1,61 @@
 # 8c/32g 3-backend NexMark sweep — verified time + accuracy (2026-06-08)
 
 # ═══════════════════════════════════════════════════════════════════════════
+# ★★★★ PMC-1 q9 OOM ROOT CAUSE = TM SLOT-PLACEMENT SKEW (NOT memory) 2026-06-16
+# ═══════════════════════════════════════════════════════════════════════════
+# THE SYMPTOM (prior sessions): q9 @100M at the uniform 2×4c/16g split OOM-killed
+# tm1 at the END-OF-RUN join peak. The decisive observation: at the kill tm1 held
+# ~15.9 GiB while tm2 idled <1 GiB — and the CLUSTER total was only ~17 GiB, far
+# below the 2×16=32 GiB the split provisions. That is NOT a memory ceiling. ONE
+# TaskManager was holding ~all of q9's join state while the other sat empty.
+#
+# ── DIAGNOSIS: Flink 2.x default slot placement packs the job onto ONE TM ──
+# q9's heavy stateful operator is the auction×bid interval-join + ROW_NUMBER rank,
+# KEYED by auction id (PARTITION BY A.id; ~10M distinct auctions at 100M scale —
+# high cardinality, so NOT a hot key and NOT parallelism-1). The job graph runs it
+# at parallelism 4 (Join[10]→Calc[11] par=4, Rank[13] par=4 — confirmed via the
+# Flink REST /jobs/<id> vertices). The split provisions 2 TMs × 4 slots = 8 slots,
+# but the job needs only 4. WHO gets those 4 slots is the bug:
+#   * Flink 2.0 REMOVED `cluster.evenly-spread-out-slots`; its replacement
+#     `taskmanager.load-balance.mode` DEFAULTS to NONE = "allocate slots on the
+#     MINIMUM number of TMs" (TaskManagerOptions.java:700 + the enum doc).
+#   * So all 4 subtasks of the keyed join landed on tm1's 4 slots. The key-groups
+#     ARE split 4 ways across the 4 subtasks — but all 4 subtasks live on tm1, so
+#     ~100% of the join state piles onto tm1's cgroup → tm1 OOM, tm2 idle.
+#   * Pure DISTRIBUTION bug. The state was always splittable; the topology just
+#     stacked every shard on one box.
+#
+# ── THE FIX: taskmanager.load-balance.mode = SLOTS (uniform, same resource) ──
+# Set `taskmanager: load-balance: mode: SLOTS` in ALL backend templates
+# (config-forst-rs-local / config-rocksdb / config-forst-local). SLOTS mode
+# "spreads out the slots evenly across all available TaskManagers" → the 4
+# subtasks distribute 2+2 across tm1/tm2, each TM holds ~half the join state.
+# This adds NO resources — it only redistributes the work the 2×4c/16g split
+# already exists to parallelize. Uniform across backends → fair topology
+# (RocksDB/ForSt get the identical placement; nobody is handed a better split).
+# parallelism stays 4 (unchanged, matches RocksDB/ForSt).
+#
+# ── VALIDATION: q9 @100M @2×4c/16g SPLIT, KV-sep ON, full mem-stack + SLOTS ──
+# REST /taskmanagers at job start: BOTH TMs freeSlots=2/4 (= 2 subtasks each) —
+# the spread is confirmed, not stacked. docker-stats per-TM RSS across the run:
+#   peak tm1≈14.69 GiB / tm2≈14.57 GiB, tracking within ~0.8 GiB the whole run
+#   (vs the old tm1=15.9 / tm2<1). After source drain both fell to ~5 GiB.
+#   A 15s fast-watcher NEVER tripped its 15-GiB-per-TM threshold → neither TM
+#   crossed 15 GiB; ~1.3 GiB cgroup headroom held throughout.
+#   RESULT: q9 FINISHED wall=1552.3s, src_out=98,000,000,
+#           out_rows=91,813,372 (EXACT), both TMs alive, NO OOM.
+# So the skew fix is what makes q9 fit 16g/TM — by halving per-TM state, not by
+# trimming the engine. (The process.size=10240m native-headroom carve from the
+# prior session is retained and complementary.)
+#
+# Worktree q9-skew; templates-linux config-{forst-rs-local,rocksdb,forst-local}.
+# Honest negative: at the very end tm2 ran ~0.8 GiB above tm1 for a stretch
+# (normal per-key-group size variance, not the catastrophic single-TM skew) —
+# both stayed well under 16g. parallelism>4 (e.g. 8 = fill all slots) was NOT
+# needed and NOT changed (would diverge from the RocksDB/ForSt parallelism=4
+# baseline → unfair); SLOTS at parallelism 4 already balances the two TMs.
+
+# ═══════════════════════════════════════════════════════════════════════════
 # ★★★★ PMC-1 DYNAMIC MEMORY-PRESSURE LEVER SHEDDING (FRS-DYN-SHED) 2026-06-16
 # ═══════════════════════════════════════════════════════════════════════════
 # THE PROBLEM (sweep 791aa54cd/98cef906b/a0bf505e7): at the uniform 2×4c/16g

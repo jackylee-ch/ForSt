@@ -22,6 +22,11 @@ taskmanager:
   bind-host: localhost
   host: localhost
   numberOfTaskSlots: 4
+  # SLOT-SKEW FIX (2026-06-16, PMC-1): spread slots evenly across both TMs (Flink
+  # 2.0 default load-balance.mode=NONE packs a job into the fewest TMs). Set
+  # identically across all backend templates for a FAIR topology.
+  load-balance:
+    mode: SLOTS
   memory:
     process:
       size: 12288m
