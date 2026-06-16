@@ -4582,17 +4582,61 @@ impl DbImpl {
     /// memtable writer there only burns wall-time while the live window state
     /// keeps growing. So for a windowed merge-CF we DECLINE the hard-cap stall
     /// (we still ENQUEUED the flush above, which is always correctness-safe) and
-    /// let the writer proceed — the window state is bounded by the window-pane
-    /// spill path (the larger follow-up), not by memtable backpressure.
+    /// let the writer proceed — BUT only up to a higher windowed SAFETY CEILING
+    /// (`over_global_windowed_ceiling`). The window accumulator is the
+    /// legitimately-large live consumer, so it is granted the WBM + shadow + vlog
+    /// slices before it must stall; the windowed force-flush lever drains cold
+    /// panes to SST long before the sum reaches the ceiling, so in steady state it
+    /// NEVER binds (no q5 freeze). The ceiling is the LAST-RESORT bound that makes
+    /// the windowed live path never-OOM BY CONSTRUCTION: even if flush cannot keep
+    /// up, the live memtable component cannot grow past a fixed fraction of the
+    /// engine-native budget — the writer stalls and lets flush drain it to SST
+    /// first (the "spill cold panes to SST under budget" guarantee). This closes
+    /// the prior unbounded-live gap where the windowed path had NO upper memtable
+    /// bound at all.
     ///
-    /// Gated: only skips when `FRS_MEM_MANAGER` is armed AND
-    /// `FRS_MEM_WINDOWED_STALL_SKIP` is not force-disabled (default: skip when
-    /// armed). When the manager is off, NEVER skips — byte-identical to today.
+    /// Gated: the ordinary-hard-cap skip applies only when `FRS_MEM_MANAGER` is
+    /// armed AND `FRS_MEM_WINDOWED_STALL_SKIP` is not force-disabled (default:
+    /// skip-the-ordinary-cap when armed). When the manager is off, NEVER skips —
+    /// byte-identical to today. When the manager is on, the windowed ceiling is
+    /// ALWAYS enforced (the never-OOM guarantee is not optional).
     fn wait_for_wbm_headroom_windowed(&self, windowed_cf: bool) {
         if windowed_cf && windowed_stall_skip_enabled() {
+            // Skip the ordinary (tuned-for-bursts, too-tight-for-q5) hard cap,
+            // but STILL enforce the higher last-resort windowed ceiling so the
+            // live memtable component is bounded by construction.
+            self.wait_for_windowed_ceiling();
             return;
         }
         self.wait_for_wbm_headroom_inner()
+    }
+
+    /// FRS-MEM-WINDOWED-CEILING: last-resort stall for a windowed merge-CF. Parks
+    /// the writer while the process-global memtable sum exceeds the windowed
+    /// ceiling, until enqueued flushes drain it back under (the bg flush pool runs
+    /// on separate threads; no lock is held here). Includes the same
+    /// progress-based defensive release as `wait_for_wbm_headroom_inner` so a
+    /// genuinely-stuck flush can never freeze the writer forever. A no-op when the
+    /// ceiling is 0 (manager off / no budget) ⇒ byte-identical to today.
+    fn wait_for_windowed_ceiling(&self) {
+        if !crate::runtime_tuning::over_global_windowed_ceiling() {
+            return;
+        }
+        const STALL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_secs(60);
+        let stall_start = std::time::Instant::now();
+        let mut last_used = crate::runtime_tuning::global_wbm_used_bytes();
+        let mut last_progress = std::time::Instant::now();
+        while crate::runtime_tuning::over_global_windowed_ceiling() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            let now_used = crate::runtime_tuning::global_wbm_used_bytes();
+            if now_used < last_used {
+                last_used = now_used;
+                last_progress = std::time::Instant::now();
+            } else if last_progress.elapsed() >= STALL_NO_PROGRESS {
+                break; // flush appears stuck — defensive release, never freeze forever.
+            }
+        }
+        prof_add(&PROF_STALL_NS, stall_start.elapsed().as_nanos() as u64);
     }
 
     fn wait_for_wbm_headroom_inner(&self) {

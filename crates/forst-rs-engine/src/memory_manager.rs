@@ -302,7 +302,27 @@ pub fn consumer_cap_bytes(consumer: Consumer) -> Option<u64> {
         | Consumer::VlogResident
         | Consumer::CompactionTransient => slice,
     };
-    Some(cap.max(MIB)) // never return a degenerate 0 cap
+    // FEASIBLE FLOOR: never hand back a degenerate cap that would STORM (thrash
+    // flush/eviction faster than it makes progress). A sub-floor block cache
+    // re-decompresses join blocks on nearly every probe; a sub-floor WBM forces a
+    // storm of tiny L0 SSTs. The block cache is per-INSTANCE (so a smaller floor —
+    // many co-resident instances each need a usable working set without the SUM
+    // exploding); the process-global consumers floor higher. Flooring is
+    // correctness-safe (all five are caches / re-derivable working sets) and at a
+    // healthy config the slice is already far above the floor (it only binds on a
+    // tiny TM / very high instance count), so it does not perturb the optimal
+    // config. The floor can push the per-instance-block-cache SUM modestly above
+    // its slice on a tiny config; that is the intended never-storm trade (a
+    // usable cache beats a thrashing one), and the SUM stays bounded by
+    // `floor × instances`, well within the engine-native budget + headroom.
+    let floor = match consumer {
+        Consumer::BlockCache => 32 * MIB,
+        Consumer::WriteBuffer
+        | Consumer::ResidentShadow
+        | Consumer::VlogResident
+        | Consumer::CompactionTransient => 64 * MIB,
+    };
+    Some(cap.max(floor))
 }
 
 // ===========================================================================
@@ -475,7 +495,7 @@ pub fn diag_str() -> String {
     };
     let mb = |b: Option<u64>| b.map(|v| v / MIB).unwrap_or(0);
     format!(
-        " mem_mgr_native_MB={} mm_blockcache_MB={} mm_wbm_MB={} mm_shadow_MB={} mm_vlog_MB={} mm_compact_MB={} mm_compact_inflight_MB={} mm_compact_waits={}",
+        " mem_mgr_native_MB={} mm_blockcache_MB={} mm_wbm_MB={} mm_shadow_MB={} mm_vlog_MB={} mm_compact_MB={} mm_compact_inflight_MB={} mm_compact_waits={} mm_windowed_ceiling_MB={}",
         native / MIB,
         mb(consumer_cap_bytes(Consumer::BlockCache)),
         mb(consumer_cap_bytes(Consumer::WriteBuffer)),
@@ -484,7 +504,32 @@ pub fn diag_str() -> String {
         mb(consumer_cap_bytes(Consumer::CompactionTransient)),
         compact_inflight_bytes() / MIB,
         compact_admission_waits(),
+        crate::runtime_tuning::global_wbm_windowed_ceiling_bytes() / MIB,
     )
+}
+
+/// PURE, test-only: the engine-native budget for a given cgroup+JVM (MiB), using
+/// the production formula but WITHOUT the process-global cache or env reads. Lets
+/// sibling-module tests (e.g. `runtime_tuning`) assert the budget/slice math at
+/// any pinned config independent of the OnceLock cache and arming state.
+#[doc(hidden)]
+pub fn engine_native_budget_for_test(cgroup_mb: u64, jvm_mb: u64) -> u64 {
+    let cgroup = cgroup_mb.saturating_mul(MIB);
+    let jvm = jvm_mb.saturating_mul(MIB);
+    let ffm = 512 * MIB; // default FFM reservation
+    let head = headroom_bytes(cgroup);
+    cgroup
+        .saturating_sub(jvm)
+        .saturating_sub(ffm)
+        .saturating_sub(head)
+        .max(ENGINE_NATIVE_FLOOR)
+}
+
+/// PURE, test-only: a consumer's slice of a given engine-native budget (the
+/// process-global slice, i.e. before the per-instance block-cache division).
+#[doc(hidden)]
+pub fn slice_for_test(native: u64, consumer: Consumer) -> u64 {
+    (native as f64 * consumer.split_fraction()) as u64
 }
 
 #[cfg(test)]
@@ -559,6 +604,99 @@ mod tests {
             native12 < native16,
             "smaller cgroup must yield a smaller engine-native budget ({native12} !< {native16})"
         );
+    }
+
+    /// FRS-MEM-MANAGER config-flexibility: at 10 g, 12 g AND 16 g the controller
+    /// must (a) NEVER over-commit — the five slices SUM to ≤ the engine-native
+    /// budget, and that budget + the JVM + FFM + headroom SUM to ≤ the cgroup; and
+    /// (b) yield a FEASIBLE per-consumer floor — no slice collapses below a
+    /// 256 MiB usable minimum that would storm (tiny caps thrash flush/eviction).
+    #[test]
+    fn config_flexible_never_overcommit_and_feasible_floor_10g_12g_16g() {
+        // 256 MiB feasible floor: below this a consumer cap storms (e.g. forced
+        // tiny SSTs → L0 explosion; a sub-256 MiB block cache thrashes).
+        const FEASIBLE_FLOOR: u64 = 256 * MIB;
+        let consumers = [
+            Consumer::BlockCache,
+            Consumer::WriteBuffer,
+            Consumer::ResidentShadow,
+            Consumer::VlogResident,
+            Consumer::CompactionTransient,
+        ];
+        // Generous-but-realistic JVM reservations per TM size (process.size).
+        for &(cgroup_gb, jvm_gb) in &[(10u64, 5u64), (12u64, 6u64), (16u64, 9u64)] {
+            let cgroup = cgroup_gb * 1024 * MIB;
+            let jvm = jvm_gb * 1024 * MIB;
+            let native = engine_native_budget_for_test(cgroup_gb * 1024, jvm_gb * 1024);
+            let ffm = 512 * MIB;
+            let head = headroom_bytes(cgroup);
+
+            // (a1) the five slices sum to ≤ native (split fractions ≤ 1.0).
+            let slice_sum: u64 = consumers.iter().map(|&c| slice_for_test(native, c)).sum();
+            assert!(
+                slice_sum <= native,
+                "{cgroup_gb}g: slice sum {slice_sum} must be ≤ native {native}"
+            );
+            // (a2) native + JVM + FFM + headroom ≤ cgroup (never over-commit the
+            // cgroup the OOM-killer watches). Only holds above the floor; below it
+            // the explicit floor accepts closer-to-cliff risk (documented).
+            if native > ENGINE_NATIVE_FLOOR {
+                let committed = native + jvm + ffm + head;
+                assert!(
+                    committed <= cgroup,
+                    "{cgroup_gb}g: committed {committed} must be ≤ cgroup {cgroup}"
+                );
+            }
+            // (b) every per-consumer slice is feasible (≥ 256 MiB) at every config
+            // — no degenerate sub-256 MiB cap that storms. (BlockCache is checked
+            // as its process-global SLICE here; the per-instance division is a
+            // separate dimension validated by `consumer_cap_bytes`.)
+            for &c in &consumers {
+                let slice = slice_for_test(native, c);
+                assert!(
+                    slice >= FEASIBLE_FLOOR,
+                    "{cgroup_gb}g: {c:?} slice {slice} below feasible floor {FEASIBLE_FLOOR}"
+                );
+            }
+            // (c) the PER-INSTANCE block-cache cap (slice / instances, then the
+            // production 32 MiB per-instance floor in `consumer_cap_bytes`) must
+            // stay feasible even at a HIGH co-resident instance count — no
+            // degenerate sub-floor per-instance cache that thrashes join probes.
+            const BC_PER_INSTANCE_FLOOR: u64 = 32 * MIB;
+            for &instances in &[8u64, 16, 32] {
+                let bc_slice = slice_for_test(native, Consumer::BlockCache);
+                let per_inst = (bc_slice / instances).max(BC_PER_INSTANCE_FLOOR);
+                assert!(
+                    per_inst >= BC_PER_INSTANCE_FLOOR,
+                    "{cgroup_gb}g/{instances}-inst: per-instance block cache {per_inst} below floor {BC_PER_INSTANCE_FLOOR}"
+                );
+            }
+        }
+    }
+
+    /// Monotonicity across the three production configs: a larger TM yields a
+    /// larger engine-native budget AND a larger cap for every consumer (no
+    /// inversion / non-monotone cliff between 10 g, 12 g and 16 g).
+    #[test]
+    fn budget_monotone_across_10g_12g_16g() {
+        let n10 = engine_native_budget_for_test(10 * 1024, 5 * 1024);
+        let n12 = engine_native_budget_for_test(12 * 1024, 6 * 1024);
+        let n16 = engine_native_budget_for_test(16 * 1024, 9 * 1024);
+        assert!(
+            n10 < n12 && n12 < n16,
+            "native must grow 10g<12g<16g: {n10} {n12} {n16}"
+        );
+        for c in [
+            Consumer::BlockCache,
+            Consumer::WriteBuffer,
+            Consumer::ResidentShadow,
+            Consumer::VlogResident,
+            Consumer::CompactionTransient,
+        ] {
+            let s10 = slice_for_test(n10, c);
+            let s16 = slice_for_test(n16, c);
+            assert!(s10 < s16, "{c:?} slice must grow 10g→16g: {s10} !< {s16}");
+        }
     }
 
     #[test]

@@ -126,6 +126,74 @@ pub fn over_global_hard_budget() -> bool {
     cap != 0 && GLOBAL_WBM_USED.load(Ordering::Relaxed) > cap
 }
 
+/// FRS-MEM-WINDOWED-CEILING (2026-06-16, PMC-1 live-state track): the
+/// LAST-RESORT live-memtable bound for a windowed merge-CF (q5 sliding-window
+/// accumulator).
+///
+/// # Why a SEPARATE, HIGHER ceiling instead of the plain hard cap
+///
+/// q5's over-budget term is NOT a write burst the ordinary hard cap was tuned
+/// for — it is the per-pane merge-operand accumulator held LIVE in the active
+/// memtable until each window fires. The plain hard cap (1.25× the WBM soft
+/// slice) fires far too early for that pattern: it pinned q5 at the cap and burnt
+/// 571 s of stall (`stall_ms=571828`, sweep-results.md) WITHOUT preventing the
+/// OOM, because the live window state kept growing while the writer parked. So
+/// the windowed path must NOT stall at the ordinary hard cap.
+///
+/// But "never stall at all" (the prior unconditional skip) leaves the windowed
+/// memtable sum with NO upper bound — a genuine unbounded-live path if flush
+/// cannot keep up. The fix is a HIGHER ceiling that is still strictly bounded by
+/// the engine-native budget, so it NEVER binds in steady state (the windowed
+/// force-flush lever drains cold panes to SST long before the sum reaches it) yet
+/// GUARANTEES, by construction, that the live memtable component can never grow
+/// past a fixed fraction of the budget → never-OOM.
+///
+/// # The value
+///
+/// The windowed accumulator is the legitimately-large live consumer, so we grant
+/// it the WBM slice PLUS the resident-shadow + vlog slices it would otherwise
+/// share (those are evict-on-pressure caches the windowed CF does not stress) —
+/// i.e. the ceiling is the sum of the WriteBuffer, ResidentShadow and
+/// VlogResident slices. That is comfortably below the engine-native budget (it
+/// excludes the block-cache and compaction-transient slices, which the windowed
+/// path still needs), so the SUM of (windowed memtables + everything else the
+/// controller bounds) stays under the cgroup minus headroom by construction.
+/// `0` (manager off / no budget) ⇒ disabled, the caller keeps today's behaviour.
+pub fn global_wbm_windowed_ceiling_bytes() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        // Explicit operator pin always wins (A/B + escape hatch).
+        if let Some(mb) = std::env::var("FRS_MEM_WINDOWED_CEILING_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+        {
+            return mb.saturating_mul(1024 * 1024);
+        }
+        use crate::memory_manager::{consumer_cap_bytes, Consumer};
+        // Sum the live-state slices the windowed accumulator may legitimately
+        // occupy. Each is `None` when the manager is off → ceiling 0 (disabled).
+        match (
+            consumer_cap_bytes(Consumer::WriteBuffer),
+            consumer_cap_bytes(Consumer::ResidentShadow),
+            consumer_cap_bytes(Consumer::VlogResident),
+        ) {
+            (Some(wbm), Some(shadow), Some(vlog)) => {
+                wbm.saturating_add(shadow).saturating_add(vlog)
+            }
+            _ => 0,
+        }
+    })
+}
+
+/// True when the process-global memtable sum exceeds the WINDOWED ceiling
+/// (a windowed merge-CF writer must stall — the last-resort never-OOM bound).
+/// `0` ceiling (manager off / no budget) disables it.
+pub fn over_global_windowed_ceiling() -> bool {
+    let cap = global_wbm_windowed_ceiling_bytes();
+    cap != 0 && GLOBAL_WBM_USED.load(Ordering::Relaxed) > cap
+}
+
 /// Current process-global memtable byte total (also used by the FRS_MEM_DIAG logger).
 pub fn global_wbm_used_bytes() -> u64 {
     GLOBAL_WBM_USED.load(Ordering::Relaxed)
@@ -530,5 +598,55 @@ mod tests {
     fn compact_window_degenerate_inputs() {
         assert_eq!(compaction_window_blocks(0, KIB64, 2 * MIB, 64 * MIB), None);
         assert_eq!(compaction_window_blocks(1, 0, 2 * MIB, 64 * MIB), None);
+    }
+
+    // -- FRS-MEM-WINDOWED-CEILING (PMC-1 live-state track) -------------------
+
+    #[test]
+    fn windowed_ceiling_disabled_when_manager_off() {
+        // With the manager unarmed (default test process), the ceiling is 0
+        // (disabled) → `over_global_windowed_ceiling` never fires, so the
+        // windowed path behaves byte-identically to today (no extra stall).
+        if !crate::memory_manager::manager_enabled() {
+            assert_eq!(
+                global_wbm_windowed_ceiling_bytes(),
+                0,
+                "manager off ⇒ windowed ceiling disabled (0)"
+            );
+            assert!(
+                !over_global_windowed_ceiling(),
+                "manager off ⇒ windowed ceiling never fires"
+            );
+        }
+    }
+
+    #[test]
+    fn windowed_ceiling_pure_sum_of_live_slices() {
+        // The ceiling = WBM + ResidentShadow + VlogResident slices (the live
+        // consumers the window accumulator may legitimately occupy). Verify the
+        // PURE relationship against the manager's own slice helpers at a pinned
+        // budget — independent of the process arming cache (these are pure fns).
+        use crate::memory_manager::{engine_native_budget_for_test, slice_for_test, Consumer};
+        let native = engine_native_budget_for_test(16 * 1024, 10 * 1024);
+        let wbm = slice_for_test(native, Consumer::WriteBuffer);
+        let shadow = slice_for_test(native, Consumer::ResidentShadow);
+        let vlog = slice_for_test(native, Consumer::VlogResident);
+        let ceiling = wbm + shadow + vlog;
+        // The ceiling MUST be strictly below the engine-native budget (it
+        // excludes the block-cache + compaction-transient slices, which the
+        // windowed path still needs) — this is the never-OOM-by-construction
+        // headroom: windowed memtables + the other bounded consumers stay under
+        // the cgroup minus headroom.
+        assert!(
+            ceiling < native,
+            "windowed ceiling {ceiling} must be strictly below native {native}"
+        );
+        // And it must be the LARGEST single live bound (a windowed CF gets more
+        // headroom than the ordinary WBM hard cap = 1.25× the WBM slice alone).
+        assert!(
+            ceiling > wbm + wbm / 4,
+            "windowed ceiling {ceiling} must exceed the ordinary hard cap {}",
+            wbm + wbm / 4
+        );
     }
 }

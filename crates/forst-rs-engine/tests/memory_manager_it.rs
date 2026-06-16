@@ -256,3 +256,80 @@ fn windowed_merge_cf_output_byte_identical_armed_vs_off() {
     std::env::remove_var("FRS_JVM_RESERVED_MB");
     std::env::remove_var("FRS_MEM_WINDOWED_FLUSH_MB");
 }
+
+/// FRS-MEM-WINDOWED-CEILING (PMC-1 live-state track): the last-resort windowed
+/// safety ceiling — the never-OOM-by-construction bound that replaced the prior
+/// UNCONDITIONAL stall-skip — must be BYTE-IDENTICAL. Forcing the ceiling
+/// pathologically LOW (so the writer actually stalls on it during the merge
+/// workload) changes only the TIMING of when bytes move to SST, never the merged
+/// value. This is the state-equivalence gate for the q5 never-OOM bound: a
+/// windowed merge-CF read returns the exact operand concatenation whether or not
+/// the ceiling stall fires.
+#[test]
+fn windowed_ceiling_stall_output_byte_identical() {
+    fn merge_fingerprint(
+        db: &Arc<DbImpl>,
+        n_keys: u32,
+        ops_per_key: u32,
+    ) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        let cf = db
+            .create_column_family(
+                ColumnFamilyDescriptor::new("win_ceiling")
+                    .with_merge_operator(Arc::new(RawConcatMergeOperator::new())),
+            )
+            .expect("create merge cf");
+        let mut expected: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        for k in 0..n_keys {
+            let key = format!("wc{k:06}").into_bytes();
+            let mut concat: Vec<u8> = Vec::new();
+            for o in 0..ops_per_key {
+                let operand = format!("op-{k}-{o}-{}", "z".repeat(48)).into_bytes();
+                concat.extend_from_slice(&operand);
+                db.merge(&cf, &key, &operand).expect("merge operand");
+            }
+            expected.push((key, Some(concat)));
+        }
+        db.switch_and_flush(&cf).expect("flush merge cf");
+        let mut actual = Vec::new();
+        for (key, _) in &expected {
+            actual.push((key.clone(), db.get(&cf, key).expect("get merge")));
+        }
+        assert_eq!(
+            actual, expected,
+            "merge read-back must equal operand concat"
+        );
+        actual
+    }
+
+    // Baseline: manager OFF env (ceiling disabled → no extra stall).
+    std::env::remove_var("FRS_MEM_MANAGER");
+    std::env::remove_var("FRS_MEM_WINDOWED_CEILING_MB");
+    let off_dir = tempfile::tempdir().expect("off tempdir");
+    let off_db = open_local(&off_dir.path().to_string_lossy());
+    let baseline = merge_fingerprint(&off_db, 300, 48);
+    drop(off_db);
+
+    // Armed with a pathologically LOW windowed ceiling (1 MiB) so the writer
+    // hits `wait_for_windowed_ceiling` during the workload. The progress-based
+    // defensive release guarantees forward progress; the output must still match.
+    std::env::set_var("FRS_MEM_MANAGER", "1");
+    std::env::set_var("FRS_MEM_CGROUP_MB", "16384");
+    std::env::set_var("FRS_JVM_RESERVED_MB", "10240");
+    std::env::set_var("FRS_MEM_WINDOWED_FLUSH_MB", "1"); // flush cold panes fast
+    std::env::set_var("FRS_MEM_WINDOWED_CEILING_MB", "1"); // ceiling fires
+
+    let armed_dir = tempfile::tempdir().expect("armed tempdir");
+    let armed_db = open_local(&armed_dir.path().to_string_lossy());
+    let armed = merge_fingerprint(&armed_db, 300, 48);
+
+    assert_eq!(
+        armed, baseline,
+        "windowed-ceiling stall must be byte-identical (timing-only, never output)"
+    );
+
+    std::env::remove_var("FRS_MEM_MANAGER");
+    std::env::remove_var("FRS_MEM_CGROUP_MB");
+    std::env::remove_var("FRS_JVM_RESERVED_MB");
+    std::env::remove_var("FRS_MEM_WINDOWED_FLUSH_MB");
+    std::env::remove_var("FRS_MEM_WINDOWED_CEILING_MB");
+}
