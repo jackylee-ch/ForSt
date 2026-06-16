@@ -314,24 +314,34 @@ jobs:
       # at SQL-submit time (the harness puts $HADOOP_HOME/share/hadoop/**/*.jar on
       # HADOOP_CLASSPATH). rocksdb does not need it. Provide a Hadoop dist so the
       # forst-rs backend can submit. (Cached; ~700 MB download only on cache miss.)
+      # Hadoop 3.4.3 (NOT 3.3.6): the forst-rs backend runs on JDK25, and Flink's
+      # installSecurityContext -> HadoopUtils.getHadoopConfiguration calls
+      # org.apache.hadoop.security.UserGroupInformation.getCurrentUser(), which on
+      # JDK18+ hits Subject.getSubject() -> UnsupportedOperationException. Hadoop
+      # 3.3.6 has NOT migrated to the Subject.current()/callAs replacement APIs, so
+      # BOTH the forst-rs JobManager and TaskManager crashed on boot
+      # ("getSubject is not supported") and never registered (tms=) -> every
+      # forst-rs query SUBMIT_FAILED. HADOOP-19212 migrated UGI off the removed
+      # APIs in Hadoop 3.4.3 / 3.5.0; -Djava.security.manager=allow is NOT a fix
+      # because JDK24+ (JEP 486) rejects it outright. So pin Hadoop 3.4.3.
       - name: Cache Hadoop dist
         id: cache-hadoop
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/.hadoop/hadoop-3.3.6
-          key: hadoop-3.3.6-dist
-      - name: Download Hadoop 3.3.6 (cache miss only)
+          path: ${{ github.workspace }}/.hadoop/hadoop-3.4.3
+          key: hadoop-3.4.3-dist
+      - name: Download Hadoop 3.4.3 (cache miss only)
         if: steps.cache-hadoop.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.hadoop"
           # dlcdn is the fast CDN mirror; archive.apache.org is the slow fallback.
           curl -fL --retry 3 -o /tmp/hadoop.tgz \
-            https://dlcdn.apache.org/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz \
+            https://dlcdn.apache.org/hadoop/common/hadoop-3.4.3/hadoop-3.4.3.tar.gz \
             || curl -fL --retry 3 -o /tmp/hadoop.tgz \
-            https://archive.apache.org/dist/hadoop/common/hadoop-3.3.6/hadoop-3.3.6.tar.gz
+            https://archive.apache.org/dist/hadoop/common/hadoop-3.4.3/hadoop-3.4.3.tar.gz
           tar -C "$GITHUB_WORKSPACE/.hadoop" -xzf /tmp/hadoop.tgz
       - name: Pin HADOOP_HOME
-        run: echo "HADOOP_HOME=$GITHUB_WORKSPACE/.hadoop/hadoop-3.3.6" >> "$GITHUB_ENV"
+        run: echo "HADOOP_HOME=$GITHUB_WORKSPACE/.hadoop/hadoop-3.4.3" >> "$GITHUB_ENV"
 
       # The packaged dist intentionally omits the (stale) log/ dir to stay small.
       # flink-daemon.sh writes its .out to $FLINK_HOME/log and aborts the daemon
