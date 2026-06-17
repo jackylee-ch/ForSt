@@ -4076,3 +4076,18 @@ fingerprint needed to resume observation; sweep unaffected.
 #    binding early (no throttle) -> at a generous 16g the headroom is strictly
 #    larger (q9@16g ran Ample, purge_count=0), so the armed controller does not
 #    throttle the optimal config. A clean q4/q7 armed-vs-off A/B is still owed.
+#
+# ── TASK 2 (optimal-config not throttled) — q4 ARMED @ 16g, no-throttle PROVEN ──
+# q4 @ 2x4c/16g, FRS_MEM_MANAGER=1 (armed), generous headroom:
+#   RESULT: q4 FINISHED wall_ms=440270 (440.3s) out_rows=25,855,920 (frs cadence
+#   count; matches the doc's prior frs q4 ~25.8M / ~450.4s baseline -> WITHIN NOISE
+#   of the manager-OFF baseline => armed does NOT slow the optimal config).
+# DIRECT no-throttle evidence from the in-run FRS_MEM_DIAG (mid-join):
+#   shed_armed=false  shed_level=Ample  purge_count=0  mm_compact_waits=0
+#   mm_compact_inflight_MB=0  stall_ms=0  rss_MB=7191/16384 (~44%)
+# i.e. EVERY valve idle: no lever shedding, no jemalloc purge, no compaction-
+# admission blocking, no WBM stall, caps (blockcache=139/wbm=1198/shadow=718/
+# vlog=399/compact=559) not binding. At a generous config the armed controller is
+# effectively transparent — the levers stay full and perf == off. CONFIRMS Task 2.
+# (Owed for completeness: the explicit q4/q7 OFF arm wall-time A/B; the prior-run
+# 450.4s frs q4 baseline in this doc serves as the OFF reference here.)
