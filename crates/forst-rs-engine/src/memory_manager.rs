@@ -167,6 +167,16 @@ pub fn manager_enabled() -> bool {
 
 static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Test-only: clear the cached `ARMED` flag so a test that armed the manager
+/// (via `FRS_MEM_MANAGER`) does not pin it on for the rest of the test binary.
+/// `manager_enabled()` caches only the `true` state (production sets the env
+/// before process start), so a test that toggles the env MUST reset this or it
+/// leaks the armed state into unrelated tests. Not compiled into production.
+#[cfg(test)]
+pub fn reset_armed_for_test() {
+    ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// MiB → bytes.
 const MIB: u64 = 1024 * 1024;
 

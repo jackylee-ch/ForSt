@@ -4493,8 +4493,13 @@ impl DbImpl {
         // Pre-write checks (same as write_single).
         self.check_fatal_error()?;
         self.consume_flush_error()?;
-        self.write_controller.may_throttle()?;
+        // FRS-MEM-WINDOWED-STALL-SKIP: resolve the CF before throttling so a
+        // windowed merge-CF can decline the futile L0/imm backlog stall. The
+        // lookup moved up from below; it is the SAME `lookup_cf_by_id` (a
+        // dropped/missing CF surfaces the same error, just one statement
+        // earlier).
         let cf_data = self.lookup_cf_by_id(cf.id())?;
+        self.may_throttle_windowed(cf_data.merge_operator().is_some())?;
 
         // Read the old value (latest view, same as get()).
         let read_seq = u64::MAX;
@@ -4593,6 +4598,38 @@ impl DbImpl {
             return;
         }
         self.wait_for_wbm_headroom_inner()
+    }
+
+    /// FRS-MEM-WINDOWED-STALL-SKIP (2026-06-17, PMC-1 q5 restart-loop fix):
+    /// the windowed-aware sibling of [`WriteController::may_throttle`]. The
+    /// throttle blocks the writer while the L0-file / immutable-memtable
+    /// flush+compaction backlog is over the stop trigger. For a windowed
+    /// merge-CF (q5 sliding-window aggregation) that backlog stall is FUTILE:
+    /// q5's over-budget term is the LIVE sliding-window accumulator operand
+    /// chains held until each pane fires — NOT memtables or L0 SSTs — so the
+    /// flush/compaction backlog never drains the offending bytes, the writer
+    /// parks for the full `stall_timeout`, the FFI maps the resulting
+    /// `timed_out` to a fatal `EngineOom`, and Flink restart-loops (q5 never
+    /// reaches `out_rows`). The live window state is bounded instead by the
+    /// already-shipped windowed safety ceiling
+    /// (`global_wbm_windowed_ceiling_bytes`) plus the windowed
+    /// pressure-flush (FRS-MEM-PRESSURE-FLUSH) that spills per-pane accumulator
+    /// chains onto SST — neither of which the writer-side throttle helps.
+    ///
+    /// So when `windowed_cf` is set AND the windowed-skip gate is armed
+    /// (`FRS_MEM_MANAGER` on AND `FRS_MEM_WINDOWED_STALL_SKIP` not
+    /// force-disabled — the SAME gate as [`Self::wait_for_wbm_headroom_windowed`])
+    /// we DECLINE the throttle and let the writer proceed.
+    ///
+    /// Byte-identical: this only changes WHETHER a futile blocking wait is
+    /// declined; it never alters any written byte, sequence number, op-type,
+    /// or merge order. When the manager is off (default) it is exactly
+    /// `self.write_controller.may_throttle()` — the legacy behavior.
+    fn may_throttle_windowed(&self, windowed_cf: bool) -> ForstResult<()> {
+        if windowed_cf && windowed_stall_skip_enabled() {
+            return Ok(());
+        }
+        self.write_controller.may_throttle()
     }
 
     fn wait_for_wbm_headroom_inner(&self) {
@@ -4938,8 +4975,12 @@ impl DbImpl {
         // a new write — the application learns about flush failures at the
         // next write boundary even though the failure happened off-thread.
         self.consume_flush_error()?;
-        self.write_controller.may_throttle()?;
+        // FRS-MEM-WINDOWED-STALL-SKIP: resolve the CF before throttling so a
+        // windowed merge-CF declines the futile L0/imm backlog stall. The
+        // lookup moved up from below — identical `lookup_cf_by_id`, one
+        // statement earlier (a dropped/missing CF surfaces the same error).
         let cf_data = self.lookup_cf_by_id(cf.id())?;
+        self.may_throttle_windowed(cf_data.merge_operator().is_some())?;
 
         // PERF (D1): reserve the engine-level sequence number with a single
         // lock-free `fetch_add` BEFORE acquiring `write_mutex`. The pre-D1
@@ -5791,7 +5832,13 @@ impl DbImpl {
             return Ok(self.sequence_number());
         }
         self.consume_flush_error()?;
-        self.write_controller.may_throttle()?;
+        // FRS-MEM-WINDOWED-STALL-SKIP: the throttle is deferred into each
+        // branch below so it can be windowed-aware — the single-CF fast path
+        // resolves its one CF in `batch_write_single_cf`, and the multi-CF
+        // slow path applies it after `cf_datas` is resolved (using the same
+        // `all_windowed` rule as the WBM stall). A windowed merge-CF declines
+        // the futile L0/imm backlog stall; every other case throttles exactly
+        // as before (byte-identical).
 
         // B-R12-NEW-H1 remainder: every FFI vectorized write path
         // (`frs_vectorized_batch_put`, `frs_vectorized_batch_delete`,
@@ -5817,6 +5864,13 @@ impl DbImpl {
         for &cf_id in groups.keys() {
             cf_datas.insert(cf_id, self.lookup_cf_by_id(cf_id)?);
         }
+        // FRS-MEM-WINDOWED-STALL-SKIP: only decline the throttle when EVERY CF
+        // in this batch is a windowed merge-CF (same `all_windowed` rule the
+        // WBM stall uses below) — a batch touching any non-merge (join) CF
+        // keeps the stall.
+        let all_windowed =
+            !cf_datas.is_empty() && cf_datas.values().all(|cf| cf.merge_operator().is_some());
+        self.may_throttle_windowed(all_windowed)?;
 
         // PERF (D1): reserve the entire engine-level sequence range with a
         // single lock-free `fetch_add(N)` BEFORE acquiring `write_mutex`.
@@ -5998,6 +6052,18 @@ impl DbImpl {
         single_cf_id: ColumnFamilyId,
         batch: WriteBatch<'a>,
     ) -> ForstResult<u64> {
+        // FRS-MEM-WINDOWED-STALL-SKIP: `batch_write` deferred the throttle into
+        // this fast-path branch (and the multi-CF branch) so it can be
+        // windowed-aware. A windowed merge-CF declines the futile L0/imm
+        // backlog stall; every other CF throttles exactly as before. Resolve
+        // the CF's merge-operator presence here (cheap read-lock + Arc clone;
+        // `batch_write_borrowed_single_cf_inner` re-looks-up by id and surfaces
+        // a dropped/missing CF).
+        let windowed_cf = self
+            .lookup_cf_by_id(single_cf_id)
+            .map(|cf_data| cf_data.merge_operator().is_some())
+            .unwrap_or(false);
+        self.may_throttle_windowed(windowed_cf)?;
         // C4R2-B-NEW-H1: extract slices from entries ONCE in a single pass
         // (pre-fix walked entries.iter() THREE TIMES building 3 separate
         // Vecs). Then dispatch through the shared borrowed-slice helper
@@ -6065,7 +6131,18 @@ impl DbImpl {
             return Ok(self.sequence_number());
         }
         self.consume_flush_error()?;
-        self.write_controller.may_throttle()?;
+        // FRS-MEM-WINDOWED-STALL-SKIP: the dominant q5 FFM vectorized
+        // merge-append write path. The L0/imm backlog throttle is futile for a
+        // windowed merge-CF (the over-budget term is live window state, not
+        // memtables) — declining it avoids the timeout→EngineOom→restart-loop.
+        // See `may_throttle_windowed`. Resolve the CF's merge-operator presence
+        // here; `batch_write_borrowed_single_cf_inner` re-looks-up by id (cheap
+        // read-lock + Arc clone) and a missing/dropped CF surfaces there.
+        let windowed_cf = self
+            .lookup_cf_by_id(cf.id())
+            .map(|cf_data| cf_data.merge_operator().is_some())
+            .unwrap_or(false);
+        self.may_throttle_windowed(windowed_cf)?;
         // Single-pass WBM charge tally.
         let mut total_charge: u64 = 0;
         for i in 0..keys.len() {
@@ -6224,8 +6301,12 @@ impl DbImpl {
             ));
         }
         self.consume_flush_error()?;
-        self.write_controller.may_throttle()?;
+        // FRS-MEM-WINDOWED-STALL-SKIP: resolve the CF before throttling so a
+        // windowed merge-CF declines the futile L0/imm backlog stall. The
+        // lookup moved up from below — identical `lookup_cf_by_id`, one
+        // statement earlier (a dropped/missing CF surfaces the same error).
         let cf_data = self.lookup_cf_by_id(cf.id())?;
+        self.may_throttle_windowed(cf_data.merge_operator().is_some())?;
 
         // PERF (D1, mirrors `batch_write`): reserve the engine sequence range
         // with a single lock-free `fetch_add(N)` BEFORE acquiring the write
@@ -25355,6 +25436,69 @@ mod tests {
             db.get(&cf, b"k").unwrap().is_none(),
             "key must remain absent after fallback — Merge must not resurrect"
         );
+    }
+
+    /// FRS-MEM-WINDOWED-STALL-SKIP (PMC-1, q5 restart-loop fix): the L0/imm
+    /// flush-backlog throttle (`WriteController::may_throttle`) is FUTILE for a
+    /// windowed merge-CF — q5's over-budget term is the live sliding-window
+    /// accumulator chains, not memtables, so blocking the writer there only
+    /// burns wall-time (timing out → fatal EngineOom → Flink restart-loop)
+    /// without bounding the OOM term. `may_throttle_windowed(windowed_cf=true)`
+    /// must DECLINE the throttle when the gate is armed (relying on the windowed
+    /// ceiling + pressure-flush to bound live state), while a NON-windowed CF
+    /// (`windowed_cf=false`) MUST still block normally — byte-identical there.
+    #[test]
+    fn test_windowed_merge_cf_declines_futile_throttle() {
+        use std::time::Duration;
+        let _g = WA_V1_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        let db = open();
+        // Force the WriteController into the Stall state (as if L0/imm backlog
+        // is over the stop trigger and not draining). Both arms below observe
+        // this same stalled controller.
+        db.write_controller().set_stall(true);
+
+        // Arm the windowed-skip gate (folds into the master FRS_MEM_MANAGER).
+        std::env::set_var("FRS_MEM_MANAGER", "1");
+        std::env::remove_var("FRS_MEM_WINDOWED_STALL_SKIP");
+        assert!(
+            windowed_stall_skip_enabled(),
+            "precondition: windowed-skip gate must be armed"
+        );
+
+        // (a) Windowed merge-CF: must DECLINE the (futile) throttle and return
+        // immediately even though the controller is stalled.
+        let start = std::time::Instant::now();
+        db.may_throttle_windowed(true)
+            .expect("windowed throttle must be declined (Ok), not block/error");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "windowed merge-CF must NOT block on the stalled controller; \
+             elapsed={:?}",
+            start.elapsed()
+        );
+
+        // (b) Non-windowed CF: must STILL throttle (block on the stalled
+        // controller) — byte-identical to today. Run it on a worker so we can
+        // observe it is parked while the controller is stalled, then clear the
+        // stall to let it complete cleanly.
+        let db2 = Arc::clone(&db);
+        let handle = std::thread::spawn(move || db2.may_throttle_windowed(false));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !handle.is_finished(),
+            "non-windowed CF must remain blocked on the stalled controller"
+        );
+        // Unblock and confirm it then proceeds without error.
+        db.write_controller().clear_stall();
+        handle
+            .join()
+            .expect("worker panicked")
+            .expect("non-windowed throttle must succeed once unstalled");
+
+        // Cleanup: do not leak the armed manager state into other tests.
+        std::env::remove_var("FRS_MEM_MANAGER");
+        crate::memory_manager::reset_armed_for_test();
     }
 
     #[test]
