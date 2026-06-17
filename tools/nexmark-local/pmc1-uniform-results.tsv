@@ -67,3 +67,5 @@ q17	forst-rs-ffm-local	FINISHED	47676	47.7	92000000	92000000	r2b-q17-forst-rs-ff
 q5	forst-rs-ffm-local	OOM_BOX_LIMIT	-	-	6000000	-	r2d-q5-forst-rs-ffm-local-OOMloop16g-noJemallocImage	20260618T001500
 q7	rocksdb	DNF_JOINWALL	-	-	50423944	-	r2b-q7-rocksdb-stalled50M-900s-2.9Kps	20260618T003000
 q20	rocksdb	FINISHED	661666	661.7	93201404	93201404	r2b-q20-rocksdb	20260618T004506
+q8	forst-rs-ffm-local	FINISHED	47722	47.7	3064670	3064401	prof-q8-jfr-r2jar	20260618T033400
+q12	forst-rs-ffm-local	FINISHED	46626	46.6	92000000	92000000	prof-q12-jfr-r2jar	20260618T033600
