@@ -4091,3 +4091,114 @@ fingerprint needed to resume observation; sweep unaffected.
 # effectively transparent — the levers stay full and perf == off. CONFIRMS Task 2.
 # (Owed for completeness: the explicit q4/q7 OFF arm wall-time A/B; the prior-run
 # 450.4s frs q4 baseline in this doc serves as the OFF reference here.)
+
+# ===========================================================================
+# PMC-1 LIVE-STATE SPILL TRACK (2026-06-17) — FRS-MEM-PRESSURE-FLUSH:
+# pressure-triggered live-memtable SPILL-to-SST (the @10g never-OOM increment)
+# ===========================================================================
+#
+# DIRECTIVE (this cycle): 16g is never-OOM (q9 fits 12.8 GiB @16g, exact —
+# 72ebc1a59), but at the 10g floor the heavy joins (q9; likely q5/q20) OOM
+# because their LIVE working set exceeds the budget. The user's contract is
+# strict: 10g must NOT OOM — at most a PERF hit. So live state must SPILL to SST
+# under memory pressure instead of OOMing.
+#
+# ── LIVE-STATE MODEL (built from the in-container FRS_MEM_DIAG cliffs above) ──
+# q9 @10g (d4fc9e810 clean-ish, manager+SLOTS+eager-jemalloc ON): killed ~59.3M,
+#   per-TM working set grows ~6.5 -> 10.7 -> 12.8 GiB (16g run). At the 10g kill:
+#   rss 8.99 GiB, jemalloc_RETAINED=5575 (purge fired 599x, couldn't drain during
+#   the compaction storm) => LIVE-alloc ~3.4 GiB at kill. The 12.8 GiB total is
+#   DOMINATED BY THE JVM (process.size carved to 10240m @16g / 6144m @10g) — the
+#   engine-native LIVE term is small and already cap-bounded by the manager. So
+#   q9's over-10g term = JVM (6 GiB) + retained-drain-lag-during-storm + the
+#   genuinely-live join-build memtable component. The memtable component is the
+#   ONLY engine-native LIVE term that is SPILLABLE (caches are re-derivable; the
+#   join records flow memtable -> SST already, but only at the WBM/per-memtable
+#   threshold — NOT proactively under cgroup pressure).
+# q5 @10g/16g: jemalloc_alloc(LIVE)=7454-8126 EXCEEDS the whole 6041 engine-native
+#   budget on its own and climbs — the un-fired sliding-window (10s/2s) AGG
+#   accumulator held LIVE until each window fires. Memtable operand chains ARE
+#   spillable (the q5 windowed-flush already moves them); the in-flight un-fired
+#   window RESULT is application-live across the FFM boundary (needs a Flink
+#   window-boundary signal — the deferred true window-pane spill).
+#
+# IS IT MEMTABLE-BOUNDED (LSM-spillable) OR A NON-MEMTABLE LIVE STRUCTURE?
+#   - q9: the join-build state IS memtable->SST (LSM-spillable). The non-memtable
+#     engine-native LIVE structures (block cache, resident_flushed shadow, vlog
+#     reader cache) are re-derivable and already manager-capped. So q9 has NO
+#     bespoke-spill-tier need; the lever is to SPILL THE LIVE MEMTABLE SOONER
+#     under pressure (and the retained-drain, an allocator/kernel property, is
+#     separately attacked by eager-jemalloc 712f4347d + the purge valve).
+#   - q5: memtable operand chains LSM-spillable (handled); the in-flight window
+#     result is a NON-memtable application-live structure the engine cannot see
+#     => bespoke Flink-boundary spill, deferred (scoped below).
+#
+# ── THE INCREMENT IMPLEMENTED: FRS-MEM-PRESSURE-FLUSH (flag-gated, default-OFF) ─
+# db.rs `maybe_switch_memtable_in_lock`: a THIRD force-switch condition
+# (`force_for_pressure`) generalising the q5 `force_for_windowed` lever to ALL
+# CFs. When the manager is armed AND the sampled cgroup pressure is >= the
+# configured threshold (default High ~0.85, FRS_MEM_PRESSURE_FLUSH_LEVEL) AND the
+# active memtable carries >= the floor (default 256 MiB = the L0-explosion floor,
+# FRS_MEM_PRESSURE_FLUSH_FLOOR_MB), force-switch the active memtable so the LIVE
+# memtable bytes SPILL to an immutable + bg-flush -> SST. This is the literal
+# "spill live state to SST under memory pressure" the contract requires:
+# memtable-resident bytes leave RSS for durable SST; reads merge memtable+imm+SST
+# identically. CORRECTNESS: a flush only changes WHEN bytes move (and thus read
+# latency) — never the output. Pressure check is evaluated BEFORE the floor
+# OnceLock so the floor env stays deterministic and unrelated armed-but-unpressured
+# writes never resolve/cache it. Diag: a new `mm_pressure_flush=` counter on the
+# [FRS_MEM_DIAG] line counts switches that fired ONLY because of the spill (direct
+# in-container proof it engaged). Off when manager off OR pressure < threshold =>
+# byte-identical to today (cheap relaxed pressure load only after the manager arms).
+#
+# MINI-BENCH / CORRECTNESS GATE (cargo, no NEXMark — box was busy with perf-q9 A/B):
+#   memory_manager_it::pressure_flush_spills_plain_cf_to_sst_byte_identical — a
+#   PLAIN (non-merge, == q9/q19/q20 join-build shape) CF, manager armed, 1 MiB
+#   spill floor: writing 4000x ~2 KiB (~8 MiB) at forced Ample pressure does NOT
+#   spill (counter unchanged) and produces the reference fingerprint; the SAME
+#   workload at forced High pressure DOES spill (mm_pressure_flush strictly
+#   increases => live memtable bytes moved to SST) AND the read-back is
+#   BYTE-IDENTICAL to the Ample baseline. Proves both halves: the spill engages
+#   under pressure (live held to SST, not resident) and never changes output.
+#   GREEN: 3 memory_manager ITs + 455 engine lib UTs; fmt + clippy(0) +
+#   rustdoc(-D warnings) clean; release cdylib links. Commit on branch spill-live.
+#
+# ── @10g NEXMark SPILL-VALIDATION PLAN (deferred until the box frees) ──
+# Config: TOPO=split 2x4c/10g + 1 JM, FRS_MEM_MANAGER=1 + SLOTS + eager-jemalloc
+# + FRS_MEM_DIAG=1, process.size=6144m (the d4fc9e810 10g recipe), KV-sep ON.
+# A/B the spill: arm 1 (spill ON, the default under the manager) vs arm 0
+# (FRS_MEM_PRESSURE_FLUSH_LEVEL=critical+1 i.e. effectively-off, OR a build with
+# the line reverted). VM MUST BE TO ITSELF (no concurrent 16g sibling — the
+# d4fc9e810 q9@10g OOM was CONFOUNDED by a perf-q9b 16g run holding 21 GiB).
+#   - q9 @10g: with spill ON, EXPECT mm_pressure_flush>0 + a LOWER live-memtable /
+#     WBM term at the cliff; PASS = FINISHES exact 91,813,372 (perf hit OK) OR at
+#     minimum crosses the ~59.3M kill point it died at. HONEST RISK: q9's 12.8 GiB
+#     total is JVM-dominated; spilling the memtable component may not free enough
+#     vs JVM(6G)+retained at 10g — if it still OOMs, the verdict is q9 needs >=12g
+#     (physics: the manager cannot shrink the JVM, and the live join state at
+#     100M legitimately needs the room). The spill is necessary, maybe not
+#     sufficient, for q9@10g.
+#   - q5 @10g: EXPECT the memtable operand chains spill (mm_pressure_flush>0,
+#     stall_ms=0 from windowed-stall-skip) but the un-fired window accumulator
+#     (~7.4 GiB live) likely still OOMs => confirms the deferred Flink-boundary
+#     window-pane spill is the true fix.
+#   - q17/q19 @10g: already FIT (d4fc9e810); MUST stay PASS exact (spill is inert
+#     for them — they never reach High pressure at 10g) — regression guard.
+#   - q4/q7 @16g: spill MUST stay inert (Ample) — perf == off (Task-2 guard).
+#
+# ── HONEST VERDICT: can q9/q5 @10g be never-OOM via LSM-spill? ──
+# q9: PARTIALLY. The LSM-spill (this increment) moves the spillable live-memtable
+#   component to SST under pressure and is the correct never-OOM lever for the
+#   ENGINE-NATIVE term, but q9's @10g over-budget is dominated by the JVM (6 GiB
+#   carved) + the retained-drain-lag — NOT by an unbounded engine live structure.
+#   The manager cannot shrink the JVM. So q9@10g may remain a physics wall (needs
+#   >=12g) even with the spill; the spill MAXIMISES what 10g can hold (perf hit,
+#   not OOM, for everything the engine controls) but does not manufacture RAM.
+#   NO bespoke spill tier is needed for q9 (its live state is already LSM-resident).
+# q5: needs a BESPOKE spill — the in-flight un-fired sliding-window accumulator is
+#   application-live across the FFM boundary; the engine sees only (window,key)
+#   merge operands, not which panes are cold. SCOPE (multi-session): a Flink-side
+#   signal (inactive windows) plumbed across FFM into a new engine spill tier that
+#   evicts cold panes' accumulators to SST and reads them back on fire. The
+#   shipped windowed-flush + this pressure-flush spill the MEMTABLE operand chains
+#   (necessary, reduces the term) but cannot evict the genuinely-live result.

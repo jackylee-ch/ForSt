@@ -119,7 +119,7 @@ pub use compaction_filter::{
 pub use db::{
     accumulator_merge_enabled, kv_adaptive_pressure_enabled, kv_min_blob_size,
     kv_separation_enabled, lifecycle_segments_enabled, multiget_coalesce_enabled,
-    s2_adaptive_active, s2_pinned_enabled, set_accumulator_merge_override,
+    pressure_flush_count, s2_adaptive_active, s2_pinned_enabled, set_accumulator_merge_override,
     set_kv_adaptive_pressure_override, set_kv_separation_override, set_leveled_hot_cf_override,
     set_lifecycle_segments_override, set_multiget_coalesce_override,
     set_s2_adaptive_fanout_min_override, set_s2_pinned_override, set_trivial_move_override,

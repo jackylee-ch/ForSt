@@ -256,3 +256,94 @@ fn windowed_merge_cf_output_byte_identical_armed_vs_off() {
     std::env::remove_var("FRS_JVM_RESERVED_MB");
     std::env::remove_var("FRS_MEM_WINDOWED_FLUSH_MB");
 }
+
+/// FRS-MEM-PRESSURE-FLUSH (PMC-1 live-state SPILL track): under memory pressure
+/// the manager force-flushes a PLAIN (non-merge) CF's live active memtable to
+/// SST — the literal "spill live state to SST, a perf hit not an OOM" the
+/// never-OOM contract requires for the q9/q19/q20 join-build CFs. This test
+/// proves BOTH halves of the contract:
+///   1. CORRECTNESS — the read-back is BYTE-IDENTICAL to a baseline run with the
+///      spill NOT engaged (pressure Ample). A flush only moves bytes memtable→SST;
+///      the read path merges memtable+imm+SST identically. Output never changes.
+///   2. The spill ACTUALLY ENGAGED — `pressure_flush_count()` strictly increases
+///      while writing under forced High pressure with a tiny spill floor, so the
+///      live memtable component was driven to SST (not left resident). With the
+///      manager OFF (or pressure Ample) the count never moves.
+#[test]
+fn pressure_flush_spills_plain_cf_to_sst_byte_identical() {
+    use forst_rs_engine::{pressure_flush_count, set_pressure_override, PressureLevel};
+
+    // Write N keys with sizeable values to a plain CF (NO merge operator — this
+    // is the q9/q19/q20 join-build shape, not q5's merge accumulator). Returns
+    // the canonical (key -> value) read-back fingerprint.
+    fn plain_fingerprint(db: &Arc<DbImpl>, n_keys: u32) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        let cf = db
+            .create_column_family(ColumnFamilyDescriptor::new("join_build"))
+            .expect("create plain cf");
+        let mut expected: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        for k in 0..n_keys {
+            let key = format!("jk{k:08}").into_bytes();
+            // ~2 KiB value so a few thousand keys cross a sub-MiB spill floor and
+            // exercise multiple force-switches.
+            let val = format!("build-{k}-{}", "z".repeat(2048)).into_bytes();
+            db.put(&cf, &key, &val).expect("put");
+            expected.push((key, Some(val)));
+        }
+        // Final flush so any tail in the active memtable is on SST for read-back
+        // (the spill handles the bulk mid-run; this drains the remainder).
+        db.switch_and_flush(&cf).expect("flush plain cf");
+        let mut actual = Vec::new();
+        for (key, _) in &expected {
+            actual.push((key.clone(), db.get(&cf, key).expect("get")));
+        }
+        assert_eq!(actual, expected, "plain-CF read-back must equal writes");
+        actual
+    }
+
+    const N: u32 = 4000; // 4000 × ~2 KiB ≈ 8 MiB written → crosses a 1 MiB floor
+
+    // ---- Baseline: pressure Ample (spill must NOT engage) -----------------
+    // Even with the manager armed, an Ample level keeps the spill dormant — the
+    // output is the reference fingerprint and the spill counter must not move.
+    std::env::set_var("FRS_MEM_MANAGER", "1");
+    std::env::set_var("FRS_MEM_CGROUP_MB", "16384");
+    std::env::set_var("FRS_JVM_RESERVED_MB", "10240");
+    std::env::set_var("FRS_MEM_PRESSURE_FLUSH_FLOOR_MB", "1"); // 1 MiB → easy to cross
+    set_pressure_override(Some(PressureLevel::Ample));
+    let before_ample = pressure_flush_count();
+    let base_dir = tempfile::tempdir().expect("base tempdir");
+    let base_db = open_local(&base_dir.path().to_string_lossy());
+    let baseline = plain_fingerprint(&base_db, N);
+    drop(base_db);
+    assert_eq!(
+        pressure_flush_count(),
+        before_ample,
+        "spill must NOT engage at Ample pressure (no pressure-flush switch)"
+    );
+
+    // ---- Spill engaged: pressure High (spill MUST move bytes to SST) ------
+    set_pressure_override(Some(PressureLevel::High));
+    let before_high = pressure_flush_count();
+    let spill_dir = tempfile::tempdir().expect("spill tempdir");
+    let spill_db = open_local(&spill_dir.path().to_string_lossy());
+    let spilled = plain_fingerprint(&spill_db, N);
+    let after_high = pressure_flush_count();
+
+    // Half 1 — CORRECTNESS: byte-identical output whether or not the spill ran.
+    assert_eq!(
+        spilled, baseline,
+        "pressure-flush spill output must be BYTE-IDENTICAL to the un-spilled baseline"
+    );
+    // Half 2 — the spill ACTUALLY ENGAGED: at least one pressure-triggered switch
+    // fired (live memtable bytes were moved to SST under pressure).
+    assert!(
+        after_high > before_high,
+        "pressure-flush spill must engage at High pressure (count {before_high} -> {after_high})"
+    );
+
+    set_pressure_override(None);
+    std::env::remove_var("FRS_MEM_MANAGER");
+    std::env::remove_var("FRS_MEM_CGROUP_MB");
+    std::env::remove_var("FRS_JVM_RESERVED_MB");
+    std::env::remove_var("FRS_MEM_PRESSURE_FLUSH_FLOOR_MB");
+}

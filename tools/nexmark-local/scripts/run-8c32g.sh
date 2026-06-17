@@ -242,6 +242,13 @@ case "$cmd" in
       -e FRS_MEM_MANAGER="${FRS_MEM_MANAGER:-}" -e FRS_MEM_CGROUP_MB="${FRS_MEM_CGROUP_MB:-}" \
       -e FRS_JVM_RESERVED_MB="${FRS_JVM_RESERVED_MB:-}" -e FRS_FFM_RESERVED_MB="${FRS_FFM_RESERVED_MB:-}" \
       -e FRS_MEM_HEADROOM_MB="${FRS_MEM_HEADROOM_MB:-}" -e FRS_MEM_INSTANCES="${FRS_MEM_INSTANCES:-}" \
+      # FRS-MEM-PRESSURE-FLUSH (2026-06-17 PMC-1 live-state SPILL): under cgroup
+      # pressure (sampled level >= FRS_MEM_PRESSURE_FLUSH_LEVEL, default High) the
+      # manager force-flushes ANY CF's live active memtable (>= FLUSH_FLOOR_MB,
+      # default 256) to SST — spills live state instead of OOMing (perf hit, never
+      # OOM; byte-identical). Auto-arms under FRS_MEM_MANAGER=1; these tune it / A/B.
+      -e FRS_MEM_PRESSURE_FLUSH_LEVEL="${FRS_MEM_PRESSURE_FLUSH_LEVEL:-}" \
+      -e FRS_MEM_PRESSURE_FLUSH_FLOOR_MB="${FRS_MEM_PRESSURE_FLUSH_FLOOR_MB:-}" \
       # FRS_FFM_DIAG (2026-06-16 PMC-1): periodic dump of the bounded FFM
       # off-heap working set (columnar/GET-out/iter-scratch + freed-on-grow).
       -e FRS_FFM_DIAG="${FRS_FFM_DIAG:-}" \

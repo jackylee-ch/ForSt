@@ -13065,8 +13065,40 @@ impl DbImpl {
         let force_for_windowed = cf_data.merge_operator().is_some()
             && crate::memory_manager::manager_enabled()
             && usage >= windowed_accumulator_flush_floor();
-        if usage < threshold && !force_for_budget && !force_for_windowed {
+        // FRS-MEM-PRESSURE-FLUSH (2026-06-17, PMC-1 live-state SPILL track): when
+        // the unified manager is armed AND the process is under memory pressure
+        // (sampled cgroup level at/above the configured threshold, default High),
+        // FORCE-switch ANY CF's active memtable carrying real bytes so the LIVE
+        // memtable component SPILLS to durable SST under pressure instead of
+        // riding RSS to the cgroup cliff. This generalises `force_for_windowed`
+        // (which only fires for q5's merge-CFs) to the join-build CFs (q9/q19/q20):
+        // their over-budget term at the tight 10 g floor includes the resident
+        // active memtable, and flushing it to SST is the literal "spill live state
+        // to SST under memory pressure, a perf hit not an OOM" the never-OOM
+        // contract requires. CORRECTNESS: a flush only moves bytes from the
+        // memtable to an immutable + the bg-flush enqueue → SST; the read path
+        // merges memtable + imm + SST identically, so output is byte-identical —
+        // only WHEN the bytes move (and thus read latency) changes. A floor
+        // (`pressure_flush_floor`, default the same 256 MiB L0-explosion floor)
+        // applies so we never flush a trivially small memtable into a storm of
+        // tiny SSTs (which would trip `l0_stop_trigger`). Off when the manager is
+        // off OR pressure is below the threshold ⇒ byte-identical to today (the
+        // cheap `current_pressure()` relaxed load is only reached once armed).
+        // Pressure check FIRST (cheap relaxed load) so the floor `OnceLock` is
+        // only resolved once the spill could actually fire — keeps the floor env
+        // read deterministic w.r.t. the caller setting it (and avoids caching the
+        // default in unrelated armed writes that are never under pressure).
+        let force_for_pressure = crate::memory_manager::manager_enabled()
+            && crate::mem_pressure::current_pressure() >= pressure_flush_threshold()
+            && usage >= pressure_flush_floor();
+        if usage < threshold && !force_for_budget && !force_for_windowed && !force_for_pressure {
             return Ok(false);
+        }
+        // FRS-MEM-PRESSURE-FLUSH diag: count a switch that fired ONLY because of
+        // the pressure spill (not the size threshold / over-budget / windowed
+        // path) — direct in-container evidence the live-state SPILL engaged.
+        if force_for_pressure && usage < threshold && !force_for_budget && !force_for_windowed {
+            PRESSURE_FLUSH_COUNT.fetch_add(1, Ordering::Relaxed);
         }
 
         cf_data.swap_active_memtable();
@@ -17317,8 +17349,10 @@ fn maybe_start_mem_diag() {
                     // consumer's coordinated cap — DIRECT in-container proof the
                     // controller engaged and which caps it derived from cgroup.
                     let mm = crate::memory_manager::diag_str();
+                    // FRS-MEM-PRESSURE-FLUSH: count of live-state spill switches.
+                    let pressure_flush = pressure_flush_count();
                     let line = format!(
-                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb} shed_armed={shed_armed} shed_level={shed_level:?} purge_armed={purge_armed} purge_count={purge_count}{mm}{}\n",
+                        "[FRS_MEM_DIAG] rss_MB={rss_mb} jemalloc_alloc_MB={alloc_mb} jemalloc_resident_MB={resident_mb} jemalloc_retained_MB={retained_mb} wbm_memtable_MB={wbm_mb} resident_shadow_MB={shadow_mb} shed_armed={shed_armed} shed_level={shed_level:?} purge_armed={purge_armed} purge_count={purge_count} mm_pressure_flush={pressure_flush}{mm}{}\n",
                         prof_diag_str()
                     );
                     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -17401,6 +17435,71 @@ fn windowed_accumulator_flush_floor() -> usize {
             .unwrap_or(DEFAULT_MB);
         mb * 1024 * 1024
     })
+}
+
+/// FRS-MEM-PRESSURE-FLUSH (PMC-1 live-state SPILL track): the memory-pressure
+/// level at/above which the manager force-flushes ANY CF's active memtable to
+/// SST (spilling the live memtable component under pressure). Default
+/// [`crate::mem_pressure::PressureLevel::High`] (≈0.85 of the cgroup) so the
+/// spill engages BEFORE the cliff but does NOT churn the steady state at Ample.
+/// Override via `FRS_MEM_PRESSURE_FLUSH_LEVEL` = `elevated|high|critical` (or
+/// `0|1|2|3`). An unrecognised value keeps the `High` default. Only consulted
+/// when the manager is armed (the caller short-circuits otherwise), so off ⇒
+/// byte-identical.
+/// FRS-MEM-PRESSURE-FLUSH: count of memtable switches that fired ONLY because
+/// the live-state spill engaged (manager armed + pressure ≥ threshold), i.e.
+/// would NOT have switched on size/over-budget/windowed alone. Surfaced on the
+/// `[FRS_MEM_DIAG]` line as `mm_pressure_flush=` — direct proof the spill ran.
+static PRESSURE_FLUSH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// FRS-MEM-PRESSURE-FLUSH: number of pressure-triggered spill switches so far
+/// (FRS_MEM_DIAG evidence).
+pub fn pressure_flush_count() -> u64 {
+    PRESSURE_FLUSH_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// FRS-MEM-PRESSURE-FLUSH (PMC-1 live-state SPILL track): the active-memtable
+/// byte floor at/above which a CF force-switches (spills to SST) under memory
+/// pressure. Default the same 256 MiB L0-explosion floor used by the WBM
+/// over-budget force-switch, so forced SSTs stay large and L0 stays shallow.
+/// Override via `FRS_MEM_PRESSURE_FLUSH_FLOOR_MB` (tests set it tiny to exercise
+/// the path without writing 256 MiB). Only consulted when the manager is armed.
+fn pressure_flush_floor() -> usize {
+    use std::sync::OnceLock;
+    static FLOOR: OnceLock<usize> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        const DEFAULT_MB: usize = 256;
+        let mb = std::env::var("FRS_MEM_PRESSURE_FLUSH_FLOOR_MB")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(DEFAULT_MB);
+        mb * 1024 * 1024
+    })
+}
+
+fn pressure_flush_threshold() -> crate::mem_pressure::PressureLevel {
+    use crate::mem_pressure::PressureLevel;
+    use std::sync::OnceLock;
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    let v = *LEVEL.get_or_init(|| {
+        let parsed = std::env::var("FRS_MEM_PRESSURE_FLUSH_LEVEL")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .and_then(|s| match s.as_str() {
+                "elevated" | "1" => Some(PressureLevel::Elevated),
+                "high" | "2" => Some(PressureLevel::High),
+                "critical" | "3" => Some(PressureLevel::Critical),
+                _ => None,
+            })
+            .unwrap_or(PressureLevel::High);
+        parsed as u8
+    });
+    match v {
+        1 => PressureLevel::Elevated,
+        3 => PressureLevel::Critical,
+        _ => PressureLevel::High,
+    }
 }
 
 // ---------------------------------------------------------------------------
