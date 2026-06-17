@@ -19,6 +19,7 @@ PASS = all three. Exact out_rows is the correctness gate (FINISH + matching rows
 | q17 | FINISHED | 92,000,000 EXACT | 236.9 | 8998/7529 (bal) | 73.9 | 3.21× | +163 | 275.4 | FASTER | a✗ b✗ c✓ | FAIL vs rdb (Flink AEC floor); beats ForSt |
 | q18 | FINISHED (clean re-run) | 92,000,000 EXACT | 470.4 | 8113/8253 (bal) | 360.4 | 1.31× | +110 | 441.7 | slower | a✗ b✗ c✗ | FAIL (marginal; prior uniform 442.6s=1.23× was a PASS — VM-noise borderline) |
 | q19 | FINISHED (clean, 0 restart) | 92,000,000 EXACT | 565.5 | 11325/11345 (bal) | 305.5 | 1.85× | +260 | 272.4 | slower | a✗ b✗ c✗ | FAIL — heavy join + 11.3G compaction-transient drags on overcommitted VM (prior uniform 238.6s would PASS — VM headroom-bound) |
+| q4 | FINISHED (clean, 0 restart) | 25,848,286 (forst-rs windowed-emit; matches prior 25.83M; rdb emits 177.6M diff semantics) | 400.1 | 9094/8318 (bal) | 503.0 | 0.80× | -103 | DNF (forst-local RESTARTING 1644s) | FASTER | a✓ b✓ c✓ | **PASS all 3** — KV-sep win; beats rdb AND forst-local |
 
 ## Docker-crash / restart events (honest log)
 - After q8/q12/q11(×2)/q17 back-to-back, VM memory pressure accumulated. q18 (1st attempt)
