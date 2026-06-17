@@ -1,61 +1,79 @@
-# best-config.tsv — EMPIRICALLY-BEST per-query forst-rs config for the 8 NexMark priority queries.
+# best-config.tsv — the SINGLE UNIFORM forst-rs config applied to EVERY NexMark query.
 #
-# PURPOSE: best-PERFORMANCE reproduction. Per-query config is INTENTIONAL here
-# (the user reversed the same-config constraint 2026-06-14). This is DISTINCT
-# from the uniform-config research question driven by run-remote-nexmark-v3.sh,
-# which deliberately holds ONE config for all queries. Use run-best.sh to apply.
+# ★★ UNIFORM CONFIG (2026-06-17, PMC-1 — user directive). PER-QUERY CONFIG IS
+# FORBIDDEN. There is exactly ONE config row (`*`) and run-best.sh applies it to
+# every query identically. The old per-query split (q9 KV-sep OFF, q11/q17 KV-sep
+# OFF, others ON, q17 routing-adaptive) has been PURGED. KV-sep is uniformly ON;
+# the engine adapts to the query SHAPE at runtime (see "ENGINE AUTO-SELECTS" below)
+# — there are no per-query branches in this file or in run-best.sh.
 #
-# ★ KV-SEP POLICY (2026-06-15, user directive): prefer KV-sep ON wherever it has
-# BETTER performance. q4/q7/q19/q20 already ON; q9 FLIPPED to ON this session
-# (the 16g/TM split now fits via the process.size=10240m carve-out — efdc5997a).
-# The ONLY queries still encoded KV-sep OFF are where a SAME-PASS A/B MEASURED ON
-# to be slower: q11 (ON 215.8 vs OFF 118.8, ON +82%) and q17 (ON 150.7 vs OFF
-# 110.7, ON +36%) — both windowed-AGG-drain, where KV-sep adds a value-deref hop
-# the agg read path does not benefit from; plus q12 (neutral, ON 40.6 ~ OFF 41.6,
-# source-bound). ⚠ OPEN ACTION: those q11/q17 OFF-wins predate the CURRENT
-# read-path lever stack (coalesced deref + join stack + R2a). Re-measure KV-sep
-# ON for q11/q17 on the current engine tip before trusting the OFF default; if ON
-# is now >= OFF, flip them. NOT flipped yet because no ON re-measure exists on the
-# current tip (this is an RD/docs task; the runner re-measures on the box).
+# WHY UNIFORM IS NOW CORRECT (the levers that made it possible this campaign):
+#   1. SLOTS load-balance (taskmanager.load-balance.mode=SLOTS, in every backend
+#      template) spreads the 4 subtasks 2+2 across both TMs. This fixed the slot-
+#      skew that OOM-killed q9/q19 (all 4 join subtasks had packed onto tm1 -> tm1
+#      held 100% of state -> 16g/TM cgroup OOM though cluster total was ~17 GiB).
+#   2. process.size=10240m carve-out (config-forst-rs-local.yaml.tpl) leaves ~6 GiB
+#      of the 16g/TM cgroup free for the engine's NATIVE (jemalloc-in-the-.so)
+#      allocation that Flink does NOT budget. q9 + KV-sep ON now fits 16g/TM.
+#   3. FRS_VLOG_POINT_DEREF auto-follows KV-sep when unset (db.rs:445-470): under
+#      uniform KV-sep ON the scattered windowed-agg RMW (q11/q17) routes a ≤1-ptr
+#      deref through get_point (reads exactly the value bytes, not a 64 KiB chunk)
+#      -> recovers q11/q17 to near-OFF parity. This is what made "KV-sep ON for the
+#      windowed queries too" perf-clean, removing the old q11/q17 OFF exception.
+#   4. FRS_MEM_MANAGER=1 (never-OOM controller) derives ONE engine-native budget
+#      from the cgroup and bounds blockcache/wbm/shadow/vlog/compaction + arms the
+#      compaction-admission + windowed levers + proactive jemalloc purge. On a box
+#      with real headroom (>=40 GiB, the remote Linux box) it runs un-throttled and
+#      is perf-neutral; it only sheds under genuine cgroup pressure.
 #
-# SOURCE: docs/superpowers/specs/2026-06-08-8c32g-3backend-sweep-results.md
-#   - "V3 FULL 8-QUERY" (flag-ON: lz4 + KV-sep + trivial-move + S2-pinned)  tip 1cda0e724
-#   - "V3 FLAG-OFF"     (ForSt-matching default: KV-sep OFF)                tip 15436bfde
-#   These two are a SAME-PASS A/B (serial, same tip-family) => the flag-ON-vs-OFF
-#   per-query deltas are REAL, not box noise. See the doc's
-#   "RECOMMENDED SELECTIVE KV-SEP PROFILE" (lines ~2735-2745).
-#   - q17 best wall 83.7s is from the routing-adaptive (R2a) capture
-#     /tmp/v3-q17-forst-rs-ffm-local.out; plain KV-sep-OFF inline was 110.7s.
+# ENGINE AUTO-SELECTS BY QUERY SHAPE (one config, runtime-adaptive — no per-query):
+#   - Windowed point-RMW (q11/q17): FRS_VLOG_POINT_DEREF (auto-on under KV-sep) ->
+#     exact-size point deref.
+#   - Scan/coalesceable joins (q4/q7/q19/q20): FRS_VLOG_COALESCE_DEREF batches the
+#     deferred BlobRef derefs per segment; multi-pointer groups take get_coalesced.
+#   The SAME env produces both paths; the engine picks per deref by locality.
 #
-# KNOB NAMES verified against engine code (crates/forst-rs-engine/src/db.rs):
-#   FRS_KV_SEPARATION    1|true|TRUE => ON  (default OFF)            db.rs:15331
-#   FRS_KV_MIN_BLOB_SIZE bytes, default 256, floor 22               db.rs:15460
-#   FRS_TRIVIAL_MOVE     1|true|TRUE => ON  (default OFF)            db.rs:15417
-#   FRS_RS_S2_PINNED     1|true|TRUE => ON  (default OFF)            db.rs:15529
-#   FRS_S2_FANOUT_MIN    usize, default usize::MAX=OFF (R1 adaptive) db.rs:15601
-#   FRS_SST_COMPRESSION  none|lz4|zstd, engine default lz4          db.rs:299
-#   FRS_VLOG_COALESCE_DEREF 1|true|TRUE => ON (default OFF)         db.rs:312
-#                        Coalesced batched value-log deref: KV-sep pure-win read
-#                        path. Byte-identical output (db.rs:18576). NO-OP when
-#                        KV-sep is OFF (no separated values to deref) → harmless
-#                        to leave set. Part of the best config for KV-sep queries.
-#   FRS_RS_EXECUTOR      inline(default)|routing|routing-adaptive|coordinated|two-regime|routing-async
-#                        ForStRsAsyncKeyedStateBackend.java:1319 (Java/flink side)
+# TOPOLOGY (uniform, every query): TOPO=split — 2x TM 4c/16g + 1x JM 2c/4g (the
+# committed 8c/32g-TM-budget split). parallelism=4, numberOfTaskSlots=4, SLOTS.
+#
+# KNOB NAMES verified against the engine (crates/forst-rs-engine/src/db.rs):
+#   FRS_KV_SEPARATION       1|true => ON (default OFF)                  db.rs:17598
+#   FRS_KV_MIN_BLOB_SIZE    bytes, default 256, floor 22               db.rs (min-blob)
+#   FRS_TRIVIAL_MOVE        1|true => ON (default OFF)
+#   FRS_RS_S2_PINNED        1|true => ON (default OFF)
+#   FRS_VLOG_COALESCE_DEREF 1|true => ON (default OFF)                  db.rs:335
+#   FRS_VLOG_POINT_DEREF    1|true|0 — UNSET => auto-follows KV-sep     db.rs:467
+#   FRS_VLOG_READER_CACHE_CAP   handle cap, default 2048               db.rs:148
+#   FRS_VLOG_RESIDENT_BUDGET_MB resident vlog byte budget, default     db.rs:176
+#   FRS_KV_ADAPTIVE_PRESSURE 1 => back off separation under budget     db.rs:228
+#   FRS_MEM_MANAGER         1 => arm the never-OOM controller          db.rs:4588
+#   FRS_SST_COMPRESSION     none|lz4|zstd (engine default + ForSt match = lz4)
+#
+# EXCLUDED FROM THE UNIFORM DEFAULT (documented — NOT safe to fold into one config):
+#   - FRS_RS_EXECUTOR=routing-adaptive (R2a): historically helped q11/q17 but is a
+#     Flink-side path selector; under uniform KV-sep ON + point-deref the q11/q17
+#     read path is already recovered, so we leave the executor at its inline default
+#     (no per-query executor switch). Operators may still set it manually to probe.
+#   - FRS_S2_FANOUT_MIN=8 (R1 adaptive-S2) / FRS_RS_PROBE_BLOOM_PRUNE /
+#     FRS_RS_LEVELED_HOT_CF / FRS_PERSISTENT_PROBE_ITER / FRS_RS_MERGE_RMW: these
+#     were the experimental per-query "validate full-stack" levers. They are NOT in
+#     the uniform default because they were never A/B-confirmed query-by-query as
+#     uniformly safe (some help joins, none were shown harmless for windowed/source-
+#     bound queries). The uniform config keeps only the levers proven beneficial-or-
+#     neutral across shapes (KV-sep + coalesce + auto point-deref + the bounds).
+#   - per-query process.size / topology: FORBIDDEN. Every query uses the SAME
+#     2x4c/16g split + 10240m carve-out.
+#
+# HONEST CEILING (the Mac 35 GiB VM, NOT the remote box): on the 37.77 GiB Mac VM
+# two co-resident 16g TMs overcommit the VM, so q9/q5/q19 can OOM from GLOBAL VM
+# pressure (jemalloc RETAINED rides RSS over the cgroup; the LIVE set always fits
+# the budget). On a host whose VM actually fits 2x16g (>=40 GiB) the controller
+# runs un-throttled -> never-OOM AND within-bar. See the repro doc + the
+# 8c32g-3backend-sweep-results.md PMC-1 sections for the empirical detail.
 #
 # COLUMNS (tab-separated):
-#   query  KV_SEPARATION  KV_MIN_BLOB_SIZE  TRIVIAL_MOVE  S2_PINNED  S2_FANOUT_MIN  RS_EXECUTOR  SST_COMPRESSION  VLOG_COALESCE_DEREF  expected_wall_s  status  note
-#   - "-" = leave unset (engine default).
-#   - status: MEASURED       = the encoded config produced expected_wall_s in a captured run.
-#             NEEDS-CONFIRM   = best-known config but THIS exact knob combination's wall is
-#                               UNMEASURED (the encoded value is the best component-measured
-#                               estimate; a confirming run is required before trusting it).
+#   query  KV_SEPARATION  KV_MIN_BLOB_SIZE  TRIVIAL_MOVE  S2_PINNED  VLOG_COALESCE_DEREF  SST_COMPRESSION  MEM_MANAGER  note
+#   query "*" = the UNIFORM config; run-best.sh applies this row to EVERY query.
 #
-query	KV_SEPARATION	KV_MIN_BLOB_SIZE	TRIVIAL_MOVE	S2_PINNED	S2_FANOUT_MIN	RS_EXECUTOR	SST_COMPRESSION	VLOG_COALESCE_DEREF	expected_wall_s	status	note
-q4	true	256	true	1	-	-	lz4	1	311	MEASURED	KV-sep ON wins (flag-ON 311 vs flag-OFF 384, +23%). +FRS_VLOG_COALESCE_DEREF=1 (coalesced batched vlog deref, part of best config). Retract-changelog cadence rows ~25.8M (documented, not a defect). Beats RDB 1.09x; ForSt DNF(OOM).
-q7	true	256	true	1	-	-	lz4	1	695	MEASURED	KV-sep ON wins big (flag-ON 695 vs flag-OFF 937, +35%). +FRS_VLOG_COALESCE_DEREF=1 (coalesced probe-side vlog deref, part of best config). Heaviest windowed-join; -26% vs prior V10. PASS RDB 1.16x; loses to ForSt.
-q9	false	-	false	-	-	-	lz4	1	1828	MEASURED	KV-sep MUST be OFF on the 35g Mac at this topology: flag-ON DNF (TM OOM ~75-83M, reproducible x2) at process.size=12288m; flag-OFF FINISHES 1828.7s (RSS ~2GiB lower). Beats ForSt 2002.5 by completing. VLOG_COALESCE_DEREF=1 is a NO-OP here (KV-sep OFF => no separated values); set uniformly, harmless. ★ UPDATE 2026-06-15 (efdc5997a): q9 KV-sep ON NOW FITS the 2x4c/16g SPLIT via the native-headroom carve-out (Flink taskmanager.memory.process.size 12288m->10240m, leaving ~6GiB cgroup for the engine's native/jemalloc allocation that Flink does NOT budget). VALIDATED: q9 @100M KV-sep ON @split FINISHED 1463.3s, EXACT out_rows 91,813,372, peak per-TM ~15.2GiB. Repro: tools/nexmark-local/scripts/q9-procsize.sh <tag> 10240m 2700  (the winning launcher). The KV-sep-ON+10240m split is now the q9 best when the box's per-TM cgroup is a true 16g; this OFF row stays the conservative fallback for tighter boxes.
-q11	false	-	false	-	-	-	lz4	1	119	MEASURED	KV-sep OFF wins (flag-OFF 118.8 vs flag-ON 215.8, -45%). Flips both-FAIL->both-PASS (1.12x RDB). Windowed-MapState-agg drain. NOTE: R2a (routing-adaptive) ALSO helped q11 historically (318.9->135.7); the OFF+R2a combo is UNMEASURED -- current cell encodes the best MEASURED (plain OFF, 118.8). See run-best.sh q11-r2a variant.
-q12	-	-	-	-	-	-	lz4	1	41	MEASURED	Source-bound parity; KV-sep neutral (flag-ON 40.6 ~ flag-OFF 41.6). Either works; left at engine default (OFF).
-q17	false	-	false	-	-	routing-adaptive	lz4	1	83.7	NEEDS-CONFIRM	BEST wall 83.7 = KV-sep-OFF regime + R2a routing-adaptive (/tmp/v3-q17 capture). Plain KV-sep-OFF inline measured 110.7 (flag-OFF pass); KV-sep-ON measured 150.7 (flag-ON). The OFF+routing-adaptive 83.7 is from a SEPARATE capture, NOT the clean serial flag-OFF pass -> CONFIRM the OFF+routing-adaptive wall on a quiet box. Fallback MEASURED config = OFF/inline @110.7.
-q19	true	256	true	1	-	-	lz4	1	216	MEASURED	#1 KV-sep-ON beneficiary (flag-ON 216 vs flag-OFF 464, +115% = largest swing). +FRS_VLOG_COALESCE_DEREF=1 (coalesced vlog deref, part of best config). BEATS BOTH backends (0.82x RDB, 1.18x ForSt). Value-carrying interval-join + Top-N read path.
-q20	true	256	true	1	-	-	lz4	1	824	MEASURED	KV-sep ON wins (flag-ON 824.4 vs flag-OFF 956.3, +16%). +FRS_VLOG_COALESCE_DEREF=1 (coalesced deep-probe vlog deref, part of best config). NEAR RDB 1.26x (busy-disk noise; quiet box likely PASS <=1.25x). PASS ForSt 1.63x. R1 adaptive-S2 (FRS_S2_FANOUT_MIN) is a candidate further lever for this deep-probe join (UNMEASURED here).
+query	KV_SEPARATION	KV_MIN_BLOB_SIZE	TRIVIAL_MOVE	S2_PINNED	VLOG_COALESCE_DEREF	SST_COMPRESSION	MEM_MANAGER	note
+*	true	256	true	1	1	lz4	1	UNIFORM config for ALL queries. KV-sep ON; FRS_VLOG_POINT_DEREF left UNSET so it auto-follows KV-sep (windowed point-RMW q11/q17 take exact-size point deref; coalesceable joins q4/q7/q19/q20 take get_coalesced) — the engine auto-selects by deref locality. FRS_MEM_MANAGER=1 never-OOM controller (un-throttled on the >=40 GiB remote box, perf-neutral). TOPO=split 2x4c/16g + 10240m carve-out + SLOTS (in templates). Vlog resident bounds (reader_cap 2048, budget 256m, adaptive pressure) keep the engine native inside the carve-out headroom. NO per-query differences.

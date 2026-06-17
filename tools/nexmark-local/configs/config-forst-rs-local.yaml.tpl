@@ -20,6 +20,16 @@ taskmanager:
   bind-host: localhost
   host: localhost
   numberOfTaskSlots: 4
+  # SLOT-SKEW FIX (2026-06-16, PMC-1): spread slots EVENLY across both TMs. Flink
+  # 2.0's default taskmanager.load-balance.mode=NONE packs a job into the MINIMUM
+  # number of TMs -> at parallelism=4 all 4 join subtasks land on tm1's 4 slots,
+  # tm1 holds 100% of the state (~15.9 GiB) and OOM-kills at the 16g/TM cgroup
+  # though the cluster total is only ~17 GiB (a DISTRIBUTION bug, not a memory
+  # ceiling). SLOTS mode spreads the 4 subtasks 2+2 across both TMs. Set identically
+  # in the rocksdb/forst templates -> fair topology, no RAM added. (Reference mirror
+  # of scripts/templates-linux/config-forst-rs-local.yaml.tpl — harness uses templates-linux.)
+  load-balance:
+    mode: SLOTS
   memory:
     # FRS-Q9-NATIVE-HEADROOM (2026-06-15, PMC-1): carve Flink's process.size DOWN
     # so the forst-rs engine's NATIVE (off-heap, jemalloc-in-the-.so) allocation

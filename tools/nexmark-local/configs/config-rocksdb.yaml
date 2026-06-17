@@ -18,6 +18,12 @@ taskmanager:
   bind-host: localhost
   host: localhost
   numberOfTaskSlots: 4
+  # SLOT-SKEW FIX (2026-06-16, PMC-1): spread slots evenly across both TMs (Flink
+  # 2.0 default load-balance.mode=NONE packs a job into the fewest TMs). Set
+  # identically across all backend templates for a FAIR topology. (Reference mirror
+  # of scripts/templates-linux/config-rocksdb.yaml — the harness uses templates-linux.)
+  load-balance:
+    mode: SLOTS
   memory:
     # 8C32G envelope: match forst-rs's JVM process.size so both engines compare
     # within the professional 8c/32g box. RocksDB state is local-disk; its block

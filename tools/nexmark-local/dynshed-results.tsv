@@ -1,7 +1,0 @@
-query	arm	state	wall_ms	wall_s	src_out	out_rows	tag	ts
-q9	forst-rs-ffm-local	NO_RESULT	-	-	-	-	dyn-q9-forst-rs-ffm-local	20260616T003029
-q9	forst-rs-ffm-local	RESTARTING	1002955	1003.0	0	-	dyn-q9-forst-rs-ffm-local	20260616T004900
-q19	forst-rs-ffm-local	FINISHED	441429	441.4	48686526	48686526	dyn-q19-forst-rs-ffm-local	20260616T005659
-q5	forst-rs-ffm-local	RESTARTING	461507	461.5	0	-	dyn-q5-forst-rs-ffm-local	20260616T010535
-q7	forst-rs-ffm-local	FINISHED	909906	909.9	92000128	92000002	dyn7on-q7-forst-rs-ffm-local	20260616T012156
-q7	forst-rs-ffm-local	FINISHED	982881	982.9	92000140	92000002	dyn7off-q7-forst-rs-ffm-local	20260616T013925

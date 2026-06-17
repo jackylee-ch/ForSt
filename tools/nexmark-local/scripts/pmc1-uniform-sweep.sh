@@ -1,92 +1,69 @@
 #!/usr/bin/env bash
-# pmc1-uniform-sweep.sh — PMC-1 uniform-split q0-q22 sweep (2026-06-15).
+# pmc1-uniform-sweep.sh — PMC-1 UNIFORM-config q0-q22 sweep (2026-06-17).
 #
-# Drives run-8c32g.sh directly under the UNIFORM 2x4c/16g SPLIT topology with
-# the established "validate" full-stack-ON forst-rs lever set per query. The ONE
-# deliberate difference from run-best.sh `validate`: q9 runs in the SAME uniform
-# split as every other query (NOT the 8c/36g single-TM special case), because
-# commit efdc5997a (process.size 12288m->10240m) makes q9 KV-sep ON fit the 16g
-# split cgroup. This is the uniform-config research arm.
+# Drives run-8c32g.sh under the UNIFORM 2x4c/16g SPLIT topology with the SINGLE
+# uniform forst-rs config applied to EVERY query — NO per-query branches (user
+# directive: per-query config is FORBIDDEN). The config is read from
+# configs/best-config.tsv (the `*` row) so this driver and run-best.sh share ONE
+# source of truth. The engine adapts to the query SHAPE at runtime under the one
+# config (FRS_VLOG_POINT_DEREF auto-follows KV-sep for windowed point-RMW;
+# FRS_VLOG_COALESCE_DEREF batches scan derefs). Records each RESULT incrementally.
 #
-# Records each RESULT incrementally to $RESULTS_TSV.
-#
-# USAGE:
-#   QUERIES="q9 q7 ..." ARMS="forst-rs-ffm-local rocksdb forst-local" \
-#     bash pmc1-uniform-sweep.sh
+# USAGE (REPO/WORKENV/etc are env-overridable; the harness detects the OS):
+#   REPO=/path/to/checkout QUERIES="q9 q7 ..." \
+#     ARMS="forst-rs-ffm-local rocksdb forst-local" bash pmc1-uniform-sweep.sh
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="${REPO:-/tmp/frs-q9memfit}"
-RUNNER="$REPO/scripts/run-8c32g.sh"
-RESULTS_TSV="${RESULTS_TSV:-$REPO/tools/nexmark-local/pmc1-uniform-results.tsv}"
+PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO="${REPO:-$(cd "$PKG_DIR/../.." && pwd)}"
+RUNNER="$PKG_DIR/scripts/run-8c32g.sh"
+[ -f "$RUNNER" ] || RUNNER="$REPO/scripts/run-8c32g.sh"
+TSV="$PKG_DIR/configs/best-config.tsv"
+RESULTS_TSV="${RESULTS_TSV:-$PKG_DIR/pmc1-uniform-results.tsv}"
 
 export EVENTS_NUM="${EVENTS_NUM:-100000000}"
 export TPS="${TPS:-10000000}"
 MAXSEC="${MAXSEC:-2700}"
 TAG_PREFIX="${TAG_PREFIX:-pmc1u}"
 
-QUERIES="${QUERIES:-q9}"
+QUERIES="${QUERIES:-q4 q7 q9 q11 q12 q17 q19 q20}"
 ARMS="${ARMS:-forst-rs-ffm-local rocksdb forst-local}"
 
 [ -f "$RESULTS_TSV" ] || printf 'query\tarm\tstate\twall_ms\twall_s\tsrc_out\tout_rows\ttag\tts\n' > "$RESULTS_TSV"
 
-# Apply the per-query validate full-stack-ON forst-rs levers (mirrors
-# run-best.sh apply_validate; forst-rs arm only — baselines ignore FRS_*).
-apply_validate() {
-  local q="$1"
-  unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE \
-        FRS_RS_S2_PINNED FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF \
-        FRS_VLOG_POINT_DEREF \
+# --- read the single uniform `*` row from configs/best-config.tsv ---
+lookup_uniform_row() {
+  awk -F'\t' '
+    /^[[:space:]]*#/ { next } /^[[:space:]]*$/ { next }
+    $1 == "query" { next } $1 == "*" { print; found=1; exit }
+    END { if (!found) exit 3 }
+  ' "$TSV"
+}
+
+# Apply the UNIFORM forst-rs config — IDENTICAL for every query (no branches).
+# Mirrors run-best.sh apply_uniform; forst-rs arm only (baselines ignore FRS_*).
+apply_uniform() {
+  local row; row="$(lookup_uniform_row)" || { echo "FATAL: no uniform '*' row in $TSV"; exit 1; }
+  local query kvsep kvmin trivial s2pin coalesce comp memmgr note
+  IFS=$'\t' read -r query kvsep kvmin trivial s2pin coalesce comp memmgr note <<<"$row"
+  unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE FRS_RS_S2_PINNED \
+        FRS_VLOG_COALESCE_DEREF FRS_VLOG_POINT_DEREF FRS_RS_EXECUTOR FRS_S2_FANOUT_MIN \
         FRS_RS_PROBE_BLOOM_PRUNE FRS_RS_LEVELED_HOT_CF FRS_PERSISTENT_PROBE_ITER \
         FRS_RS_MERGE_RMW FRS_RS_MERGE_RMW_STATES 2>/dev/null || true
-  export FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}"
+  setk() { [ "$2" != "-" ] && export "$1=$2" || true; }
+  setk FRS_KV_SEPARATION    "$kvsep"
+  setk FRS_KV_MIN_BLOB_SIZE "$kvmin"
+  setk FRS_TRIVIAL_MOVE     "$trivial"
+  setk FRS_RS_S2_PINNED     "$s2pin"
+  setk FRS_VLOG_COALESCE_DEREF "$coalesce"
+  setk FRS_MEM_MANAGER      "$memmgr"
+  export FRS_SST_COMPRESSION="${comp:-lz4}"
   export FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}"
-  join_stack() {
-    export FRS_KV_SEPARATION=true
-    export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
-    export FRS_TRIVIAL_MOVE="${FRS_TRIVIAL_MOVE:-true}"
-    export FRS_RS_S2_PINNED="${FRS_RS_S2_PINNED:-1}"
-    export FRS_S2_FANOUT_MIN="${FRS_S2_FANOUT_MIN:-8}"
-    export FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-1}"
-    export FRS_RS_PROBE_BLOOM_PRUNE="${FRS_RS_PROBE_BLOOM_PRUNE:-1}"
-    export FRS_RS_LEVELED_HOT_CF="${FRS_RS_LEVELED_HOT_CF:-1}"
-    export FRS_PERSISTENT_PROBE_ITER="${FRS_PERSISTENT_PROBE_ITER:-1}"
-  }
-  window_stack() {
-    export FRS_RS_MERGE_RMW="${FRS_RS_MERGE_RMW:-1}"
-    export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}"
-    # PMC-1 uniform V3 directive (2026-06-15): the windowed stack runs KV-sep ON
-    # (uniform config) so the newly-wired point-deref read path actually engages
-    # on vlog-separated accumulators. Point-deref is a no-op when KV-sep is OFF.
-    export FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-true}"
-    export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
-    # PMC-1 2026-06-15 windowed-agg KV-sep-ON read path: the Reducing/
-    # Aggregating accumulator RMW is single-key (no scan locality), so a chunk
-    # deref pays 64 KiB read-amp PER record. POINT deref reads exactly the
-    # record (mini-bench windowed_agg_rmw: closes ~80-91% of the KV-sep-ON gap,
-    # 5233->2224 ns/rec read; 83.7s->41.8s full RMW @2M keys/16M recs).
-    # COALESCE deref is the OPPOSITE lever (batches scattered derefs for SCAN
-    # locality) and is 2.5x HARMFUL on this single-key pattern (12865 ns/rec),
-    # so it stays OFF here — point-deref only.
-    export FRS_VLOG_POINT_DEREF="${FRS_VLOG_POINT_DEREF:-1}"
-  }
-  case "$q" in
-    q4|q7|q9|q19|q20) join_stack ;;
-    q8|q11|q12|q18)   window_stack ;;
-    q17)              export FRS_RS_EXECUTOR="${FRS_RS_EXECUTOR:-routing-adaptive}"
-                      export FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-true}"
-                      export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
-                      export FRS_VLOG_POINT_DEREF="${FRS_VLOG_POINT_DEREF:-1}" ;;
-    *)                : ;;  # light/source-bound: fairness baseline only
-  esac
-  # q9 KV-sep resident bounds (so KV-sep fits the 16g split cgroup — the whole
-  # point of the 10240m process.size carve-out). Harmless for other queries but
-  # only set them for q9 to keep the other queries' env minimal.
-  if [ "$q" = "q9" ]; then
-    export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
-    export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-512}"
-    export FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-1}"
-  fi
+  # FRS_VLOG_POINT_DEREF LEFT UNSET -> auto-follows KV-sep (db.rs:467).
+  export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
+  export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-256}"
+  export FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-1}"
 }
 
 parse_and_record() {
@@ -96,7 +73,6 @@ parse_and_record() {
   ts="$(date +%Y%m%dT%H%M%S)"
   if [ -z "$line" ]; then
     state="NO_RESULT"; wall_ms="-"; wall_s="-"; src="-"; out_rows="-"
-    # If MAXSEC banner present, mark DNF
     grep -q 'MAXSEC .* reached' "$out" && state="DNF_MAXSEC"
   else
     state="$(echo "$line" | sed -n 's/.*FINISHED.*/FINISHED/p;s/.*ENDED state=\([A-Z]*\).*/\1/p')"
@@ -121,25 +97,23 @@ for q in $QUERIES; do
     (
       export TOPO=split
       if [ "$arm" = "forst-rs-ffm-local" ]; then
-        apply_validate "$q"
+        apply_uniform
       else
-        # baselines: only fairness compression; no forst-rs levers
         unset FRS_KV_SEPARATION FRS_KV_MIN_BLOB_SIZE FRS_TRIVIAL_MOVE FRS_RS_S2_PINNED \
               FRS_S2_FANOUT_MIN FRS_RS_EXECUTOR FRS_VLOG_COALESCE_DEREF FRS_VLOG_POINT_DEREF \
-              FRS_RS_PROBE_BLOOM_PRUNE \
+              FRS_MEM_MANAGER FRS_RS_PROBE_BLOOM_PRUNE \
               FRS_RS_LEVELED_HOT_CF FRS_PERSISTENT_PROBE_ITER FRS_RS_MERGE_RMW 2>/dev/null || true
         export FRS_SST_COMPRESSION=lz4
       fi
-      echo "  levers: KV_SEP=${FRS_KV_SEPARATION:-OFF} EXEC=${FRS_RS_EXECUTOR:-default} MERGE_RMW=${FRS_RS_MERGE_RMW:-OFF} POINT_DEREF=${FRS_VLOG_POINT_DEREF:-OFF}"
+      echo "  uniform levers: KV_SEP=${FRS_KV_SEPARATION:-OFF} COALESCE=${FRS_VLOG_COALESCE_DEREF:-OFF} POINT_DEREF=<auto> MEM_MGR=${FRS_MEM_MANAGER:-OFF}"
       CLUSTER="$tag" bash "$RUNNER" run "$q" "$arm" "$MAXSEC" "$tag"
     )
     parse_and_record "$q" "$arm" "$tag" "$out"
-    # docker-clean between runs (safety; harness already tears its cluster down)
     docker rm -f "$tag-jm" "$tag-tm1" "$tag-tm2" >/dev/null 2>&1 || true
     docker network rm "$tag-net" >/dev/null 2>&1 || true
-    # free the per-cluster scratch to reclaim disk
-    rm -rf "${FRS_CTMP_BASE:-$REPO/../../Downloads/workenv/frs-tmp}/$tag" 2>/dev/null || true
-    rm -rf "/Users/lijunqing/Downloads/workenv/frs-tmp/$tag" 2>/dev/null || true
+    # The harness scratch-trap already rm -rf's the per-cluster scratch on exit;
+    # this is a belt-and-suspenders reclaim using the SAME base it computes.
+    rm -rf "${FRS_CTMP_BASE:-${WORKENV:-$HOME/workenv}/frs-tmp}/$tag" 2>/dev/null || true
   done
 done
 

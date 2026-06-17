@@ -22,55 +22,61 @@ and are **fully env-overridable** — nothing is hardcoded to one machine. Jump 
 ```
 tools/nexmark-local/
   scripts/
-    run-best.sh                  NEW — per-query BEST-config driver (<query>|sweep|print)
-    run-s3sim.sh                 NEW — local S3-simulation driver (smoke | sweep)
-    run-8c32g.sh                 portable copy of scripts/run-8c32g.sh: forwards
-                                   FRS_REMOTE_BW_MBPS + JVM process.size into the
-                                   containers, and adds OS-aware defaults
-                                   (paths/image/jemalloc/io_uring/RAM sizing)
+    run-best.sh                  UNIFORM-config driver (<query>|sweep|print|validate)
+    pmc1-uniform-sweep.sh        UNIFORM-config 3-backend sweep, records to a TSV
+    run-s3sim.sh                 local S3-simulation driver (smoke | sweep)
+    run-8c32g.sh                 portable copy of scripts/run-8c32g.sh: scratch-cleanup
+                                   trap + FRS_MEM_MANAGER/process.size passthrough +
+                                   OS-aware defaults (paths/image/jemalloc/io_uring/RAM)
     run-remote-nexmark-v3.sh     uniform-config NexMark sweep wrapper (portable)
     pick-disk.sh                 portable scratch-disk picker (Linux NVMe %util;
                                    macOS $TMPDIR; FRS_CTMP_BASE override)
   configs/
-    best-config.tsv              NEW — per-query EMPIRICALLY-BEST config table
-    config-forst-rs-s3sim.yaml.tpl   NEW — disagg config: S3 dir + local dir + throttle
-    config-forst-rs-local.yaml.tpl   copy — forst-rs uniform config (LocalFS arm)
-    config-rocksdb.yaml              copy — RocksDB baseline config
-    config-forst.yaml.tpl            copy — ForSt (C++) baseline config
+    best-config.tsv              the SINGLE UNIFORM config (one `*` row, all queries)
+    config-forst-rs-s3sim.yaml.tpl   disagg config: S3 dir + local dir + throttle
+    config-forst-rs-local.yaml.tpl   forst-rs uniform config (LocalFS arm) — SLOTS, 10240m
+    config-rocksdb.yaml              RocksDB baseline config — SLOTS
+    config-forst.yaml.tpl            ForSt (C++) baseline config — SLOTS
   docs/
     README.md                    this file
     DOCS-INDEX.md                pointers to the design/runbook specs
 ```
 
+**Remote-Linux reproduction runbook:**
+`docs/superpowers/specs/2026-06-17-remote-linux-nexmark-repro.md` — the
+authoritative step-by-step for the remote x86_64 box (prereqs, build, the exact
+uniform config, per-backend runs, expected out_rows, the .so-copy + scratch-trap
+caveats).
+
 ---
 
-## 1. Two run modes — read first
+## 1. ONE uniform config — read first
 
-This package supports **two intentionally-distinct** ways to run the sweep:
+**Per-query config is FORBIDDEN (user directive, 2026-06-17).** Every query runs
+with the SAME config; the engine adapts to the query SHAPE at runtime under that
+one config. There is exactly ONE config row (`*`) in `configs/best-config.tsv`,
+and both `run-best.sh` and `pmc1-uniform-sweep.sh` apply it to every query with
+**no per-query branches**.
 
-| Mode | Script | Config policy | Question it answers |
-|---|---|---|---|
-| **Uniform-config** | `run-remote-nexmark-v3.sh` | SAME config for every query | research: how good is forst-rs under ONE config (matching ForSt)? |
-| **Best-per-query** | `run-best.sh` | each query at its EMPIRICALLY-BEST config | reproduction: the best wall forst-rs achieves per query |
-| **Full-stack-ON validate** | `run-best.sh validate ...` | every built lever ON per query, vs rocksdb + forst | the goal proof: do priority queries beat BOTH backends with the full stack? |
+| Mode | Script | What it does |
+|---|---|---|
+| **Uniform single** | `run-best.sh <query>` | one query, forst-rs arm, uniform config |
+| **Uniform sweep** | `run-best.sh sweep` / `pmc1-uniform-sweep.sh` | all priority queries, SAME config |
+| **3-backend A/B** | `run-best.sh validate <query>` | forst-rs (uniform) vs rocksdb vs forst, matched topology |
+| **Lever attribution** | `run-best.sh validate-ab <query>` | uniform config ON vs all-OFF, same .so/jar |
 
-**All three are legitimate; they answer different questions — do not conflate them.**
-The validate mode (`run-best.sh validate print|<query>|sweep`, `validate-ab <query>`) and
-its A/B + canary protocol are specified in
-`docs/superpowers/specs/2026-06-15-levers-on-validation-plan.md`.
+`run-best.sh print` prints the exact uniform config. The full per-knob rationale
+(including the levers EXCLUDED from the uniform default and why), the topology,
+and the never-OOM honesty note are in the remote-Linux runbook:
+`docs/superpowers/specs/2026-06-17-remote-linux-nexmark-repro.md`.
 
-- **Uniform-config (research).** SAME config for ALL queries; per-query tuning is
-  out of scope for that mode. The only allowed optimization is *dynamic /
-  adaptive engine behavior under one config*. forst-rs matches ForSt:
-  `noflush=false`, writebuffer `1G`, WBM `4G`, LZ4. See `docs/DOCS-INDEX.md` →
-  remote-nexmark-config-v3.
-- **Best-per-query (reproduction).** Per-query config is **INTENTIONAL** here —
-  the same-config constraint was **reversed 2026-06-14**. Each query runs with
-  the knobs the sweep data shows are best for it (KV-separation ON for the
-  write / value-carrying / heavy-JOIN queries — q4/q7/q9/q19/q20; OFF only where
-  it MEASURABLY hurts — the windowed-AGG-drain q11/q17, and neutral q12; plus
-  the R2a routing-adaptive executor where it helps). This is the
-  best-PERFORMANCE reproduction package — see §3b and `configs/best-config.tsv`.
+**The uniform config in brief** (see `configs/best-config.tsv` for full provenance):
+KV-sep ON (`FRS_KV_SEPARATION=true`, min-blob 256), `FRS_VLOG_COALESCE_DEREF=1`,
+`FRS_VLOG_POINT_DEREF` left unset so it auto-follows KV-sep (windowed point-RMW),
+`FRS_MEM_MANAGER=1` (never-OOM controller, un-throttled on a ≥40 GiB box), lz4,
+`TOPO=split` 2×4c/16g + 1× JM 2c/4g, `process.size=10240m` carve-out + SLOTS
+load-balance, parallelism 4. forst-rs matches the ForSt base: `noflush=false`,
+writebuffer `1G`, WBM `4G`.
 
 The **8 priority queries**: `q4 q7 q9 q11 q12 q17 q19 q20`.
 The **3 backends/arms**: `forst-rs-ffm-local`, `rocksdb`, `forst-local`.
@@ -113,33 +119,39 @@ time).
 
 ---
 
-## 3b. Run the BEST-per-query sweep (best-performance reproduction)
+## 3b. Run the UNIFORM-config sweep via run-best.sh / pmc1-uniform-sweep.sh
 
-Per-query config is **intentional** here (§1). `run-best.sh` reads each query's
-row from `configs/best-config.tsv`, exports the per-query forst-rs knobs, and
-drives the unmodified `run-8c32g.sh` (forst-rs arm, `TOPO=split`).
+`run-best.sh` reads the single `*` row from `configs/best-config.tsv` and applies
+the SAME config to every query (no per-query branches), driving the unmodified
+`run-8c32g.sh` (forst-rs arm, `TOPO=split`).
 
 ```bash
-# build once (and on engine changes), exactly as for the uniform sweep:
+# build once (and on engine changes):
 bash tools/nexmark-local/scripts/run-8c32g.sh build      # + jar on the box
 
-# show the resolved best config for one query / all queries (no run):
-bash tools/nexmark-local/scripts/run-best.sh print q19
+# show the resolved uniform config (no run):
 bash tools/nexmark-local/scripts/run-best.sh print
 
-# run ONE query at its best config:
+# run ONE query at the uniform config (forst-rs arm):
 REPO=/path/to/ForSt WORKENV=~/workenv FLINK=~/workenv/flink-2.2.1 \
   IMG=forst-bench:x86 PLAT=linux/amd64 NEXMARK_HOME=~/workenv/nexmark-flink \
   bash tools/nexmark-local/scripts/run-best.sh q19
 
-# run the full 8-query best-config sweep (serial):
-REPO=/path/to/ForSt WORKENV=~/workenv FLINK=~/workenv/flink-2.2.1 \
-  IMG=forst-bench:x86 PLAT=linux/amd64 NEXMARK_HOME=~/workenv/nexmark-flink \
-  bash tools/nexmark-local/scripts/run-best.sh sweep
+# run the full priority sweep at the uniform config (serial):
+bash tools/nexmark-local/scripts/run-best.sh sweep
+
+# 3-backend fair A/B for one query (forst-rs uniform vs rocksdb vs forst):
+bash tools/nexmark-local/scripts/run-best.sh validate q9
+
+# full 3-backend sweep, recorded incrementally to a TSV:
+QUERIES="q4 q7 q9 q11 q12 q17 q19 q20" \
+  ARMS="forst-rs-ffm-local rocksdb forst-local" \
+  bash tools/nexmark-local/scripts/pmc1-uniform-sweep.sh
+# -> tools/nexmark-local/pmc1-uniform-results.tsv
 
 # subset / overrides:
 QUERIES="q4 q9" bash tools/nexmark-local/scripts/run-best.sh sweep
-MAXSEC=3600 bash tools/nexmark-local/scripts/run-best.sh q7
+MAXSEC=3600 bash tools/nexmark-local/scripts/run-best.sh q7   # MAXSEC = timeout only
 ```
 
 `run-best.sh` only touches the **forst-rs** arm (`ARM=forst-rs-ffm-local`); the
@@ -176,25 +188,22 @@ Two further combos are called out in `best-config.tsv` notes rather than guessed
 into the table: q11 with `adaptive` and q20 with the R1 adaptive-S2 knob
 `FRS_S2_FANOUT_MIN`.
 
-**Lever summary (the read-path shape).** KV-separation is not globally good or
-bad — interval-join + Top-N + heavy windowed-JOIN (q4/q7/q9/q19/q20) want it
-**ON** (write-amp / value-carrying read path); windowed-AGG-drain (q11/q17) wants
-it **OFF**. The memory-bound **q9** wants KV-sep ON too, and now **fits the same
-2×4c/16g split as every other query** via the `process.size=10240m` native-headroom
-carve-out (no single TM, no per-query topology — see §3a). R2a (`routing-adaptive`)
-helps q17 (and historically q11).
+**Lever summary (uniform — KV-sep ON for ALL queries).** KV-separation is ON for
+every query; the engine adapts the read path to the query SHAPE under that one
+config. Scan/coalesceable joins (q4/q7/q9/q19/q20) take the batched
+`FRS_VLOG_COALESCE_DEREF` path; windowed point-RMW (q11/q17/q8/q18) take the
+exact-size `get_point` path because `FRS_VLOG_POINT_DEREF` auto-follows KV-sep
+when left unset (`db.rs:445-470`). That auto point-deref is what removed the old
+q11/q17 KV-sep-OFF exception — KV-sep ON is now perf-clean for the windowed
+queries too. The memory-bound **q9** fits the same 2×4c/16g split as every other
+query via the `process.size=10240m` native-headroom carve-out (see §3a).
 
-> **Topology directive (2026-06-15): EVERY query runs on the uniform 2×4c/16g
-> split (`TOPO=split`). No single-TM topology for any query, q9 included.**
->
-> **KV-sep policy (2026-06-15): prefer KV-sep ON wherever it performs better.**
-> q4/q7/q9/q19/q20 are ON (q9 flipped this session — it now fits the split, §3a).
-> The only OFF queries are where a same-pass A/B MEASURED ON to be *slower*:
-> **q11** (ON 215.8 vs OFF 118.8s, +82%) and **q17** (ON 150.7 vs OFF 110.7s,
-> +36%) — both windowed-AGG-drain — plus neutral **q12**. ⚠ Those q11/q17 OFF-wins
-> predate the current read-path lever stack; **re-measure KV-sep ON for q11/q17 on
-> the current tip and flip them if ON is now ≥ OFF** (open action — not yet
-> re-measured, so the table keeps the last MEASURED OFF winner).
+> **UNIFORM-config directive (2026-06-17): per-query config is FORBIDDEN. Every
+> query runs the SAME config (KV-sep ON, coalesce, auto point-deref,
+> `FRS_MEM_MANAGER=1`) on the SAME 2×4c/16g split (`TOPO=split`) + SLOTS. No
+> single-TM topology, no per-query KV-sep OFF, no per-query executor. The old
+> q9/q11/q17 per-query split has been purged from `best-config.tsv` and
+> `run-best.sh`.**
 
 ---
 
@@ -206,14 +215,13 @@ helps q17 (and historically q11).
 `taskmanager.memory.process.size` **12288m → 10240m** (commit `efdc5997a`, already
 in `scripts/templates-linux/config-forst-rs-local.yaml.tpl`).
 
-**Command (forst-rs arm only, the winning launcher):**
+**Command (forst-rs arm; the uniform config already carries the carve-out):**
 
 ```bash
 # from a checkout/worktree root; REPO auto-detected, override for the box.
-bash tools/nexmark-local/scripts/q9-procsize.sh q9fit 10240m 2700
-# or via the per-query driver (KV-sep ON + the join stack at the split):
-bash tools/nexmark-local/scripts/run-best.sh q9-split
-# or the full 3-backend beat-both validate at the split:
+# q9 runs the SAME uniform config as every query — no special launcher.
+bash tools/nexmark-local/scripts/run-best.sh q9
+# or the full 3-backend beat-both A/B at the split:
 bash tools/nexmark-local/scripts/run-best.sh validate q9
 ```
 
@@ -247,15 +255,15 @@ The KV-sep resident vlog readers are additionally **bounded** (count cap 2048 +
 back-off) so resident vlog bytes stay inside that ~6 GiB headroom regardless of
 q9's scattered-death segment pattern.
 
-**Do NOT do (refuted levers, kept as repro scripts).**
+**Do NOT do (refuted levers — NOT in the uniform default).**
 
-- **Aggressive jemalloc decay** (`_RJEM_MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:0`,
-  via `q9-decay.sh`): returns freed pages faster but **speeds ingestion past
-  compaction** → more uncompacted state → OOMs **earlier** (~59.5M). The 10s
-  default's slower re-faulting actually paces ingestion. **Worse, not better.**
-- **Fewer compaction threads** (`FRS_BG_COMPACT_THREADS=1`, via `q9-fit2.sh`): a
-  single compaction's working set is already ~5 GiB (the spike is working-set,
-  not concurrency), and fewer threads → L0 buildup → **higher** base. **Worse.**
+- **Aggressive jemalloc decay** (`_RJEM_MALLOC_CONF=dirty_decay_ms:1000,muzzy_decay_ms:0`):
+  returns freed pages faster but **speeds ingestion past compaction** → more
+  uncompacted state → OOMs **earlier** (~59.5M). The compiled eager-jemalloc decay
+  in the forst-rs `.so` is tuned for this; do not override it per query.
+- **Fewer compaction threads** (`FRS_BG_COMPACT_THREADS=1`): a single compaction's
+  working set is already ~5 GiB (the spike is working-set, not concurrency), and
+  fewer threads → L0 buildup → **higher** base. **Worse.**
 
 **Env note.** The macOS Docker Desktop VM is ~35 GiB total, so the 2×16g split +
 4g JM (≈36 GiB) **barely** fits — the carve-out fit was validated under exactly
@@ -363,20 +371,18 @@ back to blocking I/O inside the Docker-Desktop VM); scratch base defaults under
 bash tools/nexmark-local/scripts/run-8c32g.sh build
 bash tools/nexmark-local/scripts/run-8c32g.sh jar       # host maven, JAVA_HOME auto
 
-# 1) show / run the per-query BEST config (forst-rs arm):
-bash tools/nexmark-local/scripts/run-best.sh print            # all 8
+# 1) show / run the UNIFORM config (forst-rs arm; SAME for every query):
+bash tools/nexmark-local/scripts/run-best.sh print            # the one config
 bash tools/nexmark-local/scripts/run-best.sh q19              # one query
-bash tools/nexmark-local/scripts/run-best.sh sweep           # all 8, serial
+bash tools/nexmark-local/scripts/run-best.sh sweep           # all priority, serial
+bash tools/nexmark-local/scripts/run-best.sh q9              # q9 = same uniform config
 
-# 2) q9 + KV-sep ON at the uniform 2×4c/16g split (§3a; process.size=10240m carve-out):
-bash tools/nexmark-local/scripts/run-best.sh q9-split
-#    (or the winning launcher directly:)
-bash tools/nexmark-local/scripts/q9-procsize.sh q9fit 10240m 2700
+# 2) the 3-backend fair sweep (uniform forst-rs vs rocksdb vs forst), recorded:
+QUERIES="q4 q7 q9 q11 q12 q17 q19 q20" \
+  ARMS="forst-rs-ffm-local rocksdb forst-local" \
+  bash tools/nexmark-local/scripts/pmc1-uniform-sweep.sh
 
-# 3) the uniform-config research sweep (8 queries x 3 backends):
-bash tools/nexmark-local/scripts/run-remote-nexmark-v3.sh
-
-# 4) the LOCAL S3-simulation smoke (no Docker):
+# 3) the LOCAL S3-simulation smoke (no Docker):
 bash tools/nexmark-local/scripts/run-s3sim.sh smoke
 ```
 
@@ -407,14 +413,13 @@ least-busy by an `iostat -x` %util sample); physical RAM auto-detected via
 # 0) build the x86 image + .so + jar per the E2E runbook (DOCS-INDEX), then .so:
 bash tools/nexmark-local/scripts/run-8c32g.sh build
 
-# 1) per-query BEST config sweep (forst-rs arm):
+# 1) UNIFORM config sweep (forst-rs arm; SAME config for every query):
 bash tools/nexmark-local/scripts/run-best.sh sweep
 
-# 2) q9 + KV-sep ON at the uniform 2×4c/16g split (§3a; process.size=10240m carve-out):
-bash tools/nexmark-local/scripts/run-best.sh q9-split
-
-# 3) uniform-config research sweep (8 queries x 3 backends, serial):
-bash tools/nexmark-local/scripts/run-remote-nexmark-v3.sh
+# 2) 3-backend fair sweep (uniform forst-rs vs rocksdb vs forst), recorded to a TSV:
+QUERIES="q4 q7 q9 q11 q12 q17 q19 q20" \
+  ARMS="forst-rs-ffm-local rocksdb forst-local" \
+  bash tools/nexmark-local/scripts/pmc1-uniform-sweep.sh
 ```
 
 If the box's core/RAM counts differ from the 8c/32g budget, size the topology

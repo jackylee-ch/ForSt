@@ -7,13 +7,17 @@ of truth). Paths are relative to the repo root.
 ## Procedure / config (read before running)
 
 - **`tools/nexmark-local/configs/best-config.tsv`** + **`scripts/run-best.sh`**
-  Per-query EMPIRICALLY-BEST config (best-performance reproduction; per-query
-  config is intentional). Distinct from the uniform-config research mode.
-  Synthesized from the V3 flag-ON vs flag-OFF passes in
+  The SINGLE UNIFORM config (one `*` row) applied to EVERY query — per-query
+  config is FORBIDDEN (2026-06-17). `pmc1-uniform-sweep.sh` is the 3-backend
+  sweep driver. Provenance in
   `docs/superpowers/specs/2026-06-08-8c32g-3backend-sweep-results.md`.
+- **`docs/superpowers/specs/2026-06-17-remote-linux-nexmark-repro.md`** ★
+  The authoritative remote-Linux runbook: prereqs, build, the EXACT uniform
+  config (env + yaml), per-backend runs, expected out_rows, the .so-copy +
+  scratch-trap caveats, never-OOM honesty. **Read this to run on the box.**
 - **`docs/superpowers/specs/2026-06-14-remote-nexmark-config-v3.md`**
-  Canonical UNIFORM config + flag values, deploy + concurrency etiquette.
-  Maps config → harness (`run-8c32g.sh`) → templates. *The* config authority.
+  Earlier uniform config + flag values, deploy + concurrency etiquette.
+  Maps config → harness (`run-8c32g.sh`) → templates.
 - **`docs/superpowers/specs/2026-06-13-nexmark-e2e-test-runbook.md`**
   Self-contained build/fire/record runbook (image, .so, jar, fire sequence,
   result parsing). *The* procedure authority. MOCK-S3 only; strictly serial.

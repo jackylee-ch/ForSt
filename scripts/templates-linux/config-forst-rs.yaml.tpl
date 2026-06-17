@@ -24,6 +24,12 @@ taskmanager:
   bind-host: localhost
   host: localhost
   numberOfTaskSlots: 4
+  # SLOT-SKEW FIX (2026-06-16, PMC-1): spread slots evenly across both TMs (Flink
+  # 2.0 default load-balance.mode=NONE packs a job into the fewest TMs). Set
+  # identically across all backend templates for a FAIR topology. (This is the S3
+  # template; the active local arm uses config-forst-rs-local.yaml.tpl.)
+  load-balance:
+    mode: SLOTS
   memory:
     # FRS-8C32G-RAMBUDGET (2026-05-30): the professional ForSt Nexmark baseline runs
     # on an 8c/32g box, so forst-rs MUST fit there too. Flink's process.size governs
