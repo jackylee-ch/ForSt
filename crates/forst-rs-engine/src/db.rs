@@ -11168,8 +11168,6 @@ impl DbImpl {
         // is STALE and must be skipped. Snapshot the version once so Tier 2
         // and Tier 3 read a consistent view of the LSM.
         let version = self.version_set.current();
-        // 2026-05-29 PERF: file-number-only set (no SstFileMeta clone per scan).
-        let live_files = version.live_sst_file_numbers();
         // 2026-05-29 PERF-RESTORE (q4/q7 iterator regression): use the
         // bound-carrying accessor and SKIP resident memtables whose SST key
         // range does not overlap the scan window [prefix, upper). v3.8 had NO
@@ -11190,9 +11188,22 @@ impl DbImpl {
         // overlapping SSTs. Shaves the per-probe rfve clone + N tier cursors +
         // the resident memory footprint (the constant-factor/contention baseline
         // vs RocksDB).
-        let resident_entries = if resident_bypass() {
+        // PMC-1 q20 (2026-06-18) LIVE-FILES-HOIST: the `live_sst_file_numbers()`
+        // HashSet build is O(total live SSTs) and grows with state — yet its ONLY
+        // consumer is the resident-shadow filter below. Under the default uniform
+        // config the resident shadow is OFF (`resident_bypass()` true) and even
+        // when ON the typical CF holds none (`has_resident_flushed()` false), so
+        // the set was built + discarded on EVERY prefix-scan-open. For q20's
+        // unbounded ~92M-entry join state this is a real per-probe dead cost
+        // (`Version::live_sst_file_numbers` 1.42% self in the 2026-06-18 profile).
+        // Defer it behind the same `has_resident_flushed` short-circuit the batch
+        // path already uses (PERF-RESTORE-#4). BYTE-IDENTICAL: when the shadow is
+        // bypassed or empty, `resident_flushed_visible_entries` returns an empty
+        // Vec regardless of the set's contents, so the emitted rows are unchanged.
+        let resident_entries = if resident_bypass() || !cf_data.has_resident_flushed() {
             Vec::new()
         } else {
+            let live_files = version.live_sst_file_numbers();
             cf_data.resident_flushed_visible_entries(&live_files)
         };
         if let Some(t) = rfve_t0 {
@@ -11666,7 +11677,7 @@ impl PersistentProbeIter {
         };
         if stale {
             self.version_changes += 1;
-            let resident_entries = if resident_bypass() {
+            let resident_entries = if resident_bypass() || !self.cf_data.has_resident_flushed() {
                 Vec::new()
             } else {
                 let live_files = cur.live_sst_file_numbers();
@@ -13472,16 +13483,26 @@ impl DbImpl {
             }
         }
 
-        // Phase 4: resident-flushed memtables. One version snapshot + one
-        // live-files HashSet — reused in phase 5 for snapshot consistency.
+        // Phase 4: resident-flushed memtables. The version snapshot is reused in
+        // phase 5 for snapshot consistency; the live-files HashSet is needed ONLY
+        // to filter the resident shadow here.
         let version = self.version_set.current();
-        // 2026-05-29 PERF: file-number-only set (no SstFileMeta clone per batch).
-        let live_files = version.live_sst_file_numbers();
+        // PMC-1 q20 (2026-06-18) LIVE-FILES-HOIST: skip the O(total live SSTs)
+        // `live_sst_file_numbers()` HashSet build when the resident shadow is
+        // empty (the default uniform config). BYTE-IDENTICAL — an empty shadow
+        // yields an empty `resident_entries` regardless of the set's contents.
+        // Mirrors the prefix-scan-open hoist; the `has_resident_flushed`
+        // short-circuit is the PERF-RESTORE-#4 fast-path predicate.
         // 2026-05-29 PERF-RESTORE: fetch entries WITH key bounds so each
         // (resident, key) probe is gated by `may_contain` — skips the hash
         // lookup for keys outside the entry's SST range. For disjoint-range
         // joins this collapses O(num_resident × num_keys) to ≈O(num_keys).
-        let resident_entries = cf_data.resident_flushed_visible_entries(&live_files);
+        let resident_entries = if cf_data.has_resident_flushed() {
+            let live_files = version.live_sst_file_numbers();
+            cf_data.resident_flushed_visible_entries(&live_files)
+        } else {
+            Vec::new()
+        };
         if !resident_entries.is_empty() {
             for resident in resident_entries.iter().rev() {
                 for (i, k) in keys.iter().enumerate() {
@@ -14049,15 +14070,24 @@ impl DbImpl {
         }
 
         let version = self.version_set.current();
-        let live_files = version.live_sst_file_numbers();
         // File numbers whose data is currently resident in RAM (just-flushed
         // memtables kept as a shadow). Reads for these keys are served from RAM
         // in batch_get Phase 4, so fetching their SSTs from S3 is pure waste.
-        let resident_shadowed: std::collections::HashSet<FileNumber> = cf_data
-            .resident_flushed_visible_entries(&live_files)
-            .into_iter()
-            .map(|e| e.file_number)
-            .collect();
+        // PMC-1 q20 (2026-06-18) LIVE-FILES-HOIST: skip the O(total live SSTs)
+        // HashSet build when the resident shadow is empty (default uniform
+        // config). BYTE-IDENTICAL — an empty shadow yields an empty
+        // `resident_shadowed`, so the prefetch loop skips nothing either way.
+        let resident_shadowed: std::collections::HashSet<FileNumber> =
+            if cf_data.has_resident_flushed() {
+                let live_files = version.live_sst_file_numbers();
+                cf_data
+                    .resident_flushed_visible_entries(&live_files)
+                    .into_iter()
+                    .map(|e| e.file_number)
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
         let readers = self.sst_readers.load();
 
         // Collect overlapping, non-shadowed file numbers not yet reader-cached.
@@ -26490,6 +26520,66 @@ mod tests {
             .collect::<ForstResult<Vec<_>>>()
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    /// PMC-1 q20 (2026-06-18) LIVE-FILES-HOIST regression: with the resident
+    /// shadow OFF (the default uniform config — `has_resident_flushed()` false),
+    /// the prefix-scan-open and `batch_get_vectorized` paths now SKIP the
+    /// `Version::live_sst_file_numbers()` HashSet build (it fed only the
+    /// resident-shadow filter, which returns empty when the shadow is empty).
+    /// This asserts the hoist is byte-identical: a multi-SST prefix scan + a
+    /// batch get over the SAME keys still return EXACTLY the seeded rows after a
+    /// flush rotated them out of the active memtable into SSTs. A regression that
+    /// re-introduces a behavioral dependency on `live_files` (or drops rows when
+    /// the shadow is empty) fails here.
+    #[test]
+    fn live_files_hoist_shadow_off_scan_and_batch_get_exact() {
+        let db = open();
+        let cf = db.default_cf();
+
+        // Seed long (>=16B, join-key regime) keys under two prefixes, flush each
+        // to its own SST so the scan/batch-get walk the Tier-3 SST fan-out — the
+        // exact path where `live_sst_file_numbers` was being built per probe.
+        let keys: Vec<Vec<u8>> = (0..6u8)
+            .map(|i| {
+                let mut k = b"joinkeyLLLLLLLL0".to_vec();
+                k.extend_from_slice(format!("-r{i}").as_bytes());
+                k
+            })
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            db.put(&cf, k, format!("v{i}").as_bytes()).unwrap();
+            db.switch_and_flush(&cf)
+                .unwrap()
+                .expect("flush produced sst");
+        }
+
+        // Prefix scan: all six rows, sorted, exact values.
+        let iter = db.prefix_scan_iter_owned(&cf, b"joinkeyLLLLLLLL0").unwrap();
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = iter.collect::<ForstResult<Vec<_>>>().unwrap();
+        out.sort_by(|l, r| l.0.cmp(&r.0));
+        assert_eq!(out.len(), 6, "prefix scan must see all 6 SST-resident rows");
+        for (i, (k, v)) in out.iter().enumerate() {
+            assert_eq!(k, &keys[i]);
+            assert_eq!(v, format!("v{i}").as_bytes());
+        }
+
+        // Batch get over the same keys: each resolves to its exact value.
+        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        let got = db.batch_get_vectorized(&cf, &refs, u64::MAX).unwrap();
+        assert_eq!(got.len(), 6);
+        for (i, v) in got.iter().enumerate() {
+            assert_eq!(
+                v.as_deref(),
+                Some(format!("v{i}").as_bytes()),
+                "batch_get key {i} must resolve from SST with shadow off"
+            );
+        }
+        // A key absent from every SST resolves to None (no spurious hit).
+        let absent = db
+            .batch_get_vectorized(&cf, &[b"joinkeyZZZZZZZZ9-x".as_slice()], u64::MAX)
+            .unwrap();
+        assert_eq!(absent, vec![None]);
     }
 
     /// CORRECTNESS GATE for the parallel join read path (q7/q9/q20):

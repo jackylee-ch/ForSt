@@ -121,6 +121,13 @@ harness = false
 name = "probe_open_bloom_prune"
 harness = false
 
+# PMC-1 q20 LIVE-FILES-HOIST: per-probe prefix-scan-open cost over a LARGE live-SST
+# set with the resident shadow OFF — sizes the reclaimed `live_sst_file_numbers()`
+# HashSet build (A/B the db.rs hoist on parent vs this branch).
+[[bench]]
+name = "live_files_hoist_q20"
+harness = false
+
 # FRS-MULTIGET-COALESCE (Phase-2 disagg): coalesced SST multi-key block read on
 # the L1+ batch point-lookup path (RetrieveMultipleBlocks) — off vs on under a
 # RTT-bearing sim-S3 FS.
