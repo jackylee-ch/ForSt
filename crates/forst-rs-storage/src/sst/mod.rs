@@ -33,7 +33,7 @@ pub use compression::{compress, decompress};
 pub use data_block::{decode_data_block, encode_data_block};
 pub use file_header::FileHeader;
 pub use footer::{ChecksumType, FooterV1, FOOTER_FIXED_FIELDS_SIZE, FOOTER_TAIL_SIZE};
-pub use kv_block::{encode_kv_data_block, KvBlock, RowRanges, SliceRef};
+pub use kv_block::{encode_kv_data_block, KvBlock, PointVersion, RowRanges, SliceRef};
 pub use prefetch::{
     prefetch_buffered_bytes, prime_opens_concurrent, read_io_pool_width, submit_read_job,
     submit_read_job_background, BlockPrefetcher, CompactionReadStats, ReadJobClass,

@@ -283,3 +283,11 @@ path = "src/bin/disagg_readpool_contention.rs"
 [[bin]]
 name = "disagg_upload_qos_compose"
 path = "src/bin/disagg_upload_qos_compose.rs"
+
+# R-1 (PMC-1, 2026-06-17): isolated per-get cost of the SST point-read on a
+# compacted v2 KV block — baseline `lookup`+`.to_vec()` vs zero-copy
+# `point_lookup_in_block`. The q11/q17 read-half (ARM C) micro. Asserts
+# byte-identity; reports ns/get + heap-allocs/run.
+[[bin]]
+name = "q11_point_lookup_block"
+path = "src/bin/q11_point_lookup_block.rs"

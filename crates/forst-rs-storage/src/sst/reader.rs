@@ -36,7 +36,7 @@ use crate::cache::{BlockCache, CacheEntry, CacheKey, CachePriority};
 use super::bloom_filter::Sbbf;
 use super::data_block::decode_data_block_zerocopy;
 use super::footer::{FooterV1, FOOTER_TAIL_SIZE};
-use super::kv_block::{KvBlock, RowRanges, SliceRef};
+use super::kv_block::{KvBlock, PointVersion, RowRanges, SliceRef};
 use super::schema::{
     BLOCK_TYPE_DATA, BLOCK_TYPE_DATA_KV, FILE_HEADER_SIZE, PREFIX_BLOOM_LEN, SST_MAGIC,
 };
@@ -178,6 +178,34 @@ pub struct LookupResult {
 /// panic — matches the `ok_or_else(corruption)` pattern used in
 /// [`SstReaderImpl::get`] downstream of this call (sister fix to
 /// R38-M1).
+/// R-1: resolves a zero-copy [`PointVersion`] (value as a range into the KV
+/// block payload) into an owned [`LookupResult`], applying the op-type value
+/// semantics shared by `get` / `get_versions`. The value is materialized
+/// exactly once here — Delete/SingleDelete carry no value; Put/Merge/BlobRef
+/// (the FRS-WA-V2a-1 pointer-bytes passthrough) copy the in-place range out.
+fn point_version_to_result(kv: &KvBlock, pv: PointVersion) -> ForstResult<LookupResult> {
+    let value = match pv.op_type {
+        OpType::Delete | OpType::SingleDelete => None,
+        OpType::Put | OpType::Merge | OpType::BlobRef => match pv.value {
+            None => None,
+            Some((off, len)) => {
+                let payload = kv.payload_bytes();
+                let start = off as usize;
+                let end = start
+                    .checked_add(len as usize)
+                    .filter(|&e| e <= payload.len())
+                    .ok_or_else(|| ForstError::corruption("KV point value range out of bounds"))?;
+                Some(payload[start..end].to_vec())
+            }
+        },
+    };
+    Ok(LookupResult {
+        value,
+        sequence: pv.sequence,
+        op_type: pv.op_type,
+    })
+}
+
 fn search_key_in_batch(batch: &RecordBatch, target_key: &[u8]) -> ForstResult<Option<usize>> {
     let keys = batch
         .column(0)
@@ -676,21 +704,14 @@ impl SstReaderImpl {
                     op_type: op,
                 }))
             }
-            DecodedBlock::Kv(kv) => match kv.lookup(key)? {
+            // R-1: zero-copy point lookup — restart-array binary search on the
+            // raw (decompressed-only) KV payload, returning the value as an
+            // in-place range; the single owning copy happens once here at the
+            // `LookupResult` boundary (no intermediate `Vec` per version, no
+            // full-block decode). Byte-identical to the prior `kv.lookup`.
+            DecodedBlock::Kv(kv) => match kv.point_lookup_in_block(key)? {
                 None => Ok(None),
-                Some((raw_value, sequence, op_type)) => {
-                    // Mirror the v1 op-type semantics exactly.
-                    // FRS-WA-V2a-1: BlobRef = pointer-bytes passthrough.
-                    let value = match op_type {
-                        OpType::Delete | OpType::SingleDelete => None,
-                        OpType::Put | OpType::Merge | OpType::BlobRef => raw_value,
-                    };
-                    Ok(Some(LookupResult {
-                        value,
-                        sequence,
-                        op_type,
-                    }))
-                }
+                Some(pv) => Ok(Some(point_version_to_result(&kv, pv)?)),
             },
         }
     }
@@ -785,19 +806,15 @@ impl SstReaderImpl {
                     }
                 }
                 DecodedBlock::Kv(kv) => {
-                    let mut raw = Vec::new();
-                    kv.collect_versions(key, &mut raw)?;
-                    for (raw_value, sequence, op) in raw {
-                        // FRS-WA-V2a-1: pointer-bytes passthrough.
-                        let value = match op {
-                            OpType::Delete | OpType::SingleDelete => None,
-                            OpType::Put | OpType::Merge | OpType::BlobRef => raw_value,
-                        };
-                        out.push(LookupResult {
-                            value,
-                            sequence,
-                            op_type: op,
-                        });
+                    // R-1: zero-copy version collection — restart-array seek on
+                    // the raw payload, value ranges resolved in place. Replaces
+                    // the intermediate `Vec<(Option<Vec<u8>>, _, _)>` tuple
+                    // allocation; the per-version owning copy now happens once,
+                    // directly into the `LookupResult`. Byte-identical.
+                    let mut pvs: Vec<PointVersion> = Vec::new();
+                    kv.point_lookup_versions(key, &mut pvs)?;
+                    for pv in pvs {
+                        out.push(point_version_to_result(&kv, pv)?);
                     }
                 }
             }

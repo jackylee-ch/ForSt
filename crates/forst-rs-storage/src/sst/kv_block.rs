@@ -67,6 +67,29 @@ pub const KV_RESTART_INTERVAL: usize = 16;
 /// Result row returned by [`KvDataBlock::lookup`].
 pub type KvLookupResult = Option<(Option<Vec<u8>>, u64, OpType)>;
 
+/// R-1 (read-path upgrade): one matched version of a point-get, with the value
+/// expressed as a **zero-copy `(offset, len)` range into the block's
+/// decompressed payload** ([`KvBlock::payload_bytes`]) instead of an owned
+/// `Vec<u8>`. This is the RocksDB-shape point read: the restart-array binary
+/// search lands on the key, and the value bytes are referenced in place — no
+/// per-probe `Vec` allocation, no Arrow/row materialization.
+///
+/// Resolution: `value` is `None` for a tombstone; otherwise
+/// `payload_bytes()[offset..offset+len]`. An empty-but-present value is
+/// `Some((off, off))` (len 0), never collapsed to `None`. Offsets are produced
+/// over bounds-checked entry parses, so they always fall inside the entries
+/// region (before the restart trailer) and stay valid for the block's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointVersion {
+    /// `(offset, len)` of the value in [`KvBlock::payload_bytes`], or `None`
+    /// for a tombstone.
+    pub value: Option<(u32, u32)>,
+    /// Sequence number of this version.
+    pub sequence: u64,
+    /// Operation type of this version.
+    pub op_type: OpType,
+}
+
 /// C (2026-06-04): whether the SST WRITE path should emit v2 KV data blocks
 /// instead of v1 Arrow-IPC blocks. Default = `false` (v1 — the safe default
 /// until v2 is proven). `FRS_SST_KV_BLOCK_FORMAT=1` flips writers (flush +
@@ -206,6 +229,22 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 
 fn col_corruption(col: usize, ty: &str) -> ForstError {
     ForstError::corruption(format!("SST KV block column {col} not {ty}"))
+}
+
+/// R-1: converts a `(start, end)` payload byte range into the `(offset, len)`
+/// form [`PointVersion`] carries, with the u32 framing guard (block payloads
+/// are well under 4 GiB, so a failure is a corruption signal, never a panic).
+fn pack_value_range(range: Option<(usize, usize)>) -> ForstResult<Option<(u32, u32)>> {
+    match range {
+        None => Ok(None),
+        Some((s, e)) => {
+            let off = u32::try_from(s)
+                .map_err(|_| ForstError::corruption("KV value offset exceeds u32"))?;
+            let len = u32::try_from(e - s)
+                .map_err(|_| ForstError::corruption("KV value len exceeds u32"))?;
+            Ok(Some((off, len)))
+        }
+    }
 }
 
 /// Encodes an SST-schema [`RecordBatch`] (`key, value, sequence, op_type`) into
@@ -572,10 +611,58 @@ impl KvBlock {
         })
     }
 
+    /// R-1: highest-sequence visible version for *exactly* `key` as a
+    /// **zero-copy** [`PointVersion`] (value referenced in-place in
+    /// [`Self::payload_bytes`]; `None` if the key is absent). Byte-identical to
+    /// [`Self::lookup`] — same restart-array binary search + linear scan,
+    /// same max-sequence selection — but it never copies the value out of the
+    /// payload (no per-probe `Vec` alloc, no full-block decode). This is the
+    /// point-get read primitive the SST `get` path uses.
+    pub fn point_lookup_in_block(&self, key: &[u8]) -> ForstResult<Option<PointVersion>> {
+        let mut best: Option<PointVersion> = None;
+        self.walk_key(key, |value_range, sequence, op_byte, _payload| {
+            if best.is_none_or(|b| sequence > b.sequence) {
+                let op = OpType::from_u8(op_byte).ok_or_else(|| {
+                    ForstError::corruption(format!("invalid op_type in KV block: {op_byte}"))
+                })?;
+                best = Some(PointVersion {
+                    value: pack_value_range(value_range)?,
+                    sequence,
+                    op_type: op,
+                });
+            }
+            Ok(())
+        })?;
+        Ok(best)
+    }
+
+    /// R-1: zero-copy twin of [`Self::collect_versions`] — appends every
+    /// version of *exactly* `key` to `out` as [`PointVersion`] (value ranges
+    /// into [`Self::payload_bytes`]) in on-disk order, with no per-version
+    /// `Vec` allocation. Used by the SST `get_versions` merge-resolution path.
+    pub fn point_lookup_versions(
+        &self,
+        key: &[u8],
+        out: &mut Vec<PointVersion>,
+    ) -> ForstResult<()> {
+        self.walk_key(key, |value_range, sequence, op_byte, _payload| {
+            let op = OpType::from_u8(op_byte).ok_or_else(|| {
+                ForstError::corruption(format!("invalid op_type in KV block: {op_byte}"))
+            })?;
+            out.push(PointVersion {
+                value: pack_value_range(value_range)?,
+                sequence,
+                op_type: op,
+            });
+            Ok(())
+        })
+    }
+
     /// Seeks to `key` and invokes `f(value_range, sequence, op_byte, payload)`
     /// for each entry whose key equals `key`, in on-disk order, then stops at
     /// the first key `> key`. Shared core of [`Self::lookup`] /
-    /// [`Self::collect_versions`].
+    /// [`Self::collect_versions`] / [`Self::point_lookup_in_block`] /
+    /// [`Self::point_lookup_versions`].
     fn walk_key<F>(&self, key: &[u8], mut f: F) -> ForstResult<()>
     where
         F: FnMut(Option<(usize, usize)>, u64, u8, &[u8]) -> ForstResult<()>,
@@ -1270,6 +1357,133 @@ mod tests {
         let kv = KvBlock::decode(&block, true).unwrap();
         assert_eq!(collect(&kv).len(), 0);
         assert!(collect_from(&kv, b"anything").is_empty());
+    }
+
+    // =======================================================================
+    // R-1: zero-copy point_lookup_in_block / point_lookup_versions byte-equality
+    // =======================================================================
+
+    /// Resolves a [`PointVersion`] (zero-copy range) into the owned
+    /// `(value, seq, op)` triple `lookup`/`collect_versions` produce, so the
+    /// two paths can be compared byte-for-byte.
+    fn resolve_pv(kv: &KvBlock, pv: &PointVersion) -> (Option<Vec<u8>>, u64, OpType) {
+        let value = pv
+            .value
+            .map(|(off, len)| kv.payload_bytes()[off as usize..(off + len) as usize].to_vec());
+        (value, pv.sequence, pv.op_type)
+    }
+
+    /// The zero-copy `point_lookup_in_block` must return EXACTLY the value
+    /// bytes / seq / op the full-decode `lookup` does, for every probe class.
+    #[test]
+    fn r1_point_lookup_in_block_matches_lookup() {
+        // (a) prefix + tombstone + empty-value, distinct keys.
+        let rows_a: Vec<TestRow<'_>> = vec![
+            (b"user:1", Some(b"alice".as_ref()), 10, OpType::Put),
+            (b"user:2", Some(b"".as_ref()), 9, OpType::Put),
+            (b"user:3", None, 8, OpType::Delete),
+        ];
+        // (b) 50 distinct keys spanning restart boundaries (varint key/value).
+        let rows_b_keys: Vec<Vec<u8>> =
+            (0..50).map(|i| format!("key{i:04}").into_bytes()).collect();
+        let rows_b: Vec<TestRow<'_>> = rows_b_keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                (
+                    k.as_slice(),
+                    Some(b"vvvv".as_ref()),
+                    100 - i as u64,
+                    OpType::Put,
+                )
+            })
+            .collect();
+        // (c) MVCC: many versions of ONE key spanning restarts (newest wins).
+        let rows_c: Vec<TestRow<'_>> = (0..50u64)
+            .map(|i| (b"k".as_ref(), Some(b"v".as_ref()), 50 - i, OpType::Put))
+            .collect();
+        // (d) single-entry block.
+        let rows_d: Vec<TestRow<'_>> = vec![(b"solo", Some(b"only".as_ref()), 7, OpType::Put)];
+
+        for (label, rows) in [
+            ("a", &rows_a),
+            ("b", &rows_b),
+            ("c", &rows_c),
+            ("d", &rows_d),
+        ] {
+            for compression in [CompressionType::None, CompressionType::Lz4] {
+                let block = encode_kv_data_block(&make_batch(rows), compression).unwrap();
+                let kv = KvBlock::decode(&block, true).unwrap();
+
+                // Probe set: every present key + boundary misses + first/last.
+                let mut probes: Vec<Vec<u8>> = rows.iter().map(|r| r.0.to_vec()).collect();
+                probes.push(Vec::new()); // before-all
+                probes.push(b"zzzzzzzz".to_vec()); // after-all
+                probes.push(b"key0019x".to_vec()); // between-keys miss (block b)
+                probes.push(b"missing".to_vec());
+                probes.dedup();
+
+                for probe in &probes {
+                    let want = kv.lookup(probe).unwrap();
+                    let got = kv.point_lookup_in_block(probe).unwrap();
+                    let got = got.map(|pv| resolve_pv(&kv, &pv));
+                    assert_eq!(
+                        got, want,
+                        "block={label} compression={compression:?} probe={probe:?}"
+                    );
+                }
+            }
+        }
+
+        // (e) empty block: every probe is a miss.
+        let kv = KvBlock::decode(
+            &encode_kv_data_block(&make_batch(&[]), CompressionType::None).unwrap(),
+            true,
+        )
+        .unwrap();
+        assert!(kv.point_lookup_in_block(b"anything").unwrap().is_none());
+    }
+
+    /// `point_lookup_versions` (zero-copy) must yield EXACTLY what
+    /// `collect_versions` does, in the same order, for every probe class.
+    #[test]
+    fn r1_point_lookup_versions_matches_collect_versions() {
+        let rows_mvcc: Vec<TestRow<'_>> = vec![
+            (b"a", Some(b"a1".as_ref()), 5, OpType::Put),
+            (b"k", Some(b"newest".as_ref()), 30, OpType::Put),
+            (b"k", Some(b"mid".as_ref()), 20, OpType::Merge),
+            (b"k", None, 10, OpType::Delete),
+            (b"z", Some(b"".as_ref()), 99, OpType::Put),
+        ];
+        // many versions of one key across restarts
+        let rows_many: Vec<TestRow<'_>> = (0..50u64)
+            .map(|i| (b"k".as_ref(), Some(b"v".as_ref()), 50 - i, OpType::Merge))
+            .collect();
+
+        for (label, rows) in [("mvcc", &rows_mvcc), ("many", &rows_many)] {
+            for compression in [CompressionType::None, CompressionType::Lz4] {
+                let block = encode_kv_data_block(&make_batch(rows), compression).unwrap();
+                let kv = KvBlock::decode(&block, true).unwrap();
+
+                let mut probes: Vec<Vec<u8>> = rows.iter().map(|r| r.0.to_vec()).collect();
+                probes.push(b"missing".to_vec());
+                probes.push(Vec::new());
+                probes.dedup();
+
+                for probe in &probes {
+                    let mut want: Vec<(Option<Vec<u8>>, u64, OpType)> = Vec::new();
+                    kv.collect_versions(probe, &mut want).unwrap();
+                    let mut got_pv: Vec<PointVersion> = Vec::new();
+                    kv.point_lookup_versions(probe, &mut got_pv).unwrap();
+                    let got: Vec<(Option<Vec<u8>>, u64, OpType)> =
+                        got_pv.iter().map(|pv| resolve_pv(&kv, pv)).collect();
+                    assert_eq!(
+                        got, want,
+                        "block={label} compression={compression:?} probe={probe:?}"
+                    );
+                }
+            }
+        }
     }
 
     // =======================================================================
