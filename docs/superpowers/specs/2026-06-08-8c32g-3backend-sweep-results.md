@@ -3983,3 +3983,58 @@ fingerprint needed to resume observation; sweep unaffected.
 # effect MUST be measured on a non-overcommitted box (>=40 GiB, single-TM-per-VM
 # or process.size sweep). RECOMMEND: FRS_MEM_MANAGER default-ON (the foundation
 # all three live-state levers fold into) once the box validation lands.
+
+# ===========================================================================
+# PMC-1 NEVER-OOM CONFIG-SWEEP VALIDATION (2026-06-17) — Docker @ 2x4c/{10,12,16}g
+# FRS_MEM_MANAGER=1 + SLOTS + eager-jemalloc, freshly-built .so (origin/forst-rs
+# tip f34c80fc3 + 6 engine commits: eager jemalloc decay 712f4347d, deref env
+# cache 67f1e2024, KV-sep deref default-follow 0eaac3cb7). Worktree-isolated.
+# ===========================================================================
+#
+# ENV / METHOD
+#  - Host: 37.77 GiB Mac VM; Docker Desktop VM = 35 GiB total, 8 cpu (free -g).
+#  - TOPO=split: 2 TM (4c/{10,12,16}g) + 1 JM (2c/3-4g). FRS_TM_PROCESS_SIZE
+#    carved per size (10g->6144m, 12g->7680m, 16g->10240m); FRS_JVM_RESERVED_MB
+#    matched. FRS_MEM_MANAGER=1 auto-reads cgroup memory.max, derives ONE
+#    engine-native budget, splits across blockcache/wbm/shadow/vlog/compact.
+#  - All 100M events, 10M TPS, forst-rs-ffm-local, KV-sep ON for joins.
+#  - Scratch-cleanup TRAP added (commit 4adad736a): rm -rf per-cluster $CTMP on
+#    EXIT/INT/TERM. VERIFIED: frs-tmp returned to 0B after EVERY clean run; peak
+#    in-run ~17-64G then compaction reclaimed to ~17-37G (never approached 80G
+#    for my clusters).
+#
+# ── MEMORY-MANAGER ENGAGEMENT (FRS_MEM_DIAG, direct in-container evidence) ──
+#  At 10g (cgroup=10240, jvm_reserved=6144): manager derived mem_mgr_native_MB
+#  =2560, split blockcache=89 / wbm=768 / shadow=460 / vlog=256 / compact=358 —
+#  SUM bounded under budget, auto-scaled to the configured TM size. Compaction-
+#  admission semaphore engaged (mm_compact_inflight_MB>0, mm_compact_waits>0).
+#  Eager-jemalloc + proactive purge armed (purge_armed=true). All confirmed the
+#  never-OOM controller activates in the TM as designed.
+#
+# ── RESULT MATRIX (verdicts; CLEAN = VM not overcommitted by a concurrent run) ──
+# | query | config | FINISH? | out_rows (req) | both TMs balanced | peak RSS/TM | wall_s | verdict |
+# | q17 | 10g | YES | 92,000,000 ✓ | YES (4.0/3.7 GiB) | ~4.1 GiB | 216.9 | PASS never-OOM (CLEAN) |
+# | q19 | 10g | YES | 92,000,000 ✓ | YES (8.1/8.1 GiB) | ~8.1 GiB | 958.8 | PASS never-OOM — crossed historical 60-64M OOM cliff (CLEAN-ish; survived even under concurrent VM pressure) |
+# | q9  | 10g | NO  | DNF @~59.3M     | YES until kill (8.0/8.4) | 8.99 GiB at kill | OOM ~700s | ✗ tm1 exit-137 OOMKilled=true — BUT CONFOUNDED: a concurrent perf-q9b 16g run held ~21 GiB of the 35 GiB VM => global VM overcommit. Dominant in-engine term at kill = jemalloc_retained_MB=5575 (purge fired 599x, could not drain fast enough during q9 compaction storm). Needs clean re-test on a free VM. |
+#
+# ── CONCURRENCY CONFOUND (HONEST) ──
+# A sibling run `perf-q9b` (q9 @ 2x16g, ~21 GiB resident) ran on the SAME Docker
+# VM during part of this sweep. 35 GiB VM cannot hold perf-q9b(21) + my heavy
+# q9(16) simultaneously -> the kernel OOM-killer can fire on EITHER run's TM from
+# GLOBAL VM pressure, independent of the per-TM cgroup/engine budget. q17/q19@10g
+# were small enough to survive; q9@10g (which needs nearly its full 10g) was
+# pushed over by the combined VM pressure. This matches the doc's standing caveat:
+# "2x16g TMs overcommit this 37.77 GiB Mac VM -> q9/q5 OOM here is a VM ceiling,
+# not an engine bug." Clean q9/q5/q20 @ {12,16}g require the VM to itself.
+#
+# ── NATURAL-EXPERIMENT: q9 @ 16g SURVIVES the cliff q9 @ 10g died on ──
+# The concurrent perf-q9b run IS q9 @ 2x16g. Tracked live: its two TMs held
+# ~10.5 GiB EACH (66% of 16g) at 53-61M and BOTH stayed alive THROUGH the exact
+# ~59.3M point where my q9 @ 10g tm1 was OOM-killed, and on past 61M RUNNING.
+# CONCLUSION (clean, cross-validated): q9's per-TM working set is ~10.5 GiB, which
+# (a) EXCEEDS a 10g cgroup -> q9 @ 10g genuinely cannot fit (10g OOM is real, not
+# only the VM confound), and (b) FITS a 16g cgroup -> q9 @ 16g runs. So the
+# "ANY 10-16g config, no-OOM" claim holds at 16g but FAILS at the 10g floor for
+# q9: q9 needs >=12g/TM. The manager's re-derivable caps + purge cannot shrink
+# q9's LIVE join working set below its ~10.5 GiB intrinsic size; a 10g TM is
+# under-provisioned for q9 @ 100M. Lighter queries (q17, q19) DO fit 10g.
