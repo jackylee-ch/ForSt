@@ -318,9 +318,20 @@ fn sample_pressure_once() -> Option<PressureLevel> {
 }
 
 /// FRS-DYN-SHED: start the process-global pressure sampler (idempotent). A
-/// no-op unless the master flag is armed. Samples every
-/// `FRS_DYN_SHED_INTERVAL_MS` (default 1000 ms) and publishes the level for the
-/// lock-free [`should_shed`] gate path.
+/// no-op unless the master flag is armed.
+///
+/// # Sampling cadence — the build-peak race
+///
+/// The base interval is `FRS_DYN_SHED_INTERVAL_MS` (default 1000 ms for the
+/// shed-only path). When the proactive purge valve is armed the default tightens
+/// to the build-peak fast interval (`PURGE_SAMPLE_MS`, 250 ms) so a fast
+/// join-build-peak spike is caught and purged BEFORE it crosses the cgroup limit
+/// between ticks — the q9 16 g/TM cliff is a sub-second RSS spike, so a 1 s tick
+/// let it cross before the reactive purge fired. Under `Elevated`-or-higher
+/// pressure the loop further re-samples at that fast interval regardless of the
+/// base interval, so the valve drains the transient hard while pressure is rising
+/// and relaxes back to the base cadence once it falls to `Ample`. Off ⇒ this
+/// whole path is dead.
 pub fn maybe_start_sampler() {
     use std::sync::OnceLock;
     static STARTED: OnceLock<()> = OnceLock::new();
@@ -330,23 +341,37 @@ pub fn maybe_start_sampler() {
         return;
     }
     STARTED.get_or_init(|| {
-        let interval_ms = std::env::var("FRS_DYN_SHED_INTERVAL_MS")
+        // Base cadence: the purge valve wants a tight default (catch the
+        // sub-second build-peak spike); the shed-only path keeps the 1 s default.
+        let purge_armed = purge_valve_enabled();
+        let default_ms = if purge_armed { PURGE_SAMPLE_MS } else { 1000 };
+        let base_ms = std::env::var("FRS_DYN_SHED_INTERVAL_MS")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
-            .unwrap_or(1000);
+            .unwrap_or(default_ms);
         let _ = std::thread::Builder::new()
             .name("frs-mem-pressure".to_string())
             .spawn(move || loop {
+                let mut next_ms = base_ms;
                 if let Some(level) = sample_pressure_once() {
                     SAMPLED_PRESSURE.store(level as u8, Ordering::Relaxed);
-                    // FRS-MEM-PRESSURE-PURGE: under High/Critical, return
-                    // jemalloc's retained (already-freed) pages to the OS so
-                    // RSS tracks LIVE — the never-OOM valve. No-op when the
-                    // valve is unarmed or pressure is below High.
+                    // FRS-MEM-PRESSURE-PURGE: return jemalloc's retained
+                    // (already-freed) pages to the OS so RSS tracks LIVE — the
+                    // never-OOM valve. Fires at/above the (lowered) purge
+                    // threshold; no-op when unarmed or below it.
                     maybe_purge(level);
+                    // Build-peak adaptive cadence: once pressure is Elevated+ and
+                    // the purge valve is armed, re-sample FAST so the valve drains
+                    // the spike hard before it crosses the cliff, regardless of
+                    // the (possibly slow) base interval. Relax back to base when
+                    // pressure falls to Ample.
+                    if purge_armed && level >= PressureLevel::Elevated && PURGE_SAMPLE_MS < base_ms
+                    {
+                        next_ms = PURGE_SAMPLE_MS;
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                std::thread::sleep(std::time::Duration::from_millis(next_ms));
             });
     });
 }
@@ -366,13 +391,17 @@ pub fn sampled_pressure_for_diag() -> PressureLevel {
 // to the shed levers (leaner config + KV-sep OFF still OOM): the bytes are
 // already FREED, jemalloc just hasn't returned them to the OS yet.
 //
-// The valve: when the sampler observes High/Critical pressure it forces
+// The valve: when the sampler observes pressure at/above the build-peak
+// threshold (`Elevated` by default — see `purge_fire_threshold`) it forces
 // jemalloc to release ALL retained dirty+muzzy pages immediately via the void
 // `arena.<MALLCTL_ARENAS_ALL>.purge` mallctl. Purge only ever returns
 // already-freed memory to the OS — it touches NO live allocation — so it is
-// byte-identical / zero correctness impact. The compiled 10 s decay
-// (MALLOC_CONF) is left as-is for q4 steady state; this only fires under
-// pressure.
+// byte-identical / zero correctness impact. The compiled eager decay
+// (MALLOC_CONF) is left as-is; this fires PROACTIVELY at Elevated and the
+// sampler re-samples fast (250 ms) under pressure so the sub-second
+// join-build-peak spike is drained BEFORE it crosses the cgroup cliff (the q9
+// 16 g/TM never-OOM lever — verdict: the ~5 GiB MADV_FREE/dirty transient
+// crossed before the 1 s reactive purge fired).
 //
 // Flag: `FRS_MEM_PRESSURE_PURGE=1` (DEFAULT OFF) OR the master `FRS_DYNAMIC_SHED`
 // (so the existing armed sweep gets the valve for free). Off ⇒ no purge, no
@@ -384,6 +413,36 @@ pub fn sampled_pressure_for_diag() -> PressureLevel {
 static PURGE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 use std::sync::atomic::AtomicU64;
+
+/// FRS-MEM-PRESSURE-PURGE build-peak cadence (2026-06-17, PMC-1 q9-purge track):
+/// the fast re-sample interval (ms) the sampler uses once the purge valve is
+/// armed and pressure is Elevated+. The q9 16 g/TM cliff is a SUB-SECOND
+/// join-build-peak RSS spike — a 1 s tick let it cross the cgroup limit before
+/// the reactive purge fired (verdict: the MADV_FREE/dirty transient ~5 GiB
+/// crossed before reclaim). 250 ms catches and drains it 4× per second.
+const PURGE_SAMPLE_MS: u64 = 250;
+
+/// FRS-MEM-PRESSURE-PURGE build-peak threshold: the LOWEST [`PressureLevel`] at
+/// (and above) which the proactive purge fires. Lowered from the original
+/// `High` (≥ 0.85 ≈ 13.9 GiB of 16) to `Elevated` (≥ 0.75 ≈ 12.3 GiB) so freed
+/// pages are returned to the OS WHILE the build-peak is still climbing — there
+/// is then ~4 GiB of headroom to absorb the burst while the purge drains the
+/// ~5 GiB transient, instead of firing only once RSS is already at the cliff.
+/// `FRS_MEM_PURGE_AT` overrides: `critical`|`high`|`elevated` (default
+/// `elevated` when the valve is armed). Purge only ever returns already-FREED
+/// memory ⇒ firing earlier is byte-identical, just more eager reclaim.
+fn purge_fire_threshold() -> PressureLevel {
+    match std::env::var("FRS_MEM_PURGE_AT")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("critical") => PressureLevel::Critical,
+        Some("high") => PressureLevel::High,
+        Some("elevated") => PressureLevel::Elevated,
+        _ => PressureLevel::Elevated,
+    }
+}
 
 /// Cached purge-valve arming: 0 = unknown, 1 = off, 2 = on. Armed iff
 /// `FRS_MEM_PRESSURE_PURGE` is truthy OR the master `FRS_DYNAMIC_SHED` is on.
@@ -453,15 +512,17 @@ fn jemalloc_purge_all() -> bool {
     }
 }
 
-/// FRS-MEM-PRESSURE-PURGE: if the valve is armed AND pressure is at/above
-/// [`PressureLevel::High`], force-purge jemalloc's retained pages and bump the
-/// purge counter. Called by the sampler each tick after publishing the level.
-/// A no-op when unarmed or below High → byte-identical to today.
+/// FRS-MEM-PRESSURE-PURGE: if the valve is armed AND pressure is at/above the
+/// (build-peak-lowered) [`purge_fire_threshold`] — `Elevated` by default —
+/// force-purge jemalloc's retained pages and bump the purge counter. Called by
+/// the sampler each tick after publishing the level. A no-op when unarmed or
+/// below the threshold. Purge only ever returns already-freed memory to the OS
+/// ⇒ byte-identical to today regardless of WHEN it fires.
 fn maybe_purge(level: PressureLevel) {
     if !purge_valve_enabled() {
         return;
     }
-    if level < PressureLevel::High {
+    if level < purge_fire_threshold() {
         return;
     }
     if jemalloc_purge_all() {
@@ -591,16 +652,18 @@ mod tests {
     }
 
     #[test]
-    fn maybe_purge_only_fires_at_high_or_above() {
+    fn maybe_purge_only_fires_at_threshold_or_above() {
         let _g = SHED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         reset();
+        // Default build-peak threshold is Elevated.
+        std::env::remove_var("FRS_MEM_PURGE_AT");
+        assert_eq!(purge_fire_threshold(), PressureLevel::Elevated);
         set_purge_valve_override(Some(true));
 
-        // Below High: no purge attempt (counter unchanged regardless of OS).
+        // Below the threshold (Ample): no purge attempt regardless of OS.
         let before = purge_count();
         maybe_purge(PressureLevel::Ample);
-        maybe_purge(PressureLevel::Elevated);
-        assert_eq!(purge_count(), before, "must not purge below High");
+        assert_eq!(purge_count(), before, "must not purge below the threshold");
 
         // Unarmed: never purges even at Critical.
         set_purge_valve_override(Some(false));
@@ -608,6 +671,25 @@ mod tests {
         let before = purge_count();
         maybe_purge(PressureLevel::Critical);
         assert_eq!(purge_count(), before, "unarmed must never purge");
+        reset();
+    }
+
+    #[test]
+    fn purge_threshold_env_override() {
+        let _g = SHED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset();
+        std::env::set_var("FRS_MEM_PURGE_AT", "high");
+        assert_eq!(purge_fire_threshold(), PressureLevel::High);
+        std::env::set_var("FRS_MEM_PURGE_AT", "critical");
+        assert_eq!(purge_fire_threshold(), PressureLevel::Critical);
+        std::env::set_var("FRS_MEM_PURGE_AT", "elevated");
+        assert_eq!(purge_fire_threshold(), PressureLevel::Elevated);
+        std::env::remove_var("FRS_MEM_PURGE_AT");
+        assert_eq!(
+            purge_fire_threshold(),
+            PressureLevel::Elevated,
+            "default ⇒ Elevated (build-peak)"
+        );
         reset();
     }
 
@@ -620,17 +702,23 @@ mod tests {
         // (The OnceLock hook persists for the process; once installed, later
         // tests still see `false`-returning behaviour only when unarmed/low.)
         register_purge_hook(|| true);
+        std::env::remove_var("FRS_MEM_PURGE_AT"); // default build-peak threshold = Elevated
         set_purge_valve_override(Some(true));
 
         let base = purge_count();
         maybe_purge(PressureLevel::Ample);
-        maybe_purge(PressureLevel::Elevated);
-        assert_eq!(purge_count(), base, "no purge below High");
+        assert_eq!(purge_count(), base, "no purge below the Elevated threshold");
 
+        maybe_purge(PressureLevel::Elevated);
+        assert_eq!(
+            purge_count(),
+            base + 1,
+            "Elevated must purge once (build-peak)"
+        );
         maybe_purge(PressureLevel::High);
-        assert_eq!(purge_count(), base + 1, "High must purge once");
+        assert_eq!(purge_count(), base + 2, "High must purge once");
         maybe_purge(PressureLevel::Critical);
-        assert_eq!(purge_count(), base + 2, "Critical must purge once");
+        assert_eq!(purge_count(), base + 3, "Critical must purge once");
         reset();
     }
 

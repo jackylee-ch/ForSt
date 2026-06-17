@@ -229,6 +229,12 @@ case "$cmd" in
       # jemalloc purge valve (no lever shedding). Default-OFF; forwarded so the
       # never-OOM valve can be armed standalone inside the TM/JM containers.
       -e FRS_MEM_PRESSURE_PURGE="${FRS_MEM_PRESSURE_PURGE:-}" \
+      # FRS-MEM-PRESSURE-PURGE build-peak threshold (2026-06-17 PMC-1 q9-purge):
+      # the lowest pressure level at which the proactive purge fires.
+      # critical|high|elevated; default elevated (≥0.75) when the valve is armed
+      # so the ~5 GiB MADV_FREE/dirty join-build transient is returned to the OS
+      # BEFORE the sub-second build-peak spike crosses the 16 g cgroup cliff.
+      -e FRS_MEM_PURGE_AT="${FRS_MEM_PURGE_AT:-}" \
       # FRS-MEM-MANAGER (2026-06-16 PMC-1): the UNIFIED engine-native memory
       # controller. FRS_MEM_MANAGER=1 arms it (default-OFF, byte-identical when
       # off). It reads the cgroup limit (FRS_MEM_CGROUP_MB override else
