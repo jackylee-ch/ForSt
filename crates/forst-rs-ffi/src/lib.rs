@@ -503,6 +503,7 @@ fn guarded_vec<F: FnOnce() -> i32>(f: F) -> i32 {
 /// - Corruption        → EngineCorrupted (301) — Fail-batch
 /// - OOM               → EngineOom (302)    — Fail-batch
 /// - DiskFull          → EngineDiskFull (303) — Fail-batch
+/// - Busy/TimedOut/Aborted → EngineOom (302) — Fail-batch (recoverable backpressure)
 /// - Other             → Unknown (999)      — treated as Fail-process
 fn error_to_frs_code(err: &forst_rs_common::ForstError) -> i32 {
     if err.is_not_found() {
@@ -513,19 +514,46 @@ fn error_to_frs_code(err: &forst_rs_common::ForstError) -> i32 {
         FrsErrorCode::EngineCorrupted as i32
     } else if err.is_invalid_argument() {
         FrsErrorCode::BatchHeaderMalformed as i32
+    } else if err.is_busy() || err.is_timed_out() || err.is_aborted() {
+        // FRS-Q5-BACKPRESSURE (2026-06-17): write-stall `TimedOut`, `Busy`, and
+        // `Aborted` (shutdown race) are RECOVERABLE — the engine is HEALTHY,
+        // just throttled while flush/compaction drains, or stopping. Per the
+        // vectorized-parity design §"Per-request failure classes", recovery is
+        // by Flink restart-from-checkpoint (the Fail-batch class), NOT a fatal
+        // `FatalErrorHandler.onFatalError` TM kill (the Fail-process class,
+        // reserved for `PANIC_CAUGHT`/`UNKNOWN` where engine state is suspect).
+        //
+        // We map to `EngineOom (302)`, an EXISTING Fail-batch code the Java FFM
+        // bridge already classifies as Fail-batch — buffer/backpressure
+        // saturation is the closest established class for "couldn't admit the
+        // write right now, replay from checkpoint". (A brand-new code would not
+        // be recognized by the Flink-side classifier, which enumerates codes
+        // explicitly rather than banding by range, so it would fall through to
+        // a fatal default — hence reuse, not a new ABI code.)
+        //
+        // Pre-fix these fell into the catch-all `Unknown(999)` (Fail-process)
+        // below, so q5's vectorized merge-append batch path
+        // (`frs_vec_merge_append_batch`) escalated an end-of-stream drain-burst
+        // write-stall to a fatal `FrsEnginePanicError`
+        // (`kind=APPEND_MERGE_BATCH ... UNKNOWN`) that crash-looped the TM. The
+        // legacy `error_to_status` already distinguished these (BUSY /
+        // TIMED_OUT / ABORTED); the vectorized mapper was the asymmetric gap.
+        // Echo the cause to stderr (→ TM `.out`) for operator diagnosis; the
+        // engine text never contains storage credentials, so this is safe.
+        eprintln!(
+            "[forst-rs-ffi] mapping recoverable backpressure to Fail-batch EngineOom(302): {err}"
+        );
+        FrsErrorCode::EngineOom as i32
     } else {
-        // All other errors (OOM, DiskFull, Aborted, Busy, write-stall timeout,
-        // etc.) don't have direct `is_*` predicates exposed by ForstError today.
-        // Map to Unknown until ForstError grows those predicates (tracked in W26
-        // follow-up).
+        // Genuinely engine-state-suspect faults (Internal, Poisoned, and any
+        // future variant without an `is_*` predicate) stay Fail-process so a
+        // real corruption is escalated, never silently retried.
         //
         // FRS-S3-STALL DIAGNOSTIC: the Java FFM bridge surfaces `Unknown(999)`
-        // as a fatal `FrsEnginePanicError`, which loses the underlying cause and
-        // restart-loops the job. Echo the real `ForstError` Display to stderr
-        // (→ TaskManager `.out`) so an operator can see e.g. "write stall
-        // timeout: flush/compaction backlog not draining" instead of a bare
-        // rc=999. The text comes from the engine and never contains storage
-        // credentials, so this is safe to emit.
+        // as a fatal `FrsEnginePanicError`. Echo the real `ForstError` Display
+        // to stderr (→ TaskManager `.out`) so an operator can see the cause
+        // instead of a bare rc=999. The text comes from the engine and never
+        // contains storage credentials, so this is safe to emit.
         eprintln!("[forst-rs-ffi] mapping engine error to Unknown(999): {err}");
         FrsErrorCode::Unknown as i32
     }
@@ -10375,6 +10403,69 @@ mod tests {
     fn frs_row_result_layout_is_3_u32() {
         use std::mem::size_of;
         assert_eq!(size_of::<FrsRowResult>(), 12); // 3 × u32, packed (repr(C))
+    }
+
+    /// REGRESSION (q5 APPEND_MERGE_BATCH crash, 2026-06-17): a write-stall
+    /// `TimedOut` is a transient BACKPRESSURE signal — the engine is healthy,
+    /// just throttled while flush/compaction drains. It MUST map to a Fail-batch
+    /// code the Java FFM bridge recognizes (recovery via Flink checkpoint
+    /// replay), NOT to `Unknown(999)`, which the FatalErrorHandler surfaces as a
+    /// fatal `FrsEnginePanicError` and crash-loops the TaskManager.
+    ///
+    /// The Java-side classifier enumerates codes explicitly (Fail-batch =
+    /// {BATCH_HEADER_MALFORMED, ENGINE_IO, ENGINE_OOM, ENGINE_DISK_FULL,
+    /// ENGINE_CORRUPTED}), so the fix reuses the EXISTING `EngineOom(302)` code
+    /// rather than inventing a new one Java wouldn't recognize. We assert the
+    /// exact code, not merely the numeric band.
+    ///
+    /// Same reasoning for `Busy` and `Aborted` (shutdown-race) — all three are
+    /// recoverable, none implies "engine state suspect". Before the fix the
+    /// vectorized mapper lumped them into `Unknown(999)` (Fail-process); the
+    /// legacy `error_to_status` already distinguished them, so the vectorized
+    /// merge-append batch path (q5's `frs_vec_merge_append_batch`) was the only
+    /// one that escalated a write-stall to a fatal crash.
+    #[test]
+    fn backpressure_errors_map_to_fail_batch_not_fail_process() {
+        use forst_rs_common::ForstError;
+
+        // Recoverable backpressure must map to the recognized Fail-batch code
+        // EngineOom(302), never to the Fail-process Unknown(999).
+        let timed_out =
+            ForstError::timed_out("write stall timeout: flush/compaction backlog not draining");
+        let code = error_to_frs_code(&timed_out);
+        assert_eq!(
+            code,
+            FrsErrorCode::EngineOom as i32,
+            "TimedOut (write-stall backpressure) must map to Fail-batch \
+             EngineOom(302), got {code} — Unknown(999) crash-loops the TM"
+        );
+        assert_ne!(code, FrsErrorCode::Unknown as i32);
+
+        let busy = ForstError::busy("engine busy");
+        let bcode = error_to_frs_code(&busy);
+        assert_eq!(
+            bcode,
+            FrsErrorCode::EngineOom as i32,
+            "Busy must map to Fail-batch EngineOom(302), got {bcode}"
+        );
+
+        let aborted = ForstError::aborted("shutdown in progress");
+        let acode = error_to_frs_code(&aborted);
+        assert_eq!(
+            acode,
+            FrsErrorCode::EngineOom as i32,
+            "Aborted must map to Fail-batch EngineOom(302), got {acode}"
+        );
+
+        // A genuinely-suspect engine fault (Internal / unknown) MUST still be
+        // Fail-process so real corruption is not silently retried.
+        let internal = ForstError::Internal("torn multi-CF batch".to_string());
+        let icode = error_to_frs_code(&internal);
+        assert_eq!(
+            icode,
+            FrsErrorCode::Unknown as i32,
+            "Internal (engine-state-suspect) must remain Fail-process"
+        );
     }
 
     // -----------------------------------------------------------------
