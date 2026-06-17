@@ -242,6 +242,15 @@ case "$cmd" in
       -e FRS_MEM_MANAGER="${FRS_MEM_MANAGER:-}" -e FRS_MEM_CGROUP_MB="${FRS_MEM_CGROUP_MB:-}" \
       -e FRS_JVM_RESERVED_MB="${FRS_JVM_RESERVED_MB:-}" -e FRS_FFM_RESERVED_MB="${FRS_FFM_RESERVED_MB:-}" \
       -e FRS_MEM_HEADROOM_MB="${FRS_MEM_HEADROOM_MB:-}" -e FRS_MEM_INSTANCES="${FRS_MEM_INSTANCES:-}" \
+      # FRS-MEM-JEMALLOC-OFF-RESERVE (2026-06-17 PMC-1 q9 p8 OOM fix): forward the
+      # operator's FRS_TM_JEMALLOC choice INTO the container so the engine
+      # controller can tell whether the JVM-side native malloc is eager (jemalloc
+      # preloaded) or plain glibc (retains freed arenas). When FRS_TM_JEMALLOC=0
+      # the controller reserves a glibc-retention cushion (shrinks engine-native)
+      # so the SUM stays under the cgroup despite the retained JVM-side off-heap.
+      # FRS_MEM_JEMALLOC_OFF_RESERVE_MB overrides the derived cushion (0 disables).
+      -e FRS_TM_JEMALLOC="${FRS_TM_JEMALLOC:-}" \
+      -e FRS_MEM_JEMALLOC_OFF_RESERVE_MB="${FRS_MEM_JEMALLOC_OFF_RESERVE_MB:-}" \
       # FRS_FFM_DIAG (2026-06-16 PMC-1): periodic dump of the bounded FFM
       # off-heap working set (columnar/GET-out/iter-scratch + freed-on-grow).
       -e FRS_FFM_DIAG="${FRS_FFM_DIAG:-}" \
@@ -378,8 +387,47 @@ case "$cmd" in
       # unaffected (prefixed symbols).
       FRS_TM_JEMALLOC_DEFAULT=1; [ "$OS" = "Darwin" ] && FRS_TM_JEMALLOC_DEFAULT=0
       TM_PRELOAD=()
-      [ "${FRS_TM_JEMALLOC:-$FRS_TM_JEMALLOC_DEFAULT}" = "1" ] \
-        && TM_PRELOAD=(-e "LD_PRELOAD=${FRS_JEMALLOC_SO:-/usr/local/lib/libjemalloc-preload.so}")
+      TM_JEMALLOC_EFF="${FRS_TM_JEMALLOC:-$FRS_TM_JEMALLOC_DEFAULT}"
+      # FRS-MEM-JEMALLOC-OFF-FORCE (2026-06-17 PMC-1 q9 p8 OOM fix): the engine
+      # mem-manager bounds engine-native allocations, but it CANNOT bound the
+      # JVM-side native off-heap (FFM/Panama state buffers + AEC in-flight) when
+      # that runs on plain glibc malloc — glibc RETAINS freed arenas, so with
+      # FRS_TM_JEMALLOC=0 the JVM-side RSS balloons ~2 GiB past process.size and a
+      # TM crests the 16g cgroup at the q9 p8 join peak (reproduced: a TM RESTARTed
+      # at ~59M). The controller's glibc-retention cushion helps but at p8 the
+      # JVM-side retention (~12 GiB) is too large to fully offset by shrinking the
+      # engine alone. The decisive never-OOM fix is to give the JVM an allocator
+      # that RETURNS pages: when the mem-manager is armed (FRS_MEM_MANAGER=1) we
+      # FORCE the eager-decay jemalloc preload over the JVM even if the operator
+      # set FRS_TM_JEMALLOC=0 (WARN), because the controller's never-OOM guarantee
+      # depends on the JVM-side actually returning freed memory. Inside the (Linux)
+      # container the preload is always valid (the macOS TSD-crash caveat is a
+      # host-allocator concern, not the containerized JVM). Set
+      # FRS_TM_JEMALLOC_ALLOW_OFF=1 to honour an explicit OFF anyway (then the
+      # engine cushion is the only defense — slower, marginal at p8).
+      if [ "$TM_JEMALLOC_EFF" != "1" ] \
+         && [ "${FRS_MEM_MANAGER:-}" = "1" ] \
+         && [ "${FRS_TM_JEMALLOC_ALLOW_OFF:-0}" != "1" ]; then
+        echo "WARN: FRS_TM_JEMALLOC=0 with FRS_MEM_MANAGER=1 — FORCING eager jemalloc on the TM JVM (the controller cannot bound glibc retention; see FRS-MEM-JEMALLOC-OFF-FORCE). Set FRS_TM_JEMALLOC_ALLOW_OFF=1 to override."
+        TM_JEMALLOC_EFF=1
+      fi
+      # When the JVM-side jemalloc preload IS on, make it EAGER-decay (return freed
+      # pages to the OS promptly) — matching the engine's own compiled-in
+      # dirty_decay_ms:0,muzzy_decay_ms:0. Without this the preload used jemalloc's
+      # non-eager defaults, so even jemalloc-ON retained freed JVM-side off-heap.
+      # An explicit MALLOC_CONF (operator pin) still wins.
+      TM_MALLOC_CONF_EFF="${MALLOC_CONF:-}"
+      if [ "$TM_JEMALLOC_EFF" = "1" ]; then
+        TM_PRELOAD=(-e "LD_PRELOAD=${FRS_JEMALLOC_SO:-/usr/local/lib/libjemalloc-preload.so}")
+        # Eager-decay config for the JVM-side jemalloc. NOTE: the ENVS array also
+        # forwards `-e MALLOC_CONF=${MALLOC_CONF:-}` (possibly empty) AFTER
+        # TM_PRELOAD in the docker run, so a MALLOC_CONF placed in TM_PRELOAD would
+        # be CLOBBERED by that empty later one. We therefore carry the effective
+        # value here and re-apply it as a LATER `-e` (after ENVS) on the TM run so
+        # the eager config actually wins. Operator MALLOC_CONF pin still wins.
+        [ -z "$TM_MALLOC_CONF_EFF" ] \
+          && TM_MALLOC_CONF_EFF="background_thread:true,dirty_decay_ms:0,muzzy_decay_ms:0"
+      fi
       # Split TM/JM resource profile (parameterized; sane 8c/32g default = 2 TM
       # 4c/16g + 1 JM 2c/4g). The origin box may have different core/RAM counts;
       # override SPLIT_TM_CPUS / SPLIT_TM_MEM / SPLIT_JM_CPUS / SPLIT_JM_MEM.
@@ -388,7 +436,7 @@ case "$cmd" in
       for i in 1 2; do
         docker run -d --name "$CLUSTER-tm$i" --network "$NET" --cpus="$SPLIT_TM_CPUS" --memory="$SPLIT_TM_MEM" --memory-swap="$SPLIT_TM_MEM" \
           ${TM_PRELOAD[@]+"${TM_PRELOAD[@]}"} ${URING_OPTS[@]+"${URING_OPTS[@]}"} \
-          "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e FLINK_CONF_DIR="$CCONF" "$IMG" bash -lc "
+          "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e FRS_TM_JEMALLOC="$TM_JEMALLOC_EFF" -e MALLOC_CONF="$TM_MALLOC_CONF_EFF" -e FLINK_CONF_DIR="$CCONF" "$IMG" bash -lc "
             mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
             cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
             for t in \$(seq 1 150); do curl -sf http://$JM_ALIAS:8081/overview >/dev/null 2>&1 && break; sleep 2; done

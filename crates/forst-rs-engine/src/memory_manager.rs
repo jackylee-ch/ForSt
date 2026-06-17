@@ -257,6 +257,113 @@ fn headroom_bytes(cgroup: u64) -> u64 {
     frac.max(floor)
 }
 
+/// FRS-MEM-JEMALLOC-OFF-RESERVE (2026-06-17, PMC-1 q9 p8 OOM fix).
+///
+/// # The bug this closes (root-caused empirically, q9 @ p8/16g)
+///
+/// The controller carves `jvm_reserved` (== `taskmanager.memory.process.size`)
+/// for the Flink JVM and trusts the JVM to hold AT that reservation. That trust
+/// is only valid when the JVM's NATIVE allocations (FFM/Panama off-heap state
+/// buffers + the async-execution-controller in-flight + thread arenas) go through
+/// an allocator that RETURNS freed pages to the OS. On Linux the bench harness
+/// achieves that by `LD_PRELOAD`-ing jemalloc with eager decay
+/// (`dirty_decay_ms:0,muzzy_decay_ms:0`) over the JVM process — but ONLY when
+/// `FRS_TM_JEMALLOC=1`. With `FRS_TM_JEMALLOC=0` the JVM's native malloc is plain
+/// **glibc malloc**, which RETAINS freed arenas (per-core, never returned under a
+/// fragmenting churn). The engine's OWN bundled `_rjem_`-prefixed jemalloc stays
+/// eager regardless, so `jemalloc_resident_MB` stays small and well within the
+/// engine-native budget — but the JVM-side RSS (`rss_MB - jemalloc_resident_MB`)
+/// balloons PAST `process.size` because of glibc retention. At parallelism=8
+/// (4 join operators per TM, double the p4 case) that retained JVM-side off-heap
+/// crests the 16 g cgroup at the join-build peak and a TM dies (exit-137), even
+/// though every engine-native cap held. Measured (q9 p8, FRS_TM_JEMALLOC=0):
+/// `jemalloc_resident_MB`≈1.3-3.5 GiB (well under the 3993 native budget) yet
+/// whole-process `rss_MB` pinned at 13.8-14.1 GiB of 16 at only ~33 M events,
+/// with the JVM-side term ≈10.8 GiB vs the 10.24 GiB reservation.
+///
+/// # The fix — make the controller AUTHORITATIVE over glibc retention too
+///
+/// When eager-decay is NOT in force on the JVM-side malloc (`FRS_TM_JEMALLOC=0`),
+/// reserve an extra **glibc-retention cushion** out of the cgroup BEFORE deriving
+/// the engine-native budget. The cushion is a fraction of the JVM reservation
+/// (the larger the JVM off-heap, the more glibc can retain). Subtracting it
+/// SHRINKS every engine-native cap (block cache / WBM / shadow / vlog /
+/// compaction), so the bounded engine footprint SUM leaves enough slack BELOW the
+/// cgroup to absorb the JVM-side glibc retention + the join-peak spike → the SUM
+/// stays under the cgroup by construction, jemalloc on or off, at any parallelism.
+/// Correctness-trivial: smaller engine caches only re-read durable state (never
+/// wrong), exactly like every other cap here. The reserve is bounded so it can
+/// never starve the engine below [`ENGINE_NATIVE_FLOOR`].
+///
+/// `FRS_MEM_JEMALLOC_OFF_RESERVE_MB` overrides the derived cushion (0 disables —
+/// e.g. when the operator KNOWS the JVM-side malloc is eager by another route).
+/// Zero cushion when eager-jemalloc IS in force (`FRS_TM_JEMALLOC` unset/`1`) →
+/// byte-identical to before this fix in the jemalloc-ON path.
+fn jemalloc_off_reserve_bytes(jvm_reserved: u64) -> u64 {
+    // Explicit override wins (operator pin / A-B). `0` => no cushion.
+    if let Ok(s) = std::env::var("FRS_MEM_JEMALLOC_OFF_RESERVE_MB") {
+        if let Ok(mb) = s.trim().parse::<u64>() {
+            return mb.saturating_mul(MIB);
+        }
+    }
+    if jvm_side_eager_decay() {
+        return 0; // eager-decay JVM-side malloc returns pages → no retention cushion.
+    }
+    // glibc-retention cushion: a fraction of the JVM reservation. 0.20 covers the
+    // measured ~0.5-1 GiB steady over-run + the join-peak retention spike with
+    // margin (≈2 GiB at a 10 GiB JVM reservation), shrinking engine-native from
+    // ~3993 MiB to ~1993 MiB so the bounded SUM clears the cgroup.
+    const GLIBC_RETENTION_FRAC: f64 = 0.20;
+    (jvm_reserved as f64 * GLIBC_RETENTION_FRAC) as u64
+}
+
+/// Whether the JVM-side native malloc is under EAGER-decay (returns freed pages
+/// to the OS promptly). Two independent signals, EITHER of which can prove the
+/// JVM is on plain glibc malloc (retains freed arenas → needs the cushion):
+///
+///   1. **`FRS_TM_JEMALLOC=0`** — the operator's explicit choice (forwarded into
+///      the container by the harness). Unset / `1` / `true` ⇒ the harness
+///      `LD_PRELOAD`s jemalloc (the Linux default), so treat as eager.
+///   2. **`LD_PRELOAD` inspection (authoritative fallback)** — even if the flag
+///      is NOT forwarded, the engine can read the JVM process's OWN `LD_PRELOAD`:
+///      if it does not name a `jemalloc` library, the JVM-side malloc IS glibc
+///      regardless of any flag. This makes the controller authoritative on the
+///      ACTUAL allocator in force, not just the harness's forwarded intent.
+///
+/// Eager iff signal 1 says eager AND signal 2 doesn't contradict it (jemalloc is
+/// actually preloaded). Conservative: when in doubt (no jemalloc visibly
+/// preloaded) we assume glibc retention and reserve the cushion — never-OOM is
+/// the priority; an unnecessary cushion only slows the engine, never crashes it.
+fn jvm_side_eager_decay() -> bool {
+    // Signal 1: explicit operator choice. FRS_TM_JEMALLOC=0 ⇒ definitively glibc.
+    if matches!(
+        std::env::var("FRS_TM_JEMALLOC").ok().as_deref(),
+        Some("0") | Some("false") | Some("FALSE")
+    ) {
+        return false;
+    }
+    // Signal 1 (cont.): an explicit ON (`1`/`true`) trusts the harness to preload
+    // jemalloc — treat as eager (the harness also sets an eager MALLOC_CONF).
+    if matches!(
+        std::env::var("FRS_TM_JEMALLOC").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE")
+    ) {
+        return true;
+    }
+    // Signal 2 (authoritative fallback when the flag is UNSET): inspect the
+    // process's actual LD_PRELOAD. A jemalloc preload ⇒ eager JVM-side malloc;
+    // otherwise the JVM is on glibc and retains → not eager.
+    match std::env::var("LD_PRELOAD") {
+        Ok(p) if p.to_ascii_lowercase().contains("jemalloc") => true,
+        // LD_PRELOAD set but no jemalloc, OR unset entirely ⇒ glibc malloc.
+        Ok(_) => false,
+        // No LD_PRELOAD: on Linux this means plain glibc (retains); be
+        // conservative and reserve the cushion. On non-cgroup hosts the budget
+        // is None anyway so this is moot.
+        Err(_) => false,
+    }
+}
+
 /// The total engine-native budget in bytes:
 /// `cgroup - jvm_reserved - ffm_reserved - headroom`, floored at
 /// `ENGINE_NATIVE_FLOOR` (1.5 GiB). This is the bytes ALL engine-native consumers
@@ -277,7 +384,16 @@ pub fn engine_native_budget_bytes() -> Option<u64> {
     let jvm = jvm_reserved_bytes(cgroup);
     let ffm = ffm_reserved_bytes();
     let head = headroom_bytes(cgroup);
-    let reserved = jvm.saturating_add(ffm).saturating_add(head);
+    // FRS-MEM-JEMALLOC-OFF-RESERVE: when the JVM-side native malloc is NOT under
+    // eager decay (FRS_TM_JEMALLOC=0 → glibc malloc retains freed arenas), carve
+    // an extra cushion so the bounded engine-native SUM leaves room for the
+    // retained JVM-side off-heap. Zero when eager-jemalloc is in force →
+    // byte-identical to the jemalloc-ON path.
+    let glibc = jemalloc_off_reserve_bytes(jvm);
+    let reserved = jvm
+        .saturating_add(ffm)
+        .saturating_add(head)
+        .saturating_add(glibc);
     let native = cgroup.saturating_sub(reserved).max(ENGINE_NATIVE_FLOOR);
     CACHE.store(native, std::sync::atomic::Ordering::Relaxed);
     Some(native)
@@ -484,8 +600,14 @@ pub fn diag_str() -> String {
         return " mem_mgr=armed(no-cgroup)".to_string();
     };
     let mb = |b: Option<u64>| b.map(|v| v / MIB).unwrap_or(0);
+    // FRS-MEM-JEMALLOC-OFF-RESERVE: surface the glibc-retention cushion + whether
+    // the JVM-side malloc is eager — DIRECT evidence the conservatism engaged when
+    // FRS_TM_JEMALLOC=0 (the q9 p8 OOM fix). When eager, glibc=0 (byte-identical).
+    let jvm_eager = jvm_side_eager_decay();
+    let jvm = cgroup_budget_bytes().map(jvm_reserved_bytes).unwrap_or(0);
+    let glibc = jemalloc_off_reserve_bytes(jvm) / MIB;
     format!(
-        " mem_mgr_native_MB={} mm_blockcache_MB={} mm_wbm_MB={} mm_shadow_MB={} mm_vlog_MB={} mm_compact_MB={} mm_compact_inflight_MB={} mm_compact_waits={}",
+        " mem_mgr_native_MB={} mm_blockcache_MB={} mm_wbm_MB={} mm_shadow_MB={} mm_vlog_MB={} mm_compact_MB={} mm_compact_inflight_MB={} mm_compact_waits={} mm_jvm_eager={} mm_glibc_reserve_MB={}",
         native / MIB,
         mb(consumer_cap_bytes(Consumer::BlockCache)),
         mb(consumer_cap_bytes(Consumer::WriteBuffer)),
@@ -494,6 +616,8 @@ pub fn diag_str() -> String {
         mb(consumer_cap_bytes(Consumer::CompactionTransient)),
         compact_inflight_bytes() / MIB,
         compact_admission_waits(),
+        jvm_eager,
+        glibc,
     )
 }
 
@@ -577,6 +701,111 @@ mod tests {
         assert_eq!(headroom_bytes(40 * 1024 * MIB), 4 * 1024 * MIB);
         // Small cgroup ⇒ the 1 GiB floor dominates.
         assert_eq!(headroom_bytes(4 * 1024 * MIB), 1024 * MIB);
+    }
+
+    // -- FRS-MEM-JEMALLOC-OFF-RESERVE (q9 p8 OOM fix) ------------------------
+
+    #[test]
+    fn jemalloc_off_reserve_zero_when_eager_and_positive_when_off() {
+        let _g = MM_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let jvm = 10 * 1024 * MIB; // 10 GiB JVM reservation (q9 p8 config)
+                                   // Ensure no operator override is in force for this assertion.
+        std::env::remove_var("FRS_MEM_JEMALLOC_OFF_RESERVE_MB");
+
+        // jemalloc-OFF (FRS_TM_JEMALLOC=0): glibc retains → a positive cushion.
+        std::env::set_var("FRS_TM_JEMALLOC", "0");
+        assert!(!jvm_side_eager_decay(), "FRS_TM_JEMALLOC=0 ⇒ not eager");
+        let off = jemalloc_off_reserve_bytes(jvm);
+        assert_eq!(off, (jvm as f64 * 0.20) as u64, "0.20×JVM cushion when off");
+        assert!(off > 0);
+
+        // jemalloc-ON (FRS_TM_JEMALLOC=1): eager decay → ZERO cushion
+        // (byte-identical to before this fix in the jemalloc-ON path).
+        std::env::set_var("FRS_TM_JEMALLOC", "1");
+        assert!(jvm_side_eager_decay(), "FRS_TM_JEMALLOC=1 ⇒ eager");
+        assert_eq!(jemalloc_off_reserve_bytes(jvm), 0, "eager ⇒ no cushion");
+
+        // Unset flag + a jemalloc LD_PRELOAD ⇒ the authoritative fallback sees
+        // jemalloc preloaded ⇒ eager ⇒ no cushion.
+        std::env::remove_var("FRS_TM_JEMALLOC");
+        let saved_preload = std::env::var("LD_PRELOAD").ok();
+        std::env::set_var("LD_PRELOAD", "/usr/local/lib/libjemalloc-preload.so");
+        assert!(
+            jvm_side_eager_decay(),
+            "unset flag + jemalloc LD_PRELOAD ⇒ eager"
+        );
+        assert_eq!(
+            jemalloc_off_reserve_bytes(jvm),
+            0,
+            "preloaded jemalloc ⇒ no cushion"
+        );
+
+        // Unset flag + NO jemalloc preload ⇒ conservative: assume glibc retention
+        // ⇒ a positive cushion (never-OOM priority — an extra cushion only slows).
+        std::env::set_var("LD_PRELOAD", "/some/other/lib.so");
+        assert!(
+            !jvm_side_eager_decay(),
+            "unset flag + non-jemalloc LD_PRELOAD ⇒ not eager (conservative)"
+        );
+        assert!(
+            jemalloc_off_reserve_bytes(jvm) > 0,
+            "glibc fallback ⇒ cushion"
+        );
+
+        // restore env to avoid leaking into other tests.
+        match saved_preload {
+            Some(v) => std::env::set_var("LD_PRELOAD", v),
+            None => std::env::remove_var("LD_PRELOAD"),
+        }
+    }
+
+    #[test]
+    fn jemalloc_off_reserve_explicit_override_wins() {
+        let _g = MM_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Even with FRS_TM_JEMALLOC=0, an explicit override pins the cushion
+        // (operator KNOWS the JVM malloc is eager by another route, or A/B).
+        std::env::set_var("FRS_TM_JEMALLOC", "0");
+        std::env::set_var("FRS_MEM_JEMALLOC_OFF_RESERVE_MB", "0");
+        assert_eq!(
+            jemalloc_off_reserve_bytes(10 * 1024 * MIB),
+            0,
+            "explicit 0 override disables the cushion"
+        );
+        std::env::set_var("FRS_MEM_JEMALLOC_OFF_RESERVE_MB", "1500");
+        assert_eq!(
+            jemalloc_off_reserve_bytes(10 * 1024 * MIB),
+            1500 * MIB,
+            "explicit override sets the cushion exactly"
+        );
+        std::env::remove_var("FRS_MEM_JEMALLOC_OFF_RESERVE_MB");
+        std::env::remove_var("FRS_TM_JEMALLOC");
+    }
+
+    #[test]
+    fn jemalloc_off_shrinks_engine_native_below_eager() {
+        // The cushion SHRINKS the engine-native budget (more room for the
+        // retained JVM-side glibc off-heap) so the bounded SUM clears the cgroup.
+        let cgroup = 16 * 1024 * MIB;
+        let jvm = 10 * 1024 * MIB;
+        let ffm = 512 * MIB;
+        let head = headroom_bytes(cgroup);
+        let native_eager = cgroup
+            .saturating_sub(jvm)
+            .saturating_sub(ffm)
+            .saturating_sub(head); // glibc reserve = 0
+        let glibc = (jvm as f64 * 0.20) as u64;
+        let native_off = cgroup
+            .saturating_sub(jvm)
+            .saturating_sub(ffm)
+            .saturating_sub(head)
+            .saturating_sub(glibc)
+            .max(ENGINE_NATIVE_FLOOR);
+        assert!(
+            native_off < native_eager,
+            "jemalloc-off engine-native ({native_off}) must be < eager ({native_eager})"
+        );
+        // And it stays at/above the floor (never starves the engine to zero).
+        assert!(native_off >= ENGINE_NATIVE_FLOOR);
     }
 
     #[test]
