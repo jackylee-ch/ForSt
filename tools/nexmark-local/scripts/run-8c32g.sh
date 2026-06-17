@@ -444,6 +444,7 @@ case "$cmd" in
           ${TM_PRELOAD[@]+"${TM_PRELOAD[@]}"} ${URING_OPTS[@]+"${URING_OPTS[@]}"} \
           "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e FRS_TM_JEMALLOC="$TM_JEMALLOC_EFF" -e MALLOC_CONF="$TM_MALLOC_CONF_EFF" -e FLINK_CONF_DIR="$CCONF" "$IMG" bash -lc "
             mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
+            cp '$SO' /usr/lib/libforst_rs_ffi.so &&
             cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
             for t in \$(seq 1 150); do curl -sf http://$JM_ALIAS:8081/overview >/dev/null 2>&1 && break; sleep 2; done
             exec bash '$FLINK/bin/taskmanager.sh' start-foreground
@@ -453,6 +454,7 @@ case "$cmd" in
         "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e CLUSTER_MODE=external -e EXPECT_TMS=2 -e JM_HOST="$JM_ALIAS" -e FLINK_CONF_DIR="$CCONF" \
         "$IMG" bash -lc "
           mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
+          cp '$SO' /usr/lib/libforst_rs_ffi.so &&
           cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
           nproc && free -g | head -2 &&
           bash scripts/measure-sql.sh
