@@ -21,6 +21,7 @@ PASS = all three. Exact out_rows is the correctness gate (FINISH + matching rows
 | q19 | FINISHED (clean, 0 restart) | 92,000,000 EXACT | 565.5 | 11325/11345 (bal) | 305.5 | 1.85× | +260 | 272.4 | slower | a✗ b✗ c✗ | FAIL — heavy join + 11.3G compaction-transient drags on overcommitted VM (prior uniform 238.6s would PASS — VM headroom-bound) |
 | q4 | FINISHED (clean, 0 restart) | 25,848,286 (forst-rs windowed-emit; matches prior 25.83M; rdb emits 177.6M diff semantics) | 400.1 | 9094/8318 (bal) | 503.0 | 0.80× | -103 | DNF (forst-local RESTARTING 1644s) | FASTER | a✓ b✓ c✓ | **PASS all 3** — KV-sep win; beats rdb AND forst-local |
 | q7 | FINISHED (clean, 0 restart) | 92,000,002 EXACT (src 92,000,164) | 1176.1 | 7556/7387 (bal) | no same-pop local rdb (remote rdb 1367.6 DNF-w/o-io_uring) | (1176<1367 dir.) | — | ForSt-M 586.8 | SLOWER | a~(dir) b— c✗ | FAIL vs ForSt (io_uring-dep heavy join, ForSt far ahead); finish+correct; slower than prior 947.8s = VM load |
+| q20 | FINISHED (clean, 0 restart; 1st attempt UnsatisfiedLinkError deploy-race DNF→re-run) | 93,201,404 EXACT | 1146.5 | 10844/11069 (bal) | no same-pop local rdb (remote rdb 1557.6; rdb-other-pop 800s) | (1146<1557 dir.) | — | ForSt-M 1535.9 | FASTER | a~(dir) b— c✓ | finish+correct, BEATS ForSt-M; no clean same-pop rdb to gate a/b (rdb 800s on a different pop = hard for all LSM) |
 
 ## Docker-crash / restart events (honest log)
 - After q8/q12/q11(×2)/q17 back-to-back, VM memory pressure accumulated. q18 (1st attempt)
