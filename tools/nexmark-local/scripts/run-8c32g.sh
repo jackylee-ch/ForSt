@@ -307,6 +307,28 @@ case "$cmd" in
       CTMP="$CTMP_BASE/$CLUSTER"
       CCONF="$CTMP/flink-conf"
       mkdir -p "$CTMP"
+      # FRS-SCRATCH-TRAP (2026-06-17 PMC-1): the per-cluster scratch ($CTMP)
+      # accumulates the engine's SST/cache/checkpoint-noflush artifacts (~36-45
+      # GB/query). If a run is killed (exit-137 OOM, SIGINT, crash) BEFORE the
+      # normal teardown below, the old code left $CTMP behind — repeated runs
+      # piled up frs-tmp until the host volume hit 100% (347 GB observed). This
+      # trap tears down the cluster (containers + network) AND rm -rf's the
+      # per-cluster scratch on ANY exit (success OR crash/kill), so frs-tmp
+      # stays bounded. It removes ONLY this run's $CTMP, never the shared base.
+      # Set FRS_KEEP_SCRATCH=1 to retain $CTMP for post-mortem (containers still
+      # torn down). The trap fires once (cleared at the start to be idempotent).
+      _frs_cleanup() {
+        trap - EXIT INT TERM
+        docker rm -f "$CLUSTER-jm" "$CLUSTER-tm1" "$CLUSTER-tm2" >/dev/null 2>&1 || true
+        docker network rm "$NET" >/dev/null 2>&1 || true
+        if [ "${FRS_KEEP_SCRATCH:-0}" = "1" ]; then
+          echo "FRS_KEEP_SCRATCH=1 — retaining cluster scratch $CTMP"
+        elif [ -n "${CTMP:-}" ] && [ "$CTMP" != "$CTMP_BASE" ] && [ -d "$CTMP" ]; then
+          echo "trap: rm -rf cluster scratch $CTMP"
+          rm -rf "$CTMP" || true
+        fi
+      }
+      trap _frs_cleanup EXIT INT TERM
       rm -rf "$CCONF" && cp -r "$FLINK/conf" "$CCONF"
       # /tmp = the per-cluster scratch; the direct base mount makes the
       # host-absolute $CCONF path (and any other $CTMP path the harness
