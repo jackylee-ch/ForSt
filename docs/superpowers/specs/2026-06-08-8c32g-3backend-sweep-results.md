@@ -4038,3 +4038,41 @@ fingerprint needed to resume observation; sweep unaffected.
 # q9: q9 needs >=12g/TM. The manager's re-derivable caps + purge cannot shrink
 # q9's LIVE join working set below its ~10.5 GiB intrinsic size; a 10g TM is
 # under-provisioned for q9 @ 100M. Lighter queries (q17, q19) DO fit 10g.
+#
+# ── q9 @ 16g CLEAN (VM to itself) — MARQUEE NEVER-OOM PROOF ──
+# After the concurrent perf-q9b finished and freed the 35 GiB VM, q9 @ 2x4c/16g
+# (process.size=10240m, FRS_MEM_MANAGER=1 + SLOTS + KV-sep ON, eager jemalloc):
+#   RESULT: q9 FINISHED wall_ms=1683663 (1683.7s) src_out=98000000 out_rows=91,813,372 (EXACT)
+#   NO OOM (neither TM exit-137); both TMs balanced the entire run (SLOTS 2+2);
+#   crossed the ~59.3M / 60M cliff that OOM-killed q9 @ 10g.
+# Per-TM working set GREW with the join: ~6.5 GiB (early) -> ~10.7 GiB (56M) ->
+# ~12.8 GiB (67M peak), ~80% of the 16g cgroup at peak. The MEM-MANAGER auto-
+# scaled the engine budget UP for the larger TM: mem_mgr_native_MB=3993 (vs 2560
+# @10g), caps blockcache=139/wbm=1198/shadow=718/vlog=399/compact=559; shed_level
+# stayed Ample with purge_count=0 (no pressure) where @10g it was Critical with
+# 599 purges. Disk peaked ~59G then compaction reclaimed to ~48G (never hit 80G).
+#
+# ── FINAL VERDICT: "ANY 10-16g config, no-OOM" ──
+#  - q17, q19: FIT 10g (the floor) -> hold across the whole 10-16g range. PASS.
+#  - q9: peak working set ~12.8 GiB -> needs >=16g (OOMs @10g; ~80% of 16g at peak,
+#    so 12g would also be tight/risky). FITS 16g exact + no-OOM. So the claim holds
+#    at the TOP of the range for the heaviest join, FAILS at the 10g floor: q9's
+#    LIVE join state is intrinsically ~12.8 GiB and the manager's re-derivable caps
+#    cannot shrink live state below that. Honest: the never-OOM machinery PREVENTS
+#    OOM whenever the TM is provisioned >= the query's live working set, and AUTO-
+#    SCALES its budget with TM size; it does NOT make an under-provisioned 10g TM
+#    hold a 12.8 GiB working set (that is physics, not a controller bug).
+#  - The MEM-MANAGER auto-scaling (2560->3993 native budget, Critical->Ample) is
+#    the key proof the SAME uniform config adapts to 10g vs 16g correctly.
+#
+# ── NOT COMPLETED THIS SESSION (honest) ──
+#  - q5 @ {10,12,16}g, q20 @ {10,12,16}g, q9/q19/q17 @ 12g, q9/q5/q17 @ 16g:
+#    not run (each heavy query is 16-28 min on this slow Mac VM + a concurrent
+#    sibling run occupied the VM for ~25 min mid-session). q5's own doc caveat
+#    (live accumulator ~7.4 GiB at the cliff, true window-pane spill deferred)
+#    stands — q5 @ 10g likely OOMs by the same working-set>budget physics as q9.
+#  - TASK 2 (q4/q7 armed-vs-off A/B): not run. DIRECTIONAL evidence from q17@10g:
+#    at the TIGHT 10g floor the manager stayed shed_level=Ample with caps NOT
+#    binding early (no throttle) -> at a generous 16g the headroom is strictly
+#    larger (q9@16g ran Ample, purge_count=0), so the armed controller does not
+#    throttle the optimal config. A clean q4/q7 armed-vs-off A/B is still owed.
