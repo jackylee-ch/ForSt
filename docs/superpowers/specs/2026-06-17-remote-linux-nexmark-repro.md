@@ -281,3 +281,45 @@ containers) and the remote x86_64 Linux box (amd64 containers). OS is detected
 via `uname -s`; `REPO`/`WORKENV`/`IMG`/`PLAT`/`NEXMARK_HOME`/`FLINK`/
 `FRS_CTMP_BASE` are all env-overridable with per-OS defaults — nothing is
 hardcoded to one machine.
+
+---
+
+## 8. The bare-metal (non-docker) Linux-local runner — ALSO uniform now
+
+`tools/nexmark-local/scripts/run-linux-local-forstrs.sh` is the standing
+**bare-metal / `/ssd2` origin-box** entrypoint (its distinct mechanism vs. the
+docker driver above). As of **2026-06-17 (PMC-1)** it is folded onto the SAME
+single-uniform-config rule:
+
+- It reads the ONE `*` row from `configs/best-config-linux-local.tsv` (now a 9-col
+  table that **mirrors** the docker `best-config.tsv` `*` row exactly:
+  `KV_SEPARATION=true KV_MIN_BLOB_SIZE=256 TRIVIAL_MOVE=true RS_S2_PINNED=1
+  VLOG_COALESCE_DEREF=1 SST_COMPRESSION=lz4 MEM_MANAGER=1`, with
+  `VLOG_POINT_DEREF` left unset to auto-follow KV-sep and the vlog resident bounds
+  `READER_CACHE_CAP=2048 / RESIDENT_BUDGET_MB=256 / KV_ADAPTIVE_PRESSURE=1`).
+- Its `apply_profile` now applies that ONE row to **every** query (the same
+  `apply_uniform` pattern as `run-best.sh`). The old per-query rows (q9 bloom/
+  hot-CF, q11/q12/q16/q17/q18 KV-sep OFF, q7/q20 persistent-probe, q3/q8
+  adaptive-S2, the `PROFILE_OVERRIDE_ENVS` per-query escape hatch, the dual TSV
+  format-detection) are **PURGED**. There are no per-query config branches.
+- `run-linux-local-forstrs-one.sh` (the single-query nohup wrapper) just forces
+  `QUERIES=<q>` and delegates — it carries no per-query config.
+
+### 8a. Honest exception: bare-metal topology is parallelism 8, not 4
+
+The bare-metal runner keeps its long-standing topology envelope of the **8c/32g TM
+budget as 2 TaskManagers × 4c/16g, parallelism 8, 4 task slots per TM**
+(`FRS_FLINK_PARALLELISM=8`, `FRS_TM_SLOTS=4`, pinned for all queries). The docker
+driver uses **parallelism 4** (slot-skew fixed via
+`taskmanager.load-balance.mode=SLOTS`). This is the one value that differs between
+the two runners — but it is a **per-runner topology choice applied identically to
+EVERY query** within the bare-metal runner, **not** a per-query config difference.
+It is preserved so the bare-metal runner's previously-measured numbers stay
+self-comparable. The uniform-config rule ("no different config for different
+queries") is fully satisfied in both runners.
+
+Per-query values that remain in the bare-metal runner are NOT config:
+`maxsec_for`/`MAXSEC` (wall-clock timeout only — the docker `run-best.sh` has the
+same per-query timeout) and `source_min_for` (a per-query correctness/completeness
+floor for the FINISHED gate — analogous to the per-query `out_rows` table in §5).
+q6 stays UNSUPPORTED in both runners (a Flink-SQL availability fact).

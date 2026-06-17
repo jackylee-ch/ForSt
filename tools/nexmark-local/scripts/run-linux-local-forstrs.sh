@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# Linux local ForSt-RS NexMark sweep with the best known per-query config.
+# Linux local ForSt-RS NexMark sweep — the SINGLE UNIFORM config for EVERY query.
 #
-# Priority queries use configs/best-config-linux-local.tsv. Queries without a measured
-# per-query profile use the stable local baseline: LZ4, jemalloc, inline executor,
-# and no KV-separation unless explicitly set by the table.
+# ★★ UNIFORM CONFIG (2026-06-17, PMC-1 — user directive). PER-QUERY CONFIG IS
+# FORBIDDEN. This bare-metal (non-docker) runner reads the ONE `*` row from
+# configs/best-config-linux-local.tsv and applies the SAME forst-rs knobs to every
+# query (the same apply_uniform pattern as the docker harness's run-best.sh). There
+# are NO per-query branches anywhere in this file. The engine adapts to the query
+# SHAPE at runtime under the one config (point-deref auto-follows KV-sep for
+# windowed RMW; coalesce for scans). See configs/best-config-linux-local.tsv for
+# the full provenance and the EXCLUDED-lever rationale.
 #
-# This script is intentionally Linux/local specific. Keep the portable Mac/Linux
-# runners untouched, and use this entrypoint for the /ssd2 origin-box runs.
+# This script is intentionally Linux/local specific (its distinct mechanism is the
+# bare-metal /ssd2 origin-box entrypoint). Keep the portable Mac/Linux runners
+# untouched, and use this entrypoint for the origin-box runs. Only the PER-QUERY
+# variation has been removed — the runner itself stays.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -159,13 +166,14 @@ fi
 
 export TOPO_DEFAULT=split
 
-lookup_row() {
-  local q="$1"
-  awk -F'\t' -v q="$q" '
+# Read the single uniform `*` row from the TSV; returns the tab-split fields.
+# (No per-query lookup — there is exactly ONE config row applied to every query.)
+lookup_uniform_row() {
+  awk -F'\t' '
     /^[[:space:]]*#/ { next }
     /^[[:space:]]*$/ { next }
     $1 == "query" { next }
-    $1 == q { print; found=1; exit }
+    $1 == "*"     { print; found=1; exit }
     END { if (!found) exit 3 }
   ' "$TSV"
 }
@@ -203,105 +211,60 @@ set_if_value() {
   [ "$v" != "-" ] && export "$k=$v" || true
 }
 
+# Apply the SINGLE UNIFORM config to EVERY query. This reads the one `*` row from
+# the TSV and exports the SAME forst-rs knobs regardless of which query is about to
+# run — there are NO per-query branches. Mirrors run-best.sh's apply_uniform.
 apply_profile() {
-  local q="$1" row profile
+  local q="$1" row
 
   clear_forstrs_knobs
   PROFILE=
   PROFILE_TOPOLOGY=
   PROFILE_MAXSEC=
+
+  # Conservative bare-metal-local defaults, UNIFORM for every query.
   export FRS_TM_JEMALLOC="${FRS_TM_JEMALLOC:-1}"
-  export FRS_SST_COMPRESSION="${FRS_SST_COMPRESSION:-lz4}"
   export FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}"
-  # Required local benchmark shape: 2 TaskManagers, each 4c/16g, 4 slots/TM,
-  # global parallelism 8. Do not let per-query profiles weaken this invariant.
-  export FRS_FLINK_PARALLELISM=8
-  export FRS_TM_SLOTS=4
-  export SPLIT_TM_CPUS=4
-  export SPLIT_TM_MEM=16g
-
-  if [ -n "${PROFILE_OVERRIDE_ENVS:-}" ]; then
-    PROFILE_TOPOLOGY="${PROFILE_OVERRIDE_TOPOLOGY:-${TOPO_DEFAULT:-split}}"
-    PROFILE_MAXSEC="${PROFILE_OVERRIDE_MAXSEC:-$MAXSEC}"
-    local pair key value
-    for pair in $PROFILE_OVERRIDE_ENVS; do
-      case "$pair" in
-        *=*)
-          key="${pair%%=*}"
-          value="${pair#*=}"
-          export "$key=$value"
-          ;;
-        *)
-          echo "WARN: ignoring malformed PROFILE_OVERRIDE_ENVS assignment '$pair' for $q" >&2
-          ;;
-      esac
-    done
-    export FRS_FLINK_PARALLELISM=8
-    export FRS_TM_SLOTS=4
-    export SPLIT_TM_CPUS=4
-    export SPLIT_TM_MEM=16g
-    profile="${PROFILE_OVERRIDE_NAME:-override}:CANDIDATE:${PROFILE_MAXSEC}s"
-  elif row="$(lookup_row "$q" 2>/dev/null)"; then
-    local cols
-    cols="$(awk -F'\t' '{print NF; exit}' <<<"$row")"
-    if [ "$cols" -ge 12 ]; then
-      local query kvsep kvmin trivial s2pin s2fan exec_ comp coalesce wall status note
-      IFS=$'\t' read -r query kvsep kvmin trivial s2pin s2fan exec_ comp coalesce wall status note <<<"$row"
-      set_if_value FRS_KV_SEPARATION "$kvsep"
-      set_if_value FRS_KV_MIN_BLOB_SIZE "$kvmin"
-      set_if_value FRS_TRIVIAL_MOVE "$trivial"
-      set_if_value FRS_RS_S2_PINNED "$s2pin"
-      set_if_value FRS_S2_FANOUT_MIN "$s2fan"
-      set_if_value FRS_RS_EXECUTOR "$exec_"
-      set_if_value FRS_VLOG_COALESCE_DEREF "$coalesce"
-      export FRS_SST_COMPRESSION="${comp:-lz4}"
-      profile="best-tsv:${status}:${wall}s"
-    else
-      local query profile_name topology maxsec env_assignments expected_wall_s status note
-      IFS=$'\t' read -r query profile_name topology maxsec env_assignments expected_wall_s status note <<<"$row"
-      PROFILE_TOPOLOGY="$topology"
-      PROFILE_MAXSEC="$maxsec"
-      if [ "$env_assignments" != "-" ] && [ -n "$env_assignments" ]; then
-        local pair key value
-        for pair in $env_assignments; do
-          case "$pair" in
-            *=*)
-              key="${pair%%=*}"
-              value="${pair#*=}"
-              export "$key=$value"
-              ;;
-            *)
-              echo "WARN: ignoring malformed env assignment '$pair' for $q in $TSV" >&2
-              ;;
-          esac
-        done
-      fi
-      export FRS_FLINK_PARALLELISM=8
-      export FRS_TM_SLOTS=4
-      export SPLIT_TM_CPUS=4
-      export SPLIT_TM_MEM=16g
-      profile="${profile_name}:${status}:${expected_wall_s}s"
-    fi
-  else
-    profile="stable-baseline"
-  fi
-
-  # Conservative global wins that are byte-compatible for local runs. Leave
-  # per-query-sensitive knobs such as KV separation to the TSV.
   export FRS_SCAN_OPEN_FANOUT="${FRS_SCAN_OPEN_FANOUT:-1}"
   export FRS_SCAN_COLD_PRIME="${FRS_SCAN_COLD_PRIME:-1}"
   export FRS_RS_READ_IO_PARALLELISM="${FRS_RS_READ_IO_PARALLELISM:-3}"
   export FRS_IO_URING="${FRS_IO_URING:-1}"
-  export FRS_VLOG_COALESCE_DEREF="${FRS_VLOG_COALESCE_DEREF:-1}"
 
-  # Final guard after all profile/default knobs: local NexMark results are only
-  # comparable when every query uses the same measured resource envelope.
+  # Bare-metal Linux-local topology invariant (UNIFORM, every query): the 8c/32g
+  # TM budget realized as 2 TaskManagers x 4c/16g, parallelism 8, 4 slots/TM. This
+  # is a runner topology choice applied identically to all queries, NOT a per-query
+  # config knob (see best-config-linux-local.tsv).
   export FRS_FLINK_PARALLELISM=8
   export FRS_TM_SLOTS=4
   export SPLIT_TM_CPUS=4
   export SPLIT_TM_MEM=16g
 
-  PROFILE="$profile"
+  # --- apply the uniform `*` row (identical for every query) ---
+  row="$(lookup_uniform_row 2>/dev/null)" \
+    || { echo "FATAL: no uniform '*' row in $TSV"; exit 1; }
+  local urow ukvsep ukvmin utrivial us2pin ucoalesce ucomp umemmgr unote
+  IFS=$'\t' read -r urow ukvsep ukvmin utrivial us2pin ucoalesce ucomp umemmgr unote <<<"$row"
+  set_if_value FRS_KV_SEPARATION       "$ukvsep"
+  set_if_value FRS_KV_MIN_BLOB_SIZE    "$ukvmin"
+  set_if_value FRS_TRIVIAL_MOVE        "$utrivial"
+  set_if_value FRS_RS_S2_PINNED        "$us2pin"
+  set_if_value FRS_VLOG_COALESCE_DEREF "$ucoalesce"
+  export FRS_SST_COMPRESSION="${ucomp:-lz4}"
+  # FRS_VLOG_POINT_DEREF deliberately LEFT UNSET -> auto-follows KV-sep (db.rs:467).
+  set_if_value FRS_MEM_MANAGER         "$umemmgr"
+  # Vlog resident bounds: keep the engine native bounded. Uniform for every query.
+  export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
+  export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-256}"
+  export FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-1}"
+
+  # Final guard: results are only comparable when every query uses the same
+  # measured resource envelope. Re-pin after all defaults.
+  export FRS_FLINK_PARALLELISM=8
+  export FRS_TM_SLOTS=4
+  export SPLIT_TM_CPUS=4
+  export SPLIT_TM_MEM=16g
+
+  PROFILE="uniform-split:KVSEP-ON:p8-2x4c16g"
 }
 
 topology_for() {
