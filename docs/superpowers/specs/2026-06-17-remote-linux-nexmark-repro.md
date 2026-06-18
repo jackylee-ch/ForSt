@@ -365,12 +365,32 @@ JVM-side term is large. Two levers to fit p8 @ 16g:
 The bare-metal Linux-local runner (`run-linux-local-forstrs.sh`) pins p8 uniformly,
 so it is the runner where this fit matters.
 
-<!-- TODO(q9-p8-fit, in-flight agent /tmp/frs-q9p8fit): DROP THE EXACT p8 @16g/TM
-     never-OOM RECIPE HERE once the q9 p8-fit agent reports — i.e. the precise
-     FRS_TM_PROCESS_SIZE / FRS_JVM_RESERVED_MB (or the >16g/TM size) + any
-     FRS_MEM_JEMALLOC_OFF_RESERVE_MB value that makes q9 FINISH exact at
-     parallelism 8 without OOM. Until then: use p4 @16g (proven), or p8 only on a
-     >16g/TM host. This placeholder is the single drop-in line for that result. -->
+**Recovered footprint-tuning finding (q9 @16g, parallelism 4) — strongly-trending,
+finish-confirm pending on the remote box.** The KEY delta is **lowering the JVM
+reserve** from the default 10240 to **`FRS_JVM_RESERVED_MB=8192`**: this frees
+~2 GiB of cgroup headroom for the JVM-side FFM/AEC off-heap, which is exactly the
+term that crests at the q9 join-build peak. The never-OOM recipe observed:
+
+```
+parallelism = 4
+FRS_JVM_RESERVED_MB=8192     # KEY delta (down from 10240) — frees ~2 GiB cgroup for off-heap
+FRS_TM_JEMALLOC=1            # lets the JVM-side return freed pages on Linux
+FRS_MEM_MANAGER=1            # proactive purge of the build-peak transient
+```
+
+With this, q9 @16g/TM cruised at a **peak of ~12.4–13.7 GiB / 16 (≈3.5 GiB
+margin)** and survived **past 60M** trending toward the finish, where the default
+10240-reserve config had crested. **Honest status: this run was killed at ~60M for
+a local Mac disk-full event (NOT an OOM) before the 100M finish-confirm — so this
+is a strongly-trending config delta, not a confirmed finish. A clean 100M
+finish-confirm (exact 91,813,372) is still owed on the remote box.**
+
+For **parallelism 8** (4 join operators per TM, so the JVM-side off-heap doubles),
+the same lever points further the same direction: **drop `FRS_JVM_RESERVED_MB`
+further (try 6144)** to free more cgroup for the doubled off-heap, OR run on a
+**>16g/TM host** (20–24g). p8 @16g remains the open fit; until a finish-confirm,
+use **p4 @16g** with the 8192-reserve recipe above (strongly-trending), or p8 only
+on a >16g/TM host.
 
 ---
 
