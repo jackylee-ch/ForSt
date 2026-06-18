@@ -84,6 +84,10 @@ PASS_ENV_KEYS=(
   FRS_RSS_SAMPLE FRS_JFR FRS_PERF FRS_PERF_DELAY FRS_PERF_DUR
   MALLOC_CONF _RJEM_MALLOC_CONF
   FRS_MEM_DIAG FRS_MEM_DIAG_FILE
+  FRS_MEM_MANAGER FRS_MEM_PURGE_AT FRS_MEM_PRESSURE_PURGE
+  FRS_MEM_CGROUP_MB FRS_JVM_RESERVED_MB FRS_FFM_RESERVED_MB
+  FRS_MEM_HEADROOM_MB FRS_MEM_INSTANCES
+  FRS_MEM_JEMALLOC_OFF_RESERVE_MB FRS_TM_JEMALLOC_ALLOW_OFF
   FRS_DISABLE_MAPSTATE_CACHE
   FRS_WBM_TOTAL_MB FRS_WBM_STALL FRS_WBM_HARD_MB
   FRS_SCAN_OPEN_FANOUT FRS_SCAN_COLD_PRIME FRS_S2_FANOUT_MIN
@@ -198,6 +202,7 @@ clear_forstrs_knobs() {
         FRS_COMPACT_WINDOWED FRS_COMPACT_WINDOW_BYTES FRS_COMPACT_PREFETCH_BUDGET \
         FRS_COMPACT_PARALLEL FRS_COMPACT_CONCURRENT FRS_COMPACT_DRAIN_L1 \
         FRS_COMPACT_RELEASE_LOCK FRS_CKPT_PARALLEL_UPLOAD \
+        FRS_MEM_MANAGER \
         SINGLE_TM_CPUS SINGLE_TM_MEM SPLIT_TM_CPUS SPLIT_TM_MEM \
         FRS_FLINK_PARALLELISM FRS_TM_SLOTS \
         FRS_TM_PROCESS_SIZE FRS_JM_PROCESS_SIZE PROFILE_TOPOLOGY PROFILE_MAXSEC 2>/dev/null || true
@@ -252,6 +257,12 @@ apply_profile() {
   export FRS_SST_COMPRESSION="${ucomp:-lz4}"
   # FRS_VLOG_POINT_DEREF deliberately LEFT UNSET -> auto-follows KV-sep (db.rs:467).
   set_if_value FRS_MEM_MANAGER         "$umemmgr"
+  # FRS_MEM_PURGE_AT=elevated: proactive build-peak jemalloc purge fires at the
+  # Elevated level (>=0.75) so the join-build MADV_FREE/dirty transient returns to
+  # the OS before the spike crosses the cgroup cliff (44d3616b0). `high` on an ample
+  # box. Armed by FRS_MEM_MANAGER=1. Uniform for every query. (FRS_TM_JEMALLOC=1 is
+  # set above — the Linux OOM amplifier; =0 is strictly worse.)
+  export FRS_MEM_PURGE_AT="${FRS_MEM_PURGE_AT:-elevated}"
   # Vlog resident bounds: keep the engine native bounded. Uniform for every query.
   export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
   export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-256}"

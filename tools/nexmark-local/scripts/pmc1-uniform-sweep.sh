@@ -58,6 +58,11 @@ apply_uniform() {
   setk FRS_RS_S2_PINNED     "$s2pin"
   setk FRS_VLOG_COALESCE_DEREF "$coalesce"
   setk FRS_MEM_MANAGER      "$memmgr"
+  # FRS_TM_JEMALLOC=1 (Linux OOM amplifier; =0 strictly worse, the manager
+  # force-enables it anyway — set explicitly) + FRS_MEM_PURGE_AT=elevated
+  # (proactive build-peak jemalloc purge). Uniform; harmless on light queries.
+  export FRS_TM_JEMALLOC="${FRS_TM_JEMALLOC:-1}"
+  export FRS_MEM_PURGE_AT="${FRS_MEM_PURGE_AT:-elevated}"
   export FRS_SST_COMPRESSION="${comp:-lz4}"
   export FRS_VLOG_COMPRESSION="${FRS_VLOG_COMPRESSION:-inherit}"
   # FRS_VLOG_POINT_DEREF LEFT UNSET -> auto-follows KV-sep (db.rs:467).

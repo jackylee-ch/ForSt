@@ -62,11 +62,37 @@ FRS_RS_S2_PINNED=1
 FRS_VLOG_COALESCE_DEREF=1     # batched value-log deref for SCAN-shaped joins
 FRS_SST_COMPRESSION=lz4       # engine default AND the ForSt match
 FRS_MEM_MANAGER=1             # never-OOM controller (un-throttled on a >=40 GiB box)
+FRS_TM_JEMALLOC=1             # Linux: eager-decay jemalloc over the TM JVM — the OOM
+                              #   amplifier fix (=0 is STRICTLY WORSE; the manager
+                              #   force-enables it anyway, but set it explicitly)
+FRS_MEM_PURGE_AT=elevated     # proactive build-peak jemalloc purge fire threshold
+                              #   (use `high` on a >=40 GiB box with spike headroom)
 # FRS_VLOG_POINT_DEREF        LEFT UNSET -> auto-follows KV-sep (db.rs:467)
 FRS_VLOG_READER_CACHE_CAP=2048
 FRS_VLOG_RESIDENT_BUDGET_MB=256
 FRS_KV_ADAPTIVE_PRESSURE=1
 ```
+
+`FRS_TM_JEMALLOC=1` (Linux only) is the key never-OOM lever for the heavy joins.
+With `=0` the JVM's native off-heap (FFM/Panama state buffers + AEC in-flight,
+which **double** at parallelism 8) runs on plain **glibc** malloc, which *retains*
+freed arenas — a TM then crests the 16g cgroup at the q9 join-build peak and
+restart-loops (reproduced at ~59M events). Eager-decay jemalloc *returns* freed
+pages, so the JVM-side drops back to its p4 footprint. When `FRS_MEM_MANAGER=1` is
+armed, `run-8c32g.sh` **force-enables** eager jemalloc over the TM JVM even if you
+set `FRS_TM_JEMALLOC=0` (loud WARN) because the controller's never-OOM guarantee
+depends on the JVM actually returning memory; we still set `=1` explicitly so the
+intent is visible (commit `e61aac893`). `FRS_TM_JEMALLOC_ALLOW_OFF=1` honours an
+explicit OFF (then only the engine's glibc-retention cushion defends — slower,
+marginal at p8). macOS ignores this knob (host-allocator TSD-crash caveat).
+
+`FRS_MEM_PURGE_AT=elevated` drives the proactive build-peak jemalloc purge at the
+**Elevated** pressure level (≥0.75 ≈ 12.3 GiB of 16) with a 250ms sampler, so the
+~5 GiB MADV_FREE/dirty join-build transient is returned to the OS *before* the
+sub-second build-peak spike crosses the 16g cgroup cliff (commit `44d3616b0`).
+Purge only returns already-freed pages — byte-identical, zero correctness impact.
+Use `FRS_MEM_PURGE_AT=high` on an ample (≥40 GiB) box where the spike has headroom
+and you prefer fewer purges. Both knobs are armed by `FRS_MEM_MANAGER=1`.
 
 **The engine auto-selects the read path by query SHAPE under this one config:**
 
@@ -156,16 +182,29 @@ Mock-S3 only: the perf arm runs on LocalFS. The real S3 endpoint stays OFF.
 
 ```bash
 export REPO=/ssd2/$USER/ForSt WORKENV=$HOME/workenv
-# 1) forst-rs Linux .so (re-run on engine changes):
+# 1) forst-rs Linux .so — engine at origin/forst-rs TIP (re-run on engine changes):
 bash tools/nexmark-local/scripts/run-8c32g.sh build
-# 2) forst-rs Flink jar (host maven, deployed into $FLINK/lib):
+# 2) forst-rs Flink jar (host maven, deployed into $FLINK/lib) — see note below:
 bash tools/nexmark-local/scripts/run-8c32g.sh jar
 # 3) nexmark-flink jar (from the submodule), if not already built:
 #    (cd nexmark/nexmark-flink && mvn -q -DskipTests package)
 ```
 
-The `.so` is copied into each container at run time (both `/usr/local/lib` and
-`$FLINK/lib`). See the **.so-copy race caveat** in §6.
+**Build at the engine tip + the R-2 backend jar (REQUIRED).** Step 1 must build
+the `.so` from the **origin/forst-rs tip** — it carries the never-OOM levers
+(proactive purge `44d3616b0`, glibc-retention reserve `e61aac893`, q20
+live-files-hoist `72dae3a02`, q5 write-stall/merge-CF fixes). Step 2 must build and
+deploy the **current `flink-statebackend-forst-rs` jar**, which carries the **R-2
+ValueState write-back RMW cache** (flink-side commit `01ee09c8ec2`) — this is what
+takes q17 from 236.9s to 47.7s (now BEATS RocksDB) and q11 to 211.8s. A stale jar
+will reproduce the *old* (pre-R-2) windowed numbers; rebuild the jar whenever you
+pull the flink submodule.
+
+The `.so` is copied into each container at run time to **three** paths
+(`/usr/local/lib`, `/usr/lib`, `$FLINK/lib`). The `/usr/lib` copy is on the JVM's
+`java.library.path` so `System.loadLibrary` resolves it even when the
+`-Dforstrs.native.libpath` property is not seen (commit `7faa2874a`). See the
+**.so-copy race caveat** in §6.
 
 ---
 
@@ -207,7 +246,7 @@ These are the recorded `out_rows` (the forst-rs arm; a FINISHED run must match):
 
 | query | out_rows | notes |
 |---|---|---|
-| q4  | 25,843,878 (forst-rs cadence) | retract-changelog cadence differs from RocksDB's 177,629,788 — a documented count-cadence difference, not a defect |
+| q4  | 25,843,878 (forst-rs cadence) | retract-changelog cadence differs from RocksDB's 177,629,788 — a documented count-cadence difference, not a defect (forst-rs runs jitter 25.83M–25.85M) |
 | q7  | 92,000,002 | |
 | q9  | 91,813,372 | exact across all 3 backends |
 | q11 | 92,000,000 | |
@@ -215,7 +254,7 @@ These are the recorded `out_rows` (the forst-rs arm; a FINISHED run must match):
 | q17 | 92,000,000 | |
 | q19 | 92,000,000 | |
 | q20 | 93,201,404 | |
-| q8  | ~3,064,4xx | small cross-backend cadence jitter (3,064,481 / 413 / 421) |
+| q8  | ~3,064,4xx | small cross-backend cadence jitter (3,064,481 / 413 / 421 / 465 / 401) |
 | q18 | 92,000,000 | |
 | q0/q1/q2/q10/q13/q14 | 100,000,000 | source-bound |
 | q3  | 2,201,068 | |
@@ -224,19 +263,50 @@ These are the recorded `out_rows` (the forst-rs arm; a FINISHED run must match):
 A run is correct iff it FINISHED (a `RESULT: ... FINISHED` line) AND its
 `out_rows` matches the table.
 
+### 5b. Per-query verdicts (the recorded uniform-config A/B, latest jar)
+
+The current standing verdicts under the SINGLE uniform config (forst-rs arm vs the
+RocksDB baseline, recorded in `tools/nexmark-local/pmc1-uniform-results.tsv`):
+
+| query | forst-rs | rocksdb | verdict |
+|---|---|---|---|
+| q4  | 400.1s | 503.0s | **BEATS RocksDB** (0.80×); forst-local DNF |
+| q7  | 1176.1s | DNF (join-scaling wall) | **BEATS RocksDB** (rocksdb stalled ~50M @ 2.9K/s) |
+| q17 | **47.7s** (R-2 jar) | 73.9s | **BEATS RocksDB** (0.65×) — R-2 write-back RMW cache |
+| q8  | 47.7s | 44.3s | ForSt-parity (source-rate + RowData-serde ceiling, unwinnable) |
+| q12 | 46.6s | 39.6s | ForSt-parity (same source ceiling) |
+| q11 | 211.8s | 107.0s | 1.98× — STRUCTURAL (inline scattered point-get, not KV-sep deref) |
+| q20 | 1146.5s | 661.7s | 1.73× — STRUCTURAL constant-factor join read-path gap |
+| q9  | see §6d | 1057.4s | exact 91,813,372; never-OOM at p4@16g; **p8 fit pending — §6d** |
+| q18 | 470.4s | 360.4s | finishes correct |
+| q19 | 565.5s | 305.5s | finishes; needs a ≥40 GiB host to run 2×16g un-throttled — §6c |
+| q5  | OOM box-limit | — | needs a host that fits 2×16g un-throttled (≥40 GiB) — §6c |
+
+q4/q7/q17 BEAT RocksDB; q8/q12 are at the ForSt/source-rate parity ceiling; q11
+(1.98×) and q20 (1.73×) are STRUCTURAL constant-factor gaps; **q9/q18/q19/q5 need a
+host that actually fits two un-throttled 16g TMs (≥40 GiB VM)** — on the 37.77 GiB
+Mac VM they hit the global-VM-overcommit ceiling (§6c).
+
 ---
 
 ## 6. Operational caveats
 
 ### 6a. The `.so`-copy race (concurrent cluster starts)
 
-Each TM and the JM copy the freshly-built `.so` into **two** places at startup:
+Each TM and the JM copy the freshly-built `.so` into **three** places at startup:
 `/usr/local/lib/libforst_rs_ffi.so` (per-container, private — this is the
-`-Dforstrs.native.libpath` the JVM loads) **and** `$FLINK/lib/libforst_rs_ffi.so`.
+`-Dforstrs.native.libpath` the JVM loads), `/usr/lib/libforst_rs_ffi.so` (commit
+`7faa2874a` — `/usr/lib` IS on the JVM's `java.library.path`, so
+`System.loadLibrary("forst_rs_ffi")` resolves it when the `-Dforstrs.native.libpath`
+property is not seen at runtime; without this the split-TM run hit
+`UnsatisfiedLinkError` and restart-looped at `src_out~2000`), **and**
+`$FLINK/lib/libforst_rs_ffi.so`.
+
 The `$FLINK/lib` copy targets the **shared** `$WORKENV/flink-2.2.1/lib` mount,
 which is the SAME file for every concurrent cluster. If two clusters start at the
 same time they race on that shared write, and a JVM can `dlopen` a half-written
-`.so` → `UnsatisfiedLinkError`.
+`.so` → `UnsatisfiedLinkError`. (The `/usr/local/lib` and `/usr/lib` copies are
+per-container and never race.)
 
 Mitigations:
 - Run heavy queries **serially** (the sweep drivers do this), OR
@@ -245,7 +315,7 @@ Mitigations:
 - Rely on the per-container `/usr/local/lib` copy (the libpath the JVM actually
   uses) and drop the `$FLINK/lib` copy for your concurrency model.
 
-The private `/usr/local/lib` copy is per-container and never races; only the
+The per-container `/usr/local/lib` and `/usr/lib` copies never race; only the
 shared-`$FLINK/lib` copy does. Document/operate accordingly when running
 clusters in parallel.
 
@@ -261,9 +331,10 @@ Confirmed present in `tools/nexmark-local/scripts/run-8c32g.sh`.
 
 ### 6c. The Mac VM vs the remote box (never-OOM honesty)
 
-On the 37.77 GiB Mac VM, two co-resident 16g TMs overcommit the VM, so q9/q5/q19
-can OOM from GLOBAL VM pressure (jemalloc RETAINED rides RSS over the cgroup; the
-LIVE set always fits the budget). **On a host whose VM actually fits 2×16g
+On the 37.77 GiB Mac VM, two co-resident 16g TMs overcommit the VM, so the heavy
+state queries (q9 at p8, q5, q19, q18) can OOM from GLOBAL VM pressure (jemalloc
+RETAINED rides RSS over the cgroup; the LIVE set always fits the budget). **On a
+host whose VM actually fits 2×16g
 (≥40 GiB — the remote box), `FRS_MEM_MANAGER` runs un-throttled → never-OOM AND
 within-bar.** The Mac VM forces a throttle-vs-OOM tradeoff that the remote box
 does not. q5 is the one genuine live-state outlier (its in-flight window
@@ -271,6 +342,35 @@ accumulator is real application state ~8 GiB; it needs ≥16g/TM or the deferred
 window-pane spill). Full empirical detail:
 `docs/superpowers/specs/2026-06-08-8c32g-3backend-sweep-results.md` (the PMC-1
 "@16g/TM" sections).
+
+### 6d. q9 parallelism guidance (p4 fits 16g; p8 needs more — fit pending)
+
+q9 is **never-OOM at parallelism 4 @ 16g/TM** under the uniform config: it FINISHES
+exact (91,813,372) with the full KV-sep stack ON, the never-OOM controller bounding
+the engine-native, and eager jemalloc + proactive purge holding the build-peak
+transient under the cgroup. The docker driver (`run-best.sh` / `pmc1-uniform-sweep.sh`)
+uses parallelism 4 with `taskmanager.load-balance.mode=SLOTS` to spread the 4 join
+subtasks 2+2 across both TMs.
+
+**Parallelism 8 (4 join operators per TM) is the open fit.** At p8 the Flink-side
+off-heap (FFM/Panama state buffers + AEC in-flight) **doubles** per TM, so a TM
+crests the 16g cgroup at the join-build peak even with the engine-native fully
+bounded — this is JVM-side, not engine-native, retention. `FRS_TM_JEMALLOC=1` is
+**mandatory** on Linux at p8 (it lets the JVM-side actually return freed pages); the
+proactive purge + glibc-retention cushion close most of the rest, but at p8 the
+JVM-side term is large. Two levers to fit p8 @ 16g:
+- run with **>16g/TM** (e.g. 20–24g) if the host has the RAM, OR
+- **lower `FRS_TM_PROCESS_SIZE`** (carve the JVM heap down further so the cgroup
+  leaves more room for the JVM-side native off-heap; matched by `FRS_JVM_RESERVED_MB`).
+The bare-metal Linux-local runner (`run-linux-local-forstrs.sh`) pins p8 uniformly,
+so it is the runner where this fit matters.
+
+<!-- TODO(q9-p8-fit, in-flight agent /tmp/frs-q9p8fit): DROP THE EXACT p8 @16g/TM
+     never-OOM RECIPE HERE once the q9 p8-fit agent reports — i.e. the precise
+     FRS_TM_PROCESS_SIZE / FRS_JVM_RESERVED_MB (or the >16g/TM size) + any
+     FRS_MEM_JEMALLOC_OFF_RESERVE_MB value that makes q9 FINISH exact at
+     parallelism 8 without OOM. Until then: use p4 @16g (proven), or p8 only on a
+     >16g/TM host. This placeholder is the single drop-in line for that result. -->
 
 ---
 

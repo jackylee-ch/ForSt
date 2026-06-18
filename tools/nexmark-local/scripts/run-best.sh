@@ -13,6 +13,9 @@
 #   FRS_KV_SEPARATION=true  FRS_KV_MIN_BLOB_SIZE=256  FRS_TRIVIAL_MOVE=true
 #   FRS_RS_S2_PINNED=1      FRS_VLOG_COALESCE_DEREF=1  FRS_SST_COMPRESSION=lz4
 #   FRS_MEM_MANAGER=1       (never-OOM controller; un-throttled on a >=40 GiB box)
+#   FRS_TM_JEMALLOC=1       (Linux: eager-decay JVM jemalloc, the OOM amplifier fix;
+#                            =0 strictly worse — the manager force-enables it anyway)
+#   FRS_MEM_PURGE_AT=elevated (proactive build-peak jemalloc purge; `high` on >=40 GiB)
 #   FRS_VLOG_POINT_DEREF    LEFT UNSET -> auto-follows KV-sep (windowed q11/q17)
 #   vlog resident bounds:   FRS_VLOG_READER_CACHE_CAP=2048
 #                           FRS_VLOG_RESIDENT_BUDGET_MB=256  FRS_KV_ADAPTIVE_PRESSURE=1
@@ -108,6 +111,19 @@ apply_uniform() {
   # FRS_VLOG_POINT_DEREF deliberately LEFT UNSET -> auto-follows KV-sep (db.rs:467).
   # The never-OOM controller (uniform; un-throttled on a >=40 GiB box).
   setk FRS_MEM_MANAGER "$memmgr"
+  # FRS_TM_JEMALLOC=1 (Linux): eager-decay jemalloc over the TM JVM is the OOM
+  # amplifier fix — =0 is strictly worse (glibc retains freed FFM/AEC arenas and
+  # crests the cgroup at the q9 build peak). FRS_MEM_MANAGER FORCE-enables it even
+  # if left 0, but we set it explicitly so the intent is visible (e61aac893). On
+  # macOS the harness ignores this (host-allocator TSD crash) — it only applies in
+  # the Linux containers. FRS_TM_JEMALLOC_ALLOW_OFF=1 honours an explicit OFF.
+  export FRS_TM_JEMALLOC="${FRS_TM_JEMALLOC:-1}"
+  # FRS_MEM_PURGE_AT=elevated: the proactive build-peak jemalloc purge fires at the
+  # Elevated pressure level (>=0.75) so the ~5 GiB MADV_FREE/dirty join-build
+  # transient is returned to the OS BEFORE the sub-second spike crosses the 16g
+  # cgroup cliff (44d3616b0). Use `high` on an ample box (>=40 GiB) where the spike
+  # has headroom and you want fewer purges. Armed by FRS_MEM_MANAGER=1.
+  export FRS_MEM_PURGE_AT="${FRS_MEM_PURGE_AT:-elevated}"
   # Vlog resident bounds: keep the engine native delta inside the ~6 GiB the
   # process.size=10240m carve-out leaves free in the 16g cgroup (uniform; harmless
   # for light queries whose vlog working set is small).
@@ -119,6 +135,7 @@ apply_uniform() {
   echo "  FRS_KV_SEPARATION=${FRS_KV_SEPARATION:-<unset>}  FRS_KV_MIN_BLOB_SIZE=${FRS_KV_MIN_BLOB_SIZE:-<unset>}  FRS_TRIVIAL_MOVE=${FRS_TRIVIAL_MOVE:-<unset>}"
   echo "  FRS_RS_S2_PINNED=${FRS_RS_S2_PINNED:-<unset>}  FRS_VLOG_COALESCE_DEREF=${FRS_VLOG_COALESCE_DEREF:-<unset>}  FRS_VLOG_POINT_DEREF=<unset: auto-follows KV-sep>"
   echo "  FRS_SST_COMPRESSION=$FRS_SST_COMPRESSION  FRS_MEM_MANAGER=${FRS_MEM_MANAGER:-<unset>}"
+  echo "  FRS_TM_JEMALLOC=${FRS_TM_JEMALLOC:-<unset>} (Linux; OOM amplifier, =0 strictly worse)  FRS_MEM_PURGE_AT=${FRS_MEM_PURGE_AT:-<unset>}"
   echo "  vlog bounds: reader_cap=$FRS_VLOG_READER_CACHE_CAP resident_budget_mb=$FRS_VLOG_RESIDENT_BUDGET_MB adaptive_pressure=$FRS_KV_ADAPTIVE_PRESSURE"
   echo "  topology: TOPO=split (2x4c/16g + 1x JM 2c/4g), process.size=10240m + SLOTS (templates), parallelism=4"
 }

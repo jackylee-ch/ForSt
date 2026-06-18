@@ -29,9 +29,11 @@
 #   topology choice (uniform across all queries), NOT a per-query config knob.
 #
 # Conservative bare-metal-local defaults still applied by the runner for EVERY
-# query (these are uniform, not per-query): FRS_TM_JEMALLOC=1, FRS_IO_URING=1,
-# FRS_SCAN_OPEN_FANOUT=1, FRS_SCAN_COLD_PRIME=1, FRS_RS_READ_IO_PARALLELISM=3,
-# FRS_VLOG_COMPRESSION=inherit.
+# query (these are uniform, not per-query): FRS_TM_JEMALLOC=1 (Linux OOM amplifier
+# — =0 strictly worse, the never-OOM manager force-enables it anyway),
+# FRS_MEM_PURGE_AT=elevated (proactive build-peak jemalloc purge; `high` on a box
+# with ample headroom), FRS_IO_URING=1, FRS_SCAN_OPEN_FANOUT=1,
+# FRS_SCAN_COLD_PRIME=1, FRS_RS_READ_IO_PARALLELISM=3, FRS_VLOG_COMPRESSION=inherit.
 #
 # KNOB NAMES verified against the engine (crates/forst-rs-engine/src/db.rs):
 #   FRS_KV_SEPARATION       1|true => ON (default OFF)
@@ -44,6 +46,9 @@
 #   FRS_VLOG_RESIDENT_BUDGET_MB resident vlog byte budget
 #   FRS_KV_ADAPTIVE_PRESSURE 1 => back off separation under budget
 #   FRS_MEM_MANAGER         1 => arm the never-OOM controller
+#   FRS_TM_JEMALLOC         1 => eager-decay jemalloc over the TM JVM (Linux OOM
+#                           amplifier; =0 strictly worse; mgr force-enables it)
+#   FRS_MEM_PURGE_AT        critical|high|elevated (default elevated when armed)
 #   FRS_SST_COMPRESSION     none|lz4|zstd (engine default + ForSt match = lz4)
 #
 # EXCLUDED FROM THE UNIFORM DEFAULT (documented — NOT folded into one config, same
