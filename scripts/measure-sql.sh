@@ -12,7 +12,11 @@
 set -u
 export FLINK_HOME="${FLINK_HOME:-/Users/lijunqing/Downloads/workenv/flink-2.2.1}"
 NEXMARK_HOME="${NEXMARK_HOME:-/Users/lijunqing/Code/stczwd/ForSt/nexmark/nexmark-flink/target/nexmark-flink-bin/nexmark-flink}"
-export HADOOP_CLASSPATH="$(find "${HADOOP_HOME:-/Users/lijunqing/Downloads/workenv/hadoop-3.4.3}/share/hadoop" -name '*.jar' | tr '\n' ':')"
+if [ "${FRS_DISABLE_HADOOP_CLASSPATH:-0}" = "1" ]; then
+  unset HADOOP_HOME HADOOP_CONF_DIR YARN_CONF_DIR HADOOP_CLASSPATH
+else
+  export HADOOP_CLASSPATH="$(find "${HADOOP_HOME:-/Users/lijunqing/Downloads/workenv/hadoop-3.4.3}/share/hadoop" -name '*.jar' | tr '\n' ':')"
+fi
 JDK17="${JDK17:-/Library/Java/JavaVirtualMachines/zulu-17.jdk/Contents/Home}"
 JDK25="${JDK25:-/Library/Java/JavaVirtualMachines/zulu-25.jdk/Contents/Home}"
 export RUN_ID="${RUN_ID:-msql-$(date +%H%M%S)}"
@@ -80,6 +84,71 @@ for ln in open(p):
 open(p, 'w').writelines(out)
 PYEOF
   echo "== FRS-FLINK-PARALLELISM override: parallelism=${FRS_FLINK_PARALLELISM:-<unchanged>} slots=${FRS_TM_SLOTS:-<unchanged>} =="
+fi
+# Optional ForSt-RS memory/profile overrides. These are intentionally inert
+# unless set by the runner; q9 on 2 x 4c/16g needs this tighter profile to keep
+# native state, async-state buffering, cache, and cgroup page cache inside the
+# per-TM memory envelope.
+if [ -n "${FRS_WRITEBUFFER_SIZE:-}" ] \
+   || [ -n "${FRS_WRITEBUFFER_COUNT:-}" ] \
+   || [ -n "${FRS_WRITEBUFFER_MANAGER_CAPACITY:-}" ] \
+   || [ -n "${FRS_COMPACTION_MAX_BACKGROUND:-}" ] \
+   || [ -n "${FRS_FLUSH_MAX_BACKGROUND:-}" ] \
+   || [ -n "${FRS_BLOCK_CACHE_CAPACITY:-}" ] \
+   || [ -n "${FRS_ASYNC_INFLIGHT_LIMIT:-}" ] \
+   || [ -n "${FRS_ASYNC_BUFFER_SIZE:-}" ] \
+   || [ -n "${FRS_ASYNC_BUFFER_TIMEOUT:-}" ]; then
+  python3 - "$CONF" <<'PYEOF'
+import os
+import sys
+
+p = sys.argv[1]
+overrides = {
+    ("state", "backend", "forst-rs", "writebuffer", "size"): os.getenv("FRS_WRITEBUFFER_SIZE"),
+    ("state", "backend", "forst-rs", "writebuffer", "count"): os.getenv("FRS_WRITEBUFFER_COUNT"),
+    ("state", "backend", "forst-rs", "writebuffer", "manager", "capacity"): os.getenv("FRS_WRITEBUFFER_MANAGER_CAPACITY"),
+    ("state", "backend", "forst-rs", "compaction", "max-background"): os.getenv("FRS_COMPACTION_MAX_BACKGROUND"),
+    ("state", "backend", "forst-rs", "flush", "max-background"): os.getenv("FRS_FLUSH_MAX_BACKGROUND"),
+    ("state", "backend", "forst-rs", "cache", "block", "capacity"): os.getenv("FRS_BLOCK_CACHE_CAPACITY"),
+    ("execution", "async-state", "in-flight-records-limit"): os.getenv("FRS_ASYNC_INFLIGHT_LIMIT"),
+    ("execution", "async-state", "buffer-size"): os.getenv("FRS_ASYNC_BUFFER_SIZE"),
+    ("execution", "async-state", "buffer-timeout"): os.getenv("FRS_ASYNC_BUFFER_TIMEOUT"),
+}
+overrides = {k: v for k, v in overrides.items() if v}
+
+def parse_key(stripped):
+    if ":" not in stripped or stripped.startswith("#"):
+        return None
+    return stripped.split(":", 1)[0].strip()
+
+out = []
+stack = {}
+seen = {}
+for ln in open(p):
+    s = ln.rstrip("\n")
+    stripped = s.strip()
+    key = parse_key(stripped)
+    if key:
+        indent = len(s) - len(s.lstrip(" "))
+        for old in [i for i in stack if i >= indent]:
+            del stack[old]
+        parents = tuple(stack[i] for i in sorted(stack))
+        path = parents + (key,)
+        if path in overrides:
+            s = " " * indent + key + ": " + overrides[path]
+            seen[path] = overrides[path]
+        stack[indent] = key
+    out.append(s + "\n")
+
+open(p, "w").writelines(out)
+missing = sorted(".".join(k) for k in overrides if k not in seen)
+if missing:
+    raise SystemExit("missing config override target(s): " + ", ".join(missing))
+print(
+    "== FRS config override: "
+    + " ".join(f"{'.'.join(k)}={v}" for k, v in sorted(seen.items()))
+)
+PYEOF
 fi
 # The repo's sql-client.sh is a WRAPPER that reroutes nexmark's hardcoded
 # `embedded` to `sql-client.sh.orig gateway --endpoint localhost:8083`, so a

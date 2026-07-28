@@ -53,6 +53,7 @@ CSV="$OUTROOT/summary.csv"
 MD="$OUTROOT/SUMMARY.md"
 ENV_DIR="$OUTROOT/env"
 IMG="${IMG:-$SCENARIO_PREFIX-forst-bench:x86}"
+USER_FRS_MEM_DIAG_FILE="${FRS_MEM_DIAG_FILE:-}"
 
 PASS_ENV_KEYS=(
   EVENTS_NUM TPS
@@ -88,6 +89,7 @@ PASS_ENV_KEYS=(
   FRS_MEM_CGROUP_MB FRS_JVM_RESERVED_MB FRS_FFM_RESERVED_MB
   FRS_MEM_HEADROOM_MB FRS_MEM_INSTANCES
   FRS_MEM_JEMALLOC_OFF_RESERVE_MB FRS_TM_JEMALLOC_ALLOW_OFF
+  FRS_FFM_DIAG
   FRS_DISABLE_MAPSTATE_CACHE
   FRS_WBM_TOTAL_MB FRS_WBM_STALL FRS_WBM_HARD_MB
   FRS_SCAN_OPEN_FANOUT FRS_SCAN_COLD_PRIME FRS_S2_FANOUT_MIN
@@ -202,7 +204,10 @@ clear_forstrs_knobs() {
         FRS_COMPACT_WINDOWED FRS_COMPACT_WINDOW_BYTES FRS_COMPACT_PREFETCH_BUDGET \
         FRS_COMPACT_PARALLEL FRS_COMPACT_CONCURRENT FRS_COMPACT_DRAIN_L1 \
         FRS_COMPACT_RELEASE_LOCK FRS_CKPT_PARALLEL_UPLOAD \
-        FRS_MEM_MANAGER \
+        FRS_MEM_MANAGER FRS_MEM_PURGE_AT FRS_MEM_PRESSURE_PURGE \
+        FRS_MEM_CGROUP_MB FRS_JVM_RESERVED_MB FRS_FFM_RESERVED_MB \
+        FRS_MEM_HEADROOM_MB FRS_MEM_INSTANCES FRS_MEM_JEMALLOC_OFF_RESERVE_MB \
+        FRS_TM_JEMALLOC_ALLOW_OFF FRS_FFM_DIAG \
         SINGLE_TM_CPUS SINGLE_TM_MEM SPLIT_TM_CPUS SPLIT_TM_MEM \
         FRS_FLINK_PARALLELISM FRS_TM_SLOTS \
         FRS_TM_PROCESS_SIZE FRS_JM_PROCESS_SIZE PROFILE_TOPOLOGY PROFILE_MAXSEC 2>/dev/null || true
@@ -236,10 +241,10 @@ apply_profile() {
   export FRS_IO_URING="${FRS_IO_URING:-1}"
 
   # Bare-metal Linux-local topology invariant (UNIFORM, every query): the 8c/32g
-  # TM budget realized as 2 TaskManagers x 4c/16g, parallelism 8, 4 slots/TM. This
+  # TM budget realized as 2 TaskManagers x 4c/16g, parallelism 4, 4 slots/TM. This
   # is a runner topology choice applied identically to all queries, NOT a per-query
   # config knob (see best-config-linux-local.tsv).
-  export FRS_FLINK_PARALLELISM=8
+  export FRS_FLINK_PARALLELISM=4
   export FRS_TM_SLOTS=4
   export SPLIT_TM_CPUS=4
   export SPLIT_TM_MEM=16g
@@ -263,6 +268,12 @@ apply_profile() {
   # box. Armed by FRS_MEM_MANAGER=1. Uniform for every query. (FRS_TM_JEMALLOC=1 is
   # set above — the Linux OOM amplifier; =0 is strictly worse.)
   export FRS_MEM_PURGE_AT="${FRS_MEM_PURGE_AT:-elevated}"
+  # Match the fixed 2x4c/16g local split and the 10240m TM process-size carve-out
+  # in config-forst-rs-local.yaml.tpl so the controller does not depend on cgroup
+  # auto-detection inside the docker 19.03 local harness.
+  export FRS_MEM_CGROUP_MB="${FRS_MEM_CGROUP_MB:-16384}"
+  export FRS_JVM_RESERVED_MB="${FRS_JVM_RESERVED_MB:-10240}"
+  export FRS_MEM_INSTANCES="${FRS_MEM_INSTANCES:-4}"
   # Vlog resident bounds: keep the engine native bounded. Uniform for every query.
   export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-2048}"
   export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_VLOG_RESIDENT_BUDGET_MB:-256}"
@@ -270,12 +281,12 @@ apply_profile() {
 
   # Final guard: results are only comparable when every query uses the same
   # measured resource envelope. Re-pin after all defaults.
-  export FRS_FLINK_PARALLELISM=8
+  export FRS_FLINK_PARALLELISM=4
   export FRS_TM_SLOTS=4
   export SPLIT_TM_CPUS=4
   export SPLIT_TM_MEM=16g
 
-  PROFILE="uniform-split:KVSEP-ON:p8-2x4c16g"
+  PROFILE="uniform-split:KVSEP-ON:p4-2x4c16g"
 }
 
 topology_for() {
@@ -352,7 +363,7 @@ valid_resource_env() {
   grep -qx 'TOPOLOGY=split' "$file" || return 1
   grep -qx 'SPLIT_TM_CPUS=4' "$file" || return 1
   grep -qx 'SPLIT_TM_MEM=16g' "$file" || return 1
-  grep -qx 'FRS_FLINK_PARALLELISM=8' "$file" || return 1
+  grep -qx 'FRS_FLINK_PARALLELISM=4' "$file" || return 1
   grep -qx 'FRS_TM_SLOTS=4' "$file" || return 1
 }
 
@@ -397,7 +408,7 @@ write_md() {
     echo "- backend: forst-rs-ffm-local"
     echo "- maxsec_per_query: $MAXSEC"
     echo "- config_tsv: $TSV"
-    echo "- topology: fixed split, 2 TaskManagers x 4c/16g; 4 slots/TM; parallelism 8"
+    echo "- topology: fixed split, 2 TaskManagers x 4c/16g; 4 slots/TM; parallelism 4"
     echo "- templates: $TEMPLATES"
     echo "- scratch: $CTMP_BASE"
     echo "- env_dir: $ENV_DIR"
@@ -536,6 +547,12 @@ for q in $QUERIES; do
     *) cluster="$SCENARIO_PREFIX-$cluster" ;;
   esac
   tag="$cluster"
+  if [ -z "$USER_FRS_MEM_DIAG_FILE" ] \
+     && [ "${FRS_MEM_DIAG:-}" = "1" ]; then
+    export FRS_MEM_DIAG_FILE="$OUTROOT/frs-mem-diag-$q.log"
+  elif [ -n "$USER_FRS_MEM_DIAG_FILE" ]; then
+    export FRS_MEM_DIAG_FILE="$USER_FRS_MEM_DIAG_FILE"
+  fi
 
   if grep -q "RESULT: $q FINISHED" "$log" 2>/dev/null \
     && valid_finished_log "$q" "$log" \
@@ -576,6 +593,9 @@ for q in $QUERIES; do
   set -e
 
   ended="$(date '+%F %T')"
+  if [ -n "${FRS_MEM_DIAG_FILE:-}" ] && [ -f "$FRS_MEM_DIAG_FILE" ]; then
+    cp -p "$FRS_MEM_DIAG_FILE" "$OUTROOT/frs-mem-diag-$q.log" 2>/dev/null || true
+  fi
   parse_and_record "$q" "$topology" "$cluster" "$profile" "$log" "$started" "$ended"
   cleanup_cluster "$cluster"
   echo "rc=$rc log=$log"

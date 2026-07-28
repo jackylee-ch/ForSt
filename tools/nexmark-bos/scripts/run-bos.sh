@@ -50,6 +50,11 @@
 # with FRS_REMOTE_BW_MBPS. This harness is ready to fire — see docs/README.md.
 set -euo pipefail
 
+DOCKER_BIN="${DOCKER_BIN:-/home/work/dockerd/bin/docker}"
+if [ -x "$DOCKER_BIN" ]; then
+  export PATH="$(dirname "$DOCKER_BIN"):$PATH"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIGS_DIR="$PKG_DIR/configs"
@@ -59,6 +64,7 @@ CONFIGS_DIR="$PKG_DIR/configs"
 # Repo root: prefer an explicit REPO (the box checkout), else the engine repo
 # that contains this package (../../.. from tools/nexmark-bos/scripts).
 REPO="${REPO:-$(cd "$PKG_DIR/../.." && pwd)}"
+export REPO
 # Use this package's run-8c32g.sh (forwards the real S3 creds + the BOS disagg
 # knobs); fall back to the canonical one only if the package copy is missing.
 RUNNER="$PKG_DIR/scripts/run-8c32g.sh"
@@ -68,7 +74,17 @@ RUNNER="$PKG_DIR/scripts/run-8c32g.sh"
 # The BOS run always uses the S3 arm (config-forst-rs.yaml.tpl). Point TEMPLATES
 # at this package's configs dir so measure-sql.sh picks up the BOS-tuned copy.
 ARM="forst-rs-ffm-s3"
-TAG_PREFIX="${TAG_PREFIX:-bos}"
+TAG_PREFIX="${TAG_PREFIX:-nexmark-bos}"
+WORKENV="${WORKENV:-$HOME/workenv}"
+HADOOP_HOME="${HADOOP_HOME:-$WORKENV/hadoop-3.3.6}"
+HADOOP_CONF_DIR="${HADOOP_CONF_DIR:-$HADOOP_HOME/etc/hadoop}"
+CORE_SITE="${CORE_SITE:-$HADOOP_CONF_DIR/core-site.xml}"
+BOS_HADOOP_FS_JAR="${BOS_HADOOP_FS_JAR:-$HADOOP_HOME/share/hadoop/common/lib/bos-hadoop-fs-2.0.0.jar}"
+FLINK="${FLINK:-$WORKENV/flink-2.2.1}"
+IMG="${IMG:-nexmark-bos:x86}"
+PLAT="${PLAT:-linux/amd64}"
+export WORKENV HADOOP_HOME HADOOP_CONF_DIR BOS_HADOOP_FS_JAR FLINK IMG PLAT
+export FRS_DISABLE_HADOOP_CLASSPATH="${FRS_DISABLE_HADOOP_CLASSPATH:-1}"
 
 ALL_QUERIES="q4 q7 q9 q11 q12 q17 q19 q20"
 
@@ -85,6 +101,10 @@ maxsec_for() {
 # These are THE optimization levers. Defaults are the recommended starting
 # point for BOS-resident state; see docs/README.md for what each tunes.
 apply_bos_knobs() {
+  export FRS_CTMP_BASE="${FRS_CTMP_BASE:-/tmp/jackylee/nexmark-bos-frs-tmp}"
+  export LOCAL_LOG_BASE="${LOCAL_LOG_BASE:-/tmp/jackylee/nexmark-bos-logs}"
+  export FRS_FLINK_PARALLELISM="${FRS_FLINK_PARALLELISM:-8}"
+  export FRS_TM_SLOTS="${FRS_TM_SLOTS:-4}"
   # KV separation ON: values -> vlog blobs (write-amp / value-carrying reads).
   export FRS_KV_SEPARATION="${FRS_KV_SEPARATION:-true}"
   export FRS_KV_MIN_BLOB_SIZE="${FRS_KV_MIN_BLOB_SIZE:-256}"
@@ -120,15 +140,64 @@ apply_bos_knobs() {
   export FRS_REMOTE_COMPACTION="${FRS_REMOTE_COMPACTION:-}"
 }
 
+apply_q9_tight_profile() {
+  export FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-7168m}"
+  export FRS_WRITEBUFFER_SIZE="${FRS_WRITEBUFFER_SIZE:-128mb}"
+  export FRS_WRITEBUFFER_COUNT="${FRS_WRITEBUFFER_COUNT:-1}"
+  export FRS_WRITEBUFFER_MANAGER_CAPACITY="${FRS_WRITEBUFFER_MANAGER_CAPACITY:-512mb}"
+  export FRS_BLOCK_CACHE_CAPACITY="${FRS_BLOCK_CACHE_CAPACITY:-256mb}"
+  export FRS_COMPACTION_MAX_BACKGROUND="${FRS_COMPACTION_MAX_BACKGROUND:-2}"
+  export FRS_FLUSH_MAX_BACKGROUND="${FRS_FLUSH_MAX_BACKGROUND:-1}"
+  export FRS_ASYNC_INFLIGHT_LIMIT="${FRS_ASYNC_INFLIGHT_LIMIT:-10000}"
+  export FRS_ASYNC_BUFFER_SIZE="${FRS_ASYNC_BUFFER_SIZE:-2048}"
+  export FRS_VLOG_READER_CACHE_CAP="${FRS_VLOG_READER_CACHE_CAP:-512}"
+  export FRS_VLOG_RESIDENT_BUDGET_MB="${FRS_Q9_VLOG_RESIDENT_BUDGET_MB:-64}"
+  export FRS_KV_ADAPTIVE_PRESSURE="${FRS_KV_ADAPTIVE_PRESSURE:-1}"
+}
+
 # --- the S3/BOS connection env (creds required for a real run, not for print) ---
 apply_bos_storage() {
-  export S3_REGION="${S3_REGION:-us-east-1}"
-  export S3_PREFIX="${S3_PREFIX:-nexmark-bos}"
+  if [ -z "${S3_ACCESS_KEY:-}" ] || [ -z "${S3_SECRET_KEY:-}" ]; then
+    load_bos_creds_for_script_only
+  fi
+  export S3_REGION="${S3_REGION:-bj}"
+  export S3_PREFIX="${S3_PREFIX:-jackylee/test/nexmark-bos}"
   # Required for a real run. (S3_PREFIX/S3_REGION have safe defaults above.)
-  export S3_ENDPOINT="${S3_ENDPOINT:-}"
-  export S3_BUCKET="${S3_BUCKET:-}"
+  export S3_ENDPOINT="${S3_ENDPOINT:-http://s3.bj.bcebos.com}"
+  export S3_BUCKET="${S3_BUCKET:-tal-poc-namespace}"
   export S3_ACCESS_KEY="${S3_ACCESS_KEY:-}"
   export S3_SECRET_KEY="${S3_SECRET_KEY:-}"
+}
+
+load_bos_creds_for_script_only() {
+  [ -r "$CORE_SITE" ] || { echo "FATAL: core-site.xml is not readable by script"; exit 1; }
+  eval "$(
+    python3 - "$CORE_SITE" <<'PY'
+import shlex
+import sys
+import xml.etree.ElementTree as ET
+
+root = ET.parse(sys.argv[1]).getroot()
+props = {}
+for prop in root.findall("property"):
+    name = prop.findtext("name")
+    value = prop.findtext("value")
+    if name is not None and value is not None:
+        props[name.strip()] = value.strip()
+
+mapping = {
+    "S3_ACCESS_KEY": "fs.bos.access.key",
+    "S3_SECRET_KEY": "fs.bos.secret.access.key",
+}
+missing = [src for src in mapping.values() if not props.get(src)]
+if missing:
+    print("echo FATAL: required BOS credential properties are missing in core-site.xml >&2")
+    print("exit 1")
+    raise SystemExit(0)
+for env_name, prop_name in mapping.items():
+    print(f"export {env_name}={shlex.quote(props[prop_name])}")
+PY
+  )"
 }
 
 require_creds() {
@@ -146,8 +215,8 @@ require_creds() {
   fi
 }
 
-# Mask a secret for echo (show first 3 chars + length).
-mask() { local v="${1:-}"; [ -z "$v" ] && { echo "<unset>"; return; }; echo "${v:0:3}…(${#v})"; }
+# Mask a secret for echo. Do not print any secret prefix.
+mask() { local v="${1:-}"; [ -z "$v" ] && { echo "<unset>"; return; }; echo "<set>"; }
 
 print_resolved() {
   apply_bos_storage
@@ -165,19 +234,31 @@ print_resolved() {
   echo "  FRS_VLOG_RESIDENT_BUDGET_MB=$FRS_VLOG_RESIDENT_BUDGET_MB  FRS_CACHE_SPACE_LIMIT_MB=$FRS_CACHE_SPACE_LIMIT_MB"
   echo "  FRS_REMOTE_BW_MBPS=$FRS_REMOTE_BW_MBPS (0 = live BOS bandwidth)  FRS_SST_COMPRESSION=$FRS_SST_COMPRESSION  FRS_VLOG_COMPRESSION=$FRS_VLOG_COMPRESSION"
   echo "  FRS_REMOTE_COMPACTION=${FRS_REMOTE_COMPACTION:-<unset>}"
+  echo "  -- common q9 resource/config profile --"
+  echo "  TOPO=${TOPO:-split}  SPLIT_TM_CPUS=${SPLIT_TM_CPUS:-4}  SPLIT_TM_MEM=${SPLIT_TM_MEM:-16g}  SPLIT_JM_CPUS=${SPLIT_JM_CPUS:-2}  SPLIT_JM_MEM=${SPLIT_JM_MEM:-4g}"
+  echo "  FRS_FLINK_PARALLELISM=$FRS_FLINK_PARALLELISM  FRS_TM_SLOTS=$FRS_TM_SLOTS  FRS_CTMP_BASE=$FRS_CTMP_BASE"
+  echo "  FRS_DISABLE_HADOOP_CLASSPATH=$FRS_DISABLE_HADOOP_CLASSPATH (forst-rs/OpenDAL S3 path; BOS jar still packaged in FLINK_HOME/lib)"
+  echo "  YAML: TM process=12288m, writebuffer=1024mb x4, WBM=4096mb, block-cache=2048mb, compaction=8, flush=4, async=60000/16000/5000"
+  echo "  q9 tight overrides: FRS_TM_PROCESS_SIZE=${FRS_TM_PROCESS_SIZE:-<unset>} FRS_WRITEBUFFER_SIZE=${FRS_WRITEBUFFER_SIZE:-<template>} FRS_WRITEBUFFER_COUNT=${FRS_WRITEBUFFER_COUNT:-<template>} FRS_WRITEBUFFER_MANAGER_CAPACITY=${FRS_WRITEBUFFER_MANAGER_CAPACITY:-<template>}"
+  echo "                     FRS_BLOCK_CACHE_CAPACITY=${FRS_BLOCK_CACHE_CAPACITY:-<template>} FRS_COMPACTION_MAX_BACKGROUND=${FRS_COMPACTION_MAX_BACKGROUND:-<template>} FRS_FLUSH_MAX_BACKGROUND=${FRS_FLUSH_MAX_BACKGROUND:-<template>}"
+  echo "                     FRS_ASYNC_INFLIGHT_LIMIT=${FRS_ASYNC_INFLIGHT_LIMIT:-<template>} FRS_ASYNC_BUFFER_SIZE=${FRS_ASYNC_BUFFER_SIZE:-<template>}"
+  echo "                     FRS_VLOG_READER_CACHE_CAP=${FRS_VLOG_READER_CACHE_CAP:-<unset>} FRS_VLOG_RESIDENT_BUDGET_MB=${FRS_VLOG_RESIDENT_BUDGET_MB:-<unset>} FRS_KV_ADAPTIVE_PRESSURE=${FRS_KV_ADAPTIVE_PRESSURE:-<unset>}"
 }
 
 run_one() {
   local q="$1"
   local ms="${MAXSEC:-$(maxsec_for "$q")}"
-  local tag="$TAG_PREFIX-$q"
+  local tag="${RUN_TAG:-$TAG_PREFIX-$q-frs-$(date +%m%d-%H%M%S)}"
   echo ""
   echo "================ BOS DISAGG RUN $q [$ARM] tag=$tag MAXSEC=$ms ================"
   ( apply_bos_storage
     require_creds
     apply_bos_knobs
+    [ "$q" = "q9" ] && apply_q9_tight_profile
     export TEMPLATES="$CONFIGS_DIR"
     export TOPO="${TOPO:-split}"
+    export BOS_HADOOP_FS_JAR="$BOS_HADOOP_FS_JAR"
+    export RUN_ID="$tag"
     print_resolved
     echo "  -> $RUNNER run $q $ARM $ms $tag"
     CLUSTER="$tag" bash "$RUNNER" run "$q" "$ARM" "$ms" "$tag"
@@ -190,7 +271,7 @@ case "$cmd" in
     q="${1:-}"
     if [ -n "$q" ]; then
       echo "== resolved BOS config for $q (MAXSEC=$(maxsec_for "$q")) =="
-      ( print_resolved )
+      ( apply_bos_knobs; [ "$q" = "q9" ] && apply_q9_tight_profile; print_resolved )
     else
       echo "== resolved BOS config (applies to all priority queries) =="
       ( print_resolved )

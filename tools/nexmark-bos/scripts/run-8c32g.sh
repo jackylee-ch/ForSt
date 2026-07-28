@@ -33,6 +33,11 @@
 #     TM/JM container memory fits with OS headroom — it never forces a size.
 set -u
 
+DOCKER_BIN="${DOCKER_BIN:-/home/work/dockerd/bin/docker}"
+if [ -x "$DOCKER_BIN" ]; then
+  export PATH="$(dirname "$DOCKER_BIN"):$PATH"
+fi
+
 # --- platform detection (branch only where behavior differs) ---
 OS="$(uname -s)"        # Darwin (macOS) | Linux (origin box)
 
@@ -71,12 +76,19 @@ else
   # Linux origin box: checkout lives at /ssd2/$USER/ForSt; x86_64 container.
   REPO="${REPO:-/ssd2/$USER/ForSt}"
   WORKENV="${WORKENV:-$HOME/workenv}"
-  IMG="${IMG:-forst-bench:x86}"
+  IMG="${IMG:-nexmark-bos:x86}"
   PLAT="${PLAT:-linux/amd64}"
 fi
 FLINK="${FLINK:-$WORKENV/flink-2.2.1}"
+HADOOP_HOME="${HADOOP_HOME:-$WORKENV/hadoop-3.3.6}"
+BOS_HADOOP_FS_JAR="${BOS_HADOOP_FS_JAR:-$HADOOP_HOME/share/hadoop/common/lib/bos-hadoop-fs-2.0.0.jar}"
 
-DKR_COMMON=(--platform "$PLAT"
+DKR_PLATFORM=()
+if [ "$OS" = "Darwin" ] || [ "${USE_DOCKER_PLATFORM:-0}" = "1" ]; then
+  DKR_PLATFORM=(--platform "$PLAT")
+fi
+
+DKR_COMMON=(${DKR_PLATFORM[@]+"${DKR_PLATFORM[@]}"}
   -v "$REPO:$REPO" -v "$WORKENV:$WORKENV"
   # FRS-SCRATCH (2026-06-08): the container's /tmp is a ~59 GB overlay on Docker.raw
   # (the Docker-Desktop VM disk), NOT the host's 425 GB volume. q9/q20/q4 write
@@ -87,11 +99,14 @@ DKR_COMMON=(--platform "$PLAT"
   -e CARGO_HOME=/cargo-cache
   # JDK17 path INSIDE the container depends on the container arch (the .deb
   # package suffix), not the host: arm64 image -> ...-arm64, amd64 -> ...-amd64.
-  -e JDK17="${JDK17_IN_IMG:-/usr/lib/jvm/java-17-openjdk-$([ "$PLAT" = "linux/amd64" ] && echo amd64 || echo arm64)}"
-  -e JDK25=/opt/java/openjdk
-  -e TEMPLATES="${TEMPLATES:-$REPO/scripts/templates-linux}"
-  -e HADOOP_HOME="$WORKENV/hadoop-3.4.3"
+      -e JDK17="${JDK17_IN_IMG:-/usr/lib/jvm/java-17-openjdk-$([ "$PLAT" = "linux/amd64" ] && echo amd64 || echo arm64)}"
+      -e JDK25=/opt/java/openjdk
+      -e TEMPLATES="${TEMPLATES:-$REPO/scripts/templates-linux}"
+      -e FRS_DISABLE_HADOOP_CLASSPATH="${FRS_DISABLE_HADOOP_CLASSPATH:-}"
+      -e HADOOP_HOME="$HADOOP_HOME"
+      -e BOS_HADOOP_FS_JAR="$BOS_HADOOP_FS_JAR"
   -e NEXMARK_HOME="$REPO/nexmark/nexmark-flink/target/nexmark-flink-bin/nexmark-flink"
+  -e FLINK_HOME="$FLINK"
   -w "$REPO")
 
 # /tmp mount is per-invocation: single/build use the shared frs-tmp; TOPO=split
@@ -102,15 +117,22 @@ cmd="${1:?build|run|jar}"; shift || true
 
 case "$cmd" in
   build)
-    echo "== building forst-rs Linux .so (arm64) into target-linux/release =="
-    docker run --rm "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" -e CARGO_TARGET_DIR="$REPO/target-linux" "$IMG" \
-      bash -lc 'cargo build --release -p forst-rs-ffi && ls -la target-linux/release/libforst_rs_ffi.so'
+    echo "== building forst-rs Linux .so into target-linux/release =="
+    if command -v cargo >/dev/null 2>&1; then
+      (cd "$REPO" && CARGO_TARGET_DIR="$REPO/target-linux" cargo build --release -p forst-rs-ffi && ls -la target-linux/release/libforst_rs_ffi.so)
+    else
+      docker run --rm "${DKR_COMMON[@]}" "${TMP_MOUNT[@]}" -e CARGO_TARGET_DIR="$REPO/target-linux" "${BUILD_IMG:-$IMG}" \
+        bash -lc 'cargo build --release -p forst-rs-ffi && ls -la target-linux/release/libforst_rs_ffi.so'
+    fi
     ;;
   run)
     Q="${1:?query}"; CFG="${2:?config}"; MS="${3:-900}"; TAG="${4:-c32}"
     SO="$REPO/target-linux/release/libforst_rs_ffi.so"
     [ -f "$SO" ] || { echo "missing $SO — run: $0 build"; exit 1; }
-    OUT="/tmp/${TAG}-$Q-$CFG.out"
+    [ -f "$BOS_HADOOP_FS_JAR" ] || { echo "missing $BOS_HADOOP_FS_JAR — set BOS_HADOOP_FS_JAR"; exit 1; }
+    LOCAL_LOG_BASE="${LOCAL_LOG_BASE:-/tmp/jackylee/nexmark-bos-logs}"
+    mkdir -p "$LOCAL_LOG_BASE"
+    OUT="$LOCAL_LOG_BASE/${TAG}-$Q-$CFG.out"
     echo "== 8c/32g run: $Q [$CFG] MAXSEC=$MS tag=$TAG =="
     # FRS_PERF (2026-06-11): native-frame CPU profiling of the TM. Needs
     # perf_event_open which Docker's default seccomp profile blocks → relax
@@ -134,6 +156,8 @@ case "$cmd" in
     esac
     ENVS=(
       -e QUERY="$Q" -e CONFIG="$CFG" -e MAXSEC="$MS" -e EVENTS_NUM="${EVENTS_NUM:-}" -e TPS="${TPS:-}" \
+      -e RUN_ID="${RUN_ID:-}" \
+      -e FRS_FLINK_PARALLELISM="${FRS_FLINK_PARALLELISM:-}" -e FRS_TM_SLOTS="${FRS_TM_SLOTS:-}" \
       # BOS DISAGG (tools/nexmark-bos): forward the REAL BOS S3 creds into the
       # TM/JM containers (the tools/nexmark-local copy pins these to `x` because
       # it only runs LocalFS / mock-S3). measure-sql.sh `envsubst`s them into
@@ -160,6 +184,15 @@ case "$cmd" in
       # (the q9 8c/36g single-TM profile sets these). Forward them so the profile
       # actually takes effect through this package's runner.
       -e FRS_TM_PROCESS_SIZE="${FRS_TM_PROCESS_SIZE:-}" -e FRS_JM_PROCESS_SIZE="${FRS_JM_PROCESS_SIZE:-}" \
+      -e FRS_WRITEBUFFER_SIZE="${FRS_WRITEBUFFER_SIZE:-}" \
+      -e FRS_WRITEBUFFER_COUNT="${FRS_WRITEBUFFER_COUNT:-}" \
+      -e FRS_WRITEBUFFER_MANAGER_CAPACITY="${FRS_WRITEBUFFER_MANAGER_CAPACITY:-}" \
+      -e FRS_BLOCK_CACHE_CAPACITY="${FRS_BLOCK_CACHE_CAPACITY:-}" \
+      -e FRS_COMPACTION_MAX_BACKGROUND="${FRS_COMPACTION_MAX_BACKGROUND:-}" \
+      -e FRS_FLUSH_MAX_BACKGROUND="${FRS_FLUSH_MAX_BACKGROUND:-}" \
+      -e FRS_ASYNC_INFLIGHT_LIMIT="${FRS_ASYNC_INFLIGHT_LIMIT:-}" \
+      -e FRS_ASYNC_BUFFER_SIZE="${FRS_ASYNC_BUFFER_SIZE:-}" \
+      -e FRS_ASYNC_BUFFER_TIMEOUT="${FRS_ASYNC_BUFFER_TIMEOUT:-}" \
       # FRS-M5 FAIRNESS FIX (2026-06-13 cycle 2, PMC-1): the default was pinned
       # to `none` (a 2026-06-02 zero-copy read-path experiment), which forced
       # forst-rs to write SST blocks UNCOMPRESSED while the ForSt and RocksDB
@@ -301,7 +334,7 @@ case "$cmd" in
           "${DKR_COMMON[@]}" "${SPLIT_TMP[@]}" "${ENVS[@]}" -e FLINK_CONF_DIR="$CCONF" "$IMG" bash -lc "
             mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
             cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
-            for t in \$(seq 1 150); do curl -sf http://$CLUSTER-jm:8081/overview >/dev/null 2>&1 && break; sleep 2; done
+            cp '$BOS_HADOOP_FS_JAR' '$FLINK/lib/' &&
             exec bash '$FLINK/bin/taskmanager.sh' start-foreground
           " >/dev/null
       done
@@ -310,6 +343,7 @@ case "$cmd" in
         "$IMG" bash -lc "
           mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
           cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
+          cp '$BOS_HADOOP_FS_JAR' '$FLINK/lib/' &&
           nproc && free -g | head -2 &&
           bash scripts/measure-sql.sh
         " 2>&1 | tee "$OUT"
@@ -350,6 +384,7 @@ case "$cmd" in
       "$IMG" bash -lc "
         cp '$SO' '$FLINK/lib/libforst_rs_ffi.so' &&
         mkdir -p /usr/local/lib && cp '$SO' /usr/local/lib/libforst_rs_ffi.so &&
+        cp '$BOS_HADOOP_FS_JAR' '$FLINK/lib/' &&
         nproc && free -g | head -2 &&
         if [ -n \"\$FRS_RSS_SAMPLE\" ]; then ( RL=$REPO/target-linux/rss-\$QUERY.log; : > \$RL; while :; do p=\$(for j in \$(pgrep -x java); do echo \"\$(awk '/VmRSS/{print \$2}' /proc/\$j/status 2>/dev/null) \$j\"; done | sort -rn | head -1 | awk '{print \$2}'); if [ -n \"\$p\" ]; then a=\$(awk '/^Anonymous:/{an+=\$2} /^Rss:/{r+=\$2} END{print r,an}' /proc/\$p/smaps 2>/dev/null); echo \"t=\$(date +%s) pid=\$p rssKB_anonKB=\$a vmRSS=\$(awk '/VmRSS/{print \$2}' /proc/\$p/status 2>/dev/null)\" >> \$RL; n=\$((\${n:-0}+1)); if [ \$((n % 6)) -eq 0 ]; then echo \"--- NMT t=\$(date +%s) ---\" >> \$RL.nmt; jcmd \$p VM.native_memory summary 2>/dev/null | grep -E \"Total:|reserved=|- \" | head -40 >> \$RL.nmt; fi; fi; sleep 5; done & ) ; fi
         if [ -n \"\$FRS_PERF\" ]; then ( apt-get update -qq >/dev/null 2>&1; apt-get install -y -qq linux-tools-generic >/dev/null 2>&1; PF=\$(find /usr/lib/linux-tools* -name perf 2>/dev/null | head -1); sleep \"\${FRS_PERF_DELAY:-700}\"; p=\$(for j in \$(pgrep -x java); do echo \"\$(awk '/VmRSS/{print \$2}' /proc/\$j/status 2>/dev/null) \$j\"; done | sort -rn | head -1 | awk '{print \$2}'); if [ -n \"\$p\" ] && [ -n \"\$PF\" ]; then echo \"=== FRS_PERF start pid=\$p dur=\${FRS_PERF_DUR:-180}s ===\"; \$PF record -F 199 -g --call-graph fp -o /tmp/\$QUERY-perf.data -p \$p -- sleep \${FRS_PERF_DUR:-180} 2>&1 | tail -2; \$PF report -i /tmp/\$QUERY-perf.data --stdio --no-children --percent-limit 0.3 > $REPO/target-linux/perf-\$QUERY-flat.txt 2>/dev/null; \$PF report -i /tmp/\$QUERY-perf.data --stdio --children --percent-limit 1 > $REPO/target-linux/perf-\$QUERY-graph.txt 2>/dev/null; echo \"=== FRS_PERF done ===\"; fi ) & fi

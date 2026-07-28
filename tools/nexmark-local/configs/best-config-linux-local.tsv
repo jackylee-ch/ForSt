@@ -16,17 +16,16 @@
 # kept deliberately as this entrypoint's distinct mechanism).
 #
 # TOPOLOGY (uniform, every query): the bare-metal Linux-local invariant is the
-# 8c/32g TM budget realized as 2 TaskManagers x 4c/16g, parallelism 8, 4 task slots
+# 8c/32g TM budget realized as 2 TaskManagers x 4c/16g, parallelism 4, 4 task slots
 # per TM, TOPO=split. This is the bare-metal runner's standing topology intent and
 # is applied identically to every query (NOT a per-query difference). The runner
-# pins SPLIT_TM_CPUS=4 / SPLIT_TM_MEM=16g / FRS_FLINK_PARALLELISM=8 / FRS_TM_SLOTS=4
+# pins SPLIT_TM_CPUS=4 / SPLIT_TM_MEM=16g / FRS_FLINK_PARALLELISM=4 / FRS_TM_SLOTS=4
 # for all queries.
 #
-#   NOTE on parallelism vs the docker harness: the docker run-best.sh uses
-#   parallelism=4 (slot-skew fixed via taskmanager.load-balance.mode=SLOTS). The
-#   bare-metal runner here keeps its long-standing parallelism=8 / 4-slots-per-TM
-#   envelope so its previously-measured numbers stay comparable. That is a RUNNER
-#   topology choice (uniform across all queries), NOT a per-query config knob.
+#   NOTE on parallelism: match the docker run-best.sh uniform topology,
+#   parallelism=4 with taskmanager.load-balance.mode=SLOTS. SLOTS spreads the 4
+#   subtasks 2+2 across both TMs and avoids the old NONE-mode slot skew without
+#   increasing per-query live join state.
 #
 # Conservative bare-metal-local defaults still applied by the runner for EVERY
 # query (these are uniform, not per-query): FRS_TM_JEMALLOC=1 (Linux OOM amplifier
@@ -67,4 +66,4 @@
 #   query "*" = the UNIFORM config; run-linux-local-forstrs.sh applies this row to EVERY query.
 #
 query	KV_SEPARATION	KV_MIN_BLOB_SIZE	TRIVIAL_MOVE	S2_PINNED	VLOG_COALESCE_DEREF	SST_COMPRESSION	MEM_MANAGER	note
-*	true	256	true	1	1	lz4	1	UNIFORM config for ALL queries (bare-metal Linux-local runner). Mirrors the docker harness `*` row. KV-sep ON; FRS_VLOG_POINT_DEREF left UNSET so it auto-follows KV-sep (windowed point-RMW q11/q17 take exact-size point deref; coalesceable joins q4/q7/q19/q20 take get_coalesced). FRS_MEM_MANAGER=1 never-OOM controller (un-throttled on the >=40 GiB box). TOPO=split, bare-metal 8c/32g as 2x4c/16g, parallelism 8, 4 slots/TM. Vlog resident bounds (reader_cap 2048, budget 256m, adaptive pressure) keep the engine native bounded. NO per-query differences.
+*	true	256	true	1	1	lz4	1	UNIFORM config for ALL queries (bare-metal Linux-local runner). Mirrors the docker harness `*` row. KV-sep ON; FRS_VLOG_POINT_DEREF left UNSET so it auto-follows KV-sep (windowed point-RMW q11/q17 take exact-size point deref; coalesceable joins q4/q7/q19/q20 take get_coalesced). FRS_MEM_MANAGER=1 never-OOM controller (un-throttled on the >=40 GiB box). TOPO=split, bare-metal 8c/32g as 2x4c/16g, parallelism 4, 4 slots/TM, SLOTS load-balance. Vlog resident bounds (reader_cap 2048, budget 256m, adaptive pressure) keep the engine native bounded. NO per-query differences.
